@@ -1,15 +1,15 @@
-from torchwright.graph import Node, Concatenate
+from torchwright.graph import Node, Concatenate, Linear
+from torchwright.graph.misc import Assert, LiteralValue
 from typing import List, Dict
+import math
+import numbers
 import torch
 
 from torchwright.graph.asserts import assert_matches_value_type
 from torchwright.graph.value_type import NodeValueType, Range
-from torchwright.ops.const import (
-    step_sharpness,
-    embedding_step_sharpness,
-)
+from torchwright.ops.const import step_sharpness, embedding_step_sharpness
 from torchwright.ops.logic_ops import cond_add_vector, cond_gate, _max_abs_or_raise
-from torchwright.ops.arithmetic_ops import sum_nodes
+from torchwright.ops.arithmetic_ops import piecewise_linear, sum_nodes
 from torchwright.ops.linear_relu_linear import linear_relu_linear
 
 
@@ -61,6 +61,7 @@ def map_to_table(
         output_proj=output_proj,
         output_bias=default,
     )
+
     # Output = default + sum_i ReLU_i * speed * (value_i - default).
     # When multiple keys overlap, multiple ReLU_i can fire at once, so
     # bound per channel by |default[j]| + sum_i |value_i[j] - default[j]|.
@@ -76,6 +77,226 @@ def map_to_table(
     return assert_matches_value_type(
         result,
         NodeValueType(value_range=Range(lo, hi)),
+    )
+
+
+def _lookup_axis_scale(index_scale, axis: int) -> float:
+    if isinstance(index_scale, numbers.Real):
+        scale = float(index_scale)
+    else:
+        if len(index_scale) != 2:
+            raise ValueError(
+                f"index_scale must be a scalar or length-2 tuple, got {index_scale!r}"
+            )
+        scale = float(index_scale[axis])
+    if not math.isfinite(scale) or scale <= 0.0:
+        raise ValueError(f"index_scale values must be finite and > 0, got {scale}")
+    return scale
+
+
+def _scale_lookup_index(inp: Node, scale: float, name: str) -> Node:
+    if scale == 1.0:
+        return inp
+    return Linear(inp, torch.tensor([[scale]]), name=name)
+
+
+def _lookup_breakpoints(n: int, eps: float) -> list[float]:
+    breakpoints = [0.0]
+    half_eps = eps / 2.0
+    for k in range(n - 1):
+        boundary = float(k) + 0.5
+        breakpoints.extend([boundary - half_eps, boundary + half_eps])
+    return breakpoints
+
+
+def _lookup_integer_index_at(x: float, n: int) -> int:
+    idx = int(math.floor(x + 0.5))
+    return max(0, min(n - 1, idx))
+
+
+def _constant_vector(values: torch.Tensor, name: str) -> Node:
+    return LiteralValue(values.to(dtype=torch.float32), name=name)
+
+
+def _lookup_numeric_slack(max_abs: float, sharpness: float, n_steps: int) -> float:
+    return max(1e-3, max_abs * sharpness * max(n_steps, 1) * 1e-6)
+
+
+def _table_lookup_row_vector(
+    index: Node,
+    table: torch.Tensor,
+    *,
+    sharpness: float,
+    d_max: int,
+    name: str,
+) -> Node:
+    rows, _cols = table.shape
+    if rows == 1:
+        return _constant_vector(table[0], name=f"{name}_constant_row")
+
+    eps = 1.0 / sharpness
+    breakpoints = _lookup_breakpoints(rows, eps)
+
+    def _row_at(x: float) -> list[float]:
+        idx = _lookup_integer_index_at(x, rows)
+        return [float(v) for v in table[idx].tolist()]
+
+    result = piecewise_linear(
+        index,
+        breakpoints,
+        _row_at,
+        input_scale=sharpness,
+        d_max=d_max,
+        name=f"{name}_row",
+    )
+    if isinstance(result, Assert):
+        result = result.inputs[0]
+    max_abs = float(table.abs().max().item())
+    return assert_matches_value_type(
+        result,
+        NodeValueType(
+            value_range=Range(float(table.min().item()), float(table.max().item()))
+        ),
+        atol=_lookup_numeric_slack(max_abs, sharpness, rows),
+    )
+
+
+def _table_lookup_column_mask(
+    index: Node,
+    n_cols: int,
+    *,
+    sharpness: float,
+    d_max: int,
+    name: str,
+) -> Node:
+    if n_cols == 1:
+        return _constant_vector(torch.tensor([1.0]), name=f"{name}_constant_mask")
+
+    eps = 1.0 / sharpness
+    breakpoints = _lookup_breakpoints(n_cols, eps)
+
+    def _mask_at(x: float) -> list[float]:
+        idx = _lookup_integer_index_at(x, n_cols)
+        return [1.0 if c == idx else -1.0 for c in range(n_cols)]
+
+    return piecewise_linear(
+        index,
+        breakpoints,
+        _mask_at,
+        input_scale=sharpness,
+        d_max=d_max,
+        name=f"{name}_mask",
+    )
+
+
+def table_lookup_2d(
+    i: Node,
+    j: Node,
+    table,
+    *,
+    index_scale=1.0,
+    sharpness: float = 100.0,
+    d_max: int = 1024,
+    name: str = "table_lookup_2d",
+) -> Node:
+    """Lookup a scalar from a compile-time constant 2D table.
+
+    Computes an integer-index lookup: scaled inputs near integer ``k``
+    select table index ``k``, with out-of-range scaled indices clamped to
+    the table edge.  The discontinuous lookup is represented by narrow
+    ReLU ramps with width ``eps = 1 / sharpness`` centered at
+    half-integer boundaries ``k + 0.5``.
+
+    The implementation builds a selected row vector from ``i`` and then
+    gates the selected column from ``j``.  Inside a ramp, the output is
+    the bounded local handoff induced by the row ramp and saturating
+    column gate: exact outside ramps and at integer indices, defined and
+    local inside ramps, but not a bilinear interpolation guarantee.
+    """
+    assert len(i) == 1, "i must be a 1D scalar node"
+    assert len(j) == 1, "j must be a 1D scalar node"
+    s = float(sharpness)
+    if not math.isfinite(s) or s <= 1.0:
+        raise ValueError(f"sharpness must be finite and > 1, got {s}")
+    if d_max < 2:
+        raise ValueError(f"d_max must be >= 2, got {d_max}")
+
+    table_t = torch.as_tensor(table, dtype=torch.float32)
+    if table_t.ndim != 2:
+        raise ValueError(f"table must be 2D, got shape {tuple(table_t.shape)}")
+    rows, cols = table_t.shape
+    if rows < 1 or cols < 1:
+        raise ValueError(f"table must be non-empty, got shape {tuple(table_t.shape)}")
+    if not torch.isfinite(table_t).all():
+        raise ValueError("table must contain only finite values")
+
+    scale_i = _lookup_axis_scale(index_scale, 0)
+    scale_j = _lookup_axis_scale(index_scale, 1)
+    i_scaled = _scale_lookup_index(i, scale_i, name=f"{name}_scale_i")
+    j_scaled = _scale_lookup_index(j, scale_j, name=f"{name}_scale_j")
+
+    row = _table_lookup_row_vector(
+        i_scaled,
+        table_t,
+        sharpness=s,
+        d_max=d_max,
+        name=name,
+    )
+    if cols == 1:
+        return row
+
+    mask = _table_lookup_column_mask(
+        j_scaled,
+        cols,
+        sharpness=s,
+        d_max=d_max,
+        name=name,
+    )
+
+    max_abs = float(table_t.abs().max().item())
+    row_slack = _lookup_numeric_slack(max_abs, s, rows)
+    offset = max_abs + row_slack + 1.0
+    x = Concatenate([mask, row])
+    cols_per_chunk = max(1, d_max // 2)
+    chunks: list[Node] = []
+    for start in range(0, cols, cols_per_chunk):
+        end = min(cols, start + cols_per_chunk)
+        chunk_cols = end - start
+        d_hidden = 2 * chunk_cols
+        input_proj = torch.zeros(d_hidden, 2 * cols)
+        input_bias = torch.zeros(d_hidden)
+        output_proj = torch.zeros(d_hidden, 1)
+        output_bias = torch.zeros(1)
+
+        for local_c, c in enumerate(range(start, end)):
+            pos_value = 2 * local_c
+            neg_value = pos_value + 1
+            input_proj[pos_value, c] = offset
+            input_proj[pos_value, cols + c] = 1.0
+            input_proj[neg_value, c] = offset
+            input_proj[neg_value, cols + c] = -1.0
+            output_proj[pos_value, 0] = 0.5
+            output_proj[neg_value, 0] = -0.5
+
+        chunk_name = f"{name}_gate_{start}_{end}" if cols > cols_per_chunk else name
+        chunks.append(
+            linear_relu_linear(
+                input_node=x,
+                input_proj=input_proj,
+                input_bias=input_bias,
+                output_proj=output_proj,
+                output_bias=output_bias,
+                name=chunk_name,
+            )
+        )
+
+    result = chunks[0] if len(chunks) == 1 else sum_nodes(chunks)
+    lo = float(table_t.min().item())
+    hi = float(table_t.max().item())
+    return assert_matches_value_type(
+        result,
+        NodeValueType(value_range=Range(lo, hi)),
+        atol=max(1e-3, offset * 0.005, row_slack),
     )
 
 

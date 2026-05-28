@@ -25,8 +25,203 @@ from torchwright.ops import (
     dynamic_extract,
     linear_bin_index,
     reciprocal,
+    table_lookup_2d,
 )
 from torchwright.ops.arithmetic_ops import clamp, subtract
+
+# ---------------------------------------------------------------------------
+# table_lookup_2d
+# ---------------------------------------------------------------------------
+
+
+def _table_lookup_2d_reference(
+    table: torch.Tensor,
+    i: torch.Tensor,
+    j: torch.Tensor,
+    index_scale=1.0,
+    sharpness: float = 100.0,
+) -> torch.Tensor:
+    if isinstance(index_scale, (int, float)):
+        scale_i = scale_j = float(index_scale)
+    else:
+        scale_i, scale_j = float(index_scale[0]), float(index_scale[1])
+    rows, cols = table.shape
+    eps = 1.0 / sharpness
+    max_abs = float(table.abs().max().item())
+    row_slack = max(1e-3, max_abs * sharpness * max(rows, 1) * 1e-6)
+    offset = max_abs + row_slack + 1.0
+
+    def _axis_blend(x: float, n: int) -> tuple[int, int, float]:
+        idx = max(0, min(n - 1, int(math.floor(x + 0.5))))
+        if n <= 1:
+            return idx, idx, 0.0
+        k = int(math.floor(x))
+        boundary = float(k) + 0.5
+        lo = boundary - eps / 2.0
+        hi = boundary + eps / 2.0
+        if 0 <= k <= n - 2 and lo <= x <= hi:
+            t = (x - lo) / eps
+            return k, k + 1, max(0.0, min(1.0, t))
+        return idx, idx, 0.0
+
+    def _gate(v: float, m: float) -> float:
+        return 0.5 * max(v + offset * m, 0.0) - 0.5 * max(
+            -v + offset * m,
+            0.0,
+        )
+
+    out = torch.empty(i.shape[0], 1, dtype=table.dtype)
+    for p in range(i.shape[0]):
+        r0, r1, rt = _axis_blend(float(i[p, 0]) * scale_i, rows)
+        c0, c1, ct = _axis_blend(float(j[p, 0]) * scale_j, cols)
+
+        def _row_value(col: int) -> float:
+            return (1.0 - rt) * float(table[r0, col]) + rt * float(table[r1, col])
+
+        if cols == 1:
+            out[p, 0] = _row_value(0)
+        else:
+            left = _row_value(c0)
+            right = _row_value(c1)
+            out[p, 0] = _gate(left, 1.0 - 2.0 * ct) + _gate(
+                right,
+                -1.0 + 2.0 * ct,
+            )
+    return out
+
+
+def _build_table_lookup_2d_graph(table, index_scale=1.0, sharpness=100.0):
+    i = create_input("i", 1)
+    j = create_input("j", 1)
+    return table_lookup_2d(
+        i,
+        j,
+        table,
+        index_scale=index_scale,
+        sharpness=sharpness,
+    )
+
+
+def test_table_lookup_2d_every_integer_cell():
+    table = torch.arange(20, dtype=torch.float32).reshape(4, 5) * 3.0 - 7.0
+    out_node = _build_table_lookup_2d_graph(table)
+
+    coords = [(r, c) for r in range(table.shape[0]) for c in range(table.shape[1])]
+    i_val = torch.tensor([[float(r)] for r, _c in coords], dtype=torch.float32)
+    j_val = torch.tensor([[float(c)] for _r, c in coords], dtype=torch.float32)
+    inputs = {"i": i_val, "j": j_val}
+    n_pos = len(coords)
+
+    expected = _table_lookup_2d_reference(table, i_val, j_val)
+    cache = reference_eval(out_node, inputs, n_pos)
+    assert torch.allclose(cache[out_node], expected, atol=5e-3)
+
+    report = probe_graph(
+        out_node,
+        pos_encoding=None,
+        input_values=inputs,
+        n_pos=n_pos,
+        d=1024,
+        d_head=16,
+        verbose=False,
+        atol=5e-3,
+    )
+    assert report.first_divergent is None, report.format_short()
+
+
+def test_table_lookup_2d_scaled_unit_coordinates():
+    table = torch.tensor(
+        [
+            [2.0, 3.0, 5.0, 7.0],
+            [11.0, 13.0, 17.0, 19.0],
+            [23.0, 29.0, 31.0, 37.0],
+        ],
+        dtype=torch.float32,
+    )
+    index_scale = table.shape
+    out_node = _build_table_lookup_2d_graph(table, index_scale=index_scale)
+
+    coords = [(r, c) for r in range(table.shape[0]) for c in range(table.shape[1])]
+    # 0.2 inside each scaled cell keeps the probe well inside the
+    # centered integer bin and outside half-integer transition bands.
+    i_val = torch.tensor(
+        [[(float(r) + 0.2) / table.shape[0]] for r, _c in coords],
+        dtype=torch.float32,
+    )
+    j_val = torch.tensor(
+        [[(float(c) + 0.2) / table.shape[1]] for _r, c in coords],
+        dtype=torch.float32,
+    )
+    inputs = {"i": i_val, "j": j_val}
+    expected = _table_lookup_2d_reference(table, i_val, j_val, index_scale)
+
+    cache = reference_eval(out_node, inputs, len(coords))
+    assert torch.allclose(cache[out_node], expected, atol=5e-3)
+
+
+def test_table_lookup_2d_target_size_integer_reference():
+    generator = torch.Generator().manual_seed(0)
+    table = torch.rand((128, 128), generator=generator, dtype=torch.float32) * 2.0 - 1.0
+    out_node = _build_table_lookup_2d_graph(table)
+
+    coords = [(0, 0), (1, 17), (64, 64), (126, 3), (127, 127)]
+    i_val = torch.tensor([[float(r)] for r, _c in coords], dtype=torch.float32)
+    j_val = torch.tensor([[float(c)] for _r, c in coords], dtype=torch.float32)
+    inputs = {"i": i_val, "j": j_val}
+    expected = _table_lookup_2d_reference(table, i_val, j_val)
+
+    cache = reference_eval(out_node, inputs, len(coords))
+    assert torch.allclose(cache[out_node], expected, atol=5e-3)
+
+
+def test_table_lookup_2d_near_integer_inputs_remain_in_bin():
+    table = torch.arange(9, dtype=torch.float32).reshape(3, 3) * 4.0
+    out_node = _build_table_lookup_2d_graph(table, sharpness=10.0)
+
+    coords = [(0.4, 0.4), (1.4, 1.4), (1.6, 1.6), (-0.4, 2.4)]
+    i_val = torch.tensor([[r] for r, _c in coords], dtype=torch.float32)
+    j_val = torch.tensor([[c] for _r, c in coords], dtype=torch.float32)
+    inputs = {"i": i_val, "j": j_val}
+    expected = _table_lookup_2d_reference(
+        table,
+        i_val,
+        j_val,
+        sharpness=10.0,
+    )
+
+    cache = reference_eval(out_node, inputs, len(coords))
+    assert torch.allclose(cache[out_node], expected, atol=5e-3)
+
+
+def test_table_lookup_2d_accepts_transition_band_inputs():
+    table = torch.tensor([[0.0, 100.0], [20.0, 120.0]], dtype=torch.float32)
+    sharpness = 10.0
+    out_node = _build_table_lookup_2d_graph(table, sharpness=sharpness)
+    inputs = {
+        "i": torch.tensor([[0.5]], dtype=torch.float32),
+        "j": torch.tensor([[0.5]], dtype=torch.float32),
+    }
+    expected = _table_lookup_2d_reference(
+        table,
+        inputs["i"],
+        inputs["j"],
+        sharpness=sharpness,
+    )
+
+    cache = reference_eval(out_node, inputs, 1)
+    assert torch.allclose(cache[out_node], expected, atol=5e-3)
+
+    report = probe_graph(
+        out_node,
+        pos_encoding=None,
+        input_values=inputs,
+        n_pos=1,
+        d=256,
+        d_head=16,
+        verbose=False,
+        atol=5e-3,
+    )
+    assert report.first_divergent is None, report.format_short()
 
 # ---------------------------------------------------------------------------
 # dynamic_extract
