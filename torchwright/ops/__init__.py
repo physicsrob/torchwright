@@ -54,6 +54,7 @@ from torchwright.ops.map_select import (
     select,
     switch,
     table_lookup_2d,
+    table_lookup_3d,
 )
 
 # I/O nodes

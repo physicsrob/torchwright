@@ -26,6 +26,7 @@ from torchwright.ops import (
     linear_bin_index,
     reciprocal,
     table_lookup_2d,
+    table_lookup_3d,
 )
 from torchwright.ops.arithmetic_ops import clamp, subtract
 
@@ -222,6 +223,327 @@ def test_table_lookup_2d_accepts_transition_band_inputs():
         atol=5e-3,
     )
     assert report.first_divergent is None, report.format_short()
+
+
+# ---------------------------------------------------------------------------
+# table_lookup_3d
+# ---------------------------------------------------------------------------
+
+
+def _table_lookup_3d_axis_order(shape, outer_axis=None):
+    """Replicates the implementation's internal axis-order heuristic:
+    A = outer_axis (default smallest), C = larger remaining, B = smaller."""
+    sizes = list(shape)
+    if outer_axis is None:
+        a = int(min(range(3), key=lambda ax: sizes[ax]))
+    else:
+        a = int(outer_axis)
+    remaining = sorted((ax for ax in range(3) if ax != a), key=lambda ax: sizes[ax])
+    return a, remaining[0], remaining[1]
+
+
+def _staircase_value(x: float, n: int, eps: float) -> float:
+    """Continuous form of the centered integer-index staircase."""
+    idx = max(0, min(n - 1, int(math.floor(x + 0.5))))
+    if n <= 1:
+        return float(idx)
+    k = int(math.floor(x))
+    lo = float(k) + 0.5 - eps / 2.0
+    hi = float(k) + 0.5 + eps / 2.0
+    if 0 <= k <= n - 2 and lo <= x <= hi:
+        return float(k) + max(0.0, min(1.0, (x - lo) / eps))
+    return float(idx)
+
+
+def _table_lookup_3d_reference(
+    table: torch.Tensor,
+    i: torch.Tensor,
+    j: torch.Tensor,
+    k: torch.Tensor,
+    index_scale=1.0,
+    sharpness: float = 100.0,
+    outer_axis=None,
+) -> torch.Tensor:
+    """Independent reference: round the two flattened axes to integer
+    indices, flatten as ``q = B*idx_a + idx_b``, and reduce to the
+    validated 2D reference over ``table.reshape(A*B, C)``."""
+    if isinstance(index_scale, (int, float)):
+        scales = [float(index_scale)] * 3
+    else:
+        scales = [float(s) for s in index_scale]
+    a_ax, b_ax, c_ax = _table_lookup_3d_axis_order(table.shape, outer_axis)
+    a_size, b_size, c_size = table.shape[a_ax], table.shape[b_ax], table.shape[c_ax]
+    table_perm = (
+        table.permute(a_ax, b_ax, c_ax).contiguous().reshape(a_size * b_size, c_size)
+    )
+    eps = 1.0 / sharpness
+    inp = [i, j, k]
+    n_pos = i.shape[0]
+    q = torch.empty(n_pos, 1, dtype=table.dtype)
+    c_scaled = torch.empty(n_pos, 1, dtype=table.dtype)
+    for p in range(n_pos):
+        sv_a = _staircase_value(float(inp[a_ax][p, 0]) * scales[a_ax], a_size, eps)
+        sv_b = _staircase_value(float(inp[b_ax][p, 0]) * scales[b_ax], b_size, eps)
+        q[p, 0] = b_size * sv_a + sv_b
+        c_scaled[p, 0] = float(inp[c_ax][p, 0]) * scales[c_ax]
+    return _table_lookup_2d_reference(table_perm, q, c_scaled, sharpness=sharpness)
+
+
+def _build_table_lookup_3d_graph(
+    table, index_scale=1.0, sharpness=100.0, outer_axis=None
+):
+    i = create_input("i", 1)
+    j = create_input("j", 1)
+    k = create_input("k", 1)
+    return table_lookup_3d(
+        i,
+        j,
+        k,
+        table,
+        index_scale=index_scale,
+        sharpness=sharpness,
+        outer_axis=outer_axis,
+    )
+
+
+def test_table_lookup_3d_axis_order_for_target_shape():
+    # 16 x 128 x 128 should resolve to A=16 (outer), B=128, C=128.
+    assert _table_lookup_3d_axis_order((16, 128, 128)) == (0, 1, 2)
+
+
+def test_table_lookup_3d_every_integer_cell():
+    table = torch.arange(24, dtype=torch.float32).reshape(2, 3, 4) * 2.0 - 5.0
+    out_node = _build_table_lookup_3d_graph(table)
+
+    coords = [
+        (a, b, c)
+        for a in range(table.shape[0])
+        for b in range(table.shape[1])
+        for c in range(table.shape[2])
+    ]
+    i_val = torch.tensor([[float(a)] for a, _b, _c in coords], dtype=torch.float32)
+    j_val = torch.tensor([[float(b)] for _a, b, _c in coords], dtype=torch.float32)
+    k_val = torch.tensor([[float(c)] for _a, _b, c in coords], dtype=torch.float32)
+    inputs = {"i": i_val, "j": j_val, "k": k_val}
+    n_pos = len(coords)
+
+    # Fully independent check: the cell value itself.
+    direct = torch.tensor(
+        [[float(table[a, b, c])] for a, b, c in coords], dtype=torch.float32
+    )
+    expected = _table_lookup_3d_reference(table, i_val, j_val, k_val)
+    cache = reference_eval(out_node, inputs, n_pos)
+    assert torch.allclose(cache[out_node], direct, atol=5e-3)
+    assert torch.allclose(cache[out_node], expected, atol=5e-3)
+
+    report = probe_graph(
+        out_node,
+        pos_encoding=None,
+        input_values=inputs,
+        n_pos=n_pos,
+        d=2048,
+        d_head=16,
+        verbose=False,
+        atol=5e-3,
+    )
+    assert report.first_divergent is None, report.format_short()
+
+
+def test_table_lookup_3d_scaled_unit_coordinates():
+    table = torch.arange(24, dtype=torch.float32).reshape(2, 3, 4) * 1.5 + 1.0
+    index_scale = table.shape
+    out_node = _build_table_lookup_3d_graph(table, index_scale=index_scale)
+
+    coords = [(0, 1, 2), (1, 0, 3), (1, 2, 0), (0, 2, 3)]
+    # +0.2 inside each scaled cell stays in the centered integer bin.  The
+    # outer axis (axis 0) must scale to an exact integer (it is asserted
+    # integer), so it gets no offset.
+    i_val = torch.tensor(
+        [[float(a) / table.shape[0]] for a, _b, _c in coords],
+        dtype=torch.float32,
+    )
+    j_val = torch.tensor(
+        [[(float(b) + 0.2) / table.shape[1]] for _a, b, _c in coords],
+        dtype=torch.float32,
+    )
+    k_val = torch.tensor(
+        [[(float(c) + 0.2) / table.shape[2]] for _a, _b, c in coords],
+        dtype=torch.float32,
+    )
+    inputs = {"i": i_val, "j": j_val, "k": k_val}
+    direct = torch.tensor(
+        [[float(table[a, b, c])] for a, b, c in coords], dtype=torch.float32
+    )
+
+    cache = reference_eval(out_node, inputs, len(coords))
+    assert torch.allclose(cache[out_node], direct, atol=5e-3)
+
+
+# Flattening 16x128 into 2048 row breakpoints makes the row PWL reconstruct
+# each value as a sum over ~q active ReLU terms.  Both the per-term slope
+# magnitude and the ReLU-argument magnitude scale with `sharpness`, so the
+# float32 accumulation error at integer cells scales with it too: ~0.08 at
+# sharpness=100, ~0.008 at sharpness=10 on unit-magnitude values.  Integer-
+# lookup fidelity at the target shape therefore improves with lower sharpness.
+@pytest.mark.parametrize("sharpness,atol", [(100.0, 0.2), (10.0, 0.02)])
+def test_table_lookup_3d_target_size_integer_reference(sharpness, atol):
+    generator = torch.Generator().manual_seed(0)
+    table = (
+        torch.rand((16, 128, 128), generator=generator, dtype=torch.float32) * 2.0 - 1.0
+    )
+    out_node = _build_table_lookup_3d_graph(table, sharpness=sharpness)
+
+    coords = [(0, 0, 0), (3, 17, 99), (8, 64, 64), (15, 127, 1), (15, 0, 127)]
+    i_val = torch.tensor([[float(a)] for a, _b, _c in coords], dtype=torch.float32)
+    j_val = torch.tensor([[float(b)] for _a, b, _c in coords], dtype=torch.float32)
+    k_val = torch.tensor([[float(c)] for _a, _b, c in coords], dtype=torch.float32)
+    inputs = {"i": i_val, "j": j_val, "k": k_val}
+    direct = torch.tensor(
+        [[float(table[a, b, c])] for a, b, c in coords], dtype=torch.float32
+    )
+
+    cache = reference_eval(out_node, inputs, len(coords))
+    assert torch.allclose(cache[out_node], direct, atol=atol)
+
+
+def test_table_lookup_3d_inner_axis_amplification():
+    # b_size = 16, so idx_a feeds q with a ×16 weight: q = 16*idx_a + idx_b.
+    # High-b integer cells (b=15) stress that the staircase lands exactly.
+    table = torch.arange(2 * 16 * 16, dtype=torch.float32).reshape(2, 16, 16) * 0.5
+    out_node = _build_table_lookup_3d_graph(table)
+    assert _table_lookup_3d_axis_order(table.shape) == (0, 1, 2)
+
+    coords = [(0, 0, 0), (0, 15, 0), (1, 15, 15), (1, 0, 7), (0, 9, 11), (1, 8, 3)]
+    i_val = torch.tensor([[float(a)] for a, _b, _c in coords], dtype=torch.float32)
+    j_val = torch.tensor([[float(b)] for _a, b, _c in coords], dtype=torch.float32)
+    k_val = torch.tensor([[float(c)] for _a, _b, c in coords], dtype=torch.float32)
+    inputs = {"i": i_val, "j": j_val, "k": k_val}
+    direct = torch.tensor(
+        [[float(table[a, b, c])] for a, b, c in coords], dtype=torch.float32
+    )
+
+    cache = reference_eval(out_node, inputs, len(coords))
+    assert torch.allclose(cache[out_node], direct, atol=5e-3)
+
+    report = probe_graph(
+        out_node,
+        pos_encoding=None,
+        input_values=inputs,
+        n_pos=len(coords),
+        d=2048,
+        d_head=16,
+        verbose=False,
+        atol=5e-3,
+    )
+    assert report.first_divergent is None, report.format_short()
+
+
+def test_table_lookup_3d_near_integer_inputs_remain_in_bin():
+    # sharpness=10 -> eps=0.1, transition half-width 0.05.  +/-0.4 on the
+    # inner (B) and vector (C) axes stays in the stable bin.  The outer (A)
+    # axis is held exactly integer (it is asserted integer).
+    table = torch.arange(2 * 3 * 3, dtype=torch.float32).reshape(2, 3, 3) * 4.0
+    out_node = _build_table_lookup_3d_graph(table, sharpness=10.0)
+
+    coords = [(0, 0.4, 0.4), (1, 1.4, 1.6), (0, 1.6, 0.4), (1, 0.4, 1.6)]
+    i_val = torch.tensor([[a] for a, _b, _c in coords], dtype=torch.float32)
+    j_val = torch.tensor([[b] for _a, b, _c in coords], dtype=torch.float32)
+    k_val = torch.tensor([[c] for _a, _b, c in coords], dtype=torch.float32)
+    inputs = {"i": i_val, "j": j_val, "k": k_val}
+    expected = _table_lookup_3d_reference(
+        table, i_val, j_val, k_val, sharpness=10.0
+    )
+
+    cache = reference_eval(out_node, inputs, len(coords))
+    assert torch.allclose(cache[out_node], expected, atol=5e-3)
+
+
+def test_table_lookup_3d_inner_and_vector_transition_match_reference():
+    # Half-integer transition on B (axis 1) and C (axis 2), A held integer.
+    table = torch.tensor(
+        [
+            [[0.0, 10.0], [20.0, 30.0]],
+            [[40.0, 50.0], [60.0, 70.0]],
+        ],
+        dtype=torch.float32,
+    )
+    sharpness = 10.0
+    out_node = _build_table_lookup_3d_graph(table, sharpness=sharpness)
+    assert _table_lookup_3d_axis_order(table.shape) == (0, 1, 2)
+
+    inputs = {
+        "i": torch.tensor([[0.0], [1.0], [0.0]], dtype=torch.float32),
+        "j": torch.tensor([[0.5], [0.0], [0.5]], dtype=torch.float32),  # B transition
+        "k": torch.tensor([[0.0], [0.5], [0.5]], dtype=torch.float32),  # C transition
+    }
+    expected = _table_lookup_3d_reference(
+        table, inputs["i"], inputs["j"], inputs["k"], sharpness=sharpness
+    )
+
+    cache = reference_eval(out_node, inputs, 3)
+    assert torch.allclose(cache[out_node], expected, atol=5e-3)
+
+    report = probe_graph(
+        out_node,
+        pos_encoding=None,
+        input_values=inputs,
+        n_pos=3,
+        d=512,
+        d_head=16,
+        verbose=False,
+        atol=5e-3,
+    )
+    assert report.first_divergent is None, report.format_short()
+
+
+def test_table_lookup_3d_outer_axis_must_be_integer():
+    table = torch.arange(2 * 3 * 4, dtype=torch.float32).reshape(2, 3, 4)
+    out_node = _build_table_lookup_3d_graph(table)
+    # A = axis 0; a clearly non-integer value there must fail the assert.
+    inputs = {
+        "i": torch.tensor([[0.5]], dtype=torch.float32),
+        "j": torch.tensor([[1.0]], dtype=torch.float32),
+        "k": torch.tensor([[2.0]], dtype=torch.float32),
+    }
+    with pytest.raises(AssertionError):
+        reference_eval(out_node, inputs, 1)
+
+
+def test_table_lookup_3d_outer_axis_override():
+    table = torch.arange(8 * 4 * 2, dtype=torch.float32).reshape(8, 4, 2) + 0.5
+    # Default outer axis would be axis 2 (size 2); override to axis 0.
+    assert _table_lookup_3d_axis_order(table.shape) == (2, 1, 0)
+    assert _table_lookup_3d_axis_order(table.shape, outer_axis=0) == (0, 2, 1)
+    out_node = _build_table_lookup_3d_graph(table, outer_axis=0)
+
+    coords = [(0, 0, 0), (7, 3, 1), (4, 1, 0), (2, 2, 1)]
+    i_val = torch.tensor([[float(a)] for a, _b, _c in coords], dtype=torch.float32)
+    j_val = torch.tensor([[float(b)] for _a, b, _c in coords], dtype=torch.float32)
+    k_val = torch.tensor([[float(c)] for _a, _b, c in coords], dtype=torch.float32)
+    inputs = {"i": i_val, "j": j_val, "k": k_val}
+    direct = torch.tensor(
+        [[float(table[a, b, c])] for a, b, c in coords], dtype=torch.float32
+    )
+
+    cache = reference_eval(out_node, inputs, len(coords))
+    assert torch.allclose(cache[out_node], direct, atol=5e-3)
+
+
+def test_table_lookup_3d_rejects_bad_shapes_and_scales():
+    i = create_input("i", 1)
+    j = create_input("j", 1)
+    k = create_input("k", 1)
+    with pytest.raises(ValueError):  # 2D table
+        table_lookup_3d(i, j, k, torch.zeros(3, 4))
+    with pytest.raises(ValueError):  # empty axis
+        table_lookup_3d(i, j, k, torch.zeros(3, 0, 4))
+    with pytest.raises(ValueError):  # wrong-length index_scale
+        table_lookup_3d(i, j, k, torch.zeros(3, 4, 5), index_scale=(1.0, 2.0))
+    with pytest.raises(ValueError):  # sharpness must be > 1
+        table_lookup_3d(i, j, k, torch.zeros(3, 4, 5), sharpness=1.0)
+    with pytest.raises(ValueError):  # bad outer_axis
+        table_lookup_3d(i, j, k, torch.zeros(3, 4, 5), outer_axis=3)
+
 
 # ---------------------------------------------------------------------------
 # dynamic_extract

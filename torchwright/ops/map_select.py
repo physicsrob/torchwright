@@ -5,7 +5,7 @@ import math
 import numbers
 import torch
 
-from torchwright.graph.asserts import assert_matches_value_type
+from torchwright.graph.asserts import assert_integer, assert_matches_value_type
 from torchwright.graph.value_type import NodeValueType, Range
 from torchwright.ops.const import step_sharpness, embedding_step_sharpness
 from torchwright.ops.logic_ops import cond_add_vector, cond_gate, _max_abs_or_raise
@@ -80,13 +80,14 @@ def map_to_table(
     )
 
 
-def _lookup_axis_scale(index_scale, axis: int) -> float:
+def _lookup_axis_scale(index_scale, axis: int, n_axes: int = 2) -> float:
     if isinstance(index_scale, numbers.Real):
         scale = float(index_scale)
     else:
-        if len(index_scale) != 2:
+        if len(index_scale) != n_axes:
             raise ValueError(
-                f"index_scale must be a scalar or length-2 tuple, got {index_scale!r}"
+                f"index_scale must be a scalar or length-{n_axes} tuple, "
+                f"got {index_scale!r}"
             )
         scale = float(index_scale[axis])
     if not math.isfinite(scale) or scale <= 0.0:
@@ -297,6 +298,155 @@ def table_lookup_2d(
         result,
         NodeValueType(value_range=Range(lo, hi)),
         atol=max(1e-3, offset * 0.005, row_slack),
+    )
+
+
+def _table_lookup_index_staircase(
+    index: Node,
+    n: int,
+    *,
+    sharpness: float,
+    d_max: int,
+    name: str,
+) -> Node:
+    """Scalar centered integer-index staircase: scaled ``index`` -> clamped
+    nearest-integer index, flat in stable bins with narrow ramps at the
+    half-integer boundaries.  The scalar analogue of the row-vector lookup;
+    width-1 output."""
+    if n == 1:
+        return _constant_vector(torch.tensor([0.0]), name=f"{name}_zero_index")
+
+    eps = 1.0 / sharpness
+    breakpoints = _lookup_breakpoints(n, eps)
+
+    def _index_at(x: float) -> float:
+        return float(_lookup_integer_index_at(x, n))
+
+    result = piecewise_linear(
+        index,
+        breakpoints,
+        _index_at,
+        input_scale=sharpness,
+        d_max=d_max,
+        name=f"{name}_staircase",
+    )
+    if isinstance(result, Assert):
+        result = result.inputs[0]
+    return assert_matches_value_type(
+        result,
+        NodeValueType(value_range=Range(0.0, float(n - 1))),
+        atol=_lookup_numeric_slack(float(n - 1), sharpness, n),
+    )
+
+
+def table_lookup_3d(
+    i: Node,
+    j: Node,
+    k: Node,
+    table,
+    *,
+    index_scale=1.0,
+    sharpness: float = 100.0,
+    outer_axis=None,
+    d_max: int = 1024,
+    name: str = "table_lookup_3d",
+) -> Node:
+    """Lookup a scalar from a compile-time constant 3D table.
+
+    A ``table_lookup_2d`` whose row index is a flattened, pre-rounded
+    ``(A, B)`` index: the two flattened axes are rounded to integer indices
+    ``idx_a, idx_b`` and combined as ``q = B * idx_a + idx_b`` into the row
+    axis of ``table.reshape(A * B, C)``; the C axis is the 2D column gate.
+
+    Semantics match ``table_lookup_2d`` per axis at integer inputs.  Off the
+    integer grid the three axes differ: the vector axis ``C`` is the
+    saturating-gate handoff, the inner flattened axis ``B`` is a two-neighbor
+    linear blend, and the outer flattened axis ``A`` is degenerate (its
+    transition sweeps a whole block of ``B`` rows).  ``A`` is therefore
+    asserted integer-valued.
+
+    Internal axis order is fixed by a heuristic: ``A`` = ``outer_axis``
+    (defaults to the smallest axis, asserted integer), ``C`` = the larger of
+    the remaining two (the contiguous vector axis), ``B`` = the smaller
+    remaining axis.  ``index_scale`` may be a scalar or length-3 tuple mapping
+    to ``(i, j, k)``.
+    """
+    inputs = [i, j, k]
+    for axis, inp in enumerate(inputs):
+        if len(inp) != 1:
+            raise ValueError(f"input for axis {axis} must be a 1D scalar node")
+    s = float(sharpness)
+    if not math.isfinite(s) or s <= 1.0:
+        raise ValueError(f"sharpness must be finite and > 1, got {s}")
+    if d_max < 2:
+        raise ValueError(f"d_max must be >= 2, got {d_max}")
+
+    table_t = torch.as_tensor(table, dtype=torch.float32)
+    if table_t.ndim != 3:
+        raise ValueError(f"table must be 3D, got shape {tuple(table_t.shape)}")
+    if any(d < 1 for d in table_t.shape):
+        raise ValueError(f"table must be non-empty, got shape {tuple(table_t.shape)}")
+    if not torch.isfinite(table_t).all():
+        raise ValueError("table must contain only finite values")
+
+    sizes = list(table_t.shape)
+    if outer_axis is None:
+        a_axis = int(min(range(3), key=lambda ax: sizes[ax]))
+    else:
+        a_axis = int(outer_axis)
+        if a_axis not in (0, 1, 2):
+            raise ValueError(f"outer_axis must be 0, 1, or 2, got {outer_axis!r}")
+    # C is the larger of the two remaining axes (kept contiguous as the
+    # vector axis); B is the smaller, so A*B stays small.
+    remaining = sorted((ax for ax in range(3) if ax != a_axis), key=lambda ax: sizes[ax])
+    b_axis, c_axis = remaining[0], remaining[1]
+
+    a_size, b_size, c_size = sizes[a_axis], sizes[b_axis], sizes[c_axis]
+
+    a_scaled = _scale_lookup_index(
+        inputs[a_axis],
+        _lookup_axis_scale(index_scale, a_axis, n_axes=3),
+        name=f"{name}_scale_a",
+    )
+    b_scaled = _scale_lookup_index(
+        inputs[b_axis],
+        _lookup_axis_scale(index_scale, b_axis, n_axes=3),
+        name=f"{name}_scale_b",
+    )
+    c_scaled = _scale_lookup_index(
+        inputs[c_axis],
+        _lookup_axis_scale(index_scale, c_axis, n_axes=3),
+        name=f"{name}_scale_c",
+    )
+
+    # The outer axis has no graceful off-grid handoff, so require it integer.
+    a_scaled = assert_integer(a_scaled)
+
+    idx_a = _table_lookup_index_staircase(
+        a_scaled, a_size, sharpness=s, d_max=d_max, name=f"{name}_a"
+    )
+    idx_b = _table_lookup_index_staircase(
+        b_scaled, b_size, sharpness=s, d_max=d_max, name=f"{name}_b"
+    )
+    q = Linear(
+        Concatenate([idx_a, idx_b]),
+        torch.tensor([[float(b_size)], [1.0]]),
+        name=f"{name}_flatten",
+    )
+
+    table_2d = (
+        table_t.permute(a_axis, b_axis, c_axis)
+        .contiguous()
+        .reshape(a_size * b_size, c_size)
+    )
+    return table_lookup_2d(
+        q,
+        c_scaled,
+        table_2d,
+        index_scale=1.0,
+        sharpness=s,
+        d_max=d_max,
+        name=f"{name}_2d",
     )
 
 
