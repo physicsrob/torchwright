@@ -30,6 +30,8 @@ from torchwright.ops.attention_ops import (
     attend_argmin,
     attend_argmax,
     attend_argmax_dot,
+    attend_argmax_dot_where,
+    attend_argmin_dot_where,
     attend_argmin_where,
     attend_argmax_where,
     attend_argmin_above_integer,
@@ -918,6 +920,103 @@ def test_attend_argmax_dot_different_queries_per_position():
     assert abs(result[2].item() - 30.0) < 0.5
     # pos 3 queries col 0 → pos 0 (col 0 = +1, among {0,1,2,3})
     assert abs(result[3].item() - 10.0) < 0.5
+
+
+# ---------------------------------------------------------------------------
+# attend_argmax_dot_where / attend_argmin_dot_where
+# ---------------------------------------------------------------------------
+
+
+def test_attend_argmax_dot_where_validity_dominates_supported_range():
+    """A valid low dot score beats an invalid high dot score."""
+    query_vector = InputNode("qv", 1, value_range=(-100.0, 100.0))
+    key_vector = InputNode("kv", 1, value_range=(-100.0, 100.0))
+    validity = InputNode("validity", 1, value_range=(-100.0, 100.0))
+    value = InputNode("value", 2, value_range=(-100.0, 100.0))
+    out = attend_argmax_dot_where(query_vector, key_vector, validity, value)
+
+    n_pos = 2
+    qv_in = torch.ones(n_pos, 1)
+    # At the default match_gain=200, dot magnitudes 4.5 stay inside the
+    # documented supported range (abs(match_gain * dot) <= 960).
+    kv_in = torch.tensor([[-4.5], [4.5]])
+    validity_in = torch.tensor([[1.0], [-1.0]])
+    value_in = torch.tensor([[7.0, 1.0], [99.0, 9.0]])
+
+    result = _run(
+        out,
+        n_pos,
+        qv=qv_in,
+        kv=kv_in,
+        validity=validity_in,
+        value=value_in,
+    )
+    assert torch.allclose(result[1], value_in[0], atol=1e-3), f"pos 1: {result[1]}"
+
+
+def test_attend_argmin_dot_where_validity_dominates_supported_range():
+    """A valid high dot score beats an invalid low dot score."""
+    query_vector = InputNode("qv", 1, value_range=(-100.0, 100.0))
+    key_vector = InputNode("kv", 1, value_range=(-100.0, 100.0))
+    validity = InputNode("validity", 1, value_range=(-100.0, 100.0))
+    value = InputNode("value", 2, value_range=(-100.0, 100.0))
+    out = attend_argmin_dot_where(query_vector, key_vector, validity, value)
+
+    n_pos = 2
+    qv_in = torch.ones(n_pos, 1)
+    kv_in = torch.tensor([[4.5], [-4.5]])
+    validity_in = torch.tensor([[1.0], [-1.0]])
+    value_in = torch.tensor([[3.0, 4.0], [99.0, 9.0]])
+
+    result = _run(
+        out,
+        n_pos,
+        qv=qv_in,
+        kv=kv_in,
+        validity=validity_in,
+        value=value_in,
+    )
+    assert torch.allclose(result[1], value_in[0], atol=1e-3), f"pos 1: {result[1]}"
+
+
+def test_attend_argmin_dot_where_zero_key_regression():
+    """Invalid zero keys must not win argmin over valid positive-dot keys."""
+    query_vector = InputNode("qv", 2, value_range=(-100.0, 100.0))
+    key_vector = InputNode("kv", 2, value_range=(-100.0, 100.0))
+    validity = InputNode("validity", 1, value_range=(-100.0, 100.0))
+    value = InputNode("value", 3, value_range=(-100.0, 100.0))
+    out = attend_argmin_dot_where(query_vector, key_vector, validity, value)
+
+    n_pos = 3
+    qv_in = torch.tensor(
+        [
+            [1.0, 0.0],
+            [1.0, 0.0],
+            [1.0, 0.0],
+        ]
+    )
+    # Pos 1 is invalid and has a zero key. Without explicit validity,
+    # its dot score 0 would beat the valid positive dot scores under argmin.
+    kv_in = torch.tensor(
+        [
+            [1.0, 0.0],
+            [0.0, 0.0],
+            [2.0, 0.0],
+        ]
+    )
+    validity_in = torch.tensor([[1.0], [-1.0], [1.0]])
+    value_in = torch.eye(3, 3)
+
+    result = _run(
+        out,
+        n_pos,
+        qv=qv_in,
+        kv=kv_in,
+        validity=validity_in,
+        value=value_in,
+    )
+    assert torch.allclose(result[1], value_in[0], atol=1e-3), f"pos 1: {result[1]}"
+    assert torch.allclose(result[2], value_in[0], atol=1e-3), f"pos 2: {result[2]}"
 
 
 # ---------------------------------------------------------------------------

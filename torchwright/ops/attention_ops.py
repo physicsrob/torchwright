@@ -50,7 +50,7 @@ from typing import Optional
 
 import torch
 
-from torchwright.graph import Node, Concatenate, Attn
+from torchwright.graph import Node, Concatenate, Attn, LiteralValue
 from torchwright.graph.asserts import (
     assert_in_range,
     assert_matches_value_type,
@@ -118,8 +118,9 @@ def _wrap_hard_selection_output(
 _QUERY_GAIN = 8.0
 
 # Direct (not gained) logit bonus for valid positions in the simple
-# ``_where`` variants (``attend_argmin_where``, ``attend_argmax_where``,
-# ``attend_mean_where``).  Routed through a dedicated ``d_qk`` column
+# scalar ``_where`` variants (``attend_argmin_where``,
+# ``attend_argmax_where``, ``attend_mean_where``) and the dot-product
+# ``_dot_where`` variants.  Routed through a dedicated ``d_qk`` column
 # with ``Q = 1.0`` and ``K = ± _VALIDITY_DIRECT``, so the contribution
 # to the logit is literally ``± _VALIDITY_DIRECT`` — not multiplied by
 # ``_QUERY_GAIN``.  Must exceed the one-sided score swing
@@ -142,6 +143,14 @@ _VALIDITY_KEY_COEFF = 1000.0
 # the 8000-unit gained ``_VALIDITY_KEY_COEFF`` contribution in
 # ``attend_argmin_valid_unmasked``).
 _MAX_SCORE_ABS = 120.0
+
+# Maximum absolute dot-product contribution supported by
+# ``attend_argmax_dot_where`` / ``attend_argmin_dot_where`` *after*
+# multiplying by ``match_gain``.  Validity contributes
+# ``± _VALIDITY_DIRECT`` directly to the logit, so keeping the match
+# term inside ±960 leaves the same 40-logit margin as the scalar
+# ``_where`` variants in the worst valid-vs-invalid case.
+_MAX_DOT_LOGIT_ABS = 960.0
 
 # Penalty (in *logit* space, not key space) applied by
 # ``attend_argmin_unmasked`` to masked positions. Must exceed
@@ -998,6 +1007,177 @@ def attend_argmax_dot(
         key_matrix=key_matrix,
         value_matrix=value_matrix,
         output_matrix=output_matrix,
+    )
+    return _wrap_hard_selection_output(
+        attn, value, assert_hardness_gt=assert_hardness_gt
+    )
+
+
+def _build_dot_where_attn(
+    query_vector: Node,
+    key_vector: Node,
+    validity: Node,
+    value: Node,
+    *,
+    score_sign: float,
+    match_gain: float,
+) -> Attn:
+    """Shared construction for dot-product selection with validity.
+
+    ``score_sign`` is ``+1`` for argmax and ``-1`` for argmin.
+    """
+    assert len(query_vector) == len(key_vector), (
+        "query_vector and key_vector must have the same width "
+        f"(got {len(query_vector)} and {len(key_vector)})"
+    )
+    assert len(validity) == 1, "attend_*_dot_where expects 1D boolean validity"
+    assert match_gain > 0, "attend_*_dot_where expects positive match_gain"
+
+    W = len(query_vector)
+    d_v = len(value)
+    # d_qk layout:
+    #   cols 0..W-1: dot-product score
+    #   col W:       direct validity bonus
+    d_qk = W + 1
+
+    # The validity term needs a query-side constant.  A LiteralValue keeps
+    # this op independent of PosEncoding while preserving the same direct
+    # validity-logit pattern used by the scalar _where variants.
+    query_one = LiteralValue(torch.tensor([1.0]), name="dot_where_query_one")
+    query_in = Concatenate([query_vector, query_one])
+    key_in = Concatenate([key_vector, validity])
+
+    query_matrix = torch.zeros((W + 1, d_qk))
+    for c in range(W):
+        query_matrix[c, c] = score_sign * match_gain
+    query_matrix[W, W] = 1.0
+
+    key_matrix = torch.zeros((W + 1, d_qk))
+    for c in range(W):
+        key_matrix[c, c] = 1.0
+    key_matrix[W, W] = _VALIDITY_DIRECT
+
+    value_matrix = torch.eye(d_v)
+    output_matrix = torch.eye(d_v)
+
+    return Attn(
+        query_in=query_in,
+        key_in=key_in,
+        value_in=value,
+        query_matrix=query_matrix,
+        key_matrix=key_matrix,
+        value_matrix=value_matrix,
+        output_matrix=output_matrix,
+    )
+
+
+def attend_argmax_dot_where(
+    query_vector: Node,
+    key_vector: Node,
+    validity: Node,
+    value: Node,
+    match_gain: float = 200.0,
+    assert_hardness_gt: Optional[float] = None,
+) -> Node:
+    """Argmax of ``query_vector · key_vector`` over valid key positions.
+
+    At each query position, returns ``value`` at the causal-window
+    position where ``validity`` is +1 and the dot product with the query
+    vector is largest.  ``validity`` follows the usual torchwright
+    boolean convention: +1.0 means "valid", -1.0 means "invalid".
+
+    The logit at key position ``i`` seen from query position ``j`` is
+
+        match_gain · (query_vector[j] · key_vector[i])
+            + _VALIDITY_DIRECT · validity[i]
+
+    Invalid rows cannot win as long as every caller-provided dot score
+    satisfies ``abs(match_gain * dot_score) <= _MAX_DOT_LOGIT_ABS``.
+    With the default ``match_gain=200``, this means
+    ``abs(dot_score) <= 4.8``.  If your dot products are larger, scale
+    the vectors or lower ``match_gain`` so the validity term has room to
+    dominate; tied valid scores produce a soft average.
+
+    **When no position is valid.** The softmax still returns a weighted
+    average over invalid positions.  Callers must ensure each consumed
+    query has at least one valid causal-window key, or gate the result
+    downstream.
+
+    Compile cost: one attention head (auto-split across multiple
+    physical heads by the compiler when ``d_v > d_head``).
+    ``d_qk = len(query_vector) + 1``, ``d_v = len(value)``.
+
+    Args:
+        query_vector: Width-``W`` node at each query position.
+        key_vector: Width-``W`` node at each key position.
+        validity: 1D boolean node (+1 valid, -1 invalid).
+        value: Node to read at the winning position.
+        match_gain: Positive coefficient applied to the dot-product term.
+        assert_hardness_gt: If set, checks the winning softmax weight.
+
+    Returns:
+        Attn node of width ``len(value)``.
+
+    See also:
+        :func:`attend_argmin_dot_where` — minimum-dot dual.
+        :func:`attend_argmax_dot` — original unmasked dot-product variant.
+    """
+    attn = _build_dot_where_attn(
+        query_vector,
+        key_vector,
+        validity,
+        value,
+        score_sign=+1.0,
+        match_gain=match_gain,
+    )
+    return _wrap_hard_selection_output(
+        attn, value, assert_hardness_gt=assert_hardness_gt
+    )
+
+
+def attend_argmin_dot_where(
+    query_vector: Node,
+    key_vector: Node,
+    validity: Node,
+    value: Node,
+    match_gain: float = 200.0,
+    assert_hardness_gt: Optional[float] = None,
+) -> Node:
+    """Argmin of ``query_vector · key_vector`` over valid key positions.
+
+    Sign-flipped twin of :func:`attend_argmax_dot_where`.  This is the
+    variant to use when zeroed invalid keys are unsafe: in an argmin, an
+    invalid zero key can otherwise beat valid keys with positive dot
+    scores.
+
+    The logit at key position ``i`` seen from query position ``j`` is
+
+        -match_gain · (query_vector[j] · key_vector[i])
+            + _VALIDITY_DIRECT · validity[i]
+
+    The same supported range applies:
+    ``abs(match_gain * dot_score) <= _MAX_DOT_LOGIT_ABS`` for all key
+    rows in the consumed causal window.  At the default
+    ``match_gain=200``, that is ``abs(dot_score) <= 4.8``.
+
+    Args:
+        query_vector: Width-``W`` node at each query position.
+        key_vector: Width-``W`` node at each key position.
+        validity: 1D boolean node (+1 valid, -1 invalid).
+        value: Node to read at the winning position.
+        match_gain: Positive coefficient applied to the dot-product term.
+        assert_hardness_gt: If set, checks the winning softmax weight.
+
+    Returns:
+        Attn node of width ``len(value)``.
+    """
+    attn = _build_dot_where_attn(
+        query_vector,
+        key_vector,
+        validity,
+        value,
+        score_sign=-1.0,
+        match_gain=match_gain,
     )
     return _wrap_hard_selection_output(
         attn, value, assert_hardness_gt=assert_hardness_gt
