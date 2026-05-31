@@ -61,30 +61,30 @@ class PosEncoding(Node):
             # NOOP -- supporting this simplifies some use cases.
             return value
 
-        # We're applying the query/key to the position
-        d_head = self.d_pos
-        assert self.d_pos <= d_head
-        assert len(value) <= d_head
+        # Q/K match positions in positional-encoding space; V/O transports
+        # the payload independently and may be wider than the position vector.
+        d_qk = self.d_pos
+        d_v = len(value)
 
-        # key_matrix shape (d_key_in, d_head)
+        # key_matrix shape (d_key_in, d_qk)
         delta = get_pos_delta_matrix(delta_pos, self.d_pos)
         # The last sin/cos pair (columns d_pos-2, d_pos-1) contains the
         # raw position counter instead of a sinusoid.  Zero it out so the
         # counter doesn't participate in the trig-identity attention.
         delta[self.d_pos - 2 :, :] = 0.0
         delta[:, self.d_pos - 2 :] = 0.0
-        key_matrix = torch.zeros((len(self), d_head))
+        key_matrix = torch.zeros((len(self), d_qk))
         key_matrix[:, : self.d_pos] = delta
 
-        # query_matrix shape (d_query_in, d_head)
-        query_matrix = attention_hardness * torch.eye(len(self), d_head)
+        # query_matrix shape (d_query_in, d_qk)
+        query_matrix = attention_hardness * torch.eye(len(self), d_qk)
         query_matrix[self.d_pos - 2 :, :] = 0.0
 
-        # value_matrix shape (d_value_in, d_head)
-        value_matrix = torch.eye(len(value), d_head)
+        # value_matrix shape (d_value_in, d_v)
+        value_matrix = torch.eye(d_v)
 
-        # output_matrix shape (d_head, d_output)
-        output_matrix = torch.eye(d_head, len(value))
+        # output_matrix shape (d_v, d_output)
+        output_matrix = torch.eye(d_v)
 
         return Attn(
             query_in=self,

@@ -32,7 +32,18 @@ def test_attend_to_offset():
     pos_encoding = PosEncoding(16)
     last_input = pos_encoding.attend_to_offset(value_input, delta_pos=-1)
     output = last_input.compute(n_pos=5, input_values={"value": input_values})
-    assert torch.allclose(output[:, 1:], input_values[:, :-1])
+    assert torch.allclose(output[0], input_values[0])
+    assert torch.allclose(output[1:], input_values[:-1])
+
+
+def test_attend_to_offset_value_can_be_wider_than_position_encoding():
+    input_values = torch.arange(5 * 20, dtype=torch.float32).reshape(5, 20)
+    value_input = InputNode("value", 20, value_range=(-100.0, 100.0))
+    pos_encoding = PosEncoding(16)
+    last_input = pos_encoding.attend_to_offset(value_input, delta_pos=-1)
+    output = last_input.compute(n_pos=5, input_values={"value": input_values})
+    assert torch.allclose(output[0], input_values[0])
+    assert torch.allclose(output[1:], input_values[:-1])
 
 
 def test_delta_matrix():

@@ -145,6 +145,23 @@ def test_compile_attend_to_offset():
     )
 
 
+def test_compile_attend_to_offset_wide_value():
+    """attend_to_offset supports values wider than the position encoding."""
+    pos = create_pos_encoding()
+    v = create_input("v", 20)
+    out = pos.attend_to_offset(v, delta_pos=-1)
+
+    n_pos = 5
+    _verify(
+        out,
+        n_pos=n_pos,
+        input_values={
+            "v": torch.randn(n_pos, 20),
+        },
+        pos_encoding=pos,
+    )
+
+
 def test_compile_map_to_table():
     """map_to_table — table lookup via MLP (large d_hidden)."""
     x = create_input("x", 2)
