@@ -106,23 +106,44 @@ class AttnLayerComponent(Component):
 
         n_new = inp.shape[0]
         n_total = K.shape[1]
+        n_past = n_total - n_new
 
-        # is_causal=True  → pure prefill (no past): local indices == absolute
-        #                   positions; upper-triangular mask is correct.
-        # is_causal=False → decode (has past): all K entries are strictly in
-        #                   the past relative to Q; no future positions to mask.
+        # Three regimes:
+        #   pure prefill (no past, n_new == n_total): is_causal=True gives
+        #     the standard upper-triangular mask.
+        #   single-step decode (n_new == 1, n_past > 0): every K entry is in
+        #     the past or is the lone new row, so no mask is needed.
+        #   batched decode with past (n_new > 1 and n_past > 0): every new
+        #     row sees the full past unconditionally, but among new rows the
+        #     mask is lower-triangular (row i sees new rows 0..i). This is
+        #     the speculative-decoding shape — is_causal=True would mask out
+        #     past columns for early rows; is_causal=False would let row 0
+        #     attend to future new rows.
         # scale=1.0 preserves the raw dot-product magnitudes that all attention
         # weights were compiled against (no 1/sqrt(d_head) rescaling).
-        with sdpa_kernel(_SDPA_BACKEND):
-            weighted = F.scaled_dot_product_attention(
-                Q.unsqueeze(0),
-                K.unsqueeze(0),
-                V.unsqueeze(0),
-                is_causal=(n_new == n_total),
-                scale=1.0,
-            ).squeeze(
-                0
-            )  # (n_heads, n_new, d_head)
+        if n_new > 1 and n_past > 0:
+            past_visible = torch.ones(n_new, n_past, dtype=torch.bool, device=Q.device)
+            new_block = torch.ones(
+                n_new, n_new, dtype=torch.bool, device=Q.device
+            ).tril()
+            attn_mask = torch.cat([past_visible, new_block], dim=1)
+            with sdpa_kernel(_SDPA_BACKEND):
+                weighted = F.scaled_dot_product_attention(
+                    Q.unsqueeze(0),
+                    K.unsqueeze(0),
+                    V.unsqueeze(0),
+                    attn_mask=attn_mask,
+                    scale=1.0,
+                ).squeeze(0)
+        else:
+            with sdpa_kernel(_SDPA_BACKEND):
+                weighted = F.scaled_dot_product_attention(
+                    Q.unsqueeze(0),
+                    K.unsqueeze(0),
+                    V.unsqueeze(0),
+                    is_causal=(n_new == n_total),
+                    scale=1.0,
+                ).squeeze(0)  # (n_heads, n_new, d_head)
 
         output = torch.einsum("hpk,hkd->pd", weighted, self.output_matrix)
 

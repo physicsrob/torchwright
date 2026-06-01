@@ -1176,6 +1176,34 @@ class CompiledHeadless:
     ) -> tuple:
         """Cached forward step.
 
+        Supports three ``n_new`` regimes uniformly:
+
+        * Pure prefill (``past`` empty, ``n_new == seq_len``).
+        * Single-step decode (``n_new == 1`` with a non-empty ``past``).
+        * **Batched decode with past** (``n_new > 1`` with a non-empty
+          ``past``) — the speculative-decoding shape. Each new row sees
+          the entire past unconditionally, plus a lower-triangular slice
+          of the new block (row ``i`` sees new rows ``0..i``). Row ``i``
+          of the returned outputs is bit-identical to the same row from
+          a sequential rollout starting from the same past.
+
+        Speculative-decoding partial-commit pattern. After running with
+        ``n_new = K + 1`` (one current input + ``K`` drafts + bonus), a
+        caller may decide to commit only the first ``commit_count``
+        rows. Slice the returned ``new_past`` directly::
+
+            outputs, (new_K, new_V) = compiled.step(inputs_batch, past)
+            # ... compare outputs[:K] to the K drafts, decide commit_count ...
+            target_len = past[0][0].shape[1] + commit_count
+            committed = (
+                tuple(K[:, :target_len] for K in new_K),
+                tuple(V[:, :target_len] for V in new_V),
+            )
+
+        ``committed`` is the past for the next step. The discarded rows
+        (``commit_count..n_new``) carry no state outside ``new_past``,
+        so the slice is the only commit primitive needed.
+
         Args:
             inputs: ``(n_new, d_input)`` float tensor for the new rows.
             past: ``(past_K_tuple, past_V_tuple)`` from a prior step or
