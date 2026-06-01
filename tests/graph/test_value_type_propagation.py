@@ -39,9 +39,9 @@ def test_placeholder_is_unknown():
 
 
 def test_pos_encoding_bounded():
-    n = PosEncoding(d_pos=8)
+    n = PosEncoding(d_pos=9)
     vt = n.value_type
-    # Sinusoidal columns are [-1, 1]; the counter column (d_pos-2)
+    # Sinusoidal columns are [-1, 1]; the counter column (the last one)
     # has range [0, 100000].  The scalar range is the envelope.
     assert vt.value_range == Range(-1.0, 100000.0)
 
@@ -150,14 +150,14 @@ def test_value_logger_passes_through():
 def test_attn_propagates_value_range_from_value_input():
     from torchwright.graph.value_type import Range
 
-    pe = PosEncoding(d_pos=8)
+    pe = PosEncoding(d_pos=9)
     value = LiteralValue(torch.tensor([2.0, 3.0]))
     attn = Attn(
         query_in=pe,
         key_in=pe,
         value_in=value,
-        query_matrix=torch.eye(8, 2),
-        key_matrix=torch.eye(8, 2),
+        query_matrix=torch.eye(9, 2),
+        key_matrix=torch.eye(9, 2),
         value_matrix=torch.eye(2),
         output_matrix=torch.eye(2),
     )

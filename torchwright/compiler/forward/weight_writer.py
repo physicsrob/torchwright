@@ -238,10 +238,24 @@ def _write_compute_attn(attn, op: AttnHeadOp, rmap: ResidualStreamMap):
 
 
 def _current_pos_attn_matrices(pos_encoding, d_head):
-    """Build Q/K matrices for current-position attention."""
+    """Build Q/K matrices for current-position (diagonal) attention.
+
+    Matches on the trig block only.  The raw position counter is redundant
+    for self-matching — the sin/cos grid alone keeps the diagonal softmax
+    weight at 1.0 far past any realistic sequence length — and is excluded
+    so the logit magnitude stays bounded (the counter would contribute a
+    ``~position^2`` diagonal term).  When ``d_head <= counter_col`` the
+    ``eye`` truncation already drops the counter row; we also zero it
+    explicitly so the behavior does not depend on that, e.g. if ``d_head``
+    exceeds ``d_pos``.
+    """
     d_pos = len(pos_encoding)
     q_mat = attention_hardness * torch.eye(d_pos, d_head)
     k_mat = torch.eye(d_pos, d_head)
+    counter_col = pos_encoding.counter_col
+    if counter_col < d_head:
+        q_mat[counter_col, :] = 0.0
+        k_mat[counter_col, :] = 0.0
     return q_mat, k_mat
 
 

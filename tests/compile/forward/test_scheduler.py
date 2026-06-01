@@ -31,7 +31,7 @@ N_HEADS = D // D_HEAD  # 4
 
 
 def _make_pos_encoding():
-    return PosEncoding(d_pos=D_HEAD)
+    return PosEncoding(17)  # trig_width 16 == D_HEAD
 
 
 def _make_linear(inp, d_out, name=""):
@@ -476,14 +476,14 @@ def test_mlp_slot_exhaustion():
 def test_schedule_under_column_pressure():
     """Stream full with dead nodes: scheduler cancels to make room for new computes.
 
-    Setup: D=64, pos=16, filler=40, x=4, a=4 → 0 free.
+    Setup: D=64, pos=17, filler=39, x=4, a=4 → 0 free.
     x is dead (consumer a is computed). Relu chain needs 3 output cols.
     Scheduler must cancel x to free space, then schedule the chain.
     """
     pos = _make_pos_encoding()
     filler = InputNode(
-        "filler", D - D_HEAD - 8, value_range=(-100.0, 100.0)
-    )  # 40 cols, not in graph
+        "filler", D - len(pos) - 8, value_range=(-100.0, 100.0)
+    )  # fills the stream to 0 free alongside pos + x + a
     x = InputNode("x", 4, value_range=(-100.0, 100.0))
     a = _make_linear(x, 4, "a")
     l2, r, l1 = _make_relu_chain(a, 8, 3, "out")
@@ -882,9 +882,9 @@ def test_no_progress_raises_error():
 
     graph = GraphAnalyzer(out)
     # Tiny d: just enough for pos + a + b, nothing spare
-    small_d = D_HEAD + 4 + 4  # 24
+    small_d = len(pos) + 4 + 4  # 17 + 4 + 4
     rmap = ResidualStreamMap(small_d)
-    rmap.allocate(pos)  # 16 cols
+    rmap.allocate(pos)  # len(pos) cols
     rmap.allocate(a)  # 4 cols
     rmap.allocate(b)  # 4 cols
     assert rmap.get_free_count() == 0

@@ -489,7 +489,20 @@ def forward_compile(
 
     # Auto-create pos_encoding if needed (required for attention ops)
     if pos_encoding is None:
-        pos_encoding = PosEncoding(d_pos=d_head)
+        pos_encoding = PosEncoding(17)
+
+    # Same-position copy heads match over the full trig grid, so d_head must
+    # admit every trig column.  Reject early with an actionable message
+    # rather than failing deep in the weight writer.
+    if d_head < pos_encoding.trig_width:
+        # Largest odd d_pos with trig_width (= d_pos - 1) <= d_head.
+        suggested_d_pos = d_head + 1 if d_head % 2 == 0 else d_head
+        raise ValueError(
+            f"d_head ({d_head}) must be >= pos_encoding.trig_width "
+            f"({pos_encoding.trig_width}). Either raise d_head, or pass a "
+            f"smaller positional encoding (an odd d_pos with "
+            f"d_pos - 1 <= d_head, e.g. PosEncoding({suggested_d_pos}))."
+        )
 
     if d_hidden is None:
         d_hidden = d

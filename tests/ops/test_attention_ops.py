@@ -43,7 +43,7 @@ from torchwright.ops.attention_ops import (
 
 
 def _pe() -> PosEncoding:
-    return PosEncoding(d_pos=16)
+    return PosEncoding(17)
 
 
 def _run(out_node, n_pos, **inputs):

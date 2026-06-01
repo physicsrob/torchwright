@@ -86,7 +86,10 @@ def create_pos_encoding() -> PosEncoding:
     """
     Create a position encoding.
 
+    16 trig columns plus one raw position counter (``d_pos = 17``).  The
+    16-wide trig grid matches a default ``d_head = 16`` exactly.
+
     Returns:
     - Node: PosEncoding node.
     """
-    return PosEncoding(d_pos=16)
+    return PosEncoding(d_pos=17)

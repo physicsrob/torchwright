@@ -602,7 +602,8 @@ def test_compile_split_vo(d_qk, d_v):
 
 def test_compile_split_vo_large_ratio():
     """d_v=64, d_head=8 — 8 V/O heads with tiny d_qk=2."""
-    pos = create_pos_encoding()
+    # d_head=8 requires trig_width <= 8, i.e. PosEncoding(9).
+    pos = PosEncoding(9)
     x = create_input("x", 8)
     out = _build_attn(x, x, x, d_qk=2, d_v=64, d_out=8)
 
@@ -620,6 +621,23 @@ def test_compile_split_vo_large_ratio():
     assert torch.allclose(
         actual.cpu(), expected, atol=1e-4
     ), f"Max diff: {(actual.cpu() - expected).abs().max().item():.6f}"
+
+
+def test_compile_rejects_d_head_below_trig_width():
+    """forward_compile rejects d_head < pos_encoding.trig_width early, before
+    the copy heads would silently match on only part of the trig grid."""
+    pos = PosEncoding(17)  # trig_width = 16
+    x = create_input("x", 4)
+    out = pos.attend_to_offset(x, delta_pos=-1)
+    with pytest.raises(ValueError, match="trig_width"):
+        forward_compile(
+            d=256,
+            d_head=8,
+            output_node=out,
+            pos_encoding=pos,
+            verbose=False,
+            max_layers=10,
+        )
 
 
 def test_compile_dqk_equals_dv_unchanged():

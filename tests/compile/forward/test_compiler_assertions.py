@@ -125,7 +125,7 @@ def test_C_literal_write_rejects_extra_target_cols():
 def test_B_attn_rejects_v_source_cols_wrong_length():
     """_write_compute_attn raises when V source_cols length doesn't match
     value_in width."""
-    pos = PosEncoding(d_pos=D_HEAD)
+    pos = PosEncoding(17)
     v_in = InputNode("v", 4, value_range=(-100.0, 100.0))
     node = Attn(
         query_in=pos,
@@ -155,7 +155,7 @@ def test_B_attn_rejects_v_source_cols_wrong_length():
 
 
 def test_B_attn_rejects_q_source_cols_wrong_length():
-    pos = PosEncoding(d_pos=D_HEAD)
+    pos = PosEncoding(17)
     v_in = InputNode("v", 4, value_range=(-100.0, 100.0))
     node = Attn(
         query_in=pos,
@@ -198,7 +198,7 @@ def test_A_end_of_layer_catches_freed_too_early(monkeypatch):
     weight = torch.eye(4, 4)
     bias = torch.zeros(4)
     l = Linear(x, weight, bias)
-    pos = PosEncoding(d_pos=D_HEAD)
+    pos = PosEncoding(17)
 
     graph = GraphAnalyzer(l)
     rmap = ResidualStreamMap(D)
@@ -225,7 +225,7 @@ def test_A_require_live_raises_for_unallocated_input():
     op context before the downstream KeyError."""
     from torchwright.compiler.forward.scheduler import LayerScheduler
 
-    pos = PosEncoding(d_pos=D_HEAD)
+    pos = PosEncoding(17)
     x = InputNode("x", 4, value_range=(-100.0, 100.0))
     weight = torch.eye(4, 4)
     bias = torch.zeros(4)
@@ -275,7 +275,7 @@ def test_scheduler_pins_never_marks_pinned_dead():
     even when its effective consumers have all been computed."""
     from torchwright.compiler.forward.scheduler import LayerScheduler
 
-    pos = PosEncoding(d_pos=D_HEAD)
+    pos = PosEncoding(17)
     x = InputNode("x", 4, value_range=(-100.0, 100.0))
     weight = torch.eye(4, 4)
     bias = torch.zeros(4)
@@ -306,7 +306,7 @@ def test_delta_transfer_guard_catches_reallocation():
         _verify_overlay_target_protection,
     )
 
-    pos = PosEncoding(d_pos=D_HEAD)
+    pos = PosEncoding(17)
     x = InputNode("x", 4, value_range=(-1.0, 1.0))
     bait = InputNode("bait", 1, value_range=(-1.0, 1.0))
     weight = torch.eye(4, 4)
@@ -314,14 +314,17 @@ def test_delta_transfer_guard_catches_reallocation():
     y = Linear(x, weight, bias)
 
     rmap = ResidualStreamMap(D)
-    rmap.allocate(pos)  # [0..15]
-    rmap.allocate(x)  # [16..19]
-    rmap.allocate(bait)  # [20]
+    rmap.allocate(pos)
+    rmap.allocate(x)
+    rmap.allocate(bait)
+    bait_col = rmap.get_indices(bait)[0]
 
-    # Poison: overlay's target col 20 is owned by `bait`, which is neither
+    # Poison: overlay's target col is owned by `bait`, which is neither
     # pos_encoding nor a pinned input.  The guard must fire.
-    overlays = {y: (x, [20])}
-    with pytest.raises(AssertionError, match=r"Overlay target column 20 is owned by"):
+    overlays = {y: (x, [bait_col])}
+    with pytest.raises(
+        AssertionError, match=rf"Overlay target column {bait_col} is owned by"
+    ):
         _verify_overlay_target_protection(
             overlays, rmap, pos_encoding=pos, overlay_pinned_inputs=set()
         )

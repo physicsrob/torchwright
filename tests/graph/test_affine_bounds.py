@@ -724,16 +724,16 @@ class TestPosEncodingRule:
         """PosEncoding produces an identity A-matrix with [-1, 1] per column."""
         from torchwright.graph import PosEncoding
 
-        pe = PosEncoding(d_pos=8)
+        pe = PosEncoding(d_pos=9)
         ab = pe.affine_bound
         assert ab.n_cols > 0, "PosEncoding must have non-degenerate bound"
-        assert ab.d_output == 8
+        assert ab.d_output == 9
         assert pe.node_id in ab.columns
         assert pe.node_id in ab.input_ranges
-        assert torch.equal(ab.A_lo, torch.eye(8, dtype=torch.float64))
+        assert torch.equal(ab.A_lo, torch.eye(9, dtype=torch.float64))
         intervals = ab.to_interval()
         for i, iv in enumerate(intervals):
-            if i == 6:  # d_pos - 2: raw position counter
+            if i == pe.counter_col:  # last column: raw position counter
                 assert iv.lo == pytest.approx(0.0)
                 assert iv.hi == pytest.approx(100000.0)
             else:
@@ -746,14 +746,14 @@ class TestAttnRule:
         with fresh_graph_session():
             from torchwright.graph import PosEncoding, Attn
 
-            pe = PosEncoding(d_pos=8)
+            pe = PosEncoding(d_pos=9)
             value = LiteralValue(torch.tensor([2.0, 3.0]))
             attn = Attn(
                 query_in=pe,
                 key_in=pe,
                 value_in=value,
-                query_matrix=torch.eye(8, 2),
-                key_matrix=torch.eye(8, 2),
+                query_matrix=torch.eye(9, 2),
+                key_matrix=torch.eye(9, 2),
                 value_matrix=torch.eye(2),
                 output_matrix=torch.eye(2),
             )

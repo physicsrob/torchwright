@@ -28,7 +28,7 @@ SEQ_LENS = [32, 640, 2048]
 
 def test_position_scalar_exhaustive():
     """Every position 0-2047 must be accurate to within 0.5."""
-    pos_encoding = PosEncoding(16)
+    pos_encoding = PosEncoding(17)
     scalar_node = pos_encoding.get_position_scalar()
     out = scalar_node.compute(n_pos=2048, input_values={}).squeeze(-1)
     expected = torch.arange(2048, dtype=out.dtype)

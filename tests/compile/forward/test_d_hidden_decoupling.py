@@ -11,14 +11,16 @@ import torch
 from torchwright.compiler.export import compile_headless
 from torchwright.compiler.forward.compile import forward_compile
 from torchwright.compiler.groups.mlp_sublayer import MLPSubLayer
-from torchwright.ops.inout_nodes import create_input, create_pos_encoding
+from torchwright.graph import PosEncoding
+from torchwright.ops.inout_nodes import create_input
 from torchwright.ops.linear_relu_linear import linear_relu_linear
 
 
 def _build_relu_chain_graph(d_input: int, d_hidden_chain: int, d_output: int):
     """Build a tiny graph: input -> Linear -> ReLU -> Linear with random weights."""
     inp = create_input("x", d_input)
-    pos = create_pos_encoding()
+    # These tests compile at d_head=8, so the encoding's trig_width must be 8.
+    pos = PosEncoding(9)
     torch.manual_seed(0)
     input_proj = torch.randn(d_hidden_chain, d_input)
     input_bias = torch.randn(d_hidden_chain)

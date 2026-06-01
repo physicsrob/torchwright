@@ -69,7 +69,7 @@ def test_chain_detector_no_overlap_after_fusion():
         f"{L_b.inputs[0]!r}"
     )
 
-    pos = PosEncoding(8)
+    pos = PosEncoding(9)
     gm = build_graph_model(L_c, pos)
 
     # The structural assertion in build_graph_model would have raised
@@ -98,7 +98,7 @@ def test_chain_detector_picks_upstream_chain():
     x, L_pre, R, L_a, L_b, R_prime, L_c = _build_post_fusion_repro()
     fuse_consecutive_linears({L_c})
 
-    pos = PosEncoding(8)
+    pos = PosEncoding(9)
     gm = build_graph_model(L_c, pos)
 
     # Exactly one chain — the upstream one.  The downstream chain
@@ -119,7 +119,7 @@ def test_cpsat_solves_post_fusion_repro():
     x, L_pre, R, L_a, L_b, R_prime, L_c = _build_post_fusion_repro()
     fuse_consecutive_linears({L_c})
 
-    pos = PosEncoding(8)
+    pos = PosEncoding(9)
     assignment, stats = solve_schedule(
         L_c, pos,
         d=64, d_head=8, d_hidden=128,
@@ -148,7 +148,7 @@ def test_heuristic_chain_detector_no_overlap_after_fusion():
     x, L_pre, R, L_a, L_b, R_prime, L_c = _build_post_fusion_repro()
     fuse_consecutive_linears({L_c})
 
-    pos = PosEncoding(8)
+    pos = PosEncoding(9)
     graph = GraphAnalyzer(L_c)
     scheduler = LayerScheduler(graph, d=64, d_head=8, pos_encoding=pos)
     # Build a ready set that includes both L_pre and L_b — the case

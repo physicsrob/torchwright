@@ -9,12 +9,14 @@ running mask".
 
 All primitives here follow this template:
 
-- ``query_in`` is the positional encoding (and, for the ``_above_integer``
-  / ``_unmasked`` / ``_dot`` variants, also the per-query signal that
-  rendezvous with a key-side vector). ``query_matrix`` populates row
-  ``d_pos - 1`` — the slowest *cosine* component ``pos_enc[j, d_pos-1]``,
-  which is ≈ 1 for any realistic ``j`` — with ``_QUERY_GAIN`` so that
-  column 0 of the logit gets a stable positive per-query gain.
+- ``query_in`` is an exact constant ``LiteralValue([1.0])`` (and, for the
+  ``_above_integer`` / ``_unmasked`` / ``_dot`` variants, also the
+  per-query signal that rendezvous with a key-side vector).
+  ``query_matrix`` scales that ``1.0`` by ``_QUERY_GAIN`` into column 0 of
+  the logit, giving a stable positive per-query gain.  (The position-aware
+  primitives — ``attend_most_recent_matching`` and
+  ``PosEncoding.attend_to_offset`` — also take ``pos_encoding`` for its
+  counter / trig columns.)
 - ``key_in`` contains **only** what ``key_matrix`` reads from: the
   content nodes that drive selection (score, validity, indicators,
   onehot, etc.).  Never concat a node into ``key_in`` without wiring up
@@ -24,13 +26,12 @@ All primitives here follow this template:
   position; ``value_matrix`` and ``output_matrix`` are identity projections
   that copy it through unchanged.
 
-Query gain.  ``_QUERY_GAIN = 8`` is extracted from the slowest cosine
-of the positional encoding (``cos(j · d[-1]) ≈ 1`` for any realistic
-``j``), giving a per-unit-score logit delta of 8 → ``exp(8) ≈ 2981``
-softmax weight ratio — ``≥ 99.9 %`` concentration for any integer
-score gap.  All current callers operate on integer-valued scores (BSP
-rank, digit, slot index) with gap ≥ 1, so the integer-score invariant
-is what secures hard selection, not a large gain.
+Query gain.  ``_QUERY_GAIN = 8`` scales the exact ``1.0`` query constant,
+giving a per-unit-score logit delta of 8 → ``exp(8) ≈ 2981`` softmax
+weight ratio — ``≥ 99.9 %`` concentration for any integer score gap.  All
+current callers operate on integer-valued scores (BSP rank, digit, slot
+index) with gap ≥ 1, so the integer-score invariant is what secures hard
+selection, not a large gain.
 
 Validity is additive, not gained.  The ``_where`` variants route
 validity through a dedicated ``d_qk`` column (``Q = 1.0``,
@@ -105,16 +106,14 @@ def _wrap_hard_selection_output(
     return assert_matches_value_type(result, vt, atol=atol)
 
 
-# Coefficient applied to the slowest-cosine component of the positional
-# encoding inside the query projection. The slowest cosine
-# ``cos(j · d[-1]) ≈ 1`` for any realistic ``j``, so ``Q[j, 0] ≈
-# _QUERY_GAIN`` independent of query position. A unit score delta then
-# produces a logit delta of 8 → ``exp(8) ≈ 2981`` softmax weight ratio,
-# i.e. ``≥ 99.9 %`` concentration. All current callers produce
-# integer-valued scores with gap ≥ 1, so this is sufficient; larger
-# gains (e.g. 80) are historical — they bought unused margin at the
-# cost of pushing K·Q magnitudes above the range where bf16 precision
-# resolves softmax-significant gaps.
+# Coefficient applied to the exact ``1.0`` query constant inside the query
+# projection, so ``Q[·, 0] = _QUERY_GAIN`` independent of query position. A
+# unit score delta then produces a logit delta of 8 → ``exp(8) ≈ 2981``
+# softmax weight ratio, i.e. ``≥ 99.9 %`` concentration. All current callers
+# produce integer-valued scores with gap ≥ 1, so this is sufficient; larger
+# gains (e.g. 80) are historical — they bought unused margin at the cost of
+# pushing K·Q magnitudes above the range where bf16 precision resolves
+# softmax-significant gaps.
 _QUERY_GAIN = 8.0
 
 # Direct (not gained) logit bonus for valid positions in the simple
@@ -165,8 +164,8 @@ _MAX_SCORE_UNMASKED_ABS = 100.0
 
 # Bonus applied to "above threshold" positions in
 # ``attend_argmin_above_integer``. Added directly to the logit (not
-# scaled by _QUERY_GAIN, because the bonus goes straight into the
-# query_matrix entries rather than through the slow-cosine multiplier).
+# scaled by _QUERY_GAIN, because the bonus rendezvous goes straight into
+# its own query_matrix columns rather than through the _QUERY_GAIN column).
 # Must exceed ``_QUERY_GAIN · (max_score - min_score)`` so a valid
 # position with the worst score still beats any invalid position with
 # the best score.
@@ -174,24 +173,10 @@ _MAX_SCORE_UNMASKED_ABS = 100.0
 # For ``score ∈ [0, 9]`` (the sort_digits toy) a bonus of 100 buys
 # ~40% margin.  For production use with piecewise-linear softmax under
 # residual-stream noise, 1000 matches _VALIDITY_DIRECT's headroom —
-# both route directly through the logit (not through the slow-cosine
-# gain) and both need to dominate noise from competing attention
+# both route directly through the logit (not through the gained score
+# column) and both need to dominate noise from competing attention
 # values in the compiled residual.
 _ABOVE_BONUS = 1000.0
-
-
-def _assert_value_fits(pos_encoding: PosEncoding, value: Node) -> int:
-    """Shared precondition: value must fit inside the attention head width.
-
-    Returns the chosen ``d_head`` (= ``pos_encoding.d_pos``).
-    """
-    d_head = pos_encoding.d_pos
-    assert len(value) <= d_head, (
-        f"attend_*: value width ({len(value)}) must be <= d_pos ({d_head}). "
-        "If you need a wider value, project it down first or split it "
-        "across multiple attention primitives."
-    )
-    return d_head
 
 
 def _build_selection_attn(
@@ -202,32 +187,31 @@ def _build_selection_attn(
 ) -> Attn:
     """Wire up a selection-style attention head.
 
-    Callers supply ``key_in`` (the content node(s) driving selection) and
-    a populated ``key_matrix``; this helper fills in the query / value /
-    output matrices shared across all primitives below.
+    Callers supply ``key_in`` (the content node(s) driving selection) and a
+    populated ``key_matrix`` of width ``d_qk``; this helper fills in the
+    query / value / output matrices.  The score logit lives in column 0:
+    ``Q`` projects an exact constant ``1.0`` (a ``LiteralValue``) scaled by
+    ``_QUERY_GAIN``, so ``Q[·, 0]`` is a stable positive gain independent of
+    query position.  A unit score delta is then decisive
+    (``exp(8) ≈ 3000``).  Value passes through identity V/O and is split
+    across physical heads by the compiler when wider than ``d_head``.
+
+    ``pos_encoding`` is accepted for API symmetry but no longer read — the
+    query constant is a ``LiteralValue``, so the head's ``d_qk`` does not
+    scale with ``d_pos``.
     """
-    d_head = _assert_value_fits(pos_encoding, value)
+    d_qk = key_matrix.shape[1]
+    d_v = len(value)
 
-    # query_in = pos_encoding. We need ``Q[j, 0]`` to be a stable positive
-    # constant (independent of query position ``j``) so the softmax
-    # decisiveness doesn't vary with where we are in the sequence. The
-    # slowest cosine component ``pos_enc[j, d_pos - 1]`` is
-    # ``cos(j · d[-1])`` which equals ``~1`` for ``j`` up to a few
-    # thousand — nearly constant over any realistic sort length. Scaling
-    # it by ``_QUERY_GAIN = 8`` makes a unit score delta decisive
-    # (``exp(8) ≈ 3000``) while keeping ``|Q·K|`` in the low hundreds.
-    # Other columns of Q don't matter for this helper because ``K`` has
-    # only column 0 populated; we zero them out for clarity.
-    query_matrix = torch.zeros((len(pos_encoding), d_head))
-    query_matrix[-1, 0] = _QUERY_GAIN
+    query_one = LiteralValue(torch.tensor([1.0]), name="selection_query_one")
+    query_matrix = torch.zeros((1, d_qk))
+    query_matrix[0, 0] = _QUERY_GAIN
 
-    # Identity pass-through for value. value_matrix embeds value into the
-    # first len(value) columns of d_head; output_matrix reads them back.
-    value_matrix = torch.eye(len(value), d_head)
-    output_matrix = torch.eye(d_head, len(value))
+    value_matrix = torch.eye(d_v)
+    output_matrix = torch.eye(d_v)
 
     return Attn(
-        query_in=pos_encoding,
+        query_in=query_one,
         key_in=key_in,
         value_in=value,
         query_matrix=query_matrix,
@@ -253,30 +237,31 @@ def _build_where_attn(
         not multiplied by the gain.
 
     ``score_sign`` is ``-1`` for argmin (small score → large logit) and
-    ``+1`` for argmax.
+    ``+1`` for argmax.  ``pos_encoding`` is accepted for API symmetry but
+    not read; the query constant is an exact ``LiteralValue([1.0])``.
     """
-    d_head = _assert_value_fits(pos_encoding, value)
-    d_pos = pos_encoding.d_pos
+    d_v = len(value)
 
     # key_in row layout: [score (1), validity (1)]
     key_in = Concatenate([score, validity])
 
-    # --- Query: col 0 gained (slow-cos · _QUERY_GAIN), col 1 stable 1.0. ---
-    query_matrix = torch.zeros((len(pos_encoding), d_head))
-    query_matrix[d_pos - 1, 0] = _QUERY_GAIN
-    query_matrix[d_pos - 1, 1] = 1.0
+    # --- Query: an exact 1.0 projected to col 0 (gained) and col 1 (direct). ---
+    query_one = LiteralValue(torch.tensor([1.0]), name="where_query_one")
+    query_matrix = torch.zeros((1, 2))
+    query_matrix[0, 0] = _QUERY_GAIN
+    query_matrix[0, 1] = 1.0
 
     # --- Key: col 0 score, col 1 direct validity. ---
-    key_matrix = torch.zeros((len(key_in), d_head))
+    key_matrix = torch.zeros((len(key_in), 2))
     key_matrix[0, 0] = score_sign
     key_matrix[1, 1] = _VALIDITY_DIRECT
 
-    # --- Value / output pass-through (identity on first len(value) cols). ---
-    value_matrix = torch.eye(len(value), d_head)
-    output_matrix = torch.eye(d_head, len(value))
+    # --- Value / output pass-through (auto-split when wide). ---
+    value_matrix = torch.eye(d_v)
+    output_matrix = torch.eye(d_v)
 
     return Attn(
-        query_in=pos_encoding,
+        query_in=query_one,
         key_in=key_in,
         value_in=value,
         query_matrix=query_matrix,
@@ -320,9 +305,8 @@ def attend_argmin(
         :func:`attend_argmax`, :func:`attend_argmin_where`.
     """
     assert len(score) == 1, "attend_argmin expects a 1D scalar score node"
-    d_head = _assert_value_fits(pos_encoding, value)
 
-    key_matrix = torch.zeros((len(score), d_head))
+    key_matrix = torch.zeros((len(score), 1))
     key_matrix[0, 0] = -1.0  # smaller score → larger logit
 
     attn = _build_selection_attn(pos_encoding, score, key_matrix, value)
@@ -351,9 +335,8 @@ def attend_argmax(
         argmax-of-``score`` key position within the causal window.
     """
     assert len(score) == 1, "attend_argmax expects a 1D scalar score node"
-    d_head = _assert_value_fits(pos_encoding, value)
 
-    key_matrix = torch.zeros((len(score), d_head))
+    key_matrix = torch.zeros((len(score), 1))
     key_matrix[0, 0] = 1.0  # larger score → larger logit
 
     attn = _build_selection_attn(pos_encoding, score, key_matrix, value)
@@ -535,25 +518,27 @@ def attend_argmin_above_integer(
     )
     n_thresholds = len(indicators_above)
     d_value = len(value)
-    d_pos = pos_encoding.d_pos
     # d_head layout:
     #   col 0:                             score logit
     #   cols 1..n_thresholds:              threshold_onehot · indicators_above terms
     #   cols n_thresholds+1 .. +d_value:   value pass-through
     d_head = 1 + n_thresholds + d_value
 
-    query_in = Concatenate([pos_encoding, threshold_onehot])
+    # Query: an exact 1.0 for the score gain (col 0) plus the threshold
+    # one-hot for the bilinear above-test.  No position info needed.
+    query_one = LiteralValue(torch.tensor([1.0]), name="above_query_one")
+    query_in = Concatenate([query_one, threshold_onehot])
     key_in = Concatenate([score, indicators_above])
 
-    # --- Query matrix, shape (d_pos + n_thresholds, d_head) ---
+    # --- Query matrix, shape (1 + n_thresholds, d_head) ---
     query_matrix = torch.zeros((len(query_in), d_head))
-    # Col 0: stable positive gain for the scoring logit.
-    query_matrix[d_pos - 1, 0] = _QUERY_GAIN
+    # Col 0: stable positive gain for the scoring logit (from the 1.0 literal).
+    query_matrix[0, 0] = _QUERY_GAIN
     # Cols 1..n_thresholds: _ABOVE_BONUS · threshold_onehot[c] routed
     # to the matching column for the bilinear rendezvous with
     # indicators_above on the key side.
     for c in range(n_thresholds):
-        query_matrix[d_pos + c, 1 + c] = _ABOVE_BONUS
+        query_matrix[1 + c, 1 + c] = _ABOVE_BONUS
 
     # --- Key matrix, shape (1 + n_thresholds, d_head) ---
     key_matrix = torch.zeros((len(key_in), d_head))
@@ -671,23 +656,24 @@ def attend_argmin_unmasked(
     )
     n_slots = len(mask_vector)
     d_value = len(value)
-    d_pos = pos_encoding.d_pos
     # Layout of d_head:
     #   col 0:                         score logit
     #   cols 1 .. n_slots:             mask · position_onehot dot-product terms
     #   cols n_slots+1 .. n_slots+d_value:  value pass-through
     d_head = 1 + n_slots + d_value
 
-    query_in = Concatenate([pos_encoding, mask_vector])
+    # Query: an exact 1.0 for the score gain (col 0) plus the per-query mask.
+    query_one = LiteralValue(torch.tensor([1.0]), name="unmasked_query_one")
+    query_in = Concatenate([query_one, mask_vector])
     key_in = Concatenate([score, position_onehot])
 
-    # --- Query matrix, shape (d_pos + n_slots, d_head) ---
+    # --- Query matrix, shape (1 + n_slots, d_head) ---
     query_matrix = torch.zeros((len(query_in), d_head))
-    # Col 0: stable positive gain from the slowest-cos component of pos_enc.
-    query_matrix[d_pos - 1, 0] = _QUERY_GAIN
+    # Col 0: stable positive gain from the exact 1.0 literal.
+    query_matrix[0, 0] = _QUERY_GAIN
     # Cols 1 .. n_slots: -_UNMASKED_PENALTY · mask_vector[c].
     for c in range(n_slots):
-        query_matrix[d_pos + c, 1 + c] = -_UNMASKED_PENALTY
+        query_matrix[1 + c, 1 + c] = -_UNMASKED_PENALTY
 
     # --- Key matrix, shape (1 + n_slots, d_head) ---
     key_matrix = torch.zeros((len(key_in), d_head))
@@ -791,21 +777,22 @@ def attend_argmin_valid_unmasked(
     )
     n_slots = len(mask_vector)
     d_value = len(value)
-    d_pos = pos_encoding.d_pos
     # Layout of d_head:
     #   col 0:                              score + gained validity
     #   cols 1 .. n_slots:                  mask · position_onehot terms
     #   cols n_slots+1 .. n_slots+d_value:  value pass-through
     d_head = 1 + n_slots + d_value
 
-    query_in = Concatenate([pos_encoding, mask_vector])
+    # Query: an exact 1.0 for the score/validity gain (col 0) plus the mask.
+    query_one = LiteralValue(torch.tensor([1.0]), name="valid_unmasked_query_one")
+    query_in = Concatenate([query_one, mask_vector])
     key_in = Concatenate([score, validity, position_onehot])
 
-    # --- Query matrix, shape (d_pos + n_slots, d_head) ---
+    # --- Query matrix, shape (1 + n_slots, d_head) ---
     query_matrix = torch.zeros((len(query_in), d_head))
-    query_matrix[d_pos - 1, 0] = _QUERY_GAIN
+    query_matrix[0, 0] = _QUERY_GAIN
     for c in range(n_slots):
-        query_matrix[d_pos + c, 1 + c] = -_UNMASKED_PENALTY
+        query_matrix[1 + c, 1 + c] = -_UNMASKED_PENALTY
 
     # --- Key matrix, shape (2 + n_slots, d_head) ---
     # Row order in key_in: [score (1), validity (1), onehot (n_slots)]
@@ -887,15 +874,16 @@ def attend_mean_where(
     assert len(validity) == 1, "attend_mean_where expects a 1D boolean validity"
 
     # d_qk = 1: the only column carries the direct validity bonus.
-    # Q reads from the slowest cosine of pos_encoding (stable ≈ 1) —
-    # unscaled, since validity here is a direct logit contribution, not
-    # combined with any gained score.  K reads only validity.  All
-    # valid positions get the same logit → uniform softmax → exact mean.
+    # Q is an exact 1.0 (a LiteralValue) — unscaled, since validity here is a
+    # direct logit contribution, not combined with any gained score.  K reads
+    # only validity.  All valid positions get the same logit → uniform
+    # softmax → exact mean.
     d_qk = 1
     d_v = len(value)
 
-    query_matrix = torch.zeros((len(pos_encoding), d_qk))
-    query_matrix[-1, 0] = 1.0
+    query_one = LiteralValue(torch.tensor([1.0]), name="mean_where_query_one")
+    query_matrix = torch.zeros((1, d_qk))
+    query_matrix[0, 0] = 1.0
 
     # pos_encoding doesn't appear in key_in — only validity drives K.
     key_matrix = torch.zeros((len(validity), d_qk))
@@ -905,7 +893,7 @@ def attend_mean_where(
     output_matrix = torch.eye(d_v)
 
     attn = Attn(
-        query_in=pos_encoding,
+        query_in=query_one,
         key_in=validity,
         value_in=value,
         query_matrix=query_matrix,
@@ -1202,8 +1190,8 @@ def attend_most_recent_matching(
     ``match_gain · (query_vector_j · key_vector_i)`` is largest, with
     ties broken by position: among positions sharing the maximum dot
     product, the one with the highest ``position_idx`` wins.  (The
-    position_idx is the raw integer counter stored in PE column
-    ``d_pos - 2``.)
+    position_idx is the raw integer counter stored in the PE
+    ``counter_col`` — the last column.)
 
     Combining content match with a recency tiebreak gives the building
     block thinking tokens use to find data in the KV cache — "most
@@ -1273,9 +1261,9 @@ def attend_most_recent_matching(
 
     Args:
         pos_encoding: The graph's positional encoding node.  Used for
-            the stable Q-side ≈1 signal (slow cosine at column
-            ``d_pos-1``) and the K-side position counter (raw integer
-            at column ``d_pos-2``).
+            the K-side position counter (raw integer at ``counter_col``,
+            the last column).  The stable Q-side ≈1 signal is an exact
+            ``LiteralValue([1.0])``, not the encoding.
         query_vector: Width-``W`` node — what we're looking for at
             each query position.
         key_vector: Width-``W`` node — the key-side identity at each
@@ -1343,38 +1331,38 @@ def attend_most_recent_matching(
     #   cols 0..W-1   content match:   Q = match_gain · query_vector[c],
     #                                  K = key_vector[c].
     #                                  Σ = match_gain · (query · key).
-    #   col  W        recency tiebreak: Q = _QUERY_GAIN (from slow-cos ≈1),
+    #   col  W        recency tiebreak: Q = _QUERY_GAIN (from a 1.0 literal),
     #                                  K = position_idx (from PE counter).
     #                                  Σ = _QUERY_GAIN · position_idx.
     # Value passes through V/O matrices independently of d_qk layout.
     d_qk = W + 1
 
-    # Both Q and K include the positional encoding alongside their
-    # content vectors so we can project the counter in on the K side
-    # and the stable slow-cos on the Q side from a single Attn call.
-    query_in = Concatenate([query_vector, pos_encoding])
+    # The recency tiebreak needs a stable ≈1 on the Q side and the raw
+    # position counter on the K side.  The Q-side constant is an exact 1.0
+    # (a LiteralValue); only the K side needs the positional encoding (for
+    # its counter column).
+    query_one = LiteralValue(torch.tensor([1.0]), name="recency_query_one")
+    query_in = Concatenate([query_vector, query_one])
     key_in = Concatenate([key_vector, pos_encoding])
 
-    # --- Query matrix, shape (W + d_pos, d_qk) ---
-    query_matrix = torch.zeros((W + d_pos, d_qk))
+    # --- Query matrix, shape (W + 1, d_qk) ---
+    query_matrix = torch.zeros((W + 1, d_qk))
     # Cols 0..W-1: match_gain · query_vector[c].
     for c in range(W):
         query_matrix[c, c] = match_gain
-    # Col W: stable ≈1 from slow-cos at PE row d_pos-1, scaled by
-    # _QUERY_GAIN so unit position gaps produce _QUERY_GAIN-sized
-    # logit gaps — the codebase convention for integer-score signals.
-    # This row lives inside the pos_encoding block, which starts at
-    # row W in query_in.
-    query_matrix[W + (d_pos - 1), W] = _QUERY_GAIN
+    # Col W: the exact 1.0 literal (row W), scaled by _QUERY_GAIN so unit
+    # position gaps produce _QUERY_GAIN-sized logit gaps — the codebase
+    # convention for integer-score signals.
+    query_matrix[W, W] = _QUERY_GAIN
 
     # --- Key matrix, shape (W + d_pos, d_qk) ---
     key_matrix = torch.zeros((W + d_pos, d_qk))
     # Cols 0..W-1: identity on key_vector[c].
     for c in range(W):
         key_matrix[c, c] = 1.0
-    # Col W: raw position counter from PE row d_pos-2 (unit coefficient
-    # on the K side; the gain lives on the Q side).
-    key_matrix[W + (d_pos - 2), W] = 1.0
+    # Col W: raw position counter from the PE counter column (unit
+    # coefficient on the K side; the gain lives on the Q side).
+    key_matrix[W + pos_encoding.counter_col, W] = 1.0
 
     # --- Value / Output: identity pass-through on value. ---
     value_matrix = torch.eye(d_v)

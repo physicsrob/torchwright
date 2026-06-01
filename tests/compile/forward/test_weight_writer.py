@@ -36,7 +36,7 @@ N_POS = 4
 
 
 def _make_pos_encoding():
-    return PosEncoding(d_pos=D_HEAD)
+    return PosEncoding(17)  # trig_width 16 == D_HEAD
 
 
 def _build_residual_stream(
@@ -264,11 +264,13 @@ def test_attn_compute_multiposition():
     cond_in = InputNode("c", 1, value_range=(-100.0, 100.0))
 
     attn_node = pos.get_prev_value(value_in, cond_in)
+    query_one = attn_node.inputs[0]  # LiteralValue([1.0]) query constant
 
     rmap = ResidualStreamMap(D)
     rmap.allocate(pos)
     rmap.allocate(value_in)
     rmap.allocate(cond_in)
+    rmap.allocate(query_one)
     out_cols = rmap.allocate(attn_node)
 
     layer = TransformerLayer(D, D_HEAD, pos)
@@ -287,15 +289,15 @@ def test_attn_compute_multiposition():
     c_values = torch.tensor([[1.0], [0.0], [0.0], [1.0]])
     pe_values = pos.compute(N_POS, {})
 
-    # get_prev_value needs Concatenate([pos, cond]) as key_in
-    # We need to also place the concatenated node's children
-    concat_node = attn_node.inputs[1]  # key_in is Concatenate([pos, cond])
+    # get_prev_value's key_in is Concatenate([cond, pos]); the query is an
+    # exact 1.0 literal.  Place every leaf/constant the head reads.
     res = _build_residual_stream(
         rmap,
         {
             pos: pe_values,
             value_in: v_values,
             cond_in: c_values,
+            query_one: query_one.compute(N_POS, {}),
         },
     )
 

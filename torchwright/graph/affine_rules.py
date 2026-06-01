@@ -339,17 +339,17 @@ def _embedding_rule(node) -> AffineBound:
 
 def _pos_encoding_rule(node) -> AffineBound:
     """Identity A-matrix: [-1, 1] for sinusoidal columns, [0, 100000] for
-    the raw position counter at column d_pos - 2."""
+    the raw position counter at ``counter_col`` (the last column)."""
     import torch
 
     d = node.d_output
-    d_pos = node.d_pos
+    counter_col = node.counter_col
     A = torch.eye(d, dtype=torch.float64)
     b = torch.zeros(d, dtype=torch.float64)
     lo = torch.full((d,), -1.0, dtype=torch.float64)
     hi = torch.full((d,), 1.0, dtype=torch.float64)
-    lo[d_pos - 2] = 0.0
-    hi[d_pos - 2] = 100000.0
+    lo[counter_col] = 0.0
+    hi[counter_col] = 100000.0
     return AffineBound(
         A_lo=A.clone(),
         A_hi=A.clone(),
