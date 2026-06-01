@@ -27,6 +27,12 @@ from torchwright.ops.arithmetic_ops import (
 )
 from torchwright.ops.logic_ops import cond_gate, cond_add_vector
 from torchwright.ops.map_select import select, map_to_table
+from torchwright.ops.attention_ops import (
+    attend_argmin,
+    attend_argmax,
+    attend_argmin_where,
+    attend_argmax_where,
+)
 
 D = 256
 D_HEAD = 16
@@ -621,6 +627,50 @@ def test_compile_split_vo_large_ratio():
     assert torch.allclose(
         actual.cpu(), expected, atol=1e-4
     ), f"Max diff: {(actual.cpu() - expected).abs().max().item():.6f}"
+
+
+def test_compile_selection_primitives():
+    """Compiled path for the simple selection primitives, whose d_qk shrank
+    to 1-2 and whose query is now a bare LiteralValue([1.0])."""
+    pos = create_pos_encoding()  # PosEncoding(17), trig_width 16 == D_HEAD
+    score = create_input("score", 1)
+    validity = create_input("valid", 1)
+    value = create_input("value", 3)
+
+    n_pos = 6
+    inputs = {
+        "score": torch.tensor([[3.0], [1.0], [4.0], [0.0], [2.0], [5.0]]),
+        # position 0 is always valid, so every causal window has a valid key
+        "valid": torch.tensor([[1.0], [-1.0], [1.0], [-1.0], [1.0], [-1.0]]),
+        "value": torch.arange(n_pos * 3, dtype=torch.float32).reshape(n_pos, 3),
+    }
+
+    for out in (
+        attend_argmin(pos, score, value),
+        attend_argmax(pos, score, value),
+        attend_argmin_where(pos, score, validity, value),
+        attend_argmax_where(pos, score, validity, value),
+    ):
+        _verify(out, n_pos=n_pos, input_values=inputs, pos_encoding=pos)
+
+
+def test_compile_selection_wide_value():
+    """Selection value wider than d_head must auto-split across heads (the
+    len(value) <= d_pos cap was removed)."""
+    pos = create_pos_encoding()
+    score = create_input("score", 1)
+    value = create_input("value", 40)  # > D_HEAD = 16
+    n_pos = 5
+    inputs = {
+        "score": torch.tensor([[3.0], [1.0], [2.0], [0.0], [4.0]]),
+        "value": torch.arange(n_pos * 40, dtype=torch.float32).reshape(n_pos, 40),
+    }
+    _verify(
+        attend_argmin(pos, score, value),
+        n_pos=n_pos,
+        input_values=inputs,
+        pos_encoding=pos,
+    )
 
 
 def test_compile_rejects_d_head_below_trig_width():

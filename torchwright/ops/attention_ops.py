@@ -295,7 +295,8 @@ def attend_argmin(
         pos_encoding: The graph's positional encoding node.
         score: 1D scalar node (``len(score) == 1``).
         value: Node whose value to read at the winning position.
-            Must satisfy ``len(value) <= pos_encoding.d_pos``.
+            No width constraint — wide V/O is auto-split across physical
+            heads by the compiler.
 
     Returns:
         A new ``Attn`` node of width ``len(value)`` equal to ``value`` at
@@ -328,7 +329,8 @@ def attend_argmax(
     Args:
         pos_encoding: The graph's positional encoding node.
         score: 1D scalar node.
-        value: Node whose value to read. ``len(value) <= pos_encoding.d_pos``.
+        value: Node whose value to read. No width constraint (wide V/O
+            auto-splits across heads).
 
     Returns:
         Attn node of width ``len(value)`` equal to ``value`` at the
@@ -384,7 +386,8 @@ def attend_argmin_where(
         pos_encoding: The graph's positional encoding node.
         score: 1D scalar node.
         validity: 1D boolean node (+1 valid, −1 invalid).
-        value: Node to read. ``len(value) <= pos_encoding.d_pos``.
+        value: Node to read. No width constraint (wide V/O auto-splits
+            across heads).
 
     Returns:
         Attn node of width ``len(value)``.
@@ -1279,12 +1282,11 @@ def attend_most_recent_matching(
             Implemented by pre-shifting ``key_vector`` and ``value`` by
             one position via :meth:`PosEncoding.attend_to_offset`, so
             that at slot ``i`` the head sees the predecessor's key and
-            value.  Costs two extra attention heads (one for the key
-            shift, one for the value shift) and adds the constraint
-            ``len(key_vector) <= d_pos`` and ``len(value) <= d_pos``
-            (the shift's per-head width limit).  At query position 0
-            the result is degenerate (no prior position exists) — the
-            caller must not consume it there.
+            value.  Costs two extra attention heads for the key and
+            value shifts (wide key/value auto-split across more heads;
+            no width cap).  At query position 0 the result is degenerate
+            (no prior position exists) — the caller must not consume it
+            there.
         assert_hardness_gt: If set, wraps the output in a softmax
             hardness assertion verifying the max attention weight per
             query exceeds this threshold during ``debug=True`` forward
@@ -1307,16 +1309,10 @@ def attend_most_recent_matching(
     )
     d_pos = pos_encoding.d_pos
     if exclude_self:
-        assert len(key_vector) <= d_pos, (
-            f"attend_most_recent_matching(exclude_self=True): "
-            f"key_vector width ({len(key_vector)}) must be <= d_pos ({d_pos}); "
-            "the position-shift step uses one attention head per shift."
-        )
-        assert len(value) <= d_pos, (
-            f"attend_most_recent_matching(exclude_self=True): "
-            f"value width ({len(value)}) must be <= d_pos ({d_pos}); "
-            "the position-shift step uses one attention head per shift."
-        )
+        # The shift uses attend_to_offset, whose Q/K width is trig_width and
+        # whose V/O auto-splits across heads, so key_vector / value may be any
+        # width (the only binding constraint, d_head >= W + 1 for this head's
+        # Q/K, is enforced by the compiler).
         # Shift key and value back by one position so that at slot i the
         # head sees key_vector[i-1] / value[i-1].  The causal mask still
         # admits i in [0, j], but the rightmost slot i = j now carries

@@ -44,6 +44,46 @@ def test_get_prev_value():
     assert torch.allclose(output, expected_prev_values)
 
 
+def test_get_prev_value_latch_within_budget():
+    """A value latched at an early trigger is held across a long-ish sequence
+    as long as the runtime length stays within the max_pos budget (< 2*max_pos
+    for a {0,1} cond)."""
+    n_pos = 400  # < 2 * default max_pos (512)
+    value_input = InputNode("value", 1, value_range=(-1000.0, 1000.0))
+    cond_input = InputNode("cond", 1, value_range=(-100.0, 100.0))
+    pos_encoding = PosEncoding(17)
+    out = pos_encoding.get_prev_value(value_input, cond_input)
+
+    cond = torch.zeros(n_pos, 1)
+    cond[3, 0] = 1.0  # single true at position 3
+    value = torch.arange(n_pos, dtype=torch.float32).reshape(n_pos, 1)
+    value[3, 0] = 42.0
+    res = out.compute(n_pos=n_pos, input_values={"value": value, "cond": cond})
+    # Every query at or after the trigger returns the latched value.
+    assert torch.allclose(res[3:], torch.full((n_pos - 3, 1), 42.0))
+
+
+def test_get_prev_value_adjacent_trues_pick_most_recent():
+    """Among adjacent true positions, the most recent (largest counter) wins."""
+    n_pos = 10
+    value_input = InputNode("value", 1, value_range=(-100.0, 100.0))
+    cond_input = InputNode("cond", 1, value_range=(-100.0, 100.0))
+    pos_encoding = PosEncoding(17)
+    out = pos_encoding.get_prev_value(value_input, cond_input)
+
+    cond = torch.zeros(n_pos, 1)
+    cond[5, 0] = 1.0
+    cond[6, 0] = 1.0  # adjacent trues at 5 and 6
+    value = torch.zeros(n_pos, 1)
+    value[5, 0] = 50.0
+    value[6, 0] = 60.0
+    res = out.compute(n_pos=n_pos, input_values={"value": value, "cond": cond})
+    # Most recent true (pos 6 -> 60) dominates; ~exp(-recency_gap) contamination
+    # from the adjacent true (50) keeps it just under 60.
+    assert torch.allclose(res[6], torch.tensor([60.0]), atol=0.05)
+    assert torch.allclose(res[9], torch.tensor([60.0]), atol=0.05)
+
+
 def test_attend_to_offset():
     input_values = torch.tensor([[1.0], [2.0], [3.0], [4.0], [5.0]])
     value_input = InputNode("value", 1, value_range=(-100.0, 100.0))

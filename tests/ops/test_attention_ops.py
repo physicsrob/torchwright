@@ -1250,31 +1250,24 @@ def test_most_recent_matching_exclude_self():
     assert abs(result_excl[3].item() - 30.0) < 1e-2, result_excl[3]
 
 
-def test_most_recent_matching_exclude_self_width_constraint():
-    """``exclude_self=True`` requires ``len(value) <= d_pos`` and
-    ``len(key_vector) <= d_pos`` because each pre-shift compiles to a
-    single attention head whose width is bounded by ``d_pos``.  The
-    default mode has no such limit.
+def test_most_recent_matching_exclude_self_accepts_wide_width():
+    """``exclude_self=True`` no longer caps key/value width: the pre-shift
+    uses ``attend_to_offset``, whose V/O auto-splits across heads.  Both modes
+    build for widths wider than the encoding (regression for the removed caps).
     """
-    import pytest
-
-    pe = _pe()  # d_pos = 16
+    pe = _pe()  # PosEncoding(17), trig_width 16
     query = InputNode("query", 4, value_range=(-1.0, 1.0))
     key = InputNode("key", 4, value_range=(-1.0, 1.0))
     wide_value = InputNode("value", 24, value_range=(-100.0, 100.0))
 
-    # Default mode accepts width 24 > d_pos = 16.
+    # Wide value (24 > trig_width 16) builds in both modes.
     attend_most_recent_matching(pe, query, key, wide_value)
+    attend_most_recent_matching(pe, query, key, wide_value, exclude_self=True)
 
-    # exclude_self mode rejects it.
-    with pytest.raises(AssertionError, match="value width"):
-        attend_most_recent_matching(pe, query, key, wide_value, exclude_self=True)
-
-    # Symmetric check on key width.
+    # Wide key_vector likewise.
     wide_query = InputNode("query", 24, value_range=(-1.0, 1.0))
     wide_key = InputNode("key", 24, value_range=(-1.0, 1.0))
     narrow_value = InputNode("value", 1, value_range=(-100.0, 100.0))
-    with pytest.raises(AssertionError, match="key_vector width"):
-        attend_most_recent_matching(
-            pe, wide_query, wide_key, narrow_value, exclude_self=True
-        )
+    attend_most_recent_matching(
+        pe, wide_query, wide_key, narrow_value, exclude_self=True
+    )

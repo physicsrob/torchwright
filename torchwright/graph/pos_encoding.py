@@ -31,6 +31,13 @@ class PosEncoding(Node):
                 f"even d_pos would leave an incomplete sin/cos pair. Use "
                 f"{d_pos + 1} or {d_pos - 1}."
             )
+        if d_pos < 3:
+            raise ValueError(
+                f"PosEncoding requires d_pos >= 3 (got {d_pos}): at least one "
+                f"complete sin/cos pair (trig_width >= 2) plus the counter "
+                f"column. trig_width = 0 has no position discrimination and "
+                f"divides by zero when building the frequency grid."
+            )
         self.d_pos = d_pos
         super().__init__(d_pos, [])
 
@@ -130,18 +137,42 @@ class PosEncoding(Node):
         """Most-recent previous ``value`` at a position where ``cond`` is true.
 
         For each query position, selects ``value`` at the most recent causal
-        position where ``cond == 1.0`` (false positions must be ``<= 0``).
-        Recency is ranked by the raw position counter: among true positions
-        the largest counter (most recent) wins by ``recency_logit_gap`` of
-        logit per position.  A condition gate that dominates the full recency
-        span makes any true key beat any false key.
+        position where ``cond`` is true.  ``cond`` may be either torchwright
+        boolean convention: ``{0, 1}`` (false = 0) or ``{-1, +1}`` (false = -1);
+        true must be ``+1`` and false must be ``<= 0``.  Recency is ranked by
+        the raw position counter: among true positions the largest counter
+        (most recent) wins by ``recency_logit_gap`` of logit per position.  A
+        condition gate (``2 * recency_logit_gap * max_pos``) makes a true key
+        outscore a false key.
 
-        Numerical limit.  The gate forces peak logits near
-        ``3 * recency_logit_gap * max_pos``.  On A100 TF32 (~1e-3 relative
-        precision) the per-position recency gap stays resolvable only while
-        ``max_pos`` is a few hundred; the default 256 is safe, ~512 is the
-        ceiling.  Larger reach needs an fp32 matmul for this head.  Runtime
-        positions must be ``<= max_pos``.
+        **Selection contract — this is exact arithmetic, not precision.**  The
+        gate is frozen at graph-build time from ``max_pos``, but the raw
+        counter grows with the *actual* runtime sequence length.  A true key at
+        counter ``t`` beats a false key at counter ``f`` only while
+        ``gate > recency_logit_gap * (f - t)``, i.e. while the runtime position
+        stays below ``2 * max_pos`` (false = 0) or ``4 * max_pos``
+        (false = -1).  **Past that bound a recent false key silently outscores
+        an early true** (e.g. a value latched at an early trigger and held
+        across a long rollout) — no error, no tie, just the wrong value.  So
+        ``max_pos`` must be set to at least the longest sequence this head will
+        ever see (the default 256 covers sequences up to ~512 / ~1024).  This
+        mirrors the caller-supplied ``match_gain`` invariant documented on
+        :func:`~torchwright.ops.attention_ops.attend_most_recent_matching`.
+        (fp32 does **not** move this bound — it is logit ordering, not mantissa
+        width.)
+
+        **Tiebreak precision — TF32, soft.**  Among *multiple* true positions,
+        resolving the most recent needs the ``recency_logit_gap`` (8) to exceed
+        the TF32 noise floor at the peak logit (~``3 * recency_logit_gap *
+        max_pos``); this holds for a few hundred positions and then degrades
+        gracefully to "approximately the most recent true" (a blend of the last
+        few trues), not a wrong false.  The common single-true latch never hits
+        this.
+
+        **All-false window.**  If no causal position has ``cond`` true, the
+        gate term is uniform and the head degrades to pure recency, returning
+        the most recent position's value.  Callers must ensure at least one
+        true key exists in every consumed window, or gate the result.
         """
         assert len(cond) == 1, "get_prev_value expects a 1-D boolean cond"
         d_v = len(value)

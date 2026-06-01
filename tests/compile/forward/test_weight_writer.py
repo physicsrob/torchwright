@@ -24,6 +24,7 @@ from torchwright.compiler.forward.weight_writer import (
     MLPOp,
     write_attn_sublayer,
     write_mlp_sublayer,
+    _current_pos_attn_matrices,
 )
 from torchwright.compiler.groups.transformer_layer import TransformerLayer
 from torchwright.graph import Linear, ReLU, Attn, Add, Concatenate
@@ -189,6 +190,20 @@ def test_attn_compute():
 
     expected = attn_node.compute(N_POS, {"v": v_values})
     assert torch.allclose(result.cpu(), expected, atol=1e-4)
+
+
+def test_current_pos_matrices_exclude_counter():
+    """Same-position copy heads must match on the trig block only — the raw
+    counter column is zeroed regardless of how d_head compares to d_pos."""
+    pe = PosEncoding(17)  # counter_col == 16
+    counter_col = pe.counter_col
+    for d_head in (8, 16, 17, 20):
+        q, k = _current_pos_attn_matrices(pe, d_head)
+        assert torch.all(q[counter_col] == 0.0), f"q counter not zero at d_head={d_head}"
+        assert torch.all(k[counter_col] == 0.0), f"k counter not zero at d_head={d_head}"
+    # A trig row IS matched (non-degenerate diagonal).
+    q16, k16 = _current_pos_attn_matrices(pe, 16)
+    assert q16[0, 0] != 0.0 and k16[0, 0] != 0.0
 
 
 def test_attn_compute_small_d_head():
