@@ -1224,8 +1224,11 @@ def attend_most_recent_matching(
     Quick sizing guide:
 
     - Unit dot products (one-hot match, ``match_dot=1`` on match,
-      ``0`` off) at ``max_n_pos ≈ 2000``: pick
-      ``match_gain ≥ 20000 + margin`` (e.g. ``30000``).
+      ``0`` off): the safe span is roughly
+      ``match_gain / _QUERY_GAIN``.  At ``match_gain = 300_000`` this
+      covers spans below ``37,500`` positions, including the DOOM
+      renderer's measured ~8,500-position rollout and the 32,768-position
+      regression test, but not a 65,536-position hard cap.
     - 10×-scaled E8 codes (``match_dot=1600``, worst off-diagonal
       ``~800``) at ``max_n_pos ≈ 2000``: the ``800``-unit dot gap gives
       plenty of headroom even at the default ``match_gain = 200``
@@ -1239,20 +1242,16 @@ def attend_most_recent_matching(
     even dense matches resolve cleanly.  Set ``assert_hardness_gt`` if
     you need runtime enforcement.
 
-    **TF32 caveat.**  On Ampere GPUs (A100), PyTorch's default matmul
-    path uses TF32 (~10-bit mantissa, ~1e-3 relative precision).  When
-    ``match_gain · match_dot`` is large and ``_QUERY_GAIN · max_n_pos``
-    is also large, the sum can exceed the regime where TF32 resolves
-    the recency-tiebreak gap cleanly.  For example, at match_gain=20
-    with 10×-scaled E8 codes (match_dot=1600) and max_n_pos≈1000, the
-    peak logit is ~30000, where TF32 absolute precision ~30 eats the
-    `_QUERY_GAIN = 8` unit-position gap.  If your callsite hits that
-    regime, either (a) use smaller match vectors so the match
-    contribution is ≲ a few thousand, or (b) switch to
-    :func:`attend_argmax_where` with an explicit integer score if one
-    is available at the callsite — its logits stay around
-    ``_VALIDITY_DIRECT ≈ 1000`` where integer-score gaps resolve
-    cleanly on TF32.  (M3 in the DOOM renderer chose option (b).)
+    **Precision policy.**  Torchwright's current oracle path uses fp32
+    ``torch.matmul`` / ``torch.softmax`` and the compiled path routes
+    SDPA through the MATH backend with fp32 tensors.  PyTorch's default
+    CUDA TF32 matmul flag is also off in the supported environment.
+    Under that policy, ``match_gain = 300_000`` leaves ample precision
+    headroom for the 8-logit adjacent-position recency gap at the spans
+    above.  If a future global precision setting enables TF32, re-run
+    the long-span regression before relying on this gain; TF32's
+    coarser mantissa can erase the 8-logit tiebreak when the total logit
+    is in the hundreds of thousands.
 
     **When no position matches.**  If no causal-window position has
     ``query_vector · key_vector`` above the unmatched baseline, the
