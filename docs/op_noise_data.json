@@ -1,6 +1,6 @@
 {
   "schema_version": 1,
-  "commit": "fe133f9",
+  "commit": "2e04d93",
   "measured_at": "2026-06-02",
   "ops": [
     {
@@ -254,12 +254,12 @@
           "name": "floor_near_boundary_10",
           "description": "Samples within ±1/step_sharpness of integer k=5 — stresses the ramp zone where `floor_int` interpolates.",
           "n_samples": 4096,
-          "max_abs_error": 0.999268,
+          "max_abs_error": 0.999279,
           "mean_abs_error": 0.128753,
-          "p99_abs_error": 0.970386,
-          "max_rel_error": 0.249817,
+          "p99_abs_error": 0.970371,
+          "max_rel_error": 0.24982,
           "mean_rel_error": 0.0321882,
-          "p99_rel_error": 0.242596,
+          "p99_rel_error": 0.242593,
           "rel_valid_samples": 4096,
           "worst_input": {
             "x": 4.99993
@@ -269,12 +269,12 @@
           "name": "floor_uniform_neg5_10",
           "description": "Uniform continuous samples on [-5, 10] — most land in flat zones; measures baseline `floor_int` accuracy.",
           "n_samples": 4096,
-          "max_abs_error": 0.998169,
-          "mean_abs_error": 0.0465452,
+          "max_abs_error": 0.998161,
+          "mean_abs_error": 0.0465444,
           "p99_abs_error": 0.895853,
           "max_rel_error": 0.953022,
-          "mean_rel_error": 0.0184898,
-          "p99_rel_error": 0.46109,
+          "mean_rel_error": 0.0184896,
+          "p99_rel_error": 0.461094,
           "rel_valid_samples": 3828,
           "worst_input": {
             "x": 5.99982

@@ -127,6 +127,71 @@ leakage of noise onto the validity bit gets multiplied by 1000 inside the
 attention logit. This op is not yet wired into the measurement pipeline
 and is a reasonable follow-up.
 
+### `floor_int` staircase is cancellation-free (saturating steps), not a slope-change ReLU sum
+
+`floor_int` (and `ceil_int = -floor_int(-x)`) previously realised its
+staircase through `piecewise_linear`, which sums slope-change ReLUs
+`Σ ±s·ReLU(x − b_i)` in **one** linear projection. For a tall staircase
+evaluated at large `x` this is catastrophic: each term has magnitude
+`~s·x`, and the partial sums during the fp32 dot-product accumulation
+overflow float32's `2^24 ≈ 16.7M` exact-integer limit, so the alternating
+`+`/`−` terms cancel into garbage. `floor_int(40000.4, [0,65535], s=1000)`
+returned `0.0` (true `40000`); even `[0,255]` staircases lost ~1–2 units
+near the top of the range. **The measured noise distributions never caught
+this** — `floor_uniform_neg5_10` / `floor_near_boundary_10` sample only
+`[-5,10]`, far inside the safe regime — which is the cautionary part: a
+clean per-op number does not certify an op outside its measured input
+range.
+
+The op now sums **bounded saturating** steps, `floor(x) = min + Σ_k step_k`
+with `step_k = clamp(s(x−k)+1, 0, W) = relu(t) − relu(t−W)`, counted as
+`floor = min + n − Σ_k relu(1 − step_k)`. Each `step_k` is a 2-term
+per-output difference (not a sum over all breakpoints), so the final `Σ`
+accumulates only bounded `[0,1]` terms — partial sums never exceed `n`. Two
+subtleties matter:
+
+- **Bound the step, don't leave it unbounded.** An earlier version output the
+  raw `relu(t)` (∈ `[0, ~s·x]`) and relied on `1 − relu(1 − relu(t))` to
+  saturate. That is reference-exact but the *intermediate* `relu(t)` carries
+  upstream compiled noise amplified by `s` (≈×10), which broke the
+  `linear_bin_index` compile-fidelity probe (`test_resampling_primitives`) on
+  an internal node even though the output was correct. Clamping the step to
+  `[0, W]` keeps the intermediate small (compiled-precise) with `≥ W−1` slack
+  below the stage-2 threshold of 1.
+- **Size `W` to the magnitude.** `relu(t) − relu(t−W)` collapses to 0 once `t`
+  and `t−W` round to the same float32 (`ulp(t) ≥ W`), so `W = max(2,
+  8·ulp(s·n))` — 2 for the common small-range case, larger only as `s·n`
+  approaches `2^24`.
+
+Cost: one extra MLP sublayer (two chained ReLUs) and a width-`n` intermediate.
+Exact at any magnitude/sharpness AND compiled-precise; pinned by
+`test_floor_int_wide_range_large_magnitude`,
+`test_floor_int_byte_range_exact_high_sharpness`, and the existing
+`linear_bin_index` compile probe. Note `thermometer_floor_div` shares the
+slope-change-sum structure but is correct for its documented **integer-only**
+contract (integer inputs land in flat zones); it is not reworked.
+
+### Known gap: the `map_select` table-lookup staircases have the same 2^24 cancellation
+
+An audit for the `floor_int` cancellation class found one untriggered sibling.
+`_table_lookup_index_staircase` / `_table_lookup_row_vector` /
+`_table_lookup_column_mask` (`torchwright/ops/map_select.py`) build a
+`piecewise_linear` with `2·(n−1)+1` breakpoints and `input_scale=sharpness`
+(default 100), feeding `table_lookup_2d`/`table_lookup_3d`. Same single
+alternating-sign ReLU sum, so the same overflow:
+`_table_lookup_index_staircase(n=256, sharpness=100)` at `x=100000` returns
+`0.0` (should clamp to 255 — the index is never clamped before the staircase),
+and `n=20000, sharpness=1000` collapses an in-range `x=19999` to `0.0`
+(`s·max_breakpoint ≈ 2e7 > 2^24`). **Untriggered today**: current table
+consumers use small tables with in-range, pre-rounded integer indices, and the
+DOOM texture/palette lookup track is still a Phase-F stub. Fix before that
+track lands large tables — clamp the index into `[0, n−1]` *before* the
+staircase, and/or apply the saturating-step reformulation. The audit also
+flagged `compare` as a milder 2-term variant that fails silently for `|x| ≳
+2^24/sharpness` (default-sharpness boundary ~1.68e6; live callers stay far
+under it), and confirmed `square`/`exp`/`multiply_2d`/`low_rank_2d` safe
+(monotone slopes or `input_scale=1`).
+
 ### Rel-error reporting: ramp-zone artefacts
 
 For `compare`, `floor_int`, `linear_bin_index`, and the boolean ops

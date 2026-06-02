@@ -265,7 +265,7 @@ def abs(inp: Node) -> Node:
     .. noise-footer::
 
        Max error: 0 abs, 0 rel over 4096 samples;
-       measured at commit fe133f9. See docs/numerical_noise.md.
+       measured at commit 2e04d93. See docs/numerical_noise.md.
     """
     return relu_add(inp, negate(inp))
 
@@ -311,7 +311,7 @@ def compare(
     .. noise-footer::
 
        Max error: 1.998 abs, 1.998 rel over 8192 samples;
-       measured at commit fe133f9. See docs/numerical_noise.md.
+       measured at commit 2e04d93. See docs/numerical_noise.md.
     """
 
     assert len(inp) == 1, "Input must be a 1D scalar node"
@@ -371,7 +371,7 @@ def min(inp1: Node, inp2: Node) -> Node:
     .. noise-footer::
 
        Max error: 3.815e-06 abs, 1.953e-06 rel over 4096 samples;
-       measured at commit fe133f9. See docs/numerical_noise.md.
+       measured at commit 2e04d93. See docs/numerical_noise.md.
     """
     assert len(inp1) == len(inp2)
     diff = subtract(inp1, inp2)
@@ -395,7 +395,7 @@ def max(inp1: Node, inp2: Node) -> Node:
     .. noise-footer::
 
        Max error: 3.815e-06 abs, 1.953e-06 rel over 4096 samples;
-       measured at commit fe133f9. See docs/numerical_noise.md.
+       measured at commit 2e04d93. See docs/numerical_noise.md.
     """
     assert len(inp1) == len(inp2)
     diff = subtract(inp1, inp2)
@@ -464,7 +464,7 @@ def piecewise_linear(
     .. noise-footer::
 
        Max error: 0.25 abs, 231.1 rel over 4096 samples;
-       measured at commit fe133f9. See docs/numerical_noise.md.
+       measured at commit 2e04d93. See docs/numerical_noise.md.
     """
     assert len(inp) == 1, "Input must be a 1D scalar node"
     n = len(breakpoints)
@@ -608,7 +608,7 @@ def piecewise_linear_2d(
     .. noise-footer::
 
        Max error: 7.778 abs, 0.6024 rel over 8192 samples;
-       measured at commit fe133f9. See docs/numerical_noise.md.
+       measured at commit 2e04d93. See docs/numerical_noise.md.
     """
     assert len(inp1) == 1, "inp1 must be a 1D scalar node"
     assert len(inp2) == 1, "inp2 must be a 1D scalar node"
@@ -1065,7 +1065,7 @@ def multiply_2d(
     .. noise-footer::
 
        Max error: 0.06249 abs, 2.15 rel over 4096 samples;
-       measured at commit fe133f9. See docs/numerical_noise.md.
+       measured at commit 2e04d93. See docs/numerical_noise.md.
     """
     assert len(inp1) == 1, "inp1 must be a 1D scalar node"
     assert len(inp2) == 1, "inp2 must be a 1D scalar node"
@@ -1264,7 +1264,7 @@ def low_rank_2d(
     .. noise-footer::
 
        Max error: 0.0651 abs, 0.3315 rel over 4096 samples;
-       measured at commit fe133f9. See docs/numerical_noise.md.
+       measured at commit 2e04d93. See docs/numerical_noise.md.
     """
     assert len(inp1) == 1, "inp1 must be a 1D scalar node"
     assert len(inp2) == 1, "inp2 must be a 1D scalar node"
@@ -1392,7 +1392,7 @@ def square(inp: Node, max_value: float, step: float = 1.0, d_max: int = 1024) ->
     .. noise-footer::
 
        Max error: 0.25 abs, 231.1 rel over 4096 samples;
-       measured at commit fe133f9. See docs/numerical_noise.md.
+       measured at commit 2e04d93. See docs/numerical_noise.md.
     """
     assert len(inp) == 1, "Input must be a 1D scalar node"
     assert max_value > 0, "max_value must be positive"
@@ -1432,7 +1432,7 @@ def square_signed(
     .. noise-footer::
 
        Max error: 0.25 abs, 276.7 rel over 4096 samples;
-       measured at commit fe133f9. See docs/numerical_noise.md.
+       measured at commit 2e04d93. See docs/numerical_noise.md.
     """
     assert len(inp) == 1, "Input must be a 1D scalar node"
     assert max_abs > 0, "max_abs must be positive"
@@ -1484,7 +1484,7 @@ def thermometer_floor_div(inp: Node, divisor: int, max_value: int) -> Node:
     .. noise-footer::
 
        Max error: 0 abs, 0 rel over 4096 samples;
-       measured at commit fe133f9. See docs/numerical_noise.md.
+       measured at commit 2e04d93. See docs/numerical_noise.md.
     """
     assert len(inp) == 1, "Input must be a 1D scalar node"
     n = max_value // divisor
@@ -1534,7 +1534,7 @@ def mod_const(inp: Node, divisor: int, max_value: int) -> Node:
     .. noise-footer::
 
        Max error: 0 abs, 0 rel over 4096 samples;
-       measured at commit fe133f9. See docs/numerical_noise.md.
+       measured at commit 2e04d93. See docs/numerical_noise.md.
     """
     assert len(inp) == 1, "Input must be a 1D scalar node"
     assert divisor > 0, "divisor must be positive"
@@ -1650,7 +1650,7 @@ def linear_bin_index(
     .. noise-footer::
 
        Max error: 1 abs, 0.9854 rel over 4096 samples;
-       measured at commit fe133f9. See docs/numerical_noise.md.
+       measured at commit 2e04d93. See docs/numerical_noise.md.
     """
     assert len(x) == 1, "x must be a 1D scalar node"
     assert len(x_min) == 1, "x_min must be a 1D scalar node"
@@ -1747,7 +1747,7 @@ def clamp(inp: Node, lo: float, hi: float) -> Node:
     .. noise-footer::
 
        Max error: 1.907e-06 abs, 0.0002899 rel over 4096 samples;
-       measured at commit fe133f9. See docs/numerical_noise.md.
+       measured at commit 2e04d93. See docs/numerical_noise.md.
     """
     assert len(inp) == 1, "Input must be a 1D scalar node"
     assert hi > lo, "hi must exceed lo"
@@ -1793,7 +1793,7 @@ def reciprocal(
     .. noise-footer::
 
        Max error: 0.0009137 abs, 0.1686 rel over 4096 samples;
-       measured at commit fe133f9. See docs/numerical_noise.md.
+       measured at commit 2e04d93. See docs/numerical_noise.md.
     """
     assert len(inp) == 1, "Input must be a 1D scalar node"
     assert min_value > 0, "min_value must be positive"
@@ -1946,7 +1946,7 @@ def log(
     .. noise-footer::
 
        Max error: 0.003023 abs, 0.003705 rel over 8192 samples;
-       measured at commit fe133f9. See docs/numerical_noise.md.
+       measured at commit 2e04d93. See docs/numerical_noise.md.
     """
     import math as _math
 
@@ -2087,7 +2087,7 @@ def exp(
     .. noise-footer::
 
        Max error: 0.02797 abs, 0.0001924 rel over 4096 samples;
-       measured at commit fe133f9. See docs/numerical_noise.md.
+       measured at commit 2e04d93. See docs/numerical_noise.md.
     """
     import math as _math
 
@@ -2208,7 +2208,7 @@ def log_abs(
     .. noise-footer::
 
        Max error: 0.000699 abs, 0.1428 rel over 4096 samples;
-       measured at commit fe133f9. See docs/numerical_noise.md.
+       measured at commit 2e04d93. See docs/numerical_noise.md.
     """
     assert len(inp) == 1, "Input must be a 1D scalar node"
     assert min_abs > 0, "min_abs must be positive"
@@ -2273,7 +2273,7 @@ def floor_int(
     .. noise-footer::
 
        Max error: 0.9993 abs, 0.953 rel over 8192 samples;
-       measured at commit fe133f9. See docs/numerical_noise.md.
+       measured at commit 2e04d93. See docs/numerical_noise.md.
     """
     assert len(inp) == 1, "Input must be a 1D scalar node"
     assert max_value >= min_value
@@ -2283,27 +2283,78 @@ def floor_int(
 
         return create_literal_value(torch.tensor([float(min_value)]))
 
-    # Build staircase: each step is a steep ramp of width eps ending at
-    # the integer boundary.  This ensures floor(k) = k exactly for all
-    # integers, and floor(k - delta) = k-1 for delta > eps.
+    # floor(x) = min_value + Σ_{k=min+1..max} step_k, with the unit step
+    #   step_k = clamp(s·(x−k)+1, 0, 2)        (∈ [0, 2], = relu(t)−relu(t−2))
+    # fully ON (==2) once x reaches the integer k (with a 1/s-wide ramp just
+    # below), OFF (==0) below it. floor counts the steps with step_k < 1:
+    #   floor = min + n − Σ_k relu(1 − step_k).
+    # Two properties make this cancellation-free AND compiled-precise:
+    #  * Each step_k is a 2-term per-output difference (NOT a sum over all
+    #    breakpoints), so its fp32 error is bounded (~ulp of s·x), and the final
+    #    Σ relu(1 − step_k) accumulates only bounded [0,1] terms — partial sums
+    #    never exceed n. The old single-projection Σ ±s·ReLU(x−b_i) summed ~n
+    #    terms of magnitude ~s·x; its partial sums overflowed float32's 2^24
+    #    exact-integer limit and collapsed to ~0 at large magnitude/sharpness.
+    #  * Clamping the step to [0, W] (not [0, 1]) keeps slack below the stage-2
+    #    threshold of 1, so an ON step absorbs to relu(1 − W) = 0 *exactly* even
+    #    with a few ulp of error, and the stage-1 intermediate stays small (≤ W,
+    #    not ~s·x) so it does not amplify upstream compiled noise. W must exceed a
+    #    few ulp(s·n): the per-step difference relu(t) − relu(t − W) collapses to
+    #    0 once t and t − W round to the same float32 value (ulp(t) ≥ W), so we
+    #    size W = max(2, 8·ulp(s·n)) — 2 for the common small-range case, larger
+    #    only when s·n approaches 2^24.
+    # Cost: one extra MLP sublayer (two chained ReLUs) vs the old form.
     import math as _math
 
-    s = sharpness if sharpness is not None else step_sharpness
-    eps = 1.0 / s
-    breakpoints = [float(min_value) - eps]
-    for k in range(min_value + 1, max_value + 1):
-        breakpoints.extend([float(k) - eps, float(k)])
-    breakpoints.append(float(max_value) + eps)
+    s = float(sharpness if sharpness is not None else step_sharpness)
+    n = max_value - min_value
+    _CHUNK = 512  # cap stage-1 hidden width (2 ReLUs per step) at ~1024
 
-    lo, hi = float(min_value), float(max_value)
+    max_t = s * n + 1.0
+    ulp = 2.0 ** (_math.floor(_math.log2(max_t)) - 23) if max_t >= 1.0 else 2.0**-23
+    step_cap = builtins.max(2.0, 8.0 * ulp)  # W
 
-    result = piecewise_linear(
-        inp,
-        breakpoints,
-        lambda x: builtins.max(lo, builtins.min(hi, float(_math.floor(x)))),
-        input_scale=s,
-        name="floor_int",
-    )
+    neg_partials = []  # each chunk contributes −Σ_k relu(1 − step_k)
+    for c0 in range(0, n, _CHUNK):
+        ks = list(
+            range(
+                min_value + 1 + c0,
+                builtins.min(min_value + 1 + c0 + _CHUNK, max_value + 1),
+            )
+        )
+        c = len(ks)
+        # stage 1 (MLP sublayer): step_k = relu(t_k) − relu(t_k − W)   width c
+        # hidden = [relu(t_k), relu(t_k − W)] per step, t_k = s·x − s·k + 1.
+        in_proj = torch.full((2 * c, 1), s)
+        in_bias = torch.empty(2 * c)
+        out_proj = torch.zeros((2 * c, c))
+        for j, k in enumerate(ks):
+            in_bias[2 * j] = 1.0 - s * k  # t_k
+            in_bias[2 * j + 1] = 1.0 - step_cap - s * k  # t_k − W
+            out_proj[2 * j, j] = 1.0
+            out_proj[2 * j + 1, j] = -1.0
+        step = linear_relu_linear(
+            input_node=inp,
+            input_proj=in_proj,
+            input_bias=in_bias,
+            output_proj=out_proj,
+            output_bias=torch.zeros(c),
+            name="floor_int_step",
+        )
+        # stage 2 (MLP sublayer): −Σ_k relu(1 − step_k)               width 1
+        neg_partials.append(
+            linear_relu_linear(
+                input_node=step,
+                input_proj=-torch.eye(c),
+                input_bias=torch.ones(c),
+                output_proj=-torch.ones((c, 1)),
+                output_bias=torch.zeros(1),
+                name="floor_int_saturate",
+            )
+        )
+
+    summed = neg_partials[0] if len(neg_partials) == 1 else sum_nodes(neg_partials)
+    result = add_const(summed, float(min_value + n))  # min + n − Σ relu(1 − step_k)
     return assert_matches_value_type(
         result,
         NodeValueType(value_range=Range(float(min_value), float(max_value))),
@@ -2324,7 +2375,7 @@ def ceil_int(inp: Node, min_value: int, max_value: int) -> Node:
     .. noise-footer::
 
        Max error: 0 abs, 0 rel over 4096 samples;
-       measured at commit fe133f9. See docs/numerical_noise.md.
+       measured at commit 2e04d93. See docs/numerical_noise.md.
     """
     assert len(inp) == 1, "Input must be a 1D scalar node"
     return negate(floor_int(negate(inp), -max_value, -min_value))
@@ -2375,7 +2426,7 @@ def multiply_integers(
     .. noise-footer::
 
        Max error: 0 abs, 0 rel over 4096 samples;
-       measured at commit fe133f9. See docs/numerical_noise.md.
+       measured at commit 2e04d93. See docs/numerical_noise.md.
     """
     assert strategy in ("deep", "shallow"), f"unknown strategy: {strategy}"
     assert len(inp1) == 1, "Input must be a 1D scalar node"
@@ -2467,7 +2518,7 @@ def signed_multiply(
     .. noise-footer::
 
        Max error: 0.06248 abs, 2.15 rel over 4096 samples;
-       measured at commit fe133f9. See docs/numerical_noise.md.
+       measured at commit 2e04d93. See docs/numerical_noise.md.
     """
     assert strategy in ("deep", "shallow"), f"unknown strategy: {strategy}"
     assert len(inp1) == 1, "Input must be a 1D scalar node"

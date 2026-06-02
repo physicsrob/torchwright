@@ -895,6 +895,52 @@ def test_ceil_int():
         ), f"ceil({v}) = {expected}, got {result.item()}"
 
 
+def test_floor_int_wide_range_large_magnitude():
+    """Regression: the old slope-change ReLU staircase summed ~n terms of
+    magnitude ~s*x in one projection, overflowing fp32's 2^24 exact-integer
+    limit and collapsing to ~0 above x ~ 2^24/s (e.g. floor_int(40000.4,
+    [0,65535], s=1000) returned 0.0). The saturating-step staircase keeps every
+    partial sum in [0, n] so it stays exact at any magnitude/sharpness."""
+    import math
+
+    # Mid-bin values (0.4 above an integer, clear of any ramp for s >= 10) so the
+    # only thing under test is the staircase summation, not near-boundary ramps.
+    x = create_input("x", 1)
+    for s in (10.0, 1000.0):
+        f = floor_int(x, min_value=0, max_value=65535, sharpness=s)
+        for v in (10.4, 1000.4, 16800.4, 40000.4, 62195.4, 65534.4):
+            r = f.compute(n_pos=1, input_values={"x": torch.tensor([[v]])}).item()
+            assert abs(r - math.floor(v)) < 0.01, (
+                f"floor_int({v}, [0,65535], s={s}) should be {math.floor(v)}, "
+                f"got {r}"
+            )
+
+
+def test_floor_int_byte_range_exact_high_sharpness():
+    """Exactness guard over the [0,255] byte range at high sharpness — the DOOM
+    digit-quad high byte floor(q/256). The saturating-step form must stay exact
+    across the whole range (the old form's partial sums grew with the step count
+    and position and could lose ~1-2 units near the top)."""
+    import math
+
+    x = create_input("x", 1)
+    f = floor_int(x, min_value=0, max_value=255, sharpness=1000.0)
+    for v in (0.4, 1.4, 100.6, 127.95, 200.3, 242.953, 254.6, 255.0):
+        r = f.compute(n_pos=1, input_values={"x": torch.tensor([[v]])}).item()
+        assert abs(r - math.floor(v)) < 0.01, f"floor_int({v}, [0,255]) got {r}"
+
+
+def test_ceil_int_wide_range_large_magnitude():
+    """ceil_int = -floor_int(-x); inherits the saturating-step fix."""
+    import math
+
+    x = create_input("x", 1)
+    c = ceil_int(x, min_value=0, max_value=65535)
+    for v in (10.4, 1000.4, 40000.4, 62195.98):
+        r = c.compute(n_pos=1, input_values={"x": torch.tensor([[v]])}).item()
+        assert abs(r - math.ceil(v)) < 0.01, f"ceil_int({v}) should be {math.ceil(v)}, got {r}"
+
+
 def test_signed_multiply():
     """Test all sign combinations."""
     a = create_input("a", 1)
