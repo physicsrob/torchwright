@@ -6,6 +6,9 @@ values, custom breakpoints, unsigned ranges, output clamping, and
 compiled transformer agreement.
 """
 
+import time
+import tracemalloc
+
 import pytest
 import torch
 
@@ -273,3 +276,82 @@ def test_multiply_2d_probe():
         atol=0.5,
     )
     assert report.first_divergent is None, report.format_short()
+
+
+# ---------------------------------------------------------------------------
+# Construction cost (analytic bilinear fast path)
+# ---------------------------------------------------------------------------
+
+
+def test_multiply_2d_build_is_linear_in_breakpoints():
+    """257 breakpoints/axis builds in O(n) time and memory, not O(n⁴).
+
+    Regression for the build-time OOM: the generic ``piecewise_linear_2d``
+    path solved a least-squares system over an O(n²)-row design matrix and
+    a ``full_matrices=True`` SVD whose discarded left-singular matrix is
+    ``(n², n²)`` — ~35 GB of float64 at n=257, which OOM'd the build.  A
+    product is exactly bilinear, so ``multiply_2d`` now builds the
+    quarter-square interpolant analytically (O(n) neurons, no solve).  This
+    test pins that property: the build must finish quickly and allocate a
+    trivial amount of memory at a breakpoint count that previously OOM'd.
+    """
+    a = create_input("a", 1)
+    b = create_input("b", 1)
+
+    max_abs = 1500.0
+    step = (2 * max_abs) / 256.0  # 257 breakpoints per axis
+
+    tracemalloc.start()
+    t0 = time.perf_counter()
+    node = multiply_2d(
+        a, b, max_abs1=max_abs, max_abs2=max_abs, step1=step, step2=step
+    )
+    elapsed = time.perf_counter() - t0
+    _cur, peak = tracemalloc.get_traced_memory()
+    tracemalloc.stop()
+
+    # O(n) construction: well under a second and a few MB of Python-traced
+    # allocation.  The pre-fix O(n⁴) path took tens of seconds and OOM'd a
+    # 30 GB machine; generous bounds here still catch any regression to it.
+    assert elapsed < 5.0, f"build took {elapsed:.2f}s — expected O(n), well under 1s"
+    assert peak < 200e6, f"build allocated {peak / 1e6:.1f} MB — expected a few MB"
+
+    # Sanity: the node still computes the product accurately at the scale
+    # the breakpoints cover.
+    for x, y in [(1000.0, 1000.0), (-1234.0, 567.0), (1500.0, -1500.0)]:
+        result = node.compute(
+            n_pos=1,
+            input_values={
+                "a": torch.tensor([[x]]),
+                "b": torch.tensor([[y]]),
+            },
+        ).item()
+        expected = x * y
+        # Bilinear interpolation error bound is step²/4 at this grid.
+        assert abs(result - expected) < step * step / 4 + 1.0, (
+            f"{x}*{y} = {expected}, got {result}"
+        )
+
+
+def test_multiply_2d_chunks_across_d_max():
+    """The analytic product bank chunks correctly when it exceeds d_max.
+
+    The quarter-square fast path emits ~2·(2n−2) neurons; a small d_max
+    forces them across multiple linear_relu_linear sublayers summed
+    together.  Grid points must stay exact regardless of chunk boundary.
+    """
+    a = create_input("a", 1)
+    b = create_input("b", 1)
+    node = multiply_2d(
+        a, b, max_abs1=5.0, max_abs2=5.0, step1=1.0, step2=1.0, d_max=4
+    )
+    for x in range(-5, 6):
+        for y in range(-5, 6):
+            result = node.compute(
+                n_pos=1,
+                input_values={
+                    "a": torch.tensor([[float(x)]]),
+                    "b": torch.tensor([[float(y)]]),
+                },
+            ).item()
+            assert abs(result - x * y) < 0.01, f"{x}*{y} != {result}"

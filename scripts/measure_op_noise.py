@@ -812,9 +812,10 @@ def _target_ops() -> List[TargetOp]:
             reference_fn=lambda inputs: inputs["a"] * inputs["b"],
             distribution_names=("multiply_uniform_pm10",),
             notes=(
-                "Single-sublayer product via 2D piecewise-linear lookup. "
-                "Analytical worst-cell absolute bound is `step1*step2/4 = 0.25` "
-                "for this configuration."
+                "Single-sublayer product built analytically via the "
+                "quarter-square identity `a*b = ((a+b)^2 - (a-b)^2)/4` "
+                "(O(n) neurons, no least-squares solve). Worst-cell absolute "
+                "bound is `step1*step2/4 = 0.25` for this configuration."
             ),
         ),
         TargetOp(

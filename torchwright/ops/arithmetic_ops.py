@@ -265,7 +265,7 @@ def abs(inp: Node) -> Node:
     .. noise-footer::
 
        Max error: 0 abs, 0 rel over 4096 samples;
-       measured at commit c234ba4. See docs/numerical_noise.md.
+       measured at commit fe133f9. See docs/numerical_noise.md.
     """
     return relu_add(inp, negate(inp))
 
@@ -311,7 +311,7 @@ def compare(
     .. noise-footer::
 
        Max error: 1.998 abs, 1.998 rel over 8192 samples;
-       measured at commit c234ba4. See docs/numerical_noise.md.
+       measured at commit fe133f9. See docs/numerical_noise.md.
     """
 
     assert len(inp) == 1, "Input must be a 1D scalar node"
@@ -371,7 +371,7 @@ def min(inp1: Node, inp2: Node) -> Node:
     .. noise-footer::
 
        Max error: 3.815e-06 abs, 1.953e-06 rel over 4096 samples;
-       measured at commit c234ba4. See docs/numerical_noise.md.
+       measured at commit fe133f9. See docs/numerical_noise.md.
     """
     assert len(inp1) == len(inp2)
     diff = subtract(inp1, inp2)
@@ -395,7 +395,7 @@ def max(inp1: Node, inp2: Node) -> Node:
     .. noise-footer::
 
        Max error: 3.815e-06 abs, 1.953e-06 rel over 4096 samples;
-       measured at commit c234ba4. See docs/numerical_noise.md.
+       measured at commit fe133f9. See docs/numerical_noise.md.
     """
     assert len(inp1) == len(inp2)
     diff = subtract(inp1, inp2)
@@ -464,7 +464,7 @@ def piecewise_linear(
     .. noise-footer::
 
        Max error: 0.25 abs, 231.1 rel over 4096 samples;
-       measured at commit c234ba4. See docs/numerical_noise.md.
+       measured at commit fe133f9. See docs/numerical_noise.md.
     """
     assert len(inp) == 1, "Input must be a 1D scalar node"
     n = len(breakpoints)
@@ -608,7 +608,7 @@ def piecewise_linear_2d(
     .. noise-footer::
 
        Max error: 7.778 abs, 0.6024 rel over 8192 samples;
-       measured at commit c234ba4. See docs/numerical_noise.md.
+       measured at commit fe133f9. See docs/numerical_noise.md.
     """
     assert len(inp1) == 1, "inp1 must be a 1D scalar node"
     assert len(inp2) == 1, "inp2 must be a 1D scalar node"
@@ -728,7 +728,26 @@ def piecewise_linear_2d(
     x_part = torch.linalg.pinv(A_v) @ bv
 
     if xs_int:
-        _U, S, Vh = torch.linalg.svd(A_v, full_matrices=True)
+        # We need Vh's rows up to the column dimension (3+K) to span the
+        # nullspace basis N_basis = Vh[rank:].T below.
+        #
+        # When A_v is TALL (rows n1*n2 >= cols 3+K — uniform / collapsed
+        # grids, e.g. the unit grid multiply_2d used to feed here), the
+        # reduced SVD already returns all 3+K right-singular vectors, so
+        # full_matrices=False yields a bit-identical Vh while avoiding the
+        # (n1*n2, n1*n2) left-singular matrix U that full_matrices=True
+        # materializes and we discard — that U is ~35 GB of float64 at
+        # n1*n2 ~ 66049 and is the build-time OOM this guard removes.
+        #
+        # When A_v is WIDE (rows < cols — non-uniform grids, where the
+        # sum/diff hyperplane families do not collapse), the reduced SVD
+        # returns only the first `rows` right-singular vectors and the
+        # nullspace rows rank..(3+K) would be missing.  There we must keep
+        # full_matrices=True so N_basis spans the full nullspace; the U it
+        # builds is only (rows, rows) and the grids that hit this path are
+        # small.
+        tall = A_v.shape[0] >= A_v.shape[1]
+        _U, S, Vh = torch.linalg.svd(A_v, full_matrices=not tall)
         tol = S.max().item() * 1e-10 if S.numel() else 0.0
         rank = int((S > tol).sum().item())
         N_basis = Vh[rank:].T  # (3+K, nulldim)
@@ -866,6 +885,120 @@ def piecewise_linear_2d(
     return result
 
 
+def _product_2d_quarter_square(
+    u_node: Node,
+    v_node: Node,
+    n: int,
+    lo1: float,
+    range1: float,
+    lo2: float,
+    range2: float,
+    d_max: int = 1024,
+    name: str = "multiply_2d",
+) -> Node:
+    """Closed-form O(n) piecewise-linear interpolant of a bilinear product.
+
+    Given two inputs already affine-mapped onto the common unit grid
+    (``u_node, v_node`` ∈ [0, 1] sampled at ``n`` equally-spaced
+    breakpoints, spacing ``h = 1/(n-1)``), build a single MLP sublayer
+    that evaluates::
+
+        P(u, v) = (lo1 + range1·u)·(lo2 + range2·v)
+
+    without the generic least-squares solve.  ``P`` is bilinear, so the
+    only nonlinear term is ``u·v``, and ``u·v = ((u+v)² − (u−v)²)/4``.
+    The piecewise-linear interpolant of ``t²`` on a uniform grid of
+    spacing ``h`` has a *constant* slope change of ``2h`` at every
+    interior breakpoint, so each square is a ReLU staircase of
+    equal-weight neurons.  The sum axis ``u+v`` ranges over ``[0, 2]``
+    and the difference axis ``u−v`` over ``[−1, 1]``, both uniform with
+    spacing ``h``: ``2·(2n−2)`` neurons total, all assembled into one
+    ``linear_relu_linear``.
+
+    The two squares use ``clamp=False`` extrapolation (the leading
+    segment's slope, carried by the base affine term, extends past both
+    ends).  That matches the product's own linear extrapolation outside
+    the grid — beyond the grid a product's piecewise-affine approximation
+    follows the last segment's slope, exactly as the generic
+    :func:`piecewise_linear_2d` product did.
+
+    Returns a 1-D scalar node holding ``P(u, v)``.
+    """
+    h = 1.0 / (n - 1)
+
+    # square(t) on a uniform grid {t_k} (spacing h, clamp=False) expands to
+    #     square(t) = const + m0·t + Σ_{k=1}^{m-2} 2h·ReLU(t − t_k)
+    # where m0 = t_0 + t_1 is the leading segment slope (carried by the
+    # affine part so the ReLUs, inactive left of t_0, never need a left
+    # ramp) and const = t_0² − m0·t_0.
+    def _square_expansion(t_bps: List[float]) -> Tuple[float, float, list]:
+        t0 = t_bps[0]
+        m0 = t_bps[0] + t_bps[1]
+        const = t0 * t0 - m0 * t0
+        relus = [(t_bps[k], 2.0 * h) for k in range(1, len(t_bps) - 1)]
+        return const, m0, relus
+
+    s_bps = [i * h for i in range(2 * n - 1)]  # u+v ∈ [0, 2]
+    d_bps = [-1.0 + i * h for i in range(2 * n - 1)]  # u−v ∈ [−1, 1]
+    cS, mS, rS = _square_expansion(s_bps)
+    cD, mD, rD = _square_expansion(d_bps)
+
+    # uv = (S2 − D2)/4, so the product's
+    #   constant term  = lo1·lo2 + range1·range2·(cS − cD)/4
+    #   u coefficient  = lo2·range1 + range1·range2·(mS − mD)/4
+    #   v coefficient  = lo1·range2 + range1·range2·(mS + mD)/4
+    prod_scale = range1 * range2
+    const_term = lo1 * lo2 + prod_scale * (cS - cD) / 4.0
+    coef_u = lo2 * range1 + prod_scale * (mS - mD) / 4.0
+    coef_v = lo1 * range2 + prod_scale * (mS + mD) / 4.0
+
+    inp = Concatenate([u_node, v_node])
+
+    # Sum-axis neuron k: ReLU(u + v − thr) contributes +2h·(prod_scale/4).
+    # Diff-axis neuron k: ReLU(u − v − thr) contributes −2h·(prod_scale/4).
+    # (proj_u, proj_v, bias, output_weight)
+    relus: list = []
+    for thr, w in rS:
+        relus.append((1.0, 1.0, -thr, prod_scale * w / 4.0))
+    for thr, w in rD:
+        relus.append((1.0, -1.0, -thr, -prod_scale * w / 4.0))
+
+    base = Linear(
+        inp,
+        torch.tensor([[coef_u], [coef_v]]),
+        name=f"{name}_base",
+    )
+
+    chunks = []
+    multi = len(relus) > d_max
+    for chunk_start in range(0, len(relus), d_max):
+        chunk = relus[chunk_start : chunk_start + d_max]
+        d = len(chunk)
+        input_proj = torch.zeros(d, 2)
+        input_bias = torch.zeros(d)
+        output_proj = torch.zeros(d, 1)
+        for k, (pu, pv, b, ow) in enumerate(chunk):
+            input_proj[k, 0] = pu
+            input_proj[k, 1] = pv
+            input_bias[k] = b
+            output_proj[k, 0] = ow
+        ob = torch.tensor([const_term]) if chunk_start == 0 else torch.zeros(1)
+        chunk_name = f"{name}_{chunk_start}_{chunk_start + d}" if multi else name
+        chunks.append(
+            linear_relu_linear(
+                input_node=inp,
+                input_proj=input_proj,
+                input_bias=input_bias,
+                output_proj=output_proj,
+                output_bias=ob,
+                name=chunk_name,
+            )
+        )
+
+    relu_part = chunks[0] if len(chunks) == 1 else sum_nodes(chunks)
+    return Add(base, relu_part)
+
+
 def multiply_2d(
     inp1: Node,
     inp2: Node,
@@ -931,8 +1064,8 @@ def multiply_2d(
 
     .. noise-footer::
 
-       Max error: 0.0625 abs, 2.15 rel over 4096 samples;
-       measured at commit c234ba4. See docs/numerical_noise.md.
+       Max error: 0.06249 abs, 2.15 rel over 4096 samples;
+       measured at commit fe133f9. See docs/numerical_noise.md.
     """
     assert len(inp1) == 1, "inp1 must be a 1D scalar node"
     assert len(inp2) == 1, "inp2 must be a 1D scalar node"
@@ -997,18 +1130,65 @@ def multiply_2d(
             name=f"{name}_norm2",
         )
 
-        def _product_normalized(u: float, v: float) -> float:
-            return (lo1_f + range1 * u) * (lo2_f + range2 * v)
-
-        result = piecewise_linear_2d(
+        # Analytic O(n) product construction (quarter-square multiplier).
+        #
+        # The generic piecewise_linear_2d path solves a least-squares
+        # system over an O(n²)-row vertex design matrix and an SVD-derived
+        # nullspace — O(n⁴) work and O(n²) memory that OOMs at ~257
+        # breakpoints per axis.  A product is exactly bilinear, so we build
+        # its piecewise-linear interpolant in closed form instead:
+        #
+        #     P(u, v) = (lo₁ + r₁·u)·(lo₂ + r₂·v)
+        #             = lo₁·lo₂ + lo₁·r₂·v + lo₂·r₁·u + r₁·r₂·(u·v)
+        #
+        # The only nonlinear term is u·v, and u·v = ((u+v)² − (u−v)²)/4.
+        # The piecewise-linear interpolant of t² on a uniform grid of
+        # spacing h has a *constant* slope change of 2h at every interior
+        # breakpoint, so each square is a ReLU staircase with equal-weight
+        # neurons.  On the common unit grid (h = 1/(n−1)) the sum axis
+        # u+v ∈ [0, 2] and the difference axis u−v ∈ [−1, 1] are both
+        # uniform with spacing h, so the whole product is one ReLU bank of
+        # ~2·(2n−2) neurons (O(n)) — same single MLP sublayer, no solve.
+        result = _product_2d_quarter_square(
             inp1_norm,
             inp2_norm,
-            bp_unit,
-            bp_unit,
-            _product_normalized,
+            n,
+            lo1_f,
+            range1,
+            lo2_f,
+            range2,
             d_max=d_max,
             name=name,
         )
+
+        # Declare the output range.  The interpolant equals the exact
+        # product at grid vertices and extrapolates linearly outside, so
+        # over an axis-aligned input box its extreme is attained at a
+        # corner.  Bound over the box covering both the grid extent and
+        # the (finite) declared input ranges; a product over a rectangle
+        # is monotone in each argument, so the min/max sit at the four
+        # corners.  This mirrors the tight range the generic
+        # piecewise_linear_2d path declared, so downstream gating that
+        # reads multiply_2d's value range is unaffected.
+        r1v = inp1.value_type.value_range
+        r2v = inp2.value_type.value_range
+        if r1v.is_finite() and r2v.is_finite():
+            ax_lo = builtins.min(lo1_f, r1v.lo)
+            ax_hi = builtins.max(hi1_f, r1v.hi)
+            bx_lo = builtins.min(lo2_f, r2v.lo)
+            bx_hi = builtins.max(hi2_f, r2v.hi)
+            corners = [
+                ax_lo * bx_lo,
+                ax_lo * bx_hi,
+                ax_hi * bx_lo,
+                ax_hi * bx_hi,
+            ]
+            result = assert_matches_value_type(
+                result,
+                NodeValueType(
+                    value_range=Range(builtins.min(corners), builtins.max(corners))
+                ),
+            )
 
     if max_abs_output is not None:
         result = clamp(result, -max_abs_output, max_abs_output)
@@ -1083,8 +1263,8 @@ def low_rank_2d(
 
     .. noise-footer::
 
-       Max error: 0.0651 abs, 0.3314 rel over 4096 samples;
-       measured at commit c234ba4. See docs/numerical_noise.md.
+       Max error: 0.0651 abs, 0.3315 rel over 4096 samples;
+       measured at commit fe133f9. See docs/numerical_noise.md.
     """
     assert len(inp1) == 1, "inp1 must be a 1D scalar node"
     assert len(inp2) == 1, "inp2 must be a 1D scalar node"
@@ -1212,7 +1392,7 @@ def square(inp: Node, max_value: float, step: float = 1.0, d_max: int = 1024) ->
     .. noise-footer::
 
        Max error: 0.25 abs, 231.1 rel over 4096 samples;
-       measured at commit c234ba4. See docs/numerical_noise.md.
+       measured at commit fe133f9. See docs/numerical_noise.md.
     """
     assert len(inp) == 1, "Input must be a 1D scalar node"
     assert max_value > 0, "max_value must be positive"
@@ -1252,7 +1432,7 @@ def square_signed(
     .. noise-footer::
 
        Max error: 0.25 abs, 276.7 rel over 4096 samples;
-       measured at commit c234ba4. See docs/numerical_noise.md.
+       measured at commit fe133f9. See docs/numerical_noise.md.
     """
     assert len(inp) == 1, "Input must be a 1D scalar node"
     assert max_abs > 0, "max_abs must be positive"
@@ -1304,7 +1484,7 @@ def thermometer_floor_div(inp: Node, divisor: int, max_value: int) -> Node:
     .. noise-footer::
 
        Max error: 0 abs, 0 rel over 4096 samples;
-       measured at commit c234ba4. See docs/numerical_noise.md.
+       measured at commit fe133f9. See docs/numerical_noise.md.
     """
     assert len(inp) == 1, "Input must be a 1D scalar node"
     n = max_value // divisor
@@ -1354,7 +1534,7 @@ def mod_const(inp: Node, divisor: int, max_value: int) -> Node:
     .. noise-footer::
 
        Max error: 0 abs, 0 rel over 4096 samples;
-       measured at commit c234ba4. See docs/numerical_noise.md.
+       measured at commit fe133f9. See docs/numerical_noise.md.
     """
     assert len(inp) == 1, "Input must be a 1D scalar node"
     assert divisor > 0, "divisor must be positive"
@@ -1470,7 +1650,7 @@ def linear_bin_index(
     .. noise-footer::
 
        Max error: 1 abs, 0.9854 rel over 4096 samples;
-       measured at commit c234ba4. See docs/numerical_noise.md.
+       measured at commit fe133f9. See docs/numerical_noise.md.
     """
     assert len(x) == 1, "x must be a 1D scalar node"
     assert len(x_min) == 1, "x_min must be a 1D scalar node"
@@ -1567,7 +1747,7 @@ def clamp(inp: Node, lo: float, hi: float) -> Node:
     .. noise-footer::
 
        Max error: 1.907e-06 abs, 0.0002899 rel over 4096 samples;
-       measured at commit c234ba4. See docs/numerical_noise.md.
+       measured at commit fe133f9. See docs/numerical_noise.md.
     """
     assert len(inp) == 1, "Input must be a 1D scalar node"
     assert hi > lo, "hi must exceed lo"
@@ -1613,7 +1793,7 @@ def reciprocal(
     .. noise-footer::
 
        Max error: 0.0009137 abs, 0.1686 rel over 4096 samples;
-       measured at commit c234ba4. See docs/numerical_noise.md.
+       measured at commit fe133f9. See docs/numerical_noise.md.
     """
     assert len(inp) == 1, "Input must be a 1D scalar node"
     assert min_value > 0, "min_value must be positive"
@@ -1765,8 +1945,8 @@ def log(
 
     .. noise-footer::
 
-       Max error: 0.003026 abs, 0.003721 rel over 8192 samples;
-       measured at commit c234ba4. See docs/numerical_noise.md.
+       Max error: 0.003023 abs, 0.003705 rel over 8192 samples;
+       measured at commit fe133f9. See docs/numerical_noise.md.
     """
     import math as _math
 
@@ -1907,7 +2087,7 @@ def exp(
     .. noise-footer::
 
        Max error: 0.02797 abs, 0.0001924 rel over 4096 samples;
-       measured at commit c234ba4. See docs/numerical_noise.md.
+       measured at commit fe133f9. See docs/numerical_noise.md.
     """
     import math as _math
 
@@ -2028,7 +2208,7 @@ def log_abs(
     .. noise-footer::
 
        Max error: 0.000699 abs, 0.1428 rel over 4096 samples;
-       measured at commit c234ba4. See docs/numerical_noise.md.
+       measured at commit fe133f9. See docs/numerical_noise.md.
     """
     assert len(inp) == 1, "Input must be a 1D scalar node"
     assert min_abs > 0, "min_abs must be positive"
@@ -2093,7 +2273,7 @@ def floor_int(
     .. noise-footer::
 
        Max error: 0.9993 abs, 0.953 rel over 8192 samples;
-       measured at commit c234ba4. See docs/numerical_noise.md.
+       measured at commit fe133f9. See docs/numerical_noise.md.
     """
     assert len(inp) == 1, "Input must be a 1D scalar node"
     assert max_value >= min_value
@@ -2144,7 +2324,7 @@ def ceil_int(inp: Node, min_value: int, max_value: int) -> Node:
     .. noise-footer::
 
        Max error: 0 abs, 0 rel over 4096 samples;
-       measured at commit c234ba4. See docs/numerical_noise.md.
+       measured at commit fe133f9. See docs/numerical_noise.md.
     """
     assert len(inp) == 1, "Input must be a 1D scalar node"
     return negate(floor_int(negate(inp), -max_value, -min_value))
@@ -2195,7 +2375,7 @@ def multiply_integers(
     .. noise-footer::
 
        Max error: 0 abs, 0 rel over 4096 samples;
-       measured at commit c234ba4. See docs/numerical_noise.md.
+       measured at commit fe133f9. See docs/numerical_noise.md.
     """
     assert strategy in ("deep", "shallow"), f"unknown strategy: {strategy}"
     assert len(inp1) == 1, "Input must be a 1D scalar node"
@@ -2287,7 +2467,7 @@ def signed_multiply(
     .. noise-footer::
 
        Max error: 0.06248 abs, 2.15 rel over 4096 samples;
-       measured at commit c234ba4. See docs/numerical_noise.md.
+       measured at commit fe133f9. See docs/numerical_noise.md.
     """
     assert strategy in ("deep", "shallow"), f"unknown strategy: {strategy}"
     assert len(inp1) == 1, "Input must be a 1D scalar node"

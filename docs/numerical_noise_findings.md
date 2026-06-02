@@ -15,27 +15,59 @@ observations and removing findings a fix has invalidated. See the
 
 ### `piecewise_linear_2d` oscillates on non-uniform grids
 
-`diff_trig_nonuniform` hits **19.4 absolute error** on a product whose
-reference value is `-24.3` — a ~80% relative deviation.
-`diff_vel_nonuniform` hits **13.6 absolute error**. The op's own docstring
+`diff_trig_nonuniform` hits **7.78 absolute error** on a product whose
+reference value is `-24.3` — a ~32% relative deviation.
+`diff_vel_nonuniform` hits **5.44 absolute error**. The op's own docstring
 already flags this: the constrained least-squares fit used on non-uniform
 breakpoint grids can oscillate inside cell interiors. **Preferred
 replacement:** `low_rank_2d`, which measures 0.065 absolute / 33% relative
 (rank-3 SVD, with a compile-time `σ_{K+1}` bound).
 
-**Noise ~doubled after commit `3895411`** ("perf(ops): drop full_matrices in
-piecewise_linear_2d SVD"). That change moved `torch.linalg.svd` from
-`full_matrices=True` to `False` to save ~15 GB of unused U. For `m > n` the
-two SVD modes compute the same `Vh` in theory, but torch's reduced-SVD
-algorithm produces a slightly different orthonormal basis in the nullspace
-span (which is what the piecewise_linear_2d fit uses via `Vh[rank:]`).
-Different nullspace basis → different constrained least-squares solution →
-different oscillation pattern, same shape but higher amplitude at DIFF_BP's
-sparsely-sampled outer cells. The commit did not re-measure noise (D7
-violation caught by `test_numerical_noise_drift` and resolved on this
-branch). The underlying issue — piecewise_linear_2d is brittle on highly
+**The SVD's `full_matrices` flag is load-bearing here, and only for *tall*
+design matrices.** `piecewise_linear_2d` reads the nullspace basis
+`N_basis = Vh[rank:].T`, which needs every right-singular vector up to the
+column dimension `3+K`. The shape of `A_v` decides whether the two SVD
+modes agree:
+
+* **Tall** (`vertex rows n1·n2 >= 3+K`): this happens on uniform / collapsed
+  grids — e.g. the unit grid `multiply_2d` used to feed here, where the
+  sum/diff hyperplane families collapse to O(n) distinct lines. The reduced
+  SVD (`full_matrices=False`) already returns all `3+K` right-singular
+  vectors, so `Vh` — and therefore the solution — is identical to the full
+  SVD, while skipping the discarded `(n1·n2, n1·n2)` left-singular matrix U
+  (~35 GB of float64 at n1·n2 ≈ 66049 — a real build-time OOM).
+* **Wide** (`rows < 3+K`): this is the *non-uniform* case — DIFF_BP × TRIG_BP
+  has 117 vertex rows but 219 hyperplane columns. The reduced SVD returns
+  only the first 117 right-singular vectors, so the nullspace rows
+  `rank..(3+K)` are *missing*. `N_basis` then can't span the nullspace the
+  interior-sample regularization needs, the oscillation is no longer pinned,
+  and `diff_trig_nonuniform`'s max abs error jumps from 7.78 to **19.4**.
+
+So the op now guards the flag: `full_matrices=False` only when `A_v` is
+tall, `full_matrices=True` (the U it builds is only `(rows, rows)`, and the
+non-uniform grids that hit this path are small) otherwise. An earlier commit
+that flipped the flag unconditionally was the source of the historical 19.4
+regression; the conditional guard keeps the non-uniform path at its
+original 7.78 while making the tall path buildable at high breakpoint
+counts. The underlying issue — `piecewise_linear_2d` is brittle on highly
 non-uniform grids — is unchanged; callers should prefer `low_rank_2d` or a
 uniform grid.
+
+### `multiply_2d` builds its product grid analytically (quarter-square)
+
+`multiply_2d` no longer routes the product through `piecewise_linear_2d`'s
+generic least-squares solve. A product is exactly bilinear, so on the
+common unit grid the op now builds the piecewise-linear interpolant in
+closed form via the quarter-square identity
+`u·v = ((u+v)² − (u−v)²)/4`: the interpolant of `t²` on a uniform grid of
+spacing `h` has a *constant* slope change of `2h` at every interior
+breakpoint, so each square is an equal-weight ReLU staircase and the whole
+product is one ReLU bank of `~2·(2n−2)` neurons — O(n) build, no SVD, no
+O(n²) design matrix (the old path OOM'd at ~257 breakpoints/axis). This is
+the same single MLP sublayer and the same diagonal-aligned interpolant, so
+`multiply_uniform_pm10` is unchanged at ~0.0625 absolute (it moved by ~1e-5,
+within GPU FP run-to-run jitter). The near-zero high-relative-error
+pathology below is structural to the product and unaffected.
 
 ### `reciprocal` relative error is load-bearing at the high-x tail
 

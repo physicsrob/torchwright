@@ -1,7 +1,7 @@
 {
   "schema_version": 1,
-  "commit": "c234ba4",
-  "measured_at": "2026-04-29",
+  "commit": "fe133f9",
+  "measured_at": "2026-06-02",
   "ops": [
     {
       "name": "abs",
@@ -315,12 +315,12 @@
           "name": "log_4decades_001_100",
           "description": "log(x) over [0.01, 100] — 4 decades. With per-decade sectioning (default), each section's pre-cancellation magnitude is bounded by `section_factor=10`, so float32 ULP noise is ~1.2e-6 per section. The dominant residual error comes from the multiply_2d blending grid in routing.",
           "n_samples": 4096,
-          "max_abs_error": 0.000247002,
-          "mean_abs_error": 0.000112631,
-          "p99_abs_error": 0.000169402,
-          "max_rel_error": 0.00372105,
-          "mean_rel_error": 4.25736e-05,
-          "p99_rel_error": 0.000264624,
+          "max_abs_error": 0.000247478,
+          "mean_abs_error": 0.000111867,
+          "p99_abs_error": 0.000168088,
+          "max_rel_error": 0.00370548,
+          "mean_rel_error": 4.2368e-05,
+          "p99_rel_error": 0.000263829,
           "rel_valid_samples": 4096,
           "worst_input": {
             "x": 0.0179683
@@ -330,12 +330,12 @@
           "name": "log_6decades_wide",
           "description": "log(x) over [0.01, 30000] — 6 decades. Stresses the sectioning path: a single-section piecewise log over this range fails outright (cancellation floor `(x_max/x_min) · 2⁻²³ ≈ 0.36 absolute, observed worst ~1.0 abs). Sectioning drops the floor to ~5e-3 absolute, dominated by compare-cancellation noise at large `x` propagating through multiply_2d blending.",
           "n_samples": 4096,
-          "max_abs_error": 0.00302601,
-          "mean_abs_error": 0.00152333,
-          "p99_abs_error": 0.00279808,
-          "max_rel_error": 0.00114918,
-          "mean_rel_error": 0.000169692,
-          "p99_rel_error": 0.000399339,
+          "max_abs_error": 0.00302315,
+          "mean_abs_error": 0.00152277,
+          "p99_abs_error": 0.00279686,
+          "max_rel_error": 0.00114823,
+          "mean_rel_error": 0.000169627,
+          "p99_rel_error": 0.000398892,
           "rel_valid_samples": 4096,
           "worst_input": {
             "x": 27070.5
@@ -374,15 +374,15 @@
           "name": "atan_cross_dot_nonuniform",
           "description": "atan2(cross/dot) over [-2, 2] × [0.5, 10] on a non-uniform grid — rank-3 SVD via `low_rank_2d`.",
           "n_samples": 4096,
-          "max_abs_error": 0.0651017,
+          "max_abs_error": 0.0651015,
           "mean_abs_error": 0.0158553,
           "p99_abs_error": 0.0574396,
-          "max_rel_error": 0.33142,
-          "mean_rel_error": 0.0803217,
-          "p99_rel_error": 0.217151,
+          "max_rel_error": 0.331451,
+          "mean_rel_error": 0.0803216,
+          "p99_rel_error": 0.21716,
           "rel_valid_samples": 4096,
           "worst_input": {
-            "a": 2.0,
+            "a": -2.0,
             "b": 3.36508
           }
         }
@@ -459,17 +459,17 @@
     {
       "name": "multiply_2d",
       "module": "torchwright.ops.arithmetic_ops",
-      "notes": "Single-sublayer product via 2D piecewise-linear lookup. Analytical worst-cell absolute bound is `step1*step2/4 = 0.25` for this configuration.",
+      "notes": "Single-sublayer product built analytically via the quarter-square identity `a*b = ((a+b)^2 - (a-b)^2)/4` (O(n) neurons, no least-squares solve). Worst-cell absolute bound is `step1*step2/4 = 0.25` for this configuration.",
       "distributions": [
         {
           "name": "multiply_uniform_pm10",
           "description": "a·b over [-10, 10]² with step=1 — generic uniform product grid; analytical bound `step1*step2/4 = 0.25`.",
           "n_samples": 4096,
-          "max_abs_error": 0.0624998,
-          "mean_abs_error": 0.0201988,
-          "p99_abs_error": 0.0584654,
-          "max_rel_error": 2.15046,
-          "mean_rel_error": 0.00729335,
+          "max_abs_error": 0.0624883,
+          "mean_abs_error": 0.0201983,
+          "p99_abs_error": 0.0584726,
+          "max_rel_error": 2.14985,
+          "mean_rel_error": 0.00729313,
           "p99_rel_error": 0.0661755,
           "rel_valid_samples": 4096,
           "worst_input": {
