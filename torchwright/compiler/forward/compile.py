@@ -945,7 +945,12 @@ def forward_compile(
     net.residual_assignment = ra
     net.assert_aliases = graph.get_assert_aliases()
 
-    if trim_heads:
+    # Skip in-place weight trimming when streaming: ``on_layer_compiled`` (the
+    # ONNX streaming path) extracts each layer's weights and NULLs the tensors
+    # per layer, so the post-loop trims here would slice ``None``. The streamed
+    # sparse export already drops the unused (zero) heads/slots, making the
+    # in-memory trim both impossible and redundant in that mode.
+    if trim_heads and on_layer_compiled is None:
         max_heads = d // d_head
         for layer in net.layers:
             layer.attn.attn.trim_unused_heads()
@@ -987,17 +992,20 @@ def forward_compile(
                     f"{kv_depth:>10}  {cp:>10}  {sa:>10}"
                 )
 
-    # Trim trailing unused MLP slots (same idea as head trimming).
-    for layer in net.layers:
-        layer.mlp.trim_unused_slots()
-    if verbose:
-        mlp_before = d_hidden * len(net.layers)
-        mlp_after = sum(layer.mlp.d_hidden for layer in net.layers)
-        mlp_saved = (mlp_before - mlp_after) * (2 * d + 2)
-        print(
-            f"\n  MLP trimming: {mlp_before - mlp_after}/{mlp_before} "
-            f"slots trimmed ({mlp_saved:,} params saved)"
-        )
+    # Trim trailing unused MLP slots (same idea as head trimming). Skipped when
+    # streaming for the same reason as head trimming above (weights already
+    # extracted + nulled per layer by ``on_layer_compiled``).
+    if on_layer_compiled is None:
+        for layer in net.layers:
+            layer.mlp.trim_unused_slots()
+        if verbose:
+            mlp_before = d_hidden * len(net.layers)
+            mlp_after = sum(layer.mlp.d_hidden for layer in net.layers)
+            mlp_saved = (mlp_before - mlp_after) * (2 * d + 2)
+            print(
+                f"\n  MLP trimming: {mlp_before - mlp_after}/{mlp_before} "
+                f"slots trimmed ({mlp_saved:,} params saved)"
+            )
 
     if device == "auto":
         net.to(get_device(verbose=verbose))
