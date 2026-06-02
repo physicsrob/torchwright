@@ -758,6 +758,7 @@ def compile_to_onnx(
     max_layers: int = 200,
     verbose: bool = True,
     trim_heads: bool = True,
+    optimize: int = 0,
 ) -> None:
     """Compile a token-I/O graph to a KV-cached ONNX model.
 
@@ -799,6 +800,7 @@ def compile_to_onnx(
         device=None,
         on_layer_compiled=on_layer_compiled,
         trim_heads=trim_heads,
+        optimize=optimize,
     )
     t_compile = time.perf_counter() - t0
 
