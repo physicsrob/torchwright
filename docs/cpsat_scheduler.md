@@ -289,6 +289,24 @@ The DEATH and BIRTH terms only run for residual-using nodes —
 chain-internal exclusive `L1` and chain-internal `ReLU` live in MLP
 hidden slots, not residual, so they have no columns to cancel.
 
+**BIRTH-dirty is over-conservative under `assume_zero_init=False`.**
+The model charges a full-width BIRTH-dirty cancel to *every* fresh
+allocation, but the heuristic only clears the *dirty subset* of the
+allocated columns — columns recycled from a previously-cancelled node
+are already clean (`ResidualStreamMap.dirty_subset`).  Under width
+pressure columns recycle constantly, so the model charges hundreds of
+columns of phantom cancels the replay never pays, and the pooled
+attention cumulative rejects schedules the heuristic compiles.  The
+exact dirty cost is allocation-order-dependent (a property of replay,
+not of the layer assignment), so a sound tight per-layer bound is not
+easily expressible.  The practical resolution: `compile_to_onnx`
+defaults `assume_zero_init=True`, because the ONNX runtime always
+builds the residual stream from zeros (`get_input_res_stream`), making
+every BIRTH-dirty cancel unnecessary — both the model and the replay
+then skip them and agree.  `assume_zero_init=False` stays the
+conservative default of `forward_compile` for callers that may pass a
+non-zero residual stream to `forward()` directly.
+
 **MLP slot budget.** Capacity `d_hidden` per layer.
 
 - For each MLP-routed standalone `Linear` `n`: an optional unit-width
@@ -305,17 +323,48 @@ hidden slots, not residual, so they have no columns to cancel.
   `layer_var[chain.relu]`, demand `len(chain.relu)` (the chain's
   hidden width).
 
-**Residual column budget.** Capacity `d − input_residual_cols`,
-where `input_residual_cols` is the sum of widths of pre-allocated
-input nodes plus `pos_encoding`.
+**Residual column budget.** Capacity `d − len(pos_encoding)`.  Only
+`pos_encoding` is reserved for the whole schedule (the attention
+sublayer reads it at nearly every layer); every other input node is
+*freeable*.
 
-- For each residual-using node `n`: a regular interval
+- For each residual-using scheduled node `n`: a regular interval
   `[layer_var[n], cancel_layer[n])`, demand `len(n)`.
+- For each freeable input node `n` (every input except `pos_encoding`):
+  a regular interval `[0, input_cancel_layer[n])`, demand `len(n)`.
+  Inputs are pre-allocated at layer 0, so their birth is fixed at 0;
+  `input_cancel_layer[n]` obeys the same consumer lower bound and
+  cancel-slack window as a scheduled node's `cancel_layer`, and is kept
+  at `max_layers` for an input feeding a terminal `Concatenate`
+  (output cone).  `solve_schedule` writes these cancels into
+  `ScheduleAssignment.node_to_cancel_layer`, and
+  `DirectedLayerScheduler._find_dead_nodes` frees the input at replay —
+  matching the heuristic, which frees consumed inputs and recycles their
+  columns (the wide token `Embedding` is freed early and its 600+
+  columns carry the geometry-stage intermediates).  Reserving every
+  input forever (the pre-fix model) starved intermediates under width
+  pressure and made the residual cumulative reject schedules the
+  heuristic compiles fine.  Each freeable input also contributes a
+  DEATH-layer cancel interval to the attention-head cumulative (its
+  columns must be zeroed before reuse).
 
 `uses_residual(n)` is `False` for chain-internal `ReLU` (lives in
 MLP hidden slots, not residual) and exclusive chain L1 (computed
 inline inside `linear1` from its input's residual columns, never
 written back to the stream). True for everything else.
+
+**Limit — within-layer (eager) freeing is not modelled.** The
+cumulative is layer-granular, so a node read by a consumer at layer
+`K` is held through `K` (`cancel ≥ K+1`).  The heuristic frees such a
+node *within* layer `K` (after the consuming attention op) and reuses
+its columns in the same layer's MLP sublayer — a density the model
+cannot represent without a sublayer-resolution residual axis.  The
+consequence shows only at the residual floor: where the heuristic runs
+at ~100% residual occupancy (e.g. the DOOM forward at `d≈2560`), the
+model needs strictly more layers than the heuristic and CP-SAT cannot
+find an incumbent in budget, so it falls back.  With any residual
+slack (the DOOM forward at `d ≥ 6400`) CP-SAT solves and beats the
+heuristic (e.g. 32 vs 40 layers).
 
 ### Objective
 

@@ -8,6 +8,7 @@ given input values.
 import copy
 import os
 import time
+import warnings
 from typing import Callable, Optional, Set
 
 import torch
@@ -404,6 +405,7 @@ def forward_compile(
     cpsat_costs: Costs = Costs(),
     cpsat_flex_routing: bool = True,
     assume_zero_init: bool = False,
+    require_solver: bool = False,
 ) -> HeadlessTransformer:
     """Compile a computation graph into a HeadlessTransformer.
 
@@ -463,6 +465,15 @@ def forward_compile(
             directly.  Defaults to False — the conservative behaviour
             that runs BIRTH-layer dirty cancels on every fresh
             allocation regardless of the runtime contract.
+        require_solver: When True and ``optimize>0``, raise
+            ``RuntimeError`` if CP-SAT returns no usable assignment
+            instead of silently falling back to the heuristic.  Use it
+            in tests and measurement harnesses that must distinguish a
+            real optimizer solve from a fallback (a fallback returns a
+            valid-but-unoptimized compile with no error).  When False
+            (the default) the compile still falls back, but now emits a
+            ``warnings.warn`` so the fallback is never silent.  Ignored
+            when ``optimize=0``.
 
     Returns:
         A HeadlessTransformer whose compute() method reproduces
@@ -509,6 +520,9 @@ def forward_compile(
 
     # 2. Initialize
     net = HeadlessTransformer(d, d_head, pos_encoding, d_hidden=d_hidden)
+    # Solver provenance, populated only when CP-SAT runs (optimize>0); stays
+    # None for the heuristic path so callers can always query it.
+    net.cpsat_solve_stats = None
     residual_map = ResidualStreamMap(d)
     residual_map.allocate(pos_encoding)
     # pos_encoding + input_nodes are populated by get_input_res_stream at
@@ -675,22 +689,45 @@ def forward_compile(
             hint_cancel=hint_cancel if hint_cancel else None,
             log_search_progress=verbose,
         )
+        # Surface the solver provenance on the returned net so callers can
+        # distinguish a real solve from a fallback without re-deriving it
+        # (``stats.status_name``, ``is_optimal``, the LB/objective gap).
+        net.cpsat_solve_stats = _stats
         if assignment is None:
             # CP-SAT found no feasible incumbent within budget — fall
             # back to the heuristic schedule.  The warm-start was a
             # sunk cost; we already know the heuristic produces a
             # valid schedule.
+            #
+            # A fallback returns a valid-but-unoptimized compile with no
+            # error, so a layer-count-only measurement cannot tell it from
+            # a real solve.  Surface it loudly (and optionally fatally via
+            # ``require_solver``) so it can never masquerade as an
+            # optimizer result.  ``INFEASIBLE`` here is almost always a
+            # model bug (the heuristic found a feasible schedule yet
+            # CP-SAT's model proved none exists) rather than a hard
+            # instance — see ``docs/cpsat_scheduler.md``.
+            fallback_msg = (
+                f"CP-SAT returned no usable assignment "
+                f"(status={_stats.status_name}, "
+                f"{cpsat_time_budget_s:.0f}s budget); falling back to the "
+                f"heuristic schedule ({hint_n_layers} layers). The compile "
+                f"is valid but UNOPTIMIZED — optimize>0 did not take "
+                f"effect. status=INFEASIBLE on a graph the heuristic "
+                f"schedules indicates a CP-SAT model bug, not a hard "
+                f"instance."
+            )
+            if require_solver:
+                raise RuntimeError(
+                    fallback_msg
+                    + " (require_solver=True: refusing the silent fallback)"
+                )
+            warnings.warn(fallback_msg, RuntimeWarning, stacklevel=2)
             if verbose and _stats.solver_log:
                 print("--- CP-SAT solver log (last 40 lines) ---")
                 for line in _stats.solver_log.splitlines()[-40:]:
                     print(f"  {line}")
                 print("--- end CP-SAT solver log ---")
-            if verbose:
-                print(
-                    f"  CP-SAT found no feasible incumbent within "
-                    f"{cpsat_time_budget_s:.0f}s budget — falling back to "
-                    f"heuristic schedule ({hint_n_layers} layers)"
-                )
             scheduler = LayerScheduler(
                 graph,
                 d,

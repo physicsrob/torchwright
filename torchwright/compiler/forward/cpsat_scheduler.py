@@ -101,7 +101,10 @@ class ScheduleAssignment:
 
     Every schedulable node — every non-`Concatenate`, non-input node
     in the ancestor cone of `output_node` — appears in all three
-    dicts.
+    dicts.  Freeable input nodes (every input except `pos_encoding`)
+    additionally appear in `node_to_cancel_layer` only: they are
+    pre-computed at layer 0 (no layer/routing decision) but get a
+    cancel layer so the replay reclaims their columns once consumed.
     """
 
     node_to_layer: Dict[int, int]
@@ -132,6 +135,51 @@ class SolveStats:
 # Routing constants used both by this module and by the probe script.
 ATTN = "attn"
 MLP = "mlp"
+
+
+# Names of the toggleable constraint families in `build_cpsat_model`.  Used
+# only by the diagnostic path (`_disabled_families`); the production solve
+# never disables any of them.  Kept as a module constant so the diagnostic
+# script and any regression test validate names against one source of truth.
+CONSTRAINT_FAMILIES = frozenset(
+    {
+        "chain_coupling",      # L1==R==L2 same-layer equalities
+        "dependency",          # edge u->v layer ordering
+        "cancel_consumer_lb",  # cancel_layer >= consumer_layer + 1
+        "cancel_slack",        # cancel_layer <= last_consumer + 1 + K window
+        "attn_cumulative",     # per-layer attention-head + cancel + dirty capacity
+        "mlp_cumulative",      # per-layer MLP hidden-slot capacity
+        "residual_cumulative", # residual-stream column capacity
+    }
+)
+
+
+@dataclass
+class BuiltModel:
+    """A constructed (but unsolved) CP-SAT model plus its decision variables.
+
+    Returned by :func:`build_cpsat_model`.  ``solve_schedule`` adds the hint,
+    the decision strategy, solves, and reads the variables back out; the
+    diagnostic path adds hard schedule-fixing constraints and toggles
+    constraint families to localize an infeasibility.
+    """
+
+    model: cp_model.CpModel
+    gm: GraphModel
+    layer_var: Dict[int, cp_model.IntVar]
+    cancel_layer: Dict[int, cp_model.IntVar]
+    is_attn: Dict[int, cp_model.IntVar]
+    is_free: Dict[int, cp_model.IntVar]
+    n_layers_var: cp_model.IntVar
+    total_attn_heads: cp_model.IntVar
+    total_mlp_bypass: cp_model.IntVar
+    available_residual: int
+    n_heads_per_layer: int
+    # Cancel-layer vars for freeable input nodes (born at layer 0).  Separate
+    # from `cancel_layer` (which is keyed by schedulable node) so the
+    # schedulable iteration stays clean; `solve_schedule` reads these into the
+    # assignment so `DirectedLayerScheduler` frees the inputs at replay.
+    input_cancel_layer: Dict[int, cp_model.IntVar]
 
 
 # ---------------------------------------------------------------------------
@@ -492,11 +540,11 @@ def uses_residual(node: Node, gm: GraphModel) -> bool:
 
 
 # ---------------------------------------------------------------------------
-# Solver
+# Model builder
 # ---------------------------------------------------------------------------
 
 
-def solve_schedule(
+def build_cpsat_model(
     output_node: Node,
     pos_encoding: PosEncoding,
     *,
@@ -505,84 +553,35 @@ def solve_schedule(
     d_hidden: int,
     costs: Costs = Costs(),
     flex_routing: bool = True,
-    time_budget_s: float = 60.0,
     max_layers: int = 60,
-    hint_layers: Optional[Dict[int, int]] = None,
-    hint_routing: Optional[Dict[int, str]] = None,
-    hint_cancel: Optional[Dict[int, int]] = None,
     cancel_slack: Optional[int] = 2,
     policy: Optional[SchedulingPolicy] = None,
-    log_search_progress: bool = False,
     reserve_heads: int = 0,
     assume_zero_init: bool = False,
-) -> Tuple[Optional[ScheduleAssignment], SolveStats]:
-    """Build and solve the CP-SAT scheduling model.
+    _disabled_families: frozenset = frozenset(),
+) -> BuiltModel:
+    """Build (but do not solve) the CP-SAT scheduling model.
 
-    Returns ``(assignment, stats)``.  ``assignment`` is ``None`` when
-    the solver found no feasible solution within the budget; check
-    ``stats.is_optimal`` to distinguish proven-optimal from
-    feasible-only.  Callers decide what to do with non-optimal /
-    no-solution outcomes (the forward compiler falls back to the
-    heuristic; the probe script just reports them).
+    Extracted from :func:`solve_schedule` so the model construction has a
+    single definition shared by the production solve and the diagnostic
+    path.  ``solve_schedule`` calls this, then adds the warm-start hint, the
+    decision strategy, solves, and reads the variables back out of the
+    returned :class:`BuiltModel`.
 
-    Args:
-        output_node: graph output. Defines the ancestor cone the
-            scheduler operates over.
-        pos_encoding: positional encoding node (always allocated by
-            ``forward_compile``; subtracted from the residual budget).
-        d, d_head, d_hidden: transformer geometry. ``n_heads_per_layer
-            = d // d_head``.  Residual budget is
-            ``d - input_residual_cols``.
-        costs: objective weights. See :class:`Costs`.
-        flex_routing: if True, CP-SAT picks attention vs MLP for each
-            standalone ``Linear``.  If False, standalone Linears use
-            the static routing dictated by ``policy.local_in_attention``.
-        time_budget_s: per-solve wall-clock cap.
-        max_layers: search horizon.  Should be at least the heuristic's
-            layer count.
-        hint_layers: optional warm-start mapping ``node_id -> layer``.
-        hint_routing: optional warm-start mapping
-            ``node_id -> "attn"|"mlp"`` for flex Linears.  When the
-            heuristic placed a standalone Linear in attention vs
-            MLP-bypass, hinting the same routing lets CP-SAT
-            reconstruct the heuristic's solution as a starting
-            incumbent.
-        hint_cancel: optional warm-start mapping ``node_id -> layer``
-            for the cancel layer.  Captures when the heuristic freed
-            each node's columns; combined with ``hint_layers`` this
-            gives a complete schedule the solver can verify and
-            improve from.
-        cancel_slack: when not None, restrict each non-pinned node's
-            cancel layer to ``[earliest_dead, earliest_dead + K]``
-            where ``earliest_dead = max(layer[c] + 1)`` over consumers
-            and ``K == cancel_slack``.  Cuts the cancel-decision
-            search space ~30x at K=2 with negligible loss of
-            optimality (the heuristic almost always cancels within
-            1–2 layers of the last consumer).  Set to None to keep
-            the wide ``[layer[n]+1, max_layers]`` domain.  Default 2.
-        policy: only consulted when ``flex_routing=False``.  Defaults
-            to ``LEGACY_POLICY``.
-        log_search_progress: if True, the solver's progress log is
-            forwarded line-by-line and accumulated in
-            ``stats.solver_log``.
-        reserve_heads: per-layer attention-head budget reserved
-            beyond the modeled compute + cancel + dirty terms.
-            Defaults to 0.  Raise it for graphs whose attention heads
-            are saturated by ops outside the model.
-        assume_zero_init: if True, the model assumes the runtime
-            zero-initialises the residual stream (so the heuristic
-            emits no BIRTH-layer dirty-column cancels for fresh
-            allocations on the initially-free pool).  Pair this with
-            ``forward_compile(assume_zero_init=True)`` so the heuristic
-            and CP-SAT model agree.  Defaults to False — the
-            conservative model that mirrors the heuristic's defensive
-            BIRTH-layer cancellation of fresh allocations.
-
-    Raises ``RuntimeError`` only on structural problems (no residual
-    columns left after pre-allocated inputs).  Solver-outcome
-    handling (no-incumbent, FEASIBLE-not-OPTIMAL) is the caller's
-    responsibility.
+    ``_disabled_families`` is a diagnostic-only escape hatch: each name in
+    :data:`CONSTRAINT_FAMILIES` gates one constraint family, and listing it
+    here skips posting that family.  The production path always passes the
+    empty set (every family on); the diagnostic path bisects an infeasibility
+    by disabling one family at a time over a hard-fixed schedule.  See
+    ``torchwright_doom/scripts/cpsat_diagnose.py``.
     """
+    unknown = _disabled_families - CONSTRAINT_FAMILIES
+    if unknown:
+        raise ValueError(
+            f"Unknown constraint family/families {sorted(unknown)}; "
+            f"valid names: {sorted(CONSTRAINT_FAMILIES)}"
+        )
+
     if policy is None:
         policy = LEGACY_POLICY
 
@@ -592,14 +591,28 @@ def solve_schedule(
     gm = build_graph_model(output_node, pos_encoding)
 
     n_heads_per_layer = d // d_head
-    input_residual = sum(len(n) for n in gm.input_nodes)
-    if gm.pos_encoding not in set(gm.input_nodes):
-        input_residual += len(gm.pos_encoding)
-    available_residual = d - input_residual
+    # ``pos_encoding`` is read by the attention sublayer at (nearly) every
+    # layer, so it stays resident for the whole schedule — reserve its columns
+    # permanently.  Every OTHER input node is *freeable*: the heuristic frees
+    # an input once its last consumer has run and recycles the columns (the
+    # wide token ``Embedding`` is freed early and its 600+ columns carry the
+    # geometry-stage intermediates).  So those inputs are modelled as residual
+    # intervals from layer 0 to a cancel layer, exactly like a scheduled node,
+    # rather than being reserved forever.  Reserving every input forever (the
+    # previous behaviour) starved intermediates under width pressure and made
+    # the residual cumulative reject schedules the heuristic compiles fine.
+    pos = gm.pos_encoding
+    freeable_inputs = [
+        n
+        for n in gm.input_nodes
+        if n is not pos and n is not gm.output_node
+    ]
+    reserved_residual = len(pos)
+    available_residual = d - reserved_residual
     if available_residual <= 0:
         raise RuntimeError(
-            f"Inputs alone require {input_residual} residual columns, "
-            f"but d={d}. No room for intermediate nodes."
+            f"pos_encoding alone requires {reserved_residual} residual "
+            f"columns, but d={d}. No room for inputs or intermediates."
         )
 
     model = cp_model.CpModel()
@@ -612,9 +625,10 @@ def solve_schedule(
         )
 
     # Chain composites: L1, R, L2 share one layer.
-    for c in gm.chains:
-        model.Add(layer_var[c.l1.node_id] == layer_var[c.relu.node_id])
-        model.Add(layer_var[c.relu.node_id] == layer_var[c.l2.node_id])
+    if "chain_coupling" not in _disabled_families:
+        for c in gm.chains:
+            model.Add(layer_var[c.l1.node_id] == layer_var[c.relu.node_id])
+            model.Add(layer_var[c.relu.node_id] == layer_var[c.l2.node_id])
 
     # ---- Routing: is_attn[n] BoolVar (or fixed literal) per node ----
     # is_attn[n] == 1 means the node runs in the attention sublayer
@@ -636,25 +650,28 @@ def solve_schedule(
     # Edge u->v: same-layer ok iff u is_attn AND v is mlp (i.e., NOT
     # v is_attn). Otherwise layer[v] > layer[u].
     input_ids = {n.node_id for n in gm.input_nodes}
-    for u, v in gm.edges:
-        if u.node_id in input_ids:
-            continue
-        if (
-            u in gm.node_to_chain
-            and v in gm.node_to_chain
-            and gm.node_to_chain[u] is gm.node_to_chain[v]
-        ):
-            continue
-        u_attn = is_attn[u.node_id]
-        v_attn = is_attn[v.node_id]
-        # same_layer_ok = u_attn AND (NOT v_attn)
-        same_ok = model.NewBoolVar(f"so_n{u.node_id}_n{v.node_id}")
-        model.AddBoolAnd([u_attn, v_attn.Not()]).OnlyEnforceIf(same_ok)
-        model.AddBoolOr([u_attn.Not(), v_attn]).OnlyEnforceIf(same_ok.Not())
-        model.Add(layer_var[v.node_id] >= layer_var[u.node_id]).OnlyEnforceIf(same_ok)
-        model.Add(
-            layer_var[v.node_id] >= layer_var[u.node_id] + 1
-        ).OnlyEnforceIf(same_ok.Not())
+    if "dependency" not in _disabled_families:
+        for u, v in gm.edges:
+            if u.node_id in input_ids:
+                continue
+            if (
+                u in gm.node_to_chain
+                and v in gm.node_to_chain
+                and gm.node_to_chain[u] is gm.node_to_chain[v]
+            ):
+                continue
+            u_attn = is_attn[u.node_id]
+            v_attn = is_attn[v.node_id]
+            # same_layer_ok = u_attn AND (NOT v_attn)
+            same_ok = model.NewBoolVar(f"so_n{u.node_id}_n{v.node_id}")
+            model.AddBoolAnd([u_attn, v_attn.Not()]).OnlyEnforceIf(same_ok)
+            model.AddBoolOr([u_attn.Not(), v_attn]).OnlyEnforceIf(same_ok.Not())
+            model.Add(
+                layer_var[v.node_id] >= layer_var[u.node_id]
+            ).OnlyEnforceIf(same_ok)
+            model.Add(
+                layer_var[v.node_id] >= layer_var[u.node_id] + 1
+            ).OnlyEnforceIf(same_ok.Not())
 
     # ---- Cancel layer per schedulable node ----
     # The natural lower bound on cancel_layer[n] is
@@ -665,6 +682,7 @@ def solve_schedule(
     # the lower bound: the heuristic almost always cancels within 1–2
     # layers of the last consumer, so K=2 cuts the cancel decision
     # space ~30x with negligible loss of optimality.
+    eff_cancel_slack = None if "cancel_slack" in _disabled_families else cancel_slack
     cancel_layer: Dict[int, cp_model.IntVar] = {}
     for n in gm.schedulable:
         cl = model.NewIntVar(0, max_layers, f"cl_n{n.node_id}")
@@ -681,20 +699,53 @@ def solve_schedule(
                 keep_forever = True
                 break
             if c.node_id in layer_var:
-                model.Add(cl >= layer_var[c.node_id] + 1)
+                if "cancel_consumer_lb" not in _disabled_families:
+                    model.Add(cl >= layer_var[c.node_id] + 1)
                 consumer_layer_vars.append(layer_var[c.node_id])
         if keep_forever:
             continue
-        if cancel_slack is not None and consumer_layer_vars:
+        if eff_cancel_slack is not None and consumer_layer_vars:
             last_cons = model.NewIntVar(
                 0, max_layers - 1, f"last_cons_n{n.node_id}"
             )
             model.AddMaxEquality(last_cons, consumer_layer_vars)
-            model.Add(cl <= last_cons + 1 + cancel_slack)
-        elif cancel_slack is not None and not consumer_layer_vars:
+            model.Add(cl <= last_cons + 1 + eff_cancel_slack)
+        elif eff_cancel_slack is not None and not consumer_layer_vars:
             # No layer-bound consumers — cancel can fire right after
             # the node's own birth layer.
-            model.Add(cl <= layer_var[n.node_id] + 1 + cancel_slack)
+            model.Add(cl <= layer_var[n.node_id] + 1 + eff_cancel_slack)
+
+    # ---- Freeable input cancel layers ----
+    # Freeable inputs are born at layer 0 (pre-allocated by the compiler
+    # before the layer loop) and live until their last consumer runs, mirroring
+    # the schedulable cancel logic with a fixed birth at 0.  An input feeding a
+    # terminal `Concatenate` (output cone) is kept forever.
+    input_cancel_layer: Dict[int, cp_model.IntVar] = {}
+    for n in freeable_inputs:
+        cl = model.NewIntVar(0, max_layers, f"cl_in{n.node_id}")
+        input_cancel_layer[n.node_id] = cl
+        model.Add(cl >= 1)  # born at layer 0; live through at least layer 0
+        keep_forever = False
+        consumer_layer_vars = []
+        for c in gm.consumers_eff.get(n, set()):
+            if isinstance(c, Concatenate):
+                model.Add(cl == max_layers)
+                keep_forever = True
+                break
+            if c.node_id in layer_var:
+                if "cancel_consumer_lb" not in _disabled_families:
+                    model.Add(cl >= layer_var[c.node_id] + 1)
+                consumer_layer_vars.append(layer_var[c.node_id])
+        if keep_forever:
+            continue
+        if eff_cancel_slack is not None and consumer_layer_vars:
+            last_cons = model.NewIntVar(
+                0, max_layers - 1, f"last_cons_in{n.node_id}"
+            )
+            model.AddMaxEquality(last_cons, consumer_layer_vars)
+            model.Add(cl <= last_cons + 1 + eff_cancel_slack)
+        elif eff_cancel_slack is not None and not consumer_layer_vars:
+            model.Add(cl <= 1 + eff_cancel_slack)
 
     # ---- Add free/compute classification ----
     # The heuristic schedules an `Add` via `add_into` (free regime)
@@ -874,11 +925,27 @@ def solve_schedule(
         dirty_intervals.append(d_iv)
         dirty_demands.append(len(n))
 
+    # Freeable inputs pay a DEATH-layer cancel head (their columns hold the
+    # input value and must be zeroed before any downstream additive write
+    # reuses them), so they consume the per-layer head budget exactly like a
+    # scheduled node's death cancel.  They never need a BIRTH-dirty cancel:
+    # the compiler marks input columns clean at allocation, so the first reuse
+    # after the input is freed lands on already-clean columns.
+    for n in freeable_inputs:
+        cl_in = input_cancel_layer[n.node_id]
+        c_end = model.NewIntVar(1, max_layers + 2, f"cend_in{n.node_id}")
+        model.Add(c_end == cl_in + 1)
+        iv = model.NewIntervalVar(cl_in, 1, c_end, f"civ_in{n.node_id}")
+        cancel_intervals.append(iv)
+        cancel_demands.append(len(n))
+
     # `reserve_heads` is a safety knob for graphs whose attention
     # heads are saturated by ops outside the model (e.g. bias writes
     # folded into deferred Linears); default 0.
     effective_capacity = max(0, n_heads_per_layer - reserve_heads) * d_head
-    if attn_intervals or cancel_intervals or dirty_intervals:
+    if "attn_cumulative" not in _disabled_families and (
+        attn_intervals or cancel_intervals or dirty_intervals
+    ):
         model.AddCumulative(
             attn_intervals + cancel_intervals + dirty_intervals,
             attn_demands + cancel_demands + dirty_demands,
@@ -909,7 +976,7 @@ def solve_schedule(
         )
         mlp_intervals.append(iv)
         mlp_demands.append(c.width)
-    if mlp_intervals:
+    if "mlp_cumulative" not in _disabled_families and mlp_intervals:
         model.AddCumulative(mlp_intervals, mlp_demands, d_hidden)
 
     # ---- Residual cumulative ----
@@ -927,7 +994,16 @@ def solve_schedule(
         )
         resid_intervals.append(iv)
         resid_demands.append(len(n))
-    if resid_intervals:
+    # Freeable inputs occupy residual columns from layer 0 until their cancel
+    # layer.  Counting them here (instead of pre-subtracting their width from
+    # `available_residual`) lets the solver reclaim their columns for
+    # intermediates once they die — the whole point of the input-freeing fix.
+    for n in freeable_inputs:
+        cl_in = input_cancel_layer[n.node_id]
+        iv = model.NewIntervalVar(0, cl_in, cl_in, f"riv_in{n.node_id}")
+        resid_intervals.append(iv)
+        resid_demands.append(len(n))
+    if "residual_cumulative" not in _disabled_families and resid_intervals:
         model.AddCumulative(resid_intervals, resid_demands, available_residual)
 
     # ---- Aggregate counters for the objective ----
@@ -997,6 +1073,138 @@ def solve_schedule(
         + costs.gamma * total_mlp_bypass
     )
 
+    return BuiltModel(
+        model=model,
+        gm=gm,
+        layer_var=layer_var,
+        cancel_layer=cancel_layer,
+        is_attn=is_attn,
+        is_free=is_free,
+        n_layers_var=n_layers_var,
+        total_attn_heads=total_attn_heads,
+        total_mlp_bypass=total_mlp_bypass,
+        available_residual=available_residual,
+        n_heads_per_layer=n_heads_per_layer,
+        input_cancel_layer=input_cancel_layer,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Solver
+# ---------------------------------------------------------------------------
+
+
+def solve_schedule(
+    output_node: Node,
+    pos_encoding: PosEncoding,
+    *,
+    d: int,
+    d_head: int,
+    d_hidden: int,
+    costs: Costs = Costs(),
+    flex_routing: bool = True,
+    time_budget_s: float = 60.0,
+    max_layers: int = 60,
+    hint_layers: Optional[Dict[int, int]] = None,
+    hint_routing: Optional[Dict[int, str]] = None,
+    hint_cancel: Optional[Dict[int, int]] = None,
+    cancel_slack: Optional[int] = 2,
+    policy: Optional[SchedulingPolicy] = None,
+    log_search_progress: bool = False,
+    reserve_heads: int = 0,
+    assume_zero_init: bool = False,
+) -> Tuple[Optional[ScheduleAssignment], SolveStats]:
+    """Build and solve the CP-SAT scheduling model.
+
+    Returns ``(assignment, stats)``.  ``assignment`` is ``None`` when
+    the solver found no feasible solution within the budget; check
+    ``stats.is_optimal`` to distinguish proven-optimal from
+    feasible-only.  Callers decide what to do with non-optimal /
+    no-solution outcomes (the forward compiler falls back to the
+    heuristic; the probe script just reports them).
+
+    Args:
+        output_node: graph output. Defines the ancestor cone the
+            scheduler operates over.
+        pos_encoding: positional encoding node (always allocated by
+            ``forward_compile``; subtracted from the residual budget).
+        d, d_head, d_hidden: transformer geometry. ``n_heads_per_layer
+            = d // d_head``.  Residual budget is
+            ``d - input_residual_cols``.
+        costs: objective weights. See :class:`Costs`.
+        flex_routing: if True, CP-SAT picks attention vs MLP for each
+            standalone ``Linear``.  If False, standalone Linears use
+            the static routing dictated by ``policy.local_in_attention``.
+        time_budget_s: per-solve wall-clock cap.
+        max_layers: search horizon.  Should be at least the heuristic's
+            layer count.
+        hint_layers: optional warm-start mapping ``node_id -> layer``.
+        hint_routing: optional warm-start mapping
+            ``node_id -> "attn"|"mlp"`` for flex Linears.  When the
+            heuristic placed a standalone Linear in attention vs
+            MLP-bypass, hinting the same routing lets CP-SAT
+            reconstruct the heuristic's solution as a starting
+            incumbent.
+        hint_cancel: optional warm-start mapping ``node_id -> layer``
+            for the cancel layer.  Captures when the heuristic freed
+            each node's columns; combined with ``hint_layers`` this
+            gives a complete schedule the solver can verify and
+            improve from.
+        cancel_slack: when not None, restrict each non-pinned node's
+            cancel layer to ``[earliest_dead, earliest_dead + K]``
+            where ``earliest_dead = max(layer[c] + 1)`` over consumers
+            and ``K == cancel_slack``.  Cuts the cancel-decision
+            search space ~30x at K=2 with negligible loss of
+            optimality (the heuristic almost always cancels within
+            1–2 layers of the last consumer).  Set to None to keep
+            the wide ``[layer[n]+1, max_layers]`` domain.  Default 2.
+        policy: only consulted when ``flex_routing=False``.  Defaults
+            to ``LEGACY_POLICY``.
+        log_search_progress: if True, the solver's progress log is
+            forwarded line-by-line and accumulated in
+            ``stats.solver_log``.
+        reserve_heads: per-layer attention-head budget reserved
+            beyond the modeled compute + cancel + dirty terms.
+            Defaults to 0.  Raise it for graphs whose attention heads
+            are saturated by ops outside the model.
+        assume_zero_init: if True, the model assumes the runtime
+            zero-initialises the residual stream (so the heuristic
+            emits no BIRTH-layer dirty-column cancels for fresh
+            allocations on the initially-free pool).  Pair this with
+            ``forward_compile(assume_zero_init=True)`` so the heuristic
+            and CP-SAT model agree.  Defaults to False — the
+            conservative model that mirrors the heuristic's defensive
+            BIRTH-layer cancellation of fresh allocations.
+
+    Raises ``RuntimeError`` only on structural problems (no residual
+    columns left after pre-allocated inputs).  Solver-outcome
+    handling (no-incumbent, FEASIBLE-not-OPTIMAL) is the caller's
+    responsibility.
+    """
+    built = build_cpsat_model(
+        output_node,
+        pos_encoding,
+        d=d,
+        d_head=d_head,
+        d_hidden=d_hidden,
+        costs=costs,
+        flex_routing=flex_routing,
+        max_layers=max_layers,
+        cancel_slack=cancel_slack,
+        policy=policy,
+        reserve_heads=reserve_heads,
+        assume_zero_init=assume_zero_init,
+    )
+    model = built.model
+    gm = built.gm
+    layer_var = built.layer_var
+    cancel_layer = built.cancel_layer
+    is_attn = built.is_attn
+    n_layers_var = built.n_layers_var
+    total_attn_heads = built.total_attn_heads
+    total_mlp_bypass = built.total_mlp_bypass
+    input_cancel_layer = built.input_cancel_layer
+
     # ---- Hint ----
     # A complete hint (layer + routing + cancel) gives CP-SAT a
     # full feasible incumbent it can verify and improve from, which
@@ -1015,6 +1223,13 @@ def solve_schedule(
         for nid, L in hint_cancel.items():
             if nid in cancel_layer and 0 <= L <= max_layers:
                 model.AddHint(cancel_layer[nid], L)
+            elif nid in input_cancel_layer and 0 <= L <= max_layers:
+                # The warm-start's tracking residual map records `free()`
+                # for input nodes too, so route their captured cancel layer
+                # to the input cancel vars — without this the input cancels
+                # are unhinted and CP-SAT cannot accept the heuristic
+                # schedule as a ready-made feasible incumbent.
+                model.AddHint(input_cancel_layer[nid], L)
 
     # ---- Decision strategy: schedule by critical path first ----
     nodes_by_cp = sorted(
@@ -1055,6 +1270,12 @@ def solve_schedule(
             node_to_routing[n.node_id] = (
                 ATTN if solver.Value(is_attn[n.node_id]) else MLP
             )
+        # Freeable inputs get a cancel layer (but no layer/routing — they are
+        # pre-computed at layer 0).  ``DirectedLayerScheduler._find_dead_nodes``
+        # frees any allocated node whose cancel layer matches the current
+        # layer, so adding inputs here makes the replay reclaim their columns.
+        for nid, cl_in in input_cancel_layer.items():
+            node_to_cancel_layer[nid] = solver.Value(cl_in)
         n_layers = solver.Value(n_layers_var)
         total_heads = solver.Value(total_attn_heads)
         total_bypass = solver.Value(total_mlp_bypass)

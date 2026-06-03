@@ -562,6 +562,7 @@ def compile_headless_to_onnx(
     extra_metadata: Optional[dict] = None,
     d_hidden: Optional[int] = None,
     trim_heads: bool = True,
+    assume_zero_init: bool = True,
 ) -> None:
     """Compile a float-I/O graph to a KV-cached ONNX model.
 
@@ -582,6 +583,12 @@ def compile_headless_to_onnx(
     ``d_hidden`` is the per-layer MLP hidden width.  Defaults to ``d``
     when omitted; pass an explicit value to decouple the MLP intermediate
     width from the residual stream width.
+
+    ``assume_zero_init`` defaults to ``True`` (see :func:`compile_to_onnx`):
+    the ONNX runtime always builds the residual stream from zeros plus the
+    input projections, so BIRTH-layer dirty-column cancels are unnecessary and
+    skipping them keeps the CP-SAT attention-head cumulative from being
+    over-tight under width pressure.
     """
     dense_inits: list = []
     sparse_inits: list = []
@@ -608,6 +615,7 @@ def compile_headless_to_onnx(
         on_layer_compiled=on_layer_compiled,
         d_hidden=d_hidden,
         trim_heads=trim_heads,
+        assume_zero_init=assume_zero_init,
     )
     t_compile = time.perf_counter() - t0
 
@@ -759,6 +767,7 @@ def compile_to_onnx(
     verbose: bool = True,
     trim_heads: bool = True,
     optimize: int = 0,
+    assume_zero_init: bool = True,
 ) -> None:
     """Compile a token-I/O graph to a KV-cached ONNX model.
 
@@ -775,6 +784,20 @@ def compile_to_onnx(
 
     Prefill = empty past + past_len=0; decode = feed back the new_K_i /
     new_V_i from a prior run with the accumulated past_len.
+
+    ``assume_zero_init`` defaults to ``True`` here (unlike ``forward_compile``,
+    which defaults ``False``): the ONNX runtime always constructs the residual
+    stream from zeros plus the input projections (see
+    ``HeadlessTransformer.get_input_res_stream`` /
+    ``_OnnxRuntime._build_res_stream``), so the initially-free residual columns
+    are guaranteed clean on entry.  The compiler can therefore skip the
+    BIRTH-layer dirty-column cancels that defend against a non-zero residual
+    stream — those cancels are pure overhead the ONNX runtime never needs, and
+    modelling them per-allocation makes the CP-SAT attention-head cumulative
+    over-tight under width pressure (it charges every fresh allocation a
+    full-width dirty cancel, while the replay only clears the genuinely-dirty
+    initial-pool subset).  No ONNX caller can supply a non-zero stream, so
+    ``True`` is always sound for this entry point.
     """
     dense_inits: list = []
     sparse_inits: list = []
@@ -801,6 +824,7 @@ def compile_to_onnx(
         on_layer_compiled=on_layer_compiled,
         trim_heads=trim_heads,
         optimize=optimize,
+        assume_zero_init=assume_zero_init,
     )
     t_compile = time.perf_counter() - t0
 

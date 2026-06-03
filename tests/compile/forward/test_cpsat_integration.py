@@ -416,13 +416,115 @@ def test_cpsat_falls_back_to_heuristic_when_no_incumbent(monkeypatch):
     monkeypatch.setattr(compile_mod, "solve_schedule", fake_solve)
 
     out, inputs = _build_branchy()
+    # The fallback now warns loudly (RuntimeWarning) so it can't masquerade
+    # as a solve; the compile is still valid.
+    with pytest.warns(RuntimeWarning, match="UNOPTIMIZED|fall(ing|s)? back"):
+        net = forward_compile(
+            d=D,
+            d_head=D_HEAD,
+            output_node=out,
+            verbose=False,
+            optimize=1,
+        )
+    actual = net.compute(2, inputs)[out].cpu()
+    expected = out.compute(2, inputs)
+    torch.testing.assert_close(actual, expected, atol=1e-4, rtol=1e-4)
+
+
+def test_cpsat_frees_wide_input_for_intermediate():
+    """A wide input consumed early must be freed so its columns carry a
+    wide downstream intermediate.
+
+    Regression for the input-freeing fix.  The token-`Embedding`-shaped
+    case in miniature: a 24-wide input ``x`` feeds one narrow ``Linear``
+    and is then dead, after which a 40-wide standalone ``Linear`` ``b``
+    must materialise.  At ``d=64`` with a 9-wide ``pos_encoding``:
+
+      * Pinning ``x`` forever (the pre-fix model) leaves only
+        ``64 - 24 - 9 = 31`` residual columns for intermediates — less
+        than ``b``'s 40, so the residual cumulative is INFEASIBLE and
+        CP-SAT falls back.  ``require_solver=True`` turns that silent
+        regression into a hard error.
+      * Freeing ``x`` once its consumer runs (the fix) frees its 24
+        columns, leaving ``64 - 9 = 55`` for ``b`` (40) plus the narrow
+        ``a`` (4) — a comfortable fit, so CP-SAT solves.
+
+    The compiled output must match the graph oracle: the directed replay
+    has to actually reclaim ``x``'s columns and reuse them for ``b``.
+    """
+    from torchwright.graph.pos_encoding import PosEncoding
+
+    torch.manual_seed(0)
+    x = create_input("x", 24)
+    a = Linear(x, torch.randn(24, 4), torch.zeros(4), name="a")
+    b = Linear(a, torch.randn(4, 40), torch.zeros(40), name="b")
+    out = Linear(b, torch.randn(40, 4), torch.zeros(4), name="out")
+
     net = forward_compile(
-        d=D,
-        d_head=D_HEAD,
+        d=64,
+        d_head=8,
         output_node=out,
+        pos_encoding=PosEncoding(9),
         verbose=False,
         optimize=1,
+        require_solver=True,
     )
+    # require_solver=True would have raised on a fallback, so reaching here
+    # means CP-SAT produced a real assignment.
+    assert net.cpsat_solve_stats is not None
+    assert net.cpsat_solve_stats.status_name in ("OPTIMAL", "FEASIBLE")
+
+    inputs = {"x": torch.randn(2, 24)}
+    actual = net.compute(2, inputs)[out].cpu()
+    expected = out.compute(2, inputs)
+    torch.testing.assert_close(actual, expected, atol=1e-4, rtol=1e-4)
+
+
+def test_require_solver_raises_on_fallback(monkeypatch):
+    """``require_solver=True`` converts a silent CP-SAT fallback into a hard
+    error; the default (``require_solver=False``) warns loudly instead of
+    failing silently.  Regression guard for the silent-fallback footgun.
+    """
+    from torchwright.compiler.forward import compile as compile_mod
+    from torchwright.compiler.forward.cpsat_scheduler import SolveStats
+
+    fake_stats = SolveStats(
+        status_name="INFEASIBLE",
+        objective_value=-1,
+        best_objective_bound=0.0,
+        wall_time_s=0.0,
+        solver_log="",
+        total_attn_heads=-1,
+        total_mlp_bypass_slots=-1,
+        is_optimal=False,
+    )
+    monkeypatch.setattr(
+        compile_mod, "solve_schedule", lambda *a, **k: (None, fake_stats)
+    )
+
+    out, inputs = _build_branchy()
+
+    # require_solver=True -> raise rather than silently fall back.
+    with pytest.raises(RuntimeError, match="no usable assignment|require_solver"):
+        forward_compile(
+            d=D,
+            d_head=D_HEAD,
+            output_node=out,
+            verbose=False,
+            optimize=1,
+            require_solver=True,
+        )
+
+    # require_solver=False (default) -> warn, fall back, still produce a
+    # correct compile.
+    with pytest.warns(RuntimeWarning, match="UNOPTIMIZED|fall(ing|s)? back"):
+        net = forward_compile(
+            d=D,
+            d_head=D_HEAD,
+            output_node=out,
+            verbose=False,
+            optimize=1,
+        )
     actual = net.compute(2, inputs)[out].cpu()
     expected = out.compute(2, inputs)
     torch.testing.assert_close(actual, expected, atol=1e-4, rtol=1e-4)
