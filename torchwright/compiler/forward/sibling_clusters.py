@@ -51,6 +51,7 @@ from typing import Dict, List, Optional, Set, Tuple
 
 from torchwright.compiler.forward.graph_analysis import GraphAnalyzer
 from torchwright.graph import Concatenate, Linear, Node
+from torchwright.graph.misc import LiteralValue
 from torchwright.graph.relu import ReLU
 
 
@@ -176,8 +177,15 @@ class SiblingClusterAnalyzer:
         for idx, inp in enumerate(inputs):
             exclusive = per_input_reachable[idx] - union_others_cache[idx]
             # Filter out input nodes — they're always live and not
-            # candidates for admission gating.
-            exclusive = {n for n in exclusive if not self.graph.is_input_node(n)}
+            # candidates for admission gating.  LiteralValue is likewise
+            # excluded: constants are width-small and now materialized
+            # just-in-time, not the wide-intermediate chains admission
+            # control targets.
+            exclusive = {
+                n
+                for n in exclusive
+                if not self.graph.is_input_node(n) and not isinstance(n, LiteralValue)
+            }
             if not exclusive:
                 continue
 

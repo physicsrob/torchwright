@@ -826,6 +826,63 @@ def test_mlp_constant():
     assert torch.allclose(result.cpu(), expected, atol=1e-6)
 
 
+def test_compute_literal_value_clears_dirty_column():
+    """A constant materialized into a column that still holds a dead node's
+    leftover value must come out equal to the constant — not constant+leftover.
+
+    Just-in-time materialization makes constants reuse *recycled* residual
+    columns (previously every constant owned a fresh layer-0 column, so this
+    path was never exercised — the investigation flagged it).  The birth
+    dirty-cancel (attn sublayer, ``x + (-x) = 0``) must zero the column before
+    the MLP output-bias write adds the constant.  Reproduced deterministically:
+    seed the target column with non-zero garbage, schedule cancel +
+    compute_literal_value on it, and assert the result is exactly the constant.
+    """
+    const_value = torch.tensor([5.0, -7.0, 3.0])
+    const = LiteralValue(const_value)
+
+    pos = _make_pos_encoding()
+    rmap = ResidualStreamMap(D)
+    rmap.allocate(pos)
+    const_cols = rmap.allocate(const)
+
+    layer = TransformerLayer(D, D_HEAD, pos)
+    # Attn sublayer: dirty-cancel the recycled target columns.
+    write_attn_sublayer(
+        layer,
+        [AttnHeadOp(op_type="cancel", node=const, target_cols=const_cols)],
+        rmap,
+        pos,
+    )
+    # MLP sublayer: write the constant via output bias.
+    write_mlp_sublayer(
+        layer,
+        [MLPOp(
+            op_type="compute_literal_value",
+            node=const,
+            target_cols=const_cols,
+            mlp_slots=[],
+        )],
+        rmap,
+    )
+    layer.to(device_mod.get_device(verbose=False))
+
+    # Seed the target columns with a dead node's non-zero leftover value.
+    garbage = torch.tensor([[111.0, -222.0, 333.0]]).repeat(N_POS, 1)
+    pe_values = pos.compute(N_POS, {})
+    res = _build_residual_stream(rmap, {pos: pe_values, const: garbage})
+
+    out = layer.attn.forward(res)  # cancel zeroes the dirty column
+    out = layer.mlp.forward(out)  # bias write adds the constant onto zero
+
+    result = out[:, const_cols].cpu()
+    expected = const_value.unsqueeze(0).repeat(N_POS, 1)
+    assert torch.allclose(result, expected, atol=1e-4), (
+        f"dirty column not cleared before bias write: got {result[0].tolist()}, "
+        f"expected {const_value.tolist()}"
+    )
+
+
 # ---------------------------------------------------------------------------
 # Biased Linear split (attention Wx + MLP b)
 # ---------------------------------------------------------------------------

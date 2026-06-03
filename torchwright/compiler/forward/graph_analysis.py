@@ -8,7 +8,6 @@ from torchwright.graph import (
     Assert,
     Concatenate,
     DebugWatch,
-    LiteralValue,
     InputNode,
     PosEncoding,
     Embedding,
@@ -201,7 +200,12 @@ class GraphAnalyzer:
         return self._all_nodes
 
     def is_input_node(self, node: Node) -> bool:
-        return isinstance(node, (Embedding, PosEncoding, InputNode, LiteralValue))
+        # LiteralValue is deliberately NOT an input node.  Constants are
+        # first-class *schedulable* nodes, materialized just-in-time via the
+        # compute_literal_value op near their consumer and freed after use —
+        # not residual columns pre-allocated at layer 0 and held for the whole
+        # network.  See constants_plan.md.
+        return isinstance(node, (Embedding, PosEncoding, InputNode))
 
     def is_ready(self, node: Node, available: Set[Node]) -> bool:
         """Check if all of a node's inputs are available.

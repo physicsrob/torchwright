@@ -93,20 +93,27 @@ class LayerScheduler:
         Returns:
             ``(attn_ops, mlp_ops, biased_linears)`` lists for the weight writer.
         """
-        # Admission-control bookkeeping for this call.
+        # Admission-control / literal-deferral bookkeeping for this call.
         self._admission_deferred = False
+        self._literal_deferred = False
         self._admission_bypass = False
 
         attn_ops, mlp_ops, biased_linears, had_schedulable = self._schedule_layer_inner(
             residual_map, computed_nodes
         )
 
-        # Deadlock guard: if admission deferred every compute candidate and
-        # nothing else was schedulable, retry with admission bypassed.  This
-        # is only safe when no state was mutated (no free_adds, no cancels,
-        # no placements) — all of those append to attn_ops, so the
-        # emptiness check is sufficient.
-        if not attn_ops and not mlp_ops and self._admission_deferred:
+        # Deadlock guard: if the only thing that could have run was deferred —
+        # either an admission-gated chain or a just-in-time-gated constant —
+        # and nothing else was schedulable, retry with both gates bypassed.
+        # Safe only when no state was mutated (no free_adds, no cancels, no
+        # placements) — all of those append to attn_ops, so the emptiness
+        # check is sufficient.  ``_admission_bypass`` lifts both gates
+        # (admission and the literal JIT gate; see _literal_needed_now).
+        if (
+            not attn_ops
+            and not mlp_ops
+            and (self._admission_deferred or self._literal_deferred)
+        ):
             self._admission_bypass = True
             attn_ops, mlp_ops, biased_linears, had_schedulable = (
                 self._schedule_layer_inner(residual_map, computed_nodes)
@@ -790,6 +797,12 @@ class LayerScheduler:
             key=self._critical_path_key,
         )
         for node in constants:
+            if not self._literal_needed_now(node, computed_nodes):
+                # No consumer needs it yet.  Leave it in ``ready`` (it has no
+                # inputs, so it reappears every layer) and materialize it
+                # just-in-time when a consumer becomes ready-except-literals.
+                self._literal_deferred = True
+                continue
             if not self._is_admissible(node):
                 self._admission_deferred = True
                 continue
@@ -958,6 +971,54 @@ class LayerScheduler:
             else:
                 result.add(consumer)
         return result
+
+    def _literal_needed_now(self, node: Node, computed_nodes: Set[Node]) -> bool:
+        """Just-in-time gate for a ``LiteralValue`` (heuristic scheduler).
+
+        A constant has no inputs, so it is "ready" from layer 0; scheduling
+        it eagerly would hold a residual column across the whole network.
+        Instead, materialize it only once some effective consumer has all of
+        its *non-constant* inputs computed — the same layer that consumer's
+        last such input lands.  The consumer is then ready next layer exactly
+        as if the constant had been pre-placed (no added latency to the
+        consumer), and the column is held only briefly.  See constants_plan.md.
+
+        Under the deadlock-retry bypass (``_admission_bypass``) the gate is
+        lifted so a stalled layer can always make progress (see
+        :meth:`schedule_layer`).
+        """
+        if getattr(self, "_admission_bypass", False):
+            return True
+        consumers = self._get_effective_consumers(node)
+        if not consumers:
+            # An output (or otherwise unconsumed) constant has nothing to
+            # wait for — materialize it so the output reader can find it.
+            return True
+        for consumer in consumers:
+            if self._ready_except_literals(consumer, computed_nodes):
+                return True
+        return False
+
+    def _ready_except_literals(self, node: Node, computed_nodes: Set[Node]) -> bool:
+        """True if every non-``LiteralValue`` effective input of ``node`` (and
+        every scheduling predecessor) is in ``computed_nodes``.
+
+        Concatenate inputs are walked transparently to their leaves.  A node
+        whose only inputs are constants is trivially ready-except-literals, so
+        a pure-constant computation materializes immediately."""
+        for inp in node.inputs:
+            leaves = (
+                flatten_concat_nodes([inp]) if isinstance(inp, Concatenate) else [inp]
+            )
+            for leaf in leaves:
+                if isinstance(leaf, LiteralValue):
+                    continue
+                if leaf not in computed_nodes:
+                    return False
+        for pred in node.scheduling_predecessors:
+            if pred not in computed_nodes:
+                return False
+        return True
 
     def _is_dead(self, node: Node, computed_nodes: Set[Node]) -> bool:
         if node is self.pos_encoding:
@@ -1307,6 +1368,12 @@ class DirectedLayerScheduler(LayerScheduler):
 
     def _route_linear_to_attn(self, node: Linear) -> bool:
         return self._assignment.node_to_routing.get(node.node_id) == "attn"
+
+    def _literal_needed_now(self, node: Node, computed_nodes: Set[Node]) -> bool:
+        # Assignment-driven: the CP-SAT layer assignment already places each
+        # constant just-in-time, and ``_get_ready_nodes`` only releases it at
+        # its assigned layer.  No consumer-readiness gate here.
+        return True
 
     def _find_dead_nodes(
         self, residual_map: ResidualStreamMap, computed_nodes: Set[Node]
