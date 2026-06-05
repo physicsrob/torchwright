@@ -35,11 +35,19 @@ from torchwright.ops.attention_ops import (
     attend_argmin_where,
     attend_argmax_where,
     attend_argmin_above_integer,
+    attend_argmin_above_in_bucket,
     attend_argmin_unmasked,
     attend_argmin_valid_unmasked,
     attend_mean_where,
     attend_most_recent_matching,
+    _QUERY_GAIN,
+    _VALIDITY_BONUS,
+    _BUCKET_BONUS,
+    _ABOVE_MATCH_BONUS,
+    _ABOVE_BONUS,
 )
+from torchwright.graph.attn import Attn
+from torchwright.graph.misc import Assert
 
 
 def _pe() -> PosEncoding:
@@ -1235,7 +1243,9 @@ def test_most_recent_matching_exclude_self():
     query_in = torch.eye(4)[torch.tensor([0, 0, 0, 0])]
     value_in = torch.tensor([[10.0], [20.0], [30.0], [40.0]])
 
-    result_default = _run(out_default, n_pos, query=query_in, key=key_in, value=value_in)
+    result_default = _run(
+        out_default, n_pos, query=query_in, key=key_in, value=value_in
+    )
     result_excl = _run(out_excl, n_pos, query=query_in, key=key_in, value=value_in)
 
     # Sanity: default mode picks self when self matches.
@@ -1271,3 +1281,627 @@ def test_most_recent_matching_exclude_self_accepts_wide_width():
     attend_most_recent_matching(
         pe, wide_query, wide_key, narrow_value, exclude_self=True
     )
+
+
+# ---------------------------------------------------------------------------
+# attend_argmin_above_in_bucket
+# ---------------------------------------------------------------------------
+#
+# Filtered argmin over the past: at each query position, pick the smallest
+# `score` among earlier rows that are valid, in a requested bucket, and
+# above a requested threshold.  Bucket = equality lookup (one-hot row +
+# one-hot picker); threshold = greater-than lookup (a "run of 1s up to the
+# score" row + one-hot picker).  These tests run the exact-math
+# `node.compute` path; the compiled fp32 round-trip lives in
+# tests/compile/forward/test_bucketed_argmin.py.
+
+
+def _onehot(idx, width):
+    v = torch.zeros(width)
+    v[idx] = 1.0
+    return v
+
+
+def _onehot_rows(indices, width):
+    return torch.stack([_onehot(i, width) for i in indices])
+
+
+def _above_table(scores, thresholds):
+    """Key-side `score_above_each_threshold`: slot c == 1 iff score > thresholds[c]."""
+    out = torch.zeros(len(scores), len(thresholds))
+    for i, s in enumerate(scores):
+        for c, t in enumerate(thresholds):
+            out[i, c] = 1.0 if s > t else 0.0
+    return out
+
+
+def _unwrap_attn(node):
+    """Peel any Assert wrappers off a hard-selection output to reach the Attn."""
+    while isinstance(node, Assert):
+        node = node.inputs[0]
+    assert isinstance(node, Attn), f"expected Attn, got {type(node).__name__}"
+    return node
+
+
+def _baib_nodes(nb, nt, value_width=4, *, assert_hardness_gt=None):
+    score = assert_integer(InputNode("baib_score", 1, value_range=(-100.0, 100.0)))
+    validity = InputNode("baib_validity", 1, value_range=(-2.0, 2.0))
+    key_bucket = InputNode("baib_kb", nb, value_range=(-2.0, 2.0))
+    above = InputNode("baib_above", nt, value_range=(-2.0, 2.0))
+    query_bucket = InputNode("baib_qb", nb, value_range=(-2.0, 2.0))
+    threshold = InputNode("baib_th", nt, value_range=(-2.0, 2.0))
+    value = InputNode("baib_value", value_width, value_range=(-100.0, 100.0))
+    return attend_argmin_above_in_bucket(
+        _pe(),
+        score,
+        validity,
+        key_bucket,
+        above,
+        query_bucket,
+        threshold,
+        value,
+        assert_hardness_gt=assert_hardness_gt,
+    )
+
+
+def _run_baib(
+    out,
+    n_pos,
+    *,
+    scores,
+    buckets,
+    valid,
+    thresholds,
+    q_bucket,
+    q_thresh,
+    value_in,
+    nb,
+    nt,
+    above_override=None,
+    perturb=None,
+):
+    kb = _onehot_rows(buckets, nb)
+    qb = _onehot_rows(q_bucket, nb)
+    th = _onehot_rows(q_thresh, nt)
+    above = (
+        _above_table(scores, thresholds) if above_override is None else above_override
+    )
+    if perturb is not None:
+        # Soften every "1.0" toward a near-clean value to mimic compiled noise.
+        for t in (kb, qb, th, above):
+            t[t == 1.0] = perturb
+    return _run(
+        out,
+        n_pos,
+        baib_score=torch.tensor([[float(s)] for s in scores]),
+        baib_validity=torch.tensor([[float(v)] for v in valid]),
+        baib_kb=kb,
+        baib_above=above,
+        baib_qb=qb,
+        baib_th=th,
+        baib_value=value_in,
+    )
+
+
+def test_baib_picks_lowest_valid_in_bucket_above():
+    """Among rows that are valid, in the queried bucket, and above the queried
+    threshold, the smallest score wins."""
+    nb, nt = 3, 5
+    out = _baib_nodes(nb, nt)
+    n_pos = 5
+    scores = [6, 4, 8, 3, 5]
+    buckets = [1, 1, 1, 0, 1]  # row 3 is in a different bucket
+    valid = [1, 1, 1, 1, 1]
+    thresholds = [0, 1, 2, 3, 4]  # slot c -> score > c
+    res = _run_baib(
+        out,
+        n_pos,
+        scores=scores,
+        buckets=buckets,
+        valid=valid,
+        thresholds=thresholds,
+        q_bucket=[1] * n_pos,
+        q_thresh=[2] * n_pos,
+        value_in=torch.eye(n_pos, 4),
+        nb=nb,
+        nt=nt,
+    )
+    # threshold slot 2 -> score > 2; bucket 1.
+    #  q0: {row0=6}                              -> row0
+    #  q1: {6, 4}                                -> row1 (4)
+    #  q4: {6, 4, 8, 5}  (row3 bucket 0 excluded)-> row1 (4)
+    assert res[0].argmax().item() == 0, res[0]
+    assert res[1].argmax().item() == 1, res[1]
+    assert res[4].argmax().item() == 1, res[4]
+
+
+def test_baib_ignores_wrong_bucket():
+    """A valid, above-threshold row in the WRONG bucket loses to a worse-score
+    row in the right bucket."""
+    nb, nt = 3, 4
+    out = _baib_nodes(nb, nt)
+    n_pos = 2
+    res = _run_baib(
+        out,
+        n_pos,
+        scores=[1, 5],
+        buckets=[0, 1],
+        valid=[1, 1],
+        thresholds=[0, 1, 2, 3],
+        q_bucket=[1, 1],
+        q_thresh=[0, 0],
+        value_in=torch.eye(n_pos, 4),
+        nb=nb,
+        nt=nt,
+    )
+    # row0 has the lower score (1) but is in bucket 0; query wants bucket 1.
+    assert res[1].argmax().item() == 1, res[1]
+
+
+def test_baib_ignores_not_above_threshold():
+    """A valid, in-bucket row whose score is NOT above the threshold loses."""
+    nb, nt = 2, 6
+    out = _baib_nodes(nb, nt)
+    n_pos = 2
+    res = _run_baib(
+        out,
+        n_pos,
+        scores=[3, 5],
+        buckets=[1, 1],
+        valid=[1, 1],
+        thresholds=[0, 1, 2, 3, 4, 5],
+        q_bucket=[1, 1],
+        q_thresh=[4, 4],
+        value_in=torch.eye(n_pos, 4),
+        nb=nb,
+        nt=nt,
+    )
+    # threshold slot 4 -> score > 4. row0 score 3 not above; row1 score 5 above.
+    assert res[1].argmax().item() == 1, res[1]
+
+
+def test_baib_ignores_invalid():
+    """An invalid row otherwise matching (and with the lowest score) loses."""
+    nb, nt = 2, 4
+    out = _baib_nodes(nb, nt)
+    n_pos = 2
+    res = _run_baib(
+        out,
+        n_pos,
+        scores=[1, 5],
+        buckets=[1, 1],
+        valid=[-1, 1],
+        thresholds=[0, 1, 2, 3],
+        q_bucket=[1, 1],
+        q_thresh=[0, 0],
+        value_in=torch.eye(n_pos, 4),
+        nb=nb,
+        nt=nt,
+    )
+    # row0 score 1 is invalid; row1 score 5 valid -> row1.
+    assert res[1].argmax().item() == 1, res[1]
+
+
+def test_baib_query_bucket_varies_per_position():
+    """A per-position query bucket selects a different row at each position."""
+    nb, nt = 3, 4
+    out = _baib_nodes(nb, nt)
+    n_pos = 3
+    res = _run_baib(
+        out,
+        n_pos,
+        scores=[5, 5, 5],
+        buckets=[0, 1, 2],
+        valid=[1, 1, 1],
+        thresholds=[0, 1, 2, 3],
+        q_bucket=[0, 1, 2],
+        q_thresh=[0, 0, 0],
+        value_in=torch.eye(n_pos, 4),
+        nb=nb,
+        nt=nt,
+    )
+    # Each row is alone in its bucket; query k asks bucket k (visible by pos k).
+    assert res[0].argmax().item() == 0, res[0]
+    assert res[1].argmax().item() == 1, res[1]
+    assert res[2].argmax().item() == 2, res[2]
+
+
+def test_baib_query_threshold_varies_per_position():
+    """A per-position query threshold selects a different row at each position."""
+    nb, nt = 1, 5
+    out = _baib_nodes(nb, nt)
+    n_pos = 3
+    res = _run_baib(
+        out,
+        n_pos,
+        scores=[2, 4, 6],
+        buckets=[0, 0, 0],
+        valid=[1, 1, 1],
+        thresholds=[1, 2, 3, 4, 5],
+        q_bucket=[0, 0, 0],
+        q_thresh=[0, 2, 4],
+        value_in=torch.eye(n_pos, 4),
+        nb=nb,
+        nt=nt,
+    )
+    # slot0 -> >1, slot2 -> >3, slot4 -> >5.
+    #  q0: >1 over {2}        -> row0 (2)
+    #  q1: >3 over {2, 4}     -> row1 (4)
+    #  q2: >5 over {2, 4, 6}  -> row2 (6)
+    assert res[0].argmax().item() == 0, res[0]
+    assert res[1].argmax().item() == 1, res[1]
+    assert res[2].argmax().item() == 2, res[2]
+
+
+def test_baib_bucket_boundary():
+    """Query bucket k; candidates in k-1, k, k+1 — only the bucket-k row wins,
+    even when neighbors have lower scores."""
+    nb, nt = 3, 4
+    out = _baib_nodes(nb, nt)
+    n_pos = 3
+    res = _run_baib(
+        out,
+        n_pos,
+        scores=[1, 5, 2],
+        buckets=[0, 1, 2],
+        valid=[1, 1, 1],
+        thresholds=[0, 1, 2, 3],
+        q_bucket=[1, 1, 1],
+        q_thresh=[0, 0, 0],
+        value_in=torch.eye(n_pos, 4),
+        nb=nb,
+        nt=nt,
+    )
+    # At q2: buckets 0 (score 1) and 2 (score 2) are off by one; only bucket 1.
+    assert res[2].argmax().item() == 1, res[2]
+
+
+def test_baib_threshold_boundary_equal_is_not_above():
+    """score == threshold is NOT strictly above."""
+    nb, nt = 1, 5
+    out = _baib_nodes(nb, nt)
+    n_pos = 2
+    res = _run_baib(
+        out,
+        n_pos,
+        scores=[3, 4],
+        buckets=[0, 0],
+        valid=[1, 1],
+        thresholds=[0, 1, 2, 3, 4],
+        q_bucket=[0, 0],
+        q_thresh=[3, 3],
+        value_in=torch.eye(n_pos, 4),
+        nb=nb,
+        nt=nt,
+    )
+    # slot 3 -> threshold value 3. row0 score 3 (3 > 3 is False) excluded;
+    # row1 score 4 (4 > 3) included.
+    assert res[1].argmax().item() == 1, res[1]
+
+
+def test_baib_arbitrary_value_width_does_not_grow_dqk():
+    """A wide `value` does not change the logical Q/K width."""
+    nb, nt = 3, 4
+    for vw in (1, 4, 20):
+        out = _baib_nodes(nb, nt, value_width=vw)
+        attn = _unwrap_attn(out)
+        assert attn.d_qk == 2 + nb + nt, (vw, attn.d_qk)
+        assert attn.d_v == vw, (vw, attn.d_v)
+    # And selection still works with a wide payload.
+    out = _baib_nodes(nb, nt, value_width=20)
+    n_pos = 2
+    value_in = torch.zeros(n_pos, 20)
+    value_in[0, 7] = 9.0
+    value_in[1, 13] = 4.0
+    res = _run_baib(
+        out,
+        n_pos,
+        scores=[5, 6],
+        buckets=[1, 1],
+        valid=[1, 1],
+        thresholds=[0, 1, 2, 3],
+        q_bucket=[1, 1],
+        q_thresh=[0, 0],
+        value_in=value_in,
+        nb=nb,
+        nt=nt,
+    )
+    # q1: smallest score is row0 (5) -> payload with 9.0 at index 7.
+    assert torch.allclose(res[1], value_in[0], atol=1e-2), res[1]
+
+
+def test_baib_duplicate_matching_rows_with_identical_payload_blend_harmlessly():
+    """Two matching rows that tie on score and carry the same payload produce
+    that payload (the blend is a no-op)."""
+    nb, nt = 2, 4
+    out = _baib_nodes(nb, nt)
+    n_pos = 2
+    payload = torch.tensor([1.0, 2.0, 3.0, 4.0])
+    value_in = torch.stack([payload, payload])
+    res = _run_baib(
+        out,
+        n_pos,
+        scores=[5, 5],
+        buckets=[1, 1],
+        valid=[1, 1],
+        thresholds=[0, 1, 2, 3],
+        q_bucket=[1, 1],
+        q_thresh=[0, 0],
+        value_in=value_in,
+        nb=nb,
+        nt=nt,
+    )
+    assert torch.allclose(res[1], payload, atol=1e-3), res[1]
+
+
+def test_baib_near_one_hot_inputs_do_not_change_selection():
+    """Bucket / threshold tables softened to ~0.97 (as compiled values are)
+    still select the same row — the predicate-bonus margin absorbs it."""
+    nb, nt = 3, 5
+    out = _baib_nodes(nb, nt)
+    n_pos = 5
+    kwargs = dict(
+        scores=[6, 4, 8, 3, 5],
+        buckets=[1, 1, 1, 0, 1],
+        valid=[1, 1, 1, 1, 1],
+        thresholds=[0, 1, 2, 3, 4],
+        q_bucket=[1] * n_pos,
+        q_thresh=[2] * n_pos,
+        value_in=torch.eye(n_pos, 4),
+        nb=nb,
+        nt=nt,
+    )
+    clean = _run_baib(out, n_pos, **kwargs)
+    noisy = _run_baib(out, n_pos, perturb=0.97, **kwargs)
+    for q in range(n_pos):
+        assert clean[q].argmax().item() == noisy[q].argmax().item(), (
+            q,
+            clean[q],
+            noisy[q],
+        )
+    assert noisy[4].argmax().item() == 1, noisy[4]
+
+
+def test_baib_threshold_above_max_has_no_match_but_does_not_crash():
+    """No row above the queried threshold: output is a finite blend (undefined
+    by contract), never NaN, never raises."""
+    nb, nt = 1, 6
+    out = _baib_nodes(nb, nt)
+    n_pos = 3
+    res = _run_baib(
+        out,
+        n_pos,
+        scores=[2, 3, 4],
+        buckets=[0, 0, 0],
+        valid=[1, 1, 1],
+        thresholds=[0, 1, 2, 3, 4, 9],
+        q_bucket=[0, 0, 0],
+        q_thresh=[5, 5, 5],
+        value_in=torch.eye(n_pos, 4),
+        nb=nb,
+        nt=nt,
+    )
+    # slot 5 -> threshold value 9; no score is above 9.
+    assert torch.isfinite(res).all(), res
+
+
+def test_baib_all_invalid_does_not_crash():
+    """Every row invalid: output is finite, never NaN, never raises."""
+    nb, nt = 2, 4
+    out = _baib_nodes(nb, nt)
+    n_pos = 3
+    res = _run_baib(
+        out,
+        n_pos,
+        scores=[2, 3, 4],
+        buckets=[1, 1, 1],
+        valid=[-1, -1, -1],
+        thresholds=[0, 1, 2, 3],
+        q_bucket=[1, 1, 1],
+        q_thresh=[0, 0, 0],
+        value_in=torch.eye(n_pos, 4),
+        nb=nb,
+        nt=nt,
+    )
+    assert torch.isfinite(res).all(), res
+
+
+def test_baib_scalar_bucket_recompute_is_unsafe_under_blend():
+    """Negative result: recomputing presence from an AVERAGED scalar bucket id
+    is unsafe — two wrong-bucket rows can blend to the query bucket id."""
+    nb, nt = 3, 4
+    out = _baib_nodes(nb, nt, value_width=1)
+    n_pos = 2
+    # Query bucket 1, but the only rows are in buckets 0 and 2 (both wrong),
+    # both valid + above, tied on score -> a 50/50 blend.  value carries the
+    # scalar bucket id.
+    value_in = torch.tensor([[0.0], [2.0]])
+    res = _run_baib(
+        out,
+        n_pos,
+        scores=[5, 5],
+        buckets=[0, 2],
+        valid=[1, 1],
+        thresholds=[0, 1, 2, 3],
+        q_bucket=[1, 1],
+        q_thresh=[0, 0],
+        value_in=value_in,
+        nb=nb,
+        nt=nt,
+    )
+    # (0 + 2) / 2 == 1 == the query bucket id: a FALSE positive if you trust it.
+    assert abs(res[1].item() - 1.0) < 1e-2, res[1]
+
+
+def test_baib_onehot_recompute_stays_false_under_blend():
+    """Positive result: the robust recomputation — carry the selected
+    `key_bucket_onehot` and dot it against the query one-hot — stays low in the
+    same no-match blend."""
+    nb, nt = 3, 4
+    out = _baib_nodes(nb, nt, value_width=nb)
+    n_pos = 2
+    value_in = _onehot_rows([0, 2], nb)  # carry each row's bucket one-hot
+    res = _run_baib(
+        out,
+        n_pos,
+        scores=[5, 5],
+        buckets=[0, 2],
+        valid=[1, 1],
+        thresholds=[0, 1, 2, 3],
+        q_bucket=[1, 1],
+        q_thresh=[0, 0],
+        value_in=value_in,
+        nb=nb,
+        nt=nt,
+    )
+    # Blended one-hot ~ [0.5, 0, 0.5]; dot with query one-hot [0,1,0] ~ 0.
+    match = float((res[1] * _onehot(1, nb)).sum())
+    assert match < 0.9, (match, res[1])
+
+
+def test_baib_assert_hardness_passes_on_clean_matches():
+    """With `assert_hardness_gt`, a clean scene with a unique winner per query
+    passes the reference-eval hardness predicate (does not raise)."""
+    nb, nt = 1, 5
+    out = _baib_nodes(nb, nt, assert_hardness_gt=0.99)
+    n_pos = 4
+    res = _run_baib(
+        out,
+        n_pos,
+        scores=[4, 2, 5, 3],
+        buckets=[0, 0, 0, 0],
+        valid=[1, 1, 1, 1],
+        thresholds=[0, 1, 2, 3, 4],
+        q_bucket=[0] * n_pos,
+        q_thresh=[0] * n_pos,
+        value_in=torch.eye(n_pos, 4),
+        nb=nb,
+        nt=nt,
+    )
+    # Smallest score over each prefix: row0, row1, row1, row1.
+    assert [res[q].argmax().item() for q in range(n_pos)] == [0, 1, 1, 1], res
+
+
+def test_baib_d_qk_is_two_plus_buckets_plus_thresholds():
+    """Width regression: logical Q/K width is exactly 2 + n_buckets + n_thresholds."""
+    for nb, nt in [(1, 1), (3, 5), (8, 6)]:
+        attn = _unwrap_attn(_baib_nodes(nb, nt, value_width=7))
+        assert attn.d_qk == 2 + nb + nt, (nb, nt, attn.d_qk)
+
+
+def test_baib_identity_vo_is_decoupled_from_dqk():
+    """V/O regression: value passes through identity matrices of width
+    len(value), decoupled from d_qk."""
+    nb, nt, vw = 2, 3, 11
+    attn = _unwrap_attn(_baib_nodes(nb, nt, value_width=vw))
+    assert attn.d_v == vw
+    assert torch.equal(attn.value_matrix, torch.eye(vw))
+    assert torch.equal(attn.output_matrix, torch.eye(vw))
+    # d_qk does not include the value width.
+    assert attn.d_qk == 2 + nb + nt
+
+
+def test_baib_bonus_magnitudes_are_op_local_not_inherited_1000():
+    """The validity / bucket / above coefficients baked into the matrices are
+    op-local AND large enough to dominate the score swing.  The compiled probe
+    cannot tell 256 from a too-small (or 1000) bonus in fp32, so these
+    structural checks are what pin the constants."""
+    nb, nt = 3, 4
+    attn = _unwrap_attn(_baib_nodes(nb, nt))
+    q, k = attn.query_matrix, attn.key_matrix
+    # col 0: score gain;  col 1: validity (Q=1.0, K=±_VALIDITY_BONUS).
+    assert q[0, 0].item() == _QUERY_GAIN
+    assert q[0, 1].item() == 1.0
+    assert k[1, 1].item() == _VALIDITY_BONUS
+    # bucket cols start at 2: query side carries the bonus, key side a bare 1.0.
+    for c in range(nb):
+        assert q[1 + c, 2 + c].item() == _BUCKET_BONUS
+        assert k[2 + c, 2 + c].item() == 1.0
+    # above cols start at 2 + n_buckets; same query/key split.
+    for c in range(nt):
+        assert q[1 + nb + c, 2 + nb + c].item() == _ABOVE_MATCH_BONUS
+        assert k[2 + nb + c, 2 + nb + c].item() == 1.0
+    # The load-bearing invariant: each bonus must dominate the worst-case
+    # gained score swing over the documented range S <= 12, i.e.
+    # min(2*_VALIDITY_BONUS, _BUCKET_BONUS, _ABOVE_MATCH_BONUS) > _QUERY_GAIN*12.
+    # An undersized "minimal" bonus (e.g. 50) silently mis-selects; this is the
+    # only check that catches that, since fp32 compiled selection cannot.
+    assert 2 * _VALIDITY_BONUS > _QUERY_GAIN * 12
+    assert _BUCKET_BONUS > _QUERY_GAIN * 12
+    assert _ABOVE_MATCH_BONUS > _QUERY_GAIN * 12
+    # Op-local and distinct from the inherited 1000-unit globals.
+    assert _VALIDITY_BONUS != 1000.0
+    assert _BUCKET_BONUS != 1000.0
+    assert _ABOVE_MATCH_BONUS != 1000.0
+    # The shared global is untouched by introducing this op.
+    assert _ABOVE_BONUS == 1000.0
+
+
+def test_baib_bonus_dominates_worst_case_score_gap():
+    """Behavioral pin for the sizing invariant: when the filter-FAILING row
+    has the best score (0) and the matching row the worst (30, a near-maximal
+    in-range gap under the ~32 diameter), the matching row must still win.  An
+    undersized bonus mis-selects here even though the small-gap fixtures stay
+    green."""
+    nb, nt = 3, 12
+    out = _baib_nodes(nb, nt)
+    n_pos = 4
+    thresholds = list(range(nt))  # slot c -> score > c
+    res = _run_baib(
+        out,
+        n_pos,
+        scores=[0, 0, 0, 30],
+        buckets=[0, 1, 1, 1],  # row 0: wrong bucket
+        valid=[1, -1, 1, 1],  # row 1: invalid
+        thresholds=thresholds,
+        q_bucket=[1, 1, 1, 1],  # query bucket 1
+        q_thresh=[0, 0, 0, 0],  # > 0: row 2 (score 0) is NOT above
+        value_in=torch.eye(n_pos, 4),
+        nb=nb,
+        nt=nt,
+    )
+    # Only row 3 passes all three filters; despite its worst score it wins.
+    assert res[3].argmax().item() == 3, res[3]
+
+
+def test_baib_single_column_bucket_and_threshold_select():
+    """n_buckets == 1 and n_thresholds == 1 (the asserted lower bound) still
+    select: a 1-wide bucket is a constant no-op filter, a 1-wide threshold
+    gates on the single above-column, and argmin-of-score still wins."""
+    nb, nt = 1, 1
+    out = _baib_nodes(nb, nt)
+    n_pos = 3
+    res = _run_baib(
+        out,
+        n_pos,
+        scores=[6, 4, 8],
+        buckets=[0, 0, 0],
+        valid=[1, 1, 1],
+        thresholds=[-1],  # every non-negative score is "above"
+        q_bucket=[0, 0, 0],
+        q_thresh=[0, 0, 0],
+        value_in=torch.eye(n_pos, 4),
+        nb=nb,
+        nt=nt,
+    )
+    assert [res[q].argmax().item() for q in range(n_pos)] == [0, 1, 1], res
+
+
+def test_baib_all_zero_selectors_stay_finite():
+    """All-zero query selectors (no bucket / threshold column chosen — e.g. an
+    out-of-range query index) drop that filter rather than crash: finite out."""
+    nb, nt = 3, 4
+    out = _baib_nodes(nb, nt)
+    n_pos = 3
+    res = _run(
+        out,
+        n_pos,
+        baib_score=torch.tensor([[6.0], [4.0], [8.0]]),
+        baib_validity=torch.ones(n_pos, 1),
+        baib_kb=_onehot_rows([1, 1, 1], nb),
+        baib_above=_above_table([6, 4, 8], [0, 1, 2, 3]),
+        baib_qb=torch.zeros(n_pos, nb),  # no bucket selected
+        baib_th=torch.zeros(n_pos, nt),  # no threshold selected
+        baib_value=torch.eye(n_pos, 4),
+    )
+    assert torch.isfinite(res).all(), res

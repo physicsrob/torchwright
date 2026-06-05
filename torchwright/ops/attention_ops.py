@@ -38,7 +38,7 @@ validity through a dedicated ``d_qk`` column (``Q = 1.0``,
 ``K = _VALIDITY_DIRECT``) rather than combining it with the score
 column under ``_QUERY_GAIN``.  This keeps worst-case ``|Q·K|`` in the
 low thousands instead of tens of thousands, so pre-softmax logits
-survive comfortably in bf16.
+stay well-resolved in the compiled fp32 path (SDPA MATH backend, TF32 off).
 
 Step-function logits (e.g. strict ``>`` comparisons against a runtime
 threshold) are not expressible in bilinear Q·K. The ``_where`` and
@@ -110,10 +110,12 @@ def _wrap_hard_selection_output(
 # projection, so ``Q[·, 0] = _QUERY_GAIN`` independent of query position. A
 # unit score delta then produces a logit delta of 8 → ``exp(8) ≈ 2981``
 # softmax weight ratio, i.e. ``≥ 99.9 %`` concentration. All current callers
-# produce integer-valued scores with gap ≥ 1, so this is sufficient; larger
-# gains (e.g. 80) are historical — they bought unused margin at the cost of
-# pushing K·Q magnitudes above the range where bf16 precision resolves
-# softmax-significant gaps.
+# produce integer-valued scores with gap ≥ 1, so 8 is sufficient; larger
+# gains (e.g. 80) are historical and bought only unused margin.  The compiled
+# path runs fp32 through the SDPA MATH backend with TF32 off (see the
+# precision-policy note on ``attend_most_recent_matching``), so the
+# discriminating gap resolves with ample headroom regardless — keeping the
+# gain modest is about not needing more, not a precision ceiling.
 _QUERY_GAIN = 8.0
 
 # Direct (not gained) logit bonus for valid positions in the simple
@@ -177,6 +179,26 @@ _MAX_SCORE_UNMASKED_ABS = 100.0
 # column) and both need to dominate noise from competing attention
 # values in the compiled residual.
 _ABOVE_BONUS = 1000.0
+
+
+# Op-local predicate bonuses for ``attend_argmin_above_in_bucket``.  That op
+# stacks THREE predicate filters (validity, bucket, strict-above) on one
+# head; each bonus is routed directly into its own ``d_qk`` column, so its
+# logit contribution is the bare constant.  Each must dominate a single
+# predicate miss against that op's worst-case gained score swing
+# ``_QUERY_GAIN · S``; the downstream range is ``S <= 12`` (so ``96``), and
+# ~256 gives a ~2.7x margin.  These are an order of magnitude below the
+# single-bonus ``_VALIDITY_DIRECT`` / ``_ABOVE_BONUS`` (1000) because those
+# were sized for a 10x larger swing (``_QUERY_GAIN · _MAX_SCORE_ABS = 960``),
+# NOT for a precision budget — the compiled path is fp32 (SDPA MATH backend,
+# TF32 off), where the gained unit-score gap resolves with thousands of ULP
+# of margin at 256 or 1000 alike.  Note the distinct name
+# ``_ABOVE_MATCH_BONUS`` (NOT ``_ABOVE_BONUS``): a second module-level
+# ``_ABOVE_BONUS`` would rebind the constant above and undersize
+# ``attend_argmin_above_integer``.
+_VALIDITY_BONUS = 256.0
+_BUCKET_BONUS = 256.0
+_ABOVE_MATCH_BONUS = 256.0
 
 
 def _build_selection_attn(
@@ -559,6 +581,189 @@ def attend_argmin_above_integer(
     for v in range(d_value):
         value_matrix[v, 1 + n_thresholds + v] = 1.0
         output_matrix[1 + n_thresholds + v, v] = 1.0
+
+    attn = Attn(
+        query_in=query_in,
+        key_in=key_in,
+        value_in=value,
+        query_matrix=query_matrix,
+        key_matrix=key_matrix,
+        value_matrix=value_matrix,
+        output_matrix=output_matrix,
+    )
+    return _wrap_hard_selection_output(
+        attn, value, assert_hardness_gt=assert_hardness_gt
+    )
+
+
+def attend_argmin_above_in_bucket(
+    pos_encoding: PosEncoding,
+    score: Node,
+    validity: Node,
+    key_bucket_onehot: Node,
+    score_above_each_threshold: Node,
+    query_bucket_onehot: Node,
+    threshold_onehot: Node,
+    value: Node,
+    assert_hardness_gt: Optional[float] = None,
+) -> Node:
+    """Smallest-``score`` row that is valid, in a requested bucket, and above
+    a requested threshold — read its ``value``.
+
+    One vanilla attention head.  For each query position it selects, among
+    all earlier positions ("rows"), the one with the minimum ``score`` that
+    passes three per-row filters, and returns that row's ``value``::
+
+        valid:      validity == +1   (torchwright's +1 / -1 convention)
+        in bucket:  the row's bucket == the bucket this query asks for
+        above:      score > the threshold this query asks for
+
+    The requested bucket and threshold are chosen per query position, at
+    runtime, via one-hot selectors.
+
+    Why bucket / threshold arrive as tables, not numbers.  A bilinear
+    ``Q·K`` logit can multiply and add but cannot test equality or a strict
+    ``>``.  So each of those two filters is a small *table of pre-answered
+    yes/no questions* — one row per position, one column per choice — and
+    the query names a column; the attention dot product reads out that one
+    cell::
+
+        bucket table (equality)        threshold table (greater-than)
+              g0 g1 g2 g3                     >t0 >t1 >t2 >t3 >t4
+        s(g2)  0  0  1  0               s(5)   1   1   1   1   1
+        s(g0)  1  0  0  0               s(2)   1   1   0   0   0
+
+    A bucket row is a one-hot (you are in exactly one group); a threshold
+    row is a run of 1s that stops at the score (you are above every
+    threshold up to your score).  ``key_bucket_onehot`` /
+    ``score_above_each_threshold`` are the key-side table rows;
+    ``query_bucket_onehot`` / ``threshold_onehot`` are the query-side column
+    pickers.  ``dot(query_bucket_onehot, key_bucket_onehot)`` is 1 iff the
+    groups match; ``dot(threshold_onehot, score_above_each_threshold)``
+    reads the precomputed "score > threshold" answer.
+
+    The attention logit at ``(query j, key i)`` is::
+
+        _QUERY_GAIN·(−score_i)
+            + _VALIDITY_BONUS·validity_i
+            + _BUCKET_BONUS·dot(query_bucket_onehot_j, key_bucket_onehot_i)
+            + _ABOVE_MATCH_BONUS·dot(threshold_onehot_j, score_above_each_threshold_i)
+
+    The three bonuses dominate, so only rows passing all three filters
+    compete; the small ``−score`` term then picks the smallest score.
+
+    Layout.  Decoupled identity V/O — ``value`` passes through unchanged and
+    may be any width without enlarging the head's logical Q/K width
+    (``d_qk = 2 + n_buckets + n_thresholds``); the compiler splits a wide
+    ``value`` over ``ceil(d_v / d_head)`` physical heads.  Compile with
+    ``d_head >= d_qk``.
+
+    No-match is undefined.  If no row passes all three filters the output is
+    a soft blend of whatever is present, NOT a sentinel — this op does not
+    report presence.  Prove a match exists upstream, or carry the selected
+    ``validity`` / ``key_bucket_onehot`` / ``score_above_each_threshold`` in
+    ``value`` and re-test them after attention (a blend of non-matching
+    one-hots dotted against the query one-hot stays well below 1).  Tied
+    scores blend their ``value`` payloads.
+
+    Args:
+        pos_encoding: graph positional encoding.  Accepted for API symmetry
+            with the other selection heads; this op is purely content-based
+            and reads no position columns.
+        score: width-1 scalar; lower wins.  Integer-valued for hard
+            selection.  Bounded score DIAMETER: a predicate bonus only
+            dominates the gained score term while ``_QUERY_GAIN *
+            (max_score - min_score)`` stays below it, so the supported
+            diameter is ``min(2*_VALIDITY_BONUS, _BUCKET_BONUS,
+            _ABOVE_MATCH_BONUS) / _QUERY_GAIN`` — ``32`` at the shipped
+            constants (the bucket / above bound; validity holds to 64).
+            Past that, a filter-failing low-score row can silently outscore
+            a matching high-score row (no error, no NaN).  The Task 3 range
+            (``S <= 12``) sits well inside it.
+        validity: width-1, +1 valid / -1 invalid.
+        key_bucket_onehot: width ``n_buckets``; the row's own bucket as a
+            0/1 one-hot.
+        score_above_each_threshold: width ``n_thresholds``; slot ``c`` is 1
+            iff ``score`` is strictly above threshold ``c`` (a monotone run
+            of 1s — NOT a one-hot).
+        query_bucket_onehot: width ``n_buckets``; the requested bucket.
+        threshold_onehot: width ``n_thresholds``; the requested threshold.
+        value: payload (any width) read at the selected row.
+        assert_hardness_gt: optional softmax-hardness floor checked at
+            reference-eval / ``debug=True`` time; keep it ``<= ~0.9997``,
+            the adjacent-score ceiling ``softmax(_QUERY_GAIN·1)``.
+
+    Returns:
+        Attn node of width ``len(value)``.
+    """
+    assert len(score) == 1, "attend_argmin_above_in_bucket expects a width-1 score"
+    assert (
+        len(validity) == 1
+    ), "attend_argmin_above_in_bucket expects a width-1 validity"
+    assert len(key_bucket_onehot) == len(query_bucket_onehot), (
+        "key_bucket_onehot and query_bucket_onehot must have the same width "
+        f"(got {len(key_bucket_onehot)} and {len(query_bucket_onehot)})"
+    )
+    assert len(score_above_each_threshold) == len(threshold_onehot), (
+        "score_above_each_threshold and threshold_onehot must have the same "
+        f"width (got {len(score_above_each_threshold)} and {len(threshold_onehot)})"
+    )
+    assert len(value) >= 1, "value must be non-empty"
+    n_buckets = len(key_bucket_onehot)
+    n_thresholds = len(score_above_each_threshold)
+    assert n_buckets >= 1, "n_buckets must be >= 1"
+    assert n_thresholds >= 1, "n_thresholds must be >= 1"
+
+    d_qk = 2 + n_buckets + n_thresholds
+    d_v = len(value)
+
+    # d_qk column layout:
+    #   col 0:                         score logit  (Q = _QUERY_GAIN, K = -score)
+    #   col 1:                         validity     (Q = 1.0, K = ± _VALIDITY_BONUS)
+    #   cols 2 .. 1+n_buckets:         bucket-equality rendezvous
+    #   cols 2+n_buckets .. d_qk-1:    strict-above rendezvous
+    bucket_col0 = 2
+    above_col0 = 2 + n_buckets
+
+    # query_in rows: [1.0 literal (1), query_bucket_onehot (n_buckets),
+    #                 threshold_onehot (n_thresholds)]
+    query_one = LiteralValue(torch.tensor([1.0]), name="bucketed_argmin_query_one")
+    query_in = Concatenate([query_one, query_bucket_onehot, threshold_onehot])
+    # key_in rows: [score (1), validity (1), key_bucket_onehot (n_buckets),
+    #               score_above_each_threshold (n_thresholds)]
+    key_in = Concatenate(
+        [score, validity, key_bucket_onehot, score_above_each_threshold]
+    )
+
+    # --- Query matrix, shape (len(query_in), d_qk) ---
+    query_matrix = torch.zeros((len(query_in), d_qk))
+    # Literal 1.0 (row 0) → score gain (col 0) and direct validity Q (col 1).
+    query_matrix[0, 0] = _QUERY_GAIN
+    query_matrix[0, 1] = 1.0
+    # query_bucket_onehot (rows 1..n_buckets) → bucket cols, coeff _BUCKET_BONUS.
+    for c in range(n_buckets):
+        query_matrix[1 + c, bucket_col0 + c] = _BUCKET_BONUS
+    # threshold_onehot (rows 1+n_buckets..) → above cols, coeff _ABOVE_MATCH_BONUS.
+    for c in range(n_thresholds):
+        query_matrix[1 + n_buckets + c, above_col0 + c] = _ABOVE_MATCH_BONUS
+
+    # --- Key matrix, shape (len(key_in), d_qk) ---
+    key_matrix = torch.zeros((len(key_in), d_qk))
+    score_row = 0
+    validity_row = 1
+    bucket_row0 = 2
+    above_row0 = 2 + n_buckets
+    key_matrix[score_row, 0] = -1.0  # col 0: -score
+    key_matrix[validity_row, 1] = _VALIDITY_BONUS  # col 1: ± _VALIDITY_BONUS
+    for c in range(n_buckets):
+        key_matrix[bucket_row0 + c, bucket_col0 + c] = 1.0
+    for c in range(n_thresholds):
+        key_matrix[above_row0 + c, above_col0 + c] = 1.0
+
+    # --- Decoupled identity V/O: value passes through unchanged and may be
+    #     wider than d_qk; the compiler splits it over physical heads. ---
+    value_matrix = torch.eye(d_v)
+    output_matrix = torch.eye(d_v)
 
     attn = Attn(
         query_in=query_in,
