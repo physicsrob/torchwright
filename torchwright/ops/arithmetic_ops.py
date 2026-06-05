@@ -2361,13 +2361,24 @@ def floor_int(
     )
 
 
-def ceil_int(inp: Node, min_value: int, max_value: int) -> Node:
+def ceil_int(
+    inp: Node,
+    min_value: int,
+    max_value: int,
+    sharpness: Optional[float] = None,
+) -> Node:
     """Compute ceil(x) using the identity ``ceil(x) = -floor(-x)``.
 
     Args:
         inp: 1D scalar node with value in [min_value, max_value].
         min_value: Lower bound (integer).
         max_value: Upper bound (integer).
+        sharpness: Override the global ``step_sharpness`` for the inner
+            ``floor_int``. Higher values narrow the ramp zone at each
+            integer boundary (e.g. 10000 gives a 1e-4-wide ramp vs. the
+            default 10 which gives 0.1) so inputs carrying a few tenths of
+            piecewise-linear noise stay in the flat zone and ceil exactly.
+            Mirrors :func:`floor_int`'s ``sharpness``.
 
     Returns:
         1D scalar node containing ceil(x).
@@ -2378,7 +2389,9 @@ def ceil_int(inp: Node, min_value: int, max_value: int) -> Node:
        measured at commit 2e04d93. See docs/numerical_noise.md.
     """
     assert len(inp) == 1, "Input must be a 1D scalar node"
-    return negate(floor_int(negate(inp), -max_value, -min_value))
+    return negate(
+        floor_int(negate(inp), -max_value, -min_value, sharpness=sharpness)
+    )
 
 
 # ---------------------------------------------------------------------------

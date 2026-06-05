@@ -941,6 +941,32 @@ def test_ceil_int_wide_range_large_magnitude():
         assert abs(r - math.ceil(v)) < 0.01, f"ceil_int({v}) should be {math.ceil(v)}, got {r}"
 
 
+def test_ceil_int_high_sharpness_screen_y():
+    """ceil_int must forward sharpness to its inner floor_int (the DOOM screen-y
+    CEIL_Y staircase). At sharpness=10000 the ramp is 1e-4 wide, so a raw screen-y
+    carrying ~0.077 of piecewise-linear multiply noise stays in the flat zone and
+    ceils to an exact integer instead of interpolating across a scanline boundary.
+    Covers the narrow [0,49] and wide [0,128] / [-128,49] ranges H actually uses."""
+    import math
+
+    x = create_input("x", 1)
+    # Mid-bin offsets (well outside the 1e-4 ramp) over the screen-y ranges.
+    ranges = [(0, 49), (0, 128), (-128, 49)]
+    offsets = (0.077, 0.4, -0.077, -0.4, 0.953)
+    for lo, hi in ranges:
+        c = ceil_int(x, min_value=lo, max_value=hi, sharpness=10000.0)
+        for k in range(lo, hi):
+            for off in offsets:
+                v = k + off
+                if not (lo <= v <= hi):
+                    continue
+                r = c.compute(n_pos=1, input_values={"x": torch.tensor([[v]])}).item()
+                assert abs(r - math.ceil(v)) < 0.01, (
+                    f"ceil_int({v}, [{lo},{hi}], s=10000) should be "
+                    f"{math.ceil(v)}, got {r}"
+                )
+
+
 def test_signed_multiply():
     """Test all sign combinations."""
     a = create_input("a", 1)
