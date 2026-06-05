@@ -906,3 +906,37 @@ class TestAssertDegenerate:
             r = asserted.value_type.value_range
             assert r.lo == pytest.approx(-3.0)
             assert r.hi == pytest.approx(7.0)
+
+
+class TestToIntervalFpCrossing:
+    """``to_interval`` snaps a sub-tolerance lower>upper crossing — fp
+    accumulation noise on a point-valued component — instead of raising; a gross
+    crossing still raises. Regression: a token embedding column at exactly 0.5
+    had its lower bound eval land ~1 ULP above 0.5, tripping the strict ``Range``
+    check during ``value_type`` propagation through a ``select``."""
+
+    @staticmethod
+    def _point_bound(lo_b: float, hi_b: float) -> AffineBound:
+        # x-free (n_cols=0) component with lower offset lo_b, upper offset hi_b.
+        return AffineBound(
+            A_lo=torch.zeros(1, 0, dtype=torch.float64),
+            A_hi=torch.zeros(1, 0, dtype=torch.float64),
+            b_lo=torch.tensor([lo_b], dtype=torch.float64),
+            b_hi=torch.tensor([hi_b], dtype=torch.float64),
+            columns={},
+            input_ranges={},
+        )
+
+    def test_sub_tolerance_crossing_snaps(self):
+        ab = self._point_bound(0.5 + 7.45e-9, 0.5)
+        intervals = ab.to_interval()
+        assert len(intervals) == 1
+        assert intervals[0].lo == intervals[0].hi == 0.5
+        # to_scalar_range goes through the same path.
+        r = ab.to_scalar_range()
+        assert r.lo == pytest.approx(0.5) and r.hi == pytest.approx(0.5)
+
+    def test_gross_crossing_still_raises(self):
+        ab = self._point_bound(1.0, 0.5)
+        with pytest.raises(ValueError):
+            ab.to_interval()

@@ -160,6 +160,15 @@ class AffineBound:
                 f"NaN in upper bound at component {i}; likely a 0*inf case "
                 f"not caught by the eval guard"
             )
+            if lo > hi:
+                # A sound affine bound has lower <= upper for every component;
+                # a crossing is fp accumulation noise on a near-degenerate
+                # (point-valued) component, e.g. an embedding column at exactly
+                # 0.5 whose lower eval lands 1 ULP above 0.5. Snap when the gap
+                # is within fp tolerance; a gross crossing falls through to the
+                # strict ``Range`` check below as a genuine-bug signal.
+                if lo - hi <= 1e-6 * (1.0 + max(abs(lo), abs(hi))):
+                    lo = hi
             ranges.append(Range(lo, hi))
         return ranges
 
