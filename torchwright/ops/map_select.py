@@ -1,5 +1,5 @@
 from torchwright.graph import Node, Concatenate, Linear
-from torchwright.graph.misc import Assert, LiteralValue
+from torchwright.graph.misc import LiteralValue
 from typing import List, Dict
 import math
 import numbers
@@ -9,7 +9,7 @@ from torchwright.graph.asserts import assert_integer, assert_matches_value_type
 from torchwright.graph.value_type import NodeValueType, Range
 from torchwright.ops.const import step_sharpness, embedding_step_sharpness
 from torchwright.ops.logic_ops import cond_add_vector, cond_gate, _max_abs_or_raise
-from torchwright.ops.arithmetic_ops import piecewise_linear, sum_nodes
+from torchwright.ops.arithmetic_ops import sum_nodes
 from torchwright.ops.linear_relu_linear import linear_relu_linear
 
 
@@ -101,20 +101,6 @@ def _scale_lookup_index(inp: Node, scale: float, name: str) -> Node:
     return Linear(inp, torch.tensor([[scale]]), name=name)
 
 
-def _lookup_breakpoints(n: int, eps: float) -> list[float]:
-    breakpoints = [0.0]
-    half_eps = eps / 2.0
-    for k in range(n - 1):
-        boundary = float(k) + 0.5
-        breakpoints.extend([boundary - half_eps, boundary + half_eps])
-    return breakpoints
-
-
-def _lookup_integer_index_at(x: float, n: int) -> int:
-    idx = int(math.floor(x + 0.5))
-    return max(0, min(n - 1, idx))
-
-
 def _constant_vector(values: torch.Tensor, name: str) -> Node:
     return LiteralValue(values.to(dtype=torch.float32), name=name)
 
@@ -134,6 +120,121 @@ def _lookup_numeric_slack(max_abs: float, sharpness: float, n_steps: int) -> flo
     return max(1e-3, max_abs * sharpness * max(n_steps, 1) * 1e-5)
 
 
+def _saturating_step_select(
+    index: Node,
+    *,
+    n: int,
+    top_value: torch.Tensor,
+    deltas: torch.Tensor,
+    sharpness: float,
+    d_max: int,
+    name: str,
+) -> Node:
+    """Cancellation-free integer-index selection from an ``n``-row table.
+
+    Returns ``value[clamp(round(index), 0, n-1)]`` as a width-``d`` vector,
+    where the rows are reconstructed from their consecutive differences:
+    ``value[n-1] == top_value`` and ``deltas[k-1] == value[k] - value[k-1]``
+    (so ``value[k] = top_value - sum_{j>k} deltas[j-1]``).
+
+    Built as ``floor_int``'s saturating-step staircase rather than the single
+    projection ``value[0] + sum_i delta_i * relu(s*(x - b_i))`` the old
+    ``piecewise_linear`` builders used.  That old form summed ~``n`` ReLU terms
+    of magnitude ~``s*x`` into one accumulator, so for a large scaled index
+    (out-of-range ``x``) or a tall table (large ``n``) the partial sums
+    overflowed float32's 2^24 exact-integer limit and the alternating-sign
+    terms cancelled into garbage (e.g. an in-range index in a 20000-row table
+    collapsed to 0).  Here:
+
+    * A leading ``min(index, n-1)`` clamp bounds the out-of-range case so the
+      step width ``W`` (sized for the in-range span ``s*(n-1)``) always
+      resolves the saturating difference.  The lower edge needs no clamp — a
+      hugely negative index leaves every step off (``relu`` of a negative is
+      exactly 0), so it selects row 0 exactly.
+    * Each boundary ``k - 0.5`` (``k = 1..n-1``) contributes a *bounded* step
+      ``step_k = relu(t_k) - relu(t_k - W)`` with ``t_k = s*(x - (k-0.5)) +
+      0.5``, then the output accumulates ``relu(1 - step_k)`` (the "row not yet
+      reached" indicator, in ``[0, 1]``) weighted by the row difference:
+      ``out = top_value - sum_k relu(1 - step_k) * deltas[k-1]``.  Every partial
+      sum is bounded by the table's total variation ``sum_k |deltas[k-1]|``,
+      not by ``s*x`` — that is what removes the cancellation.
+
+    The ``+ 0.5`` centers the ramp on the boundary (indicator ``= 0.5`` at the
+    boundary), reproducing the two-row linear blend the old ``piecewise_linear``
+    form produced in the transition band, so off-grid values are unchanged.
+
+    Cost vs the old single sublayer: one ``min`` sublayer plus the two chained
+    ReLU sublayers of the staircase.
+    """
+    d = int(top_value.shape[0])
+    s = float(sharpness)
+    top_idx = float(n - 1)
+
+    # Upper-clamp the index to n-1: (n-1) - relu((n-1) - x).  One sublayer,
+    # cancellation-free (a single ReLU of a magnitude, not a sum of them).
+    x_clamped = linear_relu_linear(
+        input_node=index,
+        input_proj=torch.tensor([[-1.0]]),
+        input_bias=torch.tensor([top_idx]),
+        output_proj=torch.tensor([[-1.0]]),
+        output_bias=torch.tensor([top_idx]),
+        name=f"{name}_clamp_hi",
+    )
+
+    # W: the saturating-step cap.  relu(t) - relu(t - W) collapses to 0 once
+    # ulp(t) >= W, so size W a few ulp above the largest |t| (= s*(n-1)+1),
+    # matching floor_int.  W = 2 for the common small range; larger only as
+    # s*(n-1) approaches 2^24.
+    max_t = s * float(n - 1) + 1.0
+    ulp = 2.0 ** (math.floor(math.log2(max_t)) - 23) if max_t >= 1.0 else 2.0**-23
+    step_cap = max(2.0, 8.0 * ulp)  # W
+
+    _CHUNK = max(1, d_max // 2)  # cap stage-1 hidden width (2 ReLUs per step)
+    partials: list[Node] = []
+    for c0 in range(1, n, _CHUNK):
+        ks = list(range(c0, min(c0 + _CHUNK, n)))  # boundary indices k = 1..n-1
+        c = len(ks)
+        # stage 1 (MLP sublayer): step_k = relu(t_k) - relu(t_k - W),
+        #   t_k = s*x - s*(k - 0.5) + 0.5.   hidden width 2c, output width c.
+        in_proj = torch.full((2 * c, 1), s)
+        in_bias = torch.empty(2 * c)
+        out_proj = torch.zeros((2 * c, c))
+        for j, k in enumerate(ks):
+            t_bias = 0.5 - s * (float(k) - 0.5)
+            in_bias[2 * j] = t_bias  # t_k
+            in_bias[2 * j + 1] = t_bias - step_cap  # t_k - W
+            out_proj[2 * j, j] = 1.0
+            out_proj[2 * j + 1, j] = -1.0
+        step = linear_relu_linear(
+            input_node=x_clamped,
+            input_proj=in_proj,
+            input_bias=in_bias,
+            output_proj=out_proj,
+            output_bias=torch.zeros(c),
+            name=f"{name}_step",
+        )
+        # stage 2 (MLP sublayer): out += output_bias - sum_k relu(1 - step_k) *
+        #   deltas[k-1].   hidden = relu(1 - step_k) (width c), output width d.
+        chunk_out_proj = torch.zeros((c, d))
+        for j, k in enumerate(ks):
+            chunk_out_proj[j, :] = -deltas[k - 1]
+        # top_value rides on the first chunk's output bias; the chunks sum to
+        # top_value - sum_k relu(1 - step_k) * deltas[k-1].
+        out_bias = top_value.clone() if c0 == 1 else torch.zeros(d)
+        partials.append(
+            linear_relu_linear(
+                input_node=step,
+                input_proj=-torch.eye(c),
+                input_bias=torch.ones(c),
+                output_proj=chunk_out_proj,
+                output_bias=out_bias,
+                name=f"{name}_saturate",
+            )
+        )
+
+    return partials[0] if len(partials) == 1 else sum_nodes(partials)
+
+
 def _table_lookup_row_vector(
     index: Node,
     table: torch.Tensor,
@@ -142,27 +243,20 @@ def _table_lookup_row_vector(
     d_max: int,
     name: str,
 ) -> Node:
-    rows, _cols = table.shape
+    rows, cols = table.shape
     if rows == 1:
         return _constant_vector(table[0], name=f"{name}_constant_row")
 
-    eps = 1.0 / sharpness
-    breakpoints = _lookup_breakpoints(rows, eps)
-
-    def _row_at(x: float) -> list[float]:
-        idx = _lookup_integer_index_at(x, rows)
-        return [float(v) for v in table[idx].tolist()]
-
-    result = piecewise_linear(
+    # value[k] = table[k]; deltas[k-1] = table[k] - table[k-1]; top = table[-1].
+    result = _saturating_step_select(
         index,
-        breakpoints,
-        _row_at,
-        input_scale=sharpness,
+        n=rows,
+        top_value=table[rows - 1].clone(),
+        deltas=table[1:] - table[:-1],
+        sharpness=sharpness,
         d_max=d_max,
         name=f"{name}_row",
     )
-    if isinstance(result, Assert):
-        result = result.inputs[0]
     max_abs = float(table.abs().max().item())
     return assert_matches_value_type(
         result,
@@ -184,18 +278,21 @@ def _table_lookup_column_mask(
     if n_cols == 1:
         return _constant_vector(torch.tensor([1.0]), name=f"{name}_constant_mask")
 
-    eps = 1.0 / sharpness
-    breakpoints = _lookup_breakpoints(n_cols, eps)
-
-    def _mask_at(x: float) -> list[float]:
-        idx = _lookup_integer_index_at(x, n_cols)
-        return [1.0 if c == idx else -1.0 for c in range(n_cols)]
-
-    return piecewise_linear(
+    # mask[k] = +1 at column k, -1 elsewhere.  top = mask[n_cols-1]; crossing
+    # boundary k flips column k-1 (+1 -> -1, delta -2) and column k (-1 -> +1,
+    # delta +2).
+    top_value = -torch.ones(n_cols)
+    top_value[n_cols - 1] = 1.0
+    deltas = torch.zeros((n_cols - 1, n_cols))
+    for k in range(1, n_cols):
+        deltas[k - 1, k - 1] = -2.0
+        deltas[k - 1, k] = 2.0
+    return _saturating_step_select(
         index,
-        breakpoints,
-        _mask_at,
-        input_scale=sharpness,
+        n=n_cols,
+        top_value=top_value,
+        deltas=deltas,
+        sharpness=sharpness,
         d_max=d_max,
         name=f"{name}_mask",
     )
@@ -327,22 +424,16 @@ def _table_lookup_index_staircase(
     if n == 1:
         return _constant_vector(torch.tensor([0.0]), name=f"{name}_zero_index")
 
-    eps = 1.0 / sharpness
-    breakpoints = _lookup_breakpoints(n, eps)
-
-    def _index_at(x: float) -> float:
-        return float(_lookup_integer_index_at(x, n))
-
-    result = piecewise_linear(
+    # value[k] = k; deltas[k-1] = 1; top = n-1.
+    result = _saturating_step_select(
         index,
-        breakpoints,
-        _index_at,
-        input_scale=sharpness,
+        n=n,
+        top_value=torch.tensor([float(n - 1)]),
+        deltas=torch.ones((n - 1, 1)),
+        sharpness=sharpness,
         d_max=d_max,
         name=f"{name}_staircase",
     )
-    if isinstance(result, Assert):
-        result = result.inputs[0]
     return assert_matches_value_type(
         result,
         NodeValueType(value_range=Range(0.0, float(n - 1))),

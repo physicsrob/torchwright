@@ -1130,3 +1130,120 @@ def test_linear_bin_index_inv_range_probe():
     assert (
         report.first_divergent is None
     ), f"probe divergence on hoisted inv_range:\n{report.format_short()}"
+
+
+# ---------------------------------------------------------------------------
+# Cancellation-free index staircase (regression)
+#
+# The old single-projection ``piecewise_linear`` builders summed ~n ReLU terms
+# of magnitude ~sharpness*index into one accumulator, overflowing fp32's 2^24
+# exact-integer limit so the alternating-sign terms cancelled into garbage.
+# Two triggers: (a) a scaled index far outside [0, n-1] (sharpness*index past
+# 2^24), and (b) a tall table whose top breakpoint position passes 2^24.  See
+# docs/numerical_noise_findings.md, "the map_select table-lookup staircases".
+# Mirrors test_floor_int_wide_range_large_magnitude; the cancellation lives in
+# the exact-math fp32 sum that node.compute / reference_eval reproduces.
+# ---------------------------------------------------------------------------
+
+
+def test_table_lookup_2d_out_of_range_index_clamps_to_edge():
+    """Trigger (a): a row index far outside [0, rows-1] clamps to the table
+    edge instead of collapsing (index 1e5 at sharpness 100 -> sharpness*index
+    1e7 > 2^24 used to return ~0)."""
+    rows = 256
+    table = torch.arange(rows * 2, dtype=torch.float32).reshape(rows, 2)
+    out_node = _build_table_lookup_2d_graph(table)  # default sharpness=100
+
+    i_val = torch.tensor([[1.0e5], [-50.0], [0.0], [128.0]], dtype=torch.float32)
+    j_val = torch.zeros_like(i_val)
+    inputs = {"i": i_val, "j": j_val}
+    expected = torch.tensor(
+        [
+            [float(table[255, 0])],
+            [float(table[0, 0])],
+            [float(table[0, 0])],
+            [float(table[128, 0])],
+        ]
+    )
+    cache = reference_eval(out_node, inputs, i_val.shape[0])
+    assert torch.allclose(cache[out_node], expected, atol=5e-3), cache[out_node]
+
+    # ...and the min-clamp + saturating-step chain compiles precisely.
+    report = probe_graph(
+        out_node,
+        pos_encoding=None,
+        input_values=inputs,
+        n_pos=i_val.shape[0],
+        d=1024,
+        d_head=16,
+        verbose=False,
+        atol=5e-3,
+    )
+    assert report.first_divergent is None, report.format_short()
+
+
+def test_table_lookup_2d_tall_table_stays_exact():
+    """Trigger (b): a 20000-row table at sharpness 100 and 1000 keeps in-range
+    indices exact (an in-range index used to collapse to 0).  Oracle-only:
+    compiling a 20000-row table is needlessly expensive and the cancellation is
+    in the exact-math fp32 sum, like the floor_int wide-range regression."""
+    rows = 20000
+    table = torch.arange(rows, dtype=torch.float32).reshape(rows, 1)
+    idxs = [0.0, 1.0, 9999.0, 12345.0, 19998.0, 19999.0]
+    for s in (100.0, 1000.0):
+        i = create_input("i", 1)
+        j = create_input("j", 1)
+        out_node = table_lookup_2d(i, j, table, sharpness=s)
+        inputs = {
+            "i": torch.tensor([[v] for v in idxs]),
+            "j": torch.zeros(len(idxs), 1),
+        }
+        got = reference_eval(out_node, inputs, len(idxs))[out_node].squeeze(-1)
+        expected = torch.tensor(idxs)
+        assert torch.allclose(got, expected, atol=5e-3), (s, got, expected)
+
+
+def test_table_lookup_index_staircase_clamps_and_rounds_at_any_magnitude():
+    """The scalar staircase computes clamp(round(x), 0, n-1) exactly at any
+    magnitude — the smallest layer that reproduces both triggers (out-of-range
+    x and large n)."""
+    from torchwright.ops.map_select import _table_lookup_index_staircase
+
+    for n, s in [(256, 100.0), (256, 1000.0), (20000, 1000.0)]:
+        x = create_input("x", 1)
+        node = _table_lookup_index_staircase(
+            x, n, sharpness=s, d_max=1024, name="st"
+        )
+        cases = [
+            (-1.0e6, 0.0),
+            (-0.4, 0.0),
+            (0.0, 0.0),
+            (0.6, 1.0),
+            (float(n // 3), float(n // 3)),
+            (float(n - 1), float(n - 1)),
+            (1.0e6, float(n - 1)),
+        ]
+        xs = torch.tensor([[c[0]] for c in cases])
+        out = reference_eval(node, {"x": xs}, len(cases))[node].squeeze(-1)
+        exp = torch.tensor([c[1] for c in cases])
+        assert torch.allclose(out, exp, atol=5e-3), (n, s, out, exp)
+
+
+def test_table_lookup_3d_large_flattened_rows_exact():
+    """The 3D lookup flattens (A, B) into A*B rows; the motivating 16x128x128
+    shape reshapes to 2048 rows — well into the tall-table regime — and stays
+    exact on the integer grid through the cancellation-free row builder."""
+    t3 = torch.arange(16 * 128 * 128, dtype=torch.float32).reshape(16, 128, 128)
+    i = create_input("i", 1)
+    j = create_input("j", 1)
+    k = create_input("k", 1)
+    node = table_lookup_3d(i, j, k, t3)
+    cells = [(0, 0, 0), (15, 127, 127), (7, 64, 33), (3, 5, 120)]
+    inputs = {
+        "i": torch.tensor([[float(a)] for a, _, _ in cells]),
+        "j": torch.tensor([[float(b)] for _, b, _ in cells]),
+        "k": torch.tensor([[float(c)] for _, _, c in cells]),
+    }
+    got = reference_eval(node, inputs, len(cells))[node].squeeze(-1)
+    expected = torch.tensor([float(t3[a, b, c]) for a, b, c in cells])
+    assert torch.allclose(got, expected, atol=5e-3), (got, expected)

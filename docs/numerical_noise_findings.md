@@ -171,26 +171,56 @@ Exact at any magnitude/sharpness AND compiled-precise; pinned by
 slope-change-sum structure but is correct for its documented **integer-only**
 contract (integer inputs land in flat zones); it is not reworked.
 
-### Known gap: the `map_select` table-lookup staircases have the same 2^24 cancellation
+### Resolved: the `map_select` table-lookup staircases had the same 2^24 cancellation
 
 An audit for the `floor_int` cancellation class found one untriggered sibling.
 `_table_lookup_index_staircase` / `_table_lookup_row_vector` /
-`_table_lookup_column_mask` (`torchwright/ops/map_select.py`) build a
+`_table_lookup_column_mask` (`torchwright/ops/map_select.py`) built a
 `piecewise_linear` with `2·(n−1)+1` breakpoints and `input_scale=sharpness`
 (default 100), feeding `table_lookup_2d`/`table_lookup_3d`. Same single
 alternating-sign ReLU sum, so the same overflow:
-`_table_lookup_index_staircase(n=256, sharpness=100)` at `x=100000` returns
-`0.0` (should clamp to 255 — the index is never clamped before the staircase),
-and `n=20000, sharpness=1000` collapses an in-range `x=19999` to `0.0`
-(`s·max_breakpoint ≈ 2e7 > 2^24`). **Untriggered today**: current table
-consumers use small tables with in-range, pre-rounded integer indices, and the
-DOOM texture/palette lookup track is still a Phase-F stub. Fix before that
-track lands large tables — clamp the index into `[0, n−1]` *before* the
-staircase, and/or apply the saturating-step reformulation. The audit also
-flagged `compare` as a milder 2-term variant that fails silently for `|x| ≳
-2^24/sharpness` (default-sharpness boundary ~1.68e6; live callers stay far
-under it), and confirmed `square`/`exp`/`multiply_2d`/`low_rank_2d` safe
-(monotone slopes or `input_scale=1`).
+`_table_lookup_index_staircase(n=256, sharpness=100)` at `x=100000` returned
+`0.0` (should clamp to 255 — the index was never clamped before the staircase),
+and `n=20000, sharpness=1000` collapsed an in-range `x=19999` to `0.0`
+(`s·max_breakpoint ≈ 2e7 > 2^24`). Two triggers: **(a)** a scaled index far
+outside `[0, n−1]` pushes `sharpness·x` past `2^24`; **(b)** a tall table's top
+breakpoint position passes `2^24`.
+
+**Fixed** by rebuilding all three on the shared `_saturating_step_select`
+helper, the table analogue of `floor_int`'s saturating-step staircase. Two
+parts, one per trigger:
+
+- **(b) The staircase.** Each half-integer boundary `k − 0.5` contributes a
+  *bounded* step `step_k = relu(t_k) − relu(t_k − W)`
+  (`t_k = s·(x − (k−0.5)) + 0.5`, `W = max(2, 8·ulp(s·(n−1)+1))`), and the
+  output accumulates `out = top − Σ_k relu(1 − step_k)·deltas[k−1]` (rows
+  reconstructed from consecutive differences: `deltas[k−1] = value[k] −
+  value[k−1]`, `value[n−1] = top`). Every partial sum is bounded by the table's
+  total variation `Σ_k |deltas[k−1]|`, not by `s·x`, so it never overflows
+  regardless of `n`. The `+ 0.5` centers the ramp on the boundary
+  (indicator `= 0.5` there), reproducing the old two-row linear blend in the
+  transition band — off-grid values are unchanged.
+- **(a) The clamp.** A leading `min(index, n−1)` (one sublayer,
+  `(n−1) − relu((n−1) − x)` — a single ReLU of a magnitude, no cancellation)
+  bounds the out-of-range case so `W`, sized for the in-range span, always
+  resolves the saturating difference. The lower edge needs no clamp: a hugely
+  negative index leaves every step off (ReLU of a negative is exactly 0) and
+  selects row 0.
+
+Cost: one `min` sublayer plus the two chained ReLU sublayers of the staircase,
+versus the old single sublayer. Exact at any magnitude/sharpness and
+compiled-precise; pinned by `test_table_lookup_2d_out_of_range_index_clamps_to_edge`,
+`test_table_lookup_2d_tall_table_stays_exact`,
+`test_table_lookup_index_staircase_clamps_and_rounds_at_any_magnitude`, and
+`test_table_lookup_3d_large_flattened_rows_exact` in
+`tests/ops/test_resampling_primitives.py`. (`table_lookup_2d`/`_3d` are not in
+the measured-op set in `scripts/measure_op_noise.py`; adding them there for a
+tracked noise number is a reasonable follow-on.)
+
+The same audit flagged `compare` as a milder 2-term variant that fails silently
+for `|x| ≳ 2^24/sharpness` (default-sharpness boundary ~1.68e6; live callers
+stay far under it) and confirmed `square`/`exp`/`multiply_2d`/`low_rank_2d` safe
+(monotone slopes or `input_scale=1`); those are unchanged.
 
 ### Rel-error reporting: ramp-zone artefacts
 
