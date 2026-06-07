@@ -49,6 +49,7 @@ class LayerScheduler:
         admission_budget_fraction: float = 0.4,
         policy: Optional[SchedulingPolicy] = None,
         pinned_nodes: Optional[Set[Node]] = None,
+        eager_free: bool = True,
     ):
         self.graph = graph
         self.d = d
@@ -57,6 +58,16 @@ class LayerScheduler:
         self.n_heads = d // d_head
         self.pos_encoding = pos_encoding
         self.policy = policy if policy is not None else SchedulingPolicy()
+        # Eager (within-layer) freeing: when a node is placed, free any of its
+        # inputs that just became dead so their columns can be reused *in the
+        # same layer*.  This is what lets the heuristic exploit within-layer
+        # column reuse — a density the layer-granular CP-SAT model cannot
+        # represent, which makes the eager schedule an infeasible CP-SAT hint.
+        # Set ``eager_free=False`` to produce a model-representable (deeper but
+        # feasible) schedule; the CP-SAT warm-start uses this so the solver gets
+        # a real incumbent to improve, while the heuristic *fallback* keeps the
+        # default eager behavior (shallower).  See ``_freshly_dead_inputs``.
+        self._eager_free = eager_free
         # Nodes whose residual-stream columns must stay allocated for the
         # entire compile.  Used for overlay inputs: the delta-transfer
         # layer at end of compile writes to those columns, so the
@@ -1057,7 +1068,14 @@ class LayerScheduler:
         Walks through ``Concatenate`` inputs since Concatenate nodes aren't
         residual-stream-allocated.  Returns only leaves currently allocated
         whose effective consumers are all in ``computed_nodes``.
+
+        Returns an empty list when ``eager_free`` is disabled (the CP-SAT
+        warm-start path), so the resulting schedule never frees and reuses a
+        column within a consumer's layer — keeping it representable by the
+        layer-granular CP-SAT model.
         """
+        if not self._eager_free:
+            return []
         result: List[Node] = []
         seen: Set[Node] = set()
         stack: List[Node] = list(node.inputs)

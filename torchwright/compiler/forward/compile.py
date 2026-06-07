@@ -52,6 +52,21 @@ class _TrackingResidualStreamMap(ResidualStreamMap):
     records that value for every node that gets freed.  Nodes
     consumed via ``reassign`` (free-add path) don't go through
     ``free`` and are correctly omitted from the cancel hint.
+
+    **Rollback-free correction.**  ``LayerScheduler`` speculatively
+    allocates a node, then rolls the allocation back with ``free(node)``
+    when the op can't be committed under the dirty-cancel / head budget
+    (``scheduler.py`` ``residual_map.free(node); continue``).  That
+    rollback is not a real death — the node is re-allocated (reborn) in
+    a later layer.  Recording the rollback layer as the node's cancel
+    produced a hint with ``cancel < birth`` (e.g. freed at layer 6,
+    actually born at layer 7), which is hard-infeasible in the CP-SAT
+    model.  To keep the emitted ``hint_cancel`` internally consistent,
+    a node's stale cancel record is cleared whenever it is re-allocated
+    or reborn via ``reassign``: a node is only ever (re)allocated after
+    a premature rollback free, so any prior cancel for it must be
+    discarded and re-recorded by its genuine later free (or omitted
+    entirely if it dies by reassign, per the free-add design above).
     """
 
     def __init__(self, base: ResidualStreamMap) -> None:
@@ -64,9 +79,23 @@ class _TrackingResidualStreamMap(ResidualStreamMap):
         self.current_layer: int = 0
         self.cancel_layer: dict[int, int] = {}
 
+    def allocate(self, node: Node):  # type: ignore[override]
+        # A node reaching allocate after a recorded free was rolled back
+        # (its earlier free was premature); drop the stale cancel so the
+        # genuine death — a later free, or omission if it dies by
+        # reassign — is what the hint reflects.
+        self.cancel_layer.pop(node.node_id, None)
+        return super().allocate(node)
+
     def free(self, node: Node) -> None:  # type: ignore[override]
         self.cancel_layer[node.node_id] = self.current_layer
         super().free(node)
+
+    def reassign(self, old_node: Node, new_node: Node) -> None:  # type: ignore[override]
+        # The new node is born here (free-add reuse), so any stale cancel
+        # recorded for it by an earlier rolled-back allocation is wrong.
+        self.cancel_layer.pop(new_node.node_id, None)
+        super().reassign(old_node, new_node)
 
 
 def _run_heuristic_warm_start(
@@ -105,6 +134,15 @@ def _run_heuristic_warm_start(
         admission_budget_fraction=admission_budget_fraction,
         policy=policy,
         pinned_nodes=overlay_pinned_inputs,
+        # The warm-start must hand CP-SAT a *model-representable* schedule.
+        # Eager (within-layer) freeing produces a shallower schedule that frees
+        # and reuses a column inside a consumer's layer — a density the
+        # layer-granular CP-SAT model cannot express, so the eager schedule is
+        # an infeasible hint and CP-SAT cold-searches and times out.  The
+        # no-eager schedule is deeper but feasible, giving the solver a real
+        # incumbent to improve from (d=4096/d_head=32: 87 -> ~81 vs the eager
+        # heuristic's 85).  The heuristic *fallback* below stays eager.
+        eager_free=False,
     )
     hint_layers: dict = {}
     hint_routing: dict = {}
@@ -703,19 +741,22 @@ def forward_compile(
             # error, so a layer-count-only measurement cannot tell it from
             # a real solve.  Surface it loudly (and optionally fatally via
             # ``require_solver``) so it can never masquerade as an
-            # optimizer result.  ``INFEASIBLE`` here is almost always a
-            # model bug (the heuristic found a feasible schedule yet
-            # CP-SAT's model proved none exists) rather than a hard
-            # instance — see ``docs/cpsat_scheduler.md``.
+            # optimizer result.  ``UNKNOWN`` means CP-SAT found no incumbent
+            # within the budget (expected at small budgets / hard geometries);
+            # ``INFEASIBLE`` on a graph the heuristic schedules would indicate
+            # a CP-SAT model bug — see ``docs/cpsat_scheduler.md``.  The
+            # fallback uses the EAGER heuristic (below), which is typically
+            # shallower than the no-eager warm-start hint (``hint_n_layers``).
             fallback_msg = (
                 f"CP-SAT returned no usable assignment "
                 f"(status={_stats.status_name}, "
                 f"{cpsat_time_budget_s:.0f}s budget); falling back to the "
-                f"heuristic schedule ({hint_n_layers} layers). The compile "
-                f"is valid but UNOPTIMIZED — optimize>0 did not take "
-                f"effect. status=INFEASIBLE on a graph the heuristic "
-                f"schedules indicates a CP-SAT model bug, not a hard "
-                f"instance."
+                f"eager heuristic schedule (the no-eager warm-start hint was "
+                f"{hint_n_layers} layers; the eager fallback is typically "
+                f"shallower). The compile is valid but UNOPTIMIZED — "
+                f"optimize>0 did not take effect. status=INFEASIBLE (vs "
+                f"UNKNOWN/timeout) on a graph the heuristic schedules would "
+                f"indicate a CP-SAT model bug, not a hard instance."
             )
             if require_solver:
                 raise RuntimeError(
@@ -728,6 +769,9 @@ def forward_compile(
                 for line in _stats.solver_log.splitlines()[-40:]:
                     print(f"  {line}")
                 print("--- end CP-SAT solver log ---")
+            # Eager heuristic fallback (default eager_free=True): a timeout
+            # never regresses below the eager heuristic's depth, even though
+            # the CP-SAT hint was the deeper no-eager schedule.
             scheduler = LayerScheduler(
                 graph,
                 d,
