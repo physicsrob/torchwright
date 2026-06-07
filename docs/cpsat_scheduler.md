@@ -553,6 +553,36 @@ heuristic's layer count also tightens the search horizon
 (`max_layers = min(user_max, hint_n_layers + 1)`), which shrinks
 each `layer_var`'s domain.
 
+**The warm-start runs with eager freeing disabled (`eager_free=False`).**
+The default heuristic frees a node's columns *within* its consumer's
+layer and reuses them the same layer (within-layer reuse).  The
+layer-granular CP-SAT model — where a node occupies the residual
+stream for the half-open layer interval `[birth, cancel)` — cannot
+express that density, so the *eager* schedule is an **infeasible**
+hint: CP-SAT discards it, cold-searches, and times out into the
+silent heuristic fallback (the post-J DOOM symptom at d=4096/d_head=32:
+`optimize=2` returned 85 via fallback).  The no-eager schedule is one
+or two layers deeper (87 vs 85 at d=4096) but model-representable, so
+CP-SAT gets a *real feasible incumbent* to verify and improve — it
+walks 87 → 86 → … → 81–82 within the `optimize=2` budget (the exact
+floor varies run-to-run with CP-SAT's parallel workers).  The heuristic
+**fallback** (used only when CP-SAT finds nothing) keeps the default
+eager behavior, so a timeout never regresses below the eager depth.
+
+**Rollback-cancel correction.**  `LayerScheduler` speculatively
+allocates a node, then rolls the allocation back with `free(node)`
+when the op can't be committed under the dirty-cancel / head budget.
+That rollback is not a real death — the node is re-allocated (reborn)
+in a later layer, and may then die by `reassign` (free-add, never
+`free`).  Recording the rollback layer as the cancel produced hints
+with `cancel < birth` (e.g. freed at layer 6, actually born at 7),
+which is hard-infeasible in the model — exactly the 3 records that kept
+the otherwise-feasible no-eager hint from being accepted as a complete
+incumbent.  `_TrackingResidualStreamMap` therefore clears a node's
+stale cancel whenever it is re-allocated or reborn via `reassign`, so
+the emitted `hint_cancel` is internally consistent (`cancel ≥ birth+1`,
+or omitted when the node dies by reassign).
+
 ### Cancel-domain restriction
 
 The cancel decision space is the dominant LB-search cost when the
@@ -610,18 +640,25 @@ feasible but possibly non-optimal.  `forward_compile` accepts it —
 ### Geometry sensitivity
 
 The win-size from CP-SAT versus heuristic depends on residual-stream
-slack.  Measured on the headless DOOM graph (~4.4K nodes); each row
-records the ``optimize`` level (and corresponding budget) used:
+slack.  The first three rows were measured on an earlier headless DOOM
+graph (~4.4K nodes); the last row is the post-J graph (~13K nodes,
+the flat pass roughly doubled depth).  Each row records the
+``optimize`` level (and corresponding budget) used:
 
-| geometry            | -O / budget | heuristic | CP-SAT | Δ    | first incumbent | OPTIMAL at |
-|---------------------|-------------|----------:|-------:|-----:|----------------:|-----------:|
-| d=2048, d_h=8192    | -O 1 (60s)  | 61        | (none) | n/a  | not in 60s      | not in 60s |
-| d=3072, d_h=8192    | -O 2 (180s) | 58        | 46     | -21% | ~27s            | ~80s       |
-| d=4096, d_h=4096    | -O 1 (60s)  | 59        | 46     | -22% | ~17s            | ~31s       |
+| geometry                       | -O / budget | heuristic | CP-SAT | Δ    | first incumbent | OPTIMAL at |
+|--------------------------------|-------------|----------:|-------:|-----:|----------------:|-----------:|
+| d=2048, d_h=8192               | -O 1 (60s)  | 61        | (none) | n/a  | not in 60s      | not in 60s |
+| d=3072, d_h=8192               | -O 2 (180s) | 58        | 46     | -21% | ~27s            | ~80s       |
+| d=4096, d_h=4096               | -O 1 (60s)  | 59        | 46     | -22% | ~17s            | ~31s       |
+| post-J d=4096, d_h=4096, dh=32 | -O 2 (180s) | 85        | 81–82  | -4%  | ~70–80s         | never (LB 50) |
 
 At d=2048 the residual cumulative is the binding constraint and
 CP-SAT struggles to close the LB gap within budget.  At d=3072+
-CP-SAT converges optimally inside the budget.  The heuristic-
+CP-SAT converges optimally inside the budget.  On the much larger
+post-J graph CP-SAT no longer proves optimality (the lower bound
+sticks at 50) but still beats the heuristic — and only once the
+warm-start feeds a *feasible* (no-eager) hint; with the eager hint it
+finds no incumbent and falls back.  The heuristic-
 fallback behavior (when CP-SAT can't find an incumbent) is the
 right answer for d=2048 — users always get a schedule, just not
 the CP-SAT one.
@@ -643,7 +680,23 @@ the CP-SAT one.
   solution.  CP-SAT's first feasible reproduces the heuristic
   warm-start; stopping there returned no improvement over
   `optimize=0` while paying the model-build cost.  Removed.
-- **`repair_hint=True`** would have let CP-SAT actively complete
-  the partial hint into a feasible solution, but it conflicts
-  with `AddDecisionStrategy` (CP-SAT crashes with
-  "fixed_search != nullptr").  Not pursued.
+- **`repair_hint=True`** would have let CP-SAT actively complete the
+  partial hint into a feasible solution, but it is **unusable in this
+  OR-Tools version** (v9.15): it aborts the process with
+  `Check failed: heuristics.fixed_search != nullptr` — *with and
+  without* `AddDecisionStrategy`, and even with
+  `search_branching=FIXED_SEARCH` (where the crash just moves from
+  setup into a parallel worker mid-search).  (An earlier note here
+  claimed it merely "conflicts with `AddDecisionStrategy`"; that was
+  wrong — removing the strategy does not avoid the crash.)  And it
+  would not have helped regardless: measured on the post-J DOOM graph,
+  the ~70 s to first incumbent is **genuine model-size search**
+  (≈23 s presolve + ≈45 s LB/feasibility search on a ~80 k-variable
+  model with three coupled `AddCumulative` constraints), not a blocked
+  seed.  The raw hint (with the 3 infeasible `cancel < birth` records)
+  and the clean hint reach their first incumbent at the *same* time —
+  the soft `AddHint` silently drops the infeasible values either way —
+  so the cancel artifacts were a correctness curiosity, not the
+  performance lever.  The lever is feeding a *feasible* hint at all
+  (the no-eager schedule, see *Warm-start hints*) plus an `optimize≥2`
+  budget; CP-SAT then improves 87 → 81.

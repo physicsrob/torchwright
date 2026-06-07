@@ -181,3 +181,19 @@ class Node:
 
     def __hash__(self):
         return self.node_id
+
+    def __deepcopy__(self, memo):
+        # Nodes are identity-bearing graph singletons (``__hash__``/``__eq__``
+        # key on ``node_id``, and the scheduler distinguishes special nodes such
+        # as ``pos_encoding`` by ``is`` identity).  Deep-copying a structure that
+        # merely *references* nodes — e.g. cloning a ``ResidualStreamMap`` to
+        # isolate the warm-start scheduler's mutations from the real map — must
+        # preserve those references, not clone the graph.  Returning ``self``
+        # keeps node identity intact while the surrounding container (dicts,
+        # lists, sets) is still deep-copied normally.  Without this, the
+        # warm-start's ``copy.deepcopy(residual_map)`` cloned ``pos_encoding``,
+        # breaking the ``n is self.pos_encoding`` reservation check in
+        # ``LayerScheduler`` so the warm-start freed pos early and produced a
+        # hint the CP-SAT model (which reserves pos) rejected as infeasible.
+        memo[id(self)] = self
+        return self

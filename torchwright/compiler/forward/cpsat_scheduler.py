@@ -984,14 +984,39 @@ def build_cpsat_model(
     resid_intervals: List = []
     resid_demands: List[int] = []
     for n in residual_nodes:
-        size = model.NewIntVar(1, max_layers + 1, f"rsz_n{n.node_id}")
-        model.Add(size == cancel_layer[n.node_id] - layer_var[n.node_id])
-        iv = model.NewIntervalVar(
-            layer_var[n.node_id],
-            size,
-            cancel_layer[n.node_id],
-            f"riv_n{n.node_id}",
-        )
+        if isinstance(n, Add) and n.node_id in is_free:
+            # Free-add reuses a dead addend's already-allocated residual
+            # columns (`reassign` in both `LayerScheduler._schedule_attn_
+            # sublayer` and the directed replay), so it adds NO fresh
+            # residual column at its birth layer.  The reused addend's own
+            # interval already covers that layer — `cancel_consumer_lb`
+            # forces the addend's cancel >= layer[A] + 1 because A is one of
+            # its consumers — so giving the Add a full interval starting at
+            # layer[A] double-counts the shared column for exactly one layer.
+            # Shift the Add's residual start by `is_free[A]`: a free-add
+            # (is_free=1) starts one layer later (the addend covers layer[A]),
+            # a compute-add (is_free=0) allocates fresh columns and starts at
+            # layer[A].  This is the residual-cumulative analogue of the
+            # BIRTH-dirty / attention-head free-add gating above, and removes
+            # the residual over-count that rejected schedules the heuristic
+            # compiles (the dead addend and its Add never occupy two distinct
+            # columns at the add layer).
+            start = model.NewIntVar(0, max_layers, f"rstart_n{n.node_id}")
+            model.Add(start == layer_var[n.node_id] + is_free[n.node_id])
+            size = model.NewIntVar(0, max_layers + 1, f"rsz_n{n.node_id}")
+            model.Add(size == cancel_layer[n.node_id] - start)
+            iv = model.NewIntervalVar(
+                start, size, cancel_layer[n.node_id], f"riv_n{n.node_id}"
+            )
+        else:
+            size = model.NewIntVar(1, max_layers + 1, f"rsz_n{n.node_id}")
+            model.Add(size == cancel_layer[n.node_id] - layer_var[n.node_id])
+            iv = model.NewIntervalVar(
+                layer_var[n.node_id],
+                size,
+                cancel_layer[n.node_id],
+                f"riv_n{n.node_id}",
+            )
         resid_intervals.append(iv)
         resid_demands.append(len(n))
     # Freeable inputs occupy residual columns from layer 0 until their cancel
