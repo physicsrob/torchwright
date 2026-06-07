@@ -43,6 +43,52 @@ def _max_abs_or_raise(vt: NodeValueType, caller: str) -> float:
     return M
 
 
+def per_column_offsets(intervals, scalar_M: float) -> "torch.Tensor":
+    """Per-output-column gate offsets ``M_j = safety * max|range_j|``.
+
+    The additive-cancellation gate ``(M + v) - M`` rounds ``v`` to
+    ``ULP(M)``; a single scalar ``M`` is forced to the *widest* column, so
+    a narrow column bundled with a wide sibling (e.g. the lifted-id key
+    ``[child, -child^2, 1]``, where ``child`` needs ~``2q``× finer precision
+    than ``-child^2``) is rounded far more coarsely than it needs to be.
+    Sizing ``M`` per column from the per-column affine interval keeps each
+    column's rounding at its own scale -- the Plan-K Step-1 edge-key fix.
+    See ``/data/torchdoom/k_step1_divergence_characterization.md``.
+
+    ``intervals`` is a per-component ``Range`` list (already intersected with
+    the scalar value_type by the caller); ``scalar_M`` is the fallback used
+    for any non-finite component. Every returned ``M_j <= scalar_M`` (the
+    per-column max never exceeds the union), so the gate stays sound.
+    """
+    out = torch.empty(len(intervals))
+    fallback = scalar_M / _GATE_OFFSET_SAFETY_FACTOR
+    for j, r in enumerate(intervals):
+        m = max(abs(r.lo), abs(r.hi))
+        if not math.isfinite(m):
+            m = fallback
+        out[j] = _GATE_OFFSET_SAFETY_FACTOR * m
+    return out
+
+
+def _intersect_intervals(node: "Node"):
+    """Per-component intervals of ``node`` intersected with its scalar
+    value_type, or ``None`` if a per-column affine bound is unavailable /
+    width-mismatched (caller falls back to the scalar offset)."""
+    try:
+        intervals = node.affine_bound.to_interval()
+    except Exception:
+        return None
+    if intervals is None or len(intervals) != len(node):
+        return None
+    vt = node.value_type.value_range
+    from torchwright.graph.value_type import Range as _Range
+
+    return [
+        _Range(max(r.lo, vt.lo), min(r.hi, vt.hi)) if vt.is_finite() else r
+        for r in intervals
+    ]
+
+
 def bool_any_true(inp_list: List[Node]) -> Node:
     """
     Returns a node that evaluates to True if any of the input nodes are true.
@@ -265,18 +311,25 @@ def cond_gate(
             message=f"cond near ±1 (c_tol={c_tol})",
             claimed_type=NodeValueType(value_range=Range(-1.0 - c_tol, 1.0 + c_tol)),
         )
+        # Per-column offsets: the gate bakes M into `(M + v) - M`, so size M
+        # per column from the per-column affine interval (a narrow column is
+        # not forced to a wide sibling's M). Falls back to the scalar M.
+        intervals = _intersect_intervals(inp)
+        M_cols = per_column_offsets(intervals, M) if intervals is not None \
+            else torch.full((d,), M)
+
         d_hidden = 2 * d
         input_proj = torch.zeros(d_hidden, 1 + d)
         input_bias = torch.zeros(d_hidden)
         output_proj = torch.zeros(d_hidden, d)
-        output_bias = torch.full((d,), -M)
+        output_bias = -M_cols.clone()
 
         for j in range(d):
             a = j
             b = d + j
-            input_proj[a, 0] = M
+            input_proj[a, 0] = M_cols[j]
             input_proj[a, 1 + j] = 1.0
-            input_proj[b, 0] = -M
+            input_proj[b, 0] = -M_cols[j]
             output_proj[a, j] = 1.0
             output_proj[b, j] = 1.0
 

@@ -8,7 +8,45 @@ import torch
 from torchwright.graph.asserts import assert_integer, assert_matches_value_type
 from torchwright.graph.value_type import NodeValueType, Range
 from torchwright.ops.const import step_sharpness, embedding_step_sharpness
-from torchwright.ops.logic_ops import cond_add_vector, cond_gate, _max_abs_or_raise
+from torchwright.ops.logic_ops import (
+    cond_add_vector,
+    cond_gate,
+    _max_abs_or_raise,
+    _intersect_intervals,
+    per_column_offsets,
+)
+
+
+def _select_per_column_offsets(true_node, false_node, scalar_M):
+    """Per-output-column gate offsets for a two-way select. The output column
+    ``j`` equals ``true_j`` or ``false_j``, so size ``M_j`` from the union of
+    the two operands' per-column affine intervals (falls back to the scalar
+    ``M`` if a per-column bound is unavailable). See ``per_column_offsets``."""
+    ti = _intersect_intervals(true_node)
+    fi = _intersect_intervals(false_node)
+    if ti is None or fi is None or len(ti) != len(fi):
+        return torch.full((len(true_node),), scalar_M)
+    union = [Range(min(t.lo, f.lo), max(t.hi, f.hi)) for t, f in zip(ti, fi)]
+    return per_column_offsets(union, scalar_M)
+
+
+def _broadcast_select_per_column_offsets(
+    true_value, false_value, n_slots, d_fill, true_bc, false_bc, scalar_M
+):
+    """Per-output-column gate offsets for broadcast_select. Output column
+    ``i*d_fill+j`` equals ``true``/``false`` at its (possibly broadcast)
+    source column, so union those two per-column intervals."""
+    ti = _intersect_intervals(true_value)
+    fi = _intersect_intervals(false_value)
+    if ti is None or fi is None:
+        return torch.full((n_slots * d_fill,), scalar_M)
+    union = []
+    for i in range(n_slots):
+        for j in range(d_fill):
+            ts = j if true_bc else i * d_fill + j
+            fs = j if false_bc else i * d_fill + j
+            union.append(Range(min(ti[ts].lo, fi[fs].lo), max(ti[ts].hi, fi[fs].hi)))
+    return per_column_offsets(union, scalar_M)
 from torchwright.ops.arithmetic_ops import sum_nodes
 from torchwright.ops.linear_relu_linear import linear_relu_linear
 
@@ -648,18 +686,23 @@ def select(
             message=f"cond near ±1 (c_tol={c_tol})",
             claimed_type=NodeValueType(value_range=Range(-1.0 - c_tol, 1.0 + c_tol)),
         )
+        # Per-column offsets sized from the union of the two operands' columns
+        # (see per_column_offsets) so a narrow column is not forced to a wide
+        # sibling's M in the `(M + v) - M` cancellation.
+        M_cols = _select_per_column_offsets(true_node, false_node, M)
+
         d_hidden = 2 * d
         input_proj = torch.zeros(d_hidden, 1 + 2 * d)
         input_bias = torch.zeros(d_hidden)
         output_proj = torch.zeros(d_hidden, d)
-        output_bias = torch.full((d,), -M)
+        output_bias = -M_cols.clone()
 
         for j in range(d):
             a = j
             b = d + j
-            input_proj[a, 0] = M
+            input_proj[a, 0] = M_cols[j]
             input_proj[a, 1 + j] = 1.0
-            input_proj[b, 0] = -M
+            input_proj[b, 0] = -M_cols[j]
             input_proj[b, 1 + d + j] = 1.0
             output_proj[a, j] = 1.0
             output_proj[b, j] = 1.0
@@ -965,6 +1008,13 @@ def broadcast_select(
     M = _select_offset(true_value, false_value, "broadcast_select")
 
     if approximate:
+        # Per-output-column offsets (see per_column_offsets) so a narrow column
+        # is not forced to a wide sibling's M in the `(M + v) - M` cancellation.
+        M_cols = _broadcast_select_per_column_offsets(
+            true_value, false_value, n_slots, d_fill,
+            true_is_broadcast, false_is_broadcast, M,
+        )
+
         d_hidden = 4 * n_slots * d_fill
         inp = Concatenate([masks, true_value, false_value])
         d_input = len(inp)
@@ -984,30 +1034,31 @@ def broadcast_select(
         for i in range(n_slots):
             for j in range(d_fill):
                 out_idx = i * d_fill + j
+                M_o = M_cols[out_idx]
                 unit_pos_t = 4 * out_idx
                 unit_pos_b = 4 * out_idx + 1
                 unit_neg_t = 4 * out_idx + 2
                 unit_neg_b = 4 * out_idx + 3
 
                 # unit_pos_t = ReLU(M * mask_i + true_ij)
-                input_proj[unit_pos_t, mask_offset + i] = M
+                input_proj[unit_pos_t, mask_offset + i] = M_o
                 if true_is_broadcast:
                     input_proj[unit_pos_t, true_offset + j] = 1.0
                 else:
                     input_proj[unit_pos_t, true_offset + i * d_fill + j] = 1.0
 
                 # unit_pos_b = ReLU(M * mask_i)
-                input_proj[unit_pos_b, mask_offset + i] = M
+                input_proj[unit_pos_b, mask_offset + i] = M_o
 
                 # unit_neg_t = ReLU(-M * mask_i + false_ij)
-                input_proj[unit_neg_t, mask_offset + i] = -M
+                input_proj[unit_neg_t, mask_offset + i] = -M_o
                 if false_is_broadcast:
                     input_proj[unit_neg_t, false_offset + j] = 1.0
                 else:
                     input_proj[unit_neg_t, false_offset + i * d_fill + j] = 1.0
 
                 # unit_neg_b = ReLU(-M * mask_i)
-                input_proj[unit_neg_b, mask_offset + i] = -M
+                input_proj[unit_neg_b, mask_offset + i] = -M_o
 
                 # output = (unit_pos_t - unit_pos_b) + (unit_neg_t - unit_neg_b)
                 output_proj[unit_pos_t, out_idx] = 1.0

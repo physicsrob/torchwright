@@ -43,7 +43,14 @@ _ERROR_METRIC_KEYS = [
     "p99_rel_error",
 ]
 
-_RTOL = 0.30
+# 0.40 (was 0.30) so the check absorbs measurements that sit on a precision
+# boundary and flip between cross-test GPU states / CPU configs run-to-run. The
+# motivating case is `reciprocal_03_200`'s p99 error, which is bistable on Modal
+# (~4.0e-4 vs ~5.8e-4, a ~31% swing) depending on concurrent-shard GPU state —
+# no single committed value passes at 0.30 in both states. This guard catches
+# gross drift (a number moving by >40%); it is not a tight regression bound.
+# See docs/numerical_noise_findings.md.
+_RTOL = 0.40
 _ATOL = 1e-6
 
 
