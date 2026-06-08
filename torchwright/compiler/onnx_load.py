@@ -30,9 +30,12 @@ import torch
 from torchwright.compiler.export import HEADLESS_META_FORMAT, meta_path_for
 
 # Past state is a pair (past_K_tuple, past_V_tuple) where each inner
-# tuple has one torch.Tensor of shape (n_heads, n_past, d_head) per
-# layer.  Both CompiledHeadless and OnnxHeadlessModule use this exact
-# representation so past tensors can be threaded between runtimes.
+# tuple has one torch.Tensor per layer.  OnnxHeadlessModule uses the
+# sequence-major cache layout (n_past, n_heads, d_head) that the ONNX
+# graph speaks; the in-process CompiledHeadless reference path keeps its
+# own head-major full-cache representation, so the two are no longer
+# interchangeable by shape (only by the abstract "prefix in, rows out"
+# contract).
 PastKV = Tuple[Tuple[torch.Tensor, ...], Tuple[torch.Tensor, ...]]
 
 
@@ -100,31 +103,32 @@ class OnnxHeadlessModule:
         )
 
         # Discover KV cache topology from the ONNX graph's input spec.
-        # past_K_i inputs have shape (n_heads_i, n_past, d_head); after
-        # head trimming each layer may have a different head count.
+        # past_K_i inputs are sequence-major (n_past, n_heads_i, d_head);
+        # after head trimming each layer may have a different head count.
         inputs = {inp.name: inp for inp in self._session.get_inputs()}
         self._n_layers = sum(1 for name in inputs if name.startswith("past_K_"))
         assert (
             self._n_layers > 0
         ), f"{onnx_path}: no past_K_* inputs — is this a cached-protocol model?"
         self._per_layer_n_heads = [
-            int(inputs[f"past_K_{i}"].shape[0]) for i in range(self._n_layers)
+            int(inputs[f"past_K_{i}"].shape[1]) for i in range(self._n_layers)
         ]
         self._d_head = int(inputs["past_K_0"].shape[2])
 
-        # Cache the list of output names in the protocol order so we
-        # can unpack session.run() results without another dict lookup.
+        # Cache the list of output names in the protocol order so we can
+        # unpack session.run() results without another dict lookup.  Outputs
+        # are the per-layer KV *deltas* (the new rows only).
         self._out_names = ["outputs"]
         for i in range(self._n_layers):
-            self._out_names += [f"new_K_{i}", f"new_V_{i}"]
+            self._out_names += [f"delta_K_{i}", f"delta_V_{i}"]
 
     def empty_past(self) -> PastKV:
-        """Zero-length past tensors suitable for a first prefill call."""
+        """Zero-length sequence-major past tensors for a first prefill call."""
         past_K = tuple(
-            torch.zeros(nh, 0, self._d_head) for nh in self._per_layer_n_heads
+            torch.zeros(0, nh, self._d_head) for nh in self._per_layer_n_heads
         )
         past_V = tuple(
-            torch.zeros(nh, 0, self._d_head) for nh in self._per_layer_n_heads
+            torch.zeros(0, nh, self._d_head) for nh in self._per_layer_n_heads
         )
         return (past_K, past_V)
 
@@ -140,11 +144,11 @@ class OnnxHeadlessModule:
             inputs: ``(n_new, d_input)`` float tensor.
             past: ``(past_K_tuple, past_V_tuple)`` from a prior step or
                 :meth:`empty_past`.  Each tuple has length ``n_layers``
-                and each entry is a ``(n_heads, n_past, d_head)`` torch
-                tensor.
+                and each entry is a sequence-major ``(n_past, n_heads,
+                d_head)`` torch tensor — the active cache prefix.
             past_len: Optional absolute query position for the new rows.
                 When ``None`` (default), derived from
-                ``past_K[0].shape[1]``.  Callers using a sliding-window
+                ``past_K[0].shape[0]``.  Callers using a sliding-window
                 runtime may pass the true global position here while
                 handing over a trimmed cache; the graph's pos-encoding
                 slice uses this value while the attention mask uses the
@@ -152,8 +156,12 @@ class OnnxHeadlessModule:
 
         Returns:
             ``(outputs, new_past)`` where ``outputs`` is a
-            ``(n_new, d_output)`` torch tensor and ``new_past`` matches
-            the shape of ``past`` with the new rows appended.
+            ``(n_new, d_output)`` torch tensor and ``new_past`` is ``past``
+            with the returned per-layer deltas concatenated on (axis 0).
+            (The graph returns only the new rows; this functional wrapper
+            rebuilds the prefix by concatenation.  The production
+            ``OnnxTokenRuntime`` instead writes deltas into a preallocated
+            cache in place.)
         """
         past_K, past_V = past
         assert len(past_K) == self._n_layers
@@ -161,7 +169,7 @@ class OnnxHeadlessModule:
 
         inputs_np = inputs.detach().cpu().numpy().astype(np.float32, copy=False)
         if past_len is None:
-            past_len = int(past_K[0].shape[1])
+            past_len = int(past_K[0].shape[0])
 
         feeds: dict = {
             "inputs": inputs_np,
@@ -178,11 +186,15 @@ class OnnxHeadlessModule:
         results = self._session.run(self._out_names, feeds)
         outputs = torch.from_numpy(results[0])
 
+        # Returned tensors are the per-layer KV deltas (new rows only);
+        # rebuild the cache prefix by concatenating on the sequence axis.
         new_K = tuple(
-            torch.from_numpy(results[1 + 2 * i]) for i in range(self._n_layers)
+            torch.cat([past_K[i], torch.from_numpy(results[1 + 2 * i])], dim=0)
+            for i in range(self._n_layers)
         )
         new_V = tuple(
-            torch.from_numpy(results[1 + 2 * i + 1]) for i in range(self._n_layers)
+            torch.cat([past_V[i], torch.from_numpy(results[1 + 2 * i + 1])], dim=0)
+            for i in range(self._n_layers)
         )
 
         return outputs, (new_K, new_V)

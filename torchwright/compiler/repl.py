@@ -51,7 +51,7 @@ def generate(
     The ONNX graph is expected to expose the cached-forward interface:
 
         inputs:  token_ids, past_len, past_K_i, past_V_i
-        outputs: logits,    new_K_i, new_V_i
+        outputs: logits,    delta_K_i, delta_V_i  (new rows only)
 
     Prefill is the first session.run() with empty past tensors. Each
     subsequent decode step feeds a single token and the accumulated past.
@@ -68,18 +68,18 @@ def generate(
     token_ids = np.array([vocab.token_to_id(t) for t in tokens], dtype=np.int64)
 
     past_K = [
-        np.zeros((per_layer_n_heads[i], 0, d_head), dtype=np.float32)
+        np.zeros((0, per_layer_n_heads[i], d_head), dtype=np.float32)
         for i in range(n_layers)
     ]
     past_V = [
-        np.zeros((per_layer_n_heads[i], 0, d_head), dtype=np.float32)
+        np.zeros((0, per_layer_n_heads[i], d_head), dtype=np.float32)
         for i in range(n_layers)
     ]
     past_len = 0
 
     out_names = ["logits"]
     for i in range(n_layers):
-        out_names += [f"new_K_{i}", f"new_V_{i}"]
+        out_names += [f"delta_K_{i}", f"delta_V_{i}"]
 
     def _step(step_tokens: np.ndarray) -> np.ndarray:
         nonlocal past_len
@@ -92,9 +92,10 @@ def generate(
             feeds[f"past_V_{i}"] = past_V[i]
         outputs = session.run(out_names, feeds)
         logits = outputs[0]
+        # Outputs are per-layer KV deltas (new rows only); grow the prefix.
         for i in range(n_layers):
-            past_K[i] = outputs[1 + 2 * i]
-            past_V[i] = outputs[1 + 2 * i + 1]
+            past_K[i] = np.concatenate([past_K[i], outputs[1 + 2 * i]], axis=0)
+            past_V[i] = np.concatenate([past_V[i], outputs[1 + 2 * i + 1]], axis=0)
         past_len += int(step_tokens.shape[0])
         return logits
 
@@ -133,7 +134,7 @@ def _load(onnx_path: str) -> _Model:
     inputs = {inp.name: inp for inp in session.get_inputs()}
     n_layers = sum(1 for name in inputs if name.startswith("past_K_"))
     assert n_layers > 0, "ONNX model has no past_K_* inputs — expected cached export"
-    per_layer_n_heads = [int(inputs[f"past_K_{i}"].shape[0]) for i in range(n_layers)]
+    per_layer_n_heads = [int(inputs[f"past_K_{i}"].shape[1]) for i in range(n_layers)]
     d_head = int(inputs["past_K_0"].shape[2])
 
     return _Model(

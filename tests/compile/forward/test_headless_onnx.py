@@ -31,15 +31,16 @@ D_HEAD = 16
 def _empty_past_feeds(per_layer_n_heads: list, d_head: int) -> dict:
     feeds = {"past_len": np.array(0, dtype=np.int64)}
     for i, nh in enumerate(per_layer_n_heads):
-        feeds[f"past_K_{i}"] = np.zeros((nh, 0, d_head), dtype=np.float32)
-        feeds[f"past_V_{i}"] = np.zeros((nh, 0, d_head), dtype=np.float32)
+        feeds[f"past_K_{i}"] = np.zeros((0, nh, d_head), dtype=np.float32)
+        feeds[f"past_V_{i}"] = np.zeros((0, nh, d_head), dtype=np.float32)
     return feeds
 
 
 def _discover_meta(session):
+    # past_K_i is sequence-major (n_past, n_heads, d_head): heads on axis 1.
     inputs = {inp.name: inp for inp in session.get_inputs()}
     n_layers = sum(1 for name in inputs if name.startswith("past_K_"))
-    per_layer_n_heads = [int(inputs[f"past_K_{i}"].shape[0]) for i in range(n_layers)]
+    per_layer_n_heads = [int(inputs[f"past_K_{i}"].shape[1]) for i in range(n_layers)]
     d_head = int(inputs["past_K_0"].shape[2])
     return n_layers, per_layer_n_heads, d_head
 
@@ -123,7 +124,7 @@ def test_headless_onnx_chunked_decode_matches_full_prefill():
         n_layers, per_layer_n_heads, d_head = _discover_meta(session)
         out_names = ["outputs"]
         for i in range(n_layers):
-            out_names += [f"new_K_{i}", f"new_V_{i}"]
+            out_names += [f"delta_K_{i}", f"delta_V_{i}"]
 
         # Full prefill (ground truth)
         feeds = {"inputs": inputs_np}
@@ -164,7 +165,7 @@ def test_headless_onnx_decode_step_matches_full_prefill():
         n_layers, per_layer_n_heads, d_head = _discover_meta(session)
         out_names = ["outputs"]
         for i in range(n_layers):
-            out_names += [f"new_K_{i}", f"new_V_{i}"]
+            out_names += [f"delta_K_{i}", f"delta_V_{i}"]
 
         # Full prefill
         feeds = {"inputs": inputs_np}
@@ -190,6 +191,84 @@ def test_headless_onnx_decode_step_matches_full_prefill():
     assert np.allclose(
         full_outputs[-1], decode_out[0], atol=1e-3
     ), f"decode seam diff: {np.abs(full_outputs[-1] - decode_out[0]).max():.6f}"
+
+
+# ---------------------------------------------------------------------------
+# Test 2b: the causal mask follows the BOUND past_K shape, not past_len.
+# This is the load-bearing invariant of the in-place (delta) cache: the
+# runtime binds past_K = cache[:cache_len] (a contiguous prefix of a larger
+# owned buffer), so the mask geometry must come from the bound seq-dim, and
+# binding the whole allocation would attend to the dead tail.
+# ---------------------------------------------------------------------------
+
+
+def test_headless_onnx_mask_follows_bound_cache_shape():
+    out, pos = _build_sample_graph()
+    a_vals = torch.tensor([[3.0], [5.0], [-2.0], [0.0], [4.0]])
+    b_vals = torch.tensor([[4.0], [-1.0], [3.0], [7.0], [2.0]])
+    inputs_np = torch.cat([a_vals, b_vals], dim=1).numpy().astype(np.float32)
+    n = 4  # rows committed to the cache before the decode step
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        onnx_path = _export(out, pos, tmpdir)
+        session = onnxruntime.InferenceSession(onnx_path)
+        n_layers, per_layer_n_heads, d_head = _discover_meta(session)
+        out_names = ["outputs"]
+        for i in range(n_layers):
+            out_names += [f"delta_K_{i}", f"delta_V_{i}"]
+
+        feeds = {"inputs": inputs_np}
+        feeds.update(_empty_past_feeds(per_layer_n_heads, d_head))
+        full_outputs = session.run(["outputs"], feeds)[0]
+
+        # Prefill n rows from empty: the deltas ARE the n-row cache (seq-major).
+        feeds = {"inputs": inputs_np[:n]}
+        feeds.update(_empty_past_feeds(per_layer_n_heads, d_head))
+        results = session.run(out_names, feeds)
+        cache_k = [results[1 + 2 * i] for i in range(n_layers)]
+        cache_v = [results[1 + 2 * i + 1] for i in range(n_layers)]
+
+        def decode(past_k, past_v, past_len):
+            feeds = {
+                "inputs": inputs_np[n : n + 1],
+                "past_len": np.array(past_len, dtype=np.int64),
+            }
+            for i in range(n_layers):
+                feeds[f"past_K_{i}"] = past_k[i]
+                feeds[f"past_V_{i}"] = past_v[i]
+            return session.run(["outputs"], feeds)[0]
+
+        # (1) Exact n-row past reproduces row n of the full prefill.
+        exact = decode(cache_k, cache_v, n)
+        assert np.allclose(full_outputs[n], exact[0], atol=1e-3)
+
+        # Allocate a larger buffer; [:n] is the real cache, the tail is garbage.
+        m = n + 3
+        big_k, big_v = [], []
+        for i in range(n_layers):
+            nh = per_layer_n_heads[i]
+            bk = np.full((m, nh, d_head), 7.0, dtype=np.float32)
+            bv = np.full((m, nh, d_head), -3.0, dtype=np.float32)
+            bk[:n] = cache_k[i]
+            bv[:n] = cache_v[i]
+            big_k.append(bk)
+            big_v.append(bv)
+
+        # (1') Binding the contiguous prefix VIEW big[:n] is bit-equal — the
+        # owned-cache in-place pattern is sound.
+        sliced = decode([bk[:n] for bk in big_k], [bv[:n] for bv in big_v], n)
+        assert np.allclose(
+            exact[0], sliced[0], atol=1e-6
+        ), f"prefix-slice bind diverged: {np.abs(exact[0] - sliced[0]).max():.6e}"
+
+        # (2) Binding the WHOLE buffer (past_len=n) attends to the dead tail —
+        # the mask spans m, not n — so it must differ. This is why the runtime
+        # binds cache[:cache_len], never the full allocation.
+        full_buf = decode(big_k, big_v, n)
+        assert not np.allclose(exact[0], full_buf[0], atol=1e-3), (
+            "binding the full allocation matched the prefix bind — the mask is "
+            "not following the bound past_K shape"
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -241,9 +320,9 @@ def test_onnx_headless_module_empty_past_shape():
         assert len(past_K) == module._n_layers
         assert len(past_V) == module._n_layers
         for i, K in enumerate(past_K):
-            assert K.shape == (module._per_layer_n_heads[i], 0, module._d_head)
+            assert K.shape == (0, module._per_layer_n_heads[i], module._d_head)
         for i, V in enumerate(past_V):
-            assert V.shape == (module._per_layer_n_heads[i], 0, module._d_head)
+            assert V.shape == (0, module._per_layer_n_heads[i], module._d_head)
 
 
 # ---------------------------------------------------------------------------

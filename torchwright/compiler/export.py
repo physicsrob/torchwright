@@ -16,10 +16,14 @@ Two exporters, symmetric:
 Both speak the KV-cache prefill/decode protocol:
 
     graph inputs:  <seq-input>, past_len, past_K_i, past_V_i  (i in 0..n_layers-1)
-    graph outputs: <seq-output>, new_K_i, new_V_i
+    graph outputs: <seq-output>, delta_K_i, delta_V_i
 
-Prefill uses empty past tensors (shape ``(n_heads, 0, d_head)``) and
-``past_len = 0``.  Decode uses past tensors produced by a prior run.
+K/V are sequence-major ``(seq, n_heads, d_head)``.  ``past_K_i`` is the
+active cache prefix ``(n_past, ...)``; ``delta_K_i`` is the *new rows
+only* ``(n_new, ...)``, which the runtime writes in place into its owned
+cache tail (no full-cache copy).  Prefill uses empty past tensors (shape
+``(0, n_heads, d_head)``) and ``past_len = 0``.  Decode binds the cache
+prefix produced by prior runs.
 
 Both exporters stream each layer's weights into ONNX initializers (with
 per-tensor sparsification) as the layer is compiled, then null out the
@@ -352,9 +356,9 @@ def _emit_cached_preamble(nodes: list, seq_input_name: str) -> None:
         host may hand over a trimmed cache with a larger ``past_len`` to
         get correct pos encodings for a sliding-window runtime.
       - graph input ``seq_input_name``: first dim is ``n_new``
-      - graph input ``past_K_0``: shape ``(n_heads, past_cache_len,
-        d_head)`` — the actual past cache length is read from its shape
-        at runtime and drives the mask geometry.
+      - graph input ``past_K_0``: shape ``(past_cache_len, n_heads,
+        d_head)`` — sequence-major; the actual past cache length is read
+        from its shape (axis 0) at runtime and drives the mask geometry.
       - initializer ``pos_encoding_full``: (max_seq_len, d_pos)
       - scalar initializers from :func:`_add_scalar_inits`
 
@@ -384,10 +388,11 @@ def _emit_cached_preamble(nodes: list, seq_input_name: str) -> None:
     add("Shape", [seq_input_name], ["_seq_shape"])
     add("Gather", ["_seq_shape", "_i64_zero_s"], ["_n_new_s"], axis=0)
 
-    # past_cache_len as 0-D scalar: Shape(past_K_0)[1]
-    # Every layer's past_K has the same shape-[1]; pick layer 0.
+    # past_cache_len as 0-D scalar: Shape(past_K_0)[0]
+    # Sequence-major cache (n_past, n_heads, d_head): the sequence length is
+    # axis 0.  Every layer's past_K shares it; pick layer 0.
     add("Shape", ["past_K_0"], ["_past_K_shape"])
-    add("Gather", ["_past_K_shape", "_i64_one_s"], ["_past_cache_len_s"], axis=0)
+    add("Gather", ["_past_K_shape", "_i64_zero_s"], ["_past_cache_len_s"], axis=0)
 
     # Mask geometry uses the actual cache length, not past_len.
     # n_total_mask = past_cache_len + n_new
@@ -431,9 +436,17 @@ def _emit_cached_layer_nodes(
 ) -> str:
     """Emit cached attention + FFN nodes for one layer.
 
-    Reads graph inputs ``past_K_{i}`` / ``past_V_{i}`` and writes graph
-    outputs ``new_K_{i}`` / ``new_V_{i}``.  Uses the shared ``mask_3d``
-    produced by :func:`_emit_cached_preamble`.
+    Reads graph inputs ``past_K_{i}`` / ``past_V_{i}`` (sequence-major
+    ``(n_past, n_heads, d_head)``, bound by the runtime to ``cache[:len]``)
+    and writes graph outputs ``delta_K_{i}`` / ``delta_V_{i}`` — the *new
+    rows only*, ``(n_new, n_heads, d_head)``.  The full ``past + new`` K/V
+    is built INTERNALLY (a per-layer transient, freed before the next
+    layer) and never exposed as a graph output, so the runtime never
+    reallocates/copies the whole cache.  Attention uses the original
+    head-major ``Transpose+MatMul`` ops (the ONNX ``Einsum`` form is broken
+    on the CUDA EP for this graph); the sequence-major past/delta are
+    transposed in.  Uses the shared ``mask_bool_3d`` from
+    :func:`_emit_cached_preamble`.
 
     ``n_heads`` is the (possibly trimmed) head count for this layer.
     Per-layer reshape constants ``l{i}_qkv_view_shape`` and
@@ -447,51 +460,52 @@ def _emit_cached_layer_nodes(
     def node(op, ins, outs, **attrs):
         nodes.append(helper.make_node(op, ins, outs, **attrs))
 
-    # Project Q, K_new, V_new from the new rows only, reshape to heads.
+    # Project Q, K_new, V_new from the new rows in sequence-major
+    # (n_new, n_heads, d_head).  The deltas (new rows only) are the graph
+    # outputs the runtime writes into its owned cache tail; the reshape
+    # constant l{i}_qkv_view_shape = [0, n_heads, d_head] copies n_new from
+    # the flat (n_new, hd) projection.
     node("MatMul", [current_res, f"{p}_WQ"], [f"{p}_Q_flat"])
-    node("Reshape", [f"{p}_Q_flat", f"{p}_qkv_view_shape"], [f"{p}_Q_view"])
-    node("Transpose", [f"{p}_Q_view"], [f"{p}_Q"], perm=[1, 0, 2])
+    node("Reshape", [f"{p}_Q_flat", f"{p}_qkv_view_shape"], [f"{p}_Q_sm"])
 
     node("MatMul", [current_res, f"{p}_WK"], [f"{p}_K_flat"])
-    node("Reshape", [f"{p}_K_flat", f"{p}_qkv_view_shape"], [f"{p}_K_view"])
-    node("Transpose", [f"{p}_K_view"], [f"{p}_K_new"], perm=[1, 0, 2])
+    node("Reshape", [f"{p}_K_flat", f"{p}_qkv_view_shape"], [f"delta_K_{layer_idx}"])
 
     node("MatMul", [current_res, f"{p}_WV"], [f"{p}_V_flat"])
-    node("Reshape", [f"{p}_V_flat", f"{p}_qkv_view_shape"], [f"{p}_V_view"])
-    node("Transpose", [f"{p}_V_view"], [f"{p}_V_new"], perm=[1, 0, 2])
+    node("Reshape", [f"{p}_V_flat", f"{p}_qkv_view_shape"], [f"delta_V_{layer_idx}"])
 
-    # Concatenate the cached past with the new rows along the seq axis.
-    # These Concat outputs are also exposed as graph outputs (new_K_i /
-    # new_V_i) so callers can feed them back as the next step's past.
-    node(
-        "Concat",
-        [f"past_K_{layer_idx}", f"{p}_K_new"],
-        [f"new_K_{layer_idx}"],
-        axis=1,
-    )
-    node(
-        "Concat",
-        [f"past_V_{layer_idx}", f"{p}_V_new"],
-        [f"new_V_{layer_idx}"],
-        axis=1,
-    )
+    # Attention runs in the ORIGINAL head-major Transpose+MatMul form — the
+    # ONNX Einsum form is numerically broken on the CUDA EP for this graph
+    # (wrong argmax from the very first token), so we keep the exact ops the
+    # pre-cache-rewrite export used.  Transpose the sequence-major Q / past /
+    # delta into head-major (n_heads, seq, d_head); the past inputs and delta
+    # outputs stay sequence-major for the runtime's contiguous-slice binding.
+    node("Transpose", [f"{p}_Q_sm"], [f"{p}_Q"], perm=[1, 0, 2])
+    node("Transpose", [f"delta_K_{layer_idx}"], [f"{p}_K_new"], perm=[1, 0, 2])
+    node("Transpose", [f"delta_V_{layer_idx}"], [f"{p}_V_new"], perm=[1, 0, 2])
+    node("Transpose", [f"past_K_{layer_idx}"], [f"{p}_past_K_hm"], perm=[1, 0, 2])
+    node("Transpose", [f"past_V_{layer_idx}"], [f"{p}_past_V_hm"], perm=[1, 0, 2])
+    # Concat the cached past with the new rows along the (head-major) seq axis.
+    node("Concat", [f"{p}_past_K_hm", f"{p}_K_new"], [f"{p}_K_full"], axis=1)
+    node("Concat", [f"{p}_past_V_hm", f"{p}_V_new"], [f"{p}_V_full"], axis=1)
 
     # Attention over the full (past + new) K and V.
-    node("Transpose", [f"new_K_{layer_idx}"], [f"{p}_K_T"], perm=[0, 2, 1])
+    node("Transpose", [f"{p}_K_full"], [f"{p}_K_T"], perm=[0, 2, 1])
     node("MatMul", [f"{p}_Q", f"{p}_K_T"], [f"{p}_logits"])
     # Overwrite-mask with CAUSAL_MASK_SENTINEL (equivalent to torch's
     # masked_fill).  An additive penalty would leave masked positions at
     # "logit + penalty", which is not dominated by real logits when they
     # are very negative (e.g. attend_argmin_unmasked with high query gain).
+    # mask_bool_3d is (1, n_new, n_total); it broadcasts over the head axis.
     node(
         "Where",
         ["mask_bool_3d", "_f32_causal_sentinel_s", f"{p}_logits"],
         [f"{p}_logits_masked"],
     )
     node("Softmax", [f"{p}_logits_masked"], [f"{p}_weights"], axis=-1)
-    node("MatMul", [f"{p}_weights", f"new_V_{layer_idx}"], [f"{p}_ctx"])
+    node("MatMul", [f"{p}_weights", f"{p}_V_full"], [f"{p}_ctx"])
 
-    # Fused output projection: (n_heads, t, d_head) → (t, hd) → (t, d)
+    # Fused output projection: (n_heads, n_new, d_head) → (n_new, hd) → (n_new, d)
     node("Transpose", [f"{p}_ctx"], [f"{p}_ctx_t"], perm=[1, 0, 2])
     node("Reshape", [f"{p}_ctx_t", f"{p}_ctx_flat_shape"], [f"{p}_ctx_flat"])
     node("MatMul", [f"{p}_ctx_flat", f"{p}_WO"], [f"{p}_attn_sum"])
@@ -514,32 +528,38 @@ def _kv_io_value_info(per_layer_n_heads: List[int], d_head: int) -> tuple[list, 
     ``per_layer_n_heads`` gives the (possibly trimmed) head count for
     each layer, so each layer's KV tensors carry only the heads it uses.
 
+    Sequence-major layout ``(seq, n_heads, d_head)``: the runtime binds the
+    contiguous active prefix ``cache[:len]`` as ``past_K_i`` and the
+    contiguous write slice ``cache[len:len+n_new]`` as the ``delta_K_i``
+    output, with no full-cache copy.
+
     Returns:
         (past_vis, new_vis) — each a list of length 2*n_layers
-        alternating ``past_K_i`` / ``past_V_i`` (inputs) and
-        ``new_K_i`` / ``new_V_i`` (outputs).
+        alternating ``past_K_i`` / ``past_V_i`` (inputs, shape
+        ``(n_past, nh, d_head)``) and ``delta_K_i`` / ``delta_V_i``
+        (outputs — the new rows only, shape ``(n_new, nh, d_head)``).
     """
     past_vis: list = []
     new_vis: list = []
     for i, nh in enumerate(per_layer_n_heads):
         past_vis.append(
             helper.make_tensor_value_info(
-                f"past_K_{i}", TensorProto.FLOAT, [nh, "n_past", d_head]
+                f"past_K_{i}", TensorProto.FLOAT, ["n_past", nh, d_head]
             )
         )
         past_vis.append(
             helper.make_tensor_value_info(
-                f"past_V_{i}", TensorProto.FLOAT, [nh, "n_past", d_head]
+                f"past_V_{i}", TensorProto.FLOAT, ["n_past", nh, d_head]
             )
         )
         new_vis.append(
             helper.make_tensor_value_info(
-                f"new_K_{i}", TensorProto.FLOAT, [nh, "n_total", d_head]
+                f"delta_K_{i}", TensorProto.FLOAT, ["n_new", nh, d_head]
             )
         )
         new_vis.append(
             helper.make_tensor_value_info(
-                f"new_V_{i}", TensorProto.FLOAT, [nh, "n_total", d_head]
+                f"delta_V_{i}", TensorProto.FLOAT, ["n_new", nh, d_head]
             )
         )
     return past_vis, new_vis
@@ -573,12 +593,13 @@ def compile_headless_to_onnx(
 
     The graph speaks the KV-cache prefill/decode protocol:
         inputs:  inputs (n_new, d_input), past_len (scalar),
-                 past_K_i, past_V_i (n_heads, n_past, d_head)
+                 past_K_i, past_V_i (n_past, n_heads, d_head)
         outputs: outputs (n_new, d_output),
-                 new_K_i, new_V_i (n_heads, n_total, d_head)
+                 delta_K_i, delta_V_i (n_new, n_heads, d_head)
 
-    Prefill = empty past tensors + past_len=0.  Decode = feed back the
-    new_K_i / new_V_i from a previous run and set past_len accordingly.
+    K/V are sequence-major; ``delta_K_i`` is the new rows only, written by
+    the runtime into its owned cache tail.  Prefill = empty past tensors +
+    past_len=0.  Decode = bind the owned cache prefix ``cache[:past_len]``.
 
     ``d_hidden`` is the per-layer MLP hidden width.  Defaults to ``d``
     when omitted; pass an explicit value to decouple the MLP intermediate
@@ -768,6 +789,7 @@ def compile_to_onnx(
     trim_heads: bool = True,
     optimize: int = 0,
     assume_zero_init: bool = True,
+    d_hidden: Optional[int] = None,
 ) -> None:
     """Compile a token-I/O graph to a KV-cached ONNX model.
 
@@ -778,12 +800,14 @@ def compile_to_onnx(
 
     The graph speaks the KV-cache prefill/decode protocol:
         inputs:  token_ids (n_new,) int64, past_len (scalar),
-                 past_K_i, past_V_i (n_heads, n_past, d_head)
+                 past_K_i, past_V_i (n_past, n_heads, d_head)
         outputs: logits (n_new, vocab_size),
-                 new_K_i, new_V_i (n_heads, n_total, d_head)
+                 delta_K_i, delta_V_i (n_new, n_heads, d_head)
 
-    Prefill = empty past + past_len=0; decode = feed back the new_K_i /
-    new_V_i from a prior run with the accumulated past_len.
+    K/V are sequence-major; ``delta_K_i`` is the new rows only, written by
+    the runtime into its owned cache tail (no full-cache copy).  Prefill =
+    empty past + past_len=0; decode = bind the owned cache prefix
+    ``cache[:past_len]`` with the accumulated past_len.
 
     ``assume_zero_init`` defaults to ``True`` here (unlike ``forward_compile``,
     which defaults ``False``): the ONNX runtime always constructs the residual
@@ -825,6 +849,7 @@ def compile_to_onnx(
         trim_heads=trim_heads,
         optimize=optimize,
         assume_zero_init=assume_zero_init,
+        d_hidden=d_hidden,
     )
     t_compile = time.perf_counter() - t0
 
@@ -1179,8 +1204,14 @@ class CompiledHeadless:
 
     def empty_past(
         self,
+        max_len: Optional[int] = None,
     ) -> tuple:
-        """Zero-length past tensors suitable for a first prefill call."""
+        """Zero-length past tensors suitable for a first prefill call.
+
+        ``max_len`` is accepted and ignored for call-site symmetry with the
+        owned-cache ONNX runtime (this in-process reference path grows its own
+        head-major tuples each step rather than preallocating).
+        """
         device = self._net.device
         past_K = tuple(
             torch.zeros(nh, 0, self._d_head, device=device)

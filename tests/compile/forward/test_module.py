@@ -43,15 +43,16 @@ def _build_1digit():
 def _empty_past_feeds(per_layer_n_heads: list, d_head: int) -> dict:
     feeds = {"past_len": np.array(0, dtype=np.int64)}
     for i, nh in enumerate(per_layer_n_heads):
-        feeds[f"past_K_{i}"] = np.zeros((nh, 0, d_head), dtype=np.float32)
-        feeds[f"past_V_{i}"] = np.zeros((nh, 0, d_head), dtype=np.float32)
+        feeds[f"past_K_{i}"] = np.zeros((0, nh, d_head), dtype=np.float32)
+        feeds[f"past_V_{i}"] = np.zeros((0, nh, d_head), dtype=np.float32)
     return feeds
 
 
 def _discover_meta(session):
+    # past_K_i is sequence-major (n_past, n_heads, d_head): heads on axis 1.
     inputs = {inp.name: inp for inp in session.get_inputs()}
     n_layers = sum(1 for name in inputs if name.startswith("past_K_"))
-    per_layer_n_heads = [int(inputs[f"past_K_{i}"].shape[0]) for i in range(n_layers)]
+    per_layer_n_heads = [int(inputs[f"past_K_{i}"].shape[1]) for i in range(n_layers)]
     d_head = int(inputs["past_K_0"].shape[2])
     return n_layers, per_layer_n_heads, d_head
 
@@ -146,7 +147,7 @@ def test_token_onnx_decode_step_matches_full_prefill():
         n_layers, per_layer_n_heads, d_head = _discover_meta(session)
         out_names = ["logits"]
         for i in range(n_layers):
-            out_names += [f"new_K_{i}", f"new_V_{i}"]
+            out_names += [f"delta_K_{i}", f"delta_V_{i}"]
 
         feeds = {"token_ids": token_ids}
         feeds.update(_empty_past_feeds(per_layer_n_heads, d_head))
