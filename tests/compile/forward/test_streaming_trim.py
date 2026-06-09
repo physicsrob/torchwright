@@ -10,9 +10,17 @@ tensors; if they run after the streaming null they hit ``NoneType`` and crash
 
 The onnxruntime-based ``compile_to_onnx`` tests are skipped when onnxruntime is
 absent, so this no-onnxruntime test pins the trim/null ordering directly: with a
-streaming callback present, ``forward_compile`` must complete (trims skipped).
-The streamed sparse export already drops the zero heads/slots, so the in-memory
-trim is both impossible and redundant in that mode.
+streaming callback present, ``forward_compile`` must complete (post-loop trims
+skipped because the callback already nulled the weights).
+
+NOTE: the *real* per-layer head/slot trim for the ONNX export now happens
+*inside* ``_make_stream_layer_weights_cb`` (it calls ``trim_unused_heads`` /
+``trim_unused_slots`` on each layer before reading and nulling its tensors), so
+the exported ONNX genuinely shrinks the KV cache and MatMuls.  That behaviour is
+covered by ``test_headless_onnx.py`` (per-layer ``past_K_i`` widths, ``l{i}_W1``
+shapes, and a trim-vs-no-trim numerical no-op).  The stub callback below does
+NOT trim — it only nulls — so this test remains a pure regression for the
+ordering guard: the post-loop trim must not slice already-nulled weights.
 """
 
 import torch

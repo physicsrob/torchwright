@@ -258,6 +258,7 @@ def _make_stream_layer_weights_cb(
     dense_inits: list,
     sparse_inits: list,
     per_layer_n_heads: list,
+    trim_heads: bool = True,
 ) -> Callable[[int, object], None]:
     """Factory for the forward_compile on_layer_compiled callback.
 
@@ -265,7 +266,19 @@ def _make_stream_layer_weights_cb(
     dense/sparse init lists (sparsified on the fly when mostly zero) and
     nulls out the layer's tensor attributes so GC can reclaim them.
 
-    After head trimming, each layer's attention matrices have shape
+    When ``trim_heads`` is set (the default), each layer is trimmed *in
+    place here* — before its tensors are read — so the unused (all-zero)
+    attention heads and MLP hidden slots are physically removed: the
+    emitted WQ/WK/WV/WO matrices, the per-layer reshape constants, and
+    the ``past_K_i``/``past_V_i`` ValueInfo all shrink to the used count,
+    cutting both the KV cache and the inference MatMuls.  This is the
+    *only* place the ONNX export trims; the post-loop trims in
+    ``forward_compile`` are skipped whenever a streaming callback is
+    installed (their tensors are already nulled here).  With
+    ``trim_heads=False`` the full-width (sparsified-but-not-trimmed)
+    model is emitted instead.
+
+    After trimming, each layer's attention matrices have shape
     ``(nh, d, d_head)`` where ``nh <= d // d_head``.  Weight matrices
     are emitted at the trimmed size and per-layer reshape constants
     are added so the ONNX graph can reshape to the correct head count.
@@ -276,6 +289,14 @@ def _make_stream_layer_weights_cb(
     def on_layer_compiled(i: int, layer) -> None:
         attn = layer.attn.attn
         mlp = layer.mlp
+
+        # Trim each layer here, before its tensors are read and nulled
+        # below.  ``used_heads`` (attn) and the per-slot weight columns
+        # (mlp) were populated by write_attn_sublayer/write_mlp_sublayer
+        # during this layer's compile, so both trims see final counts.
+        if trim_heads:
+            attn.trim_unused_heads()  # n_heads -> used heads (KV cache + attn MatMuls)
+            mlp.trim_unused_slots()  # d_hidden -> used slots (MLP MatMuls)
 
         nh = attn.n_heads  # post-trim head count
         hd = nh * d_head
@@ -621,6 +642,7 @@ def compile_headless_to_onnx(
         dense_inits,
         sparse_inits,
         per_layer_n_heads,
+        trim_heads=trim_heads,
     )
 
     # --- Phase 1: streaming compile ---------------------------------------
@@ -639,6 +661,15 @@ def compile_headless_to_onnx(
         assume_zero_init=assume_zero_init,
     )
     t_compile = time.perf_counter() - t0
+    if verbose and per_layer_n_heads:
+        _max_heads = d // d_head
+        _total = _max_heads * len(per_layer_n_heads)
+        _kept = sum(per_layer_n_heads)
+        print(
+            f"  Head pruning (ONNX): {_total - _kept}/{_total} heads pruned; "
+            f"per-layer heads range [{min(per_layer_n_heads)}, "
+            f"{max(per_layer_n_heads)}] of {_max_heads}"
+        )
 
     # --- Phase 2: metadata + graph assembly -------------------------------
     assert compiled.residual_assignment is not None
@@ -833,6 +864,7 @@ def compile_to_onnx(
         dense_inits,
         sparse_inits,
         per_layer_n_heads,
+        trim_heads=trim_heads,
     )
 
     # --- Phase 1: streaming compile ---------------------------------------
@@ -852,6 +884,15 @@ def compile_to_onnx(
         d_hidden=d_hidden,
     )
     t_compile = time.perf_counter() - t0
+    if verbose and per_layer_n_heads:
+        _max_heads = d // d_head
+        _total = _max_heads * len(per_layer_n_heads)
+        _kept = sum(per_layer_n_heads)
+        print(
+            f"  Head pruning (ONNX): {_total - _kept}/{_total} heads pruned; "
+            f"per-layer heads range [{min(per_layer_n_heads)}, "
+            f"{max(per_layer_n_heads)}] of {_max_heads}"
+        )
 
     # --- Phase 2: metadata + graph assembly -------------------------------
     assert compiled.residual_assignment is not None

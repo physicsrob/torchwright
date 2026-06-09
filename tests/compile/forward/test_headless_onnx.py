@@ -53,7 +53,7 @@ def _build_sample_graph():
     return out, create_pos_encoding()
 
 
-def _export(output_node, pos_encoding, tmpdir, name="model.onnx"):
+def _export(output_node, pos_encoding, tmpdir, name="model.onnx", trim_heads=True):
     onnx_path = os.path.join(tmpdir, name)
     compile_headless_to_onnx(
         output_node,
@@ -63,8 +63,37 @@ def _export(output_node, pos_encoding, tmpdir, name="model.onnx"):
         d_head=D_HEAD,
         max_seq_len=32,
         verbose=False,
+        trim_heads=trim_heads,
     )
     return onnx_path
+
+
+def _l_w1_d_hidden(onnx_path):
+    """Per-layer MLP hidden widths read straight off the ONNX initializers.
+
+    ``l{i}_W1`` is the first MLP weight, emitted with shape ``(d, d_hidden_i)``
+    (it is the LHS of ``MatMul(res, W1)`` where ``res`` is ``(t, d)``), so its
+    second dim is that layer's hidden width after trimming.  A mostly-zero W1 is
+    emitted as a SparseTensorProto, so look in both the dense and sparse init
+    lists (the sparse proto's ``dims`` still carries the full dense shape and its
+    name lives on ``values.name``).
+    """
+    import onnx
+
+    model = onnx.load(onnx_path)
+    dims_by_name = {init.name: list(init.dims) for init in model.graph.initializer}
+    for sp in model.graph.sparse_initializer:
+        dims_by_name[sp.values.name] = list(sp.dims)
+
+    widths = []
+    i = 0
+    while f"l{i}_W1" in dims_by_name:
+        dims = dims_by_name[f"l{i}_W1"]
+        assert dims[0] == D, f"l{i}_W1 first dim {dims[0]} != d {D}"
+        widths.append(int(dims[1]))
+        i += 1
+    assert widths, "no l{i}_W1 initializers found"
+    return widths
 
 
 # ---------------------------------------------------------------------------
@@ -401,3 +430,107 @@ def test_compiled_headless_step_prefill_decode_matches_full():
     # past_K should have grown to n_total = 5
     past_K, _ = past
     assert past_K[0].shape[1] == 5
+
+
+# ---------------------------------------------------------------------------
+# Test 7: trim_heads actually trims the exported ONNX (heads + MLP slots)
+# ---------------------------------------------------------------------------
+#
+# The streaming exporter used to leave every layer full-width (d/d_head heads,
+# full d_hidden MLP), merely sparsifying the unused heads/slots to zero.  These
+# tests pin that ``trim_heads=True`` genuinely shrinks the per-layer KV cache
+# (past_K_i widths) and MLP MatMuls (l{i}_W1 widths), that ``trim_heads=False``
+# preserves the full width, and that trimming is a numerical no-op (only all-zero
+# heads/slots are removed).
+
+
+def test_headless_onnx_trim_heads_shrinks_kv_cache():
+    """trim_heads=True: per-layer past_K widths are below the full head count."""
+    out, pos = _build_sample_graph()
+    max_heads = D // D_HEAD  # 16
+    with tempfile.TemporaryDirectory() as tmpdir:
+        onnx_path = _export(out, pos, tmpdir, trim_heads=True)
+        session = onnxruntime.InferenceSession(onnx_path)
+        _, per_layer_n_heads, _ = _discover_meta(session)
+
+    assert per_layer_n_heads, "no layers discovered"
+    assert all(1 <= nh <= max_heads for nh in per_layer_n_heads)
+    assert min(per_layer_n_heads) < max_heads, (
+        f"no layer trimmed below full width {max_heads}: {per_layer_n_heads}"
+    )
+    # A real per-layer trim leaves the layers non-uniform (different layers use
+    # different head counts); a coincidental uniform value would still satisfy
+    # the bound above, so assert the per-layer variation explicitly.
+    assert len(set(per_layer_n_heads)) > 1, (
+        f"head counts are uniform across layers: {per_layer_n_heads}"
+    )
+
+
+def test_headless_onnx_no_trim_preserves_full_width():
+    """trim_heads=False: every layer keeps the full d/d_head head count."""
+    out, pos = _build_sample_graph()
+    max_heads = D // D_HEAD  # 16
+    with tempfile.TemporaryDirectory() as tmpdir:
+        onnx_path = _export(out, pos, tmpdir, trim_heads=False)
+        session = onnxruntime.InferenceSession(onnx_path)
+        _, per_layer_n_heads, _ = _discover_meta(session)
+
+    assert per_layer_n_heads, "no layers discovered"
+    assert all(nh == max_heads for nh in per_layer_n_heads), (
+        f"expected all layers at full width {max_heads}: {per_layer_n_heads}"
+    )
+
+
+def test_headless_onnx_trim_shrinks_mlp_slots():
+    """trim_heads=True shrinks some l{i}_W1 below full d_hidden; False keeps all."""
+    out, pos = _build_sample_graph()
+    full_d_hidden = D  # d_hidden defaults to d when omitted
+    with tempfile.TemporaryDirectory() as tmpdir:
+        trim_path = _export(out, pos, tmpdir, name="trim.onnx", trim_heads=True)
+        notrim_path = _export(out, pos, tmpdir, name="notrim.onnx", trim_heads=False)
+        trim_widths = _l_w1_d_hidden(trim_path)
+        notrim_widths = _l_w1_d_hidden(notrim_path)
+
+    assert all(1 <= w <= full_d_hidden for w in trim_widths)
+    assert min(trim_widths) < full_d_hidden, (
+        f"no layer's MLP trimmed below full d_hidden {full_d_hidden}: {trim_widths}"
+    )
+    assert all(w == full_d_hidden for w in notrim_widths), (
+        f"expected all layers at full d_hidden {full_d_hidden}: {notrim_widths}"
+    )
+
+
+def test_headless_onnx_trim_is_numerical_noop():
+    """Trimmed and full-width ONNX produce identical output on the same prefill.
+
+    Trimming removes only all-zero heads/slots, so prefilling the same rows
+    through both sessions must agree — any divergence means a non-zero head or
+    slot was trimmed (a real bug).
+    """
+    out, pos = _build_sample_graph()
+    a_vals = torch.tensor([[3.0], [5.0], [-2.0], [0.0], [4.0]])
+    b_vals = torch.tensor([[4.0], [-1.0], [3.0], [7.0], [2.0]])
+    inputs_np = torch.cat([a_vals, b_vals], dim=1).numpy().astype(np.float32)
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        trim_path = _export(out, pos, tmpdir, name="trim.onnx", trim_heads=True)
+        notrim_path = _export(out, pos, tmpdir, name="notrim.onnx", trim_heads=False)
+
+        sess_trim = onnxruntime.InferenceSession(trim_path)
+        sess_notrim = onnxruntime.InferenceSession(notrim_path)
+
+        _, heads_trim, d_head = _discover_meta(sess_trim)
+        _, heads_notrim, _ = _discover_meta(sess_notrim)
+
+        feeds_trim = {"inputs": inputs_np}
+        feeds_trim.update(_empty_past_feeds(heads_trim, d_head))
+        out_trim = sess_trim.run(["outputs"], feeds_trim)[0]
+
+        feeds_notrim = {"inputs": inputs_np}
+        feeds_notrim.update(_empty_past_feeds(heads_notrim, d_head))
+        out_notrim = sess_notrim.run(["outputs"], feeds_notrim)[0]
+
+    assert np.allclose(out_trim, out_notrim, atol=1e-4), (
+        f"trim changed the output: max diff "
+        f"{np.abs(out_trim - out_notrim).max():.6e}"
+    )

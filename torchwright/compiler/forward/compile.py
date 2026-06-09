@@ -1026,11 +1026,12 @@ def forward_compile(
     net.residual_assignment = ra
     net.assert_aliases = graph.get_assert_aliases()
 
-    # Skip in-place weight trimming when streaming: ``on_layer_compiled`` (the
-    # ONNX streaming path) extracts each layer's weights and NULLs the tensors
-    # per layer, so the post-loop trims here would slice ``None``. The streamed
-    # sparse export already drops the unused (zero) heads/slots, making the
-    # in-memory trim both impossible and redundant in that mode.
+    # This post-loop trim is the in-process (no-callback) path's trim.  The ONNX
+    # streaming path trims each layer *inside* ``on_layer_compiled`` (see
+    # ``_make_stream_layer_weights_cb``) before reading and NULLing its tensors,
+    # so by the time we get here those tensors are already trimmed and nulled —
+    # re-trimming would slice ``None``.  Hence the ``on_layer_compiled is None``
+    # guard: only the in-process return value still carries live weights to trim.
     if trim_heads and on_layer_compiled is None:
         max_heads = d // d_head
         for layer in net.layers:
@@ -1073,9 +1074,10 @@ def forward_compile(
                     f"{kv_depth:>10}  {cp:>10}  {sa:>10}"
                 )
 
-    # Trim trailing unused MLP slots (same idea as head trimming). Skipped when
-    # streaming for the same reason as head trimming above (weights already
-    # extracted + nulled per layer by ``on_layer_compiled``).
+    # Trim trailing unused MLP slots (same idea as head trimming, and the
+    # in-process counterpart to the per-layer ``mlp.trim_unused_slots()`` the
+    # streaming callback runs).  Skipped when streaming because the callback
+    # already trimmed and nulled each layer's MLP weights above.
     if on_layer_compiled is None:
         for layer in net.layers:
             layer.mlp.trim_unused_slots()
