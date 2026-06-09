@@ -11,7 +11,15 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-gpu = ["onnxruntime-gpu"]
+# Pinned: the CUDA-graph capture path (torchwright_doom render runtime)
+# depends on 1.26.0 mechanics — per-annotation-id run counters,
+# gpu_graph_id "-1" skip semantics, capture-on-3rd-run.  (1.26.0 needs
+# Python >=3.11; the <3.11 branch exists only to keep universal resolution
+# alive for torchwright's requires-python floor.)
+gpu = [
+    "onnxruntime-gpu==1.26.0; python_version >= '3.11'",
+    "onnxruntime-gpu; python_version < '3.11'",
+]
 
 [dependency-groups]
 dev = [

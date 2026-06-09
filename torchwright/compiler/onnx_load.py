@@ -1,7 +1,7 @@
 """Runtime loader for headless ONNX models.
 
 Provides ``OnnxHeadlessModule`` — an ``onnxruntime``-backed callable
-that speaks the KV-cache prefill/decode protocol produced by
+that speaks the static-cache prefill/decode protocol produced by
 :func:`torchwright.compiler.export.compile_headless_to_onnx` — plus a
 :class:`HeadlessRuntime` :class:`typing.Protocol` that describes the
 shared interface with the in-memory
@@ -22,21 +22,39 @@ Two usage shapes:
 
 import json
 import os
-from typing import List, Optional, Protocol, Tuple
+from dataclasses import dataclass
+from typing import List, Optional, Protocol, Tuple, Union
 
 import numpy as np
 import torch
 
 from torchwright.compiler.export import HEADLESS_META_FORMAT, meta_path_for
 
-# Past state is a pair (past_K_tuple, past_V_tuple) where each inner
-# tuple has one torch.Tensor per layer.  OnnxHeadlessModule uses the
-# sequence-major cache layout (n_past, n_heads, d_head) that the ONNX
-# graph speaks; the in-process CompiledHeadless reference path keeps its
-# own head-major full-cache representation, so the two are no longer
-# interchangeable by shape (only by the abstract "prefix in, rows out"
-# contract).
-PastKV = Tuple[Tuple[torch.Tensor, ...], Tuple[torch.Tensor, ...]]
+
+@dataclass
+class OnnxPast:
+    """Static-S sequence-major KV cache plus the committed length.
+
+    ``k[i]`` / ``v[i]`` are the FULL ``(S, n_heads_i, d_head)`` cache
+    buffers the ONNX graph's static ``past_K_i`` inputs require (S =
+    cache_stride baked at export; ORT rejects shorter feeds).  Slots at
+    positions >= ``length`` are zeros — never garbage: hidden slots get
+    softmax weight exactly 0.0 via the in-graph mask, and ``0 * NaN``
+    would still be NaN.  ``step`` writes the returned deltas into
+    ``[length : length+n_new)`` in place and returns a new ``OnnxPast``
+    with the advanced length (the buffers are shared, the length is
+    functional state).
+    """
+
+    k: Tuple[torch.Tensor, ...]
+    v: Tuple[torch.Tensor, ...]
+    length: int
+
+
+# CompiledHeadless (the in-process reference) keeps its own head-major
+# tuple representation; the two runtimes share only the abstract
+# "rows in, outputs + advanced past out" step contract.
+PastKV = Union[OnnxPast, Tuple[Tuple[torch.Tensor, ...], Tuple[torch.Tensor, ...]]]
 
 
 class HeadlessRuntime(Protocol):
@@ -103,13 +121,22 @@ class OnnxHeadlessModule:
         )
 
         # Discover KV cache topology from the ONNX graph's input spec.
-        # past_K_i inputs are sequence-major (n_past, n_heads_i, d_head);
-        # after head trimming each layer may have a different head count.
+        # past_K_i inputs are sequence-major (S, n_heads_i, d_head) with a
+        # STATIC slot count S = cache_stride; after head trimming each layer
+        # may have a different head count.
         inputs = {inp.name: inp for inp in self._session.get_inputs()}
         self._n_layers = sum(1 for name in inputs if name.startswith("past_K_"))
         assert (
             self._n_layers > 0
         ), f"{onnx_path}: no past_K_* inputs — is this a cached-protocol model?"
+        stride_dim = inputs["past_K_0"].shape[0]
+        if not isinstance(stride_dim, int):
+            raise ValueError(
+                f"{onnx_path}: past_K_0 first dim is {stride_dim!r}, expected a "
+                f"static int — this looks like a pre-static-cache (past_len/"
+                f"Concat) export; recompile with the current exporter"
+            )
+        self._cache_stride = int(stride_dim)
         self._per_layer_n_heads = [
             int(inputs[f"past_K_{i}"].shape[1]) for i in range(self._n_layers)
         ]
@@ -122,82 +149,98 @@ class OnnxHeadlessModule:
         for i in range(self._n_layers):
             self._out_names += [f"delta_K_{i}", f"delta_V_{i}"]
 
-    def empty_past(self) -> PastKV:
-        """Zero-length sequence-major past tensors for a first prefill call."""
+    @property
+    def cache_stride(self) -> int:
+        """The static slot count ``S`` baked into the loaded model."""
+        return self._cache_stride
+
+    def empty_past(self) -> OnnxPast:
+        """Full-S zero-filled sequence-major cache buffers, length 0.
+
+        Zero (not garbage) is load-bearing: slots beyond the committed
+        length are read by the attention with weight exactly 0.0, and
+        ``0 * NaN = NaN``.
+        """
+        S = self._cache_stride
         past_K = tuple(
-            torch.zeros(0, nh, self._d_head) for nh in self._per_layer_n_heads
+            torch.zeros(S, nh, self._d_head) for nh in self._per_layer_n_heads
         )
         past_V = tuple(
-            torch.zeros(0, nh, self._d_head) for nh in self._per_layer_n_heads
+            torch.zeros(S, nh, self._d_head) for nh in self._per_layer_n_heads
         )
-        return (past_K, past_V)
+        return OnnxPast(k=past_K, v=past_V, length=0)
 
     def step(
         self,
         inputs: torch.Tensor,
-        past: PastKV,
+        past: OnnxPast,
         past_len: Optional[int] = None,
-    ) -> Tuple[torch.Tensor, PastKV]:
+    ) -> Tuple[torch.Tensor, OnnxPast]:
         """Run one cached-protocol call and return (outputs, new_past).
 
         Args:
             inputs: ``(n_new, d_input)`` float tensor.
-            past: ``(past_K_tuple, past_V_tuple)`` from a prior step or
-                :meth:`empty_past`.  Each tuple has length ``n_layers``
-                and each entry is a sequence-major ``(n_past, n_heads,
-                d_head)`` torch tensor — the active cache prefix.
-            past_len: Optional absolute query position for the new rows.
-                When ``None`` (default), derived from
-                ``past_K[0].shape[0]``.  Callers using a sliding-window
-                runtime may pass the true global position here while
-                handing over a trimmed cache; the graph's pos-encoding
-                slice uses this value while the attention mask uses the
-                cache's actual shape.
+            past: :class:`OnnxPast` from a prior step or
+                :meth:`empty_past`.
+            past_len: Optional explicit base position for the new rows.
+                When ``None`` (default), uses ``past.length``.  Must equal
+                the committed cache length — the static-cache graph derives
+                both the mask and the positional encoding from
+                ``cache_position``, so there is no trimmed-cache /
+                sliding-window affordance (the old dynamic-concat graph's
+                shape-derived mask is gone).
 
         Returns:
             ``(outputs, new_past)`` where ``outputs`` is a
-            ``(n_new, d_output)`` torch tensor and ``new_past`` is ``past``
-            with the returned per-layer deltas concatenated on (axis 0).
-            (The graph returns only the new rows; this functional wrapper
-            rebuilds the prefix by concatenation.  The production
-            ``OnnxTokenRuntime`` instead writes deltas into a preallocated
-            cache in place.)
+            ``(n_new, d_output)`` torch tensor and ``new_past`` shares the
+            (in-place updated) buffers with ``past`` at the advanced
+            committed length.
         """
-        past_K, past_V = past
-        assert len(past_K) == self._n_layers
-        assert len(past_V) == self._n_layers
+        if not isinstance(past, OnnxPast):
+            raise TypeError(
+                "OnnxHeadlessModule.step requires an OnnxPast from empty_past() "
+                f"(got {type(past).__name__}) — the static-cache protocol has "
+                "no growable-tuple representation"
+            )
+        assert len(past.k) == self._n_layers
+        assert len(past.v) == self._n_layers
+
+        base = past.length if past_len is None else int(past_len)
+        assert base == past.length, (
+            f"past_len {base} != committed length {past.length}: the static "
+            f"cache derives mask AND pos from cache_position; a trimmed cache "
+            f"with a larger absolute position is not expressible"
+        )
+        n_new = int(inputs.shape[0])
+        if base + n_new > self._cache_stride:
+            raise RuntimeError(
+                f"static cache overrun: length {base} + n_new {n_new} exceeds "
+                f"cache_stride {self._cache_stride}; re-export with a larger "
+                f"cache_stride"
+            )
 
         inputs_np = inputs.detach().cpu().numpy().astype(np.float32, copy=False)
-        if past_len is None:
-            past_len = int(past_K[0].shape[0])
-
         feeds: dict = {
             "inputs": inputs_np,
-            "past_len": np.array(past_len, dtype=np.int64),
+            "cache_position": np.arange(base, base + n_new, dtype=np.int64),
         }
         for i in range(self._n_layers):
             feeds[f"past_K_{i}"] = (
-                past_K[i].detach().cpu().numpy().astype(np.float32, copy=False)
+                past.k[i].detach().cpu().numpy().astype(np.float32, copy=False)
             )
             feeds[f"past_V_{i}"] = (
-                past_V[i].detach().cpu().numpy().astype(np.float32, copy=False)
+                past.v[i].detach().cpu().numpy().astype(np.float32, copy=False)
             )
 
         results = self._session.run(self._out_names, feeds)
         outputs = torch.from_numpy(results[0])
 
-        # Returned tensors are the per-layer KV deltas (new rows only);
-        # rebuild the cache prefix by concatenating on the sequence axis.
-        new_K = tuple(
-            torch.cat([past_K[i], torch.from_numpy(results[1 + 2 * i])], dim=0)
-            for i in range(self._n_layers)
-        )
-        new_V = tuple(
-            torch.cat([past_V[i], torch.from_numpy(results[1 + 2 * i + 1])], dim=0)
-            for i in range(self._n_layers)
-        )
+        # Persist the per-layer deltas (new rows only) into the owned slots.
+        for i in range(self._n_layers):
+            past.k[i][base : base + n_new] = torch.from_numpy(results[1 + 2 * i])
+            past.v[i][base : base + n_new] = torch.from_numpy(results[1 + 2 * i + 1])
 
-        return outputs, (new_K, new_V)
+        return outputs, OnnxPast(k=past.k, v=past.v, length=base + n_new)
 
     def __call__(self, inputs: torch.Tensor) -> torch.Tensor:
         """Convenience: stateless prefill that discards the cache.

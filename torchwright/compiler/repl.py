@@ -37,6 +37,7 @@ class _Model:
     n_layers: int
     per_layer_n_heads: List[int]
     d_head: int
+    cache_stride: int  # static slot count S baked into the export
 
 
 def generate(
@@ -48,13 +49,16 @@ def generate(
 ) -> Iterator[str]:
     """Run autoregressive generation with a KV cache over an ONNX model.
 
-    The ONNX graph is expected to expose the cached-forward interface:
+    The ONNX graph is expected to expose the static-cache interface:
 
-        inputs:  token_ids, past_len, past_K_i, past_V_i
+        inputs:  token_ids, cache_position, past_K_i, past_V_i (S, nh, d_head)
         outputs: logits,    delta_K_i, delta_V_i  (new rows only)
 
-    Prefill is the first session.run() with empty past tensors. Each
-    subsequent decode step feeds a single token and the accumulated past.
+    The past buffers are FULL static-S allocations, zero-filled beyond the
+    committed length (the graph masks those slots to exactly-zero weight;
+    zeros keep 0*value finite).  Each step writes the returned deltas into
+    slots ``[past_len : past_len+n)`` in place — no concatenation, no
+    reallocation.
 
     Yields each generated token string as it is produced.
     """
@@ -63,16 +67,17 @@ def generate(
     n_layers = model.n_layers
     per_layer_n_heads = model.per_layer_n_heads
     d_head = model.d_head
+    S = model.cache_stride
 
     tokens = [bos_token] + list(input_text)
     token_ids = np.array([vocab.token_to_id(t) for t in tokens], dtype=np.int64)
 
     past_K = [
-        np.zeros((0, per_layer_n_heads[i], d_head), dtype=np.float32)
+        np.zeros((S, per_layer_n_heads[i], d_head), dtype=np.float32)
         for i in range(n_layers)
     ]
     past_V = [
-        np.zeros((0, per_layer_n_heads[i], d_head), dtype=np.float32)
+        np.zeros((S, per_layer_n_heads[i], d_head), dtype=np.float32)
         for i in range(n_layers)
     ]
     past_len = 0
@@ -83,20 +88,27 @@ def generate(
 
     def _step(step_tokens: np.ndarray) -> np.ndarray:
         nonlocal past_len
+        n_new = int(step_tokens.shape[0])
+        if past_len + n_new > S:
+            raise RuntimeError(
+                f"static cache overrun: {past_len} + {n_new} > cache_stride {S}; "
+                f"re-export with a larger cache_stride"
+            )
         feeds = {
             "token_ids": step_tokens,
-            "past_len": np.array(past_len, dtype=np.int64),
+            "cache_position": np.arange(past_len, past_len + n_new, dtype=np.int64),
         }
         for i in range(n_layers):
             feeds[f"past_K_{i}"] = past_K[i]
             feeds[f"past_V_{i}"] = past_V[i]
         outputs = session.run(out_names, feeds)
         logits = outputs[0]
-        # Outputs are per-layer KV deltas (new rows only); grow the prefix.
+        # Outputs are per-layer KV deltas (new rows only); write them into
+        # their absolute slots.
         for i in range(n_layers):
-            past_K[i] = np.concatenate([past_K[i], outputs[1 + 2 * i]], axis=0)
-            past_V[i] = np.concatenate([past_V[i], outputs[1 + 2 * i + 1]], axis=0)
-        past_len += int(step_tokens.shape[0])
+            past_K[i][past_len : past_len + n_new] = outputs[1 + 2 * i]
+            past_V[i][past_len : past_len + n_new] = outputs[1 + 2 * i + 1]
+        past_len += n_new
         return logits
 
     # Prefill
@@ -134,6 +146,13 @@ def _load(onnx_path: str) -> _Model:
     inputs = {inp.name: inp for inp in session.get_inputs()}
     n_layers = sum(1 for name in inputs if name.startswith("past_K_"))
     assert n_layers > 0, "ONNX model has no past_K_* inputs — expected cached export"
+    stride_dim = inputs["past_K_0"].shape[0]
+    if not isinstance(stride_dim, int):
+        raise ValueError(
+            f"{onnx_path}: past_K_0 first dim is {stride_dim!r}, expected a "
+            f"static int — this looks like a pre-static-cache (past_len/Concat) "
+            f"export; recompile with the current exporter"
+        )
     per_layer_n_heads = [int(inputs[f"past_K_{i}"].shape[1]) for i in range(n_layers)]
     d_head = int(inputs["past_K_0"].shape[2])
 
@@ -143,6 +162,7 @@ def _load(onnx_path: str) -> _Model:
         n_layers=n_layers,
         per_layer_n_heads=per_layer_n_heads,
         d_head=d_head,
+        cache_stride=int(stride_dim),
     )
 
 

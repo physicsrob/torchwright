@@ -13,17 +13,27 @@ Two exporters, symmetric:
         input column names.  Consumer:
         :mod:`torchwright.compiler.onnx_load`.
 
-Both speak the KV-cache prefill/decode protocol:
+Both speak the STATIC-cache prefill/decode protocol (the vanilla
+HF-StaticCache / vLLM pattern, chosen so ONNX Runtime can capture a CUDA
+graph for the decode step — see plan_cuda_graph_decode.md):
 
-    graph inputs:  <seq-input>, past_len, past_K_i, past_V_i  (i in 0..n_layers-1)
+    graph inputs:  <seq-input>, cache_position, past_K_i, past_V_i
     graph outputs: <seq-output>, delta_K_i, delta_V_i
 
-K/V are sequence-major ``(seq, n_heads, d_head)``.  ``past_K_i`` is the
-active cache prefix ``(n_past, ...)``; ``delta_K_i`` is the *new rows
-only* ``(n_new, ...)``, which the runtime writes in place into its owned
-cache tail (no full-cache copy).  Prefill uses empty past tensors (shape
-``(0, n_heads, d_head)``) and ``past_len = 0``.  Decode binds the cache
-prefix produced by prior runs.
+K/V are sequence-major.  ``past_K_i`` is the FULL static cache buffer
+``(S, n_heads, d_head)`` where ``S = cache_stride`` is baked at export
+(static first dim — ORT rejects shorter feeds); slots at positions >=
+the committed length must be zero-filled (zero-init, never garbage).
+``cache_position`` (int64, ``(n_new,)``) carries the absolute positions
+of the new rows; the causal mask (``slot j hidden iff j > p``) and the
+positional-encoding rows are derived from it IN-GRAPH on GPU — no CPU
+shape plane, no Memcpy nodes, so the whole graph stays capturable.  The
+new rows enter the current step's attention via an in-graph ``ScatterND``
+into the static buffer; ``delta_K_i`` (the new rows only, ``(n_new,
+...)``) remains a graph output that the runtime persists into its owned
+cache slots after the run (ORT forbids output buffers aliasing inputs).
+Prefill = zero-filled past + ``cache_position = [0..n)``.  Decode =
+``cache_position = [base]`` against the same full-S binding.
 
 Both exporters stream each layer's weights into ONNX initializers (with
 per-tensor sparsification) as the layer is compiled, then null out the
@@ -49,10 +59,26 @@ from onnx import TensorProto, helper
 from torchwright.compiler.forward.compile import forward_compile
 from torchwright.graph import Concatenate, Embedding, LiteralValue, Node, PosEncoding
 from torchwright.graph.attn import CAUSAL_MASK_SENTINEL
-from torchwright.graph.misc import InputNode
+from torchwright.graph.misc import Assert, DebugWatch, InputNode
 
 HEADLESS_META_FORMAT = "torchwright.headless.v1"
 TOKEN_META_FORMAT = "torchwright.token.v1"
+
+
+def _unwrap_output_node(node: Node) -> Node:
+    """Strip Assert/DebugWatch wrappers from an output node.
+
+    Assert and DebugWatch are stripped at compile time (GraphAnalyzer), so
+    the residual assignment only carries indices for the *wrapped* node —
+    looking the wrapper itself up KeyErrors.  ``compile_headless`` (the
+    in-process path) already unwraps via ``GraphAnalyzer.get_output_node``;
+    the ONNX exporters do their own residual lookups and need the same
+    treatment (ops like ``compare``/``select`` return Assert-wrapped
+    outputs).
+    """
+    while isinstance(node, (Assert, DebugWatch)):
+        node = node.inputs[0]
+    return node
 
 
 # ---------------------------------------------------------------------------
@@ -213,27 +239,12 @@ def _add_int64_init(name: str, arr: np.ndarray, dense_inits: list) -> None:
 
 
 def _add_scalar_inits(dense_inits: list) -> None:
-    """Register 0-D scalar and tiny 1-D helper initializers used by the
-    cached preamble (Range, Where, Unsqueeze/Slice axes).
+    """Register the scalar / tiny 1-D helper initializers used by the
+    cached preamble and layers (Where sentinel, Unsqueeze axes).
+
+    Initializer-fed axes inputs do NOT create Memcpy nodes (initializers
+    are materialized on every EP), so these are CUDA-graph-safe.
     """
-    dense_inits.append(
-        helper.make_tensor(
-            name="_i64_zero_s",
-            data_type=TensorProto.INT64,
-            dims=[],
-            vals=np.array(0, dtype=np.int64).tobytes(),
-            raw=True,
-        )
-    )
-    dense_inits.append(
-        helper.make_tensor(
-            name="_i64_one_s",
-            data_type=TensorProto.INT64,
-            dims=[],
-            vals=np.array(1, dtype=np.int64).tobytes(),
-            raw=True,
-        )
-    )
     dense_inits.append(
         helper.make_tensor(
             name="_f32_causal_sentinel_s",
@@ -367,84 +378,47 @@ def _make_stream_layer_weights_cb(
 # ---------------------------------------------------------------------------
 
 
-def _emit_cached_preamble(nodes: list, seq_input_name: str) -> None:
-    """Emit nodes that produce ``pos`` and ``mask_bool_3d`` tensors.
+def _emit_cached_preamble(nodes: list) -> None:
+    """Emit nodes producing ``pos``, ``mask_bool_3d`` and ``_cache_pos_col``.
 
     Requires:
-      - graph input ``past_len``: scalar int64 — the absolute *query*
-        position the new rows live at.  Drives the positional-encoding
-        slice.  Does **not** have to equal ``past_K_0.shape[1]``; the
-        host may hand over a trimmed cache with a larger ``past_len`` to
-        get correct pos encodings for a sliding-window runtime.
-      - graph input ``seq_input_name``: first dim is ``n_new``
-      - graph input ``past_K_0``: shape ``(past_cache_len, n_heads,
-        d_head)`` — sequence-major; the actual past cache length is read
-        from its shape (axis 0) at runtime and drives the mask geometry.
+      - graph input ``cache_position``: int64 ``(n_new,)`` — the absolute
+        positions of the new rows (``[base, base+1, …]``).  The ONLY
+        position fact the host provides; the causal mask and the
+        positional-encoding rows both derive from it in-graph, on GPU.
+        There is deliberately no ``Shape``/``Range`` op and no CPU scalar
+        anywhere in this preamble: CPU<->GPU handoffs become Memcpy nodes,
+        and a single Memcpy makes ORT refuse CUDA-graph capture (hard
+        error at session creation under ``enable_cuda_graph``).
+      - initializer ``arange_S``: int64 ``(S,)`` baked ``[0 .. S)``, where
+        ``S = cache_stride`` is the static KV-cache slot count.
       - initializer ``pos_encoding_full``: (max_seq_len, d_pos)
-      - scalar initializers from :func:`_add_scalar_inits`
+      - helper initializers from :func:`_add_scalar_inits`
 
     Produces:
-      - ``pos``: (n_new, d_pos) float, sliced from pos_encoding_full at
-        ``[past_len : past_len + n_new]``.
-      - ``mask_bool_3d``: (1, n_new, past_cache_len + n_new) bool, True
-        where a query position must NOT attend to a key position.
-        Applied via ``Where(mask_bool_3d, -10000, logits)`` — this
-        overwrites masked logits (unlike an additive -10000 mask, which
-        is numerically unsafe when the original logits can dominate the
-        additive shift).
-
-    The mask is derived from the *actual cache length* (the shape-[1] of
-    ``past_K_0``) rather than the ``past_len`` input, so that callers
-    can pass a trimmed cache with a different ``past_len`` without
-    creating a shape mismatch against the attention logits.  When
-    ``past_len == past_cache_len`` (the normal non-trimmed case) this
-    emission is bit-identical in behaviour to the simpler
-    ``past_len + n_new`` construction it replaces.
+      - ``pos``: (n_new, d_pos) float — ``pos_encoding_full`` rows gathered
+        at ``cache_position``.
+      - ``mask_bool_3d``: (1, n_new, S) bool, True where blocked: slot
+        ``j`` is hidden from the query at position ``p`` iff ``j > p``.
+        Applied via ``Where(mask_bool_3d, CAUSAL_MASK_SENTINEL, logits)``
+        — an overwrite, not an additive penalty (additive is numerically
+        unsafe when real logits can be very negative).  Hidden slots
+        contain zeros (runtime zero-init discipline) and get softmax
+        weight exactly 0.0 in fp32; equivalence to the old dynamic-concat
+        graph is TOKEN-level, not float-bit-level (widening the matmuls
+        to S reselects cuBLAS kernels — see plan_cuda_graph_decode.md).
+      - ``_cache_pos_col``: (n_new, 1) int64 — shared by the mask
+        comparison and by every layer's ``ScatterND`` indices.
     """
 
     def add(op, ins, outs, **attrs):
         nodes.append(helper.make_node(op, ins, outs, **attrs))
 
-    # n_new as 0-D scalar: Shape(seq_input)[0]
-    add("Shape", [seq_input_name], ["_seq_shape"])
-    add("Gather", ["_seq_shape", "_i64_zero_s"], ["_n_new_s"], axis=0)
-
-    # past_cache_len as 0-D scalar: Shape(past_K_0)[0]
-    # Sequence-major cache (n_past, n_heads, d_head): the sequence length is
-    # axis 0.  Every layer's past_K shares it; pick layer 0.
-    add("Shape", ["past_K_0"], ["_past_K_shape"])
-    add("Gather", ["_past_K_shape", "_i64_zero_s"], ["_past_cache_len_s"], axis=0)
-
-    # Mask geometry uses the actual cache length, not past_len.
-    # n_total_mask = past_cache_len + n_new
-    add("Add", ["_past_cache_len_s", "_n_new_s"], ["_n_total_mask_s"])
-
-    # Dynamic causal mask — True where a new row must NOT attend to a column.
-    # Row r is local to the cache+new window: abs-within-window = past_cache_len + r.
-    # Column c is the same local index. mask[r, c] = c > past_cache_len + r.
-    add("Range", ["_i64_zero_s", "_n_new_s", "_i64_one_s"], ["_rows"])
-    add("Range", ["_i64_zero_s", "_n_total_mask_s", "_i64_one_s"], ["_cols"])
-    add("Add", ["_rows", "_past_cache_len_s"], ["_abs_rows"])  # (n_new,)
-    add("Unsqueeze", ["_abs_rows", "_axes1_1d"], ["_abs_rows_col"])  # (n_new, 1)
-    add("Unsqueeze", ["_cols", "_axes0_1d"], ["_cols_row"])  # (1, n_total_mask)
-    add(
-        "Greater", ["_cols_row", "_abs_rows_col"], ["_mask_bool"]
-    )  # (n_new, n_total_mask)
-    add(
-        "Unsqueeze", ["_mask_bool", "_axes0_1d"], ["mask_bool_3d"]
-    )  # (1, n_new, n_total_mask)
-
-    # Positional encoding slice uses past_len directly — this is the one
-    # place past_len still matters, so the host can set the "absolute
-    # query position" independently of the cache length.
-    add("Add", ["past_len", "_n_new_s"], ["_pos_slice_end_s"])
-    add("Unsqueeze", ["past_len", "_axes0_1d"], ["_past_len_1d"])
-    add("Unsqueeze", ["_pos_slice_end_s", "_axes0_1d"], ["_pos_slice_end_1d"])
-    add(
-        "Slice",
-        ["pos_encoding_full", "_past_len_1d", "_pos_slice_end_1d", "_axes0_1d"],
-        ["pos"],
-    )
+    add("Unsqueeze", ["arange_S", "_axes0_1d"], ["_slots_row"])  # (1, S)
+    add("Unsqueeze", ["cache_position", "_axes1_1d"], ["_cache_pos_col"])  # (n_new, 1)
+    add("Greater", ["_slots_row", "_cache_pos_col"], ["_mask_bool"])  # (n_new, S)
+    add("Unsqueeze", ["_mask_bool", "_axes0_1d"], ["mask_bool_3d"])  # (1, n_new, S)
+    add("Gather", ["pos_encoding_full", "cache_position"], ["pos"], axis=0)
 
 
 def _emit_cached_layer_nodes(
@@ -457,17 +431,23 @@ def _emit_cached_layer_nodes(
 ) -> str:
     """Emit cached attention + FFN nodes for one layer.
 
-    Reads graph inputs ``past_K_{i}`` / ``past_V_{i}`` (sequence-major
-    ``(n_past, n_heads, d_head)``, bound by the runtime to ``cache[:len]``)
-    and writes graph outputs ``delta_K_{i}`` / ``delta_V_{i}`` — the *new
-    rows only*, ``(n_new, n_heads, d_head)``.  The full ``past + new`` K/V
-    is built INTERNALLY (a per-layer transient, freed before the next
-    layer) and never exposed as a graph output, so the runtime never
-    reallocates/copies the whole cache.  Attention uses the original
-    head-major ``Transpose+MatMul`` ops (the ONNX ``Einsum`` form is broken
-    on the CUDA EP for this graph); the sequence-major past/delta are
-    transposed in.  Uses the shared ``mask_bool_3d`` from
-    :func:`_emit_cached_preamble`.
+    Reads graph inputs ``past_K_{i}`` / ``past_V_{i}`` — the FULL static
+    cache, sequence-major ``(S, n_heads, d_head)`` with zero-filled slots
+    at positions >= the committed length — and writes graph outputs
+    ``delta_K_{i}`` / ``delta_V_{i}``, the *new rows only* ``(n_new,
+    n_heads, d_head)``.  The new rows are injected into THIS step's
+    attention by an in-graph ``ScatterND`` at the absolute slots
+    ``cache_position`` (causal self-attention needs the query to see its
+    own key — the diagonal); the runtime separately persists the deltas
+    into its owned cache buffer after the run, because ORT does not
+    support binding an output that aliases an input.  The scattered
+    ``(S, ...)`` K/V is a per-layer transient, freed before the next
+    layer.  Attention uses the original head-major ``Transpose+MatMul``
+    ops (the ONNX ``Einsum`` form is broken on the CUDA EP for this
+    graph).  Uses the shared ``mask_bool_3d`` / ``_cache_pos_col`` from
+    :func:`_emit_cached_preamble`; every shape in the decode step
+    (``n_new=1``) is static, which is what makes the step CUDA-graph
+    capturable.
 
     ``n_heads`` is the (possibly trimmed) head count for this layer.
     Per-layer reshape constants ``l{i}_qkv_view_shape`` and
@@ -502,13 +482,25 @@ def _emit_cached_layer_nodes(
     # delta into head-major (n_heads, seq, d_head); the past inputs and delta
     # outputs stay sequence-major for the runtime's contiguous-slice binding.
     node("Transpose", [f"{p}_Q_sm"], [f"{p}_Q"], perm=[1, 0, 2])
-    node("Transpose", [f"delta_K_{layer_idx}"], [f"{p}_K_new"], perm=[1, 0, 2])
-    node("Transpose", [f"delta_V_{layer_idx}"], [f"{p}_V_new"], perm=[1, 0, 2])
-    node("Transpose", [f"past_K_{layer_idx}"], [f"{p}_past_K_hm"], perm=[1, 0, 2])
-    node("Transpose", [f"past_V_{layer_idx}"], [f"{p}_past_V_hm"], perm=[1, 0, 2])
-    # Concat the cached past with the new rows along the (head-major) seq axis.
-    node("Concat", [f"{p}_past_K_hm", f"{p}_K_new"], [f"{p}_K_full"], axis=1)
-    node("Concat", [f"{p}_past_V_hm", f"{p}_V_new"], [f"{p}_V_full"], axis=1)
+    # Inject the new rows into the static cache at their absolute slots
+    # (sequence-major ScatterND: indices (n_new, 1) select rows, updates are
+    # the (n_new, nh, d_head) deltas), then transpose to head-major for
+    # attention.  This replaces the old Concat(past, new) — the
+    # 21%-of-compute KV-bandwidth term — and keeps the attention width at
+    # the static S every step, which is what makes the decode shape
+    # replay-stable for CUDA-graph capture.
+    node(
+        "ScatterND",
+        [f"past_K_{layer_idx}", "_cache_pos_col", f"delta_K_{layer_idx}"],
+        [f"{p}_K_static"],
+    )
+    node(
+        "ScatterND",
+        [f"past_V_{layer_idx}", "_cache_pos_col", f"delta_V_{layer_idx}"],
+        [f"{p}_V_static"],
+    )
+    node("Transpose", [f"{p}_K_static"], [f"{p}_K_full"], perm=[1, 0, 2])
+    node("Transpose", [f"{p}_V_static"], [f"{p}_V_full"], perm=[1, 0, 2])
 
     # Attention over the full (past + new) K and V.
     node("Transpose", [f"{p}_K_full"], [f"{p}_K_T"], perm=[0, 2, 1])
@@ -543,21 +535,26 @@ def _emit_cached_layer_nodes(
     return f"{p}_res_next"
 
 
-def _kv_io_value_info(per_layer_n_heads: List[int], d_head: int) -> tuple[list, list]:
+def _kv_io_value_info(
+    per_layer_n_heads: List[int], d_head: int, cache_stride: int
+) -> tuple[list, list]:
     """Build ValueInfoProto entries for the KV-cache inputs and outputs.
 
     ``per_layer_n_heads`` gives the (possibly trimmed) head count for
     each layer, so each layer's KV tensors carry only the heads it uses.
 
-    Sequence-major layout ``(seq, n_heads, d_head)``: the runtime binds the
-    contiguous active prefix ``cache[:len]`` as ``past_K_i`` and the
-    contiguous write slice ``cache[len:len+n_new]`` as the ``delta_K_i``
-    output, with no full-cache copy.
+    Sequence-major layout with a STATIC first dim: ``past_K_i`` is the
+    full ``(cache_stride, n_heads, d_head)`` cache buffer (ORT rejects
+    shorter feeds against a static dim — every feeder allocates full-S,
+    zero-initialized).  The runtime binds the same buffer every step
+    (stable address + static shape = CUDA-graph replayable) and persists
+    the ``delta_K_i`` output rows into slots ``[base : base+n_new)``
+    after the run.
 
     Returns:
         (past_vis, new_vis) — each a list of length 2*n_layers
         alternating ``past_K_i`` / ``past_V_i`` (inputs, shape
-        ``(n_past, nh, d_head)``) and ``delta_K_i`` / ``delta_V_i``
+        ``(cache_stride, nh, d_head)``) and ``delta_K_i`` / ``delta_V_i``
         (outputs — the new rows only, shape ``(n_new, nh, d_head)``).
     """
     past_vis: list = []
@@ -565,12 +562,12 @@ def _kv_io_value_info(per_layer_n_heads: List[int], d_head: int) -> tuple[list, 
     for i, nh in enumerate(per_layer_n_heads):
         past_vis.append(
             helper.make_tensor_value_info(
-                f"past_K_{i}", TensorProto.FLOAT, ["n_past", nh, d_head]
+                f"past_K_{i}", TensorProto.FLOAT, [cache_stride, nh, d_head]
             )
         )
         past_vis.append(
             helper.make_tensor_value_info(
-                f"past_V_{i}", TensorProto.FLOAT, ["n_past", nh, d_head]
+                f"past_V_{i}", TensorProto.FLOAT, [cache_stride, nh, d_head]
             )
         )
         new_vis.append(
@@ -591,6 +588,22 @@ def _kv_io_value_info(per_layer_n_heads: List[int], d_head: int) -> tuple[list, 
 # ---------------------------------------------------------------------------
 
 
+def _resolve_cache_stride(cache_stride: Optional[int], max_seq_len: int) -> int:
+    """Resolve the static cache slot count ``S`` (default: max_seq_len).
+
+    ``S`` must be <= max_seq_len because ``Gather(pos_encoding_full,
+    cache_position)`` indexes a table sized by max_seq_len, and a compiled
+    model can never serve positions beyond its pos-encoding buffer anyway.
+    """
+    s = max_seq_len if cache_stride is None else int(cache_stride)
+    if not (1 <= s <= max_seq_len):
+        raise ValueError(
+            f"cache_stride {s} must be in [1, max_seq_len={max_seq_len}]: the "
+            f"static cache cannot hold positions the pos-encoding table lacks"
+        )
+    return s
+
+
 def compile_headless_to_onnx(
     output_node: Node,
     pos_encoding: PosEncoding,
@@ -604,6 +617,7 @@ def compile_headless_to_onnx(
     d_hidden: Optional[int] = None,
     trim_heads: bool = True,
     assume_zero_init: bool = True,
+    cache_stride: Optional[int] = None,
 ) -> None:
     """Compile a float-I/O graph to a KV-cached ONNX model.
 
@@ -612,15 +626,21 @@ def compile_headless_to_onnx(
         ``<stem>.meta.json`` — ``{"format": "torchwright.headless.v1",
                                   "input_names": [...]}``
 
-    The graph speaks the KV-cache prefill/decode protocol:
-        inputs:  inputs (n_new, d_input), past_len (scalar),
-                 past_K_i, past_V_i (n_past, n_heads, d_head)
+    The graph speaks the static-cache prefill/decode protocol:
+        inputs:  inputs (n_new, d_input), cache_position (n_new,) int64,
+                 past_K_i, past_V_i (S, n_heads, d_head)  [S static]
         outputs: outputs (n_new, d_output),
                  delta_K_i, delta_V_i (n_new, n_heads, d_head)
 
-    K/V are sequence-major; ``delta_K_i`` is the new rows only, written by
-    the runtime into its owned cache tail.  Prefill = empty past tensors +
-    past_len=0.  Decode = bind the owned cache prefix ``cache[:past_len]``.
+    K/V are sequence-major; ``past_K_i`` is the FULL static cache (slots at
+    positions >= the committed length zero-filled), ``delta_K_i`` is the new
+    rows only, persisted by the runtime into its owned cache slots after the
+    run.  Prefill = zero past + cache_position [0..n).  Decode =
+    cache_position [base] against the same full-S binding.
+
+    ``cache_stride`` is the static slot count ``S`` baked into the graph
+    (the ``arange_S`` mask constant + the ``past_K_i`` shapes); defaults to
+    ``max_seq_len``.  A compiled model hard-caps at ``prefill + decode <= S``.
 
     ``d_hidden`` is the per-layer MLP hidden width.  Defaults to ``d``
     when omitted; pass an explicit value to decouple the MLP intermediate
@@ -718,10 +738,12 @@ def compile_headless_to_onnx(
     pos_encoding_buf = _compute_pos_encoding(d_pos, max_seq_len)
 
     output_indices = compiled.residual_assignment.get_node_indices(
-        out_state, output_node
+        out_state, _unwrap_output_node(output_node)
     )
     output_gather_indices = np.asarray(output_indices, dtype=np.int64)
     d_output = len(output_gather_indices)
+
+    cache_stride_resolved = _resolve_cache_stride(cache_stride, max_seq_len)
 
     # Initializers
     _add_float_init("input_proj", input_proj, dense_inits, sparse_inits)
@@ -729,6 +751,12 @@ def compile_headless_to_onnx(
     _add_float_init("constant_values", constant_values, dense_inits, sparse_inits)
     _add_float_init("pos_encoding_full", pos_encoding_buf, dense_inits, sparse_inits)
     _add_int64_init("output_gather_indices_init", output_gather_indices, dense_inits)
+    # Baked slot indices [0..S): the in-graph causal mask compares these
+    # against cache_position — a constant, so no Shape/Range op and no CPU
+    # node for any n_new (the CUDA-graph capture requirement).
+    _add_int64_init(
+        "arange_S", np.arange(cache_stride_resolved, dtype=np.int64), dense_inits
+    )
     # Per-layer reshape constants (l{i}_qkv_view_shape, l{i}_ctx_flat_shape)
     # are emitted by the streaming weight callback.
     _add_scalar_inits(dense_inits)
@@ -739,7 +767,7 @@ def compile_headless_to_onnx(
     def add(op, ins, outs, **attrs):
         nodes.append(helper.make_node(op, ins, outs, **attrs))
 
-    _emit_cached_preamble(nodes, seq_input_name="inputs")
+    _emit_cached_preamble(nodes)
     add("MatMul", ["inputs", "input_proj"], ["inp_res"])
     add("MatMul", ["pos", "pos_proj"], ["pos_res"])
     add("Add", ["inp_res", "pos_res"], ["res_pi"])
@@ -762,8 +790,12 @@ def compile_headless_to_onnx(
     inputs_vi = helper.make_tensor_value_info(
         "inputs", TensorProto.FLOAT, ["n_new", d_input]
     )
-    past_len_vi = helper.make_tensor_value_info("past_len", TensorProto.INT64, [])
-    past_vis, new_vis = _kv_io_value_info(per_layer_n_heads, d_head)
+    cache_position_vi = helper.make_tensor_value_info(
+        "cache_position", TensorProto.INT64, ["n_new"]
+    )
+    past_vis, new_vis = _kv_io_value_info(
+        per_layer_n_heads, d_head, cache_stride_resolved
+    )
     outputs_vi = helper.make_tensor_value_info(
         "outputs", TensorProto.FLOAT, ["n_new", d_output]
     )
@@ -771,7 +803,7 @@ def compile_headless_to_onnx(
     graph = helper.make_graph(
         nodes,
         "headless_transformer_cached",
-        inputs=[inputs_vi, past_len_vi, *past_vis],
+        inputs=[inputs_vi, cache_position_vi, *past_vis],
         outputs=[outputs_vi, *new_vis],
         initializer=dense_inits,
         sparse_initializer=sparse_inits,
@@ -821,6 +853,7 @@ def compile_to_onnx(
     optimize: int = 0,
     assume_zero_init: bool = True,
     d_hidden: Optional[int] = None,
+    cache_stride: Optional[int] = None,
 ) -> None:
     """Compile a token-I/O graph to a KV-cached ONNX model.
 
@@ -829,16 +862,21 @@ def compile_to_onnx(
         ``<stem>.meta.json`` — ``{"format": "torchwright.token.v1",
                                   "vocab": [...]}``
 
-    The graph speaks the KV-cache prefill/decode protocol:
-        inputs:  token_ids (n_new,) int64, past_len (scalar),
-                 past_K_i, past_V_i (n_past, n_heads, d_head)
+    The graph speaks the static-cache prefill/decode protocol:
+        inputs:  token_ids (n_new,) int64, cache_position (n_new,) int64,
+                 past_K_i, past_V_i (S, n_heads, d_head)  [S static]
         outputs: logits (n_new, vocab_size),
                  delta_K_i, delta_V_i (n_new, n_heads, d_head)
 
-    K/V are sequence-major; ``delta_K_i`` is the new rows only, written by
-    the runtime into its owned cache tail (no full-cache copy).  Prefill =
-    empty past + past_len=0; decode = bind the owned cache prefix
-    ``cache[:past_len]`` with the accumulated past_len.
+    K/V are sequence-major; ``past_K_i`` is the FULL static cache buffer
+    (``S = cache_stride``, defaulting to ``max_seq_len``; slots at
+    positions >= the committed length must be zero-filled), ``delta_K_i``
+    is the new rows only, persisted by the runtime into its owned cache
+    slots after the run.  Prefill = zero past + cache_position [0..n);
+    decode = cache_position [base] against the same full-S binding.  All
+    mask/pos arithmetic is in-graph on GPU (no Memcpy nodes), and the
+    n_new=1 decode step has fully static shapes — the two properties that
+    make the step CUDA-graph capturable.
 
     ``assume_zero_init`` defaults to ``True`` here (unlike ``forward_compile``,
     which defaults ``False``): the ONNX runtime always constructs the residual
@@ -944,9 +982,11 @@ def compile_to_onnx(
     )
 
     output_indices = compiled.residual_assignment.get_node_indices(
-        out_state, output_node
+        out_state, _unwrap_output_node(output_node)
     )
     output_gather_indices = np.asarray(output_indices, dtype=np.int64)
+
+    cache_stride_resolved = _resolve_cache_stride(cache_stride, max_seq_len)
 
     # Initializers
     _add_float_init("embedding_proj", embedding_proj, dense_inits, sparse_inits)
@@ -955,6 +995,12 @@ def compile_to_onnx(
     _add_float_init("pos_encoding_full", pos_encoding_buf, dense_inits, sparse_inits)
     _add_float_init("embed_table", embed_table_np, dense_inits, sparse_inits)
     _add_int64_init("output_gather_indices_init", output_gather_indices, dense_inits)
+    # Baked slot indices [0..S): the in-graph causal mask compares these
+    # against cache_position — a constant, so no Shape/Range op and no CPU
+    # node for any n_new (the CUDA-graph capture requirement).
+    _add_int64_init(
+        "arange_S", np.arange(cache_stride_resolved, dtype=np.int64), dense_inits
+    )
     # Per-layer reshape constants (l{i}_qkv_view_shape, l{i}_ctx_flat_shape)
     # are emitted by the streaming weight callback.
     _add_scalar_inits(dense_inits)
@@ -966,7 +1012,7 @@ def compile_to_onnx(
     def add(op, ins, outs, **attrs):
         nodes.append(helper.make_node(op, ins, outs, **attrs))
 
-    _emit_cached_preamble(nodes, seq_input_name="token_ids")
+    _emit_cached_preamble(nodes)
     # Token embedding lookup: (vocab, d_embed) gather rows by token_ids.
     add("Gather", ["embed_table", "token_ids"], ["_token_emb"], axis=0)
     add("MatMul", ["_token_emb", "embedding_proj"], ["inp_res"])
@@ -994,8 +1040,12 @@ def compile_to_onnx(
     token_ids_vi = helper.make_tensor_value_info(
         "token_ids", TensorProto.INT64, ["n_new"]
     )
-    past_len_vi = helper.make_tensor_value_info("past_len", TensorProto.INT64, [])
-    past_vis, new_vis = _kv_io_value_info(per_layer_n_heads, d_head)
+    cache_position_vi = helper.make_tensor_value_info(
+        "cache_position", TensorProto.INT64, ["n_new"]
+    )
+    past_vis, new_vis = _kv_io_value_info(
+        per_layer_n_heads, d_head, cache_stride_resolved
+    )
     logits_vi = helper.make_tensor_value_info(
         "logits", TensorProto.FLOAT, ["n_new", vocab_size]
     )
@@ -1003,7 +1053,7 @@ def compile_to_onnx(
     graph = helper.make_graph(
         nodes,
         "token_transformer_cached",
-        inputs=[token_ids_vi, past_len_vi, *past_vis],
+        inputs=[token_ids_vi, cache_position_vi, *past_vis],
         outputs=[logits_vi, *new_vis],
         initializer=dense_inits,
         sparse_initializer=sparse_inits,

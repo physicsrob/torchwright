@@ -28,21 +28,45 @@ D = 256
 D_HEAD = 16
 
 
-def _empty_past_feeds(per_layer_n_heads: list, d_head: int) -> dict:
-    feeds = {"past_len": np.array(0, dtype=np.int64)}
-    for i, nh in enumerate(per_layer_n_heads):
-        feeds[f"past_K_{i}"] = np.zeros((0, nh, d_head), dtype=np.float32)
-        feeds[f"past_V_{i}"] = np.zeros((0, nh, d_head), dtype=np.float32)
-    return feeds
-
-
 def _discover_meta(session):
-    # past_K_i is sequence-major (n_past, n_heads, d_head): heads on axis 1.
+    # past_K_i is sequence-major with a STATIC slot count: (S, n_heads, d_head).
     inputs = {inp.name: inp for inp in session.get_inputs()}
     n_layers = sum(1 for name in inputs if name.startswith("past_K_"))
     per_layer_n_heads = [int(inputs[f"past_K_{i}"].shape[1]) for i in range(n_layers)]
     d_head = int(inputs["past_K_0"].shape[2])
-    return n_layers, per_layer_n_heads, d_head
+    cache_stride = inputs["past_K_0"].shape[0]
+    assert isinstance(cache_stride, int), (
+        f"past_K_0 first dim must be static, got {cache_stride!r}"
+    )
+    return n_layers, per_layer_n_heads, d_head, cache_stride
+
+
+def _zero_past(per_layer_n_heads: list, d_head: int, S: int):
+    """Full static-S zero-filled cache buffers, one (k, v) pair per layer."""
+    k = [np.zeros((S, nh, d_head), dtype=np.float32) for nh in per_layer_n_heads]
+    v = [np.zeros((S, nh, d_head), dtype=np.float32) for nh in per_layer_n_heads]
+    return k, v
+
+
+def _feeds(inputs_np, past_k, past_v, base: int) -> dict:
+    """Static-cache feeds: full-S past buffers + cache_position for the rows."""
+    n_new = int(inputs_np.shape[0])
+    feeds = {
+        "inputs": inputs_np,
+        "cache_position": np.arange(base, base + n_new, dtype=np.int64),
+    }
+    for i, (k, v) in enumerate(zip(past_k, past_v)):
+        feeds[f"past_K_{i}"] = k
+        feeds[f"past_V_{i}"] = v
+    return feeds
+
+
+def _write_deltas(past_k, past_v, results, base: int, n_new: int):
+    """Persist a run's delta outputs into the cache slots [base : base+n_new)."""
+    n_layers = len(past_k)
+    for i in range(n_layers):
+        past_k[i][base : base + n_new] = results[1 + 2 * i]
+        past_v[i][base : base + n_new] = results[1 + 2 * i + 1]
 
 
 def _build_sample_graph():
@@ -120,12 +144,11 @@ def test_headless_onnx_prefill_matches_compute():
     with tempfile.TemporaryDirectory() as tmpdir:
         onnx_path = _export(out, pos, tmpdir)
         session = onnxruntime.InferenceSession(onnx_path)
-        n_layers, per_layer_n_heads, d_head = _discover_meta(session)
+        n_layers, per_layer_n_heads, d_head, S = _discover_meta(session)
 
         inputs_np = torch.cat([a_vals, b_vals], dim=1).numpy().astype(np.float32)
-        feeds = {"inputs": inputs_np}
-        feeds.update(_empty_past_feeds(per_layer_n_heads, d_head))
-        onnx_out = session.run(["outputs"], feeds)[0]
+        past_k, past_v = _zero_past(per_layer_n_heads, d_head, S)
+        onnx_out = session.run(["outputs"], _feeds(inputs_np, past_k, past_v, 0))[0]
 
     assert np.allclose(
         onnx_out, expected, atol=1e-3
@@ -150,32 +173,26 @@ def test_headless_onnx_chunked_decode_matches_full_prefill():
     with tempfile.TemporaryDirectory() as tmpdir:
         onnx_path = _export(out, pos, tmpdir)
         session = onnxruntime.InferenceSession(onnx_path)
-        n_layers, per_layer_n_heads, d_head = _discover_meta(session)
+        n_layers, per_layer_n_heads, d_head, S = _discover_meta(session)
         out_names = ["outputs"]
         for i in range(n_layers):
             out_names += [f"delta_K_{i}", f"delta_V_{i}"]
 
         # Full prefill (ground truth)
-        feeds = {"inputs": inputs_np}
-        feeds.update(_empty_past_feeds(per_layer_n_heads, d_head))
-        full_outputs = session.run(["outputs"], feeds)[0]
+        pk_full, pv_full = _zero_past(per_layer_n_heads, d_head, S)
+        full_outputs = session.run(
+            ["outputs"], _feeds(inputs_np, pk_full, pv_full, 0)
+        )[0]
 
-        # Prefill 2 rows
-        feeds = {"inputs": inputs_np[:2]}
-        feeds.update(_empty_past_feeds(per_layer_n_heads, d_head))
-        results = session.run(out_names, feeds)
-        past_K = [results[1 + 2 * i] for i in range(n_layers)]
-        past_V = [results[1 + 2 * i + 1] for i in range(n_layers)]
+        # Prefill 2 rows, persisting the deltas into slots [0:2)
+        past_k, past_v = _zero_past(per_layer_n_heads, d_head, S)
+        results = session.run(out_names, _feeds(inputs_np[:2], past_k, past_v, 0))
+        _write_deltas(past_k, past_v, results, 0, 2)
 
-        # Decode a chunk of 3 rows (past_len=2, n_new=3)
-        feeds = {
-            "inputs": inputs_np[2:5],
-            "past_len": np.array(2, dtype=np.int64),
-        }
-        for i in range(n_layers):
-            feeds[f"past_K_{i}"] = past_K[i]
-            feeds[f"past_V_{i}"] = past_V[i]
-        chunk_out = session.run(["outputs"], feeds)[0]
+        # Decode a chunk of 3 rows (base=2, n_new=3)
+        chunk_out = session.run(
+            ["outputs"], _feeds(inputs_np[2:5], past_k, past_v, 2)
+        )[0]
 
     assert np.allclose(full_outputs[2:5], chunk_out, atol=1e-3), (
         f"chunked decode diff: " f"{np.abs(full_outputs[2:5] - chunk_out).max():.6f}"
@@ -191,31 +208,25 @@ def test_headless_onnx_decode_step_matches_full_prefill():
     with tempfile.TemporaryDirectory() as tmpdir:
         onnx_path = _export(out, pos, tmpdir)
         session = onnxruntime.InferenceSession(onnx_path)
-        n_layers, per_layer_n_heads, d_head = _discover_meta(session)
+        n_layers, per_layer_n_heads, d_head, S = _discover_meta(session)
         out_names = ["outputs"]
         for i in range(n_layers):
             out_names += [f"delta_K_{i}", f"delta_V_{i}"]
 
         # Full prefill
-        feeds = {"inputs": inputs_np}
-        feeds.update(_empty_past_feeds(per_layer_n_heads, d_head))
-        full_outputs = session.run(["outputs"], feeds)[0]
+        pk_full, pv_full = _zero_past(per_layer_n_heads, d_head, S)
+        full_outputs = session.run(
+            ["outputs"], _feeds(inputs_np, pk_full, pv_full, 0)
+        )[0]
 
         # Prefill 4 rows + decode 1 row
-        feeds = {"inputs": inputs_np[:4]}
-        feeds.update(_empty_past_feeds(per_layer_n_heads, d_head))
-        results = session.run(out_names, feeds)
-        past_K = [results[1 + 2 * i] for i in range(n_layers)]
-        past_V = [results[1 + 2 * i + 1] for i in range(n_layers)]
+        past_k, past_v = _zero_past(per_layer_n_heads, d_head, S)
+        results = session.run(out_names, _feeds(inputs_np[:4], past_k, past_v, 0))
+        _write_deltas(past_k, past_v, results, 0, 4)
 
-        feeds = {
-            "inputs": inputs_np[4:5],
-            "past_len": np.array(4, dtype=np.int64),
-        }
-        for i in range(n_layers):
-            feeds[f"past_K_{i}"] = past_K[i]
-            feeds[f"past_V_{i}"] = past_V[i]
-        decode_out = session.run(["outputs"], feeds)[0]
+        decode_out = session.run(
+            ["outputs"], _feeds(inputs_np[4:5], past_k, past_v, 4)
+        )[0]
 
     assert np.allclose(
         full_outputs[-1], decode_out[0], atol=1e-3
@@ -223,15 +234,17 @@ def test_headless_onnx_decode_step_matches_full_prefill():
 
 
 # ---------------------------------------------------------------------------
-# Test 2b: the causal mask follows the BOUND past_K shape, not past_len.
-# This is the load-bearing invariant of the in-place (delta) cache: the
-# runtime binds past_K = cache[:cache_len] (a contiguous prefix of a larger
-# owned buffer), so the mask geometry must come from the bound seq-dim, and
-# binding the whole allocation would attend to the dead tail.
+# Test 2b: slots at positions > cache_position are INERT.
+# This is the load-bearing invariant of the static cache (the INVERSE of the
+# old dynamic-cache test that lived here): the runtime always binds the full
+# (S, nh, d_head) allocation, and the in-graph mask must give the
+# not-yet-committed tail slots softmax weight exactly 0.0 — finite garbage
+# in those slots cannot change the output.  (Zero-init remains required in
+# production because 0 * NaN = NaN; this test uses finite garbage.)
 # ---------------------------------------------------------------------------
 
 
-def test_headless_onnx_mask_follows_bound_cache_shape():
+def test_headless_onnx_static_tail_is_inert():
     out, pos = _build_sample_graph()
     a_vals = torch.tensor([[3.0], [5.0], [-2.0], [0.0], [4.0]])
     b_vals = torch.tensor([[4.0], [-1.0], [3.0], [7.0], [2.0]])
@@ -241,62 +254,43 @@ def test_headless_onnx_mask_follows_bound_cache_shape():
     with tempfile.TemporaryDirectory() as tmpdir:
         onnx_path = _export(out, pos, tmpdir)
         session = onnxruntime.InferenceSession(onnx_path)
-        n_layers, per_layer_n_heads, d_head = _discover_meta(session)
+        n_layers, per_layer_n_heads, d_head, S = _discover_meta(session)
         out_names = ["outputs"]
         for i in range(n_layers):
             out_names += [f"delta_K_{i}", f"delta_V_{i}"]
 
-        feeds = {"inputs": inputs_np}
-        feeds.update(_empty_past_feeds(per_layer_n_heads, d_head))
-        full_outputs = session.run(["outputs"], feeds)[0]
+        pk_full, pv_full = _zero_past(per_layer_n_heads, d_head, S)
+        full_outputs = session.run(
+            ["outputs"], _feeds(inputs_np, pk_full, pv_full, 0)
+        )[0]
 
-        # Prefill n rows from empty: the deltas ARE the n-row cache (seq-major).
-        feeds = {"inputs": inputs_np[:n]}
-        feeds.update(_empty_past_feeds(per_layer_n_heads, d_head))
-        results = session.run(out_names, feeds)
-        cache_k = [results[1 + 2 * i] for i in range(n_layers)]
-        cache_v = [results[1 + 2 * i + 1] for i in range(n_layers)]
+        # Prefill n rows into a zero cache.
+        past_k, past_v = _zero_past(per_layer_n_heads, d_head, S)
+        results = session.run(out_names, _feeds(inputs_np[:n], past_k, past_v, 0))
+        _write_deltas(past_k, past_v, results, 0, n)
 
-        def decode(past_k, past_v, past_len):
-            feeds = {
-                "inputs": inputs_np[n : n + 1],
-                "past_len": np.array(past_len, dtype=np.int64),
-            }
-            for i in range(n_layers):
-                feeds[f"past_K_{i}"] = past_k[i]
-                feeds[f"past_V_{i}"] = past_v[i]
-            return session.run(["outputs"], feeds)[0]
+        def decode(pk, pv):
+            return session.run(["outputs"], _feeds(inputs_np[n : n + 1], pk, pv, n))[0]
 
-        # (1) Exact n-row past reproduces row n of the full prefill.
-        exact = decode(cache_k, cache_v, n)
+        # (1) Zero-tail cache reproduces row n of the full prefill (the
+        # prefill/decode seam under the static mask).
+        exact = decode(past_k, past_v)
         assert np.allclose(full_outputs[n], exact[0], atol=1e-3)
 
-        # Allocate a larger buffer; [:n] is the real cache, the tail is garbage.
-        m = n + 3
-        big_k, big_v = [], []
+        # (2) Fill every slot at positions > n with finite garbage.  Slot n
+        # itself is overwritten by the in-graph ScatterND (the decode row's
+        # own key — the causal diagonal), so garbage there is inert too.
+        garbage_k = [pk.copy() for pk in past_k]
+        garbage_v = [pv.copy() for pv in past_v]
         for i in range(n_layers):
-            nh = per_layer_n_heads[i]
-            bk = np.full((m, nh, d_head), 7.0, dtype=np.float32)
-            bv = np.full((m, nh, d_head), -3.0, dtype=np.float32)
-            bk[:n] = cache_k[i]
-            bv[:n] = cache_v[i]
-            big_k.append(bk)
-            big_v.append(bv)
+            garbage_k[i][n:] = 7.0
+            garbage_v[i][n:] = -3.0
 
-        # (1') Binding the contiguous prefix VIEW big[:n] is bit-equal — the
-        # owned-cache in-place pattern is sound.
-        sliced = decode([bk[:n] for bk in big_k], [bv[:n] for bv in big_v], n)
-        assert np.allclose(
-            exact[0], sliced[0], atol=1e-6
-        ), f"prefix-slice bind diverged: {np.abs(exact[0] - sliced[0]).max():.6e}"
-
-        # (2) Binding the WHOLE buffer (past_len=n) attends to the dead tail —
-        # the mask spans m, not n — so it must differ. This is why the runtime
-        # binds cache[:cache_len], never the full allocation.
-        full_buf = decode(big_k, big_v, n)
-        assert not np.allclose(exact[0], full_buf[0], atol=1e-3), (
-            "binding the full allocation matched the prefix bind — the mask is "
-            "not following the bound past_K shape"
+        dirty = decode(garbage_k, garbage_v)
+        assert np.allclose(exact[0], dirty[0], atol=1e-6), (
+            "garbage in masked static-cache slots changed the output "
+            f"(max diff {np.abs(exact[0] - dirty[0]).max():.6e}) — the mask is "
+            "not zeroing the tail weights exactly"
         )
 
 
@@ -345,13 +339,18 @@ def test_onnx_headless_module_empty_past_shape():
     with tempfile.TemporaryDirectory() as tmpdir:
         onnx_path = _export(out, pos, tmpdir)
         module = OnnxHeadlessModule(onnx_path)
-        past_K, past_V = module.empty_past()
-        assert len(past_K) == module._n_layers
-        assert len(past_V) == module._n_layers
-        for i, K in enumerate(past_K):
-            assert K.shape == (0, module._per_layer_n_heads[i], module._d_head)
-        for i, V in enumerate(past_V):
-            assert V.shape == (0, module._per_layer_n_heads[i], module._d_head)
+        past = module.empty_past()
+        S = module.cache_stride
+        assert S == 32  # _export passes max_seq_len=32; cache_stride defaults to it
+        assert past.length == 0
+        assert len(past.k) == module._n_layers
+        assert len(past.v) == module._n_layers
+        for i, K in enumerate(past.k):
+            assert K.shape == (S, module._per_layer_n_heads[i], module._d_head)
+            assert (K == 0).all(), "static cache must be zero-initialized"
+        for i, V in enumerate(past.v):
+            assert V.shape == (S, module._per_layer_n_heads[i], module._d_head)
+            assert (V == 0).all(), "static cache must be zero-initialized"
 
 
 # ---------------------------------------------------------------------------
@@ -451,7 +450,7 @@ def test_headless_onnx_trim_heads_shrinks_kv_cache():
     with tempfile.TemporaryDirectory() as tmpdir:
         onnx_path = _export(out, pos, tmpdir, trim_heads=True)
         session = onnxruntime.InferenceSession(onnx_path)
-        _, per_layer_n_heads, _ = _discover_meta(session)
+        _, per_layer_n_heads, _, _ = _discover_meta(session)
 
     assert per_layer_n_heads, "no layers discovered"
     assert all(1 <= nh <= max_heads for nh in per_layer_n_heads)
@@ -473,7 +472,7 @@ def test_headless_onnx_no_trim_preserves_full_width():
     with tempfile.TemporaryDirectory() as tmpdir:
         onnx_path = _export(out, pos, tmpdir, trim_heads=False)
         session = onnxruntime.InferenceSession(onnx_path)
-        _, per_layer_n_heads, _ = _discover_meta(session)
+        _, per_layer_n_heads, _, _ = _discover_meta(session)
 
     assert per_layer_n_heads, "no layers discovered"
     assert all(nh == max_heads for nh in per_layer_n_heads), (
@@ -519,16 +518,14 @@ def test_headless_onnx_trim_is_numerical_noop():
         sess_trim = onnxruntime.InferenceSession(trim_path)
         sess_notrim = onnxruntime.InferenceSession(notrim_path)
 
-        _, heads_trim, d_head = _discover_meta(sess_trim)
-        _, heads_notrim, _ = _discover_meta(sess_notrim)
+        _, heads_trim, d_head, S_trim = _discover_meta(sess_trim)
+        _, heads_notrim, _, S_notrim = _discover_meta(sess_notrim)
 
-        feeds_trim = {"inputs": inputs_np}
-        feeds_trim.update(_empty_past_feeds(heads_trim, d_head))
-        out_trim = sess_trim.run(["outputs"], feeds_trim)[0]
+        pk, pv = _zero_past(heads_trim, d_head, S_trim)
+        out_trim = sess_trim.run(["outputs"], _feeds(inputs_np, pk, pv, 0))[0]
 
-        feeds_notrim = {"inputs": inputs_np}
-        feeds_notrim.update(_empty_past_feeds(heads_notrim, d_head))
-        out_notrim = sess_notrim.run(["outputs"], feeds_notrim)[0]
+        pk, pv = _zero_past(heads_notrim, d_head, S_notrim)
+        out_notrim = sess_notrim.run(["outputs"], _feeds(inputs_np, pk, pv, 0))[0]
 
     assert np.allclose(out_trim, out_notrim, atol=1e-4), (
         f"trim changed the output: max diff "

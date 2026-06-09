@@ -40,21 +40,37 @@ def _build_1digit():
     return output_node, pos_encoding, embedding
 
 
-def _empty_past_feeds(per_layer_n_heads: list, d_head: int) -> dict:
-    feeds = {"past_len": np.array(0, dtype=np.int64)}
-    for i, nh in enumerate(per_layer_n_heads):
-        feeds[f"past_K_{i}"] = np.zeros((0, nh, d_head), dtype=np.float32)
-        feeds[f"past_V_{i}"] = np.zeros((0, nh, d_head), dtype=np.float32)
-    return feeds
-
-
 def _discover_meta(session):
-    # past_K_i is sequence-major (n_past, n_heads, d_head): heads on axis 1.
+    # past_K_i is sequence-major with a STATIC slot count: (S, n_heads, d_head).
     inputs = {inp.name: inp for inp in session.get_inputs()}
     n_layers = sum(1 for name in inputs if name.startswith("past_K_"))
     per_layer_n_heads = [int(inputs[f"past_K_{i}"].shape[1]) for i in range(n_layers)]
     d_head = int(inputs["past_K_0"].shape[2])
-    return n_layers, per_layer_n_heads, d_head
+    cache_stride = inputs["past_K_0"].shape[0]
+    assert isinstance(
+        cache_stride, int
+    ), f"past_K_0 first dim must be static, got {cache_stride!r}"
+    return n_layers, per_layer_n_heads, d_head, cache_stride
+
+
+def _zero_past(per_layer_n_heads: list, d_head: int, S: int):
+    """Full static-S zero-filled cache buffers, one (k, v) list pair."""
+    k = [np.zeros((S, nh, d_head), dtype=np.float32) for nh in per_layer_n_heads]
+    v = [np.zeros((S, nh, d_head), dtype=np.float32) for nh in per_layer_n_heads]
+    return k, v
+
+
+def _feeds(token_ids: np.ndarray, past_k, past_v, base: int) -> dict:
+    """Static-cache feeds: full-S past buffers + cache_position for the rows."""
+    n_new = int(token_ids.shape[0])
+    feeds = {
+        "token_ids": token_ids,
+        "cache_position": np.arange(base, base + n_new, dtype=np.int64),
+    }
+    for i, (k, v) in enumerate(zip(past_k, past_v)):
+        feeds[f"past_K_{i}"] = k
+        feeds[f"past_V_{i}"] = v
+    return feeds
 
 
 def _reference_logits(output_node, pos_encoding, embedding, tokens):
@@ -103,14 +119,13 @@ def test_token_onnx_prefill_matches_compute():
         ref_logits = _reference_logits(output_node, pos_encoding, embedding, tokens)
 
         session = onnxruntime.InferenceSession(onnx_path)
-        n_layers, per_layer_n_heads, d_head = _discover_meta(session)
+        n_layers, per_layer_n_heads, d_head, S = _discover_meta(session)
         token_ids = np.array(
             [embedding.tokenizer.get_token_id(t) for t in tokens],
             dtype=np.int64,
         )
-        feeds = {"token_ids": token_ids}
-        feeds.update(_empty_past_feeds(per_layer_n_heads, d_head))
-        onnx_logits = session.run(["logits"], feeds)[0]
+        past_k, past_v = _zero_past(per_layer_n_heads, d_head, S)
+        onnx_logits = session.run(["logits"], _feeds(token_ids, past_k, past_v, 0))[0]
 
         assert np.allclose(
             ref_logits, onnx_logits, atol=1e-4
@@ -144,29 +159,27 @@ def test_token_onnx_decode_step_matches_full_prefill():
         )
 
         session = onnxruntime.InferenceSession(onnx_path)
-        n_layers, per_layer_n_heads, d_head = _discover_meta(session)
+        n_layers, per_layer_n_heads, d_head, S = _discover_meta(session)
         out_names = ["logits"]
         for i in range(n_layers):
             out_names += [f"delta_K_{i}", f"delta_V_{i}"]
 
-        feeds = {"token_ids": token_ids}
-        feeds.update(_empty_past_feeds(per_layer_n_heads, d_head))
-        full_logits = session.run(["logits"], feeds)[0]
+        pk_full, pv_full = _zero_past(per_layer_n_heads, d_head, S)
+        full_logits = session.run(
+            ["logits"], _feeds(token_ids, pk_full, pv_full, 0)
+        )[0]
 
-        feeds = {"token_ids": token_ids[:-1]}
-        feeds.update(_empty_past_feeds(per_layer_n_heads, d_head))
-        outputs = session.run(out_names, feeds)
-        past_K = [outputs[1 + 2 * i] for i in range(n_layers)]
-        past_V = [outputs[1 + 2 * i + 1] for i in range(n_layers)]
-
-        feeds = {
-            "token_ids": token_ids[-1:],
-            "past_len": np.array(len(tokens) - 1, dtype=np.int64),
-        }
+        # Prefill all-but-last, persisting deltas into slots [0 : n-1).
+        past_k, past_v = _zero_past(per_layer_n_heads, d_head, S)
+        outputs = session.run(out_names, _feeds(token_ids[:-1], past_k, past_v, 0))
+        n_prefill = len(tokens) - 1
         for i in range(n_layers):
-            feeds[f"past_K_{i}"] = past_K[i]
-            feeds[f"past_V_{i}"] = past_V[i]
-        decode_logits = session.run(["logits"], feeds)[0]
+            past_k[i][:n_prefill] = outputs[1 + 2 * i]
+            past_v[i][:n_prefill] = outputs[1 + 2 * i + 1]
+
+        decode_logits = session.run(
+            ["logits"], _feeds(token_ids[-1:], past_k, past_v, n_prefill)
+        )[0]
 
         assert np.allclose(full_logits[-1], decode_logits[0], atol=1e-4), (
             f"decode vs full max diff: "
