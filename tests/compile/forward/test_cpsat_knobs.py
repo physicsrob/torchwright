@@ -171,18 +171,23 @@ def test_schedule_cache_round_trip(tmp_path, monkeypatch):
         verbose=False,
         optimize=2,
     )
-    out = _repro_graph()
-    net1 = forward_compile(output_node=out, **kw)
+    out1 = _repro_graph()
+    net1 = forward_compile(output_node=out1, **kw)
     assert net1.cpsat_solve_stats.status_name in ("OPTIMAL", "FEASIBLE")
     assert len(list(tmp_path.glob("*.json"))) == 1
 
-    net2 = forward_compile(output_node=out, **kw)
+    # Rebuild the graph from scratch: fresh node objects with SHIFTED raw
+    # node ids (the global counter keeps counting), exactly like a warm
+    # Modal container compiling twice in one process.  The canonical-id
+    # fingerprint must still hit.
+    out2 = _repro_graph()
+    net2 = forward_compile(output_node=out2, **kw)
     assert net2.cpsat_solve_stats.status_name == "CACHED"
     assert len(net2.layers) == len(net1.layers)
 
     inputs = {"x": torch.randn(3, 8)}
     torch.testing.assert_close(
-        net1.compute(3, inputs)[out], net2.compute(3, inputs)[out]
+        net1.compute(3, inputs)[out1], net2.compute(3, inputs)[out2]
     )
 
 
@@ -198,9 +203,12 @@ def test_schedule_cache_disabled_without_env(monkeypatch):
     )
 
     monkeypatch.delenv("TW_SCHEDULE_CACHE_DIR", raising=False)
+    dummy = create_input("dummy", 1)
     assert cache_dir() is None
-    assert load_assignment("deadbeef") is None
-    assert not store_assignment("deadbeef", ScheduleAssignment({}, {}, {}, 1), {})
+    assert load_assignment("deadbeef", dummy) is None
+    assert not store_assignment(
+        "deadbeef", ScheduleAssignment({}, {}, {}, 1), {}, dummy
+    )
 
 
 def test_floor_probe_infeasible_falls_back_to_descent():

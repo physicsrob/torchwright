@@ -689,7 +689,7 @@ def forward_compile(
             cancel_slack=2,
             policy=policy,
         )
-        cached = load_assignment(schedule_fp)
+        cached = load_assignment(schedule_fp, output_node)
         if cached is not None:
             assignment, _cached_meta = cached
             if verbose:
@@ -862,6 +862,7 @@ def forward_compile(
                             "d_head": d_head,
                             "d_hidden": d_hidden if d_hidden else d,
                         },
+                        output_node=output_node,
                     )
                     and verbose
                 ):

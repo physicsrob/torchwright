@@ -41,6 +41,28 @@ def cache_dir() -> Optional[Path]:
     return Path(value) if value else None
 
 
+def _canonical_ids(output_node: Node) -> Dict[int, int]:
+    """Map current ``node_id`` -> canonical id, independent of creation order.
+
+    Preorder DFS from the output following each node's ORDERED ``inputs``
+    list; first visit assigns the next canonical number.  The raw global
+    node-id counter is process-cumulative: a warm process that builds the
+    graph twice (observed: Modal containers reuse one process across
+    compiles) shifts every id, which would change the fingerprint and
+    silently miss the cache.  Canonical ids depend only on the topology.
+    """
+    canon: Dict[int, int] = {}
+    stack = [output_node]
+    while stack:
+        n = stack.pop()
+        if n.node_id in canon:
+            continue
+        canon[n.node_id] = len(canon)
+        # Reversed keeps the first input on top of the stack (preorder).
+        stack.extend(reversed(getattr(n, "inputs", None) or []))
+    return canon
+
+
 def graph_fingerprint(
     output_node: Node,
     pos_encoding: PosEncoding,
@@ -53,21 +75,26 @@ def graph_fingerprint(
     cancel_slack: Optional[int],
     policy: Optional[SchedulingPolicy],
 ) -> str:
-    """Topology + geometry hash.
-
-    Includes the node ids themselves: a cached assignment is keyed by
-    ``node_id``, which is only meaningful if graph construction replays
-    identically — any change to construction order changes the ids, the
-    fingerprint, and therefore misses (correct by construction).
-    """
+    """Topology + geometry hash over CANONICAL node ids (see
+    ``_canonical_ids``) — stable across processes and warm containers; any
+    change to graph construction still changes the fingerprint and misses
+    (correct by construction)."""
+    canon = _canonical_ids(output_node)
     graph = GraphAnalyzer(output_node)
-    nodes = sorted(graph.get_all_nodes(), key=lambda n: n.node_id)
+    nodes = sorted(
+        (n for n in graph.get_all_nodes() if n.node_id in canon),
+        key=lambda n: canon[n.node_id],
+    )
     topo = [
         (
-            n.node_id,
+            canon[n.node_id],
             type(n).__name__,
             len(n),
-            tuple(inp.node_id for inp in (getattr(n, "inputs", None) or [])),
+            tuple(
+                canon[inp.node_id]
+                for inp in (getattr(n, "inputs", None) or [])
+                if inp.node_id in canon
+            ),
         )
         for n in nodes
     ]
@@ -88,8 +115,12 @@ def graph_fingerprint(
 
 def load_assignment(
     fingerprint: str,
+    output_node: Node,
 ) -> Optional[Tuple[ScheduleAssignment, Dict[str, Any]]]:
-    """Return (assignment, meta) for a cached fingerprint, or None."""
+    """Return (assignment, meta) for a cached fingerprint, or None.
+
+    Stored keys are canonical ids; they are remapped onto the CURRENT
+    graph's node ids via the same deterministic traversal."""
     base = cache_dir()
     if base is None:
         return None
@@ -97,14 +128,23 @@ def load_assignment(
     if not path.exists():
         return None
     data = json.loads(path.read_text(encoding="utf-8"))
-    assignment = ScheduleAssignment(
-        node_to_layer={int(k): v for k, v in data["node_to_layer"].items()},
-        node_to_cancel_layer={
-            int(k): v for k, v in data["node_to_cancel_layer"].items()
-        },
-        node_to_routing={int(k): v for k, v in data["node_to_routing"].items()},
-        n_layers=data["n_layers"],
-    )
+    current_by_canon = {c: nid for nid, c in _canonical_ids(output_node).items()}
+
+    def _remap(table: Dict[str, Any]) -> Dict[int, Any]:
+        return {current_by_canon[int(k)]: v for k, v in table.items()}
+
+    try:
+        assignment = ScheduleAssignment(
+            node_to_layer=_remap(data["node_to_layer"]),
+            node_to_cancel_layer=_remap(data["node_to_cancel_layer"]),
+            node_to_routing=_remap(data["node_to_routing"]),
+            n_layers=data["n_layers"],
+        )
+    except KeyError:
+        # Canonical id absent from the current graph: the entry predates a
+        # construction change the fingerprint failed to capture.  Treat as
+        # a miss rather than replaying a wrong schedule.
+        return None
     return assignment, data.get("meta", {})
 
 
@@ -112,6 +152,7 @@ def store_assignment(
     fingerprint: str,
     assignment: ScheduleAssignment,
     meta: Dict[str, Any],
+    output_node: Node,
 ) -> bool:
     """Persist ``assignment`` unless an equal-or-better entry exists.
 
@@ -120,14 +161,26 @@ def store_assignment(
     base = cache_dir()
     if base is None:
         return False
-    existing = load_assignment(fingerprint)
-    if existing is not None and existing[0].n_layers <= assignment.n_layers:
-        return False
+    prior_path = base / f"{fingerprint}.json"
+    if prior_path.exists():
+        prior = json.loads(prior_path.read_text(encoding="utf-8"))
+        if prior.get("n_layers", 1 << 30) <= assignment.n_layers:
+            return False
     base.mkdir(parents=True, exist_ok=True)
+    canon = _canonical_ids(output_node)
+    if not set(assignment.node_to_layer) <= set(canon):
+        # A scheduled node is unreachable from the output via inputs — it
+        # cannot be keyed canonically; skip caching rather than store a
+        # partial schedule.
+        return False
     payload = {
-        "node_to_layer": assignment.node_to_layer,
-        "node_to_cancel_layer": assignment.node_to_cancel_layer,
-        "node_to_routing": assignment.node_to_routing,
+        "node_to_layer": {canon[k]: v for k, v in assignment.node_to_layer.items()},
+        "node_to_cancel_layer": {
+            canon[k]: v
+            for k, v in assignment.node_to_cancel_layer.items()
+            if k in canon
+        },
+        "node_to_routing": {canon[k]: v for k, v in assignment.node_to_routing.items()},
         "n_layers": assignment.n_layers,
         "meta": meta,
     }
