@@ -604,8 +604,9 @@ correct for every tested geometry).
 
 ### Determinism
 
-CP-SAT runs with `num_search_workers=16` and uses parallel worker
-strategies. Different runs may produce different `ScheduleAssignment`
+CP-SAT runs with `num_search_workers=16` by default (override with the
+`TW_CPSAT_WORKERS` env var — e.g. the 64-CPU Modal compile container
+sets it to 64) and uses parallel worker strategies. Different runs may produce different `ScheduleAssignment`
 values for the same model — different worker discovery orders find
 different optima of equal objective value. The compiled
 `HeadlessTransformer` differs across runs only in scheduling: token

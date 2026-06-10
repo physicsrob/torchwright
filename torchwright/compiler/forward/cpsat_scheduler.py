@@ -28,6 +28,7 @@ heuristic schedule.
 
 from __future__ import annotations
 
+import os
 import time
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Set, Tuple
@@ -53,7 +54,6 @@ from torchwright.graph.misc import LiteralValue
 from torchwright.graph.pos_encoding import PosEncoding
 from torchwright.graph.relu import ReLU
 
-
 # ---------------------------------------------------------------------------
 # Public dataclasses
 # ---------------------------------------------------------------------------
@@ -78,11 +78,38 @@ class Costs:
     `gamma` (MLP bypass slot pressure). Less commonly useful — the
     per-layer MLP matmul costs the full `d × d_hidden` regardless of
     how many slots are used. `gamma=0` is the normal case.
+
+    `earliness` (plateau gradient). When above zero, adds a strictly
+    LEXICOGRAPHIC secondary term `earliness * sum(layer_var)` — the
+    alpha/beta/gamma block is scaled so no amount of earliness can
+    trade against it.  A pure-depth objective is a staircase: vast
+    plateaus of schedules tie at the same layer count and local-search
+    workers get zero reward for compacting moves until one happens to
+    drop the max layer.  Earliness rewards every move that shifts any
+    node earlier, pulling incumbents toward states one move away from
+    a layer-count drop.  `earliness=0` (default) leaves the objective
+    byte-identical to the historical three-term form.
+    (Measured 2026-06-09 on the d8192 DOOM graph: earliness SLOWED
+    layer descent — the gradient mostly rewards irrelevant early-region
+    shuffling.  Kept for comparison; prefer `waste`.)
+
+    `waste` (residual-occupancy gradient). Lexicographic secondary like
+    `earliness`, but aimed at the binding resource instead of raw
+    position: minimizes total residual occupancy area
+    `sum(len(n) * (cancel_layer[n] - layer[n]))` — the column-layers a
+    value sits in the stream — over every node with a real cancel
+    window, plus `len(n) * cancel` for freeable inputs (born at layer
+    0).  Keep-forever nodes are excluded: their lifetime is unavoidable
+    and the term would reward scheduling them LATER.  Shrinking
+    producer-to-last-reader spans frees width at the pinch layers that
+    gate layer-count drops.
     """
 
     alpha: int = 1
     beta: int = 0
     gamma: int = 0
+    earliness: int = 0
+    waste: int = 0
 
 
 @dataclass(frozen=True)
@@ -123,13 +150,17 @@ class SolveStats:
     """
 
     status_name: str
-    objective_value: int        # -1 if no feasible solution
-    best_objective_bound: float # tight LB the solver proved
+    objective_value: int  # -1 if no feasible solution
+    best_objective_bound: float  # tight LB the solver proved
     wall_time_s: float
     solver_log: str
-    total_attn_heads: int       # -1 if no feasible solution
-    total_mlp_bypass_slots: int # -1 if no feasible solution
+    total_attn_heads: int  # -1 if no feasible solution
+    total_mlp_bypass_slots: int  # -1 if no feasible solution
     is_optimal: bool
+    # Lexicographic multiplier on the primary objective block (1 when Costs
+    # has no secondary terms).  objective_value // objective_scale recovers
+    # the primary value; the raw solver log's best/bound lines are scaled.
+    objective_scale: int = 1
 
 
 # Routing constants used both by this module and by the probe script.
@@ -143,13 +174,13 @@ MLP = "mlp"
 # script and any regression test validate names against one source of truth.
 CONSTRAINT_FAMILIES = frozenset(
     {
-        "chain_coupling",      # L1==R==L2 same-layer equalities
-        "dependency",          # edge u->v layer ordering
+        "chain_coupling",  # L1==R==L2 same-layer equalities
+        "dependency",  # edge u->v layer ordering
         "cancel_consumer_lb",  # cancel_layer >= consumer_layer + 1
-        "cancel_slack",        # cancel_layer <= last_consumer + 1 + K window
-        "attn_cumulative",     # per-layer attention-head + cancel + dirty capacity
-        "mlp_cumulative",      # per-layer MLP hidden-slot capacity
-        "residual_cumulative", # residual-stream column capacity
+        "cancel_slack",  # cancel_layer <= last_consumer + 1 + K window
+        "attn_cumulative",  # per-layer attention-head + cancel + dirty capacity
+        "mlp_cumulative",  # per-layer MLP hidden-slot capacity
+        "residual_cumulative",  # residual-stream column capacity
     }
 )
 
@@ -180,6 +211,10 @@ class BuiltModel:
     # schedulable iteration stays clean; `solve_schedule` reads these into the
     # assignment so `DirectedLayerScheduler` frees the inputs at replay.
     input_cancel_layer: Dict[int, cp_model.IntVar]
+    # The lexicographic multiplier applied to the primary objective block
+    # when Costs has secondary terms (earliness/waste); 1 otherwise.
+    # ObjectiveValue() // objective_scale recovers the primary value.
+    objective_scale: int = 1
 
 
 # ---------------------------------------------------------------------------
@@ -212,15 +247,15 @@ class GraphModel:
     """Static analysis of the graph that the CP-SAT model is built over."""
 
     graph: GraphAnalyzer
-    schedulable: List[Node]              # nodes that need a time slot
-    edges: List[Tuple[Node, Node]]       # (u, v) Concatenate-transparent
-    consumers_eff: Dict[Node, Set[Node]] # effective consumers (Concat-transparent)
+    schedulable: List[Node]  # nodes that need a time slot
+    edges: List[Tuple[Node, Node]]  # (u, v) Concatenate-transparent
+    consumers_eff: Dict[Node, Set[Node]]  # effective consumers (Concat-transparent)
     chains: List[Chain]
-    node_to_chain: Dict[Node, Chain]     # any of L1/R/L2 -> Chain
+    node_to_chain: Dict[Node, Chain]  # any of L1/R/L2 -> Chain
     output_node: Node
     pos_encoding: PosEncoding
-    input_nodes: List[Node]              # pre-allocated inputs (incl. LiteralValue)
-    pinned_nodes: Set[Node]              # never freed
+    input_nodes: List[Node]  # pre-allocated inputs (incl. LiteralValue)
+    pinned_nodes: Set[Node]  # never freed
 
 
 def _effective_consumers(
@@ -317,9 +352,7 @@ def build_graph_model(output_node: Node, pos_encoding: PosEncoding) -> GraphMode
     # Inputs are pre-allocated by compile.py's initialization; they
     # don't need a time slot. LiteralValue is included by
     # is_input_node; treat the same way.
-    input_nodes: List[Node] = [
-        n for n in all_nodes if graph.is_input_node(n)
-    ]
+    input_nodes: List[Node] = [n for n in all_nodes if graph.is_input_node(n)]
 
     schedulable: List[Node] = sorted(
         (
@@ -544,6 +577,120 @@ def uses_residual(node: Node, gm: GraphModel) -> bool:
 # ---------------------------------------------------------------------------
 
 
+def _compute_layer_bounds(
+    gm: "GraphModel",
+    policy: SchedulingPolicy,
+    flex_routing: bool,
+    max_layers: int,
+) -> Tuple[Dict[int, int], Dict[int, int]]:
+    """Per-node [earliest, latest] layer bounds from the dependency DAG.
+
+    Mirrors the dependency-constraint semantics exactly: edge u->v allows
+    same-layer placement only when u *can* run in the attention sublayer and
+    v *can* run in MLP (gap 0); otherwise v must come at least one layer
+    after u (gap 1).  "Can" means: flexible routing, or pinned to the
+    needed sublayer.  Chain members (L1/ReLU/L2) share one layer, so their
+    bounds are unified.  These are the same bounds CP-SAT presolve derives
+    by propagation; computing them here shrinks the input model instead.
+    """
+
+    # Per-node allowed sublayers ("modes").  The propagation is mode-aware:
+    # an edge u->v is same-layer only for (u=attn, v=mlp), and each node has
+    # ONE mode, so two consecutive same-layer hops through a node are
+    # impossible (it would need to be mlp as a consumer and attn as a
+    # producer).  Tracking earliest/latest per mode captures that; the
+    # per-edge relaxation without modes is sound but visibly weaker (proved
+    # 40 vs presolve's 50 on the d8192 DOOM graph).
+    def modes(n: Node) -> Tuple[str, ...]:
+        if flex_routing and is_flex(n, gm):
+            return (ATTN, MLP)
+        return (routing(n, gm, policy),)
+
+    def gap(a: str, b: str) -> int:
+        return 0 if (a == ATTN and b == MLP) else 1
+
+    input_ids = {n.node_id for n in gm.input_nodes}
+    node_modes = {n.node_id: modes(n) for n in gm.schedulable}
+    edges: List[Tuple[int, int]] = []
+    for u, v in gm.edges:
+        if u.node_id in input_ids:
+            continue
+        if (
+            u in gm.node_to_chain
+            and v in gm.node_to_chain
+            and gm.node_to_chain[u] is gm.node_to_chain[v]
+        ):
+            continue
+        edges.append((u.node_id, v.node_id))
+
+    ids = [n.node_id for n in gm.schedulable]
+    es = {i: {m: 0 for m in node_modes[i]} for i in ids}
+    ls = {i: {m: max_layers - 1 for m in node_modes[i]} for i in ids}
+    chain_groups = [(c.l1.node_id, c.relu.node_id, c.l2.node_id) for c in gm.chains]
+    # Fixpoint: edge sweeps interleaved with chain-equality unification.
+    # The DAG alone converges in one forward+backward sweep when edges are
+    # in topological order (gm.schedulable is build-ordered); the chain
+    # equalities can ripple a bound back, hence the loop.
+    for _ in range(200):
+        changed = False
+        for u, v in edges:
+            for b in node_modes[v]:
+                # u commits to ONE mode; the relaxation lets it pick the
+                # best one per edge (sound: real schedules are no earlier).
+                lo = min(es[u][a] + gap(a, b) for a in node_modes[u])
+                if lo > es[v][b]:
+                    es[v][b] = lo
+                    changed = True
+        for u, v in reversed(edges):
+            for a in node_modes[u]:
+                hi = max(ls[v][b] - gap(a, b) for b in node_modes[v])
+                if hi < ls[u][a]:
+                    ls[u][a] = hi
+                    changed = True
+        for g in chain_groups:
+            m_es = max(min(es[i].values()) for i in g)
+            m_ls = min(max(ls[i].values()) for i in g)
+            for i in g:
+                for m in node_modes[i]:
+                    if es[i][m] < m_es:
+                        es[i][m] = m_es
+                        changed = True
+                    if ls[i][m] > m_ls:
+                        ls[i][m] = m_ls
+                        changed = True
+        if not changed:
+            break
+    else:
+        raise RuntimeError("layer-bound propagation did not converge")
+    return (
+        {i: min(es[i].values()) for i in ids},
+        {i: max(ls[i].values()) for i in ids},
+    )
+
+
+def critical_path_layers(
+    output_node: Node,
+    pos_encoding: PosEncoding,
+    *,
+    policy: Optional[SchedulingPolicy] = None,
+    flex_routing: bool = True,
+) -> int:
+    """Exact minimum layer count imposed by the dependency DAG alone.
+
+    This is the mode-aware longest path through the graph (same semantics
+    as the CP-SAT dependency constraints), ignoring width entirely.  No
+    schedule can be shallower; when the residual stream has slack, the
+    optimum EQUALS this value (measured on the DOOM graph at d=8192).
+    Costs milliseconds beyond the graph-model build — usable as a
+    pre-solve bound or a probe horizon.
+    """
+    if policy is None:
+        policy = LEGACY_POLICY
+    gm = build_graph_model(output_node, pos_encoding)
+    es, _ = _compute_layer_bounds(gm, policy, flex_routing, max_layers=1 << 20)
+    return max(es.values()) + 1
+
+
 def build_cpsat_model(
     output_node: Node,
     pos_encoding: PosEncoding,
@@ -558,6 +705,7 @@ def build_cpsat_model(
     policy: Optional[SchedulingPolicy] = None,
     reserve_heads: int = 0,
     assume_zero_init: bool = False,
+    tighten_domains: bool = False,
     _disabled_families: frozenset = frozenset(),
 ) -> BuiltModel:
     """Build (but do not solve) the CP-SAT scheduling model.
@@ -603,9 +751,7 @@ def build_cpsat_model(
     # the residual cumulative reject schedules the heuristic compiles fine.
     pos = gm.pos_encoding
     freeable_inputs = [
-        n
-        for n in gm.input_nodes
-        if n is not pos and n is not gm.output_node
+        n for n in gm.input_nodes if n is not pos and n is not gm.output_node
     ]
     reserved_residual = len(pos)
     available_residual = d - reserved_residual
@@ -618,11 +764,32 @@ def build_cpsat_model(
     model = cp_model.CpModel()
 
     # ---- layer_var per schedulable node ----
+    # With ``tighten_domains`` the domain is [earliest, latest] from DAG
+    # propagation instead of the uniform [0, max_layers-1]; presolve would
+    # derive the same bounds itself, this just hands them over up front.
+    bounds = (
+        _compute_layer_bounds(gm, policy, flex_routing, max_layers)
+        if tighten_domains
+        else None
+    )
     layer_var: Dict[int, cp_model.IntVar] = {}
+    layer_var_hi_sum = 0
+    layer_var_lo: Dict[int, int] = {}
     for n in gm.schedulable:
-        layer_var[n.node_id] = model.NewIntVar(
-            0, max_layers - 1, f"L_n{n.node_id}"
+        lo, hi = (
+            (bounds[0][n.node_id], bounds[1][n.node_id])
+            if bounds is not None
+            else (0, max_layers - 1)
         )
+        if lo > hi:
+            raise RuntimeError(
+                f"tighten_domains produced empty domain [{lo},{hi}] for "
+                f"node {n.node_id} — critical path exceeds max_layers="
+                f"{max_layers}"
+            )
+        layer_var_hi_sum += hi
+        layer_var_lo[n.node_id] = lo
+        layer_var[n.node_id] = model.NewIntVar(lo, hi, f"L_n{n.node_id}")
 
     # Chain composites: L1, R, L2 share one layer.
     if "chain_coupling" not in _disabled_families:
@@ -666,12 +833,12 @@ def build_cpsat_model(
             same_ok = model.NewBoolVar(f"so_n{u.node_id}_n{v.node_id}")
             model.AddBoolAnd([u_attn, v_attn.Not()]).OnlyEnforceIf(same_ok)
             model.AddBoolOr([u_attn.Not(), v_attn]).OnlyEnforceIf(same_ok.Not())
-            model.Add(
-                layer_var[v.node_id] >= layer_var[u.node_id]
-            ).OnlyEnforceIf(same_ok)
-            model.Add(
-                layer_var[v.node_id] >= layer_var[u.node_id] + 1
-            ).OnlyEnforceIf(same_ok.Not())
+            model.Add(layer_var[v.node_id] >= layer_var[u.node_id]).OnlyEnforceIf(
+                same_ok
+            )
+            model.Add(layer_var[v.node_id] >= layer_var[u.node_id] + 1).OnlyEnforceIf(
+                same_ok.Not()
+            )
 
     # ---- Cancel layer per schedulable node ----
     # The natural lower bound on cancel_layer[n] is
@@ -684,12 +851,14 @@ def build_cpsat_model(
     # space ~30x with negligible loss of optimality.
     eff_cancel_slack = None if "cancel_slack" in _disabled_families else cancel_slack
     cancel_layer: Dict[int, cp_model.IntVar] = {}
+    keep_forever_ids: Set[int] = set()
     for n in gm.schedulable:
         cl = model.NewIntVar(0, max_layers, f"cl_n{n.node_id}")
         cancel_layer[n.node_id] = cl
         model.Add(cl >= layer_var[n.node_id] + 1)
         if n in gm.pinned_nodes:
             model.Add(cl == max_layers)
+            keep_forever_ids.add(n.node_id)
             continue
         keep_forever = False
         consumer_layer_vars: List[cp_model.IntVar] = []
@@ -703,11 +872,10 @@ def build_cpsat_model(
                     model.Add(cl >= layer_var[c.node_id] + 1)
                 consumer_layer_vars.append(layer_var[c.node_id])
         if keep_forever:
+            keep_forever_ids.add(n.node_id)
             continue
         if eff_cancel_slack is not None and consumer_layer_vars:
-            last_cons = model.NewIntVar(
-                0, max_layers - 1, f"last_cons_n{n.node_id}"
-            )
+            last_cons = model.NewIntVar(0, max_layers - 1, f"last_cons_n{n.node_id}")
             model.AddMaxEquality(last_cons, consumer_layer_vars)
             model.Add(cl <= last_cons + 1 + eff_cancel_slack)
         elif eff_cancel_slack is not None and not consumer_layer_vars:
@@ -721,6 +889,7 @@ def build_cpsat_model(
     # the schedulable cancel logic with a fixed birth at 0.  An input feeding a
     # terminal `Concatenate` (output cone) is kept forever.
     input_cancel_layer: Dict[int, cp_model.IntVar] = {}
+    input_keep_ids: Set[int] = set()
     for n in freeable_inputs:
         cl = model.NewIntVar(0, max_layers, f"cl_in{n.node_id}")
         input_cancel_layer[n.node_id] = cl
@@ -737,11 +906,10 @@ def build_cpsat_model(
                     model.Add(cl >= layer_var[c.node_id] + 1)
                 consumer_layer_vars.append(layer_var[c.node_id])
         if keep_forever:
+            input_keep_ids.add(n.node_id)
             continue
         if eff_cancel_slack is not None and consumer_layer_vars:
-            last_cons = model.NewIntVar(
-                0, max_layers - 1, f"last_cons_in{n.node_id}"
-            )
+            last_cons = model.NewIntVar(0, max_layers - 1, f"last_cons_in{n.node_id}")
             model.AddMaxEquality(last_cons, consumer_layer_vars)
             model.Add(cl <= last_cons + 1 + eff_cancel_slack)
         elif eff_cancel_slack is not None and not consumer_layer_vars:
@@ -795,9 +963,7 @@ def build_cpsat_model(
                 continue
             before_bools: List[cp_model.IntVar] = []
             for C in other_consumers:
-                b = model.NewBoolVar(
-                    f"before_E{E.node_id}_C{C.node_id}_A{A.node_id}"
-                )
+                b = model.NewBoolVar(f"before_E{E.node_id}_C{C.node_id}_A{A.node_id}")
                 model.Add(layer_var[C.node_id] < layer_var[A.node_id]).OnlyEnforceIf(b)
                 model.Add(layer_var[C.node_id] >= layer_var[A.node_id]).OnlyEnforceIf(
                     b.Not()
@@ -1073,7 +1239,8 @@ def build_cpsat_model(
                 fixed_mlp_bypass += 2 * n.d_output
     total_mlp_bypass = model.NewIntVar(
         0,
-        fixed_mlp_bypass + sum(2 * n.d_output for n in gm.schedulable if is_flex(n, gm)),
+        fixed_mlp_bypass
+        + sum(2 * n.d_output for n in gm.schedulable if is_flex(n, gm)),
         "total_mlp_bypass",
     )
     if mlp_bypass_term:
@@ -1092,11 +1259,42 @@ def build_cpsat_model(
     n_layers_var = model.NewIntVar(0, max_layers + 1, "n_layers")
     model.Add(n_layers_var == makespan_layer + 1)
 
-    model.Minimize(
+    primary = (
         costs.alpha * n_layers_var
         + costs.beta * total_attn_heads
         + costs.gamma * total_mlp_bypass
     )
+    # Lexicographic secondaries (see Costs): the primary block is scaled
+    # past the secondaries' maximum possible contribution so they can never
+    # trade against a layer.  Bounds are tracked at var creation — the
+    # Proto()/.proto accessor in the installed ortools build returns
+    # corrupted memory and segfaults.
+    secondary_terms = []
+    max_secondary = 0
+    if costs.earliness > 0:
+        secondary_terms.append(costs.earliness * sum(layer_var.values()))
+        max_secondary += costs.earliness * layer_var_hi_sum
+    if costs.waste > 0:
+        occupancy = []
+        for n in gm.schedulable:
+            if n.node_id in keep_forever_ids:
+                continue
+            occupancy.append(len(n) * (cancel_layer[n.node_id] - layer_var[n.node_id]))
+            max_secondary += (
+                costs.waste * len(n) * (max_layers - layer_var_lo[n.node_id])
+            )
+        for n in freeable_inputs:
+            if n.node_id in input_keep_ids:
+                continue
+            occupancy.append(len(n) * input_cancel_layer[n.node_id])
+            max_secondary += costs.waste * len(n) * max_layers
+        secondary_terms.append(costs.waste * sum(occupancy))
+    objective_scale = 1
+    if secondary_terms:
+        objective_scale = max_secondary + 1
+        model.Minimize(objective_scale * primary + sum(secondary_terms))
+    else:
+        model.Minimize(primary)
 
     return BuiltModel(
         model=model,
@@ -1111,12 +1309,46 @@ def build_cpsat_model(
         available_residual=available_residual,
         n_heads_per_layer=n_heads_per_layer,
         input_cancel_layer=input_cancel_layer,
+        objective_scale=objective_scale,
     )
 
 
 # ---------------------------------------------------------------------------
 # Solver
 # ---------------------------------------------------------------------------
+
+
+class _IncumbentTrace(cp_model.CpSolverSolutionCallback):
+    """Records (time, objective, n_layers, full assignment) per incumbent.
+
+    Used by ``solve_schedule(solution_trace=[...])``.  Each improving
+    solution appends one snapshot dict; reading ~20k variable values per
+    incumbent costs microseconds each and only runs in capture mode.
+    """
+
+    def __init__(self, layer_var, cancel_layer, input_cancel_layer, n_layers_var, out):
+        super().__init__()
+        self._layer_var = layer_var
+        self._cancel_layer = cancel_layer
+        self._input_cancel_layer = input_cancel_layer
+        self._n_layers_var = n_layers_var
+        self._out = out
+
+    def on_solution_callback(self):
+        self._out.append(
+            {
+                "t": self.WallTime(),
+                "objective": int(self.ObjectiveValue()),
+                "n_layers": self.Value(self._n_layers_var),
+                "layers": {nid: self.Value(v) for nid, v in self._layer_var.items()},
+                "cancels": {
+                    nid: self.Value(v) for nid, v in self._cancel_layer.items()
+                },
+                "input_cancels": {
+                    nid: self.Value(v) for nid, v in self._input_cancel_layer.items()
+                },
+            }
+        )
 
 
 def solve_schedule(
@@ -1138,6 +1370,9 @@ def solve_schedule(
     log_search_progress: bool = False,
     reserve_heads: int = 0,
     assume_zero_init: bool = False,
+    tighten_domains: bool = False,
+    solver_params: Optional[Dict[str, object]] = None,
+    solution_trace: Optional[List[dict]] = None,
 ) -> Tuple[Optional[ScheduleAssignment], SolveStats]:
     """Build and solve the CP-SAT scheduling model.
 
@@ -1219,6 +1454,7 @@ def solve_schedule(
         policy=policy,
         reserve_heads=reserve_heads,
         assume_zero_init=assume_zero_init,
+        tighten_domains=tighten_domains,
     )
     model = built.model
     gm = built.gm
@@ -1271,7 +1507,18 @@ def solve_schedule(
     solver = cp_model.CpSolver()
     solver.parameters.max_time_in_seconds = time_budget_s
     solver.parameters.log_search_progress = log_search_progress
-    solver.parameters.num_search_workers = 16
+    # TW_CPSAT_WORKERS lets high-core environments (e.g. a 64-CPU Modal
+    # compile container) raise the parallel-search width; 16 matches the
+    # historical hardcoded value for local runs.
+    solver.parameters.num_search_workers = int(os.environ.get("TW_CPSAT_WORKERS", "16"))
+    # Experiment escape hatch: apply arbitrary CpSolver parameter overrides
+    # (list values extend repeated fields, e.g. ``ignore_subsolvers``).
+    if solver_params:
+        for key, value in solver_params.items():
+            if isinstance(value, (list, tuple)):
+                getattr(solver.parameters, key).extend(value)
+            else:
+                setattr(solver.parameters, key, value)
 
     log_buf: List[str] = []
 
@@ -1281,7 +1528,22 @@ def solve_schedule(
     solver.log_callback = _log
 
     t0 = time.perf_counter()
-    status = solver.Solve(model)
+    if solution_trace is not None:
+        # Record every improving incumbent's full assignment for offline
+        # trajectory analysis (which schedule metrics lead layer drops).
+        # Snapshots fire on objective improvements only — with a pure-depth
+        # objective that means layer drops; a dense secondary (earliness /
+        # waste) is what surfaces intra-plateau states here.
+        callback = _IncumbentTrace(
+            layer_var,
+            cancel_layer,
+            input_cancel_layer,
+            n_layers_var,
+            solution_trace,
+        )
+        status = solver.Solve(model, callback)
+    else:
+        status = solver.Solve(model)
     elapsed = time.perf_counter() - t0
 
     has_solution = status in (cp_model.OPTIMAL, cp_model.FEASIBLE)
@@ -1326,5 +1588,6 @@ def solve_schedule(
         total_attn_heads=total_heads,
         total_mlp_bypass_slots=total_bypass,
         is_optimal=status == cp_model.OPTIMAL,
+        objective_scale=built.objective_scale,
     )
     return assignment, stats
