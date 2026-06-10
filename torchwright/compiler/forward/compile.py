@@ -17,7 +17,14 @@ from torchwright.compiler.device import get_device
 from torchwright.compiler.residual_assignment import ResidualAssignment
 from torchwright.compiler.forward.cpsat_scheduler import (
     Costs,
+    SolveStats,
+    critical_path_layers,
     solve_schedule,
+)
+from torchwright.compiler.forward.schedule_cache import (
+    graph_fingerprint,
+    load_assignment,
+    store_assignment,
 )
 from torchwright.compiler.forward.graph_analysis import GraphAnalyzer
 from torchwright.compiler.forward.residual_map import ResidualStreamMap
@@ -171,10 +178,7 @@ def _run_heuristic_warm_start(
                 hint_routing[op.node.node_id] = "mlp"
         for node in graph.get_all_nodes():
             if isinstance(node, Concatenate) and node not in hint_computed:
-                if all(
-                    leaf in hint_computed
-                    for leaf in flatten_concat_nodes([node])
-                ):
+                if all(leaf in hint_computed for leaf in flatten_concat_nodes([node])):
                     hint_computed.add(node)
         for n in hint_computed - prev_hint:
             hint_layers[n.node_id] = hi
@@ -665,72 +669,206 @@ def forward_compile(
                 "admission control."
             )
 
-        # Warm-start: run the heuristic scheduler in schedule-only
-        # mode on a cloned residual_map / computed set, capturing
-        # each schedulable node's layer, routing, and cancel layer.
-        # CP-SAT consumes the result via `hint_*`; a complete
-        # known-feasible incumbent dramatically shrinks the time the
-        # solver needs to find any feasible schedule.
-        t_hint_start = time.perf_counter()
-        hint_layers, hint_routing, hint_cancel, hint_n_layers = (
-            _run_heuristic_warm_start(
-                graph=graph,
-                d=d,
-                d_head=d_head,
-                pos_encoding=pos_encoding,
-                d_hidden=d_hidden,
-                residual_map=residual_map,
-                computed=computed,
-                clusters=clusters,
-                admission_budget_fraction=admission_budget_fraction,
-                policy=policy,
-                overlay_pinned_inputs=overlay_pinned_inputs,
-                output_node=output_node,
-                max_layers=max_layers,
-            )
-        )
-        if verbose:
-            hint_time = time.perf_counter() - t_hint_start
-            print(
-                f"  Heuristic warm-start: {hint_n_layers} layers "
-                f"({hint_time:.2f}s, {len(hint_layers)} hinted nodes)"
-            )
-            print(
-                f"  CP-SAT solver: costs={cpsat_costs}, "
-                f"flex_routing={cpsat_flex_routing}, "
-                f"time_budget_s={cpsat_time_budget_s}"
-            )
-
-        # Use the heuristic's layer count as the search horizon (with
-        # one slack layer) when it's tighter than the user-supplied
-        # max_layers.  CP-SAT's variable domain shrinks accordingly,
-        # which is a big win for graphs where max_layers >> n_layers.
-        solver_max_layers = max_layers
-        if hint_n_layers > 0:
-            solver_max_layers = min(max_layers, hint_n_layers + 1)
-
+        # ---- Schedule cache (opt-in via TW_SCHEDULE_CACHE_DIR) ----
+        # The solve outcome depends only on topology + geometry, so a past
+        # win replays directly; the fingerprint keys on node ids and
+        # therefore misses whenever graph construction changed.  A hit
+        # skips the warm start and the solver entirely and is surfaced as
+        # status_name="CACHED" — never silently.
+        assignment = None
+        hint_n_layers = 0
         t_solve_start = time.perf_counter()
-        assignment, _stats = solve_schedule(
+        schedule_fp = graph_fingerprint(
             output_node,
             pos_encoding,
             d=d,
             d_head=d_head,
-            d_hidden=d_hidden,
-            costs=cpsat_costs,
+            d_hidden=d_hidden if d_hidden else d,
             flex_routing=cpsat_flex_routing,
-            time_budget_s=cpsat_time_budget_s,
-            max_layers=solver_max_layers,
-            policy=policy,
             assume_zero_init=assume_zero_init,
-            hint_layers=hint_layers if hint_layers else None,
-            hint_routing=hint_routing if hint_routing else None,
-            hint_cancel=hint_cancel if hint_cancel else None,
-            log_search_progress=verbose,
+            cancel_slack=2,
+            policy=policy,
         )
-        # Surface the solver provenance on the returned net so callers can
-        # distinguish a real solve from a fallback without re-deriving it
-        # (``stats.status_name``, ``is_optimal``, the LB/objective gap).
-        net.cpsat_solve_stats = _stats
+        cached = load_assignment(schedule_fp)
+        if cached is not None:
+            assignment, _cached_meta = cached
+            if verbose:
+                print(
+                    f"  CP-SAT schedule cache HIT ({schedule_fp[:12]}...): "
+                    f"n_layers={assignment.n_layers} (originally "
+                    f"{_cached_meta.get('status_name', '?')})"
+                )
+            net.cpsat_solve_stats = SolveStats(
+                status_name="CACHED",
+                objective_value=assignment.n_layers,
+                best_objective_bound=float(
+                    _cached_meta.get("best_objective_bound", -1)
+                ),
+                wall_time_s=0.0,
+                solver_log="",
+                total_attn_heads=-1,
+                total_mlp_bypass_slots=-1,
+                is_optimal=bool(_cached_meta.get("is_optimal", False)),
+            )
+
+        if assignment is None:
+            # Warm-start: run the heuristic scheduler in schedule-only
+            # mode on a cloned residual_map / computed set, capturing
+            # each schedulable node's layer, routing, and cancel layer.
+            # CP-SAT consumes the result via `hint_*`; a complete
+            # known-feasible incumbent dramatically shrinks the time the
+            # solver needs to find any feasible schedule.
+            t_hint_start = time.perf_counter()
+            hint_layers, hint_routing, hint_cancel, hint_n_layers = (
+                _run_heuristic_warm_start(
+                    graph=graph,
+                    d=d,
+                    d_head=d_head,
+                    pos_encoding=pos_encoding,
+                    d_hidden=d_hidden,
+                    residual_map=residual_map,
+                    computed=computed,
+                    clusters=clusters,
+                    admission_budget_fraction=admission_budget_fraction,
+                    policy=policy,
+                    overlay_pinned_inputs=overlay_pinned_inputs,
+                    output_node=output_node,
+                    max_layers=max_layers,
+                )
+            )
+            if verbose:
+                hint_time = time.perf_counter() - t_hint_start
+                print(
+                    f"  Heuristic warm-start: {hint_n_layers} layers "
+                    f"({hint_time:.2f}s, {len(hint_layers)} hinted nodes)"
+                )
+                print(
+                    f"  CP-SAT solver: costs={cpsat_costs}, "
+                    f"flex_routing={cpsat_flex_routing}, "
+                    f"time_budget_s={cpsat_time_budget_s}"
+                )
+
+            # Use the heuristic's layer count as the search horizon (with
+            # one slack layer) when it's tighter than the user-supplied
+            # max_layers.  CP-SAT's variable domain shrinks accordingly,
+            # which is a big win for graphs where max_layers >> n_layers.
+            solver_max_layers = max_layers
+            if hint_n_layers > 0:
+                solver_max_layers = min(max_layers, hint_n_layers + 1)
+
+            # ---- Floor probe (optimize >= 2) ----
+            # The schedule optimum equals the dependency critical path
+            # whenever the residual stream has slack (measured: d=8192
+            # optimum 50 = critical path).  A COLD solve at horizon cp+1
+            # with tightened domains finds and proves that optimum in
+            # ~2 minutes, where warm-start descent is a 50-64 lottery (the
+            # hint anchors the search ~20 layers above the floor; exactly
+            # the floor leaves no construction slack — the +1 is
+            # load-bearing).  When width binds instead (measured: d=4096),
+            # the probe is proven INFEASIBLE in seconds, so it doubles as
+            # a free regime classifier; a timeout falls through the same
+            # way at bounded cost.
+            if optimize >= 2:
+                cp_layers = critical_path_layers(
+                    output_node,
+                    pos_encoding,
+                    policy=policy,
+                    flex_routing=cpsat_flex_routing,
+                )
+                if cp_layers + 1 < solver_max_layers:
+                    probe_budget = min(150.0, cpsat_time_budget_s)
+                    if verbose:
+                        print(
+                            f"  CP-SAT floor probe: horizon {cp_layers + 1} "
+                            f"(critical path {cp_layers}), budget "
+                            f"{probe_budget:.0f}s"
+                        )
+                    t_probe = time.perf_counter()
+                    assignment, _stats = solve_schedule(
+                        output_node,
+                        pos_encoding,
+                        d=d,
+                        d_head=d_head,
+                        d_hidden=d_hidden,
+                        costs=cpsat_costs,
+                        flex_routing=cpsat_flex_routing,
+                        time_budget_s=probe_budget,
+                        max_layers=cp_layers + 1,
+                        policy=policy,
+                        assume_zero_init=assume_zero_init,
+                        tighten_domains=True,
+                        log_search_progress=verbose,
+                    )
+                    probe_elapsed = time.perf_counter() - t_probe
+                    if assignment is not None:
+                        net.cpsat_solve_stats = _stats
+                        if verbose:
+                            print(
+                                f"  CP-SAT floor probe SUCCEEDED in "
+                                f"{probe_elapsed:.1f}s: "
+                                f"n_layers={assignment.n_layers} "
+                                f"(status={_stats.status_name})"
+                            )
+                    elif verbose:
+                        print(
+                            f"  CP-SAT floor probe {_stats.status_name} in "
+                            f"{probe_elapsed:.1f}s — falling back to "
+                            f"warm-start descent"
+                        )
+
+            if assignment is None:
+                t_solve_start = time.perf_counter()
+                assignment, _stats = solve_schedule(
+                    output_node,
+                    pos_encoding,
+                    d=d,
+                    d_head=d_head,
+                    d_hidden=d_hidden,
+                    costs=cpsat_costs,
+                    flex_routing=cpsat_flex_routing,
+                    time_budget_s=cpsat_time_budget_s,
+                    max_layers=solver_max_layers,
+                    policy=policy,
+                    assume_zero_init=assume_zero_init,
+                    # Sound by construction: the warm-start hint is
+                    # feasible, so it always satisfies the tightened
+                    # domains (verified: zero violations at both measured
+                    # geometries).  Saves ~7s presolve + ~9s to first
+                    # incumbent on the DOOM graph.
+                    tighten_domains=True,
+                    hint_layers=hint_layers if hint_layers else None,
+                    hint_routing=hint_routing if hint_routing else None,
+                    hint_cancel=hint_cancel if hint_cancel else None,
+                    log_search_progress=verbose,
+                )
+                # Surface the solver provenance on the returned net so
+                # callers can distinguish a real solve from a fallback
+                # without re-deriving it (``stats.status_name``,
+                # ``is_optimal``, the LB/objective gap).
+                net.cpsat_solve_stats = _stats
+
+            if assignment is not None:
+                if (
+                    store_assignment(
+                        schedule_fp,
+                        assignment,
+                        {
+                            "status_name": net.cpsat_solve_stats.status_name,
+                            "best_objective_bound": (
+                                net.cpsat_solve_stats.best_objective_bound
+                            ),
+                            "is_optimal": net.cpsat_solve_stats.is_optimal,
+                            "d": d,
+                            "d_head": d_head,
+                            "d_hidden": d_hidden if d_hidden else d,
+                        },
+                    )
+                    and verbose
+                ):
+                    print(
+                        f"  CP-SAT schedule cached ({schedule_fp[:12]}...): "
+                        f"n_layers={assignment.n_layers}"
+                    )
         if assignment is None:
             # CP-SAT found no feasible incumbent within budget — fall
             # back to the heuristic schedule.  The warm-start was a
@@ -784,7 +922,7 @@ def forward_compile(
                 pinned_nodes=overlay_pinned_inputs,
             )
         else:
-            if verbose:
+            if verbose and net.cpsat_solve_stats.status_name != "CACHED":
                 solve_time = time.perf_counter() - t_solve_start
                 print(
                     f"  CP-SAT solved in {solve_time:.2f}s: "
@@ -899,8 +1037,13 @@ def forward_compile(
 
         if verify_compiler:
             _verify_end_of_layer_writes(
-                attn_ops, mlp_ops, prev_computed, prev_allocated,
-                computed, residual_map, i,
+                attn_ops,
+                mlp_ops,
+                prev_computed,
+                prev_allocated,
+                computed,
+                residual_map,
+                i,
             )
             _verify_end_of_layer_liveness(graph, residual_map, computed, i)
 
