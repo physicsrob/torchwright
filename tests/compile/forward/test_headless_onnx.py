@@ -28,16 +28,23 @@ D = 256
 D_HEAD = 16
 
 
-def _discover_meta(session):
-    # past_K_i is sequence-major with a STATIC slot count: (S, n_heads, d_head).
+def _discover_meta(session, onnx_path):
+    # past_K_i is sequence-major (cache_slots, n_heads, d_head) with a
+    # SYMBOLIC slot dim — the bound prefix length S_eff (stride bucketing).
+    # The full stride S comes from the sidecar meta.
+    from torchwright.compiler.onnx_load import discover_cache_stride
+
     inputs = {inp.name: inp for inp in session.get_inputs()}
     n_layers = sum(1 for name in inputs if name.startswith("past_K_"))
     per_layer_n_heads = [int(inputs[f"past_K_{i}"].shape[1]) for i in range(n_layers)]
     d_head = int(inputs["past_K_0"].shape[2])
-    cache_stride = inputs["past_K_0"].shape[0]
-    assert isinstance(cache_stride, int), (
-        f"past_K_0 first dim must be static, got {cache_stride!r}"
+    slot_dim = inputs["past_K_0"].shape[0]
+    assert not isinstance(slot_dim, int), (
+        f"past_K_0 first dim must be the symbolic cache_slots, got {slot_dim!r}"
     )
+    with open(meta_path_for(onnx_path)) as f:
+        sidecar = json.load(f)
+    cache_stride = discover_cache_stride(inputs, sidecar.get("cache_stride"), onnx_path)
     return n_layers, per_layer_n_heads, d_head, cache_stride
 
 
@@ -144,7 +151,7 @@ def test_headless_onnx_prefill_matches_compute():
     with tempfile.TemporaryDirectory() as tmpdir:
         onnx_path = _export(out, pos, tmpdir)
         session = onnxruntime.InferenceSession(onnx_path)
-        n_layers, per_layer_n_heads, d_head, S = _discover_meta(session)
+        n_layers, per_layer_n_heads, d_head, S = _discover_meta(session, onnx_path)
 
         inputs_np = torch.cat([a_vals, b_vals], dim=1).numpy().astype(np.float32)
         past_k, past_v = _zero_past(per_layer_n_heads, d_head, S)
@@ -173,7 +180,7 @@ def test_headless_onnx_chunked_decode_matches_full_prefill():
     with tempfile.TemporaryDirectory() as tmpdir:
         onnx_path = _export(out, pos, tmpdir)
         session = onnxruntime.InferenceSession(onnx_path)
-        n_layers, per_layer_n_heads, d_head, S = _discover_meta(session)
+        n_layers, per_layer_n_heads, d_head, S = _discover_meta(session, onnx_path)
         out_names = ["outputs"]
         for i in range(n_layers):
             out_names += [f"delta_K_{i}", f"delta_V_{i}"]
@@ -208,7 +215,7 @@ def test_headless_onnx_decode_step_matches_full_prefill():
     with tempfile.TemporaryDirectory() as tmpdir:
         onnx_path = _export(out, pos, tmpdir)
         session = onnxruntime.InferenceSession(onnx_path)
-        n_layers, per_layer_n_heads, d_head, S = _discover_meta(session)
+        n_layers, per_layer_n_heads, d_head, S = _discover_meta(session, onnx_path)
         out_names = ["outputs"]
         for i in range(n_layers):
             out_names += [f"delta_K_{i}", f"delta_V_{i}"]
@@ -254,7 +261,7 @@ def test_headless_onnx_static_tail_is_inert():
     with tempfile.TemporaryDirectory() as tmpdir:
         onnx_path = _export(out, pos, tmpdir)
         session = onnxruntime.InferenceSession(onnx_path)
-        n_layers, per_layer_n_heads, d_head, S = _discover_meta(session)
+        n_layers, per_layer_n_heads, d_head, S = _discover_meta(session, onnx_path)
         out_names = ["outputs"]
         for i in range(n_layers):
             out_names += [f"delta_K_{i}", f"delta_V_{i}"]
@@ -292,6 +299,72 @@ def test_headless_onnx_static_tail_is_inert():
             f"(max diff {np.abs(exact[0] - dirty[0]).max():.6e}) — the mask is "
             "not zeroing the tail weights exactly"
         )
+
+
+# ---------------------------------------------------------------------------
+# Test 2c: prefix-window (stride-bucket) bindings are equivalent.
+# The symbolic cache_slots dim lets a feeder bind any prefix cache[:S_eff]
+# with base + n_new <= S_eff <= S; the in-graph mask derives its width from
+# Shape(past_K_0), so every covering window must produce the same outputs.
+# On CPU with the same n_new the kernels are identical, so the comparison
+# is bit-level, not just allclose.
+# ---------------------------------------------------------------------------
+
+
+def test_headless_onnx_prefix_window_binding():
+    out, pos = _build_sample_graph()
+    a_vals = torch.tensor([[3.0], [5.0], [-2.0], [0.0], [4.0]])
+    b_vals = torch.tensor([[4.0], [-1.0], [3.0], [7.0], [2.0]])
+    inputs_np = torch.cat([a_vals, b_vals], dim=1).numpy().astype(np.float32)
+    n = 4  # committed rows before the decode step
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        onnx_path = _export(out, pos, tmpdir)
+        session = onnxruntime.InferenceSession(onnx_path)
+        n_layers, per_layer_n_heads, d_head, S = _discover_meta(session, onnx_path)
+        out_names = ["outputs"]
+        for i in range(n_layers):
+            out_names += [f"delta_K_{i}", f"delta_V_{i}"]
+
+        # Prefill n rows into the full-S cache.
+        past_k, past_v = _zero_past(per_layer_n_heads, d_head, S)
+        results = session.run(out_names, _feeds(inputs_np[:n], past_k, past_v, 0))
+        _write_deltas(past_k, past_v, results, 0, n)
+
+        def decode_window(s_eff):
+            pk = [k[:s_eff] for k in past_k]  # contiguous prefix views
+            pv = [v[:s_eff] for v in past_v]
+            return session.run(
+                out_names, _feeds(inputs_np[n : n + 1], pk, pv, n)
+            )
+
+        # Full-S binding is the reference; every covering prefix window
+        # (smallest legal = base + n_new = n + 1) must match bit-for-bit.
+        ref = decode_window(S)
+        for s_eff in (n + 1, n + 3, S - 1):
+            got = decode_window(s_eff)
+            for r, g, name in zip(ref, got, out_names):
+                assert np.array_equal(r, g), (
+                    f"S_eff={s_eff}: {name} differs from the full-S binding "
+                    f"(max diff {np.abs(r - g).max():.6e})"
+                )
+
+        # Prefill itself also rides a window: prefill at the smallest
+        # covering bucket equals prefill at full S.
+        pk_a, pv_a = _zero_past(per_layer_n_heads, d_head, S)
+        full = session.run(out_names, _feeds(inputs_np, pk_a, pv_a, 0))
+        pk_b, pv_b = _zero_past(per_layer_n_heads, d_head, S)
+        win = session.run(
+            out_names,
+            _feeds(
+                inputs_np,
+                [k[: len(inputs_np)] for k in pk_b],
+                [v[: len(inputs_np)] for v in pv_b],
+                0,
+            ),
+        )
+        for r, g, name in zip(full, win, out_names):
+            assert np.array_equal(r, g), f"prefill window: {name} differs"
 
 
 # ---------------------------------------------------------------------------
@@ -373,6 +446,9 @@ def test_headless_onnx_sidecar_schema():
 
     assert data["format"] == HEADLESS_META_FORMAT
     assert data["input_names"] == ["alpha", "middle", "zebra"]
+    # The full stride S travels in the sidecar (the symbolic cache_slots
+    # input dim is not readable as an int).
+    assert data["cache_stride"] == 32  # _export passes max_seq_len=32
     # The sidecar should not carry any "cached" discriminator — there's
     # only one protocol now.
     assert "cached" not in data
@@ -450,7 +526,7 @@ def test_headless_onnx_trim_heads_shrinks_kv_cache():
     with tempfile.TemporaryDirectory() as tmpdir:
         onnx_path = _export(out, pos, tmpdir, trim_heads=True)
         session = onnxruntime.InferenceSession(onnx_path)
-        _, per_layer_n_heads, _, _ = _discover_meta(session)
+        _, per_layer_n_heads, _, _ = _discover_meta(session, onnx_path)
 
     assert per_layer_n_heads, "no layers discovered"
     assert all(1 <= nh <= max_heads for nh in per_layer_n_heads)
@@ -472,7 +548,7 @@ def test_headless_onnx_no_trim_preserves_full_width():
     with tempfile.TemporaryDirectory() as tmpdir:
         onnx_path = _export(out, pos, tmpdir, trim_heads=False)
         session = onnxruntime.InferenceSession(onnx_path)
-        _, per_layer_n_heads, _, _ = _discover_meta(session)
+        _, per_layer_n_heads, _, _ = _discover_meta(session, onnx_path)
 
     assert per_layer_n_heads, "no layers discovered"
     assert all(nh == max_heads for nh in per_layer_n_heads), (
@@ -518,8 +594,8 @@ def test_headless_onnx_trim_is_numerical_noop():
         sess_trim = onnxruntime.InferenceSession(trim_path)
         sess_notrim = onnxruntime.InferenceSession(notrim_path)
 
-        _, heads_trim, d_head, S_trim = _discover_meta(sess_trim)
-        _, heads_notrim, _, S_notrim = _discover_meta(sess_notrim)
+        _, heads_trim, d_head, S_trim = _discover_meta(sess_trim, trim_path)
+        _, heads_notrim, _, S_notrim = _discover_meta(sess_notrim, notrim_path)
 
         pk, pv = _zero_past(heads_trim, d_head, S_trim)
         out_trim = sess_trim.run(["outputs"], _feeds(inputs_np, pk, pv, 0))[0]

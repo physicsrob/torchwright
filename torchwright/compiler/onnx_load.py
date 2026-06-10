@@ -31,13 +31,49 @@ import torch
 from torchwright.compiler.export import HEADLESS_META_FORMAT, meta_path_for
 
 
+def discover_cache_stride(inputs: dict, sidecar_stride, onnx_path) -> int:
+    """Resolve the full static slot count ``S`` for a cached-protocol model.
+
+    Shared by all three loaders (``OnnxHeadlessModule``, ``repl``, and
+    torchwright_doom's ``OnnxTokenRuntime``).  Dual path:
+
+    - ``past_K_0`` first dim is a static int — a pre-bucketing export
+      (old compile caches): use it.  Such models can only bind the full
+      buffer (their mask is full-width); that is automatic and correct.
+    - first dim is the symbolic ``cache_slots`` — a stride-bucketing
+      export: ``S`` comes from the sidecar meta (``sidecar_stride``,
+      resolved by the caller from its meta format).
+
+    A ``past_len`` graph input identifies the ancient pre-static-cache
+    (Concat) contract and is always an error naming that cause.
+    """
+    if "past_len" in inputs:
+        raise ValueError(
+            f"{onnx_path}: model has a past_len input — this is a "
+            f"pre-static-cache (past_len/Concat) artifact; bust the "
+            f"compile-cache entry and recompile with the current exporter"
+        )
+    stride_dim = inputs["past_K_0"].shape[0]
+    if isinstance(stride_dim, int):
+        return int(stride_dim)
+    if sidecar_stride is not None:
+        return int(sidecar_stride)
+    raise ValueError(
+        f"{onnx_path}: past_K_0 first dim is symbolic ({stride_dim!r}) but "
+        f"the sidecar meta carries no cache_stride — re-export with the "
+        f"current exporter (it writes the key) or restore the sidecar"
+    )
+
+
 @dataclass
 class OnnxPast:
     """Static-S sequence-major KV cache plus the committed length.
 
     ``k[i]`` / ``v[i]`` are the FULL ``(S, n_heads_i, d_head)`` cache
-    buffers the ONNX graph's static ``past_K_i`` inputs require (S =
-    cache_stride baked at export; ORT rejects shorter feeds).  Slots at
+    buffers (S = cache_stride from the export sidecar).  This module
+    always feeds the full buffers — it is the contract-correctness
+    harness, not a perf path; prefix-window (stride-bucket) feeds are
+    the GPU runtime's affordance.  Slots at
     positions >= ``length`` are zeros — never garbage: hidden slots get
     softmax weight exactly 0.0 via the in-graph mask, and ``0 * NaN``
     would still be NaN.  ``step`` writes the returned deltas into
@@ -121,22 +157,19 @@ class OnnxHeadlessModule:
         )
 
         # Discover KV cache topology from the ONNX graph's input spec.
-        # past_K_i inputs are sequence-major (S, n_heads_i, d_head) with a
-        # STATIC slot count S = cache_stride; after head trimming each layer
-        # may have a different head count.
+        # past_K_i inputs are sequence-major (cache_slots, n_heads_i, d_head)
+        # with a SYMBOLIC slot dim (the bound prefix length); the full stride
+        # S comes from the sidecar meta (or the dim itself on old static-dim
+        # exports).  After head trimming each layer may have a different
+        # head count.
         inputs = {inp.name: inp for inp in self._session.get_inputs()}
         self._n_layers = sum(1 for name in inputs if name.startswith("past_K_"))
         assert (
             self._n_layers > 0
         ), f"{onnx_path}: no past_K_* inputs — is this a cached-protocol model?"
-        stride_dim = inputs["past_K_0"].shape[0]
-        if not isinstance(stride_dim, int):
-            raise ValueError(
-                f"{onnx_path}: past_K_0 first dim is {stride_dim!r}, expected a "
-                f"static int — this looks like a pre-static-cache (past_len/"
-                f"Concat) export; recompile with the current exporter"
-            )
-        self._cache_stride = int(stride_dim)
+        self._cache_stride = discover_cache_stride(
+            inputs, meta.get("cache_stride"), onnx_path
+        )
         self._per_layer_n_heads = [
             int(inputs[f"past_K_{i}"].shape[1]) for i in range(self._n_layers)
         ]

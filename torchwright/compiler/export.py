@@ -102,6 +102,7 @@ def _write_headless_meta(
     onnx_path: str,
     input_names: List[str],
     extra: Optional[dict] = None,
+    cache_stride: Optional[int] = None,
 ) -> str:
     """Write the headless sidecar JSON, optionally with an ``extra`` dict.
 
@@ -109,11 +110,17 @@ def _write_headless_meta(
     ``rows_per_patch`` — surfaced to the host via
     :class:`OnnxHeadlessModule.metadata`). Kept totally general so the
     compiler layer has no project-specific keys.
+
+    ``cache_stride`` is the full static slot count ``S`` — the loaders
+    need it from the sidecar because ``past_K_i``'s first dim is the
+    symbolic ``cache_slots``, not a readable int.
     """
     meta: dict = {
         "format": HEADLESS_META_FORMAT,
         "input_names": list(input_names),
     }
+    if cache_stride is not None:
+        meta["cache_stride"] = int(cache_stride)
     if extra:
         meta["extra"] = dict(extra)
     return _write_meta(onnx_path, meta)
@@ -385,28 +392,48 @@ def _emit_cached_preamble(nodes: list) -> None:
       - graph input ``cache_position``: int64 ``(n_new,)`` — the absolute
         positions of the new rows (``[base, base+1, …]``).  The ONLY
         position fact the host provides; the causal mask and the
-        positional-encoding rows both derive from it in-graph, on GPU.
-        There is deliberately no ``Shape``/``Range`` op and no CPU scalar
-        anywhere in this preamble: CPU<->GPU handoffs become Memcpy nodes,
-        and a single Memcpy makes ORT refuse CUDA-graph capture (hard
-        error at session creation under ``enable_cuda_graph``).
+        positional-encoding rows both derive from it in-graph.
+      - graph inputs ``past_K_0``…: sequence-major KV cache with a
+        SYMBOLIC first dim ``cache_slots`` — the bound length ``S_eff``
+        (a prefix window of the runtime's full-stride cache buffer) sets
+        this step's attention width.  The mask width derives from it via
+        ``Shape(past_K_0)`` below.
       - initializer ``arange_S``: int64 ``(S,)`` baked ``[0 .. S)``, where
-        ``S = cache_stride`` is the static KV-cache slot count.
+        ``S = cache_stride`` is the FULL static slot count (the maximum
+        any binding may use).
       - initializer ``pos_encoding_full``: (max_seq_len, d_pos)
       - helper initializers from :func:`_add_scalar_inits`
+
+    Memcpy invariant (the CUDA-graph capture requirement): a single
+    Memcpy node makes ORT refuse capture (hard error at session creation
+    under ``enable_cuda_graph``).  The real rule is *no Memcpy*, not "no
+    CPU node": the ``Shape`` -> shape-``Slice`` chain here is CPU-resident
+    (ORT's ``GetCpuPreferredNodes`` pass places it there) and feeds the
+    arange-``Slice``'s ``starts``/``ends``/``axes`` inputs, which the CUDA
+    Slice kernel declares CPU-native (``OrtMemTypeCPUInput``) — so no
+    CPU<->GPU handoff exists and no Memcpy is inserted (verified:
+    "MemcpyTransformer modified: 0" + capture enabled, ORT 1.26, see
+    plan_stride_bucketing.md).  ORT warns once about "shape massaging
+    nodes" under capture; that is safe here because shapes are frozen per
+    ``gpu_graph_id`` — every replay of a bucket binds the same ``S_eff``,
+    so the launch parameters baked from the CPU-computed bounds stay
+    correct.  A dynamic-size CPU-produced tensor (e.g. ``Range``) feeding
+    a GPU op WOULD be a Memcpy — that is why the slots come from slicing
+    the baked GPU-resident ``arange_S`` instead.
 
     Produces:
       - ``pos``: (n_new, d_pos) float — ``pos_encoding_full`` rows gathered
         at ``cache_position``.
-      - ``mask_bool_3d``: (1, n_new, S) bool, True where blocked: slot
+      - ``mask_bool_3d``: (1, n_new, S_eff) bool, True where blocked: slot
         ``j`` is hidden from the query at position ``p`` iff ``j > p``.
         Applied via ``Where(mask_bool_3d, CAUSAL_MASK_SENTINEL, logits)``
         — an overwrite, not an additive penalty (additive is numerically
         unsafe when real logits can be very negative).  Hidden slots
         contain zeros (runtime zero-init discipline) and get softmax
-        weight exactly 0.0 in fp32; equivalence to the old dynamic-concat
-        graph is TOKEN-level, not float-bit-level (widening the matmuls
-        to S reselects cuBLAS kernels — see plan_cuda_graph_decode.md).
+        weight exactly 0.0 in fp32; equivalence across bindings (and to
+        the old dynamic-concat graph) is TOKEN-level, not float-bit-level
+        (each matmul width reselects cuBLAS kernels — see
+        plan_cuda_graph_decode.md / plan_stride_bucketing.md).
       - ``_cache_pos_col``: (n_new, 1) int64 — shared by the mask
         comparison and by every layer's ``ScatterND`` indices.
     """
@@ -414,10 +441,21 @@ def _emit_cached_preamble(nodes: list) -> None:
     def add(op, ins, outs, **attrs):
         nodes.append(helper.make_node(op, ins, outs, **attrs))
 
-    add("Unsqueeze", ["arange_S", "_axes0_1d"], ["_slots_row"])  # (1, S)
+    # S_eff = bound first dim of the cache; slots = arange_S[:S_eff].
+    # _axes0_1d/_axes1_1d double as the [0]/[1] bounds constants.
+    add("Shape", ["past_K_0"], ["_pastK0_shape"])  # (3,) int64, CPU
+    add(
+        "Slice", ["_pastK0_shape", "_axes0_1d", "_axes1_1d", "_axes0_1d"],
+        ["_s_eff_1d"],
+    )  # (1,) = [S_eff], CPU
+    add(
+        "Slice", ["arange_S", "_axes0_1d", "_s_eff_1d", "_axes0_1d"],
+        ["_slots"],
+    )  # (S_eff,) GPU data, CPU bounds
+    add("Unsqueeze", ["_slots", "_axes0_1d"], ["_slots_row"])  # (1, S_eff)
     add("Unsqueeze", ["cache_position", "_axes1_1d"], ["_cache_pos_col"])  # (n_new, 1)
-    add("Greater", ["_slots_row", "_cache_pos_col"], ["_mask_bool"])  # (n_new, S)
-    add("Unsqueeze", ["_mask_bool", "_axes0_1d"], ["mask_bool_3d"])  # (1, n_new, S)
+    add("Greater", ["_slots_row", "_cache_pos_col"], ["_mask_bool"])  # (n_new, S_eff)
+    add("Unsqueeze", ["_mask_bool", "_axes0_1d"], ["mask_bool_3d"])  # (1, n_new, S_eff)
     add("Gather", ["pos_encoding_full", "cache_position"], ["pos"], axis=0)
 
 
@@ -536,25 +574,34 @@ def _emit_cached_layer_nodes(
 
 
 def _kv_io_value_info(
-    per_layer_n_heads: List[int], d_head: int, cache_stride: int
+    per_layer_n_heads: List[int], d_head: int
 ) -> tuple[list, list]:
     """Build ValueInfoProto entries for the KV-cache inputs and outputs.
 
     ``per_layer_n_heads`` gives the (possibly trimmed) head count for
     each layer, so each layer's KV tensors carry only the heads it uses.
 
-    Sequence-major layout with a STATIC first dim: ``past_K_i`` is the
-    full ``(cache_stride, n_heads, d_head)`` cache buffer (ORT rejects
-    shorter feeds against a static dim — every feeder allocates full-S,
-    zero-initialized).  The runtime binds the same buffer every step
-    (stable address + static shape = CUDA-graph replayable) and persists
-    the ``delta_K_i`` output rows into slots ``[base : base+n_new)``
-    after the run.
+    Sequence-major layout with a SYMBOLIC first dim ``cache_slots``: the
+    feeder binds a contiguous prefix view ``cache[: S_eff]`` of its
+    full-stride buffer (any ``S_eff <= cache_stride`` covering the
+    committed length + this pass's rows), and the step's attention runs
+    ``S_eff`` wide — the stride-bucketing affordance.  Binding the full
+    buffer reproduces the previous static-dim behavior exactly.  Every
+    layer must be bound at the SAME ``S_eff`` per run; the shared symbol
+    documents that contract but ORT does not enforce it declaratively (a
+    mismatch fails mid-run, not at bind) — the runtime enforces it by
+    constructing all layers' bindings from one ``S_eff``.  Stable
+    addresses + one frozen shape per ``gpu_graph_id`` are the CUDA-graph
+    replay requirements; the runtime persists the ``delta_K_i`` output
+    rows into slots ``[base : base+n_new)`` after the run.
+
+    The stride ``S`` itself no longer appears in the input shapes — the
+    loaders read it from the sidecar meta (``cache_stride`` key).
 
     Returns:
         (past_vis, new_vis) — each a list of length 2*n_layers
         alternating ``past_K_i`` / ``past_V_i`` (inputs, shape
-        ``(cache_stride, nh, d_head)``) and ``delta_K_i`` / ``delta_V_i``
+        ``("cache_slots", nh, d_head)``) and ``delta_K_i`` / ``delta_V_i``
         (outputs — the new rows only, shape ``(n_new, nh, d_head)``).
     """
     past_vis: list = []
@@ -562,12 +609,12 @@ def _kv_io_value_info(
     for i, nh in enumerate(per_layer_n_heads):
         past_vis.append(
             helper.make_tensor_value_info(
-                f"past_K_{i}", TensorProto.FLOAT, [cache_stride, nh, d_head]
+                f"past_K_{i}", TensorProto.FLOAT, ["cache_slots", nh, d_head]
             )
         )
         past_vis.append(
             helper.make_tensor_value_info(
-                f"past_V_{i}", TensorProto.FLOAT, [cache_stride, nh, d_head]
+                f"past_V_{i}", TensorProto.FLOAT, ["cache_slots", nh, d_head]
             )
         )
         new_vis.append(
@@ -628,19 +675,25 @@ def compile_headless_to_onnx(
 
     The graph speaks the static-cache prefill/decode protocol:
         inputs:  inputs (n_new, d_input), cache_position (n_new,) int64,
-                 past_K_i, past_V_i (S, n_heads, d_head)  [S static]
+                 past_K_i, past_V_i (cache_slots, n_heads, d_head)
+                 [cache_slots SYMBOLIC: the bound prefix length S_eff]
         outputs: outputs (n_new, d_output),
                  delta_K_i, delta_V_i (n_new, n_heads, d_head)
 
-    K/V are sequence-major; ``past_K_i`` is the FULL static cache (slots at
-    positions >= the committed length zero-filled), ``delta_K_i`` is the new
-    rows only, persisted by the runtime into its owned cache slots after the
-    run.  Prefill = zero past + cache_position [0..n).  Decode =
-    cache_position [base] against the same full-S binding.
+    K/V are sequence-major; ``past_K_i`` is a contiguous prefix view
+    ``cache[: S_eff]`` of the feeder's full-stride cache (slots at
+    positions >= the committed length zero-filled; any
+    ``base + n_new <= S_eff <= cache_stride`` is valid — stride
+    bucketing), ``delta_K_i`` is the new rows only, persisted by the
+    runtime into its owned cache slots after the run.  Prefill = zero
+    past + cache_position [0..n).  Decode = cache_position [base]
+    against a covering prefix binding.  Binding the full buffer
+    reproduces the previous static-dim behavior exactly.
 
-    ``cache_stride`` is the static slot count ``S`` baked into the graph
-    (the ``arange_S`` mask constant + the ``past_K_i`` shapes); defaults to
-    ``max_seq_len``.  A compiled model hard-caps at ``prefill + decode <= S``.
+    ``cache_stride`` is the FULL slot count ``S`` (the ``arange_S`` mask
+    constant's length, the maximum any binding may use, and the sidecar
+    meta's ``cache_stride`` key); defaults to ``max_seq_len``.  A
+    compiled model hard-caps at ``prefill + decode <= S``.
 
     ``d_hidden`` is the per-layer MLP hidden width.  Defaults to ``d``
     when omitted; pass an explicit value to decouple the MLP intermediate
@@ -751,9 +804,12 @@ def compile_headless_to_onnx(
     _add_float_init("constant_values", constant_values, dense_inits, sparse_inits)
     _add_float_init("pos_encoding_full", pos_encoding_buf, dense_inits, sparse_inits)
     _add_int64_init("output_gather_indices_init", output_gather_indices, dense_inits)
-    # Baked slot indices [0..S): the in-graph causal mask compares these
-    # against cache_position — a constant, so no Shape/Range op and no CPU
-    # node for any n_new (the CUDA-graph capture requirement).
+    # Baked slot indices [0..S), S = the FULL stride: the preamble slices
+    # this GPU-resident constant to the bound prefix length S_eff and the
+    # causal mask compares the slice against cache_position.  Keeping the
+    # arange baked (vs a Range op) is what keeps the slot data GPU-side —
+    # only scalar slice bounds live on CPU, so no Memcpy (the CUDA-graph
+    # capture requirement; see _emit_cached_preamble).
     _add_int64_init(
         "arange_S", np.arange(cache_stride_resolved, dtype=np.int64), dense_inits
     )
@@ -793,9 +849,7 @@ def compile_headless_to_onnx(
     cache_position_vi = helper.make_tensor_value_info(
         "cache_position", TensorProto.INT64, ["n_new"]
     )
-    past_vis, new_vis = _kv_io_value_info(
-        per_layer_n_heads, d_head, cache_stride_resolved
-    )
+    past_vis, new_vis = _kv_io_value_info(per_layer_n_heads, d_head)
     outputs_vi = helper.make_tensor_value_info(
         "outputs", TensorProto.FLOAT, ["n_new", d_output]
     )
@@ -823,6 +877,7 @@ def compile_headless_to_onnx(
         output_path,
         list(input_names),
         extra=extra_metadata,
+        cache_stride=cache_stride_resolved,
     )
 
     if verbose:
@@ -864,19 +919,26 @@ def compile_to_onnx(
 
     The graph speaks the static-cache prefill/decode protocol:
         inputs:  token_ids (n_new,) int64, cache_position (n_new,) int64,
-                 past_K_i, past_V_i (S, n_heads, d_head)  [S static]
+                 past_K_i, past_V_i (cache_slots, n_heads, d_head)
+                 [cache_slots SYMBOLIC: the bound prefix length S_eff]
         outputs: logits (n_new, vocab_size),
                  delta_K_i, delta_V_i (n_new, n_heads, d_head)
 
-    K/V are sequence-major; ``past_K_i`` is the FULL static cache buffer
+    K/V are sequence-major; ``past_K_i`` is a contiguous prefix view
+    ``cache[: S_eff]`` of the runtime's full-stride cache buffer
     (``S = cache_stride``, defaulting to ``max_seq_len``; slots at
-    positions >= the committed length must be zero-filled), ``delta_K_i``
-    is the new rows only, persisted by the runtime into its owned cache
-    slots after the run.  Prefill = zero past + cache_position [0..n);
-    decode = cache_position [base] against the same full-S binding.  All
-    mask/pos arithmetic is in-graph on GPU (no Memcpy nodes), and the
-    n_new=1 decode step has fully static shapes — the two properties that
-    make the step CUDA-graph capturable.
+    positions >= the committed length must be zero-filled; any
+    ``base + n_new <= S_eff <= S`` is valid — stride bucketing),
+    ``delta_K_i`` is the new rows only, persisted by the runtime into its
+    owned cache slots after the run.  Prefill = zero past +
+    cache_position [0..n); decode = cache_position [base] against a
+    covering prefix binding.  Binding the full buffer reproduces the
+    previous static-dim behavior exactly.  All mask/pos arithmetic is
+    in-graph (the mask width derives from Shape(past_K_0) via a
+    CPU-native shape chain — no Memcpy nodes, see
+    :func:`_emit_cached_preamble`), and each (n_new, S_eff) binding has
+    fully static shapes per run — the properties that make decode steps
+    CUDA-graph capturable, one captured graph per (S_eff, width) bucket.
 
     ``assume_zero_init`` defaults to ``True`` here (unlike ``forward_compile``,
     which defaults ``False``): the ONNX runtime always constructs the residual
@@ -995,9 +1057,12 @@ def compile_to_onnx(
     _add_float_init("pos_encoding_full", pos_encoding_buf, dense_inits, sparse_inits)
     _add_float_init("embed_table", embed_table_np, dense_inits, sparse_inits)
     _add_int64_init("output_gather_indices_init", output_gather_indices, dense_inits)
-    # Baked slot indices [0..S): the in-graph causal mask compares these
-    # against cache_position — a constant, so no Shape/Range op and no CPU
-    # node for any n_new (the CUDA-graph capture requirement).
+    # Baked slot indices [0..S), S = the FULL stride: the preamble slices
+    # this GPU-resident constant to the bound prefix length S_eff and the
+    # causal mask compares the slice against cache_position.  Keeping the
+    # arange baked (vs a Range op) is what keeps the slot data GPU-side —
+    # only scalar slice bounds live on CPU, so no Memcpy (the CUDA-graph
+    # capture requirement; see _emit_cached_preamble).
     _add_int64_init(
         "arange_S", np.arange(cache_stride_resolved, dtype=np.int64), dense_inits
     )
@@ -1043,9 +1108,7 @@ def compile_to_onnx(
     cache_position_vi = helper.make_tensor_value_info(
         "cache_position", TensorProto.INT64, ["n_new"]
     )
-    past_vis, new_vis = _kv_io_value_info(
-        per_layer_n_heads, d_head, cache_stride_resolved
-    )
+    past_vis, new_vis = _kv_io_value_info(per_layer_n_heads, d_head)
     logits_vi = helper.make_tensor_value_info(
         "logits", TensorProto.FLOAT, ["n_new", vocab_size]
     )
@@ -1071,7 +1134,13 @@ def compile_to_onnx(
 
     meta_path = _write_meta(
         output_path,
-        {"format": TOKEN_META_FORMAT, "vocab": list(embedding.tokenizer.vocab)},
+        {
+            "format": TOKEN_META_FORMAT,
+            "vocab": list(embedding.tokenizer.vocab),
+            # The full static slot count S: with the symbolic cache_slots
+            # first dim on past_K_i, loaders read S from here.
+            "cache_stride": cache_stride_resolved,
+        },
     )
 
     if verbose:

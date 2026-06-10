@@ -146,13 +146,9 @@ def _load(onnx_path: str) -> _Model:
     inputs = {inp.name: inp for inp in session.get_inputs()}
     n_layers = sum(1 for name in inputs if name.startswith("past_K_"))
     assert n_layers > 0, "ONNX model has no past_K_* inputs — expected cached export"
-    stride_dim = inputs["past_K_0"].shape[0]
-    if not isinstance(stride_dim, int):
-        raise ValueError(
-            f"{onnx_path}: past_K_0 first dim is {stride_dim!r}, expected a "
-            f"static int — this looks like a pre-static-cache (past_len/Concat) "
-            f"export; recompile with the current exporter"
-        )
+    from torchwright.compiler.onnx_load import discover_cache_stride
+
+    cache_stride = discover_cache_stride(inputs, meta.get("cache_stride"), onnx_path)
     per_layer_n_heads = [int(inputs[f"past_K_{i}"].shape[1]) for i in range(n_layers)]
     d_head = int(inputs["past_K_0"].shape[2])
 
@@ -162,7 +158,7 @@ def _load(onnx_path: str) -> _Model:
         n_layers=n_layers,
         per_layer_n_heads=per_layer_n_heads,
         d_head=d_head,
-        cache_stride=int(stride_dim),
+        cache_stride=cache_stride,
     )
 
 

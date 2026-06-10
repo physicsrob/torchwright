@@ -40,16 +40,26 @@ def _build_1digit():
     return output_node, pos_encoding, embedding
 
 
-def _discover_meta(session):
-    # past_K_i is sequence-major with a STATIC slot count: (S, n_heads, d_head).
+def _discover_meta(session, onnx_path):
+    # past_K_i is sequence-major (cache_slots, n_heads, d_head) with a
+    # SYMBOLIC slot dim (stride bucketing); the full stride S comes from
+    # the sidecar meta.
+    import json
+
+    from torchwright.compiler.export import meta_path_for
+    from torchwright.compiler.onnx_load import discover_cache_stride
+
     inputs = {inp.name: inp for inp in session.get_inputs()}
     n_layers = sum(1 for name in inputs if name.startswith("past_K_"))
     per_layer_n_heads = [int(inputs[f"past_K_{i}"].shape[1]) for i in range(n_layers)]
     d_head = int(inputs["past_K_0"].shape[2])
-    cache_stride = inputs["past_K_0"].shape[0]
-    assert isinstance(
-        cache_stride, int
-    ), f"past_K_0 first dim must be static, got {cache_stride!r}"
+    slot_dim = inputs["past_K_0"].shape[0]
+    assert not isinstance(
+        slot_dim, int
+    ), f"past_K_0 first dim must be the symbolic cache_slots, got {slot_dim!r}"
+    with open(meta_path_for(onnx_path)) as f:
+        sidecar = json.load(f)
+    cache_stride = discover_cache_stride(inputs, sidecar.get("cache_stride"), onnx_path)
     return n_layers, per_layer_n_heads, d_head, cache_stride
 
 
@@ -119,7 +129,7 @@ def test_token_onnx_prefill_matches_compute():
         ref_logits = _reference_logits(output_node, pos_encoding, embedding, tokens)
 
         session = onnxruntime.InferenceSession(onnx_path)
-        n_layers, per_layer_n_heads, d_head, S = _discover_meta(session)
+        n_layers, per_layer_n_heads, d_head, S = _discover_meta(session, onnx_path)
         token_ids = np.array(
             [embedding.tokenizer.get_token_id(t) for t in tokens],
             dtype=np.int64,
@@ -159,7 +169,7 @@ def test_token_onnx_decode_step_matches_full_prefill():
         )
 
         session = onnxruntime.InferenceSession(onnx_path)
-        n_layers, per_layer_n_heads, d_head, S = _discover_meta(session)
+        n_layers, per_layer_n_heads, d_head, S = _discover_meta(session, onnx_path)
         out_names = ["logits"]
         for i in range(n_layers):
             out_names += [f"delta_K_{i}", f"delta_V_{i}"]
