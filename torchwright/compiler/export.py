@@ -1,17 +1,20 @@
 """Compile a torchwright graph to a KV-cached ONNX model.
 
-Two exporters, symmetric:
+Two exporters, symmetric, both returning an :class:`OnnxArtifact`
+(paths + small build metadata; ``artifact.load()`` /
+``artifact.debug_session(...)``):
 
     compile_to_onnx(output_node, pos_encoding, embedding, path, ...)
         Token I/O: token_ids -> logits.  Sidecar format
         ``torchwright.token.v1`` carries the vocab.  Consumer:
-        :mod:`torchwright.compiler.repl`.
+        ``OnnxTokenModule`` via
+        :func:`torchwright.compiler.onnx_load.load_onnx`.
 
     compile_headless_to_onnx(output_node, pos_encoding, path, ...)
         Float I/O: inputs -> outputs.  Sidecar format
         ``torchwright.headless.v1`` carries the alphabetically-ordered
-        input column names.  Consumer:
-        :mod:`torchwright.compiler.onnx_load`.
+        input column names.  Consumer: ``OnnxHeadlessModule`` via
+        :func:`torchwright.compiler.onnx_load.load_onnx`.
 
 Both speak the STATIC-cache prefill/decode protocol (the vanilla
 HF-StaticCache / vLLM pattern, chosen so ONNX Runtime can capture a CUDA
@@ -166,6 +169,63 @@ def _write_headless_meta(
 def debug_meta_path_for(onnx_path: str) -> str:
     base, _ = os.path.splitext(onnx_path)
     return base + ".debug.json"
+
+
+@dataclass(frozen=True)
+class OnnxArtifact:
+    """Paths + small build metadata for a finished ONNX export.
+
+    Returned by :func:`compile_to_onnx` and :func:`compile_headless_to_onnx`
+    so consumers stop reconstructing paths and build facts by convention
+    (re-reading layer counts out of the ONNX file, rebuilding
+    ``d_embed``/``vocab_size`` from globals).
+
+    HARD INVARIANT: built strictly from paths and scalars AFTER export
+    completes — holds no graph, no weights, no exporter state.  The
+    exporters' streaming memory bound (one dense layer's worth of weights
+    in RAM regardless of depth) is sacred; this handle must never grow a
+    field that would anchor the compiled model in memory.
+    """
+
+    path: str
+    meta_path: str
+    debug_path: Optional[str]  # None when debug_sidecar=False
+    kind: str  # "token" | "headless"
+    n_layers: int
+    per_layer_n_heads: Tuple[int, ...]  # tuple copy, not the exporter's live list
+    d: int
+    d_head: int
+    cache_stride: int
+    cache_window: Optional[int]
+    d_embed: Optional[int] = None  # token kind only
+    vocab_size: Optional[int] = None  # token kind only
+
+    def load(self, providers=None):
+        """Load the artifact via :func:`torchwright.compiler.onnx_load.load_onnx`.
+
+        Returns an ``OnnxTokenModule`` or ``OnnxHeadlessModule`` per
+        ``kind``.
+        """
+        # Function-level import: onnx_load imports from this module at
+        # module level, so importing it at the top would be a cycle.
+        from torchwright.compiler.onnx_load import load_onnx
+
+        return load_onnx(self.path, providers=providers)
+
+    def debug_session(self, output_node, pos_encoding, providers=None):
+        """Open a :class:`torchwright.debug.onnx_debug.OnnxDebugSession`.
+
+        ``output_node``/``pos_encoding`` must come from the same
+        deterministic graph-construction code the export used (the
+        session fingerprint-checks the rebuild).
+        """
+        # Function-level import: onnx_debug imports from this module at
+        # module level, so importing it at the top would be a cycle.
+        from torchwright.debug.onnx_debug import OnnxDebugSession
+
+        return OnnxDebugSession(
+            self.path, output_node, pos_encoding, providers=providers
+        )
 
 
 def _write_debug_sidecar(
@@ -943,17 +1003,22 @@ def compile_headless_to_onnx(
     d: int = 1024,
     d_head: int = 16,
     max_seq_len: int = 512,
-    max_layers: int = 200,
-    verbose: bool = True,
+    max_layers: int = 400,
+    verbose: bool = False,
     extra_metadata: Optional[dict] = None,
     d_hidden: Optional[int] = None,
     trim_heads: bool = True,
+    optimize: int = 0,
     assume_zero_init: bool = True,
     cache_stride: Optional[int] = None,
     cache_window: Optional[int] = None,
     debug_sidecar: bool = True,
-) -> None:
+) -> OnnxArtifact:
     """Compile a float-I/O graph to a KV-cached ONNX model.
+
+    Returns an :class:`OnnxArtifact` (paths + small build metadata;
+    ``artifact.load()`` for the runtime, ``artifact.debug_session(...)``
+    for the debug surface).
 
     Writes three files:
         ``<output_path>``     — the ONNX model
@@ -1042,6 +1107,7 @@ def compile_headless_to_onnx(
         on_layer_compiled=on_layer_compiled,
         d_hidden=d_hidden,
         trim_heads=trim_heads,
+        optimize=optimize,
         assume_zero_init=assume_zero_init,
     )
     t_compile = time.perf_counter() - t0
@@ -1240,6 +1306,19 @@ def compile_headless_to_onnx(
         print(f"Wrote {output_path} ({model_size:,} bytes)")
         print(f"Wrote {meta_path}")
 
+    return OnnxArtifact(
+        path=output_path,
+        meta_path=meta_path,
+        debug_path=debug_meta_path_for(output_path) if debug_sidecar else None,
+        kind="headless",
+        n_layers=n_layers,
+        per_layer_n_heads=tuple(per_layer_n_heads),
+        d=d,
+        d_head=d_head,
+        cache_stride=cache_stride_resolved,
+        cache_window=cache_window,
+    )
+
 
 def compile_to_onnx(
     output_node: Node,
@@ -1249,17 +1328,26 @@ def compile_to_onnx(
     d: int = 1024,
     d_head: int = 16,
     max_seq_len: int = 512,
-    max_layers: int = 200,
-    verbose: bool = True,
+    max_layers: int = 400,
+    verbose: bool = False,
     trim_heads: bool = True,
     optimize: int = 0,
     assume_zero_init: bool = True,
     d_hidden: Optional[int] = None,
+    extra_metadata: Optional[dict] = None,
     cache_stride: Optional[int] = None,
     cache_window: Optional[int] = None,
     debug_sidecar: bool = True,
-) -> None:
+) -> OnnxArtifact:
     """Compile a token-I/O graph to a KV-cached ONNX model.
+
+    Returns an :class:`OnnxArtifact` (paths + small build metadata;
+    ``artifact.load()`` for the runtime, ``artifact.debug_session(...)``
+    for the debug surface).
+
+    ``extra_metadata`` is a free-form dict written under the sidecar's
+    ``"extra"`` key (surfaced via ``OnnxTokenModule.metadata``), mirroring
+    the headless exporter; top-level sidecar keys are unchanged.
 
     Writes three files:
         ``<output_path>``     — the ONNX model
@@ -1526,6 +1614,8 @@ def compile_to_onnx(
         # Windowed-cache protocol discriminator: bindings must be exactly
         # C + n_new wide (see the module docstring).
         token_meta["cache_window"] = int(cache_window)
+    if extra_metadata:
+        token_meta["extra"] = dict(extra_metadata)
     meta_path = _write_meta(output_path, token_meta)
 
     if debug_sidecar:
@@ -1560,6 +1650,21 @@ def compile_to_onnx(
         model_size = os.path.getsize(output_path)
         print(f"Wrote {output_path} ({model_size:,} bytes)")
         print(f"Wrote {meta_path}")
+
+    return OnnxArtifact(
+        path=output_path,
+        meta_path=meta_path,
+        debug_path=debug_meta_path_for(output_path) if debug_sidecar else None,
+        kind="token",
+        n_layers=n_layers,
+        per_layer_n_heads=tuple(per_layer_n_heads),
+        d=d,
+        d_head=d_head,
+        cache_stride=cache_stride_resolved,
+        cache_window=cache_window,
+        d_embed=d_embed,
+        vocab_size=int(vocab_size),
+    )
 
 
 # ---------------------------------------------------------------------------
