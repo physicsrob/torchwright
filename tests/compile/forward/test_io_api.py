@@ -302,3 +302,27 @@ def test_anonymous_input_with_io():
     inp = torch.tensor([[1.0, 2.0, 3.0, 4.0]])
     out = module(inp)
     assert torch.allclose(out, inp, atol=0.1)
+
+
+# ---------------------------------------------------------------------------
+# Schedule-parity kwargs
+# ---------------------------------------------------------------------------
+
+
+def test_assume_zero_init_kwarg_output_parity():
+    """assume_zero_init=True threads to forward_compile and preserves
+    outputs on a graph whose correctness doesn't depend on dirty-column
+    cancels (the in-process runtime builds the stream from zeros)."""
+
+    def build():
+        pos = create_pos_encoding()
+        x = create_input("x", 4)
+        return multiply_const(x, 2.0), pos
+
+    y1, pos1 = build()
+    default = compile_headless(y1, pos1, d=64, verbose=False)
+    y2, pos2 = build()
+    azi = compile_headless(y2, pos2, d=64, verbose=False, assume_zero_init=True)
+
+    inp = torch.tensor([[1.0, 2.0, 3.0, 4.0]])
+    assert torch.allclose(default(inp), azi(inp), atol=0.1)

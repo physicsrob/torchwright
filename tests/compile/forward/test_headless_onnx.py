@@ -85,8 +85,9 @@ def _build_sample_graph():
 
 
 def _export(output_node, pos_encoding, tmpdir, name="model.onnx", trim_heads=True):
+    """Export and return the OnnxArtifact (model path at ``.path``)."""
     onnx_path = os.path.join(tmpdir, name)
-    compile_headless_to_onnx(
+    return compile_headless_to_onnx(
         output_node,
         pos_encoding,
         onnx_path,
@@ -96,7 +97,6 @@ def _export(output_node, pos_encoding, tmpdir, name="model.onnx", trim_heads=Tru
         verbose=False,
         trim_heads=trim_heads,
     )
-    return onnx_path
 
 
 def _l_w1_d_hidden(onnx_path):
@@ -149,7 +149,7 @@ def test_headless_onnx_prefill_matches_compute():
     )
 
     with tempfile.TemporaryDirectory() as tmpdir:
-        onnx_path = _export(out, pos, tmpdir)
+        onnx_path = _export(out, pos, tmpdir).path
         session = onnxruntime.InferenceSession(onnx_path)
         n_layers, per_layer_n_heads, d_head, S = _discover_meta(session, onnx_path)
 
@@ -178,7 +178,7 @@ def test_headless_onnx_chunked_decode_matches_full_prefill():
     inputs_np = torch.cat([a_vals, b_vals], dim=1).numpy().astype(np.float32)
 
     with tempfile.TemporaryDirectory() as tmpdir:
-        onnx_path = _export(out, pos, tmpdir)
+        onnx_path = _export(out, pos, tmpdir).path
         session = onnxruntime.InferenceSession(onnx_path)
         n_layers, per_layer_n_heads, d_head, S = _discover_meta(session, onnx_path)
         out_names = ["outputs"]
@@ -213,7 +213,7 @@ def test_headless_onnx_decode_step_matches_full_prefill():
     inputs_np = torch.cat([a_vals, b_vals], dim=1).numpy().astype(np.float32)
 
     with tempfile.TemporaryDirectory() as tmpdir:
-        onnx_path = _export(out, pos, tmpdir)
+        onnx_path = _export(out, pos, tmpdir).path
         session = onnxruntime.InferenceSession(onnx_path)
         n_layers, per_layer_n_heads, d_head, S = _discover_meta(session, onnx_path)
         out_names = ["outputs"]
@@ -259,7 +259,7 @@ def test_headless_onnx_static_tail_is_inert():
     n = 4  # rows committed to the cache before the decode step
 
     with tempfile.TemporaryDirectory() as tmpdir:
-        onnx_path = _export(out, pos, tmpdir)
+        onnx_path = _export(out, pos, tmpdir).path
         session = onnxruntime.InferenceSession(onnx_path)
         n_layers, per_layer_n_heads, d_head, S = _discover_meta(session, onnx_path)
         out_names = ["outputs"]
@@ -319,7 +319,7 @@ def test_headless_onnx_prefix_window_binding():
     n = 4  # committed rows before the decode step
 
     with tempfile.TemporaryDirectory() as tmpdir:
-        onnx_path = _export(out, pos, tmpdir)
+        onnx_path = _export(out, pos, tmpdir).path
         session = onnxruntime.InferenceSession(onnx_path)
         n_layers, per_layer_n_heads, d_head, S = _discover_meta(session, onnx_path)
         out_names = ["outputs"]
@@ -381,7 +381,7 @@ def test_onnx_headless_module_step_matches_full_call():
     inputs = torch.cat([a_vals, b_vals], dim=1)
 
     with tempfile.TemporaryDirectory() as tmpdir:
-        onnx_path = _export(out, pos, tmpdir)
+        onnx_path = _export(out, pos, tmpdir).path
         module = OnnxHeadlessModule(onnx_path)
 
         # Independent call: prefill full sequence, drop cache
@@ -410,7 +410,7 @@ def test_onnx_headless_module_empty_past_shape():
 
     out, pos = _build_sample_graph()
     with tempfile.TemporaryDirectory() as tmpdir:
-        onnx_path = _export(out, pos, tmpdir)
+        onnx_path = _export(out, pos, tmpdir).path
         module = OnnxHeadlessModule(onnx_path)
         past = module.empty_past()
         S = module.cache_stride
@@ -439,7 +439,7 @@ def test_headless_onnx_sidecar_schema():
     pos = create_pos_encoding()
 
     with tempfile.TemporaryDirectory() as tmpdir:
-        onnx_path = _export(out, pos, tmpdir)
+        onnx_path = _export(out, pos, tmpdir).path
         meta_path = meta_path_for(onnx_path)
         with open(meta_path) as f:
             data = json.load(f)
@@ -524,7 +524,7 @@ def test_headless_onnx_trim_heads_shrinks_kv_cache():
     out, pos = _build_sample_graph()
     max_heads = D // D_HEAD  # 16
     with tempfile.TemporaryDirectory() as tmpdir:
-        onnx_path = _export(out, pos, tmpdir, trim_heads=True)
+        onnx_path = _export(out, pos, tmpdir, trim_heads=True).path
         session = onnxruntime.InferenceSession(onnx_path)
         _, per_layer_n_heads, _, _ = _discover_meta(session, onnx_path)
 
@@ -546,7 +546,7 @@ def test_headless_onnx_no_trim_preserves_full_width():
     out, pos = _build_sample_graph()
     max_heads = D // D_HEAD  # 16
     with tempfile.TemporaryDirectory() as tmpdir:
-        onnx_path = _export(out, pos, tmpdir, trim_heads=False)
+        onnx_path = _export(out, pos, tmpdir, trim_heads=False).path
         session = onnxruntime.InferenceSession(onnx_path)
         _, per_layer_n_heads, _, _ = _discover_meta(session, onnx_path)
 
@@ -561,8 +561,8 @@ def test_headless_onnx_trim_shrinks_mlp_slots():
     out, pos = _build_sample_graph()
     full_d_hidden = D  # d_hidden defaults to d when omitted
     with tempfile.TemporaryDirectory() as tmpdir:
-        trim_path = _export(out, pos, tmpdir, name="trim.onnx", trim_heads=True)
-        notrim_path = _export(out, pos, tmpdir, name="notrim.onnx", trim_heads=False)
+        trim_path = _export(out, pos, tmpdir, name="trim.onnx", trim_heads=True).path
+        notrim_path = _export(out, pos, tmpdir, name="notrim.onnx", trim_heads=False).path
         trim_widths = _l_w1_d_hidden(trim_path)
         notrim_widths = _l_w1_d_hidden(notrim_path)
 
@@ -588,8 +588,8 @@ def test_headless_onnx_trim_is_numerical_noop():
     inputs_np = torch.cat([a_vals, b_vals], dim=1).numpy().astype(np.float32)
 
     with tempfile.TemporaryDirectory() as tmpdir:
-        trim_path = _export(out, pos, tmpdir, name="trim.onnx", trim_heads=True)
-        notrim_path = _export(out, pos, tmpdir, name="notrim.onnx", trim_heads=False)
+        trim_path = _export(out, pos, tmpdir, name="trim.onnx", trim_heads=True).path
+        notrim_path = _export(out, pos, tmpdir, name="notrim.onnx", trim_heads=False).path
 
         sess_trim = onnxruntime.InferenceSession(trim_path)
         sess_notrim = onnxruntime.InferenceSession(notrim_path)
@@ -607,3 +607,113 @@ def test_headless_onnx_trim_is_numerical_noop():
         f"trim changed the output: max diff "
         f"{np.abs(out_trim - out_notrim).max():.6e}"
     )
+
+
+# ---------------------------------------------------------------------------
+# OnnxArtifact return handle
+# ---------------------------------------------------------------------------
+
+
+def test_headless_onnx_artifact_fields_and_load():
+    """The exporter's OnnxArtifact matches the export params, and
+    artifact.load() behaves identically to a directly constructed
+    OnnxHeadlessModule."""
+    from torchwright.compiler.export import debug_meta_path_for
+    from torchwright.compiler.onnx_load import OnnxHeadlessModule
+
+    out, pos = _build_sample_graph()
+    a_vals = torch.tensor([[3.0], [5.0], [-2.0]])
+    b_vals = torch.tensor([[4.0], [-1.0], [3.0]])
+    inp = torch.cat([a_vals, b_vals], dim=1)
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        artifact = _export(out, pos, tmpdir)
+
+        assert artifact.kind == "headless"
+        assert artifact.path == os.path.join(tmpdir, "model.onnx")
+        assert artifact.meta_path == meta_path_for(artifact.path)
+        assert artifact.debug_path == debug_meta_path_for(artifact.path)
+        assert os.path.exists(artifact.path)
+        assert os.path.exists(artifact.meta_path)
+        assert os.path.exists(artifact.debug_path)
+        assert artifact.d == D
+        assert artifact.d_head == D_HEAD
+        assert artifact.cache_stride == 32  # = max_seq_len default in _export
+        assert artifact.cache_window is None
+        assert artifact.d_embed is None and artifact.vocab_size is None
+        assert artifact.n_layers > 0
+        assert isinstance(artifact.per_layer_n_heads, tuple)
+        assert len(artifact.per_layer_n_heads) == artifact.n_layers
+
+        loaded = artifact.load()
+        assert isinstance(loaded, OnnxHeadlessModule)
+        direct = OnnxHeadlessModule(artifact.path)
+        assert torch.allclose(loaded(inp), direct(inp), atol=0)
+
+
+def test_headless_onnx_artifact_no_debug_sidecar():
+    """debug_sidecar=False -> artifact.debug_path is None, no file written."""
+    from torchwright.compiler.export import debug_meta_path_for
+
+    out, pos = _build_sample_graph()
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        onnx_path = os.path.join(tmpdir, "model.onnx")
+        artifact = compile_headless_to_onnx(
+            out,
+            pos,
+            onnx_path,
+            d=D,
+            d_head=D_HEAD,
+            max_seq_len=32,
+            verbose=False,
+            debug_sidecar=False,
+        )
+        assert artifact.debug_path is None
+        assert not os.path.exists(debug_meta_path_for(onnx_path))
+
+
+def test_headless_onnx_optimize_kwarg_accepted():
+    """compile_headless_to_onnx accepts optimize=0 (schedule parity kwarg)."""
+    out, pos = _build_sample_graph()
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        onnx_path = os.path.join(tmpdir, "model.onnx")
+        artifact = compile_headless_to_onnx(
+            out,
+            pos,
+            onnx_path,
+            d=D,
+            d_head=D_HEAD,
+            max_seq_len=32,
+            verbose=False,
+            optimize=0,
+        )
+        assert os.path.exists(artifact.path)
+
+
+def test_load_onnx_dispatches_headless():
+    """load_onnx on a headless export returns an OnnxHeadlessModule;
+    a doctored sidecar format raises a loud ValueError."""
+    from torchwright.compiler.onnx_load import OnnxHeadlessModule, load_onnx
+
+    out, pos = _build_sample_graph()
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        artifact = _export(out, pos, tmpdir)
+        model = load_onnx(artifact.path)
+        assert isinstance(model, OnnxHeadlessModule)
+
+        # Doctor the format key -> loud error naming both expected values.
+        with open(artifact.meta_path) as f:
+            meta = json.load(f)
+        meta["format"] = "torchwright.bogus.v9"
+        with open(artifact.meta_path, "w") as f:
+            json.dump(meta, f)
+        with pytest.raises(ValueError, match="bogus"):
+            load_onnx(artifact.path)
+
+        # Missing sidecar -> FileNotFoundError with re-export hint.
+        os.remove(artifact.meta_path)
+        with pytest.raises(FileNotFoundError, match="Re-export"):
+            load_onnx(artifact.path)

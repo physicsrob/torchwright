@@ -385,3 +385,33 @@ def test_fingerprint_stable_across_rebuilds_and_wrappers():
     # Assert wrappers are transparent — including at the root.
     wrapped = assert_in_range(out2, lo=-1e9, hi=1e9)
     assert fp1 == debug_fingerprint(wrapped, pos2, d=256, d_head=16)
+
+
+# ---------------------------------------------------------------------------
+# OnnxArtifact.debug_session — handle-built session matches direct
+# ---------------------------------------------------------------------------
+
+
+def test_artifact_debug_session_matches_direct(tmp_path):
+    onnx_path = str(tmp_path / "model.onnx")
+    out1, pos1 = _build_headless_graph()
+    artifact = compile_headless_to_onnx(
+        out1, pos1, onnx_path, d=256, d_head=D_HEAD, max_seq_len=32, verbose=False
+    )
+
+    iv = {
+        "a": torch.tensor([[1.0], [2.0], [3.0], [-4.0]]),
+        "b": torch.tensor([[5.0], [6.0], [-7.0], [8.0]]),
+    }
+
+    out2, pos2 = _build_headless_graph()
+    sess_handle = artifact.debug_session(out2, pos2)
+    assert isinstance(sess_handle, OnnxDebugSession)
+    report = probe_compiled(sess_handle, out2, iv, n_pos=4, atol=1e-2)
+    assert report.first_divergent is None, report.format_short()
+
+    out3, pos3 = _build_headless_graph()
+    sess_direct = OnnxDebugSession(onnx_path, out3, pos3)
+    a = sess_handle(sess_handle.build_prefill(iv, 4))
+    b = sess_direct(sess_direct.build_prefill(iv, 4))
+    assert torch.allclose(a, b, atol=0)

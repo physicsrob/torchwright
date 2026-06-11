@@ -299,3 +299,106 @@ def test_token_onnx_sidecar_schema_and_metadata():
         assert len(model.per_layer_n_heads) == model.n_layers
         assert all(nh <= D // D_HEAD for nh in model.per_layer_n_heads)
         assert model.d_head == D_HEAD
+
+
+# ---------------------------------------------------------------------------
+# Test 6: OnnxArtifact return handle + extra_metadata (token exporter)
+# ---------------------------------------------------------------------------
+
+
+def test_token_onnx_artifact_fields_load_and_generate():
+    from torchwright.compiler.export import debug_meta_path_for
+    from torchwright.compiler.onnx_load import OnnxTokenModule
+
+    output_node, pos_encoding, embedding = _build_1digit()
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        onnx_path = os.path.join(tmpdir, "adder.onnx")
+        artifact = compile_to_onnx(
+            output_node,
+            pos_encoding,
+            embedding,
+            onnx_path,
+            d=D,
+            d_head=D_HEAD,
+            verbose=False,
+        )
+
+        assert artifact.kind == "token"
+        assert artifact.path == onnx_path
+        assert artifact.meta_path == meta_path_for(onnx_path)
+        assert artifact.debug_path == debug_meta_path_for(onnx_path)
+        assert artifact.d == D
+        assert artifact.d_head == D_HEAD
+        assert artifact.cache_stride == 512  # max_seq_len default
+        assert artifact.cache_window is None
+        # vocab_size is the embedding TABLE's row count (the logits
+        # width) — the table is padded past the tokenizer's vocab list.
+        assert artifact.vocab_size == embedding.table.shape[0]
+        assert artifact.d_embed == embedding.table.shape[1]
+        assert artifact.n_layers > 0
+        assert artifact.per_layer_n_heads == tuple(
+            OnnxTokenModule(onnx_path).per_layer_n_heads
+        )
+
+        model = artifact.load()
+        assert isinstance(model, OnnxTokenModule)
+        assert "".join(model.generate("2+3\n")) == "5"
+
+
+def test_token_onnx_extra_metadata_roundtrip():
+    from torchwright.compiler.onnx_load import load_onnx
+    from torchwright.debug.onnx_debug import OnnxDebugSession
+
+    output_node, pos_encoding, embedding = _build_1digit()
+    extra = {"rows_per_patch": 7, "note": "hello"}
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        onnx_path = os.path.join(tmpdir, "adder.onnx")
+        compile_to_onnx(
+            output_node,
+            pos_encoding,
+            embedding,
+            onnx_path,
+            d=D,
+            d_head=D_HEAD,
+            verbose=False,
+            extra_metadata=extra,
+        )
+
+        # Nested under "extra"; top-level keys unchanged.
+        with open(meta_path_for(onnx_path)) as f:
+            meta = json.load(f)
+        assert meta["extra"] == extra
+        assert meta["format"] == TOKEN_META_FORMAT
+        assert meta["vocab"] == embedding.tokenizer.vocab
+        assert meta["cache_stride"] == 512
+
+        # Surfaced by the loader...
+        model = load_onnx(onnx_path)
+        assert model.metadata == extra
+
+        # ...and by the debug session (full sidecar dict there).
+        out2, pos2, _emb2 = _build_1digit()
+        sess = OnnxDebugSession(onnx_path, out2, pos2)
+        assert sess.metadata["extra"] == extra
+
+
+def test_token_onnx_meta_has_no_extra_key_when_omitted():
+    output_node, pos_encoding, embedding = _build_1digit()
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        onnx_path = os.path.join(tmpdir, "adder.onnx")
+        compile_to_onnx(
+            output_node,
+            pos_encoding,
+            embedding,
+            onnx_path,
+            d=D,
+            d_head=D_HEAD,
+            verbose=False,
+        )
+        with open(meta_path_for(onnx_path)) as f:
+            meta = json.load(f)
+        assert "extra" not in meta
+        assert set(meta) == {"format", "vocab", "cache_stride"}
