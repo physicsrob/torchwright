@@ -83,7 +83,9 @@ _ONNX_CONSISTENCY_CAUSES = (
     "\n    (3) debug-sidecar / canonical-id remap bug"
     " (torchwright/compiler/graph_identity.py)."
     "\n  Recompiling via compile_headless and re-running debug=True"
-    " discriminates (1) from (2)+(3)."
+    " discriminates (1) from (2)+(3) — with TW_SCHEDULE_CACHE_DIR unset"
+    " for that run: a cache-replayed schedule bug reproduces on both"
+    " backends and would masquerade as cause 2/3."
 )
 
 

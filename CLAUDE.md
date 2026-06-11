@@ -259,6 +259,47 @@ against.
   and `/tmp/torchwright-modal-run.log` symlinks to the latest run.
   Grep that file instead of spending another Modal round-trip.
 
+# Compile entry points
+
+Three entry points in `torchwright/compiler/export.py`, one loader
+front door in `torchwright/compiler/onnx_load.py`:
+
+    compiled = compile_headless(graph, pos_encoding, *, d=..., d_head=...,
+                                optimize=0, assume_zero_init=False, ...)
+
+In-process `CompiledHeadless` for tests and debugging.  `graph` is
+either a single output `Node` (outputs gathered at the node's natural
+residual columns) or an `io` dict `{"name": (input_node, output_node)}`
+(overlay mode: outputs land at input columns via delta transfer, for
+autoregressive feedback).  All other parameters are keyword-only.
+`optimize` and `assume_zero_init` thread straight to `forward_compile`,
+so this backend can reproduce a production `optimize=2` schedule
+exactly.  Passing the `PosEncoding` first (the pre-2026 argument
+order) raises a `TypeError` naming the new order.
+
+    artifact = compile_to_onnx(output_node, pos_encoding, embedding, path, ...)
+    artifact = compile_headless_to_onnx(output_node, pos_encoding, path, ...)
+
+Both exporters return an **`OnnxArtifact`**: the written paths
+(`path`, `meta_path`, `debug_path`) plus small build metadata (`kind`,
+`n_layers`, `per_layer_n_heads`, `d`, `d_head`, `cache_stride`,
+`cache_window`; token exports add `d_embed`/`vocab_size`).  It is
+built strictly from paths and scalars after export completes — it
+holds no graph, no weights, no exporter state (the exporters'
+streaming memory bound is a hard invariant).  `artifact.load()`
+returns the matching runtime module; `artifact.debug_session(
+output_node, pos_encoding)` opens an `OnnxDebugSession` (see
+*Debugging the ONNX artifact* below).
+
+    model = load_onnx(path)        # torchwright.compiler.onnx_load
+
+Loads any torchwright ONNX export by dispatching on the sidecar's
+format key: `OnnxHeadlessModule` for float-I/O exports,
+`OnnxTokenModule` for token-I/O exports (vocab tokenizer + argmax
+`generate` loop).  torchwright_doom's `OnnxTokenRuntime` remains the
+CUDA-graph perf runtime; these loaders are the contract-correctness
+harness.
+
 # Debugging compiled graphs
 
 When a compiled graph produces wrong output, the cause is almost
@@ -346,6 +387,8 @@ seconds; the compile it replaces is minutes):
 
     output_node, pos_encoding = build_my_graph()   # deterministic rebuild
     sess = OnnxDebugSession("model.onnx", output_node, pos_encoding)
+    # or, holding the export's OnnxArtifact:
+    # sess = artifact.debug_session(output_node, pos_encoding)
 
     out, past = sess.step(inputs, sess.empty_past(), debug=True)
     val = sess.debug_value(node)
@@ -374,7 +417,9 @@ Requirements and caveats:
   stop and report; (2) ONNX-emission bug in `compiler/export.py` —
   also D1; (3) a debug-sidecar/canonical-id remap bug.  Recompiling
   via `compile_headless` and re-running `debug=True` discriminates
-  (1) from (2)+(3).
+  (1) from (2)+(3) — run the discrimination compile with
+  `TW_SCHEDULE_CACHE_DIR` unset: a cache-replayed schedule bug
+  reproduces on both backends and would masquerade as cause 2/3.
 - The debug session is separate from any production session: the
   promoted outputs defeat onnxruntime's memory-reuse planning.  Never
   put it on a hot path.
