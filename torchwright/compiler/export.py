@@ -89,6 +89,7 @@ from torchwright.graph.misc import Assert, DebugWatch, InputNode
 
 HEADLESS_META_FORMAT = "torchwright.headless.v1"
 TOKEN_META_FORMAT = "torchwright.token.v1"
+DEBUG_META_FORMAT = "torchwright.debug.v1"
 
 
 def _unwrap_output_node(node: Node) -> Node:
@@ -160,6 +161,122 @@ def _write_headless_meta(
     if extra:
         meta["extra"] = dict(extra)
     return _write_meta(onnx_path, meta)
+
+
+def debug_meta_path_for(onnx_path: str) -> str:
+    base, _ = os.path.splitext(onnx_path)
+    return base + ".debug.json"
+
+
+def _write_debug_sidecar(
+    onnx_path: str,
+    *,
+    compiled,
+    output_node: Node,
+    pos_encoding: PosEncoding,
+    d: int,
+    d_head: int,
+    kind: str,
+    input_specs: List[tuple],
+    asserts: List["Assert"],
+    watches: List["DebugWatch"],
+    cache_stride: int,
+    cache_window: Optional[int],
+    verbose: bool,
+) -> str:
+    """Write ``<stem>.debug.json`` — everything OnnxDebugSession needs.
+
+    The sidecar carries the residual assignment keyed by CANONICAL node
+    id (see :mod:`torchwright.compiler.graph_identity`) per capture
+    state, a structural fingerprint of the compiled graph for rebuild
+    validation, and the Assert/DebugWatch coverage present at compile
+    time (so the loader can warn when a rebuilt graph carries fewer
+    checks than the compiled one did — the fingerprint is deliberately
+    wrapper-transparent and cannot see that).
+
+    State keys correspond one-to-one with the per-layer residual tensor
+    names in the emitted ONNX graph: ``"input"`` ↔ ``res_0``,
+    ``"L{i}.attn"`` ↔ ``l{i}_res_attn``, ``"L{i}.mlp"`` ↔
+    ``l{i}_res_next``.  States whose node→columns table is the same
+    dict object as an earlier state's (``duplicate_state`` sharing) are
+    stored as ``{"same_as": <key>}`` to keep the file small.
+
+    ``asserts``/``watches`` must have been collected BEFORE
+    ``forward_compile`` ran — compilation strips both wrapper kinds from
+    the graph in-place.
+    """
+    from torchwright.compiler.graph_identity import (
+        canonical_ids,
+        debug_fingerprint,
+        encode_cols,
+        unwrap_debug,
+    )
+
+    out = unwrap_debug(output_node)
+    canon = canonical_ids(out)
+    ra = compiled.residual_assignment
+    assert ra is not None
+
+    state_list: List[tuple] = [("input", compiled.layers[0].attn.in_state)]
+    for i, layer in enumerate(compiled.layers):
+        state_list.append((f"L{i}.attn", layer.attn.out_state))
+        state_list.append((f"L{i}.mlp", layer.mlp.out_state))
+
+    seen_tables: Dict[int, str] = {}  # id(mapping dict) -> first state key
+    state_entries: List[dict] = []
+    for key, st in state_list:
+        table = ra.mapping.get(st)
+        if table is None:
+            state_entries.append({"key": key, "nodes": {}})
+            continue
+        prior = seen_tables.get(id(table))
+        if prior is not None:
+            state_entries.append({"key": key, "same_as": prior})
+            continue
+        seen_tables[id(table)] = key
+        nodes: Dict[str, list] = {}
+        for node, cols in table.items():
+            # Alias keys may be Assert/DebugWatch wrappers
+            # (ResidualAssignment.add_alias) — fold onto the wrapped
+            # node; the loader unwraps before lookup anyway.
+            cid = canon.get(unwrap_debug(node).node_id)
+            if cid is None:
+                # Not reachable from the output via inputs (e.g. the
+                # PosEncoding leaf) — cannot be keyed canonically.
+                continue
+            nodes.setdefault(str(cid), encode_cols(list(cols)))
+        state_entries.append({"key": key, "nodes": nodes})
+
+    assert_targets = sorted(
+        {
+            canon[unwrap_debug(a.inputs[0]).node_id]
+            for a in asserts
+            if unwrap_debug(a.inputs[0]).node_id in canon
+        }
+    )
+    payload = {
+        "format": DEBUG_META_FORMAT,
+        "kind": kind,  # "token" | "headless"
+        "fingerprint": debug_fingerprint(out, pos_encoding, d=d, d_head=d_head),
+        "d": d,
+        "d_head": d_head,
+        "n_layers": len(compiled.layers),
+        "input_specs": [list(spec) for spec in input_specs],
+        "cache_stride": int(cache_stride),
+        "cache_window": int(cache_window) if cache_window is not None else None,
+        "assert_coverage": {
+            "n_asserts": len(asserts),
+            "n_watches": len(watches),
+            "assert_targets": assert_targets,
+        },
+        "states": state_entries,
+    }
+    path = debug_meta_path_for(onnx_path)
+    with open(path, "w") as f:
+        json.dump(payload, f)
+    if verbose:
+        print(f"Wrote {path} ({os.path.getsize(path):,} bytes)")
+    return path
 
 
 # ---------------------------------------------------------------------------
@@ -834,13 +951,19 @@ def compile_headless_to_onnx(
     assume_zero_init: bool = True,
     cache_stride: Optional[int] = None,
     cache_window: Optional[int] = None,
+    debug_sidecar: bool = True,
 ) -> None:
     """Compile a float-I/O graph to a KV-cached ONNX model.
 
-    Writes two files:
-        ``<output_path>``    — the ONNX model
-        ``<stem>.meta.json`` — ``{"format": "torchwright.headless.v1",
-                                  "input_names": [...]}``
+    Writes three files:
+        ``<output_path>``     — the ONNX model
+        ``<stem>.meta.json``  — ``{"format": "torchwright.headless.v1",
+                                   "input_names": [...]}``
+        ``<stem>.debug.json`` — the debug sidecar consumed by
+                                :class:`torchwright.debug.onnx_debug.
+                                OnnxDebugSession` (see
+                                :func:`compile_to_onnx`).  Disable with
+                                ``debug_sidecar=False``.
 
     The graph speaks the static-cache prefill/decode protocol:
         inputs:  inputs (n_new, d_input), cache_position (n_new,) int64,
@@ -886,6 +1009,12 @@ def compile_headless_to_onnx(
     cache_stride_resolved = _resolve_cache_stride(
         cache_stride, max_seq_len, cache_window
     )
+
+    # Assert/DebugWatch coverage must be collected BEFORE forward_compile
+    # strips both wrapper kinds from the graph in-place.
+    from torchwright.graph.asserts import collect_debug_nodes
+
+    all_asserts, all_watches = collect_debug_nodes(output_node)
 
     dense_inits: list = []
     sparse_inits: list = []
@@ -1072,6 +1201,32 @@ def compile_headless_to_onnx(
         cache_window=cache_window,
     )
 
+    if debug_sidecar:
+        # (name, offset, width) in the alphabetical order the flat
+        # ``inputs`` tensor is packed in (input_proj rows follow
+        # all_input_indices, which concatenates per-input indices in
+        # sorted-name order above).
+        debug_input_specs: List[tuple] = []
+        offset = 0
+        for name, idx in input_nodes_list:
+            debug_input_specs.append((name, offset, len(idx)))
+            offset += len(idx)
+        _write_debug_sidecar(
+            output_path,
+            compiled=compiled,
+            output_node=output_node,
+            pos_encoding=pos_encoding,
+            d=d,
+            d_head=d_head,
+            kind="headless",
+            input_specs=debug_input_specs,
+            asserts=all_asserts,
+            watches=all_watches,
+            cache_stride=cache_stride_resolved,
+            cache_window=cache_window,
+            verbose=verbose,
+        )
+
     if verbose:
         print(
             f"Phases: compile+emit {t_compile:.2f}s, "
@@ -1102,13 +1257,20 @@ def compile_to_onnx(
     d_hidden: Optional[int] = None,
     cache_stride: Optional[int] = None,
     cache_window: Optional[int] = None,
+    debug_sidecar: bool = True,
 ) -> None:
     """Compile a token-I/O graph to a KV-cached ONNX model.
 
-    Writes two files:
-        ``<output_path>``    — the ONNX model
-        ``<stem>.meta.json`` — ``{"format": "torchwright.token.v1",
-                                  "vocab": [...]}``
+    Writes three files:
+        ``<output_path>``     — the ONNX model
+        ``<stem>.meta.json``  — ``{"format": "torchwright.token.v1",
+                                   "vocab": [...]}``
+        ``<stem>.debug.json`` — the debug sidecar (residual assignment
+                                keyed by canonical node id, structural
+                                fingerprint, assert coverage) consumed
+                                by :class:`torchwright.debug.onnx_debug.
+                                OnnxDebugSession`.  Disable with
+                                ``debug_sidecar=False``.
 
     The graph speaks the static-cache prefill/decode protocol:
         inputs:  token_ids (n_new,) int64, cache_position (n_new,) int64,
@@ -1159,6 +1321,12 @@ def compile_to_onnx(
     cache_stride_resolved = _resolve_cache_stride(
         cache_stride, max_seq_len, cache_window
     )
+
+    # Assert/DebugWatch coverage must be collected BEFORE forward_compile
+    # strips both wrapper kinds from the graph in-place.
+    from torchwright.graph.asserts import collect_debug_nodes
+
+    all_asserts, all_watches = collect_debug_nodes(output_node)
 
     dense_inits: list = []
     sparse_inits: list = []
@@ -1360,6 +1528,26 @@ def compile_to_onnx(
         token_meta["cache_window"] = int(cache_window)
     meta_path = _write_meta(output_path, token_meta)
 
+    if debug_sidecar:
+        _write_debug_sidecar(
+            output_path,
+            compiled=compiled,
+            output_node=output_node,
+            pos_encoding=pos_encoding,
+            d=d,
+            d_head=d_head,
+            kind="token",
+            # The token graph reads its ids from the Embedding node's
+            # input slot; one 1-wide column matches the convention
+            # CompiledHeadless uses for the same graph.
+            input_specs=[(embedding.input_name, 0, 1)],
+            asserts=all_asserts,
+            watches=all_watches,
+            cache_stride=cache_stride_resolved,
+            cache_window=cache_window,
+            verbose=verbose,
+        )
+
     if verbose:
         print(
             f"Phases: compile+emit {t_compile:.2f}s, "
@@ -1499,6 +1687,28 @@ class _DebugState:
     state_tensor: Dict  # ResidualStreamState -> (tensor, label)
     ordered_states: List  # [ResidualStreamState, ...]
     ra: "ResidualAssignment"
+
+
+def _ordered_mlp_state_triples(net, ra) -> List[tuple]:
+    """Post-MLP sublayer states in execution order.
+
+    Returns ``(layer_index, state_name, state)`` triples, one per
+    transformer layer whose ``mlp.out_state`` is recorded in
+    ``ra.mapping``.  The final layer's ``mlp.out_state`` is always
+    appended (even if missing from ``ra.mapping``) so the top-level
+    output is reachable when the last layer happens to receive no new
+    assignments.
+    """
+    ordered: List[tuple] = []
+    for i, layer in enumerate(net.layers):
+        st = layer.mlp.out_state
+        if st in ra.mapping:
+            ordered.append((i, f"L{i}.mlp_out", st))
+    last_i = len(net.layers) - 1
+    last_st = net.layers[-1].mlp.out_state
+    if not any(s is last_st for _, _, s in ordered):
+        ordered.append((last_i, f"L{last_i}.mlp_out", last_st))
+    return ordered
 
 
 class CompiledHeadless:
@@ -1718,9 +1928,9 @@ class CompiledHeadless:
         """
         if self._debug_state is None:
             raise RuntimeError("debug_value() requires a prior debug=True forward pass")
-        from torchwright.debug.probe import (
-            _extract_compiled_value,
-            _first_state_with,
+        from torchwright.debug.extraction import (
+            extract_compiled_value,
+            first_state_with,
         )
         from torchwright.graph.misc import Assert, DebugWatch
 
@@ -1728,14 +1938,121 @@ class CompiledHeadless:
             node = node.inputs[0]
 
         ds = self._debug_state
-        state = _first_state_with(node, ds.ra, ds.ordered_states)
+        state = first_state_with(node, ds.ra, ds.ordered_states)
         if state is None:
             return None
         tensor_pair = ds.state_tensor.get(state)
         if tensor_pair is None:
             return None
         res_tensor, _ = tensor_pair
-        return _extract_compiled_value(node, ds.ra, state, res_tensor)
+        return extract_compiled_value(node, ds.ra, state, res_tensor)
+
+    # ---- DebugRuntime protocol surface ---------------------------------
+    #
+    # Shared with torchwright.debug.onnx_debug.OnnxDebugSession so the
+    # probes in torchwright/debug/probe.py work on either backend.
+
+    def _capture_states(self, res_stream: torch.Tensor, past_kvs=None):
+        """Forward once with per-sublayer residual snapshots.
+
+        Prefill (``past_kvs=None``): ``net.forward(return_states=True)``.
+        Decode (``past_kvs`` a list): manual layer walk mirroring
+        ``HeadlessTransformer.forward_cached`` plus state capture —
+        ``net.forward`` has no KV-cache entrypoint.
+
+        Returns ``(res, new_kvs_or_None, state_tensor)``.
+        """
+        net = self._net
+        state_tensor: Dict = {}
+        if past_kvs is None:
+            res, all_states = net.forward(res_stream, return_states=True)
+            for key, (state, tensor) in all_states.items():
+                state_tensor[state] = (tensor, key)
+            new_kvs = None
+        else:
+            res = res_stream
+            new_kvs_list = []
+            with torch.no_grad():
+                for i, layer in enumerate(net.layers):
+                    res, kv = layer.attn.forward_cached(res, past_kvs[i])
+                    new_kvs_list.append(kv)
+                    state_tensor[layer.attn.out_state] = (
+                        res,
+                        f"layer_{i}_attn_skip_out_state",
+                    )
+                    res = layer.mlp.forward(res)
+                    state_tensor[layer.mlp.out_state] = (
+                        res,
+                        f"layer_{i}_mlp_out_state",
+                    )
+            new_kvs = new_kvs_list
+        return res, new_kvs, state_tensor
+
+    def debug_layout(self) -> tuple:
+        """``(residual_assignment, ordered)`` without running a forward.
+
+        ``ordered`` is ``[(layer_index, state_name, state), ...]`` —
+        the post-MLP sublayer states in execution order.
+        """
+        ra = self._net.residual_assignment
+        assert ra is not None, "compiled module has no residual_assignment"
+        return ra, _ordered_mlp_state_triples(self._net, ra)
+
+    def run_with_states(
+        self,
+        prefill: torch.Tensor,
+        past_len: int = 0,
+        past_kvs=None,
+    ) -> tuple:
+        """Forward once with state capture; returns ``(ra, ordered, state_tensor)``.
+
+        ``ordered`` is the post-MLP ``(layer_index, name, state)`` triple
+        list; ``state_tensor`` maps each captured state to
+        ``(residual_tensor, label)``.
+        """
+        ra, ordered = self.debug_layout()
+        res_stream = self._build_res_stream(prefill, past_len=past_len)
+        _, _, state_tensor = self._capture_states(res_stream, past_kvs=past_kvs)
+        return ra, ordered, state_tensor
+
+    def build_prefill(
+        self,
+        input_values: Dict[str, torch.Tensor],
+        n_pos: int,
+    ) -> torch.Tensor:
+        """Pack an input-name → tensor dict into the flat row-tensor layout."""
+        d_input = max(start + width for _, start, width in self._input_specs)
+        out = torch.zeros(n_pos, d_input)
+        for name, start, width in self._input_specs:
+            if name not in input_values:
+                raise ValueError(f"missing input '{name}'")
+            out[:, start : start + width] = input_values[name]
+        return out
+
+    def capture_attention(
+        self,
+        layer_index: int,
+        prefill: torch.Tensor,
+        past_len: int = 0,
+        past_kvs=None,
+    ) -> tuple:
+        """Softmax ``(weights, logits)`` at one attention layer, each
+        ``(n_heads, n_queries, n_keys)``."""
+        from torchwright.debug.probe import attention_capture
+
+        net = self._net
+        with attention_capture(net, layer_index) as captured:
+            res_stream = self._build_res_stream(prefill, past_len=past_len)
+            with torch.no_grad():
+                # The cached path so the patched ``forward_cached`` fires;
+                # ``net.forward`` uses the fused kernel path which never
+                # calls ``attn.attn.forward_cached``.
+                net.forward_cached(res_stream, past_kvs=past_kvs)
+        weights, logits = captured["weights"], captured["logits"]
+        assert (
+            weights is not None and logits is not None
+        ), "attention_capture did not fire — hook installed on wrong layer?"
+        return weights, logits
 
     def _run_debug_checks(self, res_stream, past_kvs=None, atol: float = 1e-7):
         """Run forward with state capture, then check consistency, asserts, and watches.
@@ -1757,46 +2074,26 @@ class CompiledHeadless:
         3. Runs Assert predicates (raises on failure) and DebugWatch
            predicates (prints on trigger).
 
+        The check logic itself lives in
+        :mod:`torchwright.debug.extraction`, shared with the ONNX debug
+        backend so semantics cannot drift between the two.
+
         Returns (res, new_kvs) where new_kvs is None for prefill or a
         list of (K, V) tuples for decode.
         """
-        from torchwright.debug.probe import (
-            _extract_compiled_value,
-            _first_state_with,
-            _ordered_mlp_states,
+        from torchwright.debug.extraction import (
+            check_debug_predicates,
+            run_consistency_check,
         )
-        from torchwright.graph.misc import Assert, DebugWatch
 
         net = self._net
         ra = net.residual_assignment
         assert ra is not None
 
-        state_tensor = {}
-        new_kvs = None
-
-        if past_kvs is None:
-            res, all_states = net.forward(res_stream, return_states=True)
-            for _key, (state, tensor) in all_states.items():
-                state_tensor[state] = (tensor, _key)
-        else:
-            res = res_stream
-            new_kvs_list = []
-            with torch.no_grad():
-                for i, layer in enumerate(net.layers):
-                    res, kv = layer.attn.forward_cached(res, past_kvs[i])
-                    new_kvs_list.append(kv)
-                    state_tensor[layer.attn.out_state] = (
-                        res,
-                        f"layer_{i}_attn_skip_out_state",
-                    )
-                    res = layer.mlp.forward(res)
-                    state_tensor[layer.mlp.out_state] = (
-                        res,
-                        f"layer_{i}_mlp_out_state",
-                    )
-            new_kvs = new_kvs_list
-
-        ordered_states = [s for _, _, s in _ordered_mlp_states(net, ra)]
+        res, new_kvs, state_tensor = self._capture_states(
+            res_stream, past_kvs=past_kvs
+        )
+        ordered_states = [s for _, _, s in _ordered_mlp_state_triples(net, ra)]
 
         self._debug_state = _DebugState(
             state_tensor=state_tensor,
@@ -1804,148 +2101,10 @@ class CompiledHeadless:
             ra=ra,
         )
 
-        # Self-consistency: for each node present in multiple captured
-        # states, verify the value at its columns is the same everywhere.
-        # A mismatch means a column was overwritten while the node was
-        # still live — a scheduling or allocator bug.
-        #
-        # We collect ALL violating nodes (one entry per node, the first
-        # state where its value diverged from the initial reading) and
-        # raise a single error listing every one.  Aborting on the first
-        # failure used to hide secondary aliasings behind the first, which
-        # made it easy to misdiagnose the compiler bug as a single isolated
-        # issue when in practice a whole class of nodes was affected.
-        captured_states = [s for s in ordered_states if s in state_tensor]
-        # Each entry: (value_tensor, label_from_state_tensor, cols_list).
-        # The label comes from ``state_tensor[state][1]`` which embeds the
-        # layer index ("layer_5_mlp_out_state") — ``state.name`` alone is
-        # ambiguous because every layer's MLP out state shares the same
-        # name.
-        node_first_value: Dict[Node, Tuple[torch.Tensor, str, list]] = {}
-        violations: List[tuple] = []
-        violated_nodes: set = set()
-        for state in captured_states:
-            state_label = state_tensor[state][1]
-            for node in ra.get_nodes(state):
-                if node in violated_nodes:
-                    continue
-                res_tensor, _ = state_tensor[state]
-                val = _extract_compiled_value(node, ra, state, res_tensor)
-                if val is None:
-                    continue
-                cols = list(ra.get_node_indices(state, node))
-                if node in node_first_value:
-                    first_val, first_label, first_cols = node_first_value[node]
-                    if first_val.shape == val.shape:
-                        diff = (first_val - val).abs()
-                        max_diff = diff.max().item()
-                        if max_diff > atol:
-                            violations.append(
-                                (
-                                    node,
-                                    first_label,
-                                    state_label,
-                                    cols,
-                                    first_val.detach().clone(),
-                                    val.detach().clone(),
-                                    max_diff,
-                                )
-                            )
-                            violated_nodes.add(node)
-                else:
-                    node_first_value[node] = (
-                        val.detach().clone(),
-                        state_label,
-                        cols,
-                    )
-
-        if violations:
-            # Sort by max_abs_diff descending so the biggest offenders are
-            # at the top.
-            violations.sort(key=lambda v: v[6], reverse=True)
-            msg_lines = [
-                f"Residual-stream self-consistency failure (atol={atol:g}) — "
-                f"{len(violations)} node(s):"
-            ]
-            for i, (
-                node,
-                first_label,
-                later_label,
-                cols,
-                first_val,
-                val,
-                max_diff,
-            ) in enumerate(violations, 1):
-                diff = (first_val - val).abs()
-                if diff.ndim >= 2:
-                    per_col_max = diff.max(dim=0).values
-                else:
-                    per_col_max = diff
-                worst_col_idx = int(per_col_max.argmax().item())
-                worst_col = cols[worst_col_idx] if worst_col_idx < len(cols) else None
-                node_name = node.annotation or node.name or f"node_{node.node_id}"
-                # Summarise value tensors at the worst col if they span many
-                # positions: show min/max across positions rather than dumping
-                # the whole list so the error stays readable when the prefill
-                # is long.
-                a_slice = first_val[..., worst_col_idx]
-                b_slice = val[..., worst_col_idx]
-                if a_slice.ndim == 0 or a_slice.numel() <= 8:
-                    a_fmt = a_slice.tolist()
-                    b_fmt = b_slice.tolist()
-                else:
-                    a_fmt = (
-                        f"n={a_slice.numel()} min={float(a_slice.min()):g} "
-                        f"max={float(a_slice.max()):g}"
-                    )
-                    b_fmt = (
-                        f"n={b_slice.numel()} min={float(b_slice.min()):g} "
-                        f"max={float(b_slice.max()):g}"
-                    )
-                msg_lines.append(
-                    f"\n  [{i}] {node_name} (id={node.node_id}, "
-                    f"type={type(node).__name__}, width={len(cols)})\n"
-                    f"      first:     {first_label}\n"
-                    f"      later:     {later_label}\n"
-                    f"      cols:      {cols if len(cols) <= 16 else str(cols[:16]) + '...'}\n"
-                    f"      worst col: residual[{worst_col}] (node index {worst_col_idx})\n"
-                    f"      first val: {a_fmt}\n"
-                    f"      later val: {b_fmt}\n"
-                    f"      max_abs_diff: {max_diff:.6g}"
-                )
-            raise RuntimeError("".join(msg_lines))
-
-        for assert_node in self._asserts:
-            target = assert_node.inputs[0]
-            while isinstance(target, (Assert, DebugWatch)):
-                target = target.inputs[0]
-            state = _first_state_with(target, ra, ordered_states)
-            if state is None:
-                continue
-            tensor_pair = state_tensor.get(state)
-            if tensor_pair is None:
-                continue
-            res_tensor, _ = tensor_pair
-            compiled_val = _extract_compiled_value(target, ra, state, res_tensor)
-            if compiled_val is None:
-                continue
-            assert_node._check(compiled_val)
-
-        for watch_node in self._watches:
-            target = watch_node.inputs[0]
-            while isinstance(target, (Assert, DebugWatch)):
-                target = target.inputs[0]
-            state = _first_state_with(target, ra, ordered_states)
-            if state is None:
-                continue
-            tensor_pair = state_tensor.get(state)
-            if tensor_pair is None:
-                continue
-            res_tensor, _ = tensor_pair
-            compiled_val = _extract_compiled_value(target, ra, state, res_tensor)
-            if compiled_val is None:
-                continue
-            watch_node._check(compiled_val)
+        run_consistency_check(ordered_states, state_tensor, ra, atol)
+        check_debug_predicates(
+            self._asserts, self._watches, ra, ordered_states, state_tensor
+        )
 
         return res, new_kvs
 

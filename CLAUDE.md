@@ -295,9 +295,12 @@ capture, then performs three checks:
    columns is identical across all of them.  A node's columns sit
    in the residual stream untouched until freed; if they differ
    between snapshots, something overwrote those columns while the
-   node was still live.  This is a compiler or scheduling bug (it
-   would mean I1 or I4 failed to catch an allocation error at
-   compile time).  Raises `RuntimeError` on failure.
+   node was still live.  On `CompiledHeadless` this is a compiler or
+   scheduling bug (it would mean I1 or I4 failed to catch an
+   allocation error at compile time).  On the ONNX debug backend
+   there are two additional candidate causes — see *Debugging the
+   ONNX artifact* below; the error message lists all three.  Raises
+   `RuntimeError` on failure.
 
 2. **Assert predicates**: every `Assert` node in the graph has its
    predicate run against the compiled value.  Raises `AssertionError`
@@ -327,6 +330,57 @@ automatically.  Useful for spot-checking a specific node without
 setting up the full probe machinery.
 
 Raises `RuntimeError` if no `debug=True` forward has been run.
+
+## Debugging the ONNX artifact — OnnxDebugSession
+
+The ONNX exporters (`compile_to_onnx`, `compile_headless_to_onnx`)
+write a `<stem>.debug.json` sidecar next to the model (disable with
+`debug_sidecar=False`): the residual assignment keyed by canonical
+node id, a structural fingerprint, and the compile-time
+Assert/DebugWatch coverage.  `OnnxDebugSession` combines that sidecar,
+the artifact, and a freshly **rebuilt** graph into the same debug
+surface as `CompiledHeadless` — **no recompile** (graph rebuild is
+seconds; the compile it replaces is minutes):
+
+    from torchwright.debug.onnx_debug import OnnxDebugSession
+
+    output_node, pos_encoding = build_my_graph()   # deterministic rebuild
+    sess = OnnxDebugSession("model.onnx", output_node, pos_encoding)
+
+    out, past = sess.step(inputs, sess.empty_past(), debug=True)
+    val = sess.debug_value(node)
+    report = probe_compiled(sess, output_node, input_values, n_pos)
+
+It runs the *real artifact* under onnxruntime with the per-layer
+residual tensors (`l{i}_res_attn` / `l{i}_res_next`) promoted to graph
+outputs, so it additionally catches ONNX-emission and execution-
+provider bugs the in-process recompile path is structurally blind to.
+Every probe below (`probe_compiled`, `probe_residual`,
+`probe_attention`, `probe_layer_diff`) accepts either backend;
+`probe_attention` on this backend fetches the artifact's own
+`l{i}_weights` softmax tensors.
+
+Requirements and caveats:
+
+- The graph must be rebuilt by the same deterministic construction
+  code the compile used (the same property the CP-SAT schedule cache
+  relies on).  A fingerprint check raises loudly on mismatch.
+  Assert/DebugWatch wrappers are exempt from the fingerprint — add or
+  remove them freely on the rebuild; predicates always come from the
+  rebuilt graph (the session warns when the rebuild carries fewer
+  asserts than the compile did).
+- A self-consistency failure on this backend has **three** candidate
+  causes, all named in the error: (1) scheduler/allocator bug — D1,
+  stop and report; (2) ONNX-emission bug in `compiler/export.py` —
+  also D1; (3) a debug-sidecar/canonical-id remap bug.  Recompiling
+  via `compile_headless` and re-running `debug=True` discriminates
+  (1) from (2)+(3).
+- The debug session is separate from any production session: the
+  promoted outputs defeat onnxruntime's memory-reuse planning.  Never
+  put it on a hot path.
+- Fetching all snapshots costs `n_pos × d × 2·n_layers` floats per
+  run — probe very long prefills in slices.
+- Windowed-cache models (`cache_window=C`) are not supported yet.
 
 ## probe_compiled — full oracle comparison
 
@@ -466,10 +520,18 @@ fails in the full suite) are the most common way this bites; see
 
 ## Triage sequence for wrong output
 
+Every step below runs on either backend: a `CompiledHeadless`, or —
+when the wrong output came from a production ONNX artifact — an
+`OnnxDebugSession` over that artifact (see *Debugging the ONNX
+artifact* above; no recompile needed, and it exercises the actual
+onnxruntime execution).
+
 1. **`compiled(inputs, debug=True)`** — does the self-consistency
    check pass?  Do any asserts or watches fire?  If the consistency
-   check fails, that's a real compiler/scheduling bug (report per
-   D1).  If an assert fires, the failure message names the node
+   check fails on `CompiledHeadless`, that's a real
+   compiler/scheduling bug (report per D1); on `OnnxDebugSession` the
+   error names three candidate causes — discriminate before reporting.
+   If an assert fires, the failure message names the node
    and the invariant that broke — investigate that node's inputs.
    If the same `debug=True` call passes on some runs and fails on
    others with identical inputs, see *FP nondeterminism at tolerance
@@ -647,8 +709,11 @@ re-runnable, and don't accumulate institutional knowledge.
   `torchwright/debug/probe.py`.  Provides `probe_compiled` (full
   oracle comparison), `probe_residual` (per-layer node value
   extraction), `probe_attention` (softmax weight/logit capture),
-  and `probe_layer_diff` (layer-by-layer drift tracking).  See
-  the *Debugging compiled graphs* section above for usage.
+  and `probe_layer_diff` (layer-by-layer drift tracking).  All four
+  accept either a `CompiledHeadless` or an `OnnxDebugSession`
+  (`torchwright/debug/onnx_debug.py`) — debug the production ONNX
+  artifact directly instead of recompiling.  See the *Debugging
+  compiled graphs* section above for usage.
 - **Compiler invariants:** assertions in
   `torchwright/compiler/`.  See the *Compiler Invariants* section
   below for the canonical list.

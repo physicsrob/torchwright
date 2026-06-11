@@ -18,19 +18,25 @@ silently (see docs/cpsat_scheduler.md on fallback provenance).
 
 from __future__ import annotations
 
-import hashlib
 import json
 import os
-from dataclasses import asdict
 from pathlib import Path
 from typing import Any, Dict, Optional, Tuple
 
-from torchwright.compiler.forward.graph_analysis import GraphAnalyzer
-from torchwright.compiler.forward.scheduling_policy import SchedulingPolicy
+from torchwright.compiler.graph_identity import (
+    canonical_ids as _canonical_ids,
+    graph_fingerprint,
+)
 from torchwright.graph import Node
-from torchwright.graph.pos_encoding import PosEncoding
 
 from .cpsat_scheduler import ScheduleAssignment
+
+__all__ = [
+    "cache_dir",
+    "graph_fingerprint",
+    "load_assignment",
+    "store_assignment",
+]
 
 _ENV_DIR = "TW_SCHEDULE_CACHE_DIR"
 
@@ -41,76 +47,12 @@ def cache_dir() -> Optional[Path]:
     return Path(value) if value else None
 
 
-def _canonical_ids(output_node: Node) -> Dict[int, int]:
-    """Map current ``node_id`` -> canonical id, independent of creation order.
-
-    Preorder DFS from the output following each node's ORDERED ``inputs``
-    list; first visit assigns the next canonical number.  The raw global
-    node-id counter is process-cumulative: a warm process that builds the
-    graph twice (observed: Modal containers reuse one process across
-    compiles) shifts every id, which would change the fingerprint and
-    silently miss the cache.  Canonical ids depend only on the topology.
-    """
-    canon: Dict[int, int] = {}
-    stack = [output_node]
-    while stack:
-        n = stack.pop()
-        if n.node_id in canon:
-            continue
-        canon[n.node_id] = len(canon)
-        # Reversed keeps the first input on top of the stack (preorder).
-        stack.extend(reversed(getattr(n, "inputs", None) or []))
-    return canon
-
-
-def graph_fingerprint(
-    output_node: Node,
-    pos_encoding: PosEncoding,
-    *,
-    d: int,
-    d_head: int,
-    d_hidden: int,
-    flex_routing: bool,
-    assume_zero_init: bool,
-    cancel_slack: Optional[int],
-    policy: Optional[SchedulingPolicy],
-) -> str:
-    """Topology + geometry hash over CANONICAL node ids (see
-    ``_canonical_ids``) — stable across processes and warm containers; any
-    change to graph construction still changes the fingerprint and misses
-    (correct by construction)."""
-    canon = _canonical_ids(output_node)
-    graph = GraphAnalyzer(output_node)
-    nodes = sorted(
-        (n for n in graph.get_all_nodes() if n.node_id in canon),
-        key=lambda n: canon[n.node_id],
-    )
-    topo = [
-        (
-            canon[n.node_id],
-            type(n).__name__,
-            len(n),
-            tuple(
-                canon[inp.node_id]
-                for inp in (getattr(n, "inputs", None) or [])
-                if inp.node_id in canon
-            ),
-        )
-        for n in nodes
-    ]
-    payload = {
-        "topology": topo,
-        "pos_width": len(pos_encoding),
-        "d": d,
-        "d_head": d_head,
-        "d_hidden": d_hidden,
-        "flex_routing": flex_routing,
-        "assume_zero_init": assume_zero_init,
-        "cancel_slack": cancel_slack,
-        "policy": asdict(policy) if policy is not None else None,
-    }
-    encoded = json.dumps(payload, sort_keys=True, default=str).encode("utf-8")
-    return hashlib.sha256(encoded).hexdigest()
+# _canonical_ids and graph_fingerprint live in
+# torchwright.compiler.graph_identity (shared with the ONNX debug
+# sidecar) and are re-exported here for existing callers.  The
+# fingerprint payload is byte-identical to the pre-extraction
+# implementation for compiled (wrapper-stripped) graphs, so existing
+# cache entries keep hitting.
 
 
 def load_assignment(
