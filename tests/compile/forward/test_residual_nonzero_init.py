@@ -73,7 +73,7 @@ def test_nonzero_init_intermediate_col(monkeypatch):
     x = create_input(4)
     y = multiply_const(x, 2.0)
 
-    module = compile_headless(pos, io={"x": (x, y)}, d=64, verbose=False)
+    module = compile_headless({"x": (x, y)}, pos, d=64, verbose=False)
     inp = torch.tensor([[1.0, 2.0, 3.0, 4.0]])
     expected = torch.tensor([[2.0, 4.0, 6.0, 8.0]])
 
@@ -100,8 +100,8 @@ def test_nonzero_init_overflow_output(monkeypatch):
     y = add_const(x, 10.0)
 
     module = compile_headless(
+        {"a": (x, None), "b": (None, y)},
         pos,
-        io={"a": (x, None), "b": (None, y)},
         d=64,
         verbose=False,
     )
@@ -134,7 +134,7 @@ def test_nonzero_init_mlp_path(monkeypatch):
     x = create_input(4)
     y = relu_add(x, multiply_const(x, -1.0))  # ReLU(x) + ReLU(-x) = |x|
 
-    module = compile_headless(pos, io={"x": (x, y)}, d=128, verbose=False)
+    module = compile_headless({"x": (x, y)}, pos, d=128, verbose=False)
     inp = torch.tensor([[1.0, -2.0, 3.0, -4.0]])
     expected = torch.tensor([[1.0, 2.0, 3.0, 4.0]])
 

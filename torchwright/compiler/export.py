@@ -75,7 +75,7 @@ import json
 import os
 import time
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Callable, Dict, List, Optional, Tuple
+from typing import TYPE_CHECKING, Callable, Dict, List, Optional, Tuple, Union
 
 if TYPE_CHECKING:
     from torchwright.compiler.residual_assignment import ResidualAssignment
@@ -2215,20 +2215,19 @@ class CompiledHeadless:
 
 
 def compile_headless(
-    first_arg,
-    second_arg=None,
+    graph: Union[Node, Dict[str, Tuple[Optional[Node], Optional[Node]]]],
+    pos_encoding: PosEncoding,
+    *,
     d: int = 1024,
     d_head: int = 16,
-    max_layers: int = 100,
-    verbose: bool = True,
+    max_layers: int = 400,
+    verbose: bool = False,
     device: str = "cpu",
     extra_metadata: Optional[dict] = None,
     d_hidden: Optional[int] = None,
     trim_heads: bool = True,
-    # Named parameters for new API
-    io: Optional[Dict[str, Tuple[Optional[Node], Optional[Node]]]] = None,
-    # Legacy named parameter
-    output_node: Optional[Node] = None,
+    optimize: int = 0,
+    assume_zero_init: bool = False,
 ) -> CompiledHeadless:
     """Compile a headless graph to an in-process callable.
 
@@ -2238,11 +2237,10 @@ def compile_headless(
     artifact, autoregressive decode, fast startup), use
     :func:`compile_headless_to_onnx` instead.
 
-    Supports two calling patterns:
-    - New API: ``compile_headless(pos_encoding, io={"name": (input, output)}, ...)``
-    - Legacy API: ``compile_headless(output_node, pos_encoding, ...)``
+    ``graph`` is either a single output :class:`Node` (outputs gathered
+    at the node's natural residual columns) or an ``io`` dict declaring
+    the I/O contract:
 
-    The ``io`` dict declares the I/O contract:
     - Key: field name (string) — used for alphabetical ordering
     - Value: ``(input_node, output_node)`` tuple where:
       - ``(in, out)`` → overlaid: output lands at input's columns
@@ -2251,98 +2249,91 @@ def compile_headless(
 
     For overlaid entries, the output is placed at the same columns as the
     input via delta transfer, enabling autoregressive feedback where the
-    transformer output IS the next input.
+    transformer output IS the next input.  The two forms are NOT the
+    same compile: the io form passes column overlays to
+    ``forward_compile`` (outputs land at input columns); the node form
+    compiles without overlays.
 
     ``d_hidden`` is the per-layer MLP hidden width.  Defaults to ``d``
     when omitted; pass an explicit value to decouple the MLP intermediate
     width from the residual stream width.
+
+    ``optimize`` and ``assume_zero_init`` thread straight to
+    ``forward_compile`` (same meaning as on :func:`compile_to_onnx`) —
+    so this in-process debug backend can reproduce a production
+    ``optimize=2`` / ``assume_zero_init=True`` schedule exactly.  The
+    defaults reproduce ``forward_compile``'s own defaults (today's
+    behavior).
     """
-    # Detect API based on argument types
-    # Legacy: compile_headless(output_node, pos_encoding, ...)
-    # New: compile_headless(pos_encoding, io=..., ...)
-
-    if isinstance(first_arg, PosEncoding):
-        # New API: first_arg is pos_encoding
-        pos_encoding = first_arg
-        # second_arg should be None or io dict (not used positionally in new API)
-        if second_arg is not None and io is None:
-            # Allow compile_headless(pos_encoding, io_dict, ...) positionally
-            io = second_arg
-    else:
-        # Legacy API: first_arg is output_node, second_arg is pos_encoding
-        if output_node is not None:
-            raise ValueError(
-                "Cannot specify output_node both positionally and as keyword"
-            )
-        output_node = first_arg
-        pos_encoding = second_arg
-
-    # Handle legacy API
-    if output_node is not None:
-        if io is not None:
-            raise ValueError("Cannot specify both io and output_node")
-        return _compile_headless_legacy(
-            output_node=output_node,
-            pos_encoding=pos_encoding,
-            d=d,
-            d_head=d_head,
-            max_layers=max_layers,
-            verbose=verbose,
-            device=device,
-            extra_metadata=extra_metadata,
-            d_hidden=d_hidden,
-            trim_heads=trim_heads,
-        )
-
-    # New io-based path
-    if io is None:
-        raise ValueError("Either io or output_node must be provided")
-
-    # New io-based path
-    assert io is not None
-    _validate_io_spec(io)
-
-    # Set names on InputNodes from io dict keys
-    # This enables HeadlessTransformer.get_input_res_stream to look up values
-    for name, (in_node, out_node) in io.items():
-        if in_node is not None and isinstance(in_node, InputNode):
-            in_node.name = name
-
-    input_specs, output_specs, overlays, d_input = _compute_io_layout(io)
-
-    # Build the combined output node for forward_compile
-    # Collect all output nodes (both overlaid and overflow)
-    output_nodes = [spec[3] for spec in output_specs]
-    if len(output_nodes) == 0:
-        raise ValueError("io must have at least one output")
-    elif len(output_nodes) == 1:
-        combined_output = output_nodes[0]
-    else:
-        combined_output = Concatenate(output_nodes)
-
-    # Collect Assert and DebugWatch nodes before forward_compile strips them.
     from torchwright.graph.asserts import collect_debug_nodes
 
-    all_asserts = []
-    all_watches = []
-    _seen_ids: set = set()
-    for _name, (in_node, out_node) in io.items():
-        for root in (in_node, out_node):
-            if root is None:
-                continue
-            node_asserts, node_watches = collect_debug_nodes(root)
-            for a in node_asserts:
-                if a.node_id not in _seen_ids:
-                    _seen_ids.add(a.node_id)
-                    all_asserts.append(a)
-            for w in node_watches:
-                if w.node_id not in _seen_ids:
-                    _seen_ids.add(w.node_id)
-                    all_watches.append(w)
+    # --- Branch A: pre-compile (root + overlays + assert collection) ------
+    if isinstance(graph, dict):
+        io = graph
+        _validate_io_spec(io)
 
-    # Map input nodes to their names for the residual assignment
-    input_node_to_name = {spec[3]: spec[0] for spec in input_specs}
+        # Set names on InputNodes from io dict keys
+        # This enables HeadlessTransformer.get_input_res_stream to look
+        # up values
+        for name, (in_node, out_node) in io.items():
+            if in_node is not None and isinstance(in_node, InputNode):
+                in_node.name = name
 
+        input_specs, output_specs, overlays, d_input = _compute_io_layout(io)
+
+        # Build the combined output node for forward_compile
+        # Collect all output nodes (both overlaid and overflow)
+        output_nodes = [spec[3] for spec in output_specs]
+        if len(output_nodes) == 0:
+            raise ValueError("io must have at least one output")
+        elif len(output_nodes) == 1:
+            combined_output = output_nodes[0]
+        else:
+            combined_output = Concatenate(output_nodes)
+
+        # Collect Assert and DebugWatch nodes before forward_compile
+        # strips them, deduplicating across the io roots.
+        all_asserts = []
+        all_watches = []
+        _seen_ids: set = set()
+        for _name, (in_node, out_node) in io.items():
+            for root in (in_node, out_node):
+                if root is None:
+                    continue
+                node_asserts, node_watches = collect_debug_nodes(root)
+                for a in node_asserts:
+                    if a.node_id not in _seen_ids:
+                        _seen_ids.add(a.node_id)
+                        all_asserts.append(a)
+                for w in node_watches:
+                    if w.node_id not in _seen_ids:
+                        _seen_ids.add(w.node_id)
+                        all_watches.append(w)
+    elif isinstance(graph, PosEncoding):
+        # PosEncoding IS a Node — this check must precede the Node
+        # branch to catch stale old-order callers.
+        raise TypeError(
+            "compile_headless(pos_encoding, io=...) is the old calling "
+            "convention — did you mean the new (graph, pos_encoding) "
+            "order?  Pass the io dict (or output node) first and the "
+            "PosEncoding second."
+        )
+    elif isinstance(graph, Node):
+        # Unwrap Assert nodes at the output root — compilation strips
+        # them from the interior of the graph, but the caller's node
+        # reference may still point at one.  Downstream lookups
+        # (residual-stream indices, etc.) must match the compiled
+        # graph's effective terminal node.
+        all_asserts, all_watches = collect_debug_nodes(graph)
+        combined_output = _unwrap_output_node(graph)
+        overlays = None
+    else:
+        raise TypeError(
+            f"compile_headless expects an output Node or an io dict as "
+            f"its first argument, got {type(graph).__name__}"
+        )
+
+    # --- Shared compile ----------------------------------------------------
     net = forward_compile(
         d=d,
         d_head=d_head,
@@ -2354,80 +2345,42 @@ def compile_headless(
         d_hidden=d_hidden,
         trim_heads=trim_heads,
         overlays=overlays,
+        optimize=optimize,
+        assume_zero_init=assume_zero_init,
     )
 
     assert net.residual_assignment is not None
     out_state = net.layers[-1].mlp.out_state
 
-    # Build input_specs for CompiledHeadless (name, offset, width)
-    ch_input_specs = [(name, offset, width) for name, offset, width, _ in input_specs]
+    # --- Branch B: post-compile (input specs + output gather) --------------
+    if isinstance(graph, dict):
+        # Build input_specs for CompiledHeadless (name, offset, width)
+        ch_input_specs = [
+            (name, offset, width) for name, offset, width, _ in input_specs
+        ]
 
-    # Build output indices from output_specs
-    # For overlaid outputs, offset is the input's column offset
-    # For overflow outputs, offset is in the overflow region
-    output_indices: list[int] = []
-    ch_output_specs: List[tuple] = []
-    running = 0
-    for name, offset, width, out_node in output_specs:
-        output_indices.extend(range(offset, offset + width))
-        ch_output_specs.append((name, running, width))
-        running += width
+        # Build output indices from output_specs
+        # For overlaid outputs, offset is the input's column offset
+        # For overflow outputs, offset is in the overflow region
+        output_indices: list[int] = []
+        ch_output_specs: List[tuple] = []
+        running = 0
+        for name, offset, width, out_node in output_specs:
+            output_indices.extend(range(offset, offset + width))
+            ch_output_specs.append((name, running, width))
+            running += width
 
-    output_indices_tensor = torch.tensor(output_indices, dtype=torch.long)
+        return CompiledHeadless(
+            net,
+            ch_input_specs,
+            torch.tensor(output_indices, dtype=torch.long),
+            metadata=extra_metadata,
+            output_specs=ch_output_specs,
+            asserts=all_asserts,
+            watches=all_watches,
+        )
 
-    return CompiledHeadless(
-        net,
-        ch_input_specs,
-        output_indices_tensor,
-        metadata=extra_metadata,
-        output_specs=ch_output_specs,
-        asserts=all_asserts,
-        watches=all_watches,
-    )
-
-
-def _compile_headless_legacy(
-    output_node: Node,
-    pos_encoding: PosEncoding,
-    d: int,
-    d_head: int,
-    max_layers: int,
-    verbose: bool,
-    device: str,
-    extra_metadata: Optional[dict],
-    d_hidden: Optional[int],
-    trim_heads: bool,
-) -> CompiledHeadless:
-    """Legacy compile_headless implementation using output_node parameter."""
-    # Unwrap Assert nodes at the output root — compilation strips them
-    # from the interior of the graph, but the caller's output_node
-    # reference may still point at one.  Downstream lookups
-    # (residual-stream indices, etc.) must match the compiled graph's
-    # effective terminal node.
-    from torchwright.graph.misc import Assert, DebugWatch
-    from torchwright.graph.asserts import collect_debug_nodes
-
-    # Collect Assert and DebugWatch nodes before forward_compile strips them.
-    all_asserts, all_watches = collect_debug_nodes(output_node)
-
-    while isinstance(output_node, (Assert, DebugWatch)):
-        output_node = output_node.inputs[0]
-
-    net = forward_compile(
-        d=d,
-        d_head=d_head,
-        output_node=output_node,
-        pos_encoding=pos_encoding,
-        verbose=verbose,
-        max_layers=max_layers,
-        device=device,
-        d_hidden=d_hidden,
-        trim_heads=trim_heads,
-    )
-
-    assert net.residual_assignment is not None
     in_state = net.layers[0].attn.in_state
-    out_state = net.layers[-1].mlp.out_state
 
     input_nodes_list: List[tuple] = []  # (name, width)
     declared_names: set = set()
@@ -2452,23 +2405,23 @@ def _compile_headless_legacy(
             declared_names.add(node.input_name)
     input_nodes_list.sort(key=lambda x: x[0])
 
-    input_specs: List[tuple] = []
+    node_input_specs: List[tuple] = []
     offset = 0
     for name, width in input_nodes_list:
-        input_specs.append((name, offset, width))
+        node_input_specs.append((name, offset, width))
         offset += width
 
     # Direct residual-stream gather handles Concatenate output nodes
     # (which compute()'s per-node result dict does not populate).
-    output_indices = torch.tensor(
-        net.residual_assignment.get_node_indices(out_state, output_node),
+    node_output_indices = torch.tensor(
+        net.residual_assignment.get_node_indices(out_state, combined_output),
         dtype=torch.long,
     )
 
     return CompiledHeadless(
         net,
-        input_specs,
-        output_indices,
+        node_input_specs,
+        node_output_indices,
         metadata=extra_metadata,
         asserts=all_asserts,
         watches=all_watches,

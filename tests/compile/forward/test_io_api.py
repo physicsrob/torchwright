@@ -1,6 +1,6 @@
-"""Tests for the new io API in compile_headless.
+"""Tests for the io-dict form of compile_headless.
 
-The io API enables overlaid I/O where output values land at input columns
+The io form enables overlaid I/O where output values land at input columns
 via delta transfer, enabling autoregressive feedback where the transformer
 output IS the next input.
 """
@@ -27,8 +27,8 @@ def test_io_identity():
     x = create_input(4)
 
     module = compile_headless(
+        {"x": (x, x)},  # output = input
         pos,
-        io={"x": (x, x)},  # output = input
         d=64,
         verbose=False,
     )
@@ -45,8 +45,8 @@ def test_io_overlaid_single():
     y = multiply_const(x, 2.0)  # y = 2*x
 
     module = compile_headless(
+        {"x": (x, y)},  # x -> y, overlaid
         pos,
-        io={"x": (x, y)},  # x -> y, overlaid
         d=64,
         verbose=False,
     )
@@ -65,8 +65,8 @@ def test_io_overlaid_add_const():
     y = add_const(x, 10.0)  # y = x + 10
 
     module = compile_headless(
+        {"x": (x, y)},
         pos,
-        io={"x": (x, y)},
         d=64,
         verbose=False,
     )
@@ -88,11 +88,11 @@ def test_io_overlaid_multiple():
     out_b = add_const(b, 1.0)
 
     module = compile_headless(
-        pos,
-        io={
+        {
             "a": (a, out_a),  # Overlaid
             "b": (b, out_b),  # Overlaid
         },
+        pos,
         d=64,
         verbose=False,
     )
@@ -115,11 +115,11 @@ def test_io_input_only_not_in_output():
     out_b = multiply_const(b, 2.0)
 
     module = compile_headless(
-        pos,
-        io={
+        {
             "a": (a, None),  # Input-only: NOT in output
             "b": (b, out_b),  # Overlaid
         },
+        pos,
         d=64,
         verbose=False,
     )
@@ -142,11 +142,11 @@ def test_io_with_overflow():
     out_extra = create_literal_value(torch.tensor([99.0]))
 
     module = compile_headless(
-        pos,
-        io={
+        {
             "a": (a, out_a),  # Overlaid at columns [0:2]
             "extra": (None, out_extra),  # Overflow at column [2]
         },
+        pos,
         d=64,
         verbose=False,
     )
@@ -166,8 +166,8 @@ def test_io_autoregressive():
     next_state = add_const(state, 1.0)
 
     module = compile_headless(
+        {"state": (state, next_state)},
         pos,
-        io={"state": (state, next_state)},
         d=64,
         verbose=False,
     )
@@ -191,11 +191,11 @@ def test_io_uses_input_value():
     out_xy = add(x, y)
 
     module = compile_headless(
-        pos,
-        io={
+        {
             "x": (x, out_xy),  # Overlaid: output x+y at x's columns
             "y": (y, None),  # Input-only
         },
+        pos,
         d=64,
         verbose=False,
     )
@@ -221,7 +221,7 @@ def test_io_width_mismatch_error():
     out_a = create_literal_value(torch.zeros(2))  # Wrong width
 
     with pytest.raises(ValueError, match="width"):
-        compile_headless(pos, io={"a": (a, out_a)}, d=64, verbose=False)
+        compile_headless({"a": (a, out_a)}, pos, d=64, verbose=False)
 
 
 def test_io_empty_tuple_error():
@@ -229,7 +229,7 @@ def test_io_empty_tuple_error():
     pos = create_pos_encoding()
 
     with pytest.raises(ValueError, match="both input and output as None"):
-        compile_headless(pos, io={"a": (None, None)}, d=64, verbose=False)
+        compile_headless({"a": (None, None)}, pos, d=64, verbose=False)
 
 
 def test_io_no_output_error():
@@ -238,21 +238,21 @@ def test_io_no_output_error():
     x = create_input(4)
 
     with pytest.raises(ValueError, match="at least one output"):
-        compile_headless(pos, io={"x": (x, None)}, d=64, verbose=False)
+        compile_headless({"x": (x, None)}, pos, d=64, verbose=False)
 
 
 # ---------------------------------------------------------------------------
-# Legacy API compatibility tests
+# Calling-convention tests
 # ---------------------------------------------------------------------------
 
 
-def test_legacy_api_still_works():
-    """Legacy output_node API should still work."""
+def test_node_mode():
+    """A bare output Node compiles in node mode (natural-column gather)."""
     pos = create_pos_encoding()
-    x = create_input("x", 4)  # Legacy: named input
+    x = create_input("x", 4)  # node mode: named input
     y = multiply_const(x, 2.0)
 
-    module = compile_headless(pos, output_node=y, d=64, verbose=False)
+    module = compile_headless(y, pos, d=64, verbose=False)
 
     inp = torch.tensor([[1.0, 2.0, 3.0, 4.0]])
     out = module(inp)
@@ -261,22 +261,23 @@ def test_legacy_api_still_works():
     assert torch.allclose(out, expected, atol=0.1)
 
 
-def test_cannot_specify_both_io_and_output_node():
-    """Cannot specify both io and output_node."""
+def test_output_node_keyword_rejected():
+    """The removed output_node= keyword raises TypeError."""
     pos = create_pos_encoding()
     x = create_input(4)
     y = multiply_const(x, 2.0)
 
-    with pytest.raises(ValueError, match="Cannot specify both"):
-        compile_headless(pos, io={"x": (x, y)}, output_node=y, d=64, verbose=False)
+    with pytest.raises(TypeError):
+        compile_headless({"x": (x, y)}, pos, output_node=y, d=64, verbose=False)
 
 
-def test_must_specify_io_or_output_node():
-    """Must specify either io or output_node."""
+def test_pos_encoding_first_rejected_with_hint():
+    """The old (pos_encoding, io) order raises a TypeError naming the fix."""
     pos = create_pos_encoding()
+    x = create_input(4)
 
-    with pytest.raises(ValueError, match="Either io or output_node"):
-        compile_headless(pos, d=64, verbose=False)
+    with pytest.raises(TypeError, match="graph, pos_encoding"):
+        compile_headless(pos, {"x": (x, x)}, d=64, verbose=False)
 
 
 # ---------------------------------------------------------------------------
@@ -292,8 +293,8 @@ def test_anonymous_input_with_io():
     assert x.name == ""  # Verify it's anonymous
 
     module = compile_headless(
+        {"my_input": (x, x)},  # Name comes from io key
         pos,
-        io={"my_input": (x, x)},  # Name comes from io key
         d=64,
         verbose=False,
     )

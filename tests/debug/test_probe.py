@@ -73,8 +73,8 @@ def test_probe_residual_reads_intermediate_node():
     y = multiply_const(x, 3.0)
     z = add_const(y, 1.0)
     module = compile_headless(
+        {"x": (x, z)},
         pos,
-        io={"x": (x, z)},
         d=64,
         verbose=False,
     )
@@ -115,8 +115,8 @@ def test_probe_attention_captures_softmax_weights():
         output_matrix=torch.randn(4, 4),
     )
     module = compile_headless(
+        {"x": (x, attn)},
         pos,
-        io={"x": (x, attn)},
         d=256,
         d_head=16,
         verbose=False,
@@ -161,8 +161,8 @@ def test_probe_layer_diff_drift_and_sentinel():
     x = create_input("x", 2)
     y = multiply_const(x, 3.0)
     module = compile_headless(
+        {"x": (x, y)},
         pos,
-        io={"x": (x, y)},
         d=64,
         verbose=False,
     )
