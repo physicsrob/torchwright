@@ -203,7 +203,7 @@ def test_token_onnx_decode_step_matches_full_prefill():
 
 
 def test_token_onnx_autoregressive_1digit():
-    from torchwright.compiler.repl import _load, generate
+    from torchwright.compiler.onnx_load import load_onnx
 
     output_node, pos_encoding, embedding = _build_1digit()
 
@@ -219,10 +219,10 @@ def test_token_onnx_autoregressive_1digit():
             verbose=False,
         )
 
-        model = _load(onnx_path)
+        model = load_onnx(onnx_path)
         test_cases = [("1+1\n", "2"), ("2+3\n", "5"), ("4+5\n", "9")]
         for input_str, expected in test_cases:
-            result = "".join(generate(model, input_str))
+            result = "".join(model.generate(input_str))
             assert (
                 result == expected
             ), f"{input_str}: expected {expected!r}, got {result!r}"
@@ -234,7 +234,7 @@ def test_token_onnx_autoregressive_1digit():
 
 
 def test_token_onnx_autoregressive_3digit():
-    from torchwright.compiler.repl import _load, generate
+    from torchwright.compiler.onnx_load import load_onnx
 
     output_node, pos_encoding, embedding = create_network_parts()
 
@@ -250,7 +250,7 @@ def test_token_onnx_autoregressive_3digit():
             verbose=False,
         )
 
-        model = _load(onnx_path)
+        model = load_onnx(onnx_path)
         test_cases = [
             ("1+2\n", "3"),
             ("12+34\n", "46"),
@@ -259,7 +259,7 @@ def test_token_onnx_autoregressive_3digit():
             ("456+123\n", "579"),
         ]
         for input_str, expected in test_cases:
-            result = "".join(generate(model, input_str))
+            result = "".join(model.generate(input_str))
             assert (
                 result == expected
             ), f"{input_str}: expected {expected!r}, got {result!r}"
@@ -271,7 +271,7 @@ def test_token_onnx_autoregressive_3digit():
 
 
 def test_token_onnx_sidecar_schema_and_metadata():
-    from torchwright.compiler.repl import _load
+    from torchwright.compiler.onnx_load import OnnxTokenModule, load_onnx
 
     output_node, pos_encoding, embedding = _build_1digit()
 
@@ -293,7 +293,8 @@ def test_token_onnx_sidecar_schema_and_metadata():
         assert meta["format"] == TOKEN_META_FORMAT
         assert meta["vocab"] == embedding.tokenizer.vocab
 
-        model = _load(onnx_path)
+        model = load_onnx(onnx_path)
+        assert isinstance(model, OnnxTokenModule)
         assert model.n_layers > 0
         assert len(model.per_layer_n_heads) == model.n_layers
         assert all(nh <= D // D_HEAD for nh in model.per_layer_n_heads)
