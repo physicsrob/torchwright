@@ -1,4 +1,4 @@
-from .node import Node, annotate
+from .node import Node, annotate, annotated
 from .value_type import NodeValueType, Range
 from .attn import Attn
 from .embedding import Embedding

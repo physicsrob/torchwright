@@ -1,3 +1,4 @@
+import functools
 import os
 from contextlib import contextmanager
 from contextvars import ContextVar
@@ -56,6 +57,31 @@ def annotate(label: str):
         yield
     finally:
         _current_annotation.reset(token)
+
+
+def annotated(label: str):
+    """Decorator form of :func:`annotate`.
+
+    Tags every node created during the wrapped function's execution with
+    ``label`` (hierarchical, same nesting rules as :func:`annotate`)::
+
+        @annotated("wall projection")
+        def project_segs(...):
+            ...
+
+    Equivalent to wrapping the whole body in ``with annotate(label):`` but
+    without re-indenting it.
+    """
+
+    def deco(fn):
+        @functools.wraps(fn)
+        def wrapper(*args, **kwargs):
+            with annotate(label):
+                return fn(*args, **kwargs)
+
+        return wrapper
+
+    return deco
 
 
 class Node:
