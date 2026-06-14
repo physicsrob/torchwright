@@ -228,6 +228,129 @@ class OnnxArtifact:
         )
 
 
+# ---------------------------------------------------------------------------
+# 2-D weight-matrix occupancy (floor-plan viz)
+# ---------------------------------------------------------------------------
+
+# Axis labels per matrix kind: (axis0 = what rows index, axis1 = what cols
+# index).  The attention head and d_head dims are flattened into a single
+# "head" axis of width n_heads*d_head == d, so head ``h`` occupies columns
+# (or rows, for W_O) ``range(h*d_head, (h+1)*d_head)``.
+_MATRIX_AXES = {
+    "attn.W_Q": ("residual_in", "head"),
+    "attn.W_K": ("residual_in", "head"),
+    "attn.W_V": ("residual_in", "head"),
+    "attn.W_O": ("head", "residual_out"),
+    "mlp.W_in": ("residual_in", "hidden"),
+    "mlp.W_out": ("hidden", "residual_out"),
+}
+
+
+def _dense_rects(matrix_id, rows, cols):
+    """A dense write fills the full cross product ``rows × cols``.
+
+    Run-length-encode each axis independently (order is irrelevant for a
+    set of cells) and emit one rectangle per row-run × col-run pair.
+    """
+    from torchwright.compiler.graph_identity import encode_cols
+
+    rects = []
+    row_runs = encode_cols(sorted(rows))
+    col_runs = encode_cols(sorted(cols))
+    for rs, rl in row_runs:
+        for cs, cl in col_runs:
+            rects.append({"matrix": matrix_id, "a0": [rs, rl], "a1": [cs, cl]})
+    return rects
+
+
+def _diag_rects(matrix_id, rows, cols):
+    """A diagonal (paired) write fills only cells ``(rows[k], cols[k])``.
+
+    Pairing order is meaningful, so we do NOT sort.  Coalesce into maximal
+    segments where both axes advance by 1 in lockstep — each becomes one
+    ``diag``-flagged rectangle whose cell ``k`` is ``(a0.start+k,
+    a1.start+k)``.  With contiguous hidden slots this yields the same run
+    count as the node's 1-D residual occupancy (compact, exact).
+    """
+    rects = []
+    i, n = 0, len(rows)
+    while i < n:
+        j = i
+        while (
+            j + 1 < n and rows[j + 1] == rows[j] + 1 and cols[j + 1] == cols[j] + 1
+        ):
+            j += 1
+        length = j - i + 1
+        rects.append(
+            {
+                "matrix": matrix_id,
+                "a0": [rows[i], length],
+                "a1": [cols[i], length],
+                "diag": True,
+            }
+        )
+        i = j + 1
+    return rects
+
+
+def _build_matrix_occupancy(compiled, canon, d: int, d_head: int):
+    """Build the ``matrices`` table and ``placements`` map for the sidecar.
+
+    Returns ``(matrices, placements, n_heads, d_hidden_per_layer)``.  All
+    geometry comes from scalar params / int attributes (never weight
+    tensors, which may be trimmed/freed by export time).  Placements are
+    keyed by canonical node id; ops with no graph node (e.g. ``cancel``)
+    or whose node is unreachable from the output fold under reserved
+    ``_<op_type>`` / ``_unreachable`` buckets — they occupy real matrix
+    area, so completeness needs them, but they are not user-graph nodes.
+    """
+    from torchwright.compiler.graph_identity import unwrap_debug
+
+    n_heads = d // d_head
+    head_dim = n_heads * d_head  # == d
+
+    matrices: Dict[str, dict] = {}
+    d_hidden_per_layer: List[int] = []
+    for i, layer in enumerate(compiled.layers):
+        d_hidden = int(getattr(layer.mlp, "d_hidden", d))
+        d_hidden_per_layer.append(d_hidden)
+        shapes = {
+            "attn.W_Q": (d, head_dim),
+            "attn.W_K": (d, head_dim),
+            "attn.W_V": (d, head_dim),
+            "attn.W_O": (head_dim, d),
+            "mlp.W_in": (d, d_hidden),
+            "mlp.W_out": (d_hidden, d),
+        }
+        for kind, (a_rows, a_cols) in shapes.items():
+            axis0, axis1 = _MATRIX_AXES[kind]
+            matrices[f"L{i}.{kind}"] = {
+                "layer": i,
+                "kind": kind,
+                "shape": [int(a_rows), int(a_cols)],
+                "axis0": axis0,
+                "axis1": axis1,
+            }
+
+    placements: Dict[str, list] = {}
+    recorder = getattr(compiled, "placements", None)
+    if recorder is not None:
+        for e in recorder.entries:
+            matrix_id = f"L{e.layer}.{e.matrix_kind}"
+            if e.node is None:
+                key = f"_{e.op_type}"
+            else:
+                cid = canon.get(unwrap_debug(e.node).node_id)
+                key = str(cid) if cid is not None else "_unreachable"
+            if e.mode == "diag":
+                rects = _diag_rects(matrix_id, e.rows, e.cols)
+            else:
+                rects = _dense_rects(matrix_id, e.rows, e.cols)
+            placements.setdefault(key, []).extend(rects)
+
+    return matrices, placements, n_heads, d_hidden_per_layer
+
+
 def _write_debug_sidecar(
     onnx_path: str,
     *,
@@ -314,13 +437,20 @@ def _write_debug_sidecar(
             if unwrap_debug(a.inputs[0]).node_id in canon
         }
     )
+    matrices, placements, n_heads, d_hidden_per_layer = _build_matrix_occupancy(
+        compiled, canon, d, d_head
+    )
     payload = {
         "format": DEBUG_META_FORMAT,
         "kind": kind,  # "token" | "headless"
         "fingerprint": debug_fingerprint(out, pos_encoding, d=d, d_head=d_head),
         "d": d,
         "d_head": d_head,
+        "n_heads": n_heads,
+        "d_hidden": d_hidden_per_layer,
         "n_layers": len(compiled.layers),
+        "matrices": matrices,
+        "placements": placements,
         "input_specs": [list(spec) for spec in input_specs],
         "cache_stride": int(cache_stride),
         "cache_window": int(cache_window) if cache_window is not None else None,

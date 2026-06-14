@@ -20,6 +20,66 @@ from torchwright.graph.relu import ReLU
 
 
 @dataclass
+class PlacementEntry:
+    """One op's contribution to one weight matrix, in flat matrix coords.
+
+    ``matrix_kind`` is the per-layer suffix (e.g. ``"attn.W_Q"``,
+    ``"mlp.W_in"``); the full ``matrix_id`` is built at sidecar-emit time
+    from ``layer`` + this suffix.  ``rows`` / ``cols`` are index lists into
+    the matrix's two axes (the head/d_head dims are pre-flattened, so a
+    head ``h`` occupies columns ``range(h*d_head, (h+1)*d_head)``).
+
+    ``mode`` distinguishes how the write filled the region:
+      * ``"dense"`` — full cross product ``rows × cols`` (a real weight
+        block, written with broadcast/outer indexing).
+      * ``"diag"``  — paired write: cell ``k`` is ``(rows[k], cols[k])``
+        only (an identity / passthrough, written with aligned 1-D index
+        tensors).  ``rows`` and ``cols`` have equal length and the pairing
+        order is meaningful — do not reorder.
+    """
+
+    layer: int
+    matrix_kind: str
+    node: Optional[Node]
+    op_type: str
+    rows: List[int]
+    cols: List[int]
+    mode: Literal["dense", "diag"]
+
+
+class PlacementRecorder:
+    """Accumulates per-op 2-D weight-matrix occupancy during weight writing.
+
+    Holds only Python ints (never tensors), so it does not pin trimmed
+    layer weights and its footprint is O(emitted ops) — the same order as
+    the residual assignment.  ``set_layer`` is called once per sublayer
+    write; subsequent ``add`` calls attribute to that layer.
+    """
+
+    def __init__(self):
+        self.entries: List[PlacementEntry] = []
+        self._layer = -1
+
+    def set_layer(self, layer: int) -> None:
+        self._layer = layer
+
+    def add(
+        self,
+        matrix_kind: str,
+        node: Optional[Node],
+        op_type: str,
+        rows: List[int],
+        cols: List[int],
+        mode: Literal["dense", "diag"],
+    ) -> None:
+        self.entries.append(
+            PlacementEntry(
+                self._layer, matrix_kind, node, op_type, list(rows), list(cols), mode
+            )
+        )
+
+
+@dataclass
 class AttnHeadOp:
     op_type: Literal[
         "compute_attn",
@@ -70,23 +130,24 @@ def write_attn_sublayer(
     ops: List[AttnHeadOp],
     residual_map: ResidualStreamMap,
     pos_encoding: Optional[PosEncoding],
+    recorder: Optional[PlacementRecorder] = None,
 ):
     """Write attention head operations into a layer's AttnLayerComponent."""
     attn = layer.attn.attn
     assert pos_encoding is not None, "pos_encoding required for attention ops"
     for op in ops:
         if op.op_type == "compute_attn":
-            _write_compute_attn(attn, op, residual_map)
+            _write_compute_attn(attn, op, residual_map, recorder)
         elif op.op_type == "compute_linear":
-            _write_compute_linear(attn, op, residual_map, pos_encoding)
+            _write_compute_linear(attn, op, residual_map, pos_encoding, recorder)
         elif op.op_type == "cancel":
-            _write_cancel(attn, op, residual_map, pos_encoding)
+            _write_cancel(attn, op, residual_map, pos_encoding, recorder)
         elif op.op_type == "compute_add":
-            _write_compute_add(attn, op, residual_map, pos_encoding)
+            _write_compute_add(attn, op, residual_map, pos_encoding, recorder)
         elif op.op_type == "add_into":
-            _write_add_into(attn, op, residual_map, pos_encoding)
+            _write_add_into(attn, op, residual_map, pos_encoding, recorder)
         elif op.op_type == "delta_transfer":
-            _write_delta_transfer(attn, op, residual_map, pos_encoding)
+            _write_delta_transfer(attn, op, residual_map, pos_encoding, recorder)
         else:
             raise ValueError(f"Unknown attn op_type: {op.op_type}")
 
@@ -96,21 +157,26 @@ def write_mlp_sublayer(
     ops: List[MLPOp],
     residual_map: ResidualStreamMap,
     biased_linears: Optional[Set[Node]] = None,
+    recorder: Optional[PlacementRecorder] = None,
 ):
     """Write MLP operations into a layer's MLPSubLayer components."""
     if biased_linears is None:
         biased_linears = set()
     for op in ops:
         if op.op_type == "compute_relu":
-            _write_compute_relu(layer.mlp, op, residual_map, biased_linears)
+            _write_compute_relu(layer.mlp, op, residual_map, biased_linears, recorder)
         elif op.op_type == "compute_literal_value":
             _write_compute_literal_value(layer.mlp, op)
         elif op.op_type == "compute_bias":
             _write_compute_bias(layer.mlp, op)
         elif op.op_type == "compute_standalone_relu":
-            _write_compute_standalone_relu(layer.mlp, op, residual_map, biased_linears)
+            _write_compute_standalone_relu(
+                layer.mlp, op, residual_map, biased_linears, recorder
+            )
         elif op.op_type == "compute_linear_bypass":
-            _write_compute_linear_bypass(layer.mlp, op, residual_map, biased_linears)
+            _write_compute_linear_bypass(
+                layer.mlp, op, residual_map, biased_linears, recorder
+            )
         else:
             raise ValueError(f"Unknown mlp op_type: {op.op_type}")
 
@@ -121,9 +187,33 @@ def write_mlp_sublayer(
 
 
 def _scatter_attn_head(
-    attn, head, q_idx, k_idx, v_idx, o_idx, q_mat, k_mat, v_mat, o_mat, d_head
+    attn,
+    head,
+    q_idx,
+    k_idx,
+    v_idx,
+    o_idx,
+    q_mat,
+    k_mat,
+    v_mat,
+    o_mat,
+    d_head,
+    *,
+    recorder: Optional[PlacementRecorder] = None,
+    node: Optional[Node] = None,
+    op_type: Optional[str] = None,
 ):
     """Scatter strategy matrices into one attention head's weight tensors."""
+    if recorder is not None:
+        # Every attention write fills the head's full d_head columns for the
+        # captured rows (the head is the allocation unit) — a dense block.
+        # Q/K/V: rows = residual source cols, cols = this head's flat slice.
+        # O:     rows = this head's flat slice, cols = residual output cols.
+        head_cols = list(range(head * d_head, (head + 1) * d_head))
+        recorder.add("attn.W_Q", node, op_type, q_idx, head_cols, "dense")
+        recorder.add("attn.W_K", node, op_type, k_idx, head_cols, "dense")
+        recorder.add("attn.W_V", node, op_type, v_idx, head_cols, "dense")
+        recorder.add("attn.W_O", node, op_type, head_cols, o_idx, "dense")
     q_idx_t = torch.as_tensor(q_idx, dtype=torch.long)
     k_idx_t = torch.as_tensor(k_idx, dtype=torch.long)
     v_idx_t = torch.as_tensor(v_idx, dtype=torch.long)
@@ -154,7 +244,12 @@ def _allocate_head(attn):
     return head
 
 
-def _write_compute_attn(attn, op: AttnHeadOp, rmap: ResidualStreamMap):
+def _write_compute_attn(
+    attn,
+    op: AttnHeadOp,
+    rmap: ResidualStreamMap,
+    recorder: Optional[PlacementRecorder] = None,
+):
     """Copy an Attn node's Q/K/V/O matrices into attention heads.
 
     When the node's d_v exceeds the layer's d_head, V/O are split across
@@ -234,6 +329,9 @@ def _write_compute_attn(attn, op: AttnHeadOp, rmap: ResidualStreamMap):
             v_chunk,
             o_chunk,
             layer_d_head,
+            recorder=recorder,
+            node=op.node,
+            op_type=op.op_type,
         )
 
 
@@ -260,7 +358,11 @@ def _current_pos_attn_matrices(pos_encoding, d_head):
 
 
 def _write_compute_linear(
-    attn, op: AttnHeadOp, rmap: ResidualStreamMap, pos_encoding: PosEncoding
+    attn,
+    op: AttnHeadOp,
+    rmap: ResidualStreamMap,
+    pos_encoding: PosEncoding,
+    recorder: Optional[PlacementRecorder] = None,
 ):
     """Compile a zero-bias Linear via current-position attention.
 
@@ -312,11 +414,18 @@ def _write_compute_linear(
             v_mat,
             o_mat,
             d_head,
+            recorder=recorder,
+            node=op.node,
+            op_type=op.op_type,
         )
 
 
 def _write_compute_add(
-    attn, op: AttnHeadOp, rmap: ResidualStreamMap, pos_encoding: PosEncoding
+    attn,
+    op: AttnHeadOp,
+    rmap: ResidualStreamMap,
+    pos_encoding: PosEncoding,
+    recorder: Optional[PlacementRecorder] = None,
 ):
     """Compute Add(a, b) by copying both inputs to fresh columns via attention.
 
@@ -371,6 +480,9 @@ def _write_compute_add(
                 v_mat,
                 o_mat,
                 d_head,
+                recorder=recorder,
+                node=op.node,
+                op_type=op.op_type,
             )
         else:
             # Too wide to combine — one head per input.
@@ -391,11 +503,18 @@ def _write_compute_add(
                     v_mat,
                     o_mat,
                     d_head,
+                    recorder=recorder,
+                    node=op.node,
+                    op_type=op.op_type,
                 )
 
 
 def _write_cancel(
-    attn, op: AttnHeadOp, rmap: ResidualStreamMap, pos_encoding: PosEncoding
+    attn,
+    op: AttnHeadOp,
+    rmap: ResidualStreamMap,
+    pos_encoding: PosEncoding,
+    recorder: Optional[PlacementRecorder] = None,
 ):
     """Cancel target_cols: V=identity, O=-identity. Skip adds x + (-x) = 0.
 
@@ -433,11 +552,18 @@ def _write_cancel(
             v_mat,
             o_mat,
             d_head,
+            recorder=recorder,
+            node=op.node,
+            op_type=op.op_type,
         )
 
 
 def _write_add_into(
-    attn, op: AttnHeadOp, rmap: ResidualStreamMap, pos_encoding: PosEncoding
+    attn,
+    op: AttnHeadOp,
+    rmap: ResidualStreamMap,
+    pos_encoding: PosEncoding,
+    recorder: Optional[PlacementRecorder] = None,
 ):
     """Add(dead, live): copy live's values to dead's columns via attention.
 
@@ -483,11 +609,18 @@ def _write_add_into(
             v_mat,
             o_mat,
             d_head,
+            recorder=recorder,
+            node=op.node,
+            op_type=op.op_type,
         )
 
 
 def _write_delta_transfer(
-    attn, op: AttnHeadOp, rmap: ResidualStreamMap, pos_encoding: PosEncoding
+    attn,
+    op: AttnHeadOp,
+    rmap: ResidualStreamMap,
+    pos_encoding: PosEncoding,
+    recorder: Optional[PlacementRecorder] = None,
 ):
     """Transfer (source - subtract) to target columns via attention.
 
@@ -548,6 +681,9 @@ def _write_delta_transfer(
                 v_mat,
                 o_mat,
                 d_head,
+                recorder=recorder,
+                node=op.node,
+                op_type=op.op_type,
             )
         else:
             # Too wide to combine — one head per group.
@@ -566,6 +702,9 @@ def _write_delta_transfer(
                 v_mat,
                 o_mat,
                 d_head,
+                recorder=recorder,
+                node=op.node,
+                op_type=op.op_type,
             )
             o_mat = -torch.eye(d_head, chunk_size)  # -1 coefficient
             head = _allocate_head(attn)
@@ -581,6 +720,9 @@ def _write_delta_transfer(
                 v_mat,
                 o_mat,
                 d_head,
+                recorder=recorder,
+                node=op.node,
+                op_type=op.op_type,
             )
 
 
@@ -594,6 +736,7 @@ def _write_compute_relu(
     op: MLPOp,
     rmap: ResidualStreamMap,
     biased_linears: Optional[Set[Node]] = None,
+    recorder: Optional[PlacementRecorder] = None,
 ):
     """Compile a Linear1 -> ReLU -> Linear2 chain through the MLP sublayer.
 
@@ -657,6 +800,12 @@ def _write_compute_relu(
     )
     mlp.linear2.output_bias[out_idx_t] = l2_node.output_bias.to(target_dtype)
 
+    if recorder is not None:
+        # Dense weight blocks: W_in attributed to l1, W_out to l2 (each
+        # matrix to the graph node carrying its weights).
+        recorder.add("mlp.W_in", l1_node, op.op_type, in_idx, mlp_slots, "dense")
+        recorder.add("mlp.W_out", l2_node, op.op_type, mlp_slots, out_idx, "dense")
+
 
 def _write_compute_literal_value(mlp, op: MLPOp):
     """Write a constant value via MLP output bias."""
@@ -693,6 +842,7 @@ def _write_compute_standalone_relu(
     op: MLPOp,
     rmap: ResidualStreamMap,
     biased_linears: Optional[Set[Node]] = None,
+    recorder: Optional[PlacementRecorder] = None,
 ):
     """Compile a standalone ReLU through the MLP sublayer.
 
@@ -739,12 +889,19 @@ def _write_compute_standalone_relu(
     # linear2: MLP slots → output columns (identity, zero bias)
     mlp.linear2.output_matrix[slots_t, out_idx_t] = 1.0
 
+    if recorder is not None:
+        # Paired identity writes (cell k = (rows[k], cols[k])) — diagonal,
+        # not a dense block.  Both attributed to the ReLU node.
+        recorder.add("mlp.W_in", relu_node, op.op_type, in_idx, mlp_slots, "diag")
+        recorder.add("mlp.W_out", relu_node, op.op_type, mlp_slots, out_idx, "diag")
+
 
 def _write_compute_linear_bypass(
     mlp,
     op: MLPOp,
     rmap: ResidualStreamMap,
     biased_linears: Optional[Set[Node]] = None,
+    recorder: Optional[PlacementRecorder] = None,
 ):
     """Compile a standalone Linear via MLP using the ReLU bypass trick.
 
@@ -813,3 +970,11 @@ def _write_compute_linear_bypass(
 
     # Output bias via linear2 output bias.
     mlp.linear2.output_bias[out_idx_t] += node.output_bias.to(target_dtype)
+
+    if recorder is not None:
+        # W_in: dense ±W blocks into the positive and negative slot halves.
+        # W_out: paired ±1 identity from each slot half back to out_idx.
+        recorder.add("mlp.W_in", node, op.op_type, in_idx, pos_slots, "dense")
+        recorder.add("mlp.W_in", node, op.op_type, in_idx, neg_slots, "dense")
+        recorder.add("mlp.W_out", node, op.op_type, pos_slots, out_idx, "diag")
+        recorder.add("mlp.W_out", node, op.op_type, neg_slots, out_idx, "diag")

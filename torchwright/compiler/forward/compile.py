@@ -39,6 +39,7 @@ from torchwright.compiler.forward.sibling_clusters import (
 from torchwright.compiler.forward.weight_writer import (
     AttnHeadOp,
     MLPOp,
+    PlacementRecorder,
     write_attn_sublayer,
     write_mlp_sublayer,
 )
@@ -992,6 +993,12 @@ def forward_compile(
     # clean observation point between them.
     sublayer_snapshots: list = []
 
+    # Records each op's 2-D weight-matrix occupancy as weights are written
+    # (see weight_writer.PlacementRecorder).  Always on — it holds only ints,
+    # is O(emitted ops), and the debug sidecar reads it on every export
+    # (including schedule-cache hits, where weight writing still runs).
+    placement_recorder = PlacementRecorder()
+
     # 3. Layer loop — seed with input node params (Embedding, etc.)
     total_params = sum(n.num_params() for n in input_nodes)
     total_layer_time = 0.0
@@ -1018,9 +1025,18 @@ def forward_compile(
             residual_map, computed
         )
         t_attn_start = time.perf_counter()
-        write_attn_sublayer(layer, attn_ops, residual_map, pos_encoding)
+        placement_recorder.set_layer(i)
+        write_attn_sublayer(
+            layer, attn_ops, residual_map, pos_encoding, recorder=placement_recorder
+        )
         t_mlp_start = time.perf_counter()
-        write_mlp_sublayer(layer, mlp_ops, residual_map, set(biased_linears))
+        write_mlp_sublayer(
+            layer,
+            mlp_ops,
+            residual_map,
+            set(biased_linears),
+            recorder=placement_recorder,
+        )
         t_layer_end = time.perf_counter()
 
         layer_time = t_layer_end - t_layer_start
@@ -1129,7 +1145,14 @@ def forward_compile(
                     subtract_cols=subtract_cols,
                 )
             )
-        write_attn_sublayer(delta_layer, delta_ops, residual_map, pos_encoding)
+        placement_recorder.set_layer(len(net.layers) - 1)
+        write_attn_sublayer(
+            delta_layer,
+            delta_ops,
+            residual_map,
+            pos_encoding,
+            recorder=placement_recorder,
+        )
         per_layer_head_counts.append(_count_heads_by_type(delta_ops, d_head))
         if verbose:
             print(f"  Delta transfer layer: {len(delta_ops)} overlays")
@@ -1168,6 +1191,7 @@ def forward_compile(
     else:
         ra.assign(out_state, output_node, residual_map.get_indices(output_node))
     net.residual_assignment = ra
+    net.placements = placement_recorder
     net.assert_aliases = graph.get_assert_aliases()
 
     # This post-loop trim is the in-process (no-callback) path's trim.  The ONNX

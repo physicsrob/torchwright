@@ -31,6 +31,9 @@ class HeadlessTransformer:
     pos_encoding: Optional[PosEncoding]
     residual_assignment: Optional[ResidualAssignment]
     assert_aliases: Optional[Dict[Assert, Node]]
+    # 2-D weight-matrix occupancy recorded during weight writing (see
+    # forward.weight_writer.PlacementRecorder).  ``None`` until compile sets it.
+    placements: Optional[Any]
 
     def __init__(
         self,
@@ -46,6 +49,7 @@ class HeadlessTransformer:
         self.layers = []
         self.residual_assignment = None
         self.assert_aliases = None
+        self.placements = None
 
     @property
     def device(self) -> torch.device:
