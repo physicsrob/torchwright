@@ -44,14 +44,28 @@ _current_annotation: ContextVar[Optional[str]] = ContextVar(
 def annotate(label: str):
     """Tag all nodes created inside this block with a hierarchical label.
 
-    Nesting builds a ``/``-separated path::
+    Nesting builds a ``/``-separated path. A component already active in the
+    path is NOT repeated — so sibling functions in one subsystem calling each
+    other (a natural pattern) stay ``a/b`` instead of accumulating
+    ``a/b/a/b``::
 
         with annotate("render"):
             with annotate("texture"):
                 # nodes get annotation = "render/texture"
+            with annotate("render"):
+                # still "render" — re-entering an active scope is a no-op
+
+    ``label`` may itself be a ``/``-separated path (e.g. ``"pmrk/R_CheckPlane"``);
+    each component is deduped independently.
     """
     current = _current_annotation.get()
-    new = f"{current}/{label}" if current else label
+    parts = current.split("/") if current else []
+    seen = set(parts)
+    for comp in label.split("/"):
+        if comp and comp not in seen:
+            parts.append(comp)
+            seen.add(comp)
+    new = "/".join(parts) if parts else current
     token = _current_annotation.set(new)
     try:
         yield
