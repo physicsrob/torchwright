@@ -4,17 +4,44 @@ These passes transform the computation graph before compilation to reduce
 layer count and parameter overhead.
 """
 
-from typing import Dict, List, Set, Tuple
+from typing import Dict, List, Optional, Set, Tuple
 
-import torch
-
-from torchwright.graph import Node, Concatenate
+from torchwright.graph import Node, Concatenate, ReLU
 from torchwright.graph.linear import Linear
+
+
+def _ejected_relu(l2: Linear, consumers: Dict[Node, List[Node]]):
+    """The ReLU that fusing INTO ``l2`` would eject into the residual stream,
+    or ``None`` if the fusion ejects nothing.
+
+    ``l2`` heads a downstream chain when ``l2 -> ReLU -> exactly-one-Linear``
+    (the L1->ReLU->L2 shape the scheduler's ``_detect_chains_static`` collapses
+    into one layer with the ReLU living in MLP hidden slots at ZERO residual
+    columns).  When ``l2`` becomes the L2-terminal of an upstream fusion it can
+    no longer be that chain's L1, so the ReLU is demoted to a STANDALONE relu
+    that allocates its own ``len(R)`` residual columns — the measured width
+    blow-up.  Returns the ReLU so the caller can size the ejection; ``l2`` that
+    heads no chain ejects nothing and is always width-safe to fuse into.
+    """
+    for relu in consumers.get(l2, []):
+        if not isinstance(relu, ReLU):
+            continue
+        relu_consumers = consumers.get(relu, [])
+        if (
+            len(relu_consumers) == 1
+            and isinstance(relu_consumers[0], Linear)
+            and relu_consumers[0].inputs[0] is relu
+        ):
+            return relu
+    return None
 
 
 def fuse_consecutive_linears(
     output_nodes: Set[Node],
     verbose: bool = False,
+    *,
+    skip_relu_ejecting: bool = False,
+    eject_budget: Optional[int] = None,
 ) -> int:
     """Fuse consecutive Linear nodes without intervening nonlinearities.
 
@@ -36,6 +63,16 @@ def fuse_consecutive_linears(
     Args:
         output_nodes: The graph's output nodes (used to find all ancestors).
         verbose: Print fusion details.
+        skip_relu_ejecting: When True, skip EVERY fusion whose L2 heads a
+            downstream Linear->ReLU->Linear chain (the width-blow-up case),
+            regardless of the ejected ReLU's width.  Conservative — also drops
+            harmless narrow-ReLU ejections.  Default False.
+        eject_budget: When set (residual columns available to ejections), use
+            the budget-aware gate instead: group ejecting fusions by ejected-
+            ReLU width and skip a group only when its siblings' combined width
+            (count * width) would bust the budget — keeping the cheap narrow
+            ejections for their depth win.  Takes precedence over
+            skip_relu_ejecting.
 
     Returns:
         Number of fusions performed.
@@ -51,8 +88,11 @@ def fuse_consecutive_linears(
             if inp in consumers:
                 consumers[inp].append(node)
 
-    # Find fusion candidates: Linear -> Linear where L1 has single consumer L2
-    fusions: List[Tuple[Linear, Linear]] = []
+    # Find fusion candidates: Linear -> Linear where L1 has single consumer L2.
+    # Record the ReLU each candidate would eject into the residual stream (None
+    # if width-safe) so the gate below can reason about ejection cost.
+    gate_on = skip_relu_ejecting or eject_budget is not None
+    candidates: List[Tuple[Linear, Linear, Optional[Node]]] = []
     for node in all_nodes:
         if not isinstance(node, Linear):
             continue
@@ -82,7 +122,31 @@ def fuse_consecutive_linears(
         if new_params > old_params:
             continue
 
-        fusions.append((l1, l2))
+        candidates.append(
+            (l1, l2, _ejected_relu(l2, consumers) if gate_on else None)
+        )
+
+    # Width-aware safety gate: a fusion whose L2 heads a downstream
+    # Linear->ReLU->Linear chain ejects that chain's ReLU from MLP hidden slots
+    # into the residual stream (the width blow-up; see _ejected_relu).
+    skip_ids: Set[int] = set()
+    if eject_budget is not None:
+        # Budget-aware: m identical-width ejecting siblings can co-reside for up
+        # to m*width residual columns. Skip the whole group when that busts the
+        # budget; keep narrow ejections (cheap) and fuse them for the depth win.
+        groups: Dict[int, List[int]] = {}
+        for i, (_l1, _l2, r) in enumerate(candidates):
+            if r is not None:
+                groups.setdefault(len(r), []).append(i)
+        for width, idxs in groups.items():
+            if width * len(idxs) > eject_budget:
+                skip_ids.update(idxs)
+    elif skip_relu_ejecting:
+        skip_ids = {i for i, (_l1, _l2, r) in enumerate(candidates) if r is not None}
+
+    fusions: List[Tuple[Linear, Linear]] = [
+        (l1, l2) for i, (l1, l2, _r) in enumerate(candidates) if i not in skip_ids
+    ]
 
     # Sort upstream-first so L1→L2 is always processed before L2→L3.
     # Without this, if set iteration visits L3 before L2, we'd process
@@ -138,6 +202,8 @@ def fuse_consecutive_linears(
 def optimize_graph(
     output_nodes: Set[Node],
     verbose: bool = False,
+    *,
+    skip_relu_ejecting: bool = False,
 ) -> None:
     """Apply all graph optimization passes.
 
@@ -147,7 +213,11 @@ def optimize_graph(
     Args:
         output_nodes: The graph's output nodes.
         verbose: Print optimization details.
+        skip_relu_ejecting: Forwarded to :func:`fuse_consecutive_linears` —
+            keep only width-safe fusions.
     """
-    fused = fuse_consecutive_linears(output_nodes, verbose=verbose)
+    fused = fuse_consecutive_linears(
+        output_nodes, verbose=verbose, skip_relu_ejecting=skip_relu_ejecting
+    )
     if verbose:
         print(f"Graph optimization: fused {fused} Linear pairs")
