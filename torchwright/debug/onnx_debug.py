@@ -221,12 +221,16 @@ class OnnxDebugSession:
         self._ra = ra
         self._key_to_state = key_to_state
 
-        # --- Annotation paths from the sidecar, keyed by canonical id and
-        # mapped onto the rebuilt graph's live node objects so callers can
-        # look one up by node (mirroring node.annotation on the in-process
-        # backend).  Reachable-but-unannotated nodes are simply absent.
+        # --- Annotation paths from the sidecar's per-node table, keyed by
+        # canonical id and mapped onto the rebuilt graph's live node
+        # objects so callers can look one up by node (mirroring
+        # node.annotation on the in-process backend).  Nodes that carried
+        # no annotation are simply absent.
         self._annotation_by_node_id: Dict[int, str] = {}
-        for cid_str, label in (sidecar.get("annotations") or {}).items():
+        for cid_str, meta in (sidecar.get("nodes") or {}).items():
+            label = meta.get("annotation")
+            if label is None:
+                continue
             node = by_canon.get(int(cid_str))
             if node is not None:
                 self._annotation_by_node_id[node.node_id] = label

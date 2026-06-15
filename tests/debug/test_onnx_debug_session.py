@@ -149,9 +149,13 @@ def test_sidecar_carries_annotations(tmp_path):
 
     with open(debug_meta_path_for(onnx_path)) as f:
         sidecar = json.load(f)
-    # The annotated nodes' paths are present; "scene/sum" is deduped, not
-    # "scene/scene/sum".
-    labels = set(sidecar["annotations"].values())
+    # Annotations now ride in the per-node table; "scene/sum" is deduped,
+    # not "scene/scene/sum".
+    labels = {
+        m["annotation"]
+        for m in sidecar["nodes"].values()
+        if m["annotation"] is not None
+    }
     assert "scene" in labels
     assert "scene/sum" in labels
 
@@ -160,6 +164,55 @@ def test_sidecar_carries_annotations(tmp_path):
     sess = OnnxDebugSession(onnx_path, out2, pos2)
     assert sess.annotation(prod2) == "scene"
     assert sess.annotation(top2) == "scene/sum"
+
+
+def test_sidecar_nodes_table_schema(tmp_path):
+    """The per-node table keys by canonical id (same space as placements /
+    states) and carries op/width/weights/inputs/layer/sublayer per node."""
+    out, pos, prod, top = _build_annotated_graph()
+    onnx_path = str(tmp_path / "nodes.onnx")
+    compile_headless_to_onnx(
+        out, pos, onnx_path, d=D, d_head=D_HEAD, max_seq_len=16, verbose=False,
+        optimize=1, extra_metadata={"screen": {"width": 80, "height": 50}, "scale": 4},
+    )
+    with open(debug_meta_path_for(onnx_path)) as f:
+        sidecar = json.load(f)
+
+    # Compile knob is first-class; caller metadata rides through "extra"
+    # verbatim (torchwright does not interpret its keys).
+    assert sidecar["optimize"] == 1
+    assert sidecar["extra"] == {"screen": {"width": 80, "height": 50}, "scale": 4}
+
+    nodes = sidecar["nodes"]
+    assert nodes, "nodes table should be non-empty"
+    # Every placement / state key is a node in the table.
+    for key in sidecar["placements"]:
+        if key.startswith("_"):  # reserved op/unreachable buckets
+            continue
+        assert key in nodes, f"placement key {key} missing from nodes"
+    for entry in sidecar["states"]:
+        for key in entry.get("nodes", {}):
+            assert key in nodes, f"state node {key} missing from nodes"
+
+    # Required per-entry shape.
+    for cid, m in nodes.items():
+        assert isinstance(m["op"], str)
+        assert isinstance(m["width"], int)
+        assert isinstance(m["weight_params"], int)
+        assert isinstance(m["weight_shapes"], list)
+        assert isinstance(m["inputs"], list)
+        assert all(i in nodes for i in m["inputs"])
+        assert m["layer"] is None or isinstance(m["layer"], int)
+        assert m["sublayer"] in (None, "attn", "mlp", "embed")
+
+    # The two InputNodes carry weight_params == 0; some weight-bearing node
+    # (the signed-multiply / add chain compiles to Linears) has > 0.
+    assert any(m["weight_params"] > 0 for m in nodes.values())
+    # A computed node lands in a real transformer layer/sublayer.
+    assert any(
+        m["layer"] is not None and m["sublayer"] in ("attn", "mlp")
+        for m in nodes.values()
+    )
 
 
 # ---------------------------------------------------------------------------

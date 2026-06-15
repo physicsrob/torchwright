@@ -366,18 +366,25 @@ def _write_debug_sidecar(
     cache_stride: int,
     cache_window: Optional[int],
     verbose: bool,
+    optimize: int = 0,
+    extra: Optional[dict] = None,
 ) -> str:
     """Write ``<stem>.debug.json`` — everything OnnxDebugSession needs.
 
     The sidecar carries the residual assignment keyed by CANONICAL node
     id (see :mod:`torchwright.compiler.graph_identity`) per capture
     state, a structural fingerprint of the compiled graph for rebuild
-    validation, the ``annotate()`` label path for every reachable node
-    that carries one (also keyed by canonical id), and the
-    Assert/DebugWatch coverage present at compile time (so the loader can
-    warn when a rebuilt graph carries fewer checks than the compiled one
-    did — the fingerprint is deliberately wrapper-transparent and cannot
-    see that).
+    validation, a per-node metadata table (``nodes``) — also keyed by
+    canonical id, one entry per reachable node, carrying op type,
+    annotation path, output width, baked-weight parameter count/shapes,
+    input ids, and the layer/sublayer the node is scheduled into — and
+    the Assert/DebugWatch coverage present at compile time (so the loader
+    can warn when a rebuilt graph carries fewer checks than the compiled
+    one did — the fingerprint is deliberately wrapper-transparent and
+    cannot see that).  ``optimize`` records the compile-optimization
+    level the artifact was built at; ``extra`` is the caller's free-form
+    ``extra_metadata`` dict passed straight through (torchwright does not
+    interpret its keys), mirroring the meta sidecar's ``extra``.
 
     State keys correspond one-to-one with the per-layer residual tensor
     names in the emitted ONNX graph: ``"input"`` ↔ ``res_0``,
@@ -410,6 +417,13 @@ def _write_debug_sidecar(
 
     seen_tables: Dict[int, str] = {}  # id(mapping dict) -> first state key
     state_entries: List[dict] = []
+    # Earliest state in which each canonical id appears.  The state_list
+    # is ordered input → L0.attn → L0.mlp → L1.attn …, and a node sits in
+    # the residual stream from the sublayer that computes it until it is
+    # freed, so its FIRST appearance pins where it was computed.  Used as
+    # the layer/sublayer source for nodes the placement recorder doesn't
+    # log (literals, concatenations).
+    first_state: Dict[str, str] = {}
     for key, st in state_list:
         table = ra.mapping.get(st)
         if table is None:
@@ -431,6 +445,7 @@ def _write_debug_sidecar(
                 # PosEncoding leaf) — cannot be keyed canonically.
                 continue
             nodes.setdefault(str(cid), encode_cols(list(cols)))
+            first_state.setdefault(str(cid), key)
         state_entries.append({"key": key, "nodes": nodes})
 
     assert_targets = sorted(
@@ -440,19 +455,81 @@ def _write_debug_sidecar(
             if unwrap_debug(a.inputs[0]).node_id in canon
         }
     )
-    # Annotation paths (the "/"-separated label hierarchy set by
-    # ``annotate()`` / ``@annotated``) keyed by canonical node id, for
-    # every reachable node that carries one.  Wrappers are stepped
-    # through by ``_canonical_walk``, so this reads the annotation on the
-    # wrapped node — the same node the residual states key by.
-    annotations = {
-        str(cid): node.annotation
-        for cid, node in nodes_by_canonical_id(out).items()
-        if node.annotation is not None
-    }
     matrices, placements, n_heads, d_hidden_per_layer = _build_matrix_occupancy(
         compiled, canon, d, d_head
     )
+
+    # Per-node metadata keyed by canonical id — the same key space as
+    # ``placements`` and the residual ``states``.  One entry per node
+    # reachable from the output.
+    #
+    # layer/sublayer: the placement recorder logs the layer + matrix for
+    # every weight-bearing op (Linear/Attn/ReLU/Add), so it is the
+    # authoritative source where present; matrix_kind "attn.*"/"mlp.*"
+    # gives the sublayer.  Nodes it doesn't log (literals, concatenations)
+    # fall back to their first residual-state appearance, and pre-layer
+    # input nodes (Embedding) report sublayer "embed".
+    place_loc: Dict[str, tuple] = {}
+    recorder = getattr(compiled, "placements", None)
+    if recorder is not None:
+        for e in recorder.entries:
+            if e.node is None:
+                continue
+            cid = canon.get(unwrap_debug(e.node).node_id)
+            if cid is None:
+                continue
+            cid_s = str(cid)
+            if cid_s in place_loc:
+                continue
+            sub = "attn" if e.matrix_kind.startswith("attn") else "mlp"
+            place_loc[cid_s] = (int(e.layer), sub)
+
+    def _layer_sublayer(cid_s: str, node: Node) -> tuple:
+        if cid_s in place_loc:
+            return place_loc[cid_s]
+        key = first_state.get(cid_s)
+        if key is not None and key != "input":
+            lpart, sub = key.split(".")  # "L{k}", "attn"|"mlp"
+            return int(lpart[1:]), sub
+        if isinstance(node, Embedding):
+            return None, "embed"
+        return None, None
+
+    # Baked weight tensors probed by attribute name, summed into a
+    # parameter count and per-tensor shape list.  0 / [] for pure ops.
+    baked_attrs = ("table", "output_matrix", "matrix", "weight", "value")
+    nodes_meta: Dict[str, dict] = {}
+    for cid, node in nodes_by_canonical_id(out).items():
+        cid_s = str(cid)
+        weight_params = 0
+        weight_shapes: List[list] = []
+        for attr in baked_attrs:
+            t = getattr(node, attr, None)
+            shape = getattr(t, "shape", None)
+            if shape is None:
+                continue
+            dims = [int(s) for s in shape]
+            if not dims:  # 0-d scalar — no parameters to attribute
+                continue
+            weight_params += int(t.numel()) if hasattr(t, "numel") else 1
+            weight_shapes.append([attr, dims])
+        input_cids: List[str] = []
+        for inp in getattr(node, "inputs", None) or []:
+            icid = canon.get(unwrap_debug(inp).node_id)
+            if icid is not None:
+                input_cids.append(str(icid))
+        layer, sublayer = _layer_sublayer(cid_s, node)
+        nodes_meta[cid_s] = {
+            "op": type(node).__name__,
+            "annotation": node.annotation,
+            "width": len(node),
+            "weight_params": weight_params,
+            "weight_shapes": weight_shapes,
+            "inputs": input_cids,
+            "layer": layer,
+            "sublayer": sublayer,
+            "name": getattr(node, "name", None),
+        }
     payload = {
         "format": DEBUG_META_FORMAT,
         "kind": kind,  # "token" | "headless"
@@ -464,7 +541,9 @@ def _write_debug_sidecar(
         "n_layers": len(compiled.layers),
         "matrices": matrices,
         "placements": placements,
-        "annotations": annotations,
+        "nodes": nodes_meta,
+        "optimize": int(optimize),
+        "extra": dict(extra) if extra else {},
         "input_specs": [list(spec) for spec in input_specs],
         "cache_stride": int(cache_stride),
         "cache_window": int(cache_window) if cache_window is not None else None,
@@ -1434,6 +1513,8 @@ def compile_headless_to_onnx(
             watches=all_watches,
             cache_stride=cache_stride_resolved,
             cache_window=cache_window,
+            optimize=optimize,
+            extra=extra_metadata,
             verbose=verbose,
         )
 
@@ -1779,6 +1860,8 @@ def compile_to_onnx(
             watches=all_watches,
             cache_stride=cache_stride_resolved,
             cache_window=cache_window,
+            optimize=optimize,
+            extra=extra_metadata,
             verbose=verbose,
         )
 
