@@ -220,6 +220,16 @@ class OnnxDebugSession:
                 ra.assign(st, node, decode_cols(runs))
         self._ra = ra
         self._key_to_state = key_to_state
+
+        # --- Annotation paths from the sidecar, keyed by canonical id and
+        # mapped onto the rebuilt graph's live node objects so callers can
+        # look one up by node (mirroring node.annotation on the in-process
+        # backend).  Reachable-but-unannotated nodes are simply absent.
+        self._annotation_by_node_id: Dict[int, str] = {}
+        for cid_str, label in (sidecar.get("annotations") or {}).items():
+            node = by_canon.get(int(cid_str))
+            if node is not None:
+                self._annotation_by_node_id[node.node_id] = label
         # Post-MLP triples — the ordered states every check/probe scans,
         # mirroring the in-process backend.
         self._ordered: List[tuple] = [
@@ -524,6 +534,16 @@ class OnnxDebugSession:
             return None
         res_tensor, _ = tensor_pair
         return extract_compiled_value(node, ds.ra, state, res_tensor)
+
+    def annotation(self, node: Node) -> Optional[str]:
+        """The ``annotate()`` path recorded for ``node`` at compile time.
+
+        Looks the rebuilt ``node`` up against the annotations the sidecar
+        captured (keyed by canonical id).  Returns ``None`` for nodes that
+        carried no annotation when compiled, or that aren't reachable from
+        the output.  Assert/DebugWatch wrappers are unwrapped first.
+        """
+        return self._annotation_by_node_id.get(unwrap_debug(node).node_id)
 
     # ---- DebugRuntime protocol surface (probe entry points) ----------------
 

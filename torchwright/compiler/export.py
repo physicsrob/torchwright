@@ -372,10 +372,12 @@ def _write_debug_sidecar(
     The sidecar carries the residual assignment keyed by CANONICAL node
     id (see :mod:`torchwright.compiler.graph_identity`) per capture
     state, a structural fingerprint of the compiled graph for rebuild
-    validation, and the Assert/DebugWatch coverage present at compile
-    time (so the loader can warn when a rebuilt graph carries fewer
-    checks than the compiled one did — the fingerprint is deliberately
-    wrapper-transparent and cannot see that).
+    validation, the ``annotate()`` label path for every reachable node
+    that carries one (also keyed by canonical id), and the
+    Assert/DebugWatch coverage present at compile time (so the loader can
+    warn when a rebuilt graph carries fewer checks than the compiled one
+    did — the fingerprint is deliberately wrapper-transparent and cannot
+    see that).
 
     State keys correspond one-to-one with the per-layer residual tensor
     names in the emitted ONNX graph: ``"input"`` ↔ ``res_0``,
@@ -392,6 +394,7 @@ def _write_debug_sidecar(
         canonical_ids,
         debug_fingerprint,
         encode_cols,
+        nodes_by_canonical_id,
         unwrap_debug,
     )
 
@@ -437,6 +440,16 @@ def _write_debug_sidecar(
             if unwrap_debug(a.inputs[0]).node_id in canon
         }
     )
+    # Annotation paths (the "/"-separated label hierarchy set by
+    # ``annotate()`` / ``@annotated``) keyed by canonical node id, for
+    # every reachable node that carries one.  Wrappers are stepped
+    # through by ``_canonical_walk``, so this reads the annotation on the
+    # wrapped node — the same node the residual states key by.
+    annotations = {
+        str(cid): node.annotation
+        for cid, node in nodes_by_canonical_id(out).items()
+        if node.annotation is not None
+    }
     matrices, placements, n_heads, d_hidden_per_layer = _build_matrix_occupancy(
         compiled, canon, d, d_head
     )
@@ -451,6 +464,7 @@ def _write_debug_sidecar(
         "n_layers": len(compiled.layers),
         "matrices": matrices,
         "placements": placements,
+        "annotations": annotations,
         "input_specs": [list(spec) for spec in input_specs],
         "cache_stride": int(cache_stride),
         "cache_window": int(cache_window) if cache_window is not None else None,

@@ -125,6 +125,43 @@ def test_sidecar_written_with_expected_schema(token_artifact):
     assert sidecar["assert_coverage"]["n_asserts"] > 0
 
 
+def _build_annotated_graph():
+    """Small graph whose nodes carry nested ``annotate()`` label paths."""
+    from torchwright.graph.node import annotate
+
+    a = create_input("a", 1)
+    b = create_input("b", 1)
+    with annotate("scene"):
+        prod = signed_multiply(a, b, max_abs1=10, max_abs2=10)
+        with annotate("scene/sum"):
+            out = add(prod, multiply_const(a, 2.0))
+    return out, create_pos_encoding(), prod, out
+
+
+def test_sidecar_carries_annotations(tmp_path):
+    """The ``annotate()`` label path round-trips through the debug sidecar
+    and onto OnnxDebugSession.annotation() against a fresh rebuild."""
+    out, pos, prod, top = _build_annotated_graph()
+    onnx_path = str(tmp_path / "annotated.onnx")
+    compile_headless_to_onnx(
+        out, pos, onnx_path, d=D, d_head=D_HEAD, max_seq_len=16, verbose=False
+    )
+
+    with open(debug_meta_path_for(onnx_path)) as f:
+        sidecar = json.load(f)
+    # The annotated nodes' paths are present; "scene/sum" is deduped, not
+    # "scene/scene/sum".
+    labels = set(sidecar["annotations"].values())
+    assert "scene" in labels
+    assert "scene/sum" in labels
+
+    # Round-trip onto a fresh rebuild (new node ids) via the session.
+    out2, pos2, prod2, top2 = _build_annotated_graph()
+    sess = OnnxDebugSession(onnx_path, out2, pos2)
+    assert sess.annotation(prod2) == "scene"
+    assert sess.annotation(top2) == "scene/sum"
+
+
 # ---------------------------------------------------------------------------
 # Parity with CompiledHeadless
 # ---------------------------------------------------------------------------
