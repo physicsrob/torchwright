@@ -68,6 +68,27 @@ def create_embedding(vocab: List[str]) -> Embedding:
     return Embedding(vocab)
 
 
+def create_onehot_embedding(vocab: List[str]) -> Embedding:
+    """Create a one-hot embedding: token ``i`` maps to the ``i``-th unit vector.
+
+    The table is the identity ``eye(len(vocab))`` and there are no special
+    tokens, so ``d_embed == len(vocab)`` and every embedding row is an exact
+    one-hot.  This makes lookups exact integer counting (see
+    :func:`torchwright.ops.onehot_table.onehot_lookup`) and makes the unembed
+    an identity — ``argmax(output · eᵢ)`` over the equal-norm rows selects the
+    hot column directly, so argmax-decode is exact.
+
+    Args:
+        vocab: Ordered token list; the row index of a token is its position
+            here.
+
+    Returns:
+        Embedding node with an identity table and no ``<unk>`` prefix.
+    """
+    n = len(vocab)
+    return Embedding(vocab, d_embed=n, table=torch.eye(n), special_tokens=[])
+
+
 def create_unembedding(inp: Node, embedding: Embedding) -> Unembedding:
     """
     Create an unembedding output.

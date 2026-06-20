@@ -1,54 +1,21 @@
-"""Compile Caesar cipher and verify correctness.
+"""Caesar cipher: export to ONNX and verify correctness.
 
-Tests various shift amounts and letter combinations.
+Tests various shift amounts and letter combinations.  Converted from
+``forward_compile``; see ``_example_onnx``.
 """
 
-import torch
-
-from torchwright.compiler.forward.compile import forward_compile
-from torchwright.compiler.transformer import HeadlessTransformer
-from torchwright.graph import Node, Embedding
+import pytest
 
 from examples.caesar_cipher import create_network_parts
 
-D = 1024
-D_HEAD = 16
+from ._example_onnx import load_example, run
 
 
-def decode_token(embedding: Embedding, vector: torch.Tensor) -> str:
-    dists = torch.cdist(vector.unsqueeze(0).cpu(), embedding.table)
-    return embedding.tokenizer.decode_id(int(dists.argmin().item()))
-
-
-def run_autoregressive(
-    net: HeadlessTransformer,
-    output_node: Node,
-    embedding: Embedding,
-    input_tokens: list,
-    max_new_tokens: int = 8,
-) -> str:
-    tokens = list(input_tokens)
-    for _ in range(max_new_tokens):
-        result = net.compute(
-            n_pos=len(tokens), input_values={"embedding_input": tokens}
-        )
-        next_token = decode_token(embedding, result[output_node][-1])
-        if next_token == "<eos>":
-            break
-        tokens.append(next_token)
-    return "".join(tokens[len(input_tokens) :])
-
-
-def _build():
-    output_node, pos_encoding, embedding = create_network_parts()
-    net = forward_compile(
-        d=D,
-        d_head=D_HEAD,
-        output_node=output_node,
-        pos_encoding=pos_encoding,
-        verbose=True,
+@pytest.fixture(scope="module")
+def caesar(tmp_path_factory):
+    return load_example(
+        create_network_parts, tmp_path_factory.mktemp("caesar"), name="caesar"
     )
-    return net, output_node, embedding
 
 
 def _caesar(text: str, shift: int) -> str:
@@ -56,13 +23,9 @@ def _caesar(text: str, shift: int) -> str:
     return "".join(chr((ord(c) - ord("a") + shift) % 26 + ord("a")) for c in text)
 
 
-def test_caesar_cipher():
-    """Compile and verify Caesar cipher on various inputs."""
-    net, output_node, embedding = _build()
-
-    n_layers = len(net.layers)
-    print(f"caesar_cipher: {n_layers} layers, d={D}, d_head={D_HEAD}")
-    assert n_layers <= 40, f"Too many layers: {n_layers}"
+def test_caesar_cipher(caesar):
+    model, artifact = caesar
+    assert artifact.n_layers <= 40, f"Too many layers: {artifact.n_layers}"
 
     test_cases = [
         # shift=0: identity
@@ -86,9 +49,9 @@ def test_caesar_cipher():
         assert (
             _caesar(plaintext, int(shift)) == expected
         ), f"Reference mismatch for shift={shift}, text={plaintext}"
-        tokens = ["<bos>", shift] + list(plaintext) + ["\n"]
-        result = run_autoregressive(net, output_node, embedding, tokens)
+        # Prompt: bos, shift token, plaintext chars, newline trigger.
+        result = run(model, shift + plaintext + "\n", bos_token="<bos>")
         assert result == expected, (
-            f"For shift={shift}, '{plaintext}': "
-            f"expected '{expected}' but got '{result}'"
+            f"For shift={shift}, {plaintext!r}: "
+            f"expected {expected!r} but got {result!r}"
         )

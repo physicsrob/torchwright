@@ -1,96 +1,36 @@
-"""End-to-end compile tests for the sort_digits example variants.
+"""End-to-end ONNX tests for the sort_digits example variants.
 
-Each variant compiles its ``create_network_parts`` through the forward
-compiler, runs autoregressive decoding on a battery of inputs, and
-asserts the decoded output matches the ascending sort.
+Each variant exports its ``create_network_parts`` through
+:func:`compile_to_onnx`, runs argmax autoregressive decode on a battery of
+inputs, and asserts the decoded output matches the ascending sort.
 
 V4 is the primary variant and supports duplicates. V1 only supports
-distinct-digit inputs. V2 / V3 support duplicates (but aren't built
-yet in this file; they'll be added once those example files exist).
+distinct-digit inputs. V2 is the rank-lookup variant (MLP selection brain,
+attention is a lookup).  Converted from ``forward_compile``; see
+``_example_onnx``.
+
+The sort examples emit their sorted output starting at the trigger position
+(the ``"\\n"``), with no guaranteed ``<eos>``, so each rollout is capped at
+``len(input)`` decoded tokens.
 """
 
-import torch
+import pytest
 
-from torchwright.compiler.forward.compile import forward_compile
-from torchwright.compiler.transformer import HeadlessTransformer
-from torchwright.graph import Embedding, Node
+from ._example_onnx import load_example, run
 
 D_HEAD = 32
 
 
-def _decode_token(embedding: Embedding, vector: torch.Tensor) -> str:
-    dists = torch.cdist(vector.unsqueeze(0).cpu(), embedding.table)
-    return embedding.tokenizer.decode_id(int(dists.argmin().item()))
-
-
-def _run_autoregressive(
-    net: HeadlessTransformer,
-    output_node: Node,
-    embedding: Embedding,
-    input_tokens: list,
-    max_new_tokens: int,
-) -> str:
-    """Autoregressively decode ``max_new_tokens`` tokens after the input.
-
-    The sort examples emit their sorted output starting at the trigger
-    position (the ``"\\n"``), so ``max_new_tokens`` is the number of
-    emitted tokens we read from positions *at and after* the trigger.
-    """
-    tokens = list(input_tokens)
-    emitted = []
-    for _ in range(max_new_tokens):
-        result = net.compute(
-            n_pos=len(tokens), input_values={"embedding_input": tokens}
-        )
-        next_token = _decode_token(embedding, result[output_node][-1])
-        if next_token == "<eos>":
-            break
-        emitted.append(next_token)
-        tokens.append(next_token)
-    return "".join(emitted)
-
-
-def _build_v4():
-    from examples.sort_digits_v4 import create_network_parts, D_MODEL
-
-    output_node, pos_encoding, embedding = create_network_parts()
-    net = forward_compile(
-        d=D_MODEL,
-        d_head=D_HEAD,
-        output_node=output_node,
-        pos_encoding=pos_encoding,
-        verbose=False,
+def _check_case(model, input_str: str, expected: str):
+    result = run(
+        model,
+        input_str + "\n",
+        bos_token="<bos>",
+        max_new_tokens=len(input_str),
     )
-    return net, output_node, embedding
-
-
-def _build_v1():
-    from examples.sort_digits_v1 import create_network_parts, D_MODEL
-
-    output_node, pos_encoding, embedding = create_network_parts()
-    net = forward_compile(
-        d=D_MODEL,
-        d_head=D_HEAD,
-        output_node=output_node,
-        pos_encoding=pos_encoding,
-        verbose=False,
-    )
-    return net, output_node, embedding
-
-
-def _build_v2():
-    from examples.sort_digits_v2 import create_network_parts, D_MODEL
-
-    output_node, pos_encoding, embedding = create_network_parts()
-    net = forward_compile(
-        d=D_MODEL,
-        d_head=D_HEAD,
-        output_node=output_node,
-        pos_encoding=pos_encoding,
-        verbose=False,
-        max_layers=200,  # V2's MLP chain is deep (~20 layers per slot).
-    )
-    return net, output_node, embedding
+    assert (
+        result == expected
+    ), f"input={input_str!r} expected={expected!r} got={result!r}"
 
 
 # Cases shared by all variants that support only distinct digits.
@@ -112,14 +52,48 @@ _DUPLICATE_CASES = [
 ]
 
 
-def _check_case(net, output_node, embedding, input_str: str, expected: str):
-    tokens = ["<bos>"] + list(input_str) + ["\n"]
-    decoded = _run_autoregressive(
-        net, output_node, embedding, tokens, max_new_tokens=len(input_str)
+# ---------------------------------------------------------------------------
+# Fixtures — export once per variant, share across tests.
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture(scope="module")
+def sort_v4(tmp_path_factory):
+    from examples.sort_digits_v4 import D_MODEL, create_network_parts
+
+    return load_example(
+        create_network_parts,
+        tmp_path_factory.mktemp("sortv4"),
+        d=D_MODEL,
+        d_head=D_HEAD,
+        name="sortv4",
     )
-    assert (
-        decoded == expected
-    ), f"input={input_str!r} expected={expected!r} got={decoded!r}"
+
+
+@pytest.fixture(scope="module")
+def sort_v1(tmp_path_factory):
+    from examples.sort_digits_v1 import D_MODEL, create_network_parts
+
+    return load_example(
+        create_network_parts,
+        tmp_path_factory.mktemp("sortv1"),
+        d=D_MODEL,
+        d_head=D_HEAD,
+        name="sortv1",
+    )
+
+
+@pytest.fixture(scope="module")
+def sort_v2(tmp_path_factory):
+    from examples.sort_digits_v2 import D_MODEL, create_network_parts
+
+    return load_example(
+        create_network_parts,
+        tmp_path_factory.mktemp("sortv2"),
+        d=D_MODEL,
+        d_head=D_HEAD,
+        name="sortv2",
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -127,16 +101,16 @@ def _check_case(net, output_node, embedding, input_str: str, expected: str):
 # ---------------------------------------------------------------------------
 
 
-def test_sort_digits_v4_distinct_battery():
-    net, output_node, embedding = _build_v4()
+def test_sort_digits_v4_distinct_battery(sort_v4):
+    model, _ = sort_v4
     for inp, expected in _DISTINCT_CASES:
-        _check_case(net, output_node, embedding, inp, expected)
+        _check_case(model, inp, expected)
 
 
-def test_sort_digits_v4_duplicate_battery():
-    net, output_node, embedding = _build_v4()
+def test_sort_digits_v4_duplicate_battery(sort_v4):
+    model, _ = sort_v4
     for inp, expected in _DUPLICATE_CASES:
-        _check_case(net, output_node, embedding, inp, expected)
+        _check_case(model, inp, expected)
 
 
 # ---------------------------------------------------------------------------
@@ -144,10 +118,10 @@ def test_sort_digits_v4_duplicate_battery():
 # ---------------------------------------------------------------------------
 
 
-def test_sort_digits_v1_distinct_battery():
-    net, output_node, embedding = _build_v1()
+def test_sort_digits_v1_distinct_battery(sort_v1):
+    model, _ = sort_v1
     for inp, expected in _DISTINCT_CASES:
-        _check_case(net, output_node, embedding, inp, expected)
+        _check_case(model, inp, expected)
 
 
 # ---------------------------------------------------------------------------
@@ -170,13 +144,13 @@ _V2_DUPLICATE_CASES = [
 ]
 
 
-def test_sort_digits_v2_distinct_battery():
-    net, output_node, embedding = _build_v2()
+def test_sort_digits_v2_distinct_battery(sort_v2):
+    model, _ = sort_v2
     for inp, expected in _V2_DISTINCT_CASES:
-        _check_case(net, output_node, embedding, inp, expected)
+        _check_case(model, inp, expected)
 
 
-def test_sort_digits_v2_duplicate_battery():
-    net, output_node, embedding = _build_v2()
+def test_sort_digits_v2_duplicate_battery(sort_v2):
+    model, _ = sort_v2
     for inp, expected in _V2_DUPLICATE_CASES:
-        _check_case(net, output_node, embedding, inp, expected)
+        _check_case(model, inp, expected)

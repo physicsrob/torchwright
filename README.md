@@ -34,7 +34,7 @@ transformer weights:
 like pencil-and-paper arithmetic. The 3-digit version compiles to a 29-layer
 transformer with d=1024.
 
-**Calculator** (`examples/calculator.py`) -- Supports +, -, * on positive
+**Calculator** (`examples/calculator_simple.py`) -- Supports +, -, * on positive
 integers up to 3 digits. Subtraction handles negative results; multiplication
 uses long multiplication with partial product rows. Compiles to 38 layers with
 d=2048.
@@ -42,7 +42,7 @@ d=2048.
 Both examples can be compiled to ONNX for portable inference:
 
 ```bash
-make compile     # produces adder.onnx and calculator.onnx
+make compile     # produces adder.onnx and calculator_simple.onnx
 ```
 
 

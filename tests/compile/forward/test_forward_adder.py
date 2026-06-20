@@ -1,44 +1,16 @@
-"""Phase 5: Compile 1-digit and 3-digit adders via forward_compile,
-verify arithmetic correctness.
+"""Adder example: export 1-digit and 3-digit adders to ONNX and verify
+arithmetic via argmax decode.
+
+Converted from the in-process ``forward_compile`` path to ``compile_to_onnx``
++ ``OnnxTokenModule.generate``; see ``_example_onnx`` for why the decoded
+output is token-identical to the old nearest-embedding decode.
 """
 
 import pytest
-import torch
-
-from torchwright.compiler.forward.compile import forward_compile
-from torchwright.compiler.transformer import HeadlessTransformer
-from torchwright.graph import Node, Embedding
 
 from examples.adder import create_network_parts
 
-D = 1024
-D_HEAD = 16
-
-
-def decode_token(embedding: Embedding, vector: torch.Tensor) -> str:
-    """Decode a single embedding vector to its nearest token."""
-    dists = torch.cdist(vector.unsqueeze(0).cpu(), embedding.table)
-    return embedding.tokenizer.decode_id(int(dists.argmin().item()))
-
-
-def run_autoregressive(
-    net: HeadlessTransformer,
-    output_node: Node,
-    embedding: Embedding,
-    input_tokens: list,
-    max_new_tokens: int = 10,
-) -> str:
-    """Run a compiled network autoregressively, appending output tokens until <eos>."""
-    tokens = list(input_tokens)
-    for _ in range(max_new_tokens):
-        result = net.compute(
-            n_pos=len(tokens), input_values={"embedding_input": tokens}
-        )
-        next_token = decode_token(embedding, result[output_node][-1])
-        if next_token == "<eos>":
-            break
-        tokens.append(next_token)
-    return "".join(tokens[len(input_tokens) :])
+from ._example_onnx import load_example, run
 
 
 def _build_1digit():
@@ -47,46 +19,21 @@ def _build_1digit():
     original = adder_module.max_digits
     try:
         adder_module.max_digits = 1
-        output_node, pos_encoding, embedding = create_network_parts()
+        return create_network_parts()
     finally:
         adder_module.max_digits = original
-    return output_node, pos_encoding, embedding
-
-
-def _build_3digit():
-    output_node, pos_encoding, embedding = create_network_parts()
-    return output_node, pos_encoding, embedding
-
-
-# ---------------------------------------------------------------------------
-# Fixtures — compile once per digit count, share across tests
-# ---------------------------------------------------------------------------
 
 
 @pytest.fixture(scope="module")
-def net_1digit():
-    output_node, pos_encoding, embedding = _build_1digit()
-    net = forward_compile(
-        d=D,
-        d_head=D_HEAD,
-        output_node=output_node,
-        pos_encoding=pos_encoding,
-        verbose=True,
-    )
-    return net, output_node, embedding
+def adder_1digit(tmp_path_factory):
+    return load_example(_build_1digit, tmp_path_factory.mktemp("adder1"), name="adder1")
 
 
 @pytest.fixture(scope="module")
-def net_3digit():
-    output_node, pos_encoding, embedding = _build_3digit()
-    net = forward_compile(
-        d=D,
-        d_head=D_HEAD,
-        output_node=output_node,
-        pos_encoding=pos_encoding,
-        verbose=True,
+def adder_3digit(tmp_path_factory):
+    return load_example(
+        create_network_parts, tmp_path_factory.mktemp("adder3"), name="adder3"
     )
-    return net, output_node, embedding
 
 
 # ---------------------------------------------------------------------------
@@ -94,13 +41,9 @@ def net_3digit():
 # ---------------------------------------------------------------------------
 
 
-def test_1digit_adder(net_1digit):
-    """Compile 1-digit adder and verify arithmetic at the '\\n' position."""
-    net, output_node, embedding = net_1digit
-
-    n_layers = len(net.layers)
-    print(f"1-digit adder: {n_layers} layers")
-    assert n_layers <= 20, f"Too many layers: {n_layers}"
+def test_1digit_adder(adder_1digit):
+    model, artifact = adder_1digit
+    assert artifact.n_layers <= 20, f"Too many layers: {artifact.n_layers}"
 
     test_cases = [
         ("1+1\n", "2"),
@@ -111,11 +54,10 @@ def test_1digit_adder(net_1digit):
         ("6+3\n", "9"),
     ]
     for input_str, expected in test_cases:
-        tokens = ["<bos"] + list(input_str)
-        result = run_autoregressive(net, output_node, embedding, tokens)
+        result = run(model, input_str)
         assert (
             result == expected
-        ), f"For {input_str}: expected '{expected}' but got '{result}'"
+        ), f"For {input_str!r}: expected {expected!r} but got {result!r}"
 
 
 # ---------------------------------------------------------------------------
@@ -123,13 +65,9 @@ def test_1digit_adder(net_1digit):
 # ---------------------------------------------------------------------------
 
 
-def test_3digit_adder(net_3digit):
-    """Compile 3-digit adder, verify arithmetic at the position after '\\n'."""
-    net, output_node, embedding = net_3digit
-
-    n_layers = len(net.layers)
-    print(f"3-digit adder: {n_layers} layers, d={D}, d_head={D_HEAD}")
-    assert n_layers <= 50, f"Too many layers: {n_layers}"
+def test_3digit_adder(adder_3digit):
+    model, artifact = adder_3digit
+    assert artifact.n_layers <= 50, f"Too many layers: {artifact.n_layers}"
 
     test_cases = [
         ("1+1\n", "2"),
@@ -140,17 +78,14 @@ def test_3digit_adder(net_3digit):
         ("99+1\n", "100"),
     ]
     for input_str, expected in test_cases:
-        tokens = ["<bos"] + list(input_str)
-        result = run_autoregressive(net, output_node, embedding, tokens)
+        result = run(model, input_str)
         assert (
             result == expected
-        ), f"For {input_str}: expected '{expected}' but got '{result}'"
+        ), f"For {input_str!r}: expected {expected!r} but got {result!r}"
 
 
-def test_3digit_autoregressive(net_3digit):
-    """Run 3-digit adder autoregressively and verify complete output sequences."""
-    net, output_node, embedding = net_3digit
-
+def test_3digit_autoregressive(adder_3digit):
+    model, _ = adder_3digit
     test_cases = [
         ("1+2\n", "3"),
         ("99+1\n", "100"),
@@ -159,8 +94,7 @@ def test_3digit_autoregressive(net_3digit):
         ("456+123\n", "579"),
     ]
     for input_str, expected in test_cases:
-        tokens = ["<bos"] + list(input_str)
-        result = run_autoregressive(net, output_node, embedding, tokens)
+        result = run(model, input_str)
         assert (
             result == expected
-        ), f"For {input_str}: expected '{expected}' but got '{result}'"
+        ), f"For {input_str!r}: expected {expected!r} but got {result!r}"

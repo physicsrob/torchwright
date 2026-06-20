@@ -1,0 +1,317 @@
+{
+  "config": {
+    "digit_sweep": [
+      1,
+      2,
+      3,
+      4,
+      6,
+      8,
+      12,
+      16,
+      24,
+      32
+    ],
+    "multiply_cap": 16,
+    "depth_metric": "critical-path length over neuron-producing nodes",
+    "size_metric": "total neuron count (~ params / 2d)"
+  },
+  "results": {
+    "simple": {
+      "add": [
+        {
+          "n": 1,
+          "depth": 1,
+          "neurons": 200
+        },
+        {
+          "n": 2,
+          "depth": 2,
+          "neurons": 600
+        },
+        {
+          "n": 3,
+          "depth": 3,
+          "neurons": 1000
+        },
+        {
+          "n": 4,
+          "depth": 4,
+          "neurons": 1400
+        },
+        {
+          "n": 6,
+          "depth": 6,
+          "neurons": 2200
+        },
+        {
+          "n": 8,
+          "depth": 8,
+          "neurons": 3000
+        },
+        {
+          "n": 12,
+          "depth": 12,
+          "neurons": 4600
+        },
+        {
+          "n": 16,
+          "depth": 16,
+          "neurons": 6200
+        },
+        {
+          "n": 24,
+          "depth": 24,
+          "neurons": 9400
+        },
+        {
+          "n": 32,
+          "depth": 32,
+          "neurons": 12600
+        }
+      ],
+      "subtract": [
+        {
+          "n": 1,
+          "depth": 1,
+          "neurons": 200
+        },
+        {
+          "n": 2,
+          "depth": 2,
+          "neurons": 600
+        },
+        {
+          "n": 3,
+          "depth": 3,
+          "neurons": 1000
+        },
+        {
+          "n": 4,
+          "depth": 4,
+          "neurons": 1400
+        },
+        {
+          "n": 6,
+          "depth": 6,
+          "neurons": 2200
+        },
+        {
+          "n": 8,
+          "depth": 8,
+          "neurons": 3000
+        },
+        {
+          "n": 12,
+          "depth": 12,
+          "neurons": 4600
+        },
+        {
+          "n": 16,
+          "depth": 16,
+          "neurons": 6200
+        },
+        {
+          "n": 24,
+          "depth": 24,
+          "neurons": 9400
+        },
+        {
+          "n": 32,
+          "depth": 32,
+          "neurons": 12600
+        }
+      ],
+      "multiply": [
+        {
+          "n": 1,
+          "depth": 3,
+          "neurons": 268
+        },
+        {
+          "n": 2,
+          "depth": 5,
+          "neurons": 1056
+        },
+        {
+          "n": 3,
+          "depth": 7,
+          "neurons": 2364
+        },
+        {
+          "n": 4,
+          "depth": 9,
+          "neurons": 4192
+        },
+        {
+          "n": 6,
+          "depth": 13,
+          "neurons": 9408
+        },
+        {
+          "n": 8,
+          "depth": 17,
+          "neurons": 16704
+        },
+        {
+          "n": 12,
+          "depth": 25,
+          "neurons": 37536
+        },
+        {
+          "n": 16,
+          "depth": 33,
+          "neurons": 66688
+        }
+      ]
+    },
+    "advanced": {
+      "add": [
+        {
+          "n": 1,
+          "depth": 1,
+          "neurons": 200
+        },
+        {
+          "n": 2,
+          "depth": 2,
+          "neurons": 500
+        },
+        {
+          "n": 3,
+          "depth": 3,
+          "neurons": 809
+        },
+        {
+          "n": 4,
+          "depth": 4,
+          "neurons": 1127
+        },
+        {
+          "n": 6,
+          "depth": 5,
+          "neurons": 1772
+        },
+        {
+          "n": 8,
+          "depth": 5,
+          "neurons": 2426
+        },
+        {
+          "n": 12,
+          "depth": 6,
+          "neurons": 3761
+        },
+        {
+          "n": 16,
+          "depth": 6,
+          "neurons": 5105
+        },
+        {
+          "n": 24,
+          "depth": 7,
+          "neurons": 7856
+        },
+        {
+          "n": 32,
+          "depth": 7,
+          "neurons": 10616
+        }
+      ],
+      "subtract": [
+        {
+          "n": 1,
+          "depth": 1,
+          "neurons": 200
+        },
+        {
+          "n": 2,
+          "depth": 2,
+          "neurons": 500
+        },
+        {
+          "n": 3,
+          "depth": 3,
+          "neurons": 809
+        },
+        {
+          "n": 4,
+          "depth": 4,
+          "neurons": 1127
+        },
+        {
+          "n": 6,
+          "depth": 5,
+          "neurons": 1772
+        },
+        {
+          "n": 8,
+          "depth": 5,
+          "neurons": 2426
+        },
+        {
+          "n": 12,
+          "depth": 6,
+          "neurons": 3761
+        },
+        {
+          "n": 16,
+          "depth": 6,
+          "neurons": 5105
+        },
+        {
+          "n": 24,
+          "depth": 7,
+          "neurons": 7856
+        },
+        {
+          "n": 32,
+          "depth": 7,
+          "neurons": 10616
+        }
+      ],
+      "multiply": [
+        {
+          "n": 1,
+          "depth": 3,
+          "neurons": 600
+        },
+        {
+          "n": 2,
+          "depth": 6,
+          "neurons": 1975
+        },
+        {
+          "n": 3,
+          "depth": 9,
+          "neurons": 4688
+        },
+        {
+          "n": 4,
+          "depth": 10,
+          "neurons": 8506
+        },
+        {
+          "n": 6,
+          "depth": 12,
+          "neurons": 19457
+        },
+        {
+          "n": 8,
+          "depth": 13,
+          "neurons": 34801
+        },
+        {
+          "n": 12,
+          "depth": 15,
+          "neurons": 78704
+        },
+        {
+          "n": 16,
+          "depth": 16,
+          "neurons": 140152
+        }
+      ]
+    }
+  }
+}

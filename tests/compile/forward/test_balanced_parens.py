@@ -1,65 +1,28 @@
-"""Compile balanced-parentheses checker and verify correctness.
+"""Balanced-parentheses checker: export to ONNX and verify detection.
 
-Tests both equal-count detection (shared with token_balance) and
-underflow detection (unique to this example — catches cases like
-')(' that have equal counts but invalid nesting).
+Tests both equal-count detection (shared with token_balance) and underflow
+detection (unique to this example — catches cases like ')(' that have equal
+counts but invalid nesting).  Converted from ``forward_compile``; see
+``_example_onnx``.
 """
 
-import torch
-
-from torchwright.compiler.forward.compile import forward_compile
-from torchwright.compiler.transformer import HeadlessTransformer
-from torchwright.graph import Node, Embedding
+import pytest
 
 from examples.balanced_parens import create_network_parts
 
-D = 1024
-D_HEAD = 16
+from ._example_onnx import load_example, run
 
 
-def decode_token(embedding: Embedding, vector: torch.Tensor) -> str:
-    dists = torch.cdist(vector.unsqueeze(0).cpu(), embedding.table)
-    return embedding.tokenizer.decode_id(int(dists.argmin().item()))
-
-
-def run_autoregressive(
-    net: HeadlessTransformer,
-    output_node: Node,
-    embedding: Embedding,
-    input_tokens: list,
-    max_new_tokens: int = 5,
-) -> str:
-    tokens = list(input_tokens)
-    for _ in range(max_new_tokens):
-        result = net.compute(
-            n_pos=len(tokens), input_values={"embedding_input": tokens}
-        )
-        next_token = decode_token(embedding, result[output_node][-1])
-        if next_token == "<eos>":
-            break
-        tokens.append(next_token)
-    return "".join(tokens[len(input_tokens) :])
-
-
-def _build():
-    output_node, pos_encoding, embedding = create_network_parts()
-    net = forward_compile(
-        d=D,
-        d_head=D_HEAD,
-        output_node=output_node,
-        pos_encoding=pos_encoding,
-        verbose=True,
+@pytest.fixture(scope="module")
+def parens(tmp_path_factory):
+    return load_example(
+        create_network_parts, tmp_path_factory.mktemp("parens"), name="parens"
     )
-    return net, output_node, embedding
 
 
-def test_balanced_parens():
-    """Compile and verify balanced-parentheses detection."""
-    net, output_node, embedding = _build()
-
-    n_layers = len(net.layers)
-    print(f"balanced_parens: {n_layers} layers, d={D}, d_head={D_HEAD}")
-    assert n_layers <= 60, f"Too many layers: {n_layers}"
+def test_balanced_parens(parens):
+    model, artifact = parens
+    assert artifact.n_layers <= 60, f"Too many layers: {artifact.n_layers}"
 
     test_cases = [
         # Balanced
@@ -83,8 +46,7 @@ def test_balanced_parens():
         ("())()(", "N"),
     ]
     for input_str, expected in test_cases:
-        tokens = ["<bos>"] + list(input_str) + ["\n"]
-        result = run_autoregressive(net, output_node, embedding, tokens)
+        result = run(model, input_str + "\n", bos_token="<bos>")
         assert (
             result == expected
-        ), f"For '{input_str}': expected '{expected}' but got '{result}'"
+        ), f"For {input_str!r}: expected {expected!r} but got {result!r}"
