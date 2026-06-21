@@ -279,37 +279,37 @@
         {
           "n": 2,
           "depth": 6,
-          "neurons": 1975
+          "neurons": 3127
         },
         {
           "n": 3,
-          "depth": 9,
-          "neurons": 4688
+          "depth": 7,
+          "neurons": 5072
         },
         {
           "n": 4,
-          "depth": 10,
-          "neurons": 8506
+          "depth": 7,
+          "neurons": 7226
         },
         {
           "n": 6,
-          "depth": 12,
-          "neurons": 19457
+          "depth": 8,
+          "neurons": 12161
         },
         {
           "n": 8,
-          "depth": 13,
-          "neurons": 34801
+          "depth": 9,
+          "neurons": 30705
         },
         {
           "n": 12,
-          "depth": 15,
-          "neurons": 78704
+          "depth": 10,
+          "neurons": 51056
         },
         {
           "n": 16,
-          "depth": 16,
-          "neurons": 140152
+          "depth": 10,
+          "neurons": 87416
         }
       ]
     }

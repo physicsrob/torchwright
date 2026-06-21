@@ -18,13 +18,16 @@ The two depth wins, both ``O(log n)`` deep instead of ``O(n)``:
 
 * **multiplication — carry-save (Wallace) reduction.**  Build the digit-product
   times table, drop each product's two digits into their place-value columns
-  (so a column is a *bag* of one-hot digit addends), then repeatedly compress
-  three addends in a column into one sum digit (kept) plus one carry digit
-  (sent to the next column) with a base-10 "3:2 compressor" lookup.  A column
-  bag shrinks to two addends in ``O(log n)`` rounds; a single carry-lookahead
-  addition of the two surviving rows finishes the product.  Everything stays in
-  one-hot space — no number↔one-hot conversion — so each compressor and each
-  lookahead step is one exact lookup layer.
+  (so a column is a *bag* of one-hot digit addends), then repeatedly compress a
+  chunk of up to 11 addends in a column into one sum digit (kept) plus one carry
+  digit (sent to the next column) with a base-10 "11:2 compressor".  In base 10
+  the carry stays one digit as long as the chunk is at most 11 wide — the
+  ``b + 1`` ceiling, vs binary's forced 3 — so 11:2 is the maximal counter and
+  shrinks a column bag to two addends in very few rounds (a single pass for
+  ``n <= 5``).  A final carry-lookahead addition of the two surviving rows
+  finishes the product.
+  Everything stays in one-hot space — no number↔one-hot conversion — so each
+  compressor and each lookahead step is one exact lookup layer.
 
 Comparison is not a depth target, so it reuses the simple module's
 lexicographic fold verbatim (re-exported here so ``calculator_advanced`` finds
@@ -231,7 +234,14 @@ def _times_table(embedding: Embedding) -> Dict[torch.Tensor, torch.Tensor]:
     return table
 
 
-_COMPRESS_W = 28  # x + y + z ranges 0..27, so 28 one-hot buckets cover every total
+# Carry-save radix: how many digits one compressor swallows.  The carry must
+# stay a single digit (it becomes an ordinary addend in the next column), so the
+# sum of the inputs must fit in two base-10 digits: ``9 * RADIX <= 99``, i.e.
+# ``RADIX <= 11``.  That ``b + 1`` ceiling is why the textbook *binary* tree uses
+# 3:2 (``b = 2``); in base 10 the maximal counter is 11:2, which collapses the
+# reduction to a single pass at the demonstrated size (``2n <= 11`` for n <= 5).
+_RADIX = 11
+_COMPRESS_BUCKETS = 9 * _RADIX + 1  # encode totals 0 .. 9*RADIX (== 99) as a one-hot
 
 
 def _digit_value_proj(embedding: Embedding) -> torch.Tensor:
@@ -243,32 +253,33 @@ def _digit_value_proj(embedding: Embedding) -> torch.Tensor:
 
 
 def _make_compressor(embedding: Embedding):
-    """Return a 3:2 compressor ``(x, y, z one-hot digits) -> (sum, carry)``.
+    """Return an 11:2 compressor ``(<=11 one-hot digits) -> (sum, carry)``.
 
-    Rather than a 10x10x10 = 1000-row lookup (1000 neurons — fat enough that a
-    reduction level's parallel compressors spill across many transformer layers
-    and inflate the apparent depth), this reuses the simple multiply's carry
-    trick: read each one-hot digit's value with a free ``Linear``, add the three
-    as plain numbers (free), then encode the small total (0..27) into a one-hot
-    and read the sum digit ``total % 10`` and carry digit ``total // 10`` with
-    two free selection-matrix lookups.  Cost is one ``in_range`` of width 28
-    (~28 neurons) instead of 1000, so a level stays ~one layer deep.
+    Rather than a ``10**11``-row lookup (one neuron per input combination — fat
+    enough that a level's parallel compressors spill across many transformer
+    layers and inflate the apparent depth), this reuses the simple multiply's
+    carry trick: read each one-hot digit's value with a free ``Linear``, add them
+    as plain numbers (free), then encode the small total (``0..99``) into a
+    one-hot and read the sum digit ``total % 10`` and carry digit ``total // 10``
+    with two free selection-matrix lookups.  Cost is one ``in_range`` of width
+    ``9*RADIX + 1``, so a level stays ~one layer deep.
     """
+    n_buckets = _COMPRESS_BUCKETS
     value_proj = _digit_value_proj(embedding)
     zero_digit = embedding.get_embedding("0")
     sum_table = {
-        _state(t, _COMPRESS_W): embedding.get_embedding(str(t % 10))
-        for t in range(_COMPRESS_W)
+        _state(t, n_buckets): embedding.get_embedding(str(t % 10))
+        for t in range(n_buckets)
     }
     carry_table = {
-        _state(t, _COMPRESS_W): embedding.get_embedding(str(t // 10))
-        for t in range(_COMPRESS_W)
+        _state(t, n_buckets): embedding.get_embedding(str(t // 10))
+        for t in range(n_buckets)
     }
 
-    def compress(x: Node, y: Node, z: Node):
-        values = [Linear(d, value_proj, name="digit_value") for d in (x, y, z)]
-        total = sum_nodes(values)  # plain-number add of the three digits, 0..27
-        bucket = bool_to_01(in_range(total, add_const(total, 1.0), _COMPRESS_W))
+    def compress(digits: List[Node]):
+        values = [Linear(d, value_proj, name="digit_value") for d in digits]
+        total = sum_nodes(values)  # plain-number add of up to 11 digits, 0..99
+        bucket = bool_to_01(in_range(total, add_const(total, 1.0), n_buckets))
         sum_digit = onehot_lookup(bucket, sum_table, zero_digit)
         carry_digit = onehot_lookup(bucket, carry_table, zero_digit)
         return sum_digit, carry_digit
@@ -287,13 +298,13 @@ def multiply_digit_seqs(
        ``(tens, ones)`` one-hot pair, dropped into its place-value columns.
        Reading those bags across the columns gives up to ``2n`` *rows*, each a
        ``2n``-digit number (one digit per place, zero where a column is short).
-    2. **Carry-save reduction.** Reduce the rows three at a time: a 3:2
-       compressor turns rows ``(r0, r1, r2)`` into a *sum row* (the per-column
-       ``(r0+r1+r2) % 10``) and a *carry row* (the per-column ``// 10``, shifted
-       one place up).  Every column's compressor in a level runs in parallel and
-       the carries become a row for the next level — no carry ripples within a
-       level — so the row count falls ``3 -> 2`` each level and reaches two rows
-       after ``O(log n)`` levels.
+    2. **Carry-save reduction.** Reduce the rows up to ``_RADIX`` (== 11) at a
+       time: an 11:2 compressor turns a chunk of rows into a *sum row* (the
+       per-column ``total % 10``) and a *carry row* (the per-column ``// 10``,
+       shifted one place up).  Every column's compressor in a level runs in
+       parallel and the carries become a row for the next level — no carry
+       ripples within a level — so the row count falls ``11 -> 2`` each level and
+       reaches two rows in very few levels (a single pass for ``n <= 5``).
     3. **Final add.** The two surviving rows are summed with one carry-lookahead
        addition (``O(log n)`` deep).
 
@@ -333,28 +344,28 @@ def multiply_digit_seqs(
         for r in range(height)
     ] or [[zero] * width]
 
-    # Step 2: carry-save reduction — 3 rows -> 2 rows per level, all columns in
-    # parallel, until two rows survive.
+    # Step 2: carry-save reduction — up to _RADIX rows -> 2 rows per level, all
+    # columns in parallel, until two rows survive.
     compress = _make_compressor(embedding)
 
     while len(rows) > 2:
         nxt: List[List[Node]] = []
         k = 0
-        while k + 3 <= len(rows):
-            r0, r1, r2 = rows[k], rows[k + 1], rows[k + 2]
+        while k < len(rows):
+            chunk = rows[k : k + _RADIX]
+            k += len(chunk)
+            if len(chunk) < 3:  # 1 or 2 leftover rows: nothing to compress
+                nxt.extend(chunk)
+                continue
             sum_row = [zero] * width
             carry_row = [zero] * width
             for c in range(width):
-                sum_digit, carry_digit = compress(r0[c], r1[c], r2[c])
+                sum_digit, carry_digit = compress([row[c] for row in chunk])
                 sum_row[c] = sum_digit
                 if c + 1 < width:  # the place-2n carry is provably zero -> drop
                     carry_row[c + 1] = carry_digit
             nxt.append(sum_row)
             nxt.append(carry_row)
-            k += 3
-        while k < len(rows):  # 1 or 2 leftover rows pass through
-            nxt.append(rows[k])
-            k += 1
         rows = nxt
 
     while len(rows) < 2:  # pad to exactly two rows for the final add
