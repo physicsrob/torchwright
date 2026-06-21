@@ -1,167 +1,285 @@
 """Calculator compiled into a transformer: ``+``, ``-``, ``*`` on integers up
 to ``max_digits`` digits, parsed from ``"A op B\\n"`` and emitted digit by
-digit.
+digit.  This is the *legible* variant — the one the blog explains line by line.
 
 Every operation is the same two ideas — an exhaustive **lookup table** over
-digit combinations, and a **fold** that threads one piece of state along the
-sequence: a carry for addition, a borrow for subtraction, a running
-less/equal/greater verdict for comparison, a stack of single-digit partial
-products for multiplication.  With one-hot embeddings each digit is a unit
-vector, each lookup is exact integer counting, the compiled weight matrix *is*
-the arithmetic table, and the identity unembed makes argmax-decode exact.  See
-``torchwright/ops/onehot_table.py`` and ``torchwright/ops/onehot_arithmetic.py``.
+digit combinations (:func:`torchwright.ops.onehot_table.onehot_lookup`), and a
+**fold** that threads one piece of state along the digits: a carry for
+addition, a borrow for subtraction, a running less/equal/greater verdict for
+comparison, a per-column running sum for multiplication.  With one-hot
+embeddings each digit is a unit vector, each lookup is exact integer counting,
+the compiled weight matrix *is* the arithmetic table, and the identity unembed
+makes argmax-decode exact.
 
-The token-stream plumbing — sliding a digit window, latching operands,
-emitting the result autoregressively, trimming leading zeros — is quarantined
-behind :func:`parse_expression` and :func:`emit_result` so the body reads as
-parse → compute → emit and the four algorithms stay in the foreground.
+This file is one of two standalone calculator implementations.  It defines its
+own ``add`` / ``subtract`` / ``multiply`` (the legible serial folds) and hands
+them to :func:`examples._calculator_common.build_calculator`, which supplies the
+token-stream plumbing and the shared comparison fold.  ``calculator_advanced``
+is the depth-optimized peer (carry-lookahead add/subtract, carry-save multiply,
+``O(log n)`` depth); ``scripts/arithmetic_scaling.py`` measures the two against
+each other.  Sequences are MSB-first (``seq[0]`` most significant); each
+function documents how wide the caller must size the inputs so the fixed-width
+result never drops a nonzero carry.
 
 ``calculator_v2`` is the scalar-space alternative (digits → a number,
 thermometer-coded arithmetic); ``embedding_arithmetic`` is the older
 spherical-code / ``map_to_table`` version of these same algorithms.
 """
 
-from typing import List, Tuple
+from typing import Dict, List, Tuple
 
-from torchwright.graph import Node, Embedding, PosEncoding
-from torchwright.ops.inout_nodes import (
-    create_literal_value,
-    create_onehot_embedding,
-    create_pos_encoding,
+import torch
+
+from torchwright.graph import Embedding, Node, PosEncoding
+from torchwright.ops.arithmetic_ops import add, add_const, bool_to_01, concat, sum_nodes
+from torchwright.ops.inout_nodes import create_literal_value
+from torchwright.ops.map_select import in_range
+from torchwright.ops.onehot_table import onehot_lookup
+
+from examples._calculator_common import (
+    CALC_VOCAB,
+    D_MODEL,
+    _CARRY_W,
+    _NO,
+    _YES,
+    _slice,
+    _state,
+    build_calculator,
+    compare_digit_seqs,  # shared verbatim — re-exported as part of this variant
 )
-from torchwright.ops.logic_ops import (
-    equals_vector,
-    bool_not,
-    bool_all_true,
-    bool_any_true,
-)
-from torchwright.ops.map_select import select, switch
-from torchwright.ops import onehot_arithmetic
-from torchwright.ops.sequence_ops import (
-    NumericSequence,
-    output_sequence,
-    remove_leading_0s,
-)
 
-D_MODEL = 1024
-
-# Compact, calculator-only vocabulary: 10 digits, 3 operators, the newline that
-# ends the input, a space (the pre-result placeholder), a BOS, and an EOS that
-# pads / terminates the result.  17 tokens -> d_embed = 17 one-hot columns.
-CALC_VOCAB = [str(d) for d in range(10)] + ["+", "-", "*", "\n", " ", "<bos", "<eos>"]
+__all__ = [
+    "CALC_VOCAB",
+    "D_MODEL",
+    "add_digit_seqs",
+    "subtract_digit_seqs",
+    "compare_digit_seqs",
+    "multiply_digit_seqs",
+    "create_network_parts",
+]
 
 
-def parse_expression(
-    pos_encoding: PosEncoding, embedding: Embedding, max_digits: int
-) -> Tuple[List[Node], List[Node], Node, Node, Node, Node]:
-    """Parse ``"A op B\\n"`` from the token stream.
-
-    Returns ``(first, second, is_plus, is_minus, is_times, saw_newline)``:
-    the two operand digit windows (MSB-first), three latched ±1 flags for which
-    operator appeared, and the ±1 newline trigger that ends the input and
-    starts result emission.
-    """
-    num_seq = NumericSequence(pos_encoding, embedding, max_digits)
-
-    is_plus = equals_vector(embedding, embedding.get_embedding("+"))
-    is_minus = equals_vector(embedding, embedding.get_embedding("-"))
-    is_times = equals_vector(embedding, embedding.get_embedding("*"))
-    is_operator = bool_any_true([is_plus, is_minus, is_times])
-    saw_newline = equals_vector(embedding, embedding.get_embedding("\n"))
-
-    # Only treat an operator as such *before* the newline, so a "-" emitted as
-    # a negative sign during decoding does not re-trigger operator parsing.
-    seen_newline = pos_encoding.get_prev_value(saw_newline, saw_newline)
-    is_input_operator = bool_all_true([is_operator, bool_not(seen_newline)])
-
-    # Latch which operator was used (captured at the operator position, held
-    # forward to every later position by attention).
-    which_plus = pos_encoding.get_prev_value(is_plus, is_input_operator)
-    which_minus = pos_encoding.get_prev_value(is_minus, is_input_operator)
-    which_times = pos_encoding.get_prev_value(is_times, is_input_operator)
-
-    # First operand's window is complete at the operator; second's at newline.
-    first = num_seq.get_digits_at_event(is_input_operator)
-    second = num_seq.get_digits_at_event(saw_newline)
-    return first, second, which_plus, which_minus, which_times, saw_newline
+# ---------------------------------------------------------------------------
+# The shared shape: a lookup table threaded by a state fold.
+# ---------------------------------------------------------------------------
 
 
-def _format_result(
-    embedding: Embedding, digits: List[Node], seq_len: int
-) -> List[Node]:
-    """Pad a digit sequence to ``seq_len`` with ``<eos>``, then drop leading
-    zeros (keeping at least one digit) so ``"007"`` prints as ``"7"``."""
-    eos = create_literal_value(embedding.get_embedding("<eos>"))
-    padded = digits + [eos] * (seq_len - len(digits))
-    return remove_leading_0s(embedding, padded, max_removals=len(digits) - 1)
-
-
-def emit_result(
-    pos_encoding: PosEncoding,
+def digitwise_fold(
     embedding: Embedding,
-    saw_newline: Node,
-    result_digits: List[Node],
-) -> Node:
-    """Emit ``result_digits`` autoregressively once the newline fires, printing
-    a space at every position before then."""
-    return output_sequence(
-        pos_encoding, saw_newline, result_digits, embedding.get_embedding(" ")
-    )
+    seq1: List[Node],
+    seq2: List[Node],
+    *,
+    digit_table: Dict[torch.Tensor, torch.Tensor],
+    state_table: Dict[torch.Tensor, torch.Tensor],
+    init_state: torch.Tensor,
+) -> List[Node]:
+    """Right-to-left (LSB-first) fold threading one state one-hot.
 
+    At each digit position the key ``concat([a, b, state])`` is looked up in
+    two tables built over the same key space: ``digit_table`` gives the output
+    digit (an embedding row), ``state_table`` gives the carry/borrow passed to
+    the next, more-significant position.  This is the carry-propagation /
+    borrow-propagation shape; addition and subtraction differ only in their
+    two tables.
 
-def build_calculator(arith, max_digits: int) -> Tuple[Node, PosEncoding, Embedding]:
-    """Build the calculator graph over an arithmetic module ``arith``.
+    Args:
+        embedding: The one-hot embedding (its ``"0"`` row is the digit default).
+        seq1, seq2: Equal-length MSB-first digit sequences.
+        digit_table, state_table: Lookups keyed on ``concat([a, b, state])``.
+        init_state: The state one-hot entering the least-significant position.
 
-    ``arith`` supplies the four digit-sequence algorithms — ``add_digit_seqs``,
-    ``subtract_digit_seqs``, ``compare_digit_seqs``, ``multiply_digit_seqs`` —
-    so the same parse → compute → emit body wires up either the legible
-    ``onehot_arithmetic`` (this file's :func:`create_network_parts`) or the
-    depth-optimized ``onehot_arithmetic_fast`` (``calculator_advanced``).
-    Returns ``(output_node, pos_encoding, embedding)``.
+    Returns:
+        Output digits, MSB-first, same length as the inputs.  The final state
+        is dropped — callers size the inputs so it is always ``init_state``.
     """
-    embedding = create_onehot_embedding(CALC_VOCAB)
-    pos_encoding = create_pos_encoding()
+    assert len(seq1) == len(seq2)
+    default_digit = embedding.get_embedding("0")
+    default_state = init_state
+    state = create_literal_value(init_state)
+    out: List[Node] = []
+    for a, b in reversed(list(zip(seq1, seq2))):
+        key = concat([a, b, state])
+        out.append(onehot_lookup(key, digit_table, default_digit))
+        state = onehot_lookup(key, state_table, default_state)
+    return list(reversed(out))
 
-    first, second, is_plus, is_minus, is_times, saw_newline = parse_expression(
-        pos_encoding, embedding, max_digits
+
+# ---------------------------------------------------------------------------
+# Addition
+# ---------------------------------------------------------------------------
+
+
+def add_digit_seqs(
+    embedding: Embedding, seq1: List[Node], seq2: List[Node]
+) -> List[Node]:
+    """Add two equal-length MSB-first digit sequences with a carry fold.
+
+    Returns a sequence of the **same length**, dropping the final carry.
+
+    **No-overflow cap:** the caller must size the inputs so the sum fits in
+    that width — e.g. prepend a ``"0"`` digit to each ``n``-digit operand so an
+    ``n``-digit + ``n``-digit sum has a home for its top carry.  Within the cap
+    the dropped carry is always zero, so the result is exact.
+    """
+    digit_table: Dict[torch.Tensor, torch.Tensor] = {}
+    state_table: Dict[torch.Tensor, torch.Tensor] = {}
+    for a in range(10):
+        for b in range(10):
+            for carry in range(2):
+                key = torch.cat(
+                    [
+                        embedding.get_embedding(str(a)),
+                        embedding.get_embedding(str(b)),
+                        _state(carry, _CARRY_W),
+                    ]
+                )
+                total = a + b + carry
+                digit_table[key] = embedding.get_embedding(str(total % 10))
+                state_table[key] = _state(_YES if total >= 10 else _NO, _CARRY_W)
+    return digitwise_fold(
+        embedding,
+        seq1,
+        seq2,
+        digit_table=digit_table,
+        state_table=state_table,
+        init_state=_state(_NO, _CARRY_W),
     )
 
-    # Multiplication is the widest result (2*max_digits digits); the others are
-    # padded with <eos> to this length so the operator switch is per-position.
-    seq_len = 2 * max_digits + 2
-    zero = create_literal_value(embedding.get_embedding("0"))
 
-    # --- Addition: pad each operand by one digit so the top carry has a home. ---
-    add_digits = arith.add_digit_seqs(embedding, [zero] + first, [zero] + second)
-    add_seq = _format_result(embedding, add_digits, seq_len)
+# ---------------------------------------------------------------------------
+# Subtraction
+# ---------------------------------------------------------------------------
 
-    # --- Subtraction: |A - B| by a borrow fold, sign from the comparison. ---
-    a_ge_b = arith.compare_digit_seqs(embedding, first, second)
-    bigger = [select(a_ge_b, a, b) for a, b in zip(first, second)]
-    smaller = [select(a_ge_b, b, a) for a, b in zip(first, second)]
-    magnitude = _format_result(
-        embedding, arith.subtract_digit_seqs(embedding, bigger, smaller), seq_len
+
+def subtract_digit_seqs(
+    embedding: Embedding, seq1: List[Node], seq2: List[Node]
+) -> List[Node]:
+    """``seq1 - seq2`` digit by digit with a borrow fold (assumes ``seq1 >= seq2``).
+
+    Equal length in, equal length out.  Because ``seq1 >= seq2`` the final
+    borrow is always zero, so dropping it is exact — the caller handles the
+    sign separately (see :func:`compare_digit_seqs`).
+    """
+    digit_table: Dict[torch.Tensor, torch.Tensor] = {}
+    state_table: Dict[torch.Tensor, torch.Tensor] = {}
+    for a in range(10):
+        for b in range(10):
+            for borrow in range(2):
+                key = torch.cat(
+                    [
+                        embedding.get_embedding(str(a)),
+                        embedding.get_embedding(str(b)),
+                        _state(borrow, _CARRY_W),
+                    ]
+                )
+                diff = a - b - borrow
+                digit_table[key] = embedding.get_embedding(str(diff % 10))
+                state_table[key] = _state(_YES if diff < 0 else _NO, _CARRY_W)
+    return digitwise_fold(
+        embedding,
+        seq1,
+        seq2,
+        digit_table=digit_table,
+        state_table=state_table,
+        init_state=_state(_NO, _CARRY_W),
     )
-    minus = create_literal_value(embedding.get_embedding("-"))
-    negative = [minus] + magnitude[: seq_len - 1]
-    sub_seq = [select(a_ge_b, magnitude[i], negative[i]) for i in range(seq_len)]
 
-    # --- Multiplication: long multiplication, product fits in 2*max_digits. ---
-    mul_seq = _format_result(
-        embedding, arith.multiply_digit_seqs(embedding, first, second), seq_len
-    )
 
-    # --- Dispatch by operator, then emit. ---
-    result_digits = [
-        switch([is_plus, is_minus, is_times], [add_seq[i], sub_seq[i], mul_seq[i]])
-        for i in range(seq_len)
-    ]
-    output_node = emit_result(pos_encoding, embedding, saw_newline, result_digits)
-    return output_node, pos_encoding, embedding
+# ---------------------------------------------------------------------------
+# Multiplication
+# ---------------------------------------------------------------------------
+
+
+def multiply_digit_seqs(
+    embedding: Embedding, seq1: List[Node], seq2: List[Node]
+) -> List[Node]:
+    """Multiply ``seq1 * seq2`` (both ``n`` digits MSB-first) -> ``2n`` digits.
+
+    Rather than building whole partial-product rows and adding them with a
+    carry-propagating addition each time (an ``O(n)`` serial stack of carry
+    folds), this accumulates the digit products *as plain numbers* and carries
+    exactly once:
+
+    1. **Times table.** Every digit pair ``seq1[i] * seq2[j]`` is one lookup
+       returning its two-digit product as a pair of plain numbers
+       ``(tens, ones)`` — all ``n^2`` in parallel, one layer.
+    2. **Column sums.** Each product's tens/ones land in their place-value
+       columns, and a column's contributions are summed *as numbers*.  Number
+       addition is free (residual wiring, no carry to ripple), so this costs
+       no layers — but a column total can exceed 9.
+    3. **One carry sweep.** Sweeping the ``2n`` columns least-significant
+       first, each column's total (plus the incoming carry) is turned back
+       into a digit, passing the overflow to the next column.  This is the
+       only place carries ripple.
+
+    **No-overflow cap:** ``(10^n - 1)^2 < 10^(2n)``, so ``2n`` digits hold the
+    product.  A column receives at most ``2n`` digit contributions (each
+    ``<= 9``) and the incoming carry stays ``<= 2n``, so a column total plus
+    carry never exceeds ``20n`` — the width of the carry-sweep lookup table.
+    """
+    n = len(seq1)
+    assert len(seq2) == n
+    zero_scalar = create_literal_value(torch.tensor([0.0]))
+
+    # Step 1: the times table.  Two one-hot digits -> (tens, ones) as numbers.
+    product_table: Dict[torch.Tensor, torch.Tensor] = {}
+    for a in range(10):
+        for b in range(10):
+            key = torch.cat(
+                [embedding.get_embedding(str(a)), embedding.get_embedding(str(b))]
+            )
+            product_table[key] = torch.tensor([float(a * b // 10), float(a * b % 10)])
+    default_product = torch.tensor([0.0, 0.0])
+
+    # Steps 1-2: drop each product's digits into their place-value columns and
+    # collect the (free) per-column number contributions.  Column p is the
+    # 10^p place; columns run 0 (least significant) .. 2n-1.
+    columns: List[List[Node]] = [[] for _ in range(2 * n)]
+    for i in range(n):
+        for j in range(n):
+            product = onehot_lookup(
+                concat([seq1[i], seq2[j]]), product_table, default_product
+            )
+            tens = _slice(product, 0, 1, name="product_tens")
+            ones = _slice(product, 1, 1, name="product_ones")
+            place = (n - 1 - i) + (n - 1 - j)  # place value of the ones digit
+            columns[place].append(ones)
+            columns[place + 1].append(tens)
+
+    # Step 3: one carry sweep, least-significant column first.  Turn each
+    # column total (a number 0..20n) into a one-hot index, then read off its
+    # digit and its carry with two free selection-matrix lookups.
+    max_total = 20 * n
+    digit_table = {
+        _state(t, max_total + 1): embedding.get_embedding(str(t % 10))
+        for t in range(max_total + 1)
+    }
+    carry_table = {
+        _state(t, max_total + 1): torch.tensor([float(t // 10)])
+        for t in range(max_total + 1)
+    }
+
+    carry: Node = zero_scalar
+    out_lsb_first: List[Node] = []
+    for place in range(2 * n):
+        contributions = columns[place] or [zero_scalar]
+        total = add(sum_nodes(contributions), carry)  # free number addition
+        total_onehot = bool_to_01(in_range(total, add_const(total, 1.0), max_total + 1))
+        out_lsb_first.append(
+            onehot_lookup(total_onehot, digit_table, embedding.get_embedding("0"))
+        )
+        carry = onehot_lookup(total_onehot, carry_table, torch.tensor([0.0]))
+    return list(reversed(out_lsb_first))
 
 
 def create_network_parts(
     max_digits: int = 3,
 ) -> Tuple[Node, PosEncoding, Embedding]:
-    """The simple calculator: :func:`build_calculator` over ``onehot_arithmetic``."""
-    return build_calculator(onehot_arithmetic, max_digits)
+    """The simple calculator: the legible serial folds wired up by
+    :func:`examples._calculator_common.build_calculator`."""
+    return build_calculator(
+        max_digits,
+        add_digit_seqs=add_digit_seqs,
+        subtract_digit_seqs=subtract_digit_seqs,
+        multiply_digit_seqs=multiply_digit_seqs,
+    )

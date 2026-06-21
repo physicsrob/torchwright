@@ -24,12 +24,12 @@ sweep — multiply included — runs with no width caps.
 The two implementations tell the asymptotic story the blog's payoff figure
 makes visible:
 
-* ``simple`` (``onehot_arithmetic``) — legible serial carry/borrow folds and a
-  column-sum multiply.  Depth is **linear** in ``n`` (add ``n``, multiply
-  ``~2n``).
-* ``advanced`` (``onehot_arithmetic_fast``) — carry-lookahead add/subtract and
-  carry-save (Wallace) multiply.  Depth is **logarithmic** in ``n``, at a higher
-  neuron (width) cost.
+* ``simple`` (``examples.calculator_simple``) — legible serial carry/borrow
+  folds and a column-sum multiply.  Depth is **linear** in ``n`` (add ``n``,
+  multiply ``~2n``).
+* ``advanced`` (``examples.calculator_advanced``) — carry-lookahead add/subtract
+  and carry-save (Wallace) multiply.  Depth is **logarithmic** in ``n``, at a
+  higher neuron (width) cost.
 
 Each operand is fed at its declared ``n`` digits with no extra padding, so
 ``n`` means the same thing across all three ops — directly comparable curves.
@@ -47,14 +47,16 @@ Run locally (CPU is fine, no GPU needed)::
 import argparse
 import json
 
-from torchwright.ops import onehot_arithmetic, onehot_arithmetic_fast
+from examples import calculator_advanced, calculator_simple
 from torchwright.ops.inout_nodes import create_literal_value, create_onehot_embedding
 
 # Registered implementations, in figure order: the legible serial folds vs the
-# depth-optimized carry-lookahead / carry-save versions.
+# depth-optimized carry-lookahead / carry-save versions.  Each calculator module
+# exposes its own ``add_digit_seqs`` / ``subtract_digit_seqs`` /
+# ``multiply_digit_seqs`` at module level.
 IMPLEMENTATIONS = {
-    "simple": onehot_arithmetic,
-    "advanced": onehot_arithmetic_fast,
+    "simple": calculator_simple,
+    "advanced": calculator_advanced,
 }
 
 # Each op -> the digit-sequence function name it exposes.

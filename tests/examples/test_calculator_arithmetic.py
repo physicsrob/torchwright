@@ -2,21 +2,23 @@
 
 Each operand is a literal one-hot digit sequence, so ``node.compute`` runs the
 exact lookup/fold arithmetic with no inputs.  Results are decoded by argmax
-over the identity embedding.
+over the identity embedding.  Both standalone calculator implementations expose
+the same four digit-sequence ops at module level, so every test runs once per
+variant — the legible serial folds and the depth-optimized carry-lookahead /
+carry-save versions must agree digit for digit.
 """
 
 import pytest
 import torch
 
-from torchwright.ops import onehot_arithmetic, onehot_arithmetic_fast
+from examples import calculator_advanced, calculator_simple
 from torchwright.ops.inout_nodes import create_literal_value, create_onehot_embedding
 
 VOCAB = [str(d) for d in range(10)]
 
-# One entry per arithmetic implementation; every test below runs once per module
-# via the ``arith`` fixture (the legible serial folds and the depth-optimized
-# carry-lookahead / carry-save versions must agree digit for digit).
-ARITHMETIC_MODULES = [onehot_arithmetic, onehot_arithmetic_fast]
+# One entry per calculator implementation; every test below runs once per module
+# via the ``arith`` fixture.
+ARITHMETIC_MODULES = [calculator_simple, calculator_advanced]
 
 
 @pytest.fixture(params=ARITHMETIC_MODULES, ids=lambda m: m.__name__.rsplit(".", 1)[-1])

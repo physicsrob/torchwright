@@ -27,10 +27,8 @@ from torchwright.compiler.export import compile_headless, compile_to_onnx
 from torchwright.graph import Concatenate
 from torchwright.ops.arithmetic_ops import concat
 from torchwright.ops.inout_nodes import create_input, create_onehot_embedding
-from torchwright.ops.onehot_arithmetic import (
-    _CARRY_W,
-    _NO,
-    _state,
+from examples._calculator_common import _CARRY_W, _NO, _state
+from examples.calculator_simple import (
     add_digit_seqs,
     compare_digit_seqs,
     multiply_digit_seqs,
