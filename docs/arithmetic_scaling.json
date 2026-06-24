@@ -12,9 +12,19 @@
       24,
       32
     ],
+    "model_digit_sweep": [
+      1,
+      2,
+      3,
+      4,
+      5,
+      6
+    ],
     "multiply_cap": 16,
     "depth_metric": "critical-path length over neuron-producing nodes",
-    "size_metric": "total neuron count (~ params / 2d)"
+    "size_metric": "total neuron count (~ params / 2d)",
+    "model_depth_metric": "whole-model critical-path depth (parse + ops + dispatch + emit)",
+    "decode_steps_metric": "emitted tokens per query (scratchpad: 6n+3)"
   },
   "results": {
     "simple": {
@@ -312,6 +322,223 @@
           "neurons": 87416
         }
       ]
+    },
+    "scratchpad": {
+      "add": [
+        {
+          "n": 1,
+          "depth": 5,
+          "neurons": 663
+        },
+        {
+          "n": 2,
+          "depth": 5,
+          "neurons": 1110
+        },
+        {
+          "n": 3,
+          "depth": 5,
+          "neurons": 1629
+        },
+        {
+          "n": 4,
+          "depth": 5,
+          "neurons": 2220
+        },
+        {
+          "n": 6,
+          "depth": 5,
+          "neurons": 3618
+        },
+        {
+          "n": 8,
+          "depth": 5,
+          "neurons": 5304
+        },
+        {
+          "n": 12,
+          "depth": 5,
+          "neurons": 9540
+        }
+      ],
+      "subtract": [
+        {
+          "n": 1,
+          "depth": 6,
+          "neurons": 792
+        },
+        {
+          "n": 2,
+          "depth": 6,
+          "neurons": 1659
+        },
+        {
+          "n": 3,
+          "depth": 6,
+          "neurons": 2597
+        },
+        {
+          "n": 4,
+          "depth": 6,
+          "neurons": 3631
+        },
+        {
+          "n": 6,
+          "depth": 6,
+          "neurons": 5987
+        },
+        {
+          "n": 8,
+          "depth": 6,
+          "neurons": 8727
+        },
+        {
+          "n": 12,
+          "depth": 6,
+          "neurons": 15359
+        }
+      ],
+      "multiply": [
+        {
+          "n": 1,
+          "depth": 5,
+          "neurons": 779
+        },
+        {
+          "n": 2,
+          "depth": 5,
+          "neurons": 2577
+        },
+        {
+          "n": 3,
+          "depth": 5,
+          "neurons": 5375
+        },
+        {
+          "n": 4,
+          "depth": 5,
+          "neurons": 9173
+        },
+        {
+          "n": 6,
+          "depth": 5,
+          "neurons": 19769
+        },
+        {
+          "n": 8,
+          "depth": 5,
+          "neurons": 34365
+        },
+        {
+          "n": 12,
+          "depth": 5,
+          "neurons": 75557
+        }
+      ]
     }
+  },
+  "model_results": {
+    "simple": [
+      {
+        "n": 1,
+        "depth": 13,
+        "neurons": 2501
+      },
+      {
+        "n": 2,
+        "depth": 20,
+        "neurons": 5872
+      },
+      {
+        "n": 3,
+        "depth": 27,
+        "neurons": 10292
+      },
+      {
+        "n": 4,
+        "depth": 34,
+        "neurons": 15776
+      },
+      {
+        "n": 5,
+        "depth": 41,
+        "neurons": 22324
+      },
+      {
+        "n": 6,
+        "depth": 48,
+        "neurons": 29936
+      }
+    ],
+    "advanced": [
+      {
+        "n": 1,
+        "depth": 13,
+        "neurons": 2733
+      },
+      {
+        "n": 2,
+        "depth": 22,
+        "neurons": 7652
+      },
+      {
+        "n": 3,
+        "depth": 29,
+        "neurons": 12536
+      },
+      {
+        "n": 4,
+        "depth": 35,
+        "neurons": 18182
+      },
+      {
+        "n": 5,
+        "depth": 42,
+        "neurons": 24590
+      },
+      {
+        "n": 6,
+        "depth": 48,
+        "neurons": 31760
+      }
+    ],
+    "scratchpad": [
+      {
+        "n": 1,
+        "depth": 9,
+        "neurons": 4672,
+        "decode_steps": 11
+      },
+      {
+        "n": 2,
+        "depth": 9,
+        "neurons": 10180,
+        "decode_steps": 19
+      },
+      {
+        "n": 3,
+        "depth": 9,
+        "neurons": 17375,
+        "decode_steps": 27
+      },
+      {
+        "n": 4,
+        "depth": 9,
+        "neurons": 26282,
+        "decode_steps": 35
+      },
+      {
+        "n": 5,
+        "depth": 9,
+        "neurons": 36901,
+        "decode_steps": 43
+      },
+      {
+        "n": 6,
+        "depth": 9,
+        "neurons": 49232,
+        "decode_steps": 51
+      }
+    ]
   }
 }
