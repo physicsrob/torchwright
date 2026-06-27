@@ -111,9 +111,9 @@ def build_config(
     # the table's row count, not the tokenizer's token count.
     embed_table = inits["embed_table"]
     vocab_size, d_embed = embed_table.shape
-    assert len(vocab) <= vocab_size, (
-        f"meta vocab len {len(vocab)} exceeds embed_table rows {vocab_size}"
-    )
+    assert (
+        len(vocab) <= vocab_size
+    ), f"meta vocab len {len(vocab)} exceeds embed_table rows {vocab_size}"
     d = inits["embedding_proj"].shape[1]
     d_pos = inits["pos_proj"].shape[0]
     max_seq = inits["pos_encoding_full"].shape[0]
@@ -135,11 +135,25 @@ def build_config(
     for i in range(n_layers):
         nh = int(inits[f"l{i}_qkv_view_shape"][1])
         hd = inits[f"l{i}_WQ"].shape[1]
-        assert hd == nh * d_head, (
-            f"layer {i}: WQ width {hd} != n_heads {nh} * d_head {d_head}"
-        )
+        assert (
+            hd == nh * d_head
+        ), f"layer {i}: WQ width {hd} != n_heads {nh} * d_head {d_head}"
         n_heads_per_layer.append(nh)
         d_hidden_per_layer.append(int(inits[f"l{i}_W1"].shape[1]))
+
+    # RoPE: the exporter records `rope_base` in the sidecar meta and bakes, for
+    # each layer with a rotary head, an `l{i}_rope_enable_q` (nh, 1, 1) per-head
+    # enable.  Absent = the sinusoidal (non-rotary) model.
+    rope_base = float(meta.get("rope_base", 0.0))
+    rotary_enable_per_layer: List[List[int]] = []
+    for i in range(n_layers):
+        key = f"l{i}_rope_enable_q"
+        if key in inits:
+            rotary_enable_per_layer.append(
+                [int(round(float(x))) for x in inits[key].reshape(-1)]
+            )
+        else:
+            rotary_enable_per_layer.append([0] * n_heads_per_layer[i])
 
     # Resolve bos/eos ids. A token of None means "this model has no bos/eos";
     # a non-None token that isn't in the vocab is a caller error (e.g. wrong
@@ -171,6 +185,8 @@ def build_config(
         d_output=int(d_output),
         head_kind="token",
         cache_stride=meta.get("cache_stride"),
+        rope_base=rope_base,
+        rotary_enable_per_layer=rotary_enable_per_layer,
         bos_token_id=bos_id,
         eos_token_id=eos_id,
         tie_word_embeddings=True,
@@ -225,6 +241,18 @@ def build_state_dict(config, inits: Dict[str, np.ndarray]) -> Tuple[dict, set]:
         sd[f"{p}.mlp.linear2.weight"] = _t(take(f"l{i}_W2").T)  # (d, d_h)
         sd[f"{p}.mlp.linear2.bias"] = _t(take(f"l{i}_b2"))
 
+    # RoPE constants are config-derived (rebuilt in the model from rope_base +
+    # the per-head enable), not state-dict weights — mark them consumed so the
+    # all-mapped check passes.
+    for name in ("rope_freq", "rope_base", "rope_split"):
+        if name in inits:
+            consumed.add(name)
+    for i in range(config.n_layers):
+        for suffix in ("rope_enable_q", "rope_enable_k"):
+            key = f"l{i}_{suffix}"
+            if key in inits:
+                consumed.add(key)
+
     return sd, consumed
 
 
@@ -266,9 +294,7 @@ def convert_onnx_to_hf(
     inits = _load_all_initializers(model_proto)
     meta = _read_meta(onnx_path)
 
-    config = build_config(
-        inits, meta, bos_token=bos_token, eos_token=eos_token
-    )
+    config = build_config(inits, meta, bos_token=bos_token, eos_token=eos_token)
     sd, consumed = build_state_dict(config, inits)
     _assert_all_mapped(inits, consumed)
 
@@ -309,9 +335,7 @@ def save_bundle(
     from .configuration_torchwright import TorchwrightConfig
     from .modeling_torchwright import TorchwrightForCausalLM
 
-    model = convert_onnx_to_hf(
-        onnx_path, bos_token=bos_token, eos_token=eos_token
-    )
+    model = convert_onnx_to_hf(onnx_path, bos_token=bos_token, eos_token=eos_token)
     TorchwrightConfig.register_for_auto_class()
     TorchwrightForCausalLM.register_for_auto_class("AutoModelForCausalLM")
     os.makedirs(save_dir, exist_ok=True)

@@ -1,5 +1,6 @@
 import torch
 from torchwright.graph import Node
+from torchwright.graph.rope import ROPE_BASE, apply_rope, rope_cos_sin
 
 # Causal mask sentinel: future positions are filled with this value before
 # softmax.  Must be large enough that no valid logit ever falls below it,
@@ -91,6 +92,8 @@ class Attn(Node):
         key_matrix: torch.Tensor,
         value_matrix: torch.Tensor,
         output_matrix: torch.Tensor,
+        rotary: bool = False,
+        rope_base: float = ROPE_BASE,
     ):
         self.d_qk = query_matrix.shape[1]
         self.d_v = value_matrix.shape[1]
@@ -110,10 +113,18 @@ class Attn(Node):
             value_matrix,
         )
 
+        if rotary and self.d_qk % 2 != 0:
+            raise ValueError(
+                f"rotary Attn requires an even d_qk (got {self.d_qk}); "
+                f"rotate_half pairs dim p with dim p+d_qk/2."
+            )
+
         self.query_matrix = query_matrix
         self.key_matrix = key_matrix
         self.value_matrix = value_matrix
         self.output_matrix = output_matrix
+        self.rotary = rotary
+        self.rope_base = rope_base
         super().__init__(output_matrix.shape[1], inputs=[query_in, key_in, value_in])
 
     def compute_value_type(self):
@@ -135,6 +146,18 @@ class Attn(Node):
         # key_values shape is (pos, d_qk)
         query_values = torch.matmul(query_in, self.query_matrix)
         # query_values shape is (pos, d_qk)
+
+        # RoPE: rotate Q and K by absolute position (row index) before the
+        # dot product, so the logit depends on the relative offset (i - j).
+        # rotate_half over d_qk; same grid the compiled component applies.
+        if self.rotary:
+            positions = torch.arange(n_pos, device=query_values.device)
+            cos, sin = rope_cos_sin(positions, self.d_qk, self.rope_base)
+            cos = cos.to(query_values.dtype)
+            sin = sin.to(query_values.dtype)
+            query_values = apply_rope(query_values, cos, sin)
+            key_values = apply_rope(key_values, cos, sin)
+
         attn_logits = query_values.matmul(key_values.t())
         # attn_logits shape is (query pos, key pos)
 

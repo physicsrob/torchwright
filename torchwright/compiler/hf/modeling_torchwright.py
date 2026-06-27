@@ -94,6 +94,44 @@ class TorchwrightAttention(nn.Module):
         self.v_proj = nn.Linear(self.d, hd, bias=False)
         self.o_proj = nn.Linear(hd, self.d, bias=False)
 
+        # RoPE (LLaMA3 rotate_half, half-split, scale baked into base). A head is
+        # rotary iff its enable bit is set; rotation is full-width over d_head, by
+        # ABSOLUTE position (cache_position). rope_base 0.0 => the sinusoidal
+        # (non-rotary) model, in which case nothing below runs. Buffers are
+        # non-persistent: rebuilt from the serialized config on load.
+        enable = (
+            config.rotary_enable_per_layer[layer_idx]
+            if config.rotary_enable_per_layer
+            else []
+        )
+        self.rope_active = config.rope_base > 0.0 and any(enable)
+        if self.rope_active:
+            p = torch.arange(0, self.d_head, 2, dtype=torch.float64)
+            inv = (config.rope_base ** (-p / self.d_head)).to(torch.float32)
+            self.register_buffer(
+                "rope_freq", torch.cat([inv, inv]), persistent=False
+            )  # (d_head,)
+            self.register_buffer(
+                "rope_enable",
+                torch.tensor(enable, dtype=torch.float32).view(1, self.n_heads, 1, 1),
+                persistent=False,
+            )
+
+    @staticmethod
+    def _rotate_half(x: torch.Tensor) -> torch.Tensor:
+        half = x.shape[-1] // 2
+        return torch.cat([-x[..., half:], x[..., :half]], dim=-1)
+
+    def _apply_rope(
+        self, x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor
+    ) -> torch.Tensor:
+        # x: (B, n_heads, T, d_head); cos/sin: (T, d_head) -> (1, 1, T, d_head).
+        # Per-head enable blend keeps non-rotary heads untouched.
+        cos = cos[None, None]
+        sin = sin[None, None]
+        rot = x * cos + self._rotate_half(x) * sin
+        return x + self.rope_enable * (rot - x)
+
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -106,6 +144,15 @@ class TorchwrightAttention(nn.Module):
         q = self.q_proj(hidden_states).view(shape).transpose(1, 2)
         k = self.k_proj(hidden_states).view(shape).transpose(1, 2)
         v = self.v_proj(hidden_states).view(shape).transpose(1, 2)
+
+        # RoPE rotates Q and the NEW K by absolute position, before the cache
+        # update, so the cache stores already-rotated K (slot == position).
+        if self.rope_active:
+            ang = cache_position.to(torch.float32)[:, None] * self.rope_freq[None, :]
+            cos = torch.cos(ang)  # (T, d_head)
+            sin = torch.sin(ang)
+            q = self._apply_rope(q, cos, sin)
+            k = self._apply_rope(k, cos, sin)
 
         if past_key_values is not None:
             k, v = past_key_values.update(k, v, self.layer_idx)
@@ -200,19 +247,14 @@ class TorchwrightModel(TorchwrightPreTrainedModel):
             torch.zeros(config.max_seq, config.d_pos),
             persistent=True,
         )
-        self.register_buffer(
-            "constant_values", torch.zeros(config.d), persistent=True
-        )
+        self.register_buffer("constant_values", torch.zeros(config.d), persistent=True)
         self.register_buffer(
             "output_gather_indices",
             torch.zeros(config.d_output, dtype=torch.long),
             persistent=True,
         )
         self.layers = nn.ModuleList(
-            [
-                TorchwrightDecoderLayer(config, i)
-                for i in range(config.n_layers)
-            ]
+            [TorchwrightDecoderLayer(config, i) for i in range(config.n_layers)]
         )
         self.post_init()
 
@@ -286,9 +328,7 @@ class TorchwrightModel(TorchwrightPreTrainedModel):
                 # so map position_ids onto it rather than silently ignoring it.
                 cache_position = position_ids[0].to(device=device, dtype=torch.long)
             else:
-                cache_position = torch.arange(
-                    past_seen, past_seen + T, device=device
-                )
+                cache_position = torch.arange(past_seen, past_seen + T, device=device)
 
         # Token + absolute-PE + constant residual seed.
         inp_res = tok @ self.embedding_proj  # (B, T, d)

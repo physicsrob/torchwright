@@ -317,6 +317,11 @@ def _write_compute_attn(
         )
 
         head = _allocate_head(attn)
+        if node.rotary:
+            # Rotary planes live in the active [0:d_qk] columns of the head;
+            # all V/O chunk heads share the same Q/K and so are equally rotary.
+            attn.rotary_width[head] = node.d_qk
+            attn.rope_base = node.rope_base
         _scatter_attn_head(
             attn,
             head,

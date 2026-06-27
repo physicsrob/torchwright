@@ -82,6 +82,8 @@ class TorchwrightConfig(PretrainedConfig):
         d_output: int = 0,
         head_kind: str = "token",
         cache_stride: int | None = None,
+        rope_base: float = 0.0,
+        rotary_enable_per_layer: list | None = None,
         **kwargs,
     ):
         self.d = int(d)
@@ -96,6 +98,14 @@ class TorchwrightConfig(PretrainedConfig):
         self.d_output = int(d_output)
         self.head_kind = head_kind
         self.cache_stride = None if cache_stride is None else int(cache_stride)
+        # RoPE: rope_base 0.0 means "no rotary" (back-compat for the sinusoidal
+        # models).  rotary_enable_per_layer[i] is a per-head 0/1 list (length
+        # n_heads_per_layer[i]) marking which heads of layer i rotate full-width
+        # (rotate_half over d_head).  See docs/rope_port_plan.md §6.
+        self.rope_base = float(rope_base)
+        self.rotary_enable_per_layer = [
+            [int(x) for x in row] for row in (rotary_enable_per_layer or [])
+        ]
         # Aliases so generic transformers utilities that reach for the canonical
         # field names (cache sizing, repr, sharding heuristics) find them. We own
         # them here and recompute from our own fields, so drop any (possibly

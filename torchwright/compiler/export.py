@@ -62,6 +62,7 @@ from onnx import TensorProto, helper
 from torchwright.compiler.forward.compile import forward_compile
 from torchwright.graph import Concatenate, Embedding, LiteralValue, Node, PosEncoding
 from torchwright.graph.attn import CAUSAL_MASK_SENTINEL
+from torchwright.graph.rope import ROPE_BASE
 from torchwright.graph.misc import Assert, DebugWatch, InputNode
 
 HEADLESS_META_FORMAT = "torchwright.headless.v1"
@@ -239,9 +240,7 @@ def _diag_rects(matrix_id, rows, cols):
     i, n = 0, len(rows)
     while i < n:
         j = i
-        while (
-            j + 1 < n and rows[j + 1] == rows[j] + 1 and cols[j + 1] == cols[j] + 1
-        ):
+        while j + 1 < n and rows[j + 1] == rows[j] + 1 and cols[j + 1] == cols[j] + 1:
             j += 1
         length = j - i + 1
         rects.append(
@@ -667,12 +666,62 @@ def _add_scalar_inits(dense_inits: list) -> None:
 # ---------------------------------------------------------------------------
 
 
+def _rope_freq_row(d_head: int, base: float) -> np.ndarray:
+    """``(1, d_head)`` per-dim RoPE angular frequencies in the half-split layout.
+
+    Matches :func:`torchwright.graph.rope.rope_inv_freq` (``base^(-2k/d_head)``)
+    with each plane's frequency repeated across both halves, so the runtime
+    ``angle = pos · freq`` reproduces the in-process / oracle rotation.
+    """
+    p = np.arange(0, d_head, 2, dtype=np.float64)
+    inv = base ** (-p / d_head)  # (d_head/2,)
+    return np.concatenate([inv, inv]).astype(np.float32).reshape(1, d_head)
+
+
+def _maybe_add_rope_inits(
+    per_layer_rotary: list, d_head: int, dense_inits: list
+) -> float:
+    """Add the global RoPE initializers (``rope_freq``, ``rope_split``) when any
+    layer has a rotary head.  Returns the RoPE base (``0.0`` when inactive) so
+    the caller can gate the preamble cos/sin emission and record the base in the
+    sidecar meta.  All rotary layers must share one base (the single global
+    grid)."""
+    rope_active = any(r.get("any") for r in per_layer_rotary)
+    if not rope_active:
+        return 0.0
+    bases = {
+        r["base"] for r in per_layer_rotary if r.get("any") and r["base"] is not None
+    }
+    if len(bases) > 1:
+        raise NotImplementedError(
+            f"ONNX RoPE export requires one global base; got {sorted(bases)}."
+        )
+    base = bases.pop() if bases else ROPE_BASE
+    freq = _rope_freq_row(d_head, base)  # (1, d_head), guaranteed dense
+    dense_inits.append(
+        helper.make_tensor(
+            name="rope_freq",
+            data_type=TensorProto.FLOAT,
+            dims=list(freq.shape),
+            vals=freq.tobytes(),
+            raw=True,
+        )
+    )
+    _add_int64_init(
+        "rope_split",
+        np.array([d_head // 2, d_head // 2], dtype=np.int64),
+        dense_inits,
+    )
+    return float(base)
+
+
 def _make_stream_layer_weights_cb(
     d: int,
     d_head: int,
     dense_inits: list,
     sparse_inits: list,
     per_layer_n_heads: list,
+    per_layer_rotary: Optional[list] = None,
     trim_heads: bool = True,
 ) -> Callable[[int, object], None]:
     """Factory for the forward_compile on_layer_compiled callback.
@@ -716,6 +765,43 @@ def _make_stream_layer_weights_cb(
         nh = attn.n_heads  # post-trim head count
         hd = nh * d_head
         per_layer_n_heads.append(nh)
+
+        # RoPE: per-head enable vector.  Runtime rotation is full-width
+        # (rotate_half over d_head); a rotary head must therefore have
+        # rotary_width == d_head.  Partial-width rotary (the in-process
+        # capability) is not emitted to ONNX yet — fail loud rather than
+        # silently rotate the wrong dims.
+        rotary_width = list(getattr(attn, "rotary_width", [0] * nh))[:nh]
+        any_rotary = any(w != 0 for w in rotary_width)
+        if per_layer_rotary is not None:
+            per_layer_rotary.append(
+                {"any": any_rotary, "base": getattr(attn, "rope_base", None)}
+            )
+        if any_rotary:
+            for h, w in enumerate(rotary_width):
+                if w not in (0, d_head):
+                    raise NotImplementedError(
+                        f"ONNX RoPE requires rotary_width == d_head ({d_head}) "
+                        f"or 0; layer {i} head {h} has width {w}. Full-width "
+                        f"rotary heads only on the ONNX/HF runtime paths."
+                    )
+            enable = np.array(
+                [1.0 if w != 0 else 0.0 for w in rotary_width], dtype=np.float32
+            )
+            # Q is head-major (nh, n_new, d_head) -> enable (nh, 1, 1);
+            # delta_K is sequence-major (n_new, nh, d_head) -> enable (1, nh, 1).
+            _add_float_init(
+                f"l{i}_rope_enable_q",
+                enable.reshape(nh, 1, 1),
+                dense_inits,
+                sparse_inits,
+            )
+            _add_float_init(
+                f"l{i}_rope_enable_k",
+                enable.reshape(1, nh, 1),
+                dense_inits,
+                sparse_inits,
+            )
 
         def emit(name: str, arr: np.ndarray) -> None:
             dense_tp, sparse_tp = _tensor_to_proto(name, arr)
@@ -782,7 +868,7 @@ def _make_stream_layer_weights_cb(
 # ---------------------------------------------------------------------------
 
 
-def _emit_cached_preamble(nodes: list) -> None:
+def _emit_cached_preamble(nodes: list, rope_active: bool = False) -> None:
     """Emit nodes producing ``pos``, ``mask_bool_3d`` and ``_cache_pos_col``.
 
     Requires:
@@ -842,11 +928,13 @@ def _emit_cached_preamble(nodes: list) -> None:
     # _axes0_1d/_axes1_1d double as the [0]/[1] bounds constants.
     add("Shape", ["past_K_0"], ["_pastK0_shape"])  # (3,) int64, CPU
     add(
-        "Slice", ["_pastK0_shape", "_axes0_1d", "_axes1_1d", "_axes0_1d"],
+        "Slice",
+        ["_pastK0_shape", "_axes0_1d", "_axes1_1d", "_axes0_1d"],
         ["_s_eff_1d"],
     )  # (1,) = [S_eff], CPU
     add(
-        "Slice", ["arange_S", "_axes0_1d", "_s_eff_1d", "_axes0_1d"],
+        "Slice",
+        ["arange_S", "_axes0_1d", "_s_eff_1d", "_axes0_1d"],
         ["_slots"],
     )  # (S_eff,) GPU data, CPU bounds
     add("Unsqueeze", ["_slots", "_axes0_1d"], ["_slots_row"])  # (1, S_eff)
@@ -854,6 +942,22 @@ def _emit_cached_preamble(nodes: list) -> None:
     add("Greater", ["_slots_row", "_cache_pos_col"], ["_mask_bool"])  # (n_new, S_eff)
     add("Unsqueeze", ["_mask_bool", "_axes0_1d"], ["mask_bool_3d"])  # (1, n_new, S_eff)
     add("Gather", ["pos_encoding_full", "cache_position"], ["pos"], axis=0)
+
+    if rope_active:
+        # RoPE cos/sin from absolute positions, shared across layers.
+        # angle(pos, dim) = pos * rope_freq[dim]; rope_freq is the half-split
+        # per-dim frequency baked by the exporter.
+        add("Cast", ["cache_position"], ["_rope_pos_f"], to=TensorProto.FLOAT)
+        add("Unsqueeze", ["_rope_pos_f", "_axes1_1d"], ["_rope_pos_col"])  # (n_new,1)
+        add("Mul", ["_rope_pos_col", "rope_freq"], ["_rope_ang"])  # (n_new, d_head)
+        add("Cos", ["_rope_ang"], ["_rope_cos"])
+        add("Sin", ["_rope_ang"], ["_rope_sin"])
+        # Broadcast forms: head-major Q is (nh, n_new, d_head) -> (1,n_new,d_head);
+        # sequence-major delta_K is (n_new, nh, d_head) -> (n_new,1,d_head).
+        add("Unsqueeze", ["_rope_cos", "_axes0_1d"], ["_rope_cos_q"])
+        add("Unsqueeze", ["_rope_sin", "_axes0_1d"], ["_rope_sin_q"])
+        add("Unsqueeze", ["_rope_cos", "_axes1_1d"], ["_rope_cos_k"])
+        add("Unsqueeze", ["_rope_sin", "_axes1_1d"], ["_rope_sin_k"])
 
 
 def _emit_cached_layer_nodes(
@@ -864,6 +968,7 @@ def _emit_cached_layer_nodes(
     d_head: int,
     n_heads: int,
     scatter_idx_col: str = "_cache_pos_col",
+    rotary: Optional[dict] = None,
 ) -> str:
     """Emit cached attention + FFN nodes for one layer.
 
@@ -901,6 +1006,25 @@ def _emit_cached_layer_nodes(
     def node(op, ins, outs, **attrs):
         nodes.append(helper.make_node(op, ins, outs, **attrs))
 
+    rope_on = rotary is not None and rotary.get("any", False)
+
+    def rope_rotate(src: str, dst: str, cos: str, sin: str, enable: str) -> None:
+        """rotate_half RoPE blended per head: ``dst = src + enable*(rot - src)``.
+
+        ``rot = src*cos + rotate_half(src)*sin`` over the last (d_head) axis;
+        ``enable`` (1.0 rotary / 0.0 not) selects per head, so non-rotary heads
+        pass through unchanged.  Matches graph/rope.py (rotate_half, half-split).
+        """
+        node("Split", [src, "rope_split"], [f"{dst}_h1", f"{dst}_h2"], axis=-1)
+        node("Neg", [f"{dst}_h2"], [f"{dst}_h2n"])
+        node("Concat", [f"{dst}_h2n", f"{dst}_h1"], [f"{dst}_rh"], axis=-1)
+        node("Mul", [src, cos], [f"{dst}_c"])
+        node("Mul", [f"{dst}_rh", sin], [f"{dst}_s"])
+        node("Add", [f"{dst}_c", f"{dst}_s"], [f"{dst}_rot"])
+        node("Sub", [f"{dst}_rot", src], [f"{dst}_diff"])
+        node("Mul", [f"{dst}_diff", enable], [f"{dst}_de"])
+        node("Add", [src, f"{dst}_de"], [dst])
+
     # Project Q, K_new, V_new from the new rows in sequence-major
     # (n_new, n_heads, d_head).  The deltas (new rows only) are the graph
     # outputs the runtime writes into its owned cache tail; the reshape
@@ -910,7 +1034,21 @@ def _emit_cached_layer_nodes(
     node("Reshape", [f"{p}_Q_flat", f"{p}_qkv_view_shape"], [f"{p}_Q_sm"])
 
     node("MatMul", [current_res, f"{p}_WK"], [f"{p}_K_flat"])
-    node("Reshape", [f"{p}_K_flat", f"{p}_qkv_view_shape"], [f"delta_K_{layer_idx}"])
+    if rope_on:
+        # Rotate the new K (sequence-major) by absolute position, so the cache
+        # stores already-rotated K (matches the in-process component and HF).
+        node("Reshape", [f"{p}_K_flat", f"{p}_qkv_view_shape"], [f"{p}_K_sm"])
+        rope_rotate(
+            f"{p}_K_sm",
+            f"delta_K_{layer_idx}",
+            "_rope_cos_k",
+            "_rope_sin_k",
+            f"{p}_rope_enable_k",
+        )
+    else:
+        node(
+            "Reshape", [f"{p}_K_flat", f"{p}_qkv_view_shape"], [f"delta_K_{layer_idx}"]
+        )
 
     node("MatMul", [current_res, f"{p}_WV"], [f"{p}_V_flat"])
     node("Reshape", [f"{p}_V_flat", f"{p}_qkv_view_shape"], [f"delta_V_{layer_idx}"])
@@ -922,6 +1060,17 @@ def _emit_cached_layer_nodes(
     # delta into head-major (n_heads, seq, d_head); the past inputs and delta
     # outputs stay sequence-major for the runtime's contiguous-slice binding.
     node("Transpose", [f"{p}_Q_sm"], [f"{p}_Q"], perm=[1, 0, 2])
+    q_name = f"{p}_Q"
+    if rope_on:
+        # Rotate Q (head-major) by absolute position.
+        rope_rotate(
+            f"{p}_Q",
+            f"{p}_Q_roped",
+            "_rope_cos_q",
+            "_rope_sin_q",
+            f"{p}_rope_enable_q",
+        )
+        q_name = f"{p}_Q_roped"
     # Inject the new rows into the static cache at their absolute slots
     # (sequence-major ScatterND: indices (n_new, 1) select rows, updates are
     # the (n_new, nh, d_head) deltas), then transpose to head-major for
@@ -944,7 +1093,7 @@ def _emit_cached_layer_nodes(
 
     # Attention over the full (past + new) K and V.
     node("Transpose", [f"{p}_K_full"], [f"{p}_K_T"], perm=[0, 2, 1])
-    node("MatMul", [f"{p}_Q", f"{p}_K_T"], [f"{p}_logits"])
+    node("MatMul", [q_name, f"{p}_K_T"], [f"{p}_logits"])
     # Overwrite-mask with CAUSAL_MASK_SENTINEL (equivalent to torch's
     # masked_fill).  An additive penalty would leave masked positions at
     # "logit + penalty", which is not dominated by real logits when they
@@ -975,9 +1124,7 @@ def _emit_cached_layer_nodes(
     return f"{p}_res_next"
 
 
-def _kv_io_value_info(
-    per_layer_n_heads: List[int], d_head: int
-) -> tuple[list, list]:
+def _kv_io_value_info(per_layer_n_heads: List[int], d_head: int) -> tuple[list, list]:
     """Build ValueInfoProto entries for the KV-cache inputs and outputs.
 
     ``per_layer_n_heads`` gives the (possibly trimmed) head count for
@@ -1134,6 +1281,7 @@ def compile_headless_to_onnx(
     dense_inits: list = []
     sparse_inits: list = []
     per_layer_n_heads: list = []
+    per_layer_rotary: list = []
 
     on_layer_compiled = _make_stream_layer_weights_cb(
         d,
@@ -1141,6 +1289,7 @@ def compile_headless_to_onnx(
         dense_inits,
         sparse_inits,
         per_layer_n_heads,
+        per_layer_rotary,
         trim_heads=trim_heads,
     )
 
@@ -1248,7 +1397,9 @@ def compile_headless_to_onnx(
     def add(op, ins, outs, **attrs):
         nodes.append(helper.make_node(op, ins, outs, **attrs))
 
-    _emit_cached_preamble(nodes)
+    rope_base_val = _maybe_add_rope_inits(per_layer_rotary, d_head, dense_inits)
+    rope_active = rope_base_val > 0.0
+    _emit_cached_preamble(nodes, rope_active)
     add("MatMul", ["inputs", "input_proj"], ["inp_res"])
     add("MatMul", ["pos", "pos_proj"], ["pos_res"])
     add("Add", ["inp_res", "pos_res"], ["res_pi"])
@@ -1264,6 +1415,7 @@ def compile_headless_to_onnx(
             d_head,
             per_layer_n_heads[i],
             scatter_idx_col="_cache_pos_col",
+            rotary=per_layer_rotary[i],
         )
 
     add(
@@ -1453,6 +1605,7 @@ def compile_to_onnx(
     dense_inits: list = []
     sparse_inits: list = []
     per_layer_n_heads: list = []
+    per_layer_rotary: list = []
 
     on_layer_compiled = _make_stream_layer_weights_cb(
         d,
@@ -1460,6 +1613,7 @@ def compile_to_onnx(
         dense_inits,
         sparse_inits,
         per_layer_n_heads,
+        per_layer_rotary,
         trim_heads=trim_heads,
     )
 
@@ -1571,7 +1725,9 @@ def compile_to_onnx(
     def add(op, ins, outs, **attrs):
         nodes.append(helper.make_node(op, ins, outs, **attrs))
 
-    _emit_cached_preamble(nodes)
+    rope_base_val = _maybe_add_rope_inits(per_layer_rotary, d_head, dense_inits)
+    rope_active = rope_base_val > 0.0
+    _emit_cached_preamble(nodes, rope_active)
     # Token embedding lookup: (vocab, d_embed) gather rows by token_ids.
     add("Gather", ["embed_table", "token_ids"], ["_token_emb"], axis=0)
     add("MatMul", ["_token_emb", "embedding_proj"], ["inp_res"])
@@ -1589,6 +1745,7 @@ def compile_to_onnx(
             d_head,
             per_layer_n_heads[i],
             scatter_idx_col="_cache_pos_col",
+            rotary=per_layer_rotary[i],
         )
 
     add(
@@ -1639,6 +1796,8 @@ def compile_to_onnx(
         # first dim on past_K_i, loaders read S from here.
         "cache_stride": cache_stride_resolved,
     }
+    if rope_base_val:
+        token_meta["rope_base"] = rope_base_val
     if extra_metadata:
         token_meta["extra"] = dict(extra_metadata)
     meta_path = _write_meta(output_path, token_meta)
@@ -2220,9 +2379,7 @@ class CompiledHeadless:
         ra = net.residual_assignment
         assert ra is not None
 
-        res, new_kvs, state_tensor = self._capture_states(
-            res_stream, past_kvs=past_kvs
-        )
+        res, new_kvs, state_tensor = self._capture_states(res_stream, past_kvs=past_kvs)
         ordered_states = [s for _, _, s in _ordered_mlp_state_triples(net, ra)]
 
         self._debug_state = _DebugState(

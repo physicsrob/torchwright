@@ -7,6 +7,7 @@ from torch.nn.attention import SDPBackend, sdpa_kernel
 from torchwright.compiler.components.component import Component
 from torchwright.graph import PosEncoding
 from torchwright.graph.attn import CAUSAL_MASK_SENTINEL  # kept for compat
+from torchwright.graph.rope import ROPE_BASE, apply_rope, rope_cos_sin
 
 # F.scaled_dot_product_attention's default backend on A100 with fp32
 # inputs is EFFICIENT_ATTENTION, which on some inputs perturbs V by
@@ -48,8 +49,40 @@ class AttnLayerComponent(Component):
         self.value_matrix = torch.zeros(self.n_heads, d, d_head)
         self.output_matrix = torch.zeros(self.n_heads, d_head, d)
 
+        # Per-head rotary width: 0 = non-rotary; w > 0 rotates the head's
+        # first w (active d_qk) dims by absolute position before the QK dot
+        # product (rotate_half, see torchwright/graph/rope.py).  Set by the
+        # weight writer when it scatters a rotary Attn node.
+        self.rotary_width = [0] * self.n_heads
+        self.rope_base = ROPE_BASE
+
     def __repr__(self):
         return f"AttnLayerComponent(name='{self.name}')"
+
+    def _apply_rope(
+        self, Q: torch.Tensor, K: torch.Tensor, positions: torch.Tensor
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Rotate Q/K of rotary heads by ``positions`` (rotate_half over the
+        head's active d_qk dims).  Q/K are ``(n_heads, P, d_head)``; ``positions``
+        is ``(P,)`` of absolute positions.  Non-rotary heads pass through.
+
+        Each rotary plane lives entirely in the active ``[0:w]`` columns, so the
+        zero padding in ``[w:d_head]`` is untouched and the QK dot product over
+        ``d_head`` equals the dot over the rotated ``[0:w]`` — matching the
+        oracle, which rotates the same ``d_qk`` block (see graph/rope.py)."""
+        if all(w == 0 for w in self.rotary_width):
+            return Q, K
+        Q = Q.clone()
+        K = K.clone()
+        for h, w in enumerate(self.rotary_width):
+            if w == 0:
+                continue
+            cos, sin = rope_cos_sin(positions, w, self.rope_base)  # (P, w)
+            cos = cos.to(Q.dtype)
+            sin = sin.to(Q.dtype)
+            Q[h, :, :w] = apply_rope(Q[h, :, :w], cos, sin)
+            K[h, :, :w] = apply_rope(K[h, :, :w], cos, sin)
+        return Q, K
 
     def forward(self, inp: torch.Tensor):
         # inp shape (n_pos, d)
@@ -59,6 +92,11 @@ class AttnLayerComponent(Component):
         Q = torch.einsum("pd,hdk->hpk", inp, self.query_matrix)
         K = torch.einsum("pd,hdk->hpk", inp, self.key_matrix)
         V = torch.einsum("pd,hdk->hpk", inp, self.value_matrix)
+
+        # RoPE: prefill positions are 0..n_pos-1.
+        n_pos = inp.shape[0]
+        positions = torch.arange(n_pos, device=inp.device)
+        Q, K = self._apply_rope(Q, K, positions)
 
         # Fused attention kernel.  scale=1.0 preserves the raw dot-product
         # magnitude that all attention weights were compiled against (no
@@ -98,15 +136,23 @@ class AttnLayerComponent(Component):
         K_new = torch.einsum("pd,hdk->hpk", inp, self.key_matrix)
         V_new = torch.einsum("pd,hdk->hpk", inp, self.value_matrix)
 
+        n_new = inp.shape[0]
+        n_past = past_kv[0].shape[1] if past_kv is not None else 0
+
+        # RoPE: Q and the new K rotate by their ABSOLUTE positions
+        # n_past..n_past+n_new-1.  K is stored already-rotated, so the past K
+        # needs no re-rotation (slot == position; this matches HF, which
+        # rotates key_states before the cache update).
+        positions = torch.arange(n_past, n_past + n_new, device=inp.device)
+        Q, K_new = self._apply_rope(Q, K_new, positions)
+
         if past_kv is not None:
             K = torch.cat([past_kv[0], K_new], dim=1)
             V = torch.cat([past_kv[1], V_new], dim=1)
         else:
             K, V = K_new, V_new
 
-        n_new = inp.shape[0]
         n_total = K.shape[1]
-        n_past = n_total - n_new
 
         # Three regimes:
         #   pure prefill (no past, n_new == n_total): is_causal=True gives
@@ -143,7 +189,9 @@ class AttnLayerComponent(Component):
                     V.unsqueeze(0),
                     is_causal=(n_new == n_total),
                     scale=1.0,
-                ).squeeze(0)  # (n_heads, n_new, d_head)
+                ).squeeze(
+                    0
+                )  # (n_heads, n_new, d_head)
 
         output = torch.einsum("hpk,hkd->pd", weighted, self.output_matrix)
 
@@ -162,6 +210,7 @@ class AttnLayerComponent(Component):
             self.key_matrix = self.key_matrix[:n].contiguous()
             self.value_matrix = self.value_matrix[:n].contiguous()
             self.output_matrix = self.output_matrix[:n].contiguous()
+            self.rotary_width = self.rotary_width[:n]
             self.n_heads = n
 
     def num_params(self) -> int:
