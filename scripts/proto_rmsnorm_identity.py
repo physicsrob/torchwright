@@ -96,9 +96,9 @@ def run_case(max_digits, prompt, m, k_cols=K_COLS):
 
 def main():
     cases = [
-        (1, ["<bos", "2", "*", "3", "\n"], 1e9),
-        (3, ["<bos", "1", "2", "*", "3", "4", "\n"], 1e9),
-        (3, ["<bos", "9", "9", "9", "*", "9", "9", "9", "\n"], 1e9),
+        (1, ["<bos>", "2", "*", "3", "\n"], 1e9),
+        (3, ["<bos>", "1", "2", "*", "3", "4", "\n"], 1e9),
+        (3, ["<bos>", "9", "9", "9", "*", "9", "9", "9", "\n"], 1e9),
     ]
     print("=== identity check across cases (M=1e9, K_COLS=4) ===")
     for md, prompt, m in cases:
@@ -112,7 +112,7 @@ def main():
 
     print("\n=== sweep M (3-digit 999*999, the largest data energy) ===")
     for m in [1e9, 1e6, 1e4, 1e3, 1e2, 1e1]:
-        r = run_case(3, ["<bos", "9", "9", "9", "*", "9", "9", "9", "\n"], m)
+        r = run_case(3, ["<bos>", "9", "9", "9", "*", "9", "9", "9", "\n"], m)
         print(
             f" M={m:>7.0e}  C={r['C']:.3e}  rms_spread={r['rms_spread']:.3e}  "
             f"max|d|={r['max_abs_diff']:.3e}  decode_ok={r['decode_ok']}"
