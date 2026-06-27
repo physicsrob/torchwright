@@ -40,8 +40,7 @@ Correctness invariants (all from the compiler source; see the config docstring):
 
 Generation is plain greedy argmax-append with an EOS stop, i.e. stock
 ``generate(do_sample=False)``. The native model uses a stock unbounded
-``DynamicCache``; that is token-identical to the windowed production cache (a
-torchwright invariant), just heavier in memory.
+``DynamicCache``.
 
 Padding is not modeled: the mask is causal-only, so batched generation with
 left/right padding is unsupported. The consumers (calculator, DOOM) run a

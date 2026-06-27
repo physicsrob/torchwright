@@ -40,15 +40,6 @@ Constraints (stated upfront):
 * Fetching every residual snapshot costs
   ``n_pos × d × 2·n_layers`` floats on host per run — fine for
   debug-sized runs; probe very long prefills in slices.
-* Windowed-cache models (``cache_window=C``) are debugged under
-  **identity slot placement**: slot ``j`` = position ``j``, nothing is
-  ever evicted, and runs are capped at ``C`` committed rows (debug
-  longer runs in slices, or export an unbounded variant).  Identity
-  placement satisfies the exporter's host contract, so the windowed
-  equivalence guarantee applies and debug output is token-identical to
-  the unbounded export's.  The session never reproduces a host eviction
-  policy — probing a post-eviction state needs the host's own slot
-  contents and is out of scope here.
 """
 
 from __future__ import annotations
@@ -146,18 +137,6 @@ class OnnxDebugSession:
         import onnxruntime as ort
 
         sidecar = _sidecar_or_raise(onnx_path)
-        # Windowed-cache artifacts are debugged under IDENTITY slot
-        # placement: slot j = position j, nothing ever evicted.  That
-        # satisfies the exporter's host contract (committed slots filled
-        # in slot order, never wrapping), so by the exporter's own
-        # equivalence guarantee the debug output is token-identical to
-        # the unbounded export's — at the cost of a hard cap at C
-        # committed rows (enforced in _feeds).
-        self._cache_window: Optional[int] = (
-            int(sidecar["cache_window"])
-            if sidecar.get("cache_window") is not None
-            else None
-        )
 
         self._onnx_path = onnx_path
         self._kind: str = sidecar["kind"]  # "token" | "headless"
@@ -360,25 +339,9 @@ class OnnxDebugSession:
         (valid under stride bucketing) so debug runs never materialize
         the full stride buffer; old static-dim exports get full-width
         zero-padded feeds instead.
-
-        Windowed-cache artifacts bind exactly ``C + n_new`` wide (the
-        protocol requirement): committed rows at identity slots
-        ``[0, base)``, never-written slots ``[base, C)`` zeroed (the
-        writtenness mask gives them weight exactly 0.0), staging tail
-        ``[C, C+n_new)`` zeroed (the in-graph scatter overwrites it).
         """
         n_new = int(prefill.shape[0])
-        if self._cache_window is not None:
-            if base + n_new > self._cache_window:
-                raise RuntimeError(
-                    f"windowed-cache debug overrun: base {base} + n_new "
-                    f"{n_new} exceeds cache_window {self._cache_window}.  "
-                    f"This debug session uses identity slot placement and "
-                    f"never evicts, so a windowed artifact is debuggable up "
-                    f"to cache_window committed positions — debug longer "
-                    f"runs in slices, or export an unbounded variant"
-                )
-        elif base + n_new > self._cache_stride:
+        if base + n_new > self._cache_stride:
             raise RuntimeError(
                 f"static cache overrun: base {base} + n_new {n_new} exceeds "
                 f"cache_stride {self._cache_stride}"
@@ -393,9 +356,7 @@ class OnnxDebugSession:
             feeds["inputs"] = (
                 prefill.detach().cpu().numpy().astype(np.float32, copy=False)
             )
-        if self._cache_window is not None:
-            bind_width = self._cache_window + n_new
-        elif self._static_slot_dim is not None:
+        if self._static_slot_dim is not None:
             bind_width = self._static_slot_dim
         else:
             bind_width = base + n_new
@@ -628,16 +589,6 @@ class OnnxDebugSession:
         ``(n_heads, n_queries, n_keys)`` with ``n_keys = past + new`` —
         the same shape the in-process ``attention_capture`` hook
         produces.
-
-        On windowed-cache artifacts the wire key axis is ``C + n_new``
-        (committed window + staging tail); under this session's identity
-        placement the committed keys ``[0, base)`` already sit at their
-        positions and the new rows live at ``[C, C+n_new)``, so the two
-        bands are spliced back into the unbounded ``base + n_new`` layout
-        — key index == absolute position on every backend and protocol.
-        The dropped never-written band ``[base, C)`` is asserted to carry
-        weight exactly 0.0 first; anything else is a windowed-mask
-        emission bug.
         """
         if prefill.ndim == 1:
             prefill = prefill.reshape(-1, 1)
@@ -646,22 +597,4 @@ class OnnxDebugSession:
         weights_np, logits_np = self._session.run(
             [f"l{layer_index}_weights", f"l{layer_index}_logits_masked"], feeds
         )
-        if self._cache_window is not None:
-            C = self._cache_window
-            dead = weights_np[:, :, base:C]
-            if dead.size and float(np.abs(dead).max()) != 0.0:
-                raise RuntimeError(
-                    f"windowed mask leak at layer {layer_index}: never-written "
-                    f"committed slots [{base}, {C}) received attention weight "
-                    f"(max {float(np.abs(dead).max()):.3e}, expected exactly "
-                    f"0.0) — the writtenness mask in the windowed preamble is "
-                    f"broken (ONNX emission bug in "
-                    f"torchwright/compiler/export.py — D1: stop and report)"
-                )
-            weights_np = np.concatenate(
-                [weights_np[:, :, :base], weights_np[:, :, C:]], axis=2
-            )
-            logits_np = np.concatenate(
-                [logits_np[:, :, :base], logits_np[:, :, C:]], axis=2
-            )
         return torch.from_numpy(weights_np), torch.from_numpy(logits_np)

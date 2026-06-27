@@ -47,16 +47,13 @@ from onnx import numpy_helper
 from torchwright.compiler.export import meta_path_for, debug_meta_path_for
 
 # These initializers are the cached-protocol scaffolding (mask sentinel, slot
-# arange, reshape constants, windowed scalars) — structural, not weights. Every
-# other initializer must map to a model parameter or the converter raises.
+# arange, reshape constants) — structural, not weights. Every other initializer
+# must map to a model parameter or the converter raises.
 _IGNORABLE_EXACT = {
     "arange_S",
     "_f32_causal_sentinel_s",
     "_axes0_1d",
     "_axes1_1d",
-    "_i64_neg1_s",
-    "_i64_far_future_s",
-    "_i64_cwin_s",
 }
 _IGNORABLE_SUFFIX = ("_qkv_view_shape", "_ctx_flat_shape")
 

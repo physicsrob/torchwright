@@ -282,8 +282,8 @@ order) raises a `TypeError` naming the new order.
 
 Both exporters return an **`OnnxArtifact`**: the written paths
 (`path`, `meta_path`, `debug_path`) plus small build metadata (`kind`,
-`n_layers`, `per_layer_n_heads`, `d`, `d_head`, `cache_stride`,
-`cache_window`; token exports add `d_embed`/`vocab_size`).  It is
+`n_layers`, `per_layer_n_heads`, `d`, `d_head`, `cache_stride`;
+token exports add `d_embed`/`vocab_size`).  It is
 built strictly from paths and scalars after export completes — it
 holds no graph, no weights, no exporter state (the exporters'
 streaming memory bound is a hard invariant).  `artifact.load()`
@@ -425,14 +425,6 @@ Requirements and caveats:
   put it on a hot path.
 - Fetching all snapshots costs `n_pos × d × 2·n_layers` floats per
   run — probe very long prefills in slices.
-- Windowed-cache models (`cache_window=C`) are debugged under
-  identity slot placement (slot j = position j, nothing evicted),
-  capped at `C` committed rows — that satisfies the exporter's host
-  contract, so debug output is token-identical to the unbounded
-  export's.  Probe attention key indices are absolute positions on
-  both protocols (the session splices out the windowed wire layout).
-  Debug longer runs in slices, or export an unbounded variant; the
-  session never reproduces a host eviction policy.
 
 ## probe_compiled — full oracle comparison
 

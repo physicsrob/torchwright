@@ -63,8 +63,7 @@ class TorchwrightConfig(PretrainedConfig):
             float-I/O head is a noted future extension).
         cache_stride: The static KV-cache slot count ``S`` baked into the
             source ONNX artifact, kept for provenance. The native model uses a
-            stock unbounded cache, which is token-identical to the windowed
-            production cache.
+            stock unbounded cache.
     """
 
     model_type = "torchwright"
