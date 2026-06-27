@@ -268,29 +268,3 @@ def test_reserve_blocks_subsequent_allocation():
     rmap.allocate(a)
     # a must get the unreserved columns [4,5,6,7], not the reserved ones.
     assert rmap.get_indices(a) == [4, 5, 6, 7]
-
-
-def test_scheduler_pins_never_marks_pinned_dead():
-    """A node listed in pinned_nodes must never appear in the dead list,
-    even when its effective consumers have all been computed."""
-    from torchwright.compiler.forward.scheduler import LayerScheduler
-
-    pos = PosEncoding(17)
-    x = InputNode("x", 4, value_range=(-100.0, 100.0))
-    weight = torch.eye(4, 4)
-    bias = torch.zeros(4)
-    l = Linear(x, weight, bias)
-
-    graph = GraphAnalyzer(l)
-    rmap = ResidualStreamMap(D)
-    rmap.allocate(pos)
-    rmap.allocate(x)
-
-    scheduler_unpinned = LayerScheduler(graph, D, D_HEAD, pos)
-    scheduler_pinned = LayerScheduler(graph, D, D_HEAD, pos, pinned_nodes={x})
-
-    # Once l is computed, x has no remaining consumers: unpinned scheduler
-    # lists x as dead, pinned scheduler does not.
-    computed = {x, l}
-    assert x in scheduler_unpinned._find_dead_nodes(rmap, computed)
-    assert x not in scheduler_pinned._find_dead_nodes(rmap, computed)

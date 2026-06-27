@@ -117,7 +117,6 @@ def _run_heuristic_warm_start(
     clusters,
     admission_budget_fraction: float,
     policy: Optional[SchedulingPolicy],
-    overlay_pinned_inputs: Set[Node],
     output_node: Node,
     max_layers: int,
 ) -> tuple[dict, dict, dict, int]:
@@ -141,7 +140,6 @@ def _run_heuristic_warm_start(
         clusters=clusters,
         admission_budget_fraction=admission_budget_fraction,
         policy=policy,
-        pinned_nodes=overlay_pinned_inputs,
         # The warm-start must hand CP-SAT a *model-representable* schedule.
         # Eager (within-layer) freeing produces a shallower schedule that frees
         # and reuses a column inside a consumer's layer — a density the
@@ -553,11 +551,6 @@ def forward_compile(
     if policy is None:
         policy = SchedulingPolicy()
 
-    # The scheduler's pin set (a general "never free these nodes" capability
-    # used by the in-tree forward-cost analysis scripts) stays empty here —
-    # nothing in the compile path pins nodes against freeing.
-    overlay_pinned_inputs: set[Node] = set()
-
     # Map optimize level to CP-SAT time budget.  Level 0 skips CP-SAT
     # entirely; higher levels accept best-feasible (not proven-optimal)
     # at budget exhaustion and fall back to the heuristic if CP-SAT
@@ -644,7 +637,6 @@ def forward_compile(
                     clusters=clusters,
                     admission_budget_fraction=admission_budget_fraction,
                     policy=policy,
-                    overlay_pinned_inputs=overlay_pinned_inputs,
                     output_node=output_node,
                     max_layers=max_layers,
                 )
@@ -833,8 +825,7 @@ def forward_compile(
                 clusters=clusters,
                 admission_budget_fraction=admission_budget_fraction,
                 policy=policy,
-                pinned_nodes=overlay_pinned_inputs,
-            )
+                    )
         else:
             if verbose and net.cpsat_solve_stats.status_name != "CACHED":
                 solve_time = time.perf_counter() - t_solve_start
@@ -852,8 +843,7 @@ def forward_compile(
                 clusters=clusters,
                 admission_budget_fraction=admission_budget_fraction,
                 policy=policy,
-                pinned_nodes=overlay_pinned_inputs,
-            )
+                    )
     else:
         scheduler = LayerScheduler(
             graph,
@@ -864,8 +854,7 @@ def forward_compile(
             clusters=clusters,
             admission_budget_fraction=admission_budget_fraction,
             policy=policy,
-            pinned_nodes=overlay_pinned_inputs,
-        )
+            )
 
     # Save input indices before scheduling (scheduling may free/reassign them)
     input_indices: dict[Node, list[int]] = {
