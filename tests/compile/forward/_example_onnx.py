@@ -44,14 +44,13 @@ def load_example(build_fn, out_dir, *, d=D, d_head=D_HEAD, name="example"):
     return load_onnx(onnx_path), artifact
 
 
-def run(model, input_text, *, bos_token="<bos", max_new_tokens=24):
+def run(model, input_text, *, bos_token="<bos>", max_new_tokens=24):
     """Argmax-decode one prompt; return the joined output string.
 
     ``input_text`` is everything after the BOS token: the example's old
     ``["<bos>"] + list(input) [+ ["\\n"]]`` prompt becomes ``bos_token``
-    plus this string.  ``bos_token`` is ``"<bos"`` for adder/calculator (a
-    vocab quirk — their BOS has no closing ``>``) and ``"<bos>"`` for the
-    rest.
+    plus this string.  ``bos_token`` defaults to ``"<bos>"`` for every
+    example.
     """
     return "".join(
         model.generate(input_text, bos_token=bos_token, max_new_tokens=max_new_tokens)

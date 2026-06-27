@@ -250,16 +250,16 @@ def _assert_all_mapped(inits: Dict[str, np.ndarray], consumed: set) -> None:
 def convert_onnx_to_hf(
     onnx_path: str,
     *,
-    bos_token: Optional[str] = "<bos",
+    bos_token: Optional[str] = "<bos>",
     eos_token: Optional[str] = "<eos>",
 ):
     """Load an ONNX token artifact and return an in-memory ``TorchwrightForCausalLM``.
 
     fp32, ``eval()`` mode. ``bos_token`` / ``eos_token`` are looked up in the
     vocab to populate the config's token ids, and must exist in it (a wrong
-    token raises; pass ``None`` for a model with no bos/eos). The calculator
-    vocab spells BOS as ``"<bos"`` (no closing bracket) but EOS as ``"<eos>"`` —
-    hence the asymmetric defaults; DOOM passes ``begin`` / ``done``.
+    token raises; pass ``None`` for a model with no bos/eos). The generic
+    example vocab's control tokens are ``"<bos>"`` / ``"<eos>"`` (hence the
+    defaults); DOOM passes ``begin`` / ``done``.
     """
     import torch
 
@@ -297,7 +297,7 @@ def save_bundle(
     onnx_path: str,
     save_dir: str,
     *,
-    bos_token: Optional[str] = "<bos",
+    bos_token: Optional[str] = "<bos>",
     eos_token: Optional[str] = "<eos>",
     add_bos_token: bool = True,
     write_tokenizer: bool = True,

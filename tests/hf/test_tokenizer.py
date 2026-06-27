@@ -16,7 +16,7 @@ pytest.importorskip("transformers")
 
 from torchwright.compiler.hf.tokenization_torchwright import TorchwrightTokenizer
 
-_VOCAB = ["<unk>", "<bos", "<eos>"] + list("0123456789+-*\n")
+_VOCAB = ["<unk>", "<bos>", "<eos>"] + list("0123456789+-*\n")
 
 
 @pytest.fixture
@@ -28,7 +28,7 @@ def vocab_file(tmp_path):
 
 def test_char_level_encode_decode_round_trip(vocab_file):
     tok = TorchwrightTokenizer(
-        vocab_file=vocab_file, bos_token="<bos", eos_token="<eos>"
+        vocab_file=vocab_file, bos_token="<bos>", eos_token="<eos>"
     )
     ids = tok("12*34\n")["input_ids"]
     # bos prepended, then one id per character.
@@ -40,7 +40,7 @@ def test_char_level_encode_decode_round_trip(vocab_file):
 def test_add_bos_token_false_persists(tmp_path, vocab_file):
     tok = TorchwrightTokenizer(
         vocab_file=vocab_file,
-        bos_token="<bos",
+        bos_token="<bos>",
         eos_token="<eos>",
         add_bos_token=False,
     )

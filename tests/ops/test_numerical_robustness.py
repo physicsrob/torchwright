@@ -18,7 +18,7 @@ from torchwright.ops.inout_nodes import create_literal_value, create_embedding
 from torchwright.ops.logic_ops import equals_vector
 from torchwright.ops.map_select import map_to_table, select
 
-VOCAB = [str(i) for i in range(10)] + ["+", "-", "*", "=", "<eos>", "<bos"]
+VOCAB = [str(i) for i in range(10)] + ["+", "-", "*", "=", "<eos>", "<bos>"]
 
 
 def _make_digit_embedding():

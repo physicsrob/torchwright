@@ -48,7 +48,7 @@ def create_network(max_digits: int = 3) -> Unembedding:
     """
     vocab = list(
         " 0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ!@#$%^&*()-+="
-    ) + ["\n", "<bos", "<eos>", "default"]
+    ) + ["\n", "<bos>", "<eos>", "default"]
     embedding = create_embedding(vocab=vocab)
     pos_encoding = create_pos_encoding()
 

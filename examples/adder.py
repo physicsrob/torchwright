@@ -37,7 +37,7 @@ def create_network_parts() -> Tuple[Node, PosEncoding, Embedding]:
     """Build the 3-digit adder graph and return (output_node, pos_encoding, embedding)."""
     vocab = list(
         " 0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ!@#$%^&*()-+="
-    ) + ["\n", "<bos", "<eos>", "default"]
+    ) + ["\n", "<bos>", "<eos>", "default"]
     embedding = create_embedding(vocab=vocab)
     pos_encoding = create_pos_encoding()
 

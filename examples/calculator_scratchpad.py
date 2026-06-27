@@ -924,7 +924,7 @@ def _parse(
     digit windows (one-hot embeddings, MSB-first, length ``n``, latched and held
     forward), three latched ±1 operator flags, and the newline trigger.
 
-    Input layout (``<bos`` at position 0): ``A`` digits at ``1..n``, operator at
+    Input layout (``<bos>`` at position 0): ``A`` digits at ``1..n``, operator at
     ``n+1``, ``B`` digits at ``n+2..2n+1``, newline at ``2n+2``.  Every operand
     digit therefore sits at a fixed offset from the newline, read directly
     instead of through an ``O(n)`` sliding window.

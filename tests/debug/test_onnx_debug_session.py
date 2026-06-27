@@ -50,7 +50,7 @@ from torchwright.debug.onnx_debug import OnnxDebugSession  # noqa: E402
 
 D = 1024
 D_HEAD = 16
-TOKENS = ["<bos", "1", "+", "2", "\n"]
+TOKENS = ["<bos>", "1", "+", "2", "\n"]
 
 
 def _build_adder():

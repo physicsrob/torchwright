@@ -13,7 +13,7 @@ The vocabulary is the compiler's token list (the ``vocab`` array in the ONNX
 trivial-ASCII surfaces this serves (e.g. the calculator: digits, ``+ - *``,
 newline), every printable token is a single character, so encoding is
 character-level — ``"12*34\n"`` → ids for ``1 2 * 3 4 \n``. Multi-character
-control tokens (``<bos`` / ``<eos>`` / ``<unk>``) are registered as special
+control tokens (``<bos>`` / ``<eos>`` / ``<unk>``) are registered as special
 tokens and split out before the character pass, exactly as ``transformers``
 does for any added token.
 
@@ -49,7 +49,7 @@ class TorchwrightTokenizer(PreTrainedTokenizer):
         vocab_file: str | None = None,
         *,
         unk_token: str = "<unk>",
-        bos_token: str = "<bos",
+        bos_token: str = "<bos>",
         eos_token: str = "<eos>",
         add_bos_token: bool = True,
         **kwargs,

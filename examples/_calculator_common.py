@@ -28,6 +28,7 @@ from typing import Dict, List, Tuple
 import torch
 
 from torchwright.graph import Embedding, Linear, Node, PosEncoding
+from torchwright.graph.embedding import bos_token
 from torchwright.ops.arithmetic_ops import compare as _compare_scalar, concat
 from torchwright.ops.inout_nodes import (
     create_literal_value,
@@ -53,7 +54,15 @@ D_MODEL = 1024
 # Compact, calculator-only vocabulary: 10 digits, 3 operators, the newline that
 # ends the input, a space (the pre-result placeholder), a BOS, and an EOS that
 # pads / terminates the result.  17 tokens -> d_embed = 17 one-hot columns.
-CALC_VOCAB = [str(d) for d in range(10)] + ["+", "-", "*", "\n", " ", "<bos", "<eos>"]
+CALC_VOCAB = [str(d) for d in range(10)] + [
+    "+",
+    "-",
+    "*",
+    "\n",
+    " ",
+    bos_token,
+    "<eos>",
+]
 
 
 # ---------------------------------------------------------------------------

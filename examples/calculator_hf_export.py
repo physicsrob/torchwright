@@ -34,7 +34,7 @@ import argparse
 import os
 
 ONNX_PATH = "calculator_v2.onnx"
-BOS = "<bos"
+BOS = "<bos>"
 EOS = "<eos>"
 
 _MODEL_CARD = """\
@@ -56,7 +56,7 @@ This is a **compiled** transformer: a computation graph for integer arithmetic
 here as a native `transformers` causal LM. The weights are not trained — they
 are *emitted* by a compiler from the arithmetic graph.
 
-* **Task**: greedy text generation. Prompt `"<bos" + "12*34\\n"`, read back the
+* **Task**: greedy text generation. Prompt `"<bos>" + "12*34\\n"`, read back the
   digits of the answer until `"<eos>"`.
 * **Precision**: **fp32 only**. The compiled attention relies on exact algebraic
   cancellation; a fp16/bf16 downcast breaks correctness.

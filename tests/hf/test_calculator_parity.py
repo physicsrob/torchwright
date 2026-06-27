@@ -41,7 +41,7 @@ from torchwright.compiler.onnx_load import load_onnx
 
 from tests.hf._hf_parity import compile_example
 
-_BOS = "<bos"
+_BOS = "<bos>"
 _EOS = "<eos>"
 
 # In-range gate: add/sub at any magnitude, mult with comfortable digit margin.
