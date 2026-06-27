@@ -1,19 +1,12 @@
 """Compile a torchwright graph to a KV-cached ONNX model.
 
-Two exporters, symmetric, both returning an :class:`OnnxArtifact`
-(paths + small build metadata; ``artifact.load()`` /
-``artifact.debug_session(...)``):
+One exporter returning an :class:`OnnxArtifact` (paths + small build
+metadata; ``artifact.load()`` / ``artifact.debug_session(...)``):
 
     compile_to_onnx(output_node, pos_encoding, embedding, path, ...)
         Token I/O: token_ids -> logits.  Sidecar format
         ``torchwright.token.v1`` carries the vocab.  Consumer:
         ``OnnxTokenModule`` via
-        :func:`torchwright.compiler.onnx_load.load_onnx`.
-
-    compile_headless_to_onnx(output_node, pos_encoding, path, ...)
-        Float I/O: inputs -> outputs.  Sidecar format
-        ``torchwright.headless.v1`` carries the alphabetically-ordered
-        input column names.  Consumer: ``OnnxHeadlessModule`` via
         :func:`torchwright.compiler.onnx_load.load_onnx`.
 
 Both speak the STATIC-cache prefill/decode protocol (the vanilla
@@ -64,7 +57,6 @@ from torchwright.graph import Concatenate, Embedding, LiteralValue, Node, PosEnc
 from torchwright.graph.attn import CAUSAL_MASK_SENTINEL
 from torchwright.graph.misc import Assert, DebugWatch, InputNode
 
-HEADLESS_META_FORMAT = "torchwright.headless.v1"
 TOKEN_META_FORMAT = "torchwright.token.v1"
 DEBUG_META_FORMAT = "torchwright.debug.v1"
 
@@ -102,34 +94,6 @@ def _write_meta(onnx_path: str, meta: dict) -> str:
     return meta_path
 
 
-def _write_headless_meta(
-    onnx_path: str,
-    input_names: List[str],
-    extra: Optional[dict] = None,
-    cache_stride: Optional[int] = None,
-) -> str:
-    """Write the headless sidecar JSON, optionally with an ``extra`` dict.
-
-    ``extra`` is a free-form dict for per-export metadata (e.g. DOOM's
-    ``rows_per_patch`` — surfaced to the host via
-    :class:`OnnxHeadlessModule.metadata`). Kept totally general so the
-    compiler layer has no project-specific keys.
-
-    ``cache_stride`` is the full static slot count ``S`` — the loaders
-    need it from the sidecar because ``past_K_i``'s first dim is the
-    symbolic ``cache_slots``, not a readable int.
-    """
-    meta: dict = {
-        "format": HEADLESS_META_FORMAT,
-        "input_names": list(input_names),
-    }
-    if cache_stride is not None:
-        meta["cache_stride"] = int(cache_stride)
-    if extra:
-        meta["extra"] = dict(extra)
-    return _write_meta(onnx_path, meta)
-
-
 def debug_meta_path_for(onnx_path: str) -> str:
     base, _ = os.path.splitext(onnx_path)
     return base + ".debug.json"
@@ -139,7 +103,7 @@ def debug_meta_path_for(onnx_path: str) -> str:
 class OnnxArtifact:
     """Paths + small build metadata for a finished ONNX export.
 
-    Returned by :func:`compile_to_onnx` and :func:`compile_headless_to_onnx`
+    Returned by :func:`compile_to_onnx`
     so consumers stop reconstructing paths and build facts by convention
     (re-reading layer counts out of the ONNX file, rebuilding
     ``d_embed``/``vocab_size`` from globals).
@@ -154,7 +118,7 @@ class OnnxArtifact:
     path: str
     meta_path: str
     debug_path: Optional[str]  # None when debug_sidecar=False
-    kind: str  # "token" | "headless"
+    kind: str  # always "token"
     n_layers: int
     per_layer_n_heads: Tuple[int, ...]  # tuple copy, not the exporter's live list
     d: int
@@ -166,8 +130,7 @@ class OnnxArtifact:
     def load(self, providers=None):
         """Load the artifact via :func:`torchwright.compiler.onnx_load.load_onnx`.
 
-        Returns an ``OnnxTokenModule`` or ``OnnxHeadlessModule`` per
-        ``kind``.
+        Returns an ``OnnxTokenModule``.
         """
         # Function-level import: onnx_load imports from this module at
         # module level, so importing it at the top would be a cycle.
@@ -494,7 +457,7 @@ def _write_debug_sidecar(
         }
     payload = {
         "format": DEBUG_META_FORMAT,
-        "kind": kind,  # "token" | "headless"
+        "kind": kind,  # always "token"
         "fingerprint": debug_fingerprint(out, pos_encoding, d=d, d_head=d_head),
         "d": d,
         "d_head": d_head,
@@ -1056,314 +1019,6 @@ def _resolve_cache_stride(
     return s
 
 
-def compile_headless_to_onnx(
-    output_node: Node,
-    pos_encoding: PosEncoding,
-    output_path: str,
-    d: int = 1024,
-    d_head: int = 16,
-    max_seq_len: int = 512,
-    max_layers: int = 400,
-    verbose: bool = False,
-    extra_metadata: Optional[dict] = None,
-    d_hidden: Optional[int] = None,
-    trim_heads: bool = True,
-    optimize: int = 0,
-    assume_zero_init: bool = True,
-    cache_stride: Optional[int] = None,
-    debug_sidecar: bool = True,
-) -> OnnxArtifact:
-    """Compile a float-I/O graph to a KV-cached ONNX model.
-
-    Returns an :class:`OnnxArtifact` (paths + small build metadata;
-    ``artifact.load()`` for the runtime, ``artifact.debug_session(...)``
-    for the debug surface).
-
-    Writes three files:
-        ``<output_path>``     — the ONNX model
-        ``<stem>.meta.json``  — ``{"format": "torchwright.headless.v1",
-                                   "input_names": [...]}``
-        ``<stem>.debug.json`` — the debug sidecar consumed by
-                                :class:`torchwright.debug.onnx_debug.
-                                OnnxDebugSession` (see
-                                :func:`compile_to_onnx`).  Disable with
-                                ``debug_sidecar=False``.
-
-    The graph speaks the static-cache prefill/decode protocol:
-        inputs:  inputs (n_new, d_input), cache_position (n_new,) int64,
-                 past_K_i, past_V_i (cache_slots, n_heads, d_head)
-                 [cache_slots SYMBOLIC: the bound prefix length S_eff]
-        outputs: outputs (n_new, d_output),
-                 delta_K_i, delta_V_i (n_new, n_heads, d_head)
-
-    K/V are sequence-major; ``past_K_i`` is a contiguous prefix view
-    ``cache[: S_eff]`` of the feeder's full-stride cache (slots at
-    positions >= the committed length zero-filled; any
-    ``base + n_new <= S_eff <= cache_stride`` is valid — stride
-    bucketing), ``delta_K_i`` is the new rows only, persisted by the
-    runtime into its owned cache slots after the run.  Prefill = zero
-    past + cache_position [0..n).  Decode = cache_position [base]
-    against a covering prefix binding.  Binding the full buffer
-    reproduces the previous static-dim behavior exactly.
-
-    ``cache_stride`` is the FULL slot count ``S`` (the ``arange_S`` mask
-    constant's length, the maximum any binding may use, and the sidecar
-    meta's ``cache_stride`` key); defaults to ``max_seq_len``.  A
-    compiled model hard-caps at ``prefill + decode <= S``.
-
-    ``d_hidden`` is the per-layer MLP hidden width.  Defaults to ``d``
-    when omitted; pass an explicit value to decouple the MLP intermediate
-    width from the residual stream width.
-
-    ``assume_zero_init`` defaults to ``True`` (see :func:`compile_to_onnx`):
-    the ONNX runtime always builds the residual stream from zeros plus the
-    input projections, so BIRTH-layer dirty-column cancels are unnecessary and
-    skipping them keeps the CP-SAT attention-head cumulative from being
-    over-tight under width pressure.
-    """
-    # Validate the cache config up front — a ValueError after the
-    # (potentially very long) streaming compile would waste the whole run.
-    cache_stride_resolved = _resolve_cache_stride(cache_stride, max_seq_len)
-
-    # Assert/DebugWatch coverage must be collected BEFORE forward_compile
-    # strips both wrapper kinds from the graph in-place.
-    from torchwright.graph.asserts import collect_debug_nodes
-
-    all_asserts, all_watches = collect_debug_nodes(output_node)
-
-    dense_inits: list = []
-    sparse_inits: list = []
-    per_layer_n_heads: list = []
-
-    on_layer_compiled = _make_stream_layer_weights_cb(
-        d,
-        d_head,
-        dense_inits,
-        sparse_inits,
-        per_layer_n_heads,
-        trim_heads=trim_heads,
-    )
-
-    # --- Phase 1: streaming compile ---------------------------------------
-    t0 = time.perf_counter()
-    compiled = forward_compile(
-        d=d,
-        d_head=d_head,
-        output_node=output_node,
-        pos_encoding=pos_encoding,
-        verbose=verbose,
-        max_layers=max_layers,
-        device=None,
-        on_layer_compiled=on_layer_compiled,
-        d_hidden=d_hidden,
-        trim_heads=trim_heads,
-        optimize=optimize,
-        assume_zero_init=assume_zero_init,
-    )
-    t_compile = time.perf_counter() - t0
-    if verbose and per_layer_n_heads:
-        _max_heads = d // d_head
-        _total = _max_heads * len(per_layer_n_heads)
-        _kept = sum(per_layer_n_heads)
-        print(
-            f"  Head pruning (ONNX): {_total - _kept}/{_total} heads pruned; "
-            f"per-layer heads range [{min(per_layer_n_heads)}, "
-            f"{max(per_layer_n_heads)}] of {_max_heads}"
-        )
-
-    # --- Phase 2: metadata + graph assembly -------------------------------
-    assert compiled.residual_assignment is not None
-    n_layers = len(compiled.layers)
-
-    t0 = time.perf_counter()
-    in_state = compiled.layers[0].attn.in_state
-    out_state = compiled.layers[-1].mlp.out_state
-
-    input_nodes_list: List[tuple] = []
-    pos_indices: Optional[List[int]] = None
-    constant_values = np.zeros(d, dtype=np.float32)
-
-    for node in compiled.residual_assignment.get_nodes(in_state):
-        indices = compiled.residual_assignment.get_node_indices(in_state, node)
-        if isinstance(node, InputNode):
-            input_nodes_list.append((node.name, indices))
-        elif isinstance(node, PosEncoding):
-            pos_indices = indices
-        elif isinstance(node, LiteralValue):
-            for k, idx in enumerate(indices):
-                constant_values[idx] = float(node.value[k])
-        elif isinstance(node, (Concatenate, Embedding)):
-            pass
-
-    assert len(input_nodes_list) > 0, "No InputNode found in residual assignment"
-    assert pos_indices is not None, "No PosEncoding node found in residual assignment"
-
-    input_nodes_list.sort(key=lambda x: x[0])
-    input_names = [name for name, _ in input_nodes_list]
-
-    all_input_indices: List[int] = []
-    for _, idx in input_nodes_list:
-        all_input_indices.extend(idx)
-    d_input = len(all_input_indices)
-
-    input_proj = np.zeros((d_input, d), dtype=np.float32)
-    for k, idx in enumerate(all_input_indices):
-        input_proj[k, idx] = 1.0
-
-    d_pos = len(pos_indices)
-    pos_proj = np.zeros((d_pos, d), dtype=np.float32)
-    for k, idx in enumerate(pos_indices):
-        pos_proj[k, idx] = 1.0
-
-    pos_encoding_buf = _compute_pos_encoding(d_pos, max_seq_len)
-
-    output_indices = compiled.residual_assignment.get_node_indices(
-        out_state, _unwrap_output_node(output_node)
-    )
-    output_gather_indices = np.asarray(output_indices, dtype=np.int64)
-    d_output = len(output_gather_indices)
-
-    # Initializers
-    _add_float_init("input_proj", input_proj, dense_inits, sparse_inits)
-    _add_float_init("pos_proj", pos_proj, dense_inits, sparse_inits)
-    _add_float_init("constant_values", constant_values, dense_inits, sparse_inits)
-    _add_float_init("pos_encoding_full", pos_encoding_buf, dense_inits, sparse_inits)
-    _add_int64_init("output_gather_indices_init", output_gather_indices, dense_inits)
-    # Baked slot indices [0..S), S = the FULL stride: the preamble slices
-    # this GPU-resident constant to the bound prefix length S_eff and the
-    # causal mask compares the slice against cache_position.  Keeping the
-    # arange baked (vs a Range op) is what keeps the slot data GPU-side —
-    # only scalar slice bounds live on CPU, so no Memcpy (the CUDA-graph
-    # capture requirement; see _emit_cached_preamble).
-    _add_int64_init(
-        "arange_S", np.arange(cache_stride_resolved, dtype=np.int64), dense_inits
-    )
-    # Per-layer reshape constants (l{i}_qkv_view_shape, l{i}_ctx_flat_shape)
-    # are emitted by the streaming weight callback.
-    _add_scalar_inits(dense_inits)
-
-    # Nodes: preamble (mask + pos), residual stream, layers, postamble.
-    nodes: list = []
-
-    def add(op, ins, outs, **attrs):
-        nodes.append(helper.make_node(op, ins, outs, **attrs))
-
-    _emit_cached_preamble(nodes)
-    add("MatMul", ["inputs", "input_proj"], ["inp_res"])
-    add("MatMul", ["pos", "pos_proj"], ["pos_res"])
-    add("Add", ["inp_res", "pos_res"], ["res_pi"])
-    add("Add", ["res_pi", "constant_values"], ["res_0"])
-
-    current_res = "res_0"
-    for i in range(n_layers):
-        current_res = _emit_cached_layer_nodes(
-            nodes,
-            i,
-            current_res,
-            d,
-            d_head,
-            per_layer_n_heads[i],
-            scatter_idx_col="_cache_pos_col",
-        )
-
-    add(
-        "Gather",
-        [current_res, "output_gather_indices_init"],
-        ["outputs"],
-        axis=1,
-    )
-
-    # Graph I/O value infos
-    inputs_vi = helper.make_tensor_value_info(
-        "inputs", TensorProto.FLOAT, ["n_new", d_input]
-    )
-    cache_position_vi = helper.make_tensor_value_info(
-        "cache_position", TensorProto.INT64, ["n_new"]
-    )
-    past_vis, new_vis = _kv_io_value_info(per_layer_n_heads, d_head)
-    outputs_vi = helper.make_tensor_value_info(
-        "outputs", TensorProto.FLOAT, ["n_new", d_output]
-    )
-
-    graph = helper.make_graph(
-        nodes,
-        "headless_transformer_cached",
-        inputs=[inputs_vi, cache_position_vi, *past_vis],
-        outputs=[outputs_vi, *new_vis],
-        initializer=dense_inits,
-        sparse_initializer=sparse_inits,
-    )
-    model = helper.make_model(
-        graph,
-        opset_imports=[helper.make_opsetid("", 14)],
-        producer_name="torchwright",
-    )
-    t_build = time.perf_counter() - t0
-
-    t0 = time.perf_counter()
-    onnx.save_model(model, output_path)
-    t_save = time.perf_counter() - t0
-
-    meta_path = _write_headless_meta(
-        output_path,
-        list(input_names),
-        extra=extra_metadata,
-        cache_stride=cache_stride_resolved,
-    )
-
-    if debug_sidecar:
-        # (name, offset, width) in the alphabetical order the flat
-        # ``inputs`` tensor is packed in (input_proj rows follow
-        # all_input_indices, which concatenates per-input indices in
-        # sorted-name order above).
-        debug_input_specs: List[tuple] = []
-        offset = 0
-        for name, idx in input_nodes_list:
-            debug_input_specs.append((name, offset, len(idx)))
-            offset += len(idx)
-        _write_debug_sidecar(
-            output_path,
-            compiled=compiled,
-            output_node=output_node,
-            pos_encoding=pos_encoding,
-            d=d,
-            d_head=d_head,
-            kind="headless",
-            input_specs=debug_input_specs,
-            asserts=all_asserts,
-            watches=all_watches,
-            cache_stride=cache_stride_resolved,
-            optimize=optimize,
-            extra=extra_metadata,
-            verbose=verbose,
-        )
-
-    if verbose:
-        print(
-            f"Phases: compile+emit {t_compile:.2f}s, "
-            f"build {t_build:.2f}s, save {t_save:.2f}s"
-        )
-        print(
-            f"{n_layers} layers, "
-            f"{len(sparse_inits)} sparse inits, {len(dense_inits)} dense inits"
-        )
-        model_size = os.path.getsize(output_path)
-        print(f"Wrote {output_path} ({model_size:,} bytes)")
-        print(f"Wrote {meta_path}")
-
-    return OnnxArtifact(
-        path=output_path,
-        meta_path=meta_path,
-        debug_path=debug_meta_path_for(output_path) if debug_sidecar else None,
-        kind="headless",
-        n_layers=n_layers,
-        per_layer_n_heads=tuple(per_layer_n_heads),
-        d=d,
-        d_head=d_head,
-        cache_stride=cache_stride_resolved,
-    )
-
-
 def compile_to_onnx(
     output_node: Node,
     pos_encoding: PosEncoding,
@@ -1389,8 +1044,8 @@ def compile_to_onnx(
     for the debug surface).
 
     ``extra_metadata`` is a free-form dict written under the sidecar's
-    ``"extra"`` key (surfaced via ``OnnxTokenModule.metadata``), mirroring
-    the headless exporter; top-level sidecar keys are unchanged.
+    ``"extra"`` key (surfaced via ``OnnxTokenModule.metadata``); top-level
+    sidecar keys are unchanged.
 
     Writes three files:
         ``<output_path>``     — the ONNX model
@@ -1694,11 +1349,12 @@ def compile_to_onnx(
 
 # ---------------------------------------------------------------------------
 # In-process headless callable: a thin adapter over HeadlessTransformer.compute()
-# that presents the same (inputs) -> outputs interface as OnnxHeadlessModule.
+# presenting an (inputs) -> outputs interface.
 #
-# Used for compiler-output tests that don't need an ONNX round-trip.  For
-# production inference, export with compile_headless_to_onnx instead —
-# that path streams weights and runs under onnxruntime.
+# This is the in-process debug/test backend (the DebugRuntime behind
+# debug=True forwards and the probe_* tools) — no ONNX round-trip.  For
+# production inference, compile a token ONNX artifact with compile_to_onnx
+# and load it with load_onnx.
 # ---------------------------------------------------------------------------
 
 
@@ -1842,10 +1498,10 @@ def _ordered_mlp_state_triples(net, ra) -> List[tuple]:
 
 
 class CompiledHeadless:
-    """Callable wrapper around :class:`HeadlessTransformer`.
+    """Callable wrapper around :class:`HeadlessTransformer` — the
+    in-process debug/test backend.
 
-    Exposes the same three-method surface as
-    :class:`torchwright.compiler.onnx_load.OnnxHeadlessModule`:
+    Exposes a three-method surface:
 
     - ``module(inputs)``: stateless per-query inference — runs the
       non-cached ``forward()`` path and returns outputs.
@@ -2258,9 +1914,9 @@ def compile_headless(
 
     Returns a :class:`CompiledHeadless` that evaluates the graph via
     :meth:`HeadlessTransformer.forward` behind the standard
-    ``module(inputs) -> outputs`` interface.  For production use (saved
-    artifact, autoregressive decode, fast startup), use
-    :func:`compile_headless_to_onnx` instead.
+    ``module(inputs) -> outputs`` interface.  This is the in-process
+    debug/test backend; for production inference, compile a token ONNX
+    artifact with :func:`compile_to_onnx`.
 
     ``graph`` is either a single output :class:`Node` (outputs gathered
     at the node's natural residual columns) or an ``io`` dict declaring

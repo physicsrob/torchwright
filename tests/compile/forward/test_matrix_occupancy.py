@@ -22,7 +22,7 @@ from torchwright.compiler.export import (
     _build_matrix_occupancy,
     _dense_rects,
     _diag_rects,
-    compile_headless_to_onnx,
+    compile_to_onnx,
     debug_meta_path_for,
 )
 from torchwright.compiler.forward.compile import forward_compile
@@ -227,14 +227,39 @@ def test_placement_keys_are_canonical_or_bucket():
 # ---------------------------------------------------------------------------
 
 
-def _read_sidecar(tmpdir, name="model.onnx"):
-    out, pos = _build_graph()
+def _token_parts():
+    """A small (1-digit adder) token graph for the sidecar-occupancy tests."""
+    import examples.adder as adder_module
+
+    original = adder_module.max_digits
+    try:
+        adder_module.max_digits = 1
+        from examples.adder import create_network_parts
+
+        return create_network_parts()
+    finally:
+        adder_module.max_digits = original
+
+
+def _compile_sidecar(parts, tmpdir, name="model.onnx"):
+    """Compile a token graph and return its debug sidecar dict.
+
+    The debug sidecar (and its occupancy table) is written identically by the
+    token exporter; a real token graph just gives compile_to_onnx an embedding
+    to unembed against.
+    """
+    output_node, pos, embedding = parts
     onnx_path = os.path.join(tmpdir, name)
-    compile_headless_to_onnx(
-        out, pos, onnx_path, d=D, d_head=D_HEAD, max_seq_len=32, verbose=False
+    compile_to_onnx(
+        output_node, pos, embedding, onnx_path,
+        d=1024, d_head=D_HEAD, max_seq_len=32, verbose=False,
     )
     with open(debug_meta_path_for(onnx_path)) as f:
         return json.load(f)
+
+
+def _read_sidecar(tmpdir, name="model.onnx"):
+    return _compile_sidecar(_token_parts(), tmpdir, name)
 
 
 def test_sidecar_carries_occupancy():
@@ -242,7 +267,7 @@ def test_sidecar_carries_occupancy():
         data = _read_sidecar(tmpdir)
 
     assert data["format"] == DEBUG_META_FORMAT
-    assert data["n_heads"] == N_HEADS
+    assert data["n_heads"] == data["d"] // data["d_head"]
     assert isinstance(data["d_hidden"], list)
     assert len(data["d_hidden"]) == data["n_layers"]
     assert data["matrices"], "matrices table should be non-empty"
@@ -258,11 +283,16 @@ def test_occupancy_stable_across_cache_hit(monkeypatch):
     # The schedule cache replays the CP-SAT solve, but weight writing (and thus
     # placement recording) always runs — a cache hit must still yield identical
     # occupancy data.
+    # Compile the SAME graph object twice: head-column assignment is ordered by
+    # node id(), so two FRESH rebuilds would permute heads independently of the
+    # cache; reusing one graph keeps node ids (hence occupancy) identical
+    # between the cold solve and the warm replay.
+    parts = _token_parts()
     with tempfile.TemporaryDirectory() as cache_dir:
         monkeypatch.setenv("TW_SCHEDULE_CACHE_DIR", cache_dir)
         with tempfile.TemporaryDirectory() as tmpdir:
-            first = _read_sidecar(tmpdir, "a.onnx")  # cold: solves + caches
-            second = _read_sidecar(tmpdir, "b.onnx")  # warm: cache hit
+            first = _compile_sidecar(parts, tmpdir, "a.onnx")  # cold: solves + caches
+            second = _compile_sidecar(parts, tmpdir, "b.onnx")  # warm: cache hit
 
     for key in ("n_heads", "d_hidden", "matrices", "placements"):
         assert first[key] == second[key], f"{key} differs across cache hit"

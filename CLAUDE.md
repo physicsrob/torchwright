@@ -261,7 +261,7 @@ against.
 
 # Compile entry points
 
-Three entry points in `torchwright/compiler/export.py`, one loader
+Two entry points in `torchwright/compiler/export.py`, one loader
 front door in `torchwright/compiler/onnx_load.py`:
 
     compiled = compile_headless(graph, pos_encoding, *, d=..., d_head=...,
@@ -278,12 +278,11 @@ exactly.  Passing the `PosEncoding` first (the pre-2026 argument
 order) raises a `TypeError` naming the new order.
 
     artifact = compile_to_onnx(output_node, pos_encoding, embedding, path, ...)
-    artifact = compile_headless_to_onnx(output_node, pos_encoding, path, ...)
 
-Both exporters return an **`OnnxArtifact`**: the written paths
+The exporter returns an **`OnnxArtifact`**: the written paths
 (`path`, `meta_path`, `debug_path`) plus small build metadata (`kind`,
-`n_layers`, `per_layer_n_heads`, `d`, `d_head`, `cache_stride`;
-token exports add `d_embed`/`vocab_size`).  It is
+`n_layers`, `per_layer_n_heads`, `d`, `d_head`, `cache_stride`,
+`d_embed`, `vocab_size`).  It is
 built strictly from paths and scalars after export completes — it
 holds no graph, no weights, no exporter state (the exporters'
 streaming memory bound is a hard invariant).  `artifact.load()`
@@ -293,12 +292,10 @@ output_node, pos_encoding)` opens an `OnnxDebugSession` (see
 
     model = load_onnx(path)        # torchwright.compiler.onnx_load
 
-Loads any torchwright ONNX export by dispatching on the sidecar's
-format key: `OnnxHeadlessModule` for float-I/O exports,
-`OnnxTokenModule` for token-I/O exports (vocab tokenizer + argmax
-`generate` loop).  torchwright_doom's `OnnxTokenRuntime` remains the
-CUDA-graph perf runtime; these loaders are the contract-correctness
-harness.
+Loads a torchwright token-I/O ONNX export, returning an
+`OnnxTokenModule` (vocab tokenizer + argmax `generate` loop).
+torchwright_doom's `OnnxTokenRuntime` remains the CUDA-graph perf
+runtime; this loader is the contract-correctness harness.
 
 # Debugging compiled graphs
 
@@ -374,8 +371,8 @@ Raises `RuntimeError` if no `debug=True` forward has been run.
 
 ## Debugging the ONNX artifact — OnnxDebugSession
 
-The ONNX exporters (`compile_to_onnx`, `compile_headless_to_onnx`)
-write a `<stem>.debug.json` sidecar next to the model (disable with
+The ONNX exporter (`compile_to_onnx`)
+writes a `<stem>.debug.json` sidecar next to the model (disable with
 `debug_sidecar=False`): the residual assignment keyed by canonical
 node id, a structural fingerprint, and the compile-time
 Assert/DebugWatch coverage.  `OnnxDebugSession` combines that sidecar,
