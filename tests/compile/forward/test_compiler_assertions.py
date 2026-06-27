@@ -259,8 +259,8 @@ def test_reserve_rejects_allocated_col():
 
 
 def test_reserve_blocks_subsequent_allocation():
-    """Reserved columns cannot be handed out by allocate() — this is the
-    bedrock of overlay-target protection."""
+    """Reserved columns cannot be handed out by allocate() — the
+    allocator-level guarantee that a reserved column is never reused."""
     rmap = ResidualStreamMap(8)
     rmap.reserve([0, 1, 2, 3])
 
@@ -294,42 +294,3 @@ def test_scheduler_pins_never_marks_pinned_dead():
     computed = {x, l}
     assert x in scheduler_unpinned._find_dead_nodes(rmap, computed)
     assert x not in scheduler_pinned._find_dead_nodes(rmap, computed)
-
-
-def test_delta_transfer_guard_catches_reallocation():
-    """If an overlay target column is owned by an unrelated live node at
-    delta-transfer time, the guard must fire and name that node.  This is
-    the last-line assertion that protects against the allocator reusing
-    an overlay target position for an intermediate — exactly the bug that
-    the pin/reserve machinery exists to prevent."""
-    from torchwright.compiler.forward.compile import (
-        _verify_overlay_target_protection,
-    )
-
-    pos = PosEncoding(17)
-    x = InputNode("x", 4, value_range=(-1.0, 1.0))
-    bait = InputNode("bait", 1, value_range=(-1.0, 1.0))
-    weight = torch.eye(4, 4)
-    bias = torch.zeros(4)
-    y = Linear(x, weight, bias)
-
-    rmap = ResidualStreamMap(D)
-    rmap.allocate(pos)
-    rmap.allocate(x)
-    rmap.allocate(bait)
-    bait_col = rmap.get_indices(bait)[0]
-
-    # Poison: overlay's target col is owned by `bait`, which is neither
-    # pos_encoding nor a pinned input.  The guard must fire.
-    overlays = {y: (x, [bait_col])}
-    with pytest.raises(
-        AssertionError, match=rf"Overlay target column {bait_col} is owned by"
-    ):
-        _verify_overlay_target_protection(
-            overlays, rmap, pos_encoding=pos, overlay_pinned_inputs=set()
-        )
-
-    # Control: if we pin `bait`, the guard accepts it.
-    _verify_overlay_target_protection(
-        overlays, rmap, pos_encoding=pos, overlay_pinned_inputs={bait}
-    )

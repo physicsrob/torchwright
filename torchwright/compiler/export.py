@@ -1358,114 +1358,6 @@ def compile_to_onnx(
 # ---------------------------------------------------------------------------
 
 
-def _compute_io_layout(
-    io: Dict[str, Tuple[Optional[Node], Optional[Node]]],
-) -> Tuple[List[tuple], List[tuple], Dict[Node, Tuple[Optional[Node], List[int]]], int]:
-    """Compute column assignments from io spec.
-
-    The io dict declares the I/O contract:
-    - Key: field name (string) — used for alphabetical ordering
-    - Value: (input_node, output_node) tuple where:
-      - (in, out) → overlaid: output lands at input's columns via delta transfer
-      - (in, None) → input-only: columns hold input value, no output
-      - (None, out) → output-only: overflow columns appended after input region
-
-    Returns:
-        input_specs: List[(name, offset, width, input_node)] for input fields
-        output_specs: List[(name, offset, width, output_node)] for output fields
-        overlays: Dict[output_node -> (input_node or None, target_cols)] for delta transfer
-            - For overlaid: (input_node, target_cols) - subtract input before adding output
-            - For overflow: (None, target_cols) - just copy to target (subtract zero)
-        d_input: Total width of input region
-    """
-    # Sort by name (alphabetical)
-    sorted_names = sorted(io.keys())
-
-    # Input region: all entries with non-None input
-    input_specs = []
-    input_name_to_offset = {}
-    offset = 0
-    for name in sorted_names:
-        in_node, out_node = io[name]
-        if in_node is not None:
-            width = len(in_node)
-            input_specs.append((name, offset, width, in_node))
-            input_name_to_offset[name] = offset
-            offset += width
-    d_input = offset
-
-    # Output region: overlaid at input positions, overflow after
-    output_specs = []
-    overlays: Dict[Node, Tuple[Optional[Node], List[int]]] = {}
-    overflow_offset = d_input
-
-    for name in sorted_names:
-        in_node, out_node = io[name]
-        if out_node is not None:
-            width = len(out_node)
-            if in_node is not None:
-                # Overlaid: output at input's columns via delta transfer
-                in_offset = input_name_to_offset[name]
-                output_specs.append((name, in_offset, width, out_node))
-                target_cols = list(range(in_offset, in_offset + width))
-                overlays[out_node] = (in_node, target_cols)
-            else:
-                # Overflow: output after input region, also via delta
-                # transfer.  Like the overlay case, the delta layer
-                # subtracts whatever is currently at ``target_cols`` (see
-                # forward/compile.py where ``subtract_cols = target_cols``
-                # unconditionally), so the overflow path does not rely on
-                # the caller zero-initialising the overflow region.
-                output_specs.append((name, overflow_offset, width, out_node))
-                target_cols = list(range(overflow_offset, overflow_offset + width))
-                overlays[out_node] = (None, target_cols)
-                overflow_offset += width
-
-    return input_specs, output_specs, overlays, d_input
-
-
-def _validate_io_spec(io: Dict[str, Tuple[Optional[Node], Optional[Node]]]) -> None:
-    """Validate the io spec.
-
-    Raises ValueError if:
-    - Any entry has both nodes as None (empty tuple)
-    - Overlaid pairs have mismatched widths
-    - Duplicate nodes across different entries (same node in two different names)
-
-    Note: It's valid for in_node == out_node (identity case) within the same entry.
-    """
-    seen_input_nodes = set()
-    seen_output_nodes = set()
-
-    for name, (in_node, out_node) in io.items():
-        # Check for empty tuple
-        if in_node is None and out_node is None:
-            raise ValueError(f"io entry '{name}' has both input and output as None")
-
-        # Check for duplicate input nodes across entries
-        if in_node is not None:
-            if in_node in seen_input_nodes:
-                raise ValueError(f"Input node {in_node} appears in multiple io entries")
-            seen_input_nodes.add(in_node)
-
-        # Check for duplicate output nodes across entries
-        # Allow same node to appear as both input and output within the same entry
-        if out_node is not None and out_node is not in_node:
-            if out_node in seen_output_nodes:
-                raise ValueError(
-                    f"Output node {out_node} appears in multiple io entries"
-                )
-            seen_output_nodes.add(out_node)
-
-        # Check width mismatch for overlaid pairs
-        if in_node is not None and out_node is not None:
-            if len(in_node) != len(out_node):
-                raise ValueError(
-                    f"io entry '{name}' has width mismatch: "
-                    f"input width {len(in_node)} != output width {len(out_node)}"
-                )
-
-
 @dataclass
 class _DebugState:
     """Captured residual-stream snapshots from a debug=True forward pass."""
@@ -1518,7 +1410,6 @@ class CompiledHeadless:
         input_specs: List[tuple],
         output_indices: torch.Tensor,
         metadata: Optional[dict] = None,
-        output_specs: Optional[List[tuple]] = None,
         asserts: Optional[List] = None,
         watches: Optional[List] = None,
     ) -> None:
@@ -1526,10 +1417,6 @@ class CompiledHeadless:
         # input_specs: list of (name, start_col, width) in input-tensor column order.
         self._input_specs = list(input_specs)
         self._output_indices = output_indices
-        # output_specs: list of (name, offset_in_out, width) in gathered-output
-        # column order.  None for legacy callers that compile a single
-        # concatenated output_node and do not declare field names.
-        self._output_specs = list(output_specs) if output_specs is not None else []
         self.input_names: List[str] = [name for name, _, _ in input_specs]
         self.metadata: dict = dict(metadata or {})
         self._asserts = list(asserts) if asserts else []
@@ -1693,13 +1580,6 @@ class CompiledHeadless:
             if n == name:
                 return inputs[..., s : s + w]
         raise KeyError(f"input field {name!r} not found")
-
-    def output_slice(self, name: str, outputs: torch.Tensor) -> torch.Tensor:
-        """Return the slice of ``outputs`` (post-gather) for the named output field."""
-        for n, s, w in self._output_specs:
-            if n == name:
-                return outputs[..., s : s + w]
-        raise KeyError(f"output field {name!r} not found")
 
     def debug_value(self, node: "Node") -> Optional[torch.Tensor]:
         """Return the compiled value of ``node`` from the last debug=True forward.
@@ -1896,7 +1776,7 @@ class CompiledHeadless:
 
 
 def compile_headless(
-    graph: Union[Node, Dict[str, Tuple[Optional[Node], Optional[Node]]]],
+    graph: Node,
     pos_encoding: PosEncoding,
     *,
     d: int = 1024,
@@ -1910,7 +1790,7 @@ def compile_headless(
     optimize: int = 0,
     assume_zero_init: bool = False,
 ) -> CompiledHeadless:
-    """Compile a headless graph to an in-process callable.
+    """Compile a graph to an in-process callable.
 
     Returns a :class:`CompiledHeadless` that evaluates the graph via
     :meth:`HeadlessTransformer.forward` behind the standard
@@ -1918,22 +1798,8 @@ def compile_headless(
     debug/test backend; for production inference, compile a token ONNX
     artifact with :func:`compile_to_onnx`.
 
-    ``graph`` is either a single output :class:`Node` (outputs gathered
-    at the node's natural residual columns) or an ``io`` dict declaring
-    the I/O contract:
-
-    - Key: field name (string) — used for alphabetical ordering
-    - Value: ``(input_node, output_node)`` tuple where:
-      - ``(in, out)`` → overlaid: output lands at input's columns
-      - ``(in, None)`` → input-only: columns hold input value, no output
-      - ``(None, out)`` → output-only: overflow columns appended after input region
-
-    For overlaid entries, the output is placed at the same columns as the
-    input via delta transfer, enabling autoregressive feedback where the
-    transformer output IS the next input.  The two forms are NOT the
-    same compile: the io form passes column overlays to
-    ``forward_compile`` (outputs land at input columns); the node form
-    compiles without overlays.
+    ``graph`` is a single output :class:`Node`; its outputs are gathered
+    at the node's natural residual columns.
 
     ``d_hidden`` is the per-layer MLP hidden width.  Defaults to ``d``
     when omitted; pass an explicit value to decouple the MLP intermediate
@@ -1948,73 +1814,26 @@ def compile_headless(
     """
     from torchwright.graph.asserts import collect_debug_nodes
 
-    # --- Branch A: pre-compile (root + overlays + assert collection) ------
-    if isinstance(graph, dict):
-        io = graph
-        _validate_io_spec(io)
-
-        # Set names on InputNodes from io dict keys
-        # This enables HeadlessTransformer.get_input_res_stream to look
-        # up values
-        for name, (in_node, out_node) in io.items():
-            if in_node is not None and isinstance(in_node, InputNode):
-                in_node.name = name
-
-        input_specs, output_specs, overlays, d_input = _compute_io_layout(io)
-
-        # Build the combined output node for forward_compile
-        # Collect all output nodes (both overlaid and overflow)
-        output_nodes = [spec[3] for spec in output_specs]
-        if len(output_nodes) == 0:
-            raise ValueError("io must have at least one output")
-        elif len(output_nodes) == 1:
-            combined_output = output_nodes[0]
-        else:
-            combined_output = Concatenate(output_nodes)
-
-        # Collect Assert and DebugWatch nodes before forward_compile
-        # strips them, deduplicating across the io roots.
-        all_asserts = []
-        all_watches = []
-        _seen_ids: set = set()
-        for _name, (in_node, out_node) in io.items():
-            for root in (in_node, out_node):
-                if root is None:
-                    continue
-                node_asserts, node_watches = collect_debug_nodes(root)
-                for a in node_asserts:
-                    if a.node_id not in _seen_ids:
-                        _seen_ids.add(a.node_id)
-                        all_asserts.append(a)
-                for w in node_watches:
-                    if w.node_id not in _seen_ids:
-                        _seen_ids.add(w.node_id)
-                        all_watches.append(w)
-    elif isinstance(graph, PosEncoding):
-        # PosEncoding IS a Node — this check must precede the Node
-        # branch to catch stale old-order callers.
+    if isinstance(graph, PosEncoding):
+        # PosEncoding IS a Node — catch the stale (pos_encoding, graph)
+        # argument order before the Node branch below.
         raise TypeError(
-            "compile_headless(pos_encoding, io=...) is the old calling "
-            "convention — did you mean the new (graph, pos_encoding) "
-            "order?  Pass the io dict (or output node) first and the "
-            "PosEncoding second."
+            "compile_headless(pos_encoding, graph) is the old calling "
+            "convention — pass the output node first and the PosEncoding "
+            "second."
         )
-    elif isinstance(graph, Node):
-        # Unwrap Assert nodes at the output root — compilation strips
-        # them from the interior of the graph, but the caller's node
-        # reference may still point at one.  Downstream lookups
-        # (residual-stream indices, etc.) must match the compiled
-        # graph's effective terminal node.
-        all_asserts, all_watches = collect_debug_nodes(graph)
-        combined_output = _unwrap_output_node(graph)
-        overlays = None
-    else:
+    if not isinstance(graph, Node):
         raise TypeError(
-            f"compile_headless expects an output Node or an io dict as "
-            f"its first argument, got {type(graph).__name__}"
+            f"compile_headless expects an output Node as its first "
+            f"argument, got {type(graph).__name__}"
         )
 
-    # --- Shared compile ----------------------------------------------------
+    # Unwrap Assert nodes at the output root — compilation strips them from
+    # the interior of the graph, but the caller's reference may still point
+    # at one, and downstream lookups must match the compiled terminal node.
+    all_asserts, all_watches = collect_debug_nodes(graph)
+    combined_output = _unwrap_output_node(graph)
+
     net = forward_compile(
         d=d,
         d_head=d_head,
@@ -2025,42 +1844,12 @@ def compile_headless(
         device=device,
         d_hidden=d_hidden,
         trim_heads=trim_heads,
-        overlays=overlays,
         optimize=optimize,
         assume_zero_init=assume_zero_init,
     )
 
     assert net.residual_assignment is not None
     out_state = net.layers[-1].mlp.out_state
-
-    # --- Branch B: post-compile (input specs + output gather) --------------
-    if isinstance(graph, dict):
-        # Build input_specs for CompiledHeadless (name, offset, width)
-        ch_input_specs = [
-            (name, offset, width) for name, offset, width, _ in input_specs
-        ]
-
-        # Build output indices from output_specs
-        # For overlaid outputs, offset is the input's column offset
-        # For overflow outputs, offset is in the overflow region
-        output_indices: list[int] = []
-        ch_output_specs: List[tuple] = []
-        running = 0
-        for name, offset, width, out_node in output_specs:
-            output_indices.extend(range(offset, offset + width))
-            ch_output_specs.append((name, running, width))
-            running += width
-
-        return CompiledHeadless(
-            net,
-            ch_input_specs,
-            torch.tensor(output_indices, dtype=torch.long),
-            metadata=extra_metadata,
-            output_specs=ch_output_specs,
-            asserts=all_asserts,
-            watches=all_watches,
-        )
-
     in_state = net.layers[0].attn.in_state
 
     input_nodes_list: List[tuple] = []  # (name, width)

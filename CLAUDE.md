@@ -267,15 +267,13 @@ front door in `torchwright/compiler/onnx_load.py`:
     compiled = compile_headless(graph, pos_encoding, *, d=..., d_head=...,
                                 optimize=0, assume_zero_init=False, ...)
 
-In-process `CompiledHeadless` for tests and debugging.  `graph` is
-either a single output `Node` (outputs gathered at the node's natural
-residual columns) or an `io` dict `{"name": (input_node, output_node)}`
-(overlay mode: outputs land at input columns via delta transfer, for
-autoregressive feedback).  All other parameters are keyword-only.
-`optimize` and `assume_zero_init` thread straight to `forward_compile`,
-so this backend can reproduce a production `optimize=2` schedule
-exactly.  Passing the `PosEncoding` first (the pre-2026 argument
-order) raises a `TypeError` naming the new order.
+In-process `CompiledHeadless` for tests and debugging.  `graph` is a
+single output `Node` (outputs gathered at the node's natural residual
+columns).  All other parameters are keyword-only.  `optimize` and
+`assume_zero_init` thread straight to `forward_compile`, so this backend
+can reproduce a production `optimize=2` schedule exactly.  Passing the
+`PosEncoding` first (the pre-2026 argument order) raises a `TypeError`
+naming the new order.
 
     artifact = compile_to_onnx(output_node, pos_encoding, embedding, path, ...)
 

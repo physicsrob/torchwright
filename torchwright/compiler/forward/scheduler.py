@@ -69,9 +69,10 @@ class LayerScheduler:
         # default eager behavior (shallower).  See ``_freshly_dead_inputs``.
         self._eager_free = eager_free
         # Nodes whose residual-stream columns must stay allocated for the
-        # entire compile.  Used for overlay inputs: the delta-transfer
-        # layer at end of compile writes to those columns, so the
-        # allocator must not reuse them for other live-to-end nodes.
+        # entire compile, never reclaimed when their consumers finish — a
+        # general "pin these columns" affordance.  The compile path passes
+        # an empty set; the in-tree forward-cost analysis scripts pass an
+        # explicit pin set.
         self._pinned_nodes: Set[Node] = (
             set(pinned_nodes) if pinned_nodes is not None else set()
         )
