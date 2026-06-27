@@ -47,6 +47,8 @@ def _broadcast_select_per_column_offsets(
             fs = j if false_bc else i * d_fill + j
             union.append(Range(min(ti[ts].lo, fi[fs].lo), max(ti[ts].hi, fi[fs].hi)))
     return per_column_offsets(union, scalar_M)
+
+
 from torchwright.ops.arithmetic_ops import sum_nodes
 from torchwright.ops.linear_relu_linear import linear_relu_linear
 
@@ -538,7 +540,9 @@ def table_lookup_3d(
             raise ValueError(f"outer_axis must be 0, 1, or 2, got {outer_axis!r}")
     # C is the larger of the two remaining axes (kept contiguous as the
     # vector axis); B is the smaller, so A*B stays small.
-    remaining = sorted((ax for ax in range(3) if ax != a_axis), key=lambda ax: sizes[ax])
+    remaining = sorted(
+        (ax for ax in range(3) if ax != a_axis), key=lambda ax: sizes[ax]
+    )
     b_axis, c_axis = remaining[0], remaining[1]
 
     a_size, b_size, c_size = sizes[a_axis], sizes[b_axis], sizes[c_axis]
@@ -1011,8 +1015,13 @@ def broadcast_select(
         # Per-output-column offsets (see per_column_offsets) so a narrow column
         # is not forced to a wide sibling's M in the `(M + v) - M` cancellation.
         M_cols = _broadcast_select_per_column_offsets(
-            true_value, false_value, n_slots, d_fill,
-            true_is_broadcast, false_is_broadcast, M,
+            true_value,
+            false_value,
+            n_slots,
+            d_fill,
+            true_is_broadcast,
+            false_is_broadcast,
+            M,
         )
 
         d_hidden = 4 * n_slots * d_fill
@@ -1169,3 +1178,118 @@ def broadcast_select(
         output_bias=output_bias,
         name="broadcast_select",
     )
+
+
+def soft_blend(cond: Node, t: Node, f: Node, *, atol: float = 1e-4) -> Node:
+    """Bounded crisp-handoff switch between ``t`` and ``f`` driven by ``cond``.
+
+    This is **not** a cond-blender.  It is for the case where ``cond`` is crisp
+    (near ±1) wherever ``t`` and ``f`` differ, and soft (near 0) only where
+    ``t ≈ f`` — so almost no resolution flows through ``cond``; the resolution
+    lives in ``t``/``f``, read during the crisp-cond interiors.  Where ``cond``
+    *is* soft, ``t`` and ``f`` are (by the caller's construction) nearly equal,
+    so any blend between them is acceptable.
+
+    The motivating use is the octant recency ramp (docs/rope_port_plan.md §3,
+    Phase 1b): the per-octant branch values are constructed to be *exactly*
+    equal at each shared octant boundary, which is exactly where the selecting
+    ``cond`` (a ``compare`` on ``|u|−|v|``, ``u``, or ``v``) passes through 0
+    and cannot saturate.  ``select``'s ``(M+v)−M`` cancellation core drives the
+    output to ≈ ``−M`` there (a non-monotone dip); ``soft_blend`` cannot, because
+    its core has **no** ``−M`` output bias and the result is then clamped into
+    the ``[min(t,f), max(t,f)]`` box.
+
+    Construction — a median-of-three, ``out = median(raw, min(t,f), max(t,f))``
+    ``= min(max(raw, min(t,f)), max(t,f))``:
+
+    - ``raw`` reuses ``broadcast_select``'s per-unit carrier core with
+      ``output_bias = 0`` (instantiated ``n_slots=1``)::
+
+          raw_j = ReLU(M_j·cond + t_j) − ReLU(M_j·cond)
+                + ReLU(−M_j·cond + f_j) − ReLU(−M_j·cond)
+
+      At ``cond=+1`` this is ``t_j``; at ``cond=−1`` it is ``f_j``; at
+      ``cond=0`` it is ``ReLU(t_j)+ReLU(f_j)`` — bounded by ``|t_j|+|f_j|``,
+      **never** the ``−M`` dip that ``select`` produces.
+    - The ``min``/``max`` clamp is load-bearing: for **same-sign** ``t,f`` the
+      ``raw`` core overshoots the ``[min,max]`` box (e.g. ``t=f=a>0`` gives
+      ``raw=2a`` at ``cond=0``); the clamp restores both in-box-ness *and*
+      monotonicity.
+
+    No activation×activation multiply, no ``compare`` postcondition assert.
+
+    Args:
+        cond: length-1 switch, crisp (±1) where ``t``/``f`` differ.
+        t: value when ``cond`` is +1 (any width ``d``).
+        f: value when ``cond`` is −1 (same width ``d``).
+        atol: tolerance for the output value-type assert; covers the PL noise
+            of the two ``min``/``max`` clamp ops.
+
+    Returns:
+        Node of width ``d``, value in ``[min(t,f), max(t,f)]`` elementwise.
+
+    .. noise-footer::
+
+       Max error: 1.192e-07 abs, 1.672e-07 rel over 4096 samples;
+       measured at commit 2e04d93. See docs/numerical_noise.md.
+    """
+    from torchwright.ops.arithmetic_ops import min as op_min, max as op_max
+
+    assert len(cond) == 1
+    assert len(t) == len(f)
+    d = len(t)
+
+    # Per-column carrier offsets from the union of t/f ranges (raises if either
+    # lacks a finite value-type — soft_blend requires bounded operands).
+    M = _select_offset(t, f, "soft_blend")
+    M_cols = _broadcast_select_per_column_offsets(t, f, 1, d, False, False, M)
+
+    # raw: broadcast_select's carrier core, n_slots=1, output_bias=0, and
+    # WITHOUT the crisp-mask union assert / c_tol override tail (which would
+    # fire on a soft cond).
+    d_hidden = 4 * d
+    inp = Concatenate([cond, t, f])
+    cond_off = 0
+    t_off = 1
+    f_off = 1 + d
+    input_proj = torch.zeros(d_hidden, len(inp))
+    input_bias = torch.zeros(d_hidden)
+    output_proj = torch.zeros(d_hidden, d)
+    output_bias = torch.zeros(d)
+    for j in range(d):
+        M_o = M_cols[j]
+        u_pt = 4 * j  # ReLU(M·cond + t_j)
+        u_pb = 4 * j + 1  # ReLU(M·cond)
+        u_nt = 4 * j + 2  # ReLU(-M·cond + f_j)
+        u_nb = 4 * j + 3  # ReLU(-M·cond)
+        input_proj[u_pt, cond_off] = M_o
+        input_proj[u_pt, t_off + j] = 1.0
+        input_proj[u_pb, cond_off] = M_o
+        input_proj[u_nt, cond_off] = -M_o
+        input_proj[u_nt, f_off + j] = 1.0
+        input_proj[u_nb, cond_off] = -M_o
+        output_proj[u_pt, j] = 1.0
+        output_proj[u_pb, j] = -1.0
+        output_proj[u_nt, j] = 1.0
+        output_proj[u_nb, j] = -1.0
+    raw = linear_relu_linear(
+        input_node=inp,
+        input_proj=input_proj,
+        input_bias=input_bias,
+        output_proj=output_proj,
+        output_bias=output_bias,
+        name="soft_blend_raw",
+    )
+
+    lo = op_min(t, f)
+    hi = op_max(t, f)
+    out = op_min(op_max(raw, lo), hi)
+
+    # Output is clamped into [min(t,f), max(t,f)] ⊆ union(t,f) box, regardless
+    # of cond — so the union value-type holds up to the min/max PL noise.
+    tv = t.value_type
+    fv = f.value_type
+    r = tv.value_range.union(fv.value_range)
+    if r.is_finite():
+        out = assert_matches_value_type(out, NodeValueType(value_range=r), atol=atol)
+    return out

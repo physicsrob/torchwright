@@ -38,6 +38,7 @@ For commentary on the numbers — which are expected, which warrant investigatio
 | `piecewise_linear_2d` | `torchwright.ops.arithmetic_ops` | 7.778 | 0.6024 | `diff_trig_nonuniform` |
 | `reciprocal` | `torchwright.ops.arithmetic_ops` | 0.0009137 | 0.1686 | `reciprocal_03_200` |
 | `signed_multiply` | `torchwright.ops.arithmetic_ops` | 0.06248 | 2.15 | `signed_multiply_pm10` |
+| `soft_blend` | `torchwright.ops.map_select` | 1.192e-07 | 1.672e-07 | `soft_blend_boundary` |
 | `square` | `torchwright.ops.arithmetic_ops` | 0.25 | 231.1 | `square_unsigned_0_10` |
 | `square_signed` | `torchwright.ops.arithmetic_ops` | 0.25 | 276.7 | `square_signed_pm10` |
 | `thermometer_floor_div` | `torchwright.ops.arithmetic_ops` | 0 | 0 | `thermometer_integers_0_100_by10` |
@@ -579,6 +580,25 @@ a·b over [-10, 10]² via polarization identity, step=1.0 — analytical bound `
 | Mean rel error | 0.007293 |
 | p99 rel error | 0.06615 |
 | Worst input | `a=-1.746`, `b=-1.746` |
+
+## `soft_blend`
+
+Bounded crisp-handoff switch: median(raw, min(t,f), max(t,f)) with raw = broadcast_select's carrier core (no -M bias). Crisp cond returns t/f exactly; soft cond stays in-box; the min/max clamp restores in-box-ness on same-sign overshoot. Noise is the PL error of the linear-relu-linear core plus the two min/max clamp ops. M=2.0 (safety 2.0 x bound 1.0).
+
+### `soft_blend_boundary`
+
+Mixed crisp/soft conditions with t,f in [-1,1]; a grid concentrating on soft cond with t≈f (octant boundary) and same-sign t,f (carrier overshoot, clamp load-bearing).
+
+| Metric | Value |
+| --- | --- |
+| Samples | 4096 |
+| Max abs error | 1.192e-07 |
+| Mean abs error | 1.269e-09 |
+| p99 abs error | 5.96e-08 |
+| Max rel error | 1.672e-07 (over 4096 samples with &#124;ref&#124; ≥ 1e-6) |
+| Mean rel error | 2.673e-09 |
+| p99 rel error | 9.364e-08 |
+| Worst input | `cond=0.04451`, `t=0.7122`, `f=0.7132` |
 
 ## `square`
 

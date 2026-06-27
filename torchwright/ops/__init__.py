@@ -52,6 +52,7 @@ from torchwright.ops.map_select import (
     in_range,
     map_to_table,
     select,
+    soft_blend,
     switch,
     table_lookup_2d,
     table_lookup_3d,

@@ -609,6 +609,30 @@
       ]
     },
     {
+      "name": "soft_blend",
+      "module": "torchwright.ops.map_select",
+      "notes": "Bounded crisp-handoff switch: median(raw, min(t,f), max(t,f)) with raw = broadcast_select's carrier core (no -M bias). Crisp cond returns t/f exactly; soft cond stays in-box; the min/max clamp restores in-box-ness on same-sign overshoot. Noise is the PL error of the linear-relu-linear core plus the two min/max clamp ops. M=2.0 (safety 2.0 x bound 1.0).",
+      "distributions": [
+        {
+          "name": "soft_blend_boundary",
+          "description": "Mixed crisp/soft conditions with t,f in [-1,1]; a grid concentrating on soft cond with t≈f (octant boundary) and same-sign t,f (carrier overshoot, clamp load-bearing).",
+          "n_samples": 4096,
+          "max_abs_error": 1.19209e-07,
+          "mean_abs_error": 1.26943e-09,
+          "p99_abs_error": 5.96046e-08,
+          "max_rel_error": 1.67157e-07,
+          "mean_rel_error": 2.67301e-09,
+          "p99_rel_error": 9.36412e-08,
+          "rel_valid_samples": 4096,
+          "worst_input": {
+            "cond": 0.0445098,
+            "t": 0.712157,
+            "f": 0.713157
+          }
+        }
+      ]
+    },
+    {
       "name": "square",
       "module": "torchwright.ops.arithmetic_ops",
       "notes": "Always an underestimate of x² between grid points. Max segment error is `(step/2)²` at half-integers.",

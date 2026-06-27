@@ -71,6 +71,7 @@ from torchwright.ops.logic_ops import (
     cond_gate,
     equals_vector,
 )
+from torchwright.ops.map_select import soft_blend
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 DOCS_JSON = REPO_ROOT / "docs" / "op_noise_data.json"
@@ -163,8 +164,7 @@ def _signed_log_uniform_with_v_bottom(
     u = torch.rand(n_random, generator=gen)
     abs_x = torch.exp(log_lo + u * (log_hi - log_lo))
     signs = (
-        torch.randint(0, 2, (n_random,), generator=gen).to(torch.float32) * 2.0
-        - 1.0
+        torch.randint(0, 2, (n_random,), generator=gen).to(torch.float32) * 2.0 - 1.0
     )
     random_part = (signs * abs_x).unsqueeze(1)
 
@@ -349,6 +349,46 @@ def _cond_gate_distribution(
         name=name,
         description=description,
         inputs={"cond": cond, "inp": value},
+        n_samples=n_samples,
+    )
+
+
+def _soft_blend_distribution(
+    name: str, description: str, n_samples: int = 4096, seed: int = 0
+) -> InputDistribution:
+    """Inputs for ``soft_blend`` stressing the octant-boundary regime.
+
+    Half the conditions are crisp (±1), half are soft (uniform in [-1, 1]);
+    ``t``/``f`` span [-1, 1] with a structured grid concentrating on the
+    hard cases — soft ``cond`` with ``t ≈ f`` (the octant boundary) and
+    same-sign ``t,f`` (where the carrier core overshoots and the clamp is
+    load-bearing)."""
+    gen = torch.Generator().manual_seed(seed)
+    n_grid = 256
+    n_rand = n_samples - n_grid
+
+    crisp = (
+        torch.randint(0, 2, (n_rand // 2, 1), generator=gen).to(torch.float32) * 2.0
+        - 1.0
+    )
+    soft = torch.rand((n_rand - n_rand // 2, 1), generator=gen) * 2.0 - 1.0
+    cond_rand = torch.cat([crisp, soft], dim=0)
+    t_rand = torch.rand((n_rand, 1), generator=gen) * 2.0 - 1.0
+    f_rand = torch.rand((n_rand, 1), generator=gen) * 2.0 - 1.0
+
+    # Structured grid: cond≈0, t near f (boundary) and same-sign overshoot.
+    base = torch.linspace(-0.8, 0.8, n_grid).unsqueeze(1)
+    cond_grid = torch.linspace(-0.05, 0.05, n_grid).unsqueeze(1)
+    t_grid = base
+    f_grid = base + 1e-3  # t ≈ f, same sign
+
+    cond = torch.cat([cond_rand, cond_grid], dim=0)
+    t = torch.cat([t_rand, t_grid], dim=0)
+    f = torch.cat([f_rand, f_grid], dim=0)
+    return InputDistribution(
+        name=name,
+        description=description,
+        inputs={"cond": cond, "t": t, "f": f},
         n_samples=n_samples,
     )
 
@@ -628,6 +668,12 @@ def _distributions() -> Dict[str, InputDistribution]:
             "cond_gate_signed_bool_times_value",
             "±1 conditions paired with scalar values in [-5, 5]. Expected "
             "output: `value` when cond=+1, `0` when cond=-1.",
+        ),
+        "soft_blend_boundary": _soft_blend_distribution(
+            "soft_blend_boundary",
+            "Mixed crisp/soft conditions with t,f in [-1,1]; a grid "
+            "concentrating on soft cond with t≈f (octant boundary) and "
+            "same-sign t,f (carrier overshoot, clamp load-bearing).",
         ),
     }
 
@@ -1161,7 +1207,46 @@ def _target_ops() -> List[TargetOp]:
                 "round-off; noisy conditions blur the gate."
             ),
         ),
+        TargetOp(
+            name="soft_blend",
+            module="torchwright.ops.map_select",
+            source_file="torchwright/ops/map_select.py",
+            input_specs={"cond": 1, "t": 1, "f": 1},
+            build_graph=_build_soft_blend,
+            reference_fn=_soft_blend_reference,
+            distribution_names=("soft_blend_boundary",),
+            notes=(
+                "Bounded crisp-handoff switch: median(raw, min(t,f), max(t,f)) "
+                "with raw = broadcast_select's carrier core (no -M bias). "
+                "Crisp cond returns t/f exactly; soft cond stays in-box; the "
+                "min/max clamp restores in-box-ness on same-sign overshoot. "
+                "Noise is the PL error of the linear-relu-linear core plus the "
+                "two min/max clamp ops. M=2.0 (safety 2.0 x bound 1.0)."
+            ),
+        ),
     ]
+
+
+def _build_soft_blend(nodes: Dict[str, Node]) -> Node:
+    from torchwright.graph.asserts import assert_matches_value_type
+    from torchwright.graph.value_type import NodeValueType, Range
+
+    box = NodeValueType(value_range=Range(-1.0, 1.0))
+    cond = assert_matches_value_type(nodes["cond"], box)
+    t = assert_matches_value_type(nodes["t"], box)
+    f = assert_matches_value_type(nodes["f"], box)
+    return soft_blend(cond, t, f)
+
+
+def _soft_blend_reference(inputs: Dict[str, torch.Tensor]) -> torch.Tensor:
+    """Exact carrier-core + clamp the op computes (M = 2.0 for the [-1,1] box)."""
+    cond, t, f = inputs["cond"], inputs["t"], inputs["f"]
+    M = 2.0
+    relu = lambda z: torch.clamp(z, min=0.0)
+    raw = relu(M * cond + t) - relu(M * cond) + relu(-M * cond + f) - relu(-M * cond)
+    lo = torch.minimum(t, f)
+    hi = torch.maximum(t, f)
+    return torch.minimum(torch.maximum(raw, lo), hi)
 
 
 # ---------------------------------------------------------------------------
@@ -1280,9 +1365,7 @@ def render_markdown(data: Dict) -> str:
         "Every piecewise-linear op in `torchwright/ops/` is measured on one or more"
     )
     lines.append("named input distributions characterising its expected input ranges.")
-    lines.append(
-        "The canonical data lives in `docs/op_noise_data.json`; this file is"
-    )
+    lines.append("The canonical data lives in `docs/op_noise_data.json`; this file is")
     lines.append("regenerated from that JSON by `make measure-noise`.")
     lines.append("")
     lines.append(
