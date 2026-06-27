@@ -38,32 +38,6 @@ cache slots after the run (ORT forbids output buffers aliasing inputs).
 Prefill = zero-filled past + ``cache_position = [0..n)``.  Decode =
 ``cache_position = [base]`` against the same full-S binding.
 
-**Windowed-cache variant** (``cache_window=C``, the attention-sink +
-sliding-window pattern — StreamingLLM sinks / Mistral sliding window):
-the committed cache is a fixed ``C``-slot host-managed window instead of
-one-slot-per-position.  Every pass binds ``past_K_i`` exactly
-``(C + n_new, nh, d_head)``: slots ``[0, C)`` hold committed rows placed
-by the host (any policy — e.g. a permanent sink prefix plus a ring that
-wraps), and the new rows scatter in-graph to the constant staging tail
-``[C, C + n_new)``.  Committed slot ``j`` is visible iff ``j <
-cache_position[0]`` (slots the host has written so far — requires the
-host to fill committed slots in slot order until all ``C`` are written
-once; after that every committed slot stays visible and eviction is
-physical overwrite, not masking).  Staging slot ``t`` is visible iff its
-position ``cache_position[t] <= p`` (the causal triangle).  The graph
-never learns which position a committed slot holds — it doesn't need
-to: committed rows are all from previous passes, hence always causally
-visible.  ``delta_K_i`` outputs are unchanged; the host persists them at
-slots of its choosing (the window policy lives entirely host-side).
-Positions stay ABSOLUTE throughout (pos-encoding gather, recency
-scores), so reads whose span exceeds what the host keeps resident
-return whatever the mask still exposes — windowed output equals
-unbounded output ONLY IF every attention read lands on a slot the host
-kept (the span condition; callers must size ``C`` against their worst
-read span).  Mask and scatter indices still derive solely from
-``cache_position``, with no Shape/CPU nodes at all in windowed mode —
-the capture story strictly improves.
-
 Both exporters stream each layer's weights into ONNX initializers (with
 per-tensor sparsification) as the layer is compiled, then null out the
 torch tensor references.  Peak in-memory weight footprint stays around
@@ -133,7 +107,6 @@ def _write_headless_meta(
     input_names: List[str],
     extra: Optional[dict] = None,
     cache_stride: Optional[int] = None,
-    cache_window: Optional[int] = None,
 ) -> str:
     """Write the headless sidecar JSON, optionally with an ``extra`` dict.
 
@@ -145,13 +118,6 @@ def _write_headless_meta(
     ``cache_stride`` is the full static slot count ``S`` — the loaders
     need it from the sidecar because ``past_K_i``'s first dim is the
     symbolic ``cache_slots``, not a readable int.
-
-    ``cache_window`` marks the windowed-cache protocol variant (the
-    committed slot count ``C``); absent for the default unbounded
-    protocol.  A windowed model's bindings must be exactly
-    ``C + n_new`` wide — loaders that don't know the key must not be
-    fed windowed models (they'd bind prefix views and fail loudly on
-    the mask width).
     """
     meta: dict = {
         "format": HEADLESS_META_FORMAT,
@@ -159,8 +125,6 @@ def _write_headless_meta(
     }
     if cache_stride is not None:
         meta["cache_stride"] = int(cache_stride)
-    if cache_window is not None:
-        meta["cache_window"] = int(cache_window)
     if extra:
         meta["extra"] = dict(extra)
     return _write_meta(onnx_path, meta)
@@ -196,7 +160,6 @@ class OnnxArtifact:
     d: int
     d_head: int
     cache_stride: int
-    cache_window: Optional[int]
     d_embed: Optional[int] = None  # token kind only
     vocab_size: Optional[int] = None  # token kind only
 
@@ -364,7 +327,6 @@ def _write_debug_sidecar(
     asserts: List["Assert"],
     watches: List["DebugWatch"],
     cache_stride: int,
-    cache_window: Optional[int],
     verbose: bool,
     optimize: int = 0,
     extra: Optional[dict] = None,
@@ -546,7 +508,6 @@ def _write_debug_sidecar(
         "extra": dict(extra) if extra else {},
         "input_specs": [list(spec) for spec in input_specs],
         "cache_stride": int(cache_stride),
-        "cache_window": int(cache_window) if cache_window is not None else None,
         "assert_coverage": {
             "n_asserts": len(asserts),
             "n_watches": len(watches),
@@ -701,39 +662,6 @@ def _add_scalar_inits(dense_inits: list) -> None:
     _add_int64_init("_axes1_1d", np.array([1], dtype=np.int64), dense_inits)
 
 
-# A committed slot the host has not written yet must read as "infinitely
-# far in the future" so the causal Greater masks it for every query.  Any
-# value > max representable position works; 2^62 keeps clear of int64
-# overflow in the comparison (no arithmetic ever touches it).
-_FAR_FUTURE_SLOT_POS = 1 << 62
-
-
-def _add_windowed_scalar_inits(dense_inits: list, cache_window: int) -> None:
-    """Scalar initializers used only by the windowed-cache preamble.
-
-    All int64 scalars; initializer-fed, so GPU-materialized on the CUDA
-    EP (no Memcpy — same argument as :func:`_add_scalar_inits`).
-    """
-    for name, val in (
-        # already-written committed slots: "position -1" — visible to
-        # every query (-1 > p is never true)
-        ("_i64_neg1_s", -1),
-        # not-yet-written committed slots: masked for every query
-        ("_i64_far_future_s", _FAR_FUTURE_SLOT_POS),
-        # the staging-tail offset: new row r scatters to slot C + r
-        ("_i64_cwin_s", cache_window),
-    ):
-        dense_inits.append(
-            helper.make_tensor(
-                name=name,
-                data_type=TensorProto.INT64,
-                dims=[],
-                vals=np.array(val, dtype=np.int64).tobytes(),
-                raw=True,
-            )
-        )
-
-
 # ---------------------------------------------------------------------------
 # Streaming weight emission callback (shared by both exporters)
 # ---------------------------------------------------------------------------
@@ -854,9 +782,7 @@ def _make_stream_layer_weights_cb(
 # ---------------------------------------------------------------------------
 
 
-def _emit_cached_preamble(
-    nodes: list, cache_window: Optional[int] = None
-) -> None:
+def _emit_cached_preamble(nodes: list) -> None:
     """Emit nodes producing ``pos``, ``mask_bool_3d`` and ``_cache_pos_col``.
 
     Requires:
@@ -907,92 +833,27 @@ def _emit_cached_preamble(
         plan_cuda_graph_decode.md / plan_stride_bucketing.md).
       - ``_cache_pos_col``: (n_new, 1) int64 — shared by the mask
         comparison and by every layer's ``ScatterND`` indices.
-
-    **Windowed mode** (``cache_window=C``): the same three tensors plus
-    ``_write_slot_col`` (the layers' ScatterND indices — the staging
-    tail ``[C, C+n_new)``, computed as ``C + (cache_position - base)``;
-    ``_cache_pos_col`` then serves the mask only).  The mask compares
-    the query positions against a per-slot vector ``_slot_pos``:
-    committed slots map to ``-1`` (written → always visible) or
-    ``2^62`` (unwritten → never visible) via ``arange_C < base``;
-    staging slots map to their own ``cache_position`` (the causal
-    triangle).  ``arange_S`` must be baked at length exactly ``C`` (the
-    binding is ``C + n_new`` wide; a mismatch fails loudly at the
-    mask-broadcast).  No ``Shape`` chain at all in this mode — every
-    mask/scatter tensor is GPU-resident elementwise int64 arithmetic on
-    ``cache_position`` and initializers, so the Memcpy invariant holds
-    with zero CPU-resident nodes.
     """
 
     def add(op, ins, outs, **attrs):
         nodes.append(helper.make_node(op, ins, outs, **attrs))
 
-    if cache_window is None:
-        # S_eff = bound first dim of the cache; slots = arange_S[:S_eff].
-        # _axes0_1d/_axes1_1d double as the [0]/[1] bounds constants.
-        add("Shape", ["past_K_0"], ["_pastK0_shape"])  # (3,) int64, CPU
-        add(
-            "Slice", ["_pastK0_shape", "_axes0_1d", "_axes1_1d", "_axes0_1d"],
-            ["_s_eff_1d"],
-        )  # (1,) = [S_eff], CPU
-        add(
-            "Slice", ["arange_S", "_axes0_1d", "_s_eff_1d", "_axes0_1d"],
-            ["_slots"],
-        )  # (S_eff,) GPU data, CPU bounds
-        add("Unsqueeze", ["_slots", "_axes0_1d"], ["_slots_row"])  # (1, S_eff)
-        add(
-            "Unsqueeze", ["cache_position", "_axes1_1d"], ["_cache_pos_col"]
-        )  # (n_new, 1)
-        add(
-            "Greater", ["_slots_row", "_cache_pos_col"], ["_mask_bool"]
-        )  # (n_new, S_eff)
-        add(
-            "Unsqueeze", ["_mask_bool", "_axes0_1d"], ["mask_bool_3d"]
-        )  # (1, n_new, S_eff)
-        add("Gather", ["pos_encoding_full", "cache_position"], ["pos"], axis=0)
-        return
-
-    # --- Windowed mode: fixed C committed slots + n_new staging slots. ---
-    # base = cache_position[0], the committed-position count.  The [0]/[1]
-    # axes constants double as the Slice bounds, exactly as above.
+    # S_eff = bound first dim of the cache; slots = arange_S[:S_eff].
+    # _axes0_1d/_axes1_1d double as the [0]/[1] bounds constants.
+    add("Shape", ["past_K_0"], ["_pastK0_shape"])  # (3,) int64, CPU
     add(
-        "Slice", ["cache_position", "_axes0_1d", "_axes1_1d", "_axes0_1d"],
-        ["_base_1d"],
-    )  # (1,) = [base], GPU
-    # Committed slot j: written iff j < base (the host fills committed
-    # slots in slot order until all C are written once — after that this
-    # is uniformly true).  Written -> "position -1" (visible to every
-    # query); unwritten -> far-future (masked for every query).
-    add("Less", ["arange_S", "_base_1d"], ["_committed_written"])  # (C,) bool
+        "Slice", ["_pastK0_shape", "_axes0_1d", "_axes1_1d", "_axes0_1d"],
+        ["_s_eff_1d"],
+    )  # (1,) = [S_eff], CPU
     add(
-        "Where", ["_committed_written", "_i64_neg1_s", "_i64_far_future_s"],
-        ["_committed_slot_pos"],
-    )  # (C,) int64
-    # Staging slot t holds the new row at cache_position[t]; appending
-    # cache_position itself gives the causal triangle under the same
-    # Greater comparison the default mask uses.
-    add(
-        "Concat", ["_committed_slot_pos", "cache_position"], ["_slot_pos"],
-        axis=0,
-    )  # (C + n_new,)
-    add("Unsqueeze", ["_slot_pos", "_axes0_1d"], ["_slot_pos_row"])  # (1, C+n_new)
-    add(
-        "Unsqueeze", ["cache_position", "_axes1_1d"], ["_cache_pos_col"]
-    )  # (n_new, 1)
-    add(
-        "Greater", ["_slot_pos_row", "_cache_pos_col"], ["_mask_bool"]
-    )  # (n_new, C+n_new)
-    add(
-        "Unsqueeze", ["_mask_bool", "_axes0_1d"], ["mask_bool_3d"]
-    )  # (1, n_new, C+n_new)
+        "Slice", ["arange_S", "_axes0_1d", "_s_eff_1d", "_axes0_1d"],
+        ["_slots"],
+    )  # (S_eff,) GPU data, CPU bounds
+    add("Unsqueeze", ["_slots", "_axes0_1d"], ["_slots_row"])  # (1, S_eff)
+    add("Unsqueeze", ["cache_position", "_axes1_1d"], ["_cache_pos_col"])  # (n_new, 1)
+    add("Greater", ["_slots_row", "_cache_pos_col"], ["_mask_bool"])  # (n_new, S_eff)
+    add("Unsqueeze", ["_mask_bool", "_axes0_1d"], ["mask_bool_3d"])  # (1, n_new, S_eff)
     add("Gather", ["pos_encoding_full", "cache_position"], ["pos"], axis=0)
-    # ScatterND indices: new row r -> staging slot C + r.  Derived as
-    # C + (cache_position - base) — GPU-resident elementwise int64, no
-    # Range op (a CPU-produced dynamic-size tensor feeding a GPU op
-    # would be a Memcpy; see the capture invariant above).
-    add("Sub", ["cache_position", "_base_1d"], ["_stage_offsets"])  # (n_new,)
-    add("Add", ["_stage_offsets", "_i64_cwin_s"], ["_write_slots"])  # (n_new,)
-    add("Unsqueeze", ["_write_slots", "_axes1_1d"], ["_write_slot_col"])  # (n_new, 1)
 
 
 def _emit_cached_layer_nodes(
@@ -1030,9 +891,8 @@ def _emit_cached_layer_nodes(
     streaming weight callback.
 
     ``scatter_idx_col`` names the (n_new, 1) int64 tensor used as the
-    ScatterND row indices.  Default ``_cache_pos_col`` = slot ==
-    position (the unbounded protocol); the windowed preamble emits
-    ``_write_slot_col`` (the constant staging tail) instead.
+    ScatterND row indices — ``_cache_pos_col`` (slot == position, the
+    unbounded protocol).
 
     Returns the name of the next residual stream tensor.
     """
@@ -1180,36 +1040,13 @@ def _kv_io_value_info(
 def _resolve_cache_stride(
     cache_stride: Optional[int],
     max_seq_len: int,
-    cache_window: Optional[int] = None,
 ) -> int:
     """Resolve the static cache slot count ``S`` (default: max_seq_len).
 
     ``S`` must be <= max_seq_len because ``Gather(pos_encoding_full,
     cache_position)`` indexes a table sized by max_seq_len, and a compiled
     model can never serve positions beyond its pos-encoding buffer anyway.
-
-    In windowed mode (``cache_window=C``) the committed slot count IS the
-    stride: ``arange_S`` is baked at length exactly ``C`` and the sidecar's
-    ``cache_stride`` reads ``C``.  ``cache_stride`` and ``cache_window``
-    are mutually exclusive — the window fixes the slot count, so a
-    separate stride has nothing left to mean.  ``C > max_seq_len`` is
-    rejected: such a window could never fill (positions cap at
-    max_seq_len) and signals caller confusion, even though it would be
-    mechanically harmless.
     """
-    if cache_window is not None:
-        if cache_stride is not None:
-            raise ValueError(
-                "cache_stride and cache_window are mutually exclusive: the "
-                "windowed cache fixes the committed slot count at cache_window"
-            )
-        c = int(cache_window)
-        if not (1 <= c <= max_seq_len):
-            raise ValueError(
-                f"cache_window {c} must be in [1, max_seq_len={max_seq_len}]: "
-                f"a window wider than the position space can never fill"
-            )
-        return c
     s = max_seq_len if cache_stride is None else int(cache_stride)
     if not (1 <= s <= max_seq_len):
         raise ValueError(
@@ -1234,7 +1071,6 @@ def compile_headless_to_onnx(
     optimize: int = 0,
     assume_zero_init: bool = True,
     cache_stride: Optional[int] = None,
-    cache_window: Optional[int] = None,
     debug_sidecar: bool = True,
 ) -> OnnxArtifact:
     """Compile a float-I/O graph to a KV-cached ONNX model.
@@ -1275,13 +1111,6 @@ def compile_headless_to_onnx(
     meta's ``cache_stride`` key); defaults to ``max_seq_len``.  A
     compiled model hard-caps at ``prefill + decode <= S``.
 
-    ``cache_window=C`` selects the windowed-cache protocol instead (see
-    the module docstring): bindings are exactly ``C + n_new`` wide,
-    committed slot placement is the host's policy, positions stay
-    absolute and may run to ``max_seq_len`` regardless of ``C``.
-    Mutually exclusive with ``cache_stride``; the sidecar carries both
-    ``cache_stride == C`` and the ``cache_window`` discriminator key.
-
     ``d_hidden`` is the per-layer MLP hidden width.  Defaults to ``d``
     when omitted; pass an explicit value to decouple the MLP intermediate
     width from the residual stream width.
@@ -1294,9 +1123,7 @@ def compile_headless_to_onnx(
     """
     # Validate the cache config up front — a ValueError after the
     # (potentially very long) streaming compile would waste the whole run.
-    cache_stride_resolved = _resolve_cache_stride(
-        cache_stride, max_seq_len, cache_window
-    )
+    cache_stride_resolved = _resolve_cache_stride(cache_stride, max_seq_len)
 
     # Assert/DebugWatch coverage must be collected BEFORE forward_compile
     # strips both wrapper kinds from the graph in-place.
@@ -1414,8 +1241,6 @@ def compile_headless_to_onnx(
     # Per-layer reshape constants (l{i}_qkv_view_shape, l{i}_ctx_flat_shape)
     # are emitted by the streaming weight callback.
     _add_scalar_inits(dense_inits)
-    if cache_window is not None:
-        _add_windowed_scalar_inits(dense_inits, cache_stride_resolved)
 
     # Nodes: preamble (mask + pos), residual stream, layers, postamble.
     nodes: list = []
@@ -1423,15 +1248,12 @@ def compile_headless_to_onnx(
     def add(op, ins, outs, **attrs):
         nodes.append(helper.make_node(op, ins, outs, **attrs))
 
-    _emit_cached_preamble(nodes, cache_window=cache_window)
+    _emit_cached_preamble(nodes)
     add("MatMul", ["inputs", "input_proj"], ["inp_res"])
     add("MatMul", ["pos", "pos_proj"], ["pos_res"])
     add("Add", ["inp_res", "pos_res"], ["res_pi"])
     add("Add", ["res_pi", "constant_values"], ["res_0"])
 
-    scatter_idx_col = (
-        "_cache_pos_col" if cache_window is None else "_write_slot_col"
-    )
     current_res = "res_0"
     for i in range(n_layers):
         current_res = _emit_cached_layer_nodes(
@@ -1441,7 +1263,7 @@ def compile_headless_to_onnx(
             d,
             d_head,
             per_layer_n_heads[i],
-            scatter_idx_col=scatter_idx_col,
+            scatter_idx_col="_cache_pos_col",
         )
 
     add(
@@ -1487,7 +1309,6 @@ def compile_headless_to_onnx(
         list(input_names),
         extra=extra_metadata,
         cache_stride=cache_stride_resolved,
-        cache_window=cache_window,
     )
 
     if debug_sidecar:
@@ -1512,7 +1333,6 @@ def compile_headless_to_onnx(
             asserts=all_asserts,
             watches=all_watches,
             cache_stride=cache_stride_resolved,
-            cache_window=cache_window,
             optimize=optimize,
             extra=extra_metadata,
             verbose=verbose,
@@ -1541,7 +1361,6 @@ def compile_headless_to_onnx(
         d=d,
         d_head=d_head,
         cache_stride=cache_stride_resolved,
-        cache_window=cache_window,
     )
 
 
@@ -1561,7 +1380,6 @@ def compile_to_onnx(
     d_hidden: Optional[int] = None,
     extra_metadata: Optional[dict] = None,
     cache_stride: Optional[int] = None,
-    cache_window: Optional[int] = None,
     debug_sidecar: bool = True,
 ) -> OnnxArtifact:
     """Compile a token-I/O graph to a KV-cached ONNX model.
@@ -1608,13 +1426,6 @@ def compile_to_onnx(
     fully static shapes per run — the properties that make decode steps
     CUDA-graph capturable, one captured graph per (S_eff, width) bucket.
 
-    ``cache_window=C`` selects the windowed-cache protocol instead (see
-    the module docstring): bindings are exactly ``C + n_new`` wide,
-    committed slot placement is the host's policy, positions stay
-    absolute and may run to ``max_seq_len`` regardless of ``C``.
-    Mutually exclusive with ``cache_stride``; the sidecar carries both
-    ``cache_stride == C`` and the ``cache_window`` discriminator key.
-
     ``assume_zero_init`` defaults to ``True`` here (unlike ``forward_compile``,
     which defaults ``False``): the ONNX runtime always constructs the residual
     stream from zeros plus the input projections (see
@@ -1631,9 +1442,7 @@ def compile_to_onnx(
     """
     # Validate the cache config up front — a ValueError after the
     # (potentially very long) streaming compile would waste the whole run.
-    cache_stride_resolved = _resolve_cache_stride(
-        cache_stride, max_seq_len, cache_window
-    )
+    cache_stride_resolved = _resolve_cache_stride(cache_stride, max_seq_len)
 
     # Assert/DebugWatch coverage must be collected BEFORE forward_compile
     # strips both wrapper kinds from the graph in-place.
@@ -1754,8 +1563,6 @@ def compile_to_onnx(
     # Per-layer reshape constants (l{i}_qkv_view_shape, l{i}_ctx_flat_shape)
     # are emitted by the streaming weight callback.
     _add_scalar_inits(dense_inits)
-    if cache_window is not None:
-        _add_windowed_scalar_inits(dense_inits, cache_stride_resolved)
 
     # Nodes: preamble (mask + pos), token embed, residual stream, layers,
     # output gather, unembed.
@@ -1764,7 +1571,7 @@ def compile_to_onnx(
     def add(op, ins, outs, **attrs):
         nodes.append(helper.make_node(op, ins, outs, **attrs))
 
-    _emit_cached_preamble(nodes, cache_window=cache_window)
+    _emit_cached_preamble(nodes)
     # Token embedding lookup: (vocab, d_embed) gather rows by token_ids.
     add("Gather", ["embed_table", "token_ids"], ["_token_emb"], axis=0)
     add("MatMul", ["_token_emb", "embedding_proj"], ["inp_res"])
@@ -1772,9 +1579,6 @@ def compile_to_onnx(
     add("Add", ["inp_res", "pos_res"], ["res_pi"])
     add("Add", ["res_pi", "constant_values"], ["res_0"])
 
-    scatter_idx_col = (
-        "_cache_pos_col" if cache_window is None else "_write_slot_col"
-    )
     current_res = "res_0"
     for i in range(n_layers):
         current_res = _emit_cached_layer_nodes(
@@ -1784,7 +1588,7 @@ def compile_to_onnx(
             d,
             d_head,
             per_layer_n_heads[i],
-            scatter_idx_col=scatter_idx_col,
+            scatter_idx_col="_cache_pos_col",
         )
 
     add(
@@ -1835,10 +1639,6 @@ def compile_to_onnx(
         # first dim on past_K_i, loaders read S from here.
         "cache_stride": cache_stride_resolved,
     }
-    if cache_window is not None:
-        # Windowed-cache protocol discriminator: bindings must be exactly
-        # C + n_new wide (see the module docstring).
-        token_meta["cache_window"] = int(cache_window)
     if extra_metadata:
         token_meta["extra"] = dict(extra_metadata)
     meta_path = _write_meta(output_path, token_meta)
@@ -1859,7 +1659,6 @@ def compile_to_onnx(
             asserts=all_asserts,
             watches=all_watches,
             cache_stride=cache_stride_resolved,
-            cache_window=cache_window,
             optimize=optimize,
             extra=extra_metadata,
             verbose=verbose,
@@ -1888,7 +1687,6 @@ def compile_to_onnx(
         d=d,
         d_head=d_head,
         cache_stride=cache_stride_resolved,
-        cache_window=cache_window,
         d_embed=d_embed,
         vocab_size=int(vocab_size),
     )

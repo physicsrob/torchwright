@@ -7,6 +7,7 @@ from torchwright.graph.spherical_codes import get_spherical_codes
 from torchwright.graph.value_type import NodeValueType
 
 unk_token = "<unk>"
+bos_token = "<bos>"
 default_special_tokens = [unk_token]
 
 

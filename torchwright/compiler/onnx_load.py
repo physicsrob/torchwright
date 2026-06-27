@@ -487,7 +487,7 @@ class OnnxTokenModule:
         self,
         input_text: str,
         max_new_tokens: int = 10,
-        bos_token: str = "<bos",
+        bos_token: str = "<bos>",
         eos_token: str = "<eos>",
     ) -> Iterator[str]:
         """Autoregressive argmax generation over the cached protocol.

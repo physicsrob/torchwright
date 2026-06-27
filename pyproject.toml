@@ -20,6 +20,13 @@ gpu = [
     "onnxruntime-gpu==1.26.0; python_version >= '3.11'",
     "onnxruntime-gpu; python_version < '3.11'",
 ]
+# Native HuggingFace surface for compiled token models (compiler/hf/):
+# publishing a compiled artifact as a standard transformers causal LM.
+# Opt-in — the core compiler does not need them.
+hf = [
+    "transformers>=5.0",
+    "safetensors",
+]
 
 [dependency-groups]
 dev = [
@@ -29,6 +36,8 @@ dev = [
     "pytest",
     "pytest-cov",
     "pytest-xdist>=3.8.0",
+    "transformers>=5.0",
+    "safetensors",
 ]
 
 [[tool.uv.index]]

@@ -125,7 +125,7 @@ def test_token_onnx_prefill_matches_compute():
             verbose=False,
         )
 
-        tokens = ["<bos", "1", "+", "2", "\n"]
+        tokens = ["<bos>", "1", "+", "2", "\n"]
         ref_logits = _reference_logits(output_node, pos_encoding, embedding, tokens)
 
         session = onnxruntime.InferenceSession(onnx_path)
@@ -162,7 +162,7 @@ def test_token_onnx_decode_step_matches_full_prefill():
             verbose=False,
         )
 
-        tokens = ["<bos", "1", "+", "2", "\n"]
+        tokens = ["<bos>", "1", "+", "2", "\n"]
         token_ids = np.array(
             [embedding.tokenizer.get_token_id(t) for t in tokens],
             dtype=np.int64,
@@ -331,7 +331,6 @@ def test_token_onnx_artifact_fields_load_and_generate():
         assert artifact.d == D
         assert artifact.d_head == D_HEAD
         assert artifact.cache_stride == 512  # max_seq_len default
-        assert artifact.cache_window is None
         # vocab_size is the embedding TABLE's row count (the logits
         # width) — the table is padded past the tokenizer's vocab list.
         assert artifact.vocab_size == embedding.table.shape[0]

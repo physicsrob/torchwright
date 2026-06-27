@@ -34,8 +34,19 @@ makes visible:
 Each operand is fed at its declared ``n`` digits with no extra padding, so
 ``n`` means the same thing across all three ops — directly comparable curves.
 
-Output: a JSON file (the data the blog/vizkit consumes), a printed table, and
-an optional matplotlib PNG (depth-vs-n and neurons-vs-n).
+On top of those per-op *kernel* metrics, a second pass measures **end-to-end
+model depth** — ``critical_path_depth`` of the whole ``create_network_parts(n)``
+graph (parse + all three ops + dispatch + emit), one number per implementation.
+This is the figure that makes the payoff visible: ``simple`` and ``advanced``
+grow ~linearly (the ``O(n)`` sliding-window parser dominates even ``advanced``'s
+``O(log n)`` arithmetic), while ``examples.calculator_scratchpad`` — which
+streams the serial carry/borrow/comparison work out as "thinking" tokens —
+stays **flat** in ``n`` and pays the cost in decode *steps* (``6n+3``) instead.
+
+Output: a JSON file (the data the blog/vizkit consumes), printed tables, and an
+optional matplotlib PNG (per-op kernel depth and end-to-end model depth, with a
+colour per implementation shared across both panels).  Decode steps stay in the
+JSON (``decode_steps``) but are no longer a plotted panel.
 
 Run locally (CPU is fine, no GPU needed)::
 
@@ -47,8 +58,12 @@ Run locally (CPU is fine, no GPU needed)::
 import argparse
 import json
 
-from examples import calculator_advanced, calculator_simple
-from torchwright.ops.inout_nodes import create_literal_value, create_onehot_embedding
+from examples import calculator_advanced, calculator_scratchpad, calculator_simple
+from torchwright.ops.inout_nodes import (
+    create_literal_value,
+    create_onehot_embedding,
+    create_pos_encoding,
+)
 
 # Registered implementations, in figure order: the legible serial folds vs the
 # depth-optimized carry-lookahead / carry-save versions.  Each calculator module
@@ -74,6 +89,22 @@ DEFAULT_MULTIPLY_CAP = 16
 
 # Operands are one-hot digits 0..9; the ops only ever look up digit rows.
 VOCAB = [str(d) for d in range(10)]
+
+# End-to-end *model* depth (parse + all three ops + dispatch + emit), one number
+# per implementation per digit count — the figure that makes the scratchpad's
+# payoff visible.  All three modules expose ``create_network_parts(max_digits)``.
+# ``simple`` / ``advanced`` grow ~linearly (the O(n) sliding-window parser
+# dominates even ``advanced``'s O(log n) arithmetic); ``scratchpad`` stays flat
+# and pays in decode *steps* instead.
+MODEL_IMPLEMENTATIONS = {
+    "simple": calculator_simple,
+    "advanced": calculator_advanced,
+    "scratchpad": calculator_scratchpad,
+}
+
+# Each model build includes the O(n^2) multiply graph, so the end-to-end sweep
+# is capped low; the flat-vs-linear divergence is already unmistakable by n=6.
+DEFAULT_MODEL_DIGIT_SWEEP = [1, 2, 3, 4, 5, 6]
 
 
 def log(message: str) -> None:
@@ -143,6 +174,40 @@ def measure_op(arith, fn_name, n, embedding):
     return critical_path_depth(outputs), total_neurons(outputs)
 
 
+# The scratchpad's per-op "kernel" is its streamed sweep, not a digit-seq
+# transform: it needs the scratch vocab and a position encoding and returns
+# emitted-token nodes, so it can't go through ``measure_op``.  These are its
+# private op builders ``(pos_encoding, embedding, A, B, n) -> (thinking,
+# answer)``; reaching for them keeps the kernel panel able to show all three
+# implementations without widening the scratchpad's public surface for a viz.
+_SCRATCHPAD_OPS = {
+    "add": calculator_scratchpad._add_op,
+    "subtract": calculator_scratchpad._sub_op,
+    "multiply": calculator_scratchpad._mul_op,
+}
+
+# The streamed kernel's *graph build* is ~O(n^3): n^2 partial products plus the
+# pointer-gather trim, which derives each answer digit once into a scratch region
+# and reads it back with a single one-hot attention per slot (no per-slot
+# materialization of all N digits — the old ~O(n^4) term).  Its depth is flat in
+# n, so a short sweep shows the whole story; the cap is comfortably affordable now.
+SCRATCHPAD_OP_CAP = 12
+
+
+def measure_scratchpad_op(op_fn, n):
+    """Build the streamed scratchpad ``op(a, b)`` kernel; return (depth, neurons).
+
+    Depth is flat in ``n`` (the streaming moves the serial recurrence onto the
+    decode-step axis); only the neuron count grows."""
+    embedding = create_onehot_embedding(calculator_scratchpad.scratch_vocab(n))
+    pos_encoding = create_pos_encoding()
+    a = _operand(embedding, n)
+    b = _operand(embedding, n)
+    thinking, answer = op_fn(pos_encoding, embedding, a, b, n)
+    outputs = thinking + answer
+    return critical_path_depth(outputs), total_neurons(outputs)
+
+
 def _sweep_for(op_name, digit_sweep, multiply_cap):
     if op_name == "multiply":
         capped = [n for n in digit_sweep if n <= multiply_cap]
@@ -168,7 +233,65 @@ def run(digit_sweep, multiply_cap=DEFAULT_MULTIPLY_CAP):
                 records.append({"n": n, "depth": depth, "neurons": neurons})
                 log(f"{impl_name}/{op_name} n={n}: depth={depth}, neurons={neurons:,}")
             results[impl_name][op_name] = records
+
+    # The scratchpad's per-op kernels (flat depth) alongside the legible serial /
+    # depth-optimized ones, so all three implementations appear in the kernel
+    # panel too — not only the end-to-end model panel.
+    results["scratchpad"] = {}
+    for op_name, op_fn in _SCRATCHPAD_OPS.items():
+        records = []
+        sweep = [
+            n
+            for n in _sweep_for(op_name, digit_sweep, multiply_cap)
+            if n <= SCRATCHPAD_OP_CAP
+        ]
+        for n in sweep:
+            depth, neurons = measure_scratchpad_op(op_fn, n)
+            records.append({"n": n, "depth": depth, "neurons": neurons})
+            log(f"scratchpad/{op_name} n={n}: depth={depth}, neurons={neurons:,}")
+        results["scratchpad"][op_name] = records
     return results
+
+
+def measure_model(impl, n):
+    """Build the whole model ``create_network_parts(n)``; return its end-to-end
+    (depth, neurons) — parse + arithmetic + dispatch + emit, not one op."""
+    output_node, _, _ = impl.create_network_parts(max_digits=n)
+    return critical_path_depth([output_node]), total_neurons([output_node])
+
+
+def run_models(digit_sweep):
+    """End-to-end model depth/size for every implementation, plus the scratchpad
+    decode-step count (its O(n) cost, the axis that grows instead of depth)."""
+    results = {}
+    for name, impl in MODEL_IMPLEMENTATIONS.items():
+        records = []
+        for n in digit_sweep:
+            depth, neurons = measure_model(impl, n)
+            record = {"n": n, "depth": depth, "neurons": neurons}
+            if name == "scratchpad":
+                record["decode_steps"] = impl.decode_steps(n)
+            records.append(record)
+            steps = f", steps={record['decode_steps']}" if "decode_steps" in record else ""
+            log(f"model {name} n={n}: depth={depth}, neurons={neurons:,}{steps}")
+        results[name] = records
+    return results
+
+
+def print_models_table(model_results) -> None:
+    print("\n== end-to-end model scaling (whole-model critical-path depth) ==")
+    for name, records in model_results.items():
+        print(f"\n  model = {name}")
+        has_steps = any("decode_steps" in r for r in records)
+        header = f"    {'n':>4}  {'depth':>6}  {'neurons':>12}"
+        if has_steps:
+            header += f"  {'steps':>6}"
+        print(header)
+        for r in records:
+            row = f"    {r['n']:>4}  {r['depth']:>6}  {r['neurons']:>12,}"
+            if has_steps:
+                row += f"  {r['decode_steps']:>6}"
+            print(row)
 
 
 def print_table(results) -> None:
@@ -182,15 +305,19 @@ def print_table(results) -> None:
                 print(f"    {r['n']:>4}  {r['depth']:>6}  {r['neurons']:>12,}")
 
 
-def build_payload(results, digit_sweep, multiply_cap):
+def build_payload(results, model_results, digit_sweep, model_digit_sweep, multiply_cap):
     return {
         "config": {
             "digit_sweep": digit_sweep,
+            "model_digit_sweep": model_digit_sweep,
             "multiply_cap": multiply_cap,
             "depth_metric": "critical-path length over neuron-producing nodes",
             "size_metric": "total neuron count (~ params / 2d)",
+            "model_depth_metric": "whole-model critical-path depth (parse + ops + dispatch + emit)",
+            "decode_steps_metric": "emitted tokens per query (scratchpad: 6n+3)",
         },
         "results": results,
+        "model_results": model_results,
     }
 
 
@@ -200,24 +327,7 @@ def write_json(payload, path) -> None:
     log(f"wrote scaling data -> {path}")
 
 
-def _plot_series(impl_name, ops):
-    """(label, records) per impl, collapsing add+subtract when they are equal.
-
-    Add and subtract are the same structure over same-shape tables, so they have
-    identical depth and size — plotting them as two coincident lines just hides
-    one under the other.  When the records match exactly, emit a single
-    ``add+subtract`` series; otherwise keep them apart.
-    """
-    add, sub = ops.get("add"), ops.get("subtract")
-    collapse = add is not None and sub is not None and add == sub
-    for op_name, records in ops.items():
-        if collapse and op_name == "subtract":
-            continue
-        name = "add+subtract" if collapse and op_name == "add" else op_name
-        yield f"{impl_name}/{name}", records
-
-
-def write_plot(results, path) -> None:
+def write_plot(results, model_results, path) -> None:
     try:
         import matplotlib
 
@@ -227,20 +337,53 @@ def write_plot(results, path) -> None:
         log("matplotlib not installed; skipping PNG (JSON is still written)")
         return
 
-    fig, (ax_depth, ax_size) = plt.subplots(1, 2, figsize=(12, 5))
-    for impl_name, ops in results.items():
-        for label, records in _plot_series(impl_name, ops):
-            ns = [r["n"] for r in records]
-            ax_depth.plot(ns, [r["depth"] for r in records], marker="o", label=label)
-            ax_size.plot(ns, [r["neurons"] for r in records], marker="o", label=label)
+    # One colour per implementation, shared across both panels so the eye maps
+    # the same algorithm between the kernel-depth and the model-depth view, and
+    # both legends read the same three names.
+    impl_names = list(dict.fromkeys(list(results) + list(model_results)))
+    cmap = plt.get_cmap("tab10")
+    impl_color = {name: cmap(i) for i, name in enumerate(impl_names)}
+
+    fig, (ax_depth, ax_model) = plt.subplots(1, 2, figsize=(12, 5))
+
+    # Left: the multiply kernel's depth — the headline op, one line per
+    # implementation (simple linear, advanced log, scratchpad flat), so the
+    # legend matches the right panel exactly.
+    for impl_name in impl_color:
+        ops = results.get(impl_name)
+        if not ops or "multiply" not in ops:
+            continue
+        records = ops["multiply"]
+        ns = [r["n"] for r in records]
+        ax_depth.plot(
+            ns,
+            [r["depth"] for r in records],
+            marker="o",
+            color=impl_color[impl_name],
+            label=impl_name,
+        )
+    ax_depth.set_title("arithmetic-kernel depth (multiply)")
     ax_depth.set_ylabel("critical-path depth (layers)")
-    ax_size.set_ylabel("neurons (~ params / 2d)")
-    ax_size.set_yscale("log")
-    for ax in (ax_depth, ax_size):
+
+    # Right (the headline): whole-model depth — scratchpad flat, the legible
+    # calculators linear.
+    for name, records in model_results.items():
+        ns = [r["n"] for r in records]
+        ax_model.plot(
+            ns,
+            [r["depth"] for r in records],
+            marker="o",
+            color=impl_color[name],
+            label=name,
+        )
+    ax_model.set_title("end-to-end model depth (flat ⇔ scratchpad)")
+    ax_model.set_ylabel("model critical-path depth (layers)")
+
+    for ax in (ax_depth, ax_model):
         ax.set_xlabel("digit count n")
         ax.grid(True, alpha=0.3)
         ax.legend(fontsize=8)
-    fig.suptitle("One-hot arithmetic: depth and size vs digit count")
+    fig.suptitle("One-hot arithmetic: kernel depth and model depth")
     fig.tight_layout()
     fig.savefig(path, dpi=120)
     log(f"wrote scaling plot -> {path}")
@@ -266,17 +409,35 @@ def main() -> None:
         default=DEFAULT_MULTIPLY_CAP,
         help="cap the multiply sweep at this n (default: %d)" % DEFAULT_MULTIPLY_CAP,
     )
+    parser.add_argument(
+        "--model-digits",
+        default=None,
+        help="comma-separated end-to-end model sweep (default: %s)"
+        % DEFAULT_MODEL_DIGIT_SWEEP,
+    )
     args = parser.parse_args()
 
     digit_sweep = (
         [int(x) for x in args.digits.split(",")] if args.digits else DEFAULT_DIGIT_SWEEP
     )
+    model_digit_sweep = (
+        [int(x) for x in args.model_digits.split(",")]
+        if args.model_digits
+        else DEFAULT_MODEL_DIGIT_SWEEP
+    )
 
     results = run(digit_sweep, args.multiply_cap)
+    model_results = run_models(model_digit_sweep)
     print_table(results)
-    write_json(build_payload(results, digit_sweep, args.multiply_cap), args.out)
+    print_models_table(model_results)
+    write_json(
+        build_payload(
+            results, model_results, digit_sweep, model_digit_sweep, args.multiply_cap
+        ),
+        args.out,
+    )
     if args.plot:
-        write_plot(results, args.plot_out)
+        write_plot(results, model_results, args.plot_out)
 
 
 if __name__ == "__main__":

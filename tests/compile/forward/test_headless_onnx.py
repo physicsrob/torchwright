@@ -639,7 +639,6 @@ def test_headless_onnx_artifact_fields_and_load():
         assert artifact.d == D
         assert artifact.d_head == D_HEAD
         assert artifact.cache_stride == 32  # = max_seq_len default in _export
-        assert artifact.cache_window is None
         assert artifact.d_embed is None and artifact.vocab_size is None
         assert artifact.n_layers > 0
         assert isinstance(artifact.per_layer_n_heads, tuple)

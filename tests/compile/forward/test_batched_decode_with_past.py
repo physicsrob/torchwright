@@ -45,7 +45,7 @@ def _row_input(net, tokens, t):
 def test_batched_decode_with_past_matches_sequential(compiled_calc):
     """K+1 batched rows from past_len=L equal L+1..L+K+1 sequential rows."""
     net, _, _ = compiled_calc
-    tokens = ["<bos"] + list("3+5+9\n")
+    tokens = ["<bos>"] + list("3+5+9\n")
     seed_len = 3  # past_len at the start of the batched step
     batch_size = len(tokens) - seed_len  # K+1 rows in the batched step
     assert batch_size >= 2, "test requires n_new >= 2 to exercise the new mask"
