@@ -237,6 +237,14 @@ Keep the public helper *call semantics* stable so DOOM and the ops layer change 
 DOOM (`torchwright_doom`) builds no raw `Attn` (re-confirm by grep), so a semantics-preserving
 migration leaves the renderer untouched until final validation.
 
+**Working split — torchwright first, `torchwright_doom` untouched through Phase 4.** All Phase 0–4
+work happens in torchwright and is validated by the §9 confidence suite (capabilities calibrated to
+real DOOM difficulty). `torchwright_doom` is only *read* (the consumer census), never edited, from a
+torchwright worktree. To keep DOOM untouched until the end, **defer the `pos_encoding`-drops-from-
+signatures change to Phase 5**: through Phases 1–4 keep each helper's signature stable and swap the
+mechanism *internally*, so no DOOM call site changes. Consumer edits + DOOM render parity are a
+separate `torchwright_doom` branch (Phase 5+), coordinated via the umbrella pointer bump.
+
 ## 8. Implementation phases (ordered, each independently testable)
 
 Each phase ends with a probe/oracle validation (`probe_compiled` in-process,
@@ -291,7 +299,9 @@ peak at a different key).
 `prefix_*` on the near-marker `1/(gap+1)` count. Gates: (a) each consumer's marker is a
 graph-recognizable in-context token and the post-marker gate is constructible; (b) the
 worst-case `gap` bound per consumer holds and `1/(gap+1)` resolves at that bound (`1/350` vs
-`1/351` ≫ noise). Validation: DOOM pixel arithmetic reproduces vs oracle over a deep rollout.
+`1/351` ≫ noise). Validation: the §9 bucket-1 confidence test — a torchwright-only graph with an
+in-stream marker and value `= pos − marker_pos` recovered via the count, vs oracle, pushed to the
+~350 gap bound over a deep rollout (no `torchwright_doom`).
 
 **Phase 1b — Recency signal (bucket 2): the octant two-head readout.** Build the §3 mechanism.
 Gates: (a) **BOS attendability** — trivially satisfied (§5); confirm the recency signal is
@@ -354,14 +364,40 @@ within the documented op-noise budget.
 
 ## 9. Validation and evidence
 
+**Strategy — torchwright-internal confidence suite (decoupled from `torchwright_doom`).**
+Phases 0–4 are validated entirely inside torchwright, with **no `torchwright_doom` edits**. The
+move: treat each DOOM consumer *class* as a torchwright *capability*, and prove that capability
+with a torchwright-only test graph that reproduces the class's essential shape **and its real
+worst-case difficulty**. If the suite passes, the eventual DOOM migration is mechanical (swap each
+consumer onto an already-proven capability), not a question of whether RoPE can do it. The census
+of which DOOM call sites map to which capability is **read-only** analysis of `torchwright_doom`
+(no edits from a torchwright worktree); consumer edits and full DOOM render parity are a separate
+`torchwright_doom` branch, coordinated via the umbrella pointer-bump, after the torchwright branch
+is mergeable (§7). The three capabilities and their calibration targets:
+
+| Capability (DOOM consumer class) | torchwright confidence test | Calibrate to |
+|---|---|---|
+| **Offset / self-match** (`attend_to_offset`, the 5 compiler self-match callers) | rotary offset head; all-Δ + Δ=0 self-match (Phases 0/2) | token-identical vs trig-shift; I1–I4 hold |
+| **Bucket 1 — bounded near-marker count** (`get_position_scalar`, `prefix_*`) | marker token in-stream + value `= pos − marker_pos` via the `1/(gap+1)` count, vs oracle | gap **< ~350**; `1/350` vs `1/351` resolves |
+| **Bucket 2 — recency ordering** (`attend_most_recent_matching`, `get_prev_value`) | real `compare`/`cond_gate`/`add` octant ramp; "most recent matching key" selection | gap-1 at absolute pos out to **~42k**; Phase-1b gates (handoff continuity, min slope ≈2.2e-5/tok, 0 flips) |
+| **Content selection** (`attend_argmin/argmax/_where/...`) | each selector under RoPE slow planes, against its own score/validity bounds | real head gaps (`_QUERY_GAIN=8`, the bucket margins) |
+
+**Calibration discipline (the rule that makes this real, not theater):** every confidence test
+must encode the *actual worst-case difficulty*, not a toy version. A bucket-1 test at gap≤10 or a
+recency test at 11.6k proves little; they must push to ~350 and ~42k respectively. A test easier
+than the real consumer is false confidence. The numbers exist (this §9, the analysis scripts), so
+faithful tests are buildable now without DOOM.
+
 **Testing strategy.** Per-phase `probe_compiled` + `OnnxDebugSession` (root-CLAUDE triage
 sequence). D6 reproducers at the smallest layer: offset → op test; bucket-1 count → op test over
 the bounded gap range; recency → op test over the gap distribution. Oracle parity first:
 `Attn.compute` rotary path tested against the compiled rotary head before any head migrates.
 Cache invariant test (Phase 0): prefill and unbounded decode produce identical offset-head
 logits. Compiler-invariant tests for the self-match migration before broad suite runs.
-`make measure-noise` + update `numerical_noise_findings.md` for any new PL op (D7). Final: full
-DOOM render parity (Phase 5) and deep-rollout parity (Phase 1/4).
+`make measure-noise` + update `numerical_noise_findings.md` for any new PL op (D7). Per-phase
+validation is the torchwright-internal confidence suite above (deep-rollout parity for Phases 1/4
+via representative graphs, not DOOM). Full **DOOM render parity is the final integration step on a
+separate `torchwright_doom` branch** (post-Phase-5), not a per-phase gate in this repo.
 
 **Load-bearing numbers and their sources.**
 - **Recency requirement + octant headroom:** the full-frame instrumentation log
