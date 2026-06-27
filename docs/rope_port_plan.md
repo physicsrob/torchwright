@@ -336,9 +336,14 @@ in-stream marker and value `= pos − marker_pos` recovered via the count, vs or
 >   multiply. Output value-type = `union(t,f)` box (explicit override, applied post-clamp);
 >   precondition: `t,f` carry finite value-types (else `_max_abs_or_raise` raises). Consider whether
 >   a single-sublayer median-of-three PL construction is cheaper than min(max()).
-> - **Remaining build steps:** (1) add `soft_blend` (op test: crisp→t/f exactly, soft→in-box,
->   `t≈f`→≈t, *and* the same-sign-overshoot D6 repro where the clamp saves monotonicity; add a
->   `TargetOp` + `make measure-noise` + findings, D7); (2) add a checked graph assertion that
+> - **Remaining build steps:** (1) ✅ **DONE** — `soft_blend` added (`map_select.py`,
+>   commit `102dedb`): median-of-three on broadcast_select's carrier core (output_bias=0, no
+>   crisp-mask assert tail), clamped by the elementwise `min`/`max`. Op tests
+>   (`tests/ops/test_soft_blend.py`) cover crisp→t/f, soft→in-box, `t≈f`→≈t, and the
+>   same-sign-overshoot D6 repro; `TargetOp` + `make measure-noise` + findings landed. Measured at
+>   **fp32 round-off (1.19e-07 abs)** even at the octant-boundary worst input — exact-by-construction,
+>   no PL floor of its own. (The op tests are oracle-level via `.compute()`; the *compiled*
+>   monotonicity check is the gate-b sweep below, step 4.) (2) add a checked graph assertion that
 >   adjacent-octant branches are equal at all three boundary types (`u=0`, `v=0`, `|u|=|v|`) so a
 >   violation is caught at construction; (3) swap the 7 `select`s in the ramp builder for
 >   `soft_blend`; (4) run the gate below.
@@ -517,8 +522,9 @@ separate `torchwright_doom` branch** (post-Phase-5), not a per-phase gate in thi
 - **Recency confirm-compile (in progress).** Assembly math proven monotone
   (`scripts/rope_octant_assembly.py`, g=2.0, min step 2.275e-5/tok ~190×). Naive `select` build
   fails at octant boundaries (soft cond → `−M`); fix is the new **`soft_blend`** op (median-of-three
-  on `broadcast_select`'s carrier core — see Phase 1b status). Remaining: add `soft_blend` + tests +
-  noise, add a branch-equality-at-boundary graph assertion, swap the 7 selects, then run the gate:
+  on `broadcast_select`'s carrier core — see Phase 1b status). `soft_blend` is **built + tested +
+  measured** (commit `102dedb`, fp32-round-off noise). Remaining: build the graph-level octant ramp
+  builder with a branch-equality-at-boundary graph assertion, wire in `soft_blend`, then run the gate:
   **sub-token-dense** φ-sweep at each of the 8 boundaries through the **compiled** path, across runs,
   asserting strict φ-monotonicity (min step ≥ ~2.2e-5/tok), + `probe_compiled` parity, + 0
   full-frame replay flips with the real ramp.
