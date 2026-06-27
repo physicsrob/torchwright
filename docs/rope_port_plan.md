@@ -304,6 +304,54 @@ in-stream marker and value `= pos − marker_pos` recovered via the count, vs or
 ~350 gap bound over a deep rollout (no `torchwright_doom`).
 
 **Phase 1b — Recency signal (bucket 2): the octant two-head readout.** Build the §3 mechanism.
+
+> **Status (2026-06-27, in progress — not built; resume here in a fresh session).**
+> - **Assembly math proven.** `scripts/rope_octant_assembly.py` builds the *real* (not idealized)
+>   octant ramp from the two centered weights `u=σ(g·cosφ)−0.5`, `v=σ(g·sinφ)−0.5`: 8 octants from
+>   `sign(u)`, `sign(v)`, `|u|>|v|`; in each, the steep (nearer-0) weight with a per-octant sign +
+>   chaining offset. **Strictly monotone, min step 2.275e-5/token at `g=2.0`, ~190× the fp32
+>   weight-noise floor — matches the replay model.** `GAIN = g = 2.0` is the chosen head gain `M`.
+> - **Naive `select` build fails at boundaries (the real gate-b finding).** Building the 8-octant
+>   tree with the existing `select` is exact at mid-octant (verified 4.6e-7) but breaks near each
+>   boundary: a token's `φ = pos·θ` can land arbitrarily close to a `kπ/4` boundary, where the
+>   selection signal (`|u|−|v|`, `u`, or `v`) passes through 0, so the selector `compare` can't
+>   saturate to ±1 → `select`'s shared `output_bias=−M` cancellation drives the output to ≈ `−M`
+>   (`map_select.py:698`). Compiled dense sweep: ~13% non-monotone. No `compare` sharpness fixes it
+>   (a token can land *on* a boundary). This is the genuine unproven-mechanism crack the
+>   confirm-compile existed to find.
+> - **Fix: a new `soft_blend(cond, t, f)` op (dual-reviewed by Claude + Codex, agreed).** A
+>   *bounded crisp handoff switch*, **not** a cond-blender — it passes ~zero resolution through
+>   `cond` (the ramp's gap-1 resolution lives in `t`/`f`, read during crisp-cond octant interiors);
+>   `cond` is soft only where `t≈f` (proven by construction — the offset chaining makes adjacent
+>   octants' branch values *exactly* equal at each shared edge, and each boundary makes exactly one
+>   of the three tests soft). Build: `out = median(raw, min(t,f), max(t,f))` = `min(max(raw,
+>   min(t,f)), max(t,f))` via the elementwise `min`/`max` ops (`arithmetic_ops.py:359/383`; **not**
+>   the static-bounds `clamp`). `raw` reuses **`broadcast_select`'s per-unit-carrier core**
+>   (`map_select.py:1043-1067`, 4 units/col, `output_bias=0` → `raw(0)=ReLU(t)+ReLU(f)`, bounded by
+>   `|t|+|f|`, **no `−M` dip**) instantiated `n_slots=1` — **not** a helper shared with `select`
+>   (whose `−M` core *is* the failure), and **dropping** broadcast_select's crisp-mask tail (the
+>   `atol=M·c_tol` union assert at `:1082` and c_tol override at `:1090`, which would fire on soft
+>   cond). The `min`/`max` clamp is load-bearing: for same-sign `t,f`, `raw` overshoots the box and
+>   is non-monotone; the clamp restores both in-box *and* monotonicity. No activation×activation
+>   multiply. Output value-type = `union(t,f)` box (explicit override, applied post-clamp);
+>   precondition: `t,f` carry finite value-types (else `_max_abs_or_raise` raises). Consider whether
+>   a single-sublayer median-of-three PL construction is cheaper than min(max()).
+> - **Remaining build steps:** (1) add `soft_blend` (op test: crisp→t/f exactly, soft→in-box,
+>   `t≈f`→≈t, *and* the same-sign-overshoot D6 repro where the clamp saves monotonicity; add a
+>   `TargetOp` + `make measure-noise` + findings, D7); (2) add a checked graph assertion that
+>   adjacent-octant branches are equal at all three boundary types (`u=0`, `v=0`, `|u|=|v|`) so a
+>   violation is caught at construction; (3) swap the 7 `select`s in the ramp builder for
+>   `soft_blend`; (4) run the gate below.
+> - **Gate-b sweep — the teeth:** the soft window in `φ` (`~1/sharpness`) may be *narrower than one
+>   production token* (`θ≈2π/61440≈1e-4`), so a per-token sweep can step over a clamp-induced flat
+>   spot and **falsely pass**. The sweep must be **sub-token-dense in a tight neighborhood of each of
+>   the 8 boundaries**, run through the **compiled** path (not just the oracle), across runs (fp32
+>   nondeterminism), asserting strict φ-monotonicity with min step ≥ ~2.2e-5/token.
+> - **Fallback (documented only):** convex-multiply `f + ½(cond+1)(t−f)` inside `soft_blend`. Not
+>   promoted — it is an activation×activation multiply, and at a boundary `t−f→0` so
+>   `dC/dφ = ½(cond+1)(t′−f′)` leans on head derivatives at the crossover too: no guaranteed-smoother
+>   φ-slope for the multiply's cost. Use only if the sweep shows a real `soft_blend` φ-dip.
+
 Gates: (a) **BOS attendability** — trivially satisfied (§5); confirm the recency signal is
 identical between prefill and unbounded decode out to the full rollout. (b) **Build the real
 two-weight assembly and confirm monotone with margin** — the replay derisk (§9) modeled the ramp
@@ -466,10 +514,14 @@ separate `torchwright_doom` branch** (post-Phase-5), not a per-phase gate in thi
   runtime paths.
 - **Oracle-first.** ✅ DONE (Phase 0). `Attn.compute` rotary path landed before any head migration;
   `probe_compiled` parity confirmed.
-- **Recency confirm-compile.** Build the real two-weight octant assembly; verify handoff
-  continuity at the **boundary-straddling tokens** (within the `compare` `c_tol` band of each `π/4`
-  switch) at **production `φ`-density** and across runs (fp32 nondeterminism), compiled min slope
-  ≈ 2.2e-5/token, 0 full-frame replay flips (Phase 1b gate b).
+- **Recency confirm-compile (in progress).** Assembly math proven monotone
+  (`scripts/rope_octant_assembly.py`, g=2.0, min step 2.275e-5/tok ~190×). Naive `select` build
+  fails at octant boundaries (soft cond → `−M`); fix is the new **`soft_blend`** op (median-of-three
+  on `broadcast_select`'s carrier core — see Phase 1b status). Remaining: add `soft_blend` + tests +
+  noise, add a branch-equality-at-boundary graph assertion, swap the 7 selects, then run the gate:
+  **sub-token-dense** φ-sweep at each of the 8 boundaries through the **compiled** path, across runs,
+  asserting strict φ-monotonicity (min step ≥ ~2.2e-5/tok), + `probe_compiled` parity, + 0
+  full-frame replay flips with the real ramp.
 - **Recency leakage budget.** Pin the {BOS, self} exclusion score gap (≈ `log(N / resolution)` ≈
   22+ logits at `N ~ 42k`) and confirm leakage — and its growth with key count — stays below the
   gap-1 signal (Phase 1b gate d).
