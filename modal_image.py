@@ -9,8 +9,8 @@ IMAGE = (
     # in pyproject.toml).  Modal builds from torchwright/pyproject.toml
     # standalone (it rejects the umbrella's workspace table) and syncs
     # torchwright/uv.lock --frozen, so that lock must be regenerated
-    # out-of-workspace whenever these groups change; GitHub CI's `uv ... --locked`
-    # is what enforces it.
+    # out-of-workspace whenever these groups change (run `make modal-lock`);
+    # `make test` runs `check-modal-lock` first to catch drift.
     .uv_sync(groups=["dev", "test-onnx"], extra_options="--no-install-project")
     .add_local_file("E8.8.1024.txt", "/root/E8.8.1024.txt")
     .add_local_dir("docs", "/root/docs")

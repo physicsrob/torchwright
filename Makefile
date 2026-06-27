@@ -14,8 +14,28 @@ lint:
 	uv run black --check .
 	uv run mypy .
 
+# Guard the standalone lock the Modal --frozen build installs from.  It cannot
+# be refreshed by uv inside the workspace, so it drifts silently; this check
+# (a prerequisite of `make test`) fails fast if a Modal-synced group gained a
+# dependency the lock is missing.  Fix drift with `make modal-lock`.
+.PHONY: check-modal-lock
+check-modal-lock:
+	@uv run python -m scripts.check_modal_lock
+
+# Regenerate torchwright/uv.lock OUT OF the workspace (uv would otherwise resolve
+# to the umbrella root).  Mirrors the only supported way to refresh this lock.
+.PHONY: modal-lock
+modal-lock:
+	@echo "Regenerating standalone torchwright/uv.lock out-of-workspace…"
+	@TMP="$$(mktemp -d)" ; \
+		cp pyproject.toml uv.lock "$$TMP/" ; \
+		( cd "$$TMP" && uv lock ) ; \
+		cp "$$TMP/uv.lock" uv.lock ; \
+		rm -rf "$$TMP" ; \
+		echo "Updated torchwright/uv.lock — review the diff and commit."
+
 .PHONY: test
-test:
+test: check-modal-lock
 	@bash -c ' \
 		LOGFILE=/tmp/torchwright-test-$$(date +%Y%m%d-%H%M%S).log ; \
 		ln -sfn "$$LOGFILE" /tmp/torchwright-test.log ; \

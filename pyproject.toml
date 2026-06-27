@@ -46,8 +46,8 @@ dev = [
 # torchwright_doom's `onnxruntime-gpu` main dependency, and the CPU and GPU
 # builds collide on the same `onnxruntime` import path.  Keeping it out of `dev`
 # lets the local workspace use the GPU build while the Modal test image
-# (modal_image.py) and GitHub CI (.github/workflows/ci.yml) opt in explicitly
-# via `--group test-onnx`.  Pinned in lockstep with the gpu extra so the CPU
+# (modal_image.py) opts in explicitly via `--group test-onnx`.  Pinned in
+# lockstep with the gpu extra so the CPU
 # oracle the parity tests compare against matches the 1.26.0 runtime contract;
 # marker-split mirrors the gpu extra to keep universal resolution alive down to
 # the requires-python floor.
