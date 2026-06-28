@@ -5,8 +5,9 @@ sidecar, checks its format key, and returns an ``OnnxTokenModule`` — an
 ``onnxruntime``-backed callable speaking the static-cache prefill/decode
 protocol:
 
-- ``OnnxTokenModule`` — token I/O (``torchwright.token.v1``), produced
-  by :func:`torchwright.compiler.export.compile_to_onnx`; adds the
+- ``OnnxTokenModule`` — token I/O (``TOKEN_META_FORMAT``, currently
+  ``torchwright.token.v3``), produced by
+  :func:`torchwright.compiler.export.compile_to_onnx`; adds the
   vocab tokenizer and an argmax :meth:`OnnxTokenModule.generate` loop.
 
 Two usage shapes:
@@ -103,8 +104,8 @@ class OnnxTokenModule:
 
     Args:
         onnx_path: Path to the ``.onnx`` file.  A sidecar
-            ``<stem>.meta.json`` with format ``torchwright.token.v1``
-            must exist alongside it.
+            ``<stem>.meta.json`` with format ``TOKEN_META_FORMAT``
+            (currently ``torchwright.token.v3``) must exist alongside it.
         providers: ``onnxruntime`` execution providers list.  Defaults
             to CPU.
     """
@@ -287,9 +288,7 @@ class OnnxTokenModule:
         it is produced.  Stops at ``eos_token`` or ``max_new_tokens``.
         """
         tokens = [bos_token] + list(input_text)
-        ids = torch.tensor(
-            [self.token_to_id(t) for t in tokens], dtype=torch.int64
-        )
+        ids = torch.tensor([self.token_to_id(t) for t in tokens], dtype=torch.int64)
 
         logits, past = self.step(ids, self.empty_past())
         for _ in range(max_new_tokens):
@@ -298,9 +297,7 @@ class OnnxTokenModule:
             if next_token == eos_token:
                 break
             yield next_token
-            logits, past = self.step(
-                torch.tensor([next_id], dtype=torch.int64), past
-            )
+            logits, past = self.step(torch.tensor([next_id], dtype=torch.int64), past)
 
     def eval(self) -> "OnnxTokenModule":
         return self
@@ -310,7 +307,8 @@ def load_onnx(onnx_path: str, providers=None) -> OnnxTokenModule:
     """Load a torchwright token-I/O ONNX export.
 
     Reads ``<stem>.meta.json`` next to ``onnx_path`` and returns an
-    :class:`OnnxTokenModule` (``torchwright.token.v1``).
+    :class:`OnnxTokenModule` (format ``TOKEN_META_FORMAT``, currently
+    ``torchwright.token.v3``).
     """
     meta_path = meta_path_for(onnx_path)
     if not os.path.exists(meta_path):

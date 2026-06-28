@@ -5,8 +5,8 @@ metadata; ``artifact.load()`` / ``artifact.debug_session(...)``):
 
     compile_to_onnx(output_node, pos_encoding, embedding, path, ...)
         Token I/O: token_ids -> logits.  Sidecar format
-        ``torchwright.token.v1`` carries the vocab.  Consumer:
-        ``OnnxTokenModule`` via
+        ``TOKEN_META_FORMAT`` (currently ``torchwright.token.v3``)
+        carries the vocab.  Consumer: ``OnnxTokenModule`` via
         :func:`torchwright.compiler.onnx_load.load_onnx`.
 
 Both speak the STATIC-cache prefill/decode protocol (the vanilla
@@ -1389,8 +1389,11 @@ def compile_to_onnx(
         )
 
     # Final norm before the unembed (Llama-style), the bit-exact identity.  It
-    # reads ALL d columns for mean(x^2), so every column must stay finite — the
-    # pinned constant is finite and scratch/freed columns are zero.
+    # reads ALL d columns for mean(x^2), so the identity needs the total non-pinned
+    # energy bounded — which forward_compile's _certify_rms_norm_energy guarantees
+    # from the graph's value ranges (cancel-freed columns are zero, reassigned ones
+    # are owned by a snapshot node; either way the per-column bound holds).  Every
+    # column must also stay finite: the pinned constant is finite by construction.
     if rms_spec is not None:
         _emit_rmsnorm(
             add, current_res, "final_norm", "_rms_eps", "_final_normed", "_final_norm"

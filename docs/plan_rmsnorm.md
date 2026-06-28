@@ -9,9 +9,9 @@ shipped, with two corrections recorded inline and in *Open questions*:
   *shipping* graph `calculator_v2` reaches `Σ data² ~ 2.6e13` on its squaring
   path (`999*999`, `999+1`), which exceeds the `q=30` reduction half-ULP bound
   (`~2^36`) and **silently broke the identity** (logits off by ~1e7). `q=44`
-  (gain `2^39` at `d=1024`, bound `2^64`) clears it with ~`2^13` margin; `q` is
-  a tunable knob (`rms_norm_const_exp`). The out-energy bound is the one real
-  constraint — see *Constraints*.
+  (gain `2^39` at `d=1024`, bound `2^64`) clears it with ~`2^19` margin
+  (`2^64 / 2^44.6`); `q` is a tunable knob (`rms_norm_const_exp`). The
+  out-energy bound is the one real constraint — see *Constraints*.
 - **The energy bound is now certified at compile time** (resolving the
   code-review's dominant finding). `forward_compile` walks the residual
   assignment and, from each node's static `value_range`, computes a sound
@@ -41,12 +41,13 @@ The norm computes **nothing** — by construction it is the identity. Its entire
 value is faithfulness/credibility: today the compiler emits "no normalization
 anywhere," and a skeptical reader sees that as skipping the hard parts.
 
-**This gap is already shipped and explicit.** `examples/calculator_hf_export.py`
-publishes the compiled calculator as a HuggingFace model whose card claims it is
-"a *bona fide* standard transformer, not a bespoke runtime" — while the shipped
-model code (`torchwright/compiler/hf/modeling_torchwright.py:26`) and config
-(`configuration_torchwright.py:21`) both document **"No normalization anywhere;
-no final norm"** as a correctness invariant. The norm closes exactly that gap.
+**This gap was shipped and explicit (the motivation for this work).**
+`examples/calculator_hf_export.py` publishes the compiled calculator as a
+HuggingFace model whose card claims it is "a *bona fide* standard transformer,
+not a bespoke runtime" — yet before this branch the shipped model code and config
+both documented **"No normalization anywhere; no final norm"** as a correctness
+invariant. The norm closed exactly that gap (those docstrings now describe the
+identity RMSNorm).
 
 **The honest framing (and the actual insight):** real transformers need
 normalization to keep activations in range *during training*. We don't train —
