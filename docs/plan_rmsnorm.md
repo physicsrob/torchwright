@@ -1,10 +1,13 @@
 # Plan: RMSNorm as a compiled-transformer identity
 
-**Status:** design exploration, hardened against post-merge `main` (the merge
-that added the HuggingFace export layer `torchwright/compiler/hf/` and removed
-the windowed KV-cache). Decisions below are **leanings, not locked**, except the
-two marked **[LOCKED]**. Prototyped on `calculator_simple`; not yet wired into
-any emitter. Branch: `worktree-rmsnorm-prototype`.
+**Status:** design exploration, hardened against post-merge `main` (the merges
+that added the HuggingFace export layer `torchwright/compiler/hf/`, removed the
+windowed KV-cache, and switched the token export to a vanilla untied
+llama3-style embedding — `embed_table` is now `(vocab, d)`, gathered straight
+into the seed, with no `embedding_proj` / `d_embed`). Decisions below are
+**leanings, not locked**, except the three marked **[LOCKED]**. Prototyped on
+`calculator_simple`; not yet wired into any emitter. Branch:
+`worktree-rmsnorm-prototype`.
 
 ## Goal & motivation
 
@@ -20,7 +23,7 @@ anywhere," and a skeptical reader sees that as skipping the hard parts.
 **This gap is already shipped and explicit.** `examples/calculator_hf_export.py`
 publishes the compiled calculator as a HuggingFace model whose card claims it is
 "a *bona fide* standard transformer, not a bespoke runtime" — while the shipped
-model code (`torchwright/compiler/hf/modeling_torchwright.py:29`) and config
+model code (`torchwright/compiler/hf/modeling_torchwright.py:26`) and config
 (`configuration_torchwright.py:21`) both document **"No normalization anywhere;
 no final norm"** as a correctness invariant. The norm closes exactly that gap.
 
@@ -36,16 +39,18 @@ point; if we're not willing to make it, there's no reason to add the norm.
 RMSNorm computes, per position, `rms = sqrt(mean(x^2) + eps)` then outputs
 `x_i / rms * g_i` (g = per-channel gain).
 
-1. **Pin the RMS.** Reserve a residual column holding a large constant. Its
+1. **Pin the RMS.** Reserve a residual column (two at odd power-of-two
+   widths — see *Two gain variants*) holding a large constant. Its
    squared magnitude dominates the sum-of-squares, so `rms` becomes a
    position-independent constant `C`. In fp32 the data energy falls below the
    constant's LSB, so `rms` is **bit-exactly** constant (measured:
    `rms_spread = 0`).
 2. **Cancel it with the gain.** Set the gain uniformly to `C`. Then
    `x_i / rms * C = x_i` — the norm is the identity, and **every existing
-   compiled weight is reused unchanged**. The constant column is seeded once,
-   passes through each norm unchanged, and is never written by any sublayer, so
-   it re-pins the RMS at every layer (including the final norm).
+   compiled weight is reused unchanged**. The constant column(s) are seeded once
+   (folded into the embedding table — see *the one unavoidable core hook*), pass
+   through each norm unchanged, and are never written by any sublayer, so they
+   re-pin the RMS at every layer (including the final norm).
 
 **Insertion points (pre-norm).** Each emitter currently produces, per layer,
 `res = res + attn(res)` then `res = res + mlp(res)` with no norm
@@ -54,9 +59,9 @@ RMSNorm computes, per position, `rms = sqrt(mean(x^2) + eps)` then outputs
 each sublayer only: `res = res + attn(norm(res))`, `res = res + mlp(norm(res))`.
 The skip term stays the un-normed `res`, so the residual stream itself is never
 overwritten with normed values. A **final norm** is applied to the last hidden
-state before the output gather/unembed (`export.py` lines ~1249–1257;
-`modeling_torchwright.py` lines ~397–398), matching a standard Llama-style
-decoder. **[LOCKED: include the final norm.]**
+state before the unembed (an untied `lm_head` over the full residual stream,
+`export.py:1265–1266` — `res @ lm_head.T`; no output-column gather post-merge),
+matching a standard Llama-style decoder. **[LOCKED: include the final norm.]**
 
 ### Why the gain is necessarily large (a credibility caveat)
 
@@ -91,15 +96,23 @@ the fallback this commitment lets us avoid.
   `= 2^q` contributes energy `2^(2q)` (an *even* power of two), so its RMS
   `2^(q - b/2)` is an exact power of two **only when `b` is even** (`d=1024=2^10`
   ✓). When `b` is **odd** — DOOM runs at `d=8192=2^13` — a single column lands
-  the RMS on `2^(q-7)·√2`, which is not representable in fp32 and breaks
-  bit-exactness (the `1±ε` scaling the cancel-head analysis below warns about).
+  the RMS on `2^(q-7)·√2`, an irrational multiple of a power of two. The fp32
+  `sqrt` returns a representable, correctly-rounded value, but it is **not a
+  power of two**, so `÷rms` and `×gain` become genuine fp32 roundings rather than
+  exact exponent shifts (the `1±ε` scaling the cancel-head analysis below warns
+  about).
   The fix: use **two equal columns** `= 2^q`. Their combined energy `2^(2q+1)`
   is an *odd* power of two, so `rms = sqrt(2^(2q+1)/2^13) = 2^(q-6)` is again an
   exact power of two. **General rule: one constant column for even-power-of-two
-  widths, two equal columns for odd-power-of-two widths.** Reserve the column(s)
-  *inside* the existing `d` (they ride in the embedding alongside the graph's
-  other baked-in constants — see the allocator note), so the RMS denominator
-  stays `d`, **there is no width blowup**, and matmul shapes are unchanged. The
+  widths, two equal columns for odd-power-of-two widths** (the minimal
+  power-of-two-RMS construction — 8 or 32 equal columns also work but waste
+  columns; unequal or non-power-of-two-RMS layouts are *not* bit-exact). Reserve
+  the column(s)
+  *inside* the existing `d` — their value folds into the embedding table
+  (`embed_table[:, j] = 2^q`, replicated across every vocab row so the per-token
+  lookup reproduces it at every position; see *the one unavoidable core hook*),
+  so the RMS denominator stays `d`, **there is no width blowup**, and matmul
+  shapes are unchanged. The
   two-column layout at 8192 is **pending prototype confirmation** (Evidence
   gap 3 / Open questions).
 - **Formula gain (fallback, not used)** `C = sqrt(K/d)` (K = constant energy).
@@ -113,7 +126,7 @@ the fallback this commitment lets us avoid.
 
 The scheduler emits **cancel heads** (`V=identity, O=-identity`, so
 `attn_out + skip == 0` algebraically) to zero residual columns
-(`torchwright/compiler/forward/scheduler.py:277`,
+(`torchwright/compiler/forward/scheduler.py:269`,
 `AttnHeadOp("cancel", ...)`). These are **not** DOOM-specific — any compiled
 graph that zeroes columns uses them, the calculator included. The sensitivity is
 documented at `torchwright/compiler/components/attn.py:18–22`: a single fp32-LSB
@@ -179,7 +192,7 @@ vs. normed forward:
      `convert.py:convert_onnx_to_hf` (it reads ONNX initializers → HF state
      dict), and `modeling_torchwright.py` **transcribes** the ONNX forward
      one-for-one.
-   - `convert.py:_assert_all_mapped` (lines ~231–244) **raises** if any ONNX
+   - `convert.py:_assert_all_mapped` (lines ~223–236) **raises** if any ONNX
      initializer is unmapped. So if the norm adds a per-layer initializer (a
      gain vector), the converter *must* map it and the shipped model *must* have
      a matching parameter — or HF conversion fails loudly.
@@ -200,8 +213,12 @@ vs. normed forward:
    synthesize the uniform gain from config at load time and emit no initializer —
    keeps the ONNX graph smaller but makes the shipped model less literally a
    "standard RMSNorm." Decide before implementing (Open questions).
-4. **Constant column is compiler-internal**, not a graph/embedding value. (See
-   the allocator note below for *why* — it can't honestly be a graph node.)
+4. **The constant's value folds into the embedding table; only its column
+   reservation is compiler-internal.** The value is written directly into
+   `embed_table` (replicated across vocab rows — see decision 6); it is the only
+   seed constant. What is *not* a graph value is the never-freed column
+   reservation: a `LiteralValue` with no consumer would be reclaimed
+   (`graph_analysis.py:202`; see *the one unavoidable core hook*).
 5. **Config impact.** `TorchwrightConfig` currently lists normalization among
    "invariants this config does NOT carry a knob for" (lines ~18–28). Adding the
    norm means new fields (at least `rms_norm_eps`; possibly a norm-on flag) and
@@ -209,26 +226,68 @@ vs. normed forward:
    shipped files are **hermetic** (torch + transformers only, enforced by
    `tests/hf/test_shipped_model.py`), so the RMSNorm must be a standalone
    `nn.Module` there — no torchwright import.
+6. **[LOCKED] Seed the norm constant via `embed_table`; delete the vestigial
+   `constant_values` buffer.** Post-merge the token seed is a stock-llama
+   `res = embed_tokens(ids) + pos` with the placement scatters folded into the
+   weights. There is also a `constant_values` (d,) buffer added at the seed — but
+   it is **provably all-zeros**: graph `LiteralValue` constants are *not* seeded.
+   The merged "constants as JIT nodes" design materializes each one just-in-time
+   into the per-layer MLP `linear2` output bias near its consumer and frees it
+   (`graph_analysis.py:202` excludes `LiteralValue` from input nodes;
+   `scheduler.py:824` → `weight_writer.py:693`; `test_literal_jit.py:96` asserts a
+   literal is absent from `in_state`). So the export fill loop's `LiteralValue`
+   branch (`export.py:1163–1165`) is dead code, and the buffer is zero
+   (empirically confirmed: nonzero count 0). The change is therefore **two
+   independent pieces**:
+   - **Delete `constant_values`** — a norm-independent cleanup of an always-zero
+     dead buffer; dropping an all-zero `Add` is bit-exact *today*.
+   - **Seed the norm's pinned constant** into `embed_table[:, j] = 2^q`
+     (replicated across every vocab row so the per-token gather reproduces it at
+     every position). This is the *only* genuine new seed constant; the graph's
+     real constants live in the MLP bias and are untouched.
+
+   Bit-exact: the constant lands in a disjoint reserved column, so `gather + pos`
+   equals today's `gather + pos + (zero) constant_values` (HF parity
+   `max_logit_diff == 0` is the gate). `lm_head` is built from the compact
+   real-feature table and is zero off the output columns, so the finite `2^q`
+   multiplies to 0 and never reaches the logits. Storage: HF
+   `embed_tokens.weight` is already dense `(vocab, d)`, so seeding adds nothing
+   and the buffer is *removed*; the ONNX COO init grows by `vocab × (1 or 2)`
+   nonzeros. **Atomicity:** exporter (`export.py`), converter (`convert.py`
+   mapping + `_assert_all_mapped`), HF buffer (`modeling_torchwright.py`), and the
+   meta format must change together, or conversion/load fails before the norm is
+   reached. Caveat: deleting `constant_values` changes the just-landed `fa49576`
+   seed for *all* token models (norm-off included) — worth a glance from its
+   author.
 
 ### The one unavoidable core hook
 
-Seeding the constant is **free and already exists**: the preamble builds a dense
-`constant_values` (d,) vector (`export.py` lines ~1158–1168, added to the seed
-once at ~1235), populated from graph `LiteralValue` nodes; the HF model already
-carries it as a saved buffer (`modeling_torchwright.py:203–205`, mapped in
-`convert.py:209`). A constant column is just another entry there.
+**Seeding the norm constant is folding it into the embedding table** (decision
+6): write `2^q` into `embed_table[:, j]` for every vocab row, so the per-token
+gather reproduces it at every position. `embed_table` is already built
+`(vocab, d)` (`export.py:1199–1200`) and gathered straight into the seed
+(`export.py:1244–1245`); the constant is one more populated column — no bespoke
+buffer, no new initializer, and the converter gate (`convert.py:_assert_all_mapped`,
+~223–236) stays satisfied because nothing new is introduced on the constant path.
+(The graph's *own* constants are not seeded — they live in the per-layer MLP
+bias; see decision 6.)
 
-What is **new** machinery: the column must be **permanently reserved,
-never-freed, never-written** across the whole network depth. Normal nodes
-(including `LiteralValue`s) are freed when their consumers finish; a constant
-with no graph consumer would be reclaimed immediately and never survive to
-layer 1. So the reservation is inherently a core/allocator concept — this is
-why the constant cannot honestly live in the graph/embedding. The split:
-- **Core (small, conditional hook):** when the norm is requested, reserve +
-  write-protect one column; compute `C`. Off by default, so existing compiles
-  are unaffected.
-- **Emission (the bulk):** seed via `constant_values`; insert the norm op in
-  the ONNX emitter; transcribe to the shipped HF model; teach `convert.py`.
+What is **new** is **not** the reservation primitive — `ResidualStreamMap.reserve()`
+already exists (`residual_map.py:114`), removes columns from the free pool
+permanently, and the never-freed/never-allocated guarantee is enforced by
+`_check_invariants`. It currently has **no callers** (the overlay user it was
+built for is gone on this branch). What is missing is everything *around* it: a
+caller from the norm path; **recording the reserved `(column, value)`** so the
+exporter can fold it (today a reserved column is in neither `_free` nor any
+node's residual assignment, so the export loop's `get_nodes(in_state)` cannot see
+it); and routing the in-process/debug path around it. Folding changes *seeding*;
+this is *lifetime + metadata*. The split:
+- **Core (small, conditional hook):** when the norm is requested, call
+  `reserve()` for the column(s); compute `C`; record the pinned `(column, value)`
+  on the compiled artifact. Off by default, so existing compiles are unaffected.
+- **Emission (the bulk):** seed the pinned norm constant into `embed_table`,
+  delete the `constant_values` buffer and bump the meta format, insert the norm
+  op in the ONNX emitter, transcribe to the shipped HF model, teach `convert.py`.
 
 ## Constraints (state upfront)
 
@@ -248,22 +307,39 @@ why the constant cannot honestly live in the graph/embedding. The split:
   by a factor of `2^24 ≈ 1.7e7`"). Pick the constant with margin against the
   **deepest-layer** energy. Example at `d=8192` with two columns `= 2^30`:
   `E = 2^61`, `rms = 2^24` (gain ≈ `1.7e7`), tolerates `Σ data² < ~1.4e11`; well
-  clear of fp32 overflow at `~3.4e38`. Raise the constant if a deep layer's
-  energy approaches the bound.
+  clear of fp32 overflow at `~3.4e38`. The `2^-24` half-ULP is against the
+  *final* `E`; a reduction passing through a partial sum of one constant column
+  (`2^60`) has a tighter half-ULP (`2^36 ≈ 6.8e10`), so the safe ceiling is
+  reduction-order-dependent and up to ~2× below the headline figure — the
+  runtime's RMSNorm reduction order is implementation-defined, so budget against
+  the tighter bound. Raise the constant if a deep layer's energy approaches it.
 - **RMSNorm, not LayerNorm** — LayerNorm subtracts the mean, which the large
   constants would dominate and which would shift every data column.
+- **The final norm reads every column, so scratch must stay finite.** Unlike the
+  unembed (`res @ lm_head.T`, which contributes only the output columns), the
+  final norm computes `mean(x²)` over **all** `d` columns — a single Inf/NaN in
+  any freed/scratch column would poison `rms` and therefore *every* logit (a
+  strictly broader blast radius than today; the exporter already flags the finite
+  requirement at `export.py:1262–1264`). The pinned constant is finite, but the
+  norm path must not let non-finite values reach reserved/scratch columns.
 - **Shipped-file hermeticity + converter gate** — restated from decisions 1/5:
-  the shipped RMSNorm is torch-only; every ONNX initializer the norm introduces
-  must be mapped in `convert.py` or conversion fails.
+  the shipped RMSNorm is torch-only; the gain vectors are the only new ONNX
+  initializers and must be mapped in `convert.py` or conversion fails. The
+  constant introduces no initializer (it folds into `embed_table`, decision 6),
+  and `constant_values` is removed.
 
 ## Open questions
 
 1. **Gain representation:** saved per-layer `weight` initializer (decision 3
    lean) vs. synthesized-from-config at load. Decides how much `convert.py` and
    the ONNX emitter grow.
-2. **Allocator fork:** does "permanently-reserved column" stay a norm-specific
-   special case, or become a general "pinned column" primitive? Decides whether
-   this is real allocator machinery or an emission-time one-off.
+2. **Allocator fork:** `ResidualStreamMap.reserve()` already exists
+   (`residual_map.py:114`) but is unused; the norm constant is the only thing
+   needing a never-freed reserved column (graph constants are JIT-materialized
+   into the MLP bias, not reserved). Does that reservation stay a norm-special
+   case or become a general "pinned column" primitive — and either way it needs a
+   value-surfacing path so the exporter can fold the reserved column. Decides
+   whether this is real allocator machinery or an emission-time one-off.
 3. **ONNX scope / debug interaction:** ONNX gets the norm (it must, since HF is
    converted from it). Verify the added ops don't perturb `OnnxDebugSession`'s
    structural fingerprint or its per-layer self-consistency check — pre-norm
@@ -281,6 +357,8 @@ why the constant cannot honestly live in the graph/embedding. The split:
 ## Out of scope / not done
 
 - Wiring the norm into the ONNX emitter, `convert.py`, and the shipped HF model.
+- Seeding the norm constant via `embed_table` and deleting the vestigial
+  `constant_values` buffer (decision 6), with the HF parity test as the gate.
 - The allocator "reserved column" support and its conditional core hook.
 - New `TorchwrightConfig` fields and the "no normalization" docstring rewrites.
 - Validation against a real DOOM frame.
