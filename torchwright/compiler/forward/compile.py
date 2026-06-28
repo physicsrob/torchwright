@@ -163,6 +163,63 @@ def _reserve_rms_norm_columns(
     )
 
 
+def _certify_rms_norm_energy(ra, spec: RmsNormSpec) -> None:
+    """Prove the pinned-constant RMSNorm is the bit-exact identity for this graph.
+
+    The norm is an identity only while the data energy the reduction sees stays
+    under the pinned constant's reduction half-ULP: ``Σ data² < const_value²·2⁻²⁴``
+    (the constant column contributes ``const_value²`` to ``mean(x²)``; once data
+    energy reaches its half-ULP the fp32 sum no longer rounds to the exact power
+    of two, the forced RMS drifts off ``2^m``, and the identity breaks).  This
+    bound is graph-dependent, so certify it here from the compiler's static value
+    ranges rather than trusting the ``q`` default.
+
+    Bound (sound, cancel-agnostic): for each residual column, take the largest
+    ``max(lo², hi²)`` of any node ever assigned to it across all sublayer
+    snapshots — which also covers a freed-but-not-yet-overwritten column, since
+    its stale value came from a node that *was* assigned there — and sum over the
+    non-pinned columns.  That upper-bounds ``Σ data²`` at every norm.  Raises
+    ``ValueError`` (with the smallest sufficient ``q``) if the bound is not met,
+    or if any contributing node lacks a finite value range to certify against.
+    """
+    reserved = set(spec.reserved_cols)
+    budget = spec.const_value * spec.const_value * 2.0**-24  # const²·2⁻²⁴
+
+    col_max: dict = {}
+    for state, mapping in ra.mapping.items():
+        for node, indices in mapping.items():
+            data_cols = [c for c in indices if c not in reserved]
+            if not data_cols:
+                continue
+            vr = node.value_type.value_range
+            if not vr.is_finite():
+                raise ValueError(
+                    f"rms_norm cannot be certified as an identity: node "
+                    f"{node!r} has a non-finite value range {vr}, so the "
+                    f"residual energy the norm reduces over is unbounded. Give "
+                    f"the graph finite bounds, or pass rms_norm=False."
+                )
+            mag2 = max(vr.lo * vr.lo, vr.hi * vr.hi)
+            for c in data_cols:
+                if mag2 > col_max.get(c, 0.0):
+                    col_max[c] = mag2
+
+    energy_bound = sum(col_max.values())
+    if energy_bound >= budget:
+        # smallest q with const²·2⁻²⁴ = 2^(2q-24) > energy_bound, +1 bit margin
+        import math
+
+        need_q = math.ceil((math.log2(max(energy_bound, 1.0)) + 24) / 2) + 1
+        raise ValueError(
+            f"rms_norm identity not certified: the graph's residual energy "
+            f"upper bound ({energy_bound:.3e}) exceeds the pinned-constant "
+            f"budget ({budget:.3e} = const²·2⁻²⁴). The forced RMS would drift "
+            f"off its power of two and the norm would stop being the identity. "
+            f"Pass rms_norm_const_exp>={need_q} (a larger pinned constant) or "
+            f"rms_norm=False."
+        )
+
+
 class _TrackingResidualStreamMap(ResidualStreamMap):
     """Residual map that records the layer at which each node is freed.
 
@@ -1197,6 +1254,14 @@ def forward_compile(
     net.residual_assignment = ra
     net.placements = placement_recorder
     net.assert_aliases = graph.get_assert_aliases()
+
+    # Certify the RMSNorm identity against the graph's value ranges: the norm is
+    # the identity only while the data energy stays under the pinned constant's
+    # reduction half-ULP, and that is graph-dependent.  Do it now that the full
+    # residual assignment exists, so a graph whose energy exceeds the budget
+    # fails loudly here instead of silently shipping a non-identity norm.
+    if net.rms_norm_spec is not None:
+        _certify_rms_norm_energy(ra, net.rms_norm_spec)
 
     # This post-loop trim is the in-process (no-callback) path's trim.  The ONNX
     # streaming path trims each layer *inside* ``on_layer_compiled`` (see

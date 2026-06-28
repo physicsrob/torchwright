@@ -9,10 +9,17 @@ shipped, with two corrections recorded inline and in *Open questions*:
   *shipping* graph `calculator_v2` reaches `Σ data² ~ 2.6e13` on its squaring
   path (`999*999`, `999+1`), which exceeds the `q=30` reduction half-ULP bound
   (`~2^36`) and **silently broke the identity** (logits off by ~1e7). `q=44`
-  (gain `2^39` at `d=1024`, bound `2^64`) clears it with ~`2^19` margin; `q` is
-  now a tunable knob (`rms_norm_const_exp`) so a deeper-energy graph (DOOM,
-  untested) can raise it. The out-energy bound is the one real constraint —
-  see *Constraints* and Open question 5.
+  (gain `2^39` at `d=1024`, bound `2^64`) clears it with ~`2^13` margin; `q` is
+  a tunable knob (`rms_norm_const_exp`). The out-energy bound is the one real
+  constraint — see *Constraints*.
+- **The energy bound is now certified at compile time** (resolving the
+  code-review's dominant finding). `forward_compile` walks the residual
+  assignment and, from each node's static `value_range`, computes a sound
+  per-column upper bound on `Σ data²` (the per-column max over all snapshots,
+  which also covers freed-but-stale columns folded into the all-`d` final norm)
+  and **raises with the smallest sufficient `q`** if it exceeds `const²·2⁻²⁴`.
+  So a high-energy graph fails loudly instead of silently shipping a
+  non-identity norm; `q=44` is just the default floor.
 - **The norm defaults on only at power-of-two `d`** (`compile_to_onnx(rms_norm=
   None)` → on iff `d` is a power of two; explicit `True` raises on non-pow2 `d`;
   `False` off). Arbitrary-width graphs are therefore unaffected by the default.
@@ -363,11 +370,14 @@ this is *lifetime + metadata*. The split:
    reads the sidecar, no recompile) matches. The norm is the identity, so the
    promoted `l{i}_res_*` snapshots stay un-normed and self-consistency holds.
    `tests/debug/test_onnx_debug_session.py` (d=256, norm now on) passes.
-4. **DOOM validation — STILL OPEN.** Bit-exactness on the *actual* DOOM graph
-   (in the `torchwright_doom` submodule, not tested here) is unverified: diff a
-   rendered frame against baseline, and **measure the deepest-layer `Σ data²`**
-   to confirm `q=44` (bound `2^64`) clears it — raise `rms_norm_const_exp` if
-   not. This is the one remaining gap.
+4. **DOOM validation — STILL OPEN, but de-risked.** Bit-exactness on the
+   *actual* DOOM graph (in the `torchwright_doom` submodule, not tested here) is
+   unverified: diff a rendered frame against baseline. The deepest-layer energy
+   is now **certified at compile time** — if DOOM's `value_range` energy exceeds
+   `q=44`'s bound the export raises with the required `q` rather than silently
+   breaking, so the remaining risk is (a) a `value_range` too loose to certify
+   (raises spuriously → needs tighter graph bounds or a higher `q`) and (b) the
+   rendered-frame diff itself.
 5. **Shipping graph — RESOLVED.** `calculator_v2` (the production HF-export
    graph) is bit-exact identity through the ONNX oracle including `999*999`
    (`tests/hf/test_rms_norm_identity.py`), after raising `q` to 44 — see the

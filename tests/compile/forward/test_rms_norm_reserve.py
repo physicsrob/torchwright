@@ -19,9 +19,37 @@ torch = pytest.importorskip("torch")
 
 from torchwright.compiler.forward.compile import (
     _RMS_NORM_CONST_EXP,
+    RmsNormSpec,
+    _certify_rms_norm_energy,
     _reserve_rms_norm_columns,
 )
 from torchwright.compiler.forward.residual_map import ResidualStreamMap
+from torchwright.graph.value_type import Range
+
+
+class _FakeVT:
+    def __init__(self, lo, hi):
+        self.value_range = Range(lo, hi)
+
+
+class _FakeNode:
+    def __init__(self, lo, hi):
+        self.value_type = _FakeVT(lo, hi)
+
+
+class _FakeRA:
+    """Minimal stand-in for ResidualAssignment: .mapping = {state: {node: cols}}."""
+
+    def __init__(self, mapping):
+        self.mapping = mapping
+
+
+def _spec(q=_RMS_NORM_CONST_EXP, reserved=(1023,)):
+    b = 10
+    m = (2 * q - b) // 2
+    return RmsNormSpec(
+        reserved_cols=reserved, const_value=float(2**q), gain=float(2**m), eps=1e-5
+    )
 
 
 @pytest.mark.parametrize(
@@ -110,6 +138,40 @@ def _rmsnorm_identity_holds(d, n_const, q, data_energy, eps=1e-5):
     ms = (res * res).mean(-1, keepdim=True)
     normed = res / torch.sqrt(ms + eps) * gain
     return bool((normed[:, :d_data] == data).all())
+
+
+def test_certify_passes_under_budget():
+    """A graph whose per-column energy stays under const²·2⁻²⁴ certifies."""
+    spec = _spec()  # q=44 -> budget 2^64
+    # one node spanning many columns, magnitude well under the budget
+    ra = _FakeRA({"s0": {_FakeNode(-1e6, 1e6): list(range(900))}})
+    _certify_rms_norm_energy(ra, spec)  # must not raise (~900 * 1e12 = 9e14 < 2^64)
+
+
+def test_certify_raises_over_budget_with_required_q():
+    """Energy above the budget raises and names a larger sufficient q."""
+    spec = _spec()  # q=44 -> budget 2^64 ~ 1.8e19
+    # 1000 columns each at magnitude 1e10 -> 1e20 energy, over budget
+    ra = _FakeRA({"s0": {_FakeNode(-1e10, 1e10): list(range(1000))}})
+    with pytest.raises(ValueError, match=r"not certified.*rms_norm_const_exp>="):
+        _certify_rms_norm_energy(ra, spec)
+
+
+def test_certify_raises_on_non_finite_range():
+    """A node the compiler can't bound cannot be certified — fail loud."""
+    spec = _spec()
+    ra = _FakeRA({"s0": {_FakeNode(float("-inf"), float("inf")): [0]}})
+    with pytest.raises(ValueError, match="non-finite value range"):
+        _certify_rms_norm_energy(ra, spec)
+
+
+def test_certify_ignores_reserved_columns():
+    """The pinned constant columns are the pin, not data — excluded from the
+    energy sum (so a huge value there does not trip the budget)."""
+    spec = _spec(reserved=(1023,))
+    # the only node sits on the reserved column at the constant magnitude
+    ra = _FakeRA({"s0": {_FakeNode(-(2.0**44), 2.0**44): [1023]}})
+    _certify_rms_norm_energy(ra, spec)  # must not raise (reserved col skipped)
 
 
 def test_energy_bound_identity_holds_below_and_breaks_above():
