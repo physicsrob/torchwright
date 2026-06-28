@@ -305,7 +305,13 @@ in-stream marker and value `= pos − marker_pos` recovered via the count, vs or
 
 **Phase 1b — Recency signal (bucket 2): the octant two-head readout.** Build the §3 mechanism.
 
-> **Status (2026-06-27, in progress — not built; resume here in a fresh session).**
+> **Status (2026-06-27): confirm-compile DONE — the unproven-mechanism crack is closed.** The
+> octant recency ramp is built as a graph (`torchwright/ops/recency_ramp.py`, commit `c2ad29d`) on the
+> new `soft_blend` op (`102dedb`) and is **strictly monotone on the compiled transformer** (gate-b,
+> `tests/compile/forward/test_recency_ramp_compiled.py`, `65089c8`). What remains in Phase 1b is
+> wiring the ramp to the *actual* two graded `Attn` heads and gates (a)/(c)/(d) below — that overlaps
+> Phase 4 (recency end-to-end); the ramp builder currently takes the two centered weights `u`,`v` as
+> abstract inputs.
 > - **Assembly math proven.** `scripts/rope_octant_assembly.py` builds the *real* (not idealized)
 >   octant ramp from the two centered weights `u=σ(g·cosφ)−0.5`, `v=σ(g·sinφ)−0.5`: 8 octants from
 >   `sign(u)`, `sign(v)`, `|u|>|v|`; in each, the steep (nearer-0) weight with a per-octant sign +
@@ -345,13 +351,19 @@ in-stream marker and value `= pos − marker_pos` recovered via the count, vs or
 >   no PL floor of its own. (The op tests are oracle-level via `.compute()`; the *compiled*
 >   monotonicity check is the gate-b sweep below, step 4.) (2) add a checked graph assertion that
 >   adjacent-octant branches are equal at all three boundary types (`u=0`, `v=0`, `|u|=|v|`) so a
->   violation is caught at construction; (3) swap the 7 `select`s in the ramp builder for
->   `soft_blend`; (4) run the gate below.
-> - **Gate-b sweep — the teeth:** the soft window in `φ` (`~1/sharpness`) may be *narrower than one
->   production token* (`θ≈2π/61440≈1e-4`), so a per-token sweep can step over a clamp-induced flat
->   spot and **falsely pass**. The sweep must be **sub-token-dense in a tight neighborhood of each of
->   the 8 boundaries**, run through the **compiled** path (not just the oracle), across runs (fp32
->   nondeterminism), asserting strict φ-monotonicity with min step ≥ ~2.2e-5/token.
+>   violation is caught at construction — ✅ **DONE** (`_assert_branches_meet_at_boundaries`, a
+>   build-time Python check on the offset table at the 7 in-range boundaries); (3) ✅ **DONE** — the
+>   7-node octant tree is built with `soft_blend` (`recency_ramp.py`); (4) ✅ **DONE** — gate green.
+> - **Gate-b sweep — DONE, with a correction to the plan's wording** (`65089c8`). The compiled ramp is
+>   strictly monotone, worst boundary step **~2.19e-5/token** (~183× the fp32 floor), matching the
+>   assembly model. **The "sub-token-dense" wording was wrong:** the ramp output is `O(1)` in fp32, so
+>   a sub-token step (~few ULP of the output) hits fp32 **output quantization** and reports spurious
+>   zero steps that are *not* a real flat spot (m=120 sub-token sampling shows min step 0 for this
+>   reason, independent of `compare` sharpness). The physically correct gate samples at **token
+>   spacing** (steps ~`θ` are cleanly resolvable) and **sweeps the token-grid phase offset** over
+>   `[0,θ)` to cover every alignment of the real token grid relative to each boundary. All offsets
+>   monotone ⇒ no real token grid lands in a dip. There was **no real `soft_blend` φ-dip** — the
+>   fallback below stays unused.
 > - **Fallback (documented only):** convex-multiply `f + ½(cond+1)(t−f)` inside `soft_blend`. Not
 >   promoted — it is an activation×activation multiply, and at a boundary `t−f→0` so
 >   `dC/dφ = ½(cond+1)(t′−f′)` leans on head derivatives at the crossover too: no guaranteed-smoother
@@ -519,15 +531,15 @@ separate `torchwright_doom` branch** (post-Phase-5), not a per-phase gate in thi
   runtime paths.
 - **Oracle-first.** ✅ DONE (Phase 0). `Attn.compute` rotary path landed before any head migration;
   `probe_compiled` parity confirmed.
-- **Recency confirm-compile (in progress).** Assembly math proven monotone
-  (`scripts/rope_octant_assembly.py`, g=2.0, min step 2.275e-5/tok ~190×). Naive `select` build
-  fails at octant boundaries (soft cond → `−M`); fix is the new **`soft_blend`** op (median-of-three
-  on `broadcast_select`'s carrier core — see Phase 1b status). `soft_blend` is **built + tested +
-  measured** (commit `102dedb`, fp32-round-off noise). Remaining: build the graph-level octant ramp
-  builder with a branch-equality-at-boundary graph assertion, wire in `soft_blend`, then run the gate:
-  **sub-token-dense** φ-sweep at each of the 8 boundaries through the **compiled** path, across runs,
-  asserting strict φ-monotonicity (min step ≥ ~2.2e-5/tok), + `probe_compiled` parity, + 0
-  full-frame replay flips with the real ramp.
+- **Recency confirm-compile.** ✅ **DONE.** The unproven-mechanism crack is closed. `soft_blend`
+  (`102dedb`), the graph-level octant ramp builder with a build-time branch-equality check
+  (`recency_ramp.py`, `c2ad29d`), and the compiled gate-b monotonicity sweep
+  (`test_recency_ramp_compiled.py`, `65089c8`) are all landed and green. The compiled ramp is strictly
+  monotone, worst boundary step ~2.19e-5/tok (~183× fp32 floor), matching the assembly model. The
+  gate's correct form is **token-density across phase offsets**, not sub-token-dense (which hits fp32
+  output quantization — see Phase 1b status). **Still to do (Phase 4):** wire the ramp to the real
+  two graded `Attn` heads, `probe_compiled` parity end-to-end, and 0 full-frame replay flips with the
+  real ramp on a ~42k log.
 - **Recency leakage budget.** Pin the {BOS, self} exclusion score gap (≈ `log(N / resolution)` ≈
   22+ logits at `N ~ 42k`) and confirm leakage — and its growth with key count — stays below the
   gap-1 signal (Phase 1b gate d).
