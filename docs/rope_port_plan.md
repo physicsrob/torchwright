@@ -315,16 +315,24 @@ in-stream marker and value `= pos − marker_pos` recovered via the count, vs or
 >   `_RECIP_REL_SAFETY=16`) → rounds to the right integer with **~8× margin**; compiled matches the
 >   oracle. Empty-window queries degrade to bounded garbage (`~max_gap`), not an error — the caller
 >   must only consume the gap where the marker is visible (documented contract).
-> - **Follow-up 1 — `prefix_*` is a separate, harder sub-problem.** `prefix_sum`/`prefix_and` use
->   `get_position_scalar` only for an *absolute* `pos ≥ 2^k` out-of-bounds gate (k up to ~16). That is
->   **not** a bounded near-marker difference, so the count doesn't apply. It needs its own RoPE-native
->   OOB detector (e.g. "did the `attend_to_offset(-2^k)` read land on a real key / before BOS?"),
->   designed separately — flagged so it isn't assumed solved.
-> - **Follow-up 2 — consumer rewiring is Phase 5.** `get_position_scalar` returns an *absolute*
->   index with no RoPE meaning; its consumers must be rewritten to the marker-relative count, and the
->   marker is consumer-specific. Per §7 (DOOM untouched through Phase 4) that rewiring lands at Phase 5.
->   Gate (a) — each consumer's marker is graph-recognizable + the post-marker gate is constructible —
->   is verified per-consumer then.
+> - **Census (committed grep, 2026-06-27) — settles scope.** `prefix_sum`/`prefix_and` are used
+>   **only in `examples/`** (balanced_parens, sort_digits, token_balance) — **not** in
+>   `torchwright_doom` and not in core torchwright. `torchwright_doom` reads position at exactly **one**
+>   site: `render_main.py:262` `pos.get_position_scalar()`, used for `pixel_index = pos −
+>   span_v0.pos − 1` — i.e. *exactly* the bucket-1 marker-relative count (marker = the span's vertex-0
+>   publish), which `count_since_marker` serves directly. So the port-relevant bucket-1 deliverable is
+>   **done**.
+> - **`prefix_*` is out-of-scope for the port (examples-only).** It gates on an *absolute* `pos ≥ 2^k`
+>   threshold (k up to ~16), which is **not** a bounded near-marker difference and would need its own
+>   RoPE-native OOB detector. Since no DOOM consumer uses it, that detector is **not** built; the
+>   `prefix_*` demos will need migration (or retirement) only if Phase 5's PosEncoding deletion is made
+>   to keep them working — tracked, not on the render path. (A count-to-BOS boolean `compare(1/(pos+1),
+>   1/(2^k+1))` resolves small k but hits the `1/m²` collapse for large k — confirming this needs a
+>   different mechanism, deferred.)
+> - **Consumer rewiring is Phase 5.** The one DOOM `get_position_scalar` site rewires to
+>   `count_since_marker(span_v0_marker, …)`; per §7 (DOOM untouched through Phase 4) that lands at
+>   Phase 5, where gate (a) — the marker is graph-recognizable + the post-marker window is
+>   constructible — is verified against the real span-v0 publish.
 
 **Phase 1b — Recency signal (bucket 2): the octant two-head readout.** Build the §3 mechanism.
 
