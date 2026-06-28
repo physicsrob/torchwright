@@ -41,6 +41,7 @@ from torchwright.ops.arithmetic_ops import (
     multiply_const,
     subtract,
 )
+from torchwright.ops.const import step_sharpness
 from torchwright.ops.map_select import soft_blend
 
 # Per octant (increasing phi): (which centered weight is steep, sign that makes
@@ -151,16 +152,26 @@ def octant_recency_ramp(
 
     b = [branch(o) for o in range(8)]
 
-    # Three octant tests (torchwright booleans: +1 = true).
-    cond_u = compare(u, 0.0, sharpness=sharpness)  # +1 iff u >= 0
-    cond_v = compare(v, 0.0, sharpness=sharpness)  # +1 iff v >= 0
+    # Three octant tests (torchwright booleans: +1 = true).  compare's ramp is
+    # one-sided: cond=0 lands at inp = thresh + 1/(2s), and cond=-1 (crisp) at
+    # inp = thresh.  With thresh=0 the whole soft zone sits on the true side of
+    # the boundary, so soft_blend would be soft where the branches already
+    # differ — its precondition (soft only where t==f) holds only approximately.
+    # Shift each threshold by -1/(2s) so cond=0 lands exactly on the boundary
+    # (inp=0) and the soft zone straddles it symmetrically: now soft_blend is
+    # fully soft precisely where the adjacent branches are equal.
+    s = step_sharpness if sharpness is None else sharpness
+    half = 1.0 / (2.0 * s)
+    cond_u = compare(u, -half, sharpness=s)  # +1 iff u >~ 0 (soft zone centered on 0)
+    cond_v = compare(v, -half, sharpness=s)  # +1 iff v >~ 0
     cond_c = compare(
-        subtract(abs_op(u), abs_op(v)), 0.0, sharpness=sharpness
-    )  # +1 iff |u|>|v|
+        subtract(abs_op(u), abs_op(v)), -half, sharpness=s
+    )  # +1 iff |u| >~ |v|
 
-    # Binary tree on (sign v, sign u, |u|>|v|).  Each node's two operands are
-    # equal on its cond=0 surface (the matching in-range boundary), so every
-    # select is a soft_blend.  Octant assignments (sign_v, sign_u, |u|>|v|):
+    # Binary tree on (sign v, sign u, |u|>|v|).  With the centered thresholds
+    # above, each node's two operands are equal exactly on its cond=0 surface
+    # (the matching in-range boundary), so every select is a soft_blend.
+    # Octant assignments (sign_v, sign_u, |u|>|v|):
     #   o0:(+,+,T) o1:(+,+,F) o2:(+,-,F) o3:(+,-,T)
     #   o4:(-,-,T) o5:(-,-,F) o6:(-,+,F) o7:(-,+,T)
     # cond_c soft at |u|=|v|:

@@ -312,6 +312,12 @@ in-stream marker and value `= pos − marker_pos` recovered via the count, vs or
 > wiring the ramp to the *actual* two graded `Attn` heads and gates (a)/(c)/(d) below — that overlaps
 > Phase 4 (recency end-to-end); the ramp builder currently takes the two centered weights `u`,`v` as
 > abstract inputs.
+> - **Codex-review refinement (post-`65089c8`):** `compare`'s ramp is one-sided — `cond=0` lands at
+>   `inp = thresh + 1/(2s)`, so with `thresh=0` the soft zone sits entirely on the true side and
+>   `soft_blend` is soft where the branches already *differ* (precondition only approximately true).
+>   Fixed by shifting each octant test's threshold to `-1/(2s)` so `cond=0` lands exactly on the
+>   boundary and the soft zone straddles it symmetrically — `soft_blend` is now fully soft precisely
+>   where the adjacent branches are equal. Tests still green (oracle + compiled gate-b).
 > - **Assembly math proven.** `scripts/rope_octant_assembly.py` builds the *real* (not idealized)
 >   octant ramp from the two centered weights `u=σ(g·cosφ)−0.5`, `v=σ(g·sinφ)−0.5`: 8 octants from
 >   `sign(u)`, `sign(v)`, `|u|>|v|`; in each, the steep (nearer-0) weight with a per-octant sign +
