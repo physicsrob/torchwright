@@ -17,6 +17,7 @@ from torchwright.graph import Node, Linear, Attn, Add, Concatenate
 from torchwright.graph.misc import LiteralValue
 from torchwright.graph.pos_encoding import PosEncoding, attention_hardness
 from torchwright.graph.relu import ReLU
+from torchwright.graph.rope import ROPE_BASE
 
 
 @dataclass
@@ -127,21 +128,36 @@ def write_attn_sublayer(
     residual_map: ResidualStreamMap,
     pos_encoding: Optional[PosEncoding],
     recorder: Optional[PlacementRecorder] = None,
+    const_one: Optional[Node] = None,
 ):
-    """Write attention head operations into a layer's AttnLayerComponent."""
+    """Write attention head operations into a layer's AttnLayerComponent.
+
+    ``const_one`` selects the self-match substrate for the four
+    arithmetic-transport ops (``compute_linear``/``compute_add``/``cancel``/
+    ``add_into``).  When ``None`` (the default), each builds a trig
+    current-position head over ``pos_encoding`` (the legacy path).  When set to
+    the reserved constant-1 :class:`LiteralValue` node, each builds a **rotary**
+    Δ=0 self-match head that reads that column and lets the runtime rotation
+    place the softmax on the diagonal — the Phase-2-part-2 migration that frees
+    the self-match from the trig block (``docs/rope_port_plan.md``).
+    """
     attn = layer.attn.attn
     assert pos_encoding is not None, "pos_encoding required for attention ops"
     for op in ops:
         if op.op_type == "compute_attn":
             _write_compute_attn(attn, op, residual_map, recorder)
         elif op.op_type == "compute_linear":
-            _write_compute_linear(attn, op, residual_map, pos_encoding, recorder)
+            _write_compute_linear(
+                attn, op, residual_map, pos_encoding, recorder, const_one
+            )
         elif op.op_type == "cancel":
-            _write_cancel(attn, op, residual_map, pos_encoding, recorder)
+            _write_cancel(attn, op, residual_map, pos_encoding, recorder, const_one)
         elif op.op_type == "compute_add":
-            _write_compute_add(attn, op, residual_map, pos_encoding, recorder)
+            _write_compute_add(
+                attn, op, residual_map, pos_encoding, recorder, const_one
+            )
         elif op.op_type == "add_into":
-            _write_add_into(attn, op, residual_map, pos_encoding, recorder)
+            _write_add_into(attn, op, residual_map, pos_encoding, recorder, const_one)
         else:
             raise ValueError(f"Unknown attn op_type: {op.op_type}")
 
@@ -356,16 +372,54 @@ def _current_pos_attn_matrices(pos_encoding, d_head):
     return q_mat, k_mat
 
 
+def _self_match_source(pos_encoding, d_head, rmap, const_one):
+    """Q/K source columns + matrices + rotary width for a Δ=0 self-match head.
+
+    ``const_one is None`` → the trig path: read the ``pos_encoding`` grid with
+    :func:`_current_pos_attn_matrices`; the head is non-rotary (width 0).
+
+    ``const_one`` set → the rotary path: read the single reserved constant-1
+    column and project it to ``hardness · ones`` (query) / ``ones`` (key) across
+    all ``d_head`` dims, marking the head rotary over the full ``d_head`` (the
+    runtime rotates it by absolute position, rotate_half, so the logit
+    ``∝ Σ_p cos((i − j)·θ_p)`` peaks at ``i == j``).  Full-width ``d_head`` is
+    required — it is the ONNX/HF rotary contract (``rotary_width == d_head``) and
+    matches the §6 LLaMA3 end state.
+
+    Returns ``(qk_idx, q_mat, k_mat, rotary_width)`` where ``qk_idx`` is used for
+    both the query and key source (Δ=0 self-match reads one source on both
+    sides).
+    """
+    if const_one is None:
+        pe_idx = rmap.get_indices(pos_encoding)
+        q_mat, k_mat = _current_pos_attn_matrices(pos_encoding, d_head)
+        return pe_idx, q_mat, k_mat, 0
+
+    const_idx = rmap.get_indices(const_one)  # width 1
+    q_mat = attention_hardness * torch.ones(1, d_head)
+    k_mat = torch.ones(1, d_head)
+    return const_idx, q_mat, k_mat, d_head
+
+
+def _mark_rotary(attn, head, rotary_width):
+    """Mark one self-match head rotary (no-op for the trig path, width 0)."""
+    if rotary_width:
+        attn.rotary_width[head] = rotary_width
+        attn.rope_base = ROPE_BASE
+
+
 def _write_compute_linear(
     attn,
     op: AttnHeadOp,
     rmap: ResidualStreamMap,
     pos_encoding: PosEncoding,
     recorder: Optional[PlacementRecorder] = None,
+    const_one: Optional[Node] = None,
 ):
     """Compile a zero-bias Linear via current-position attention.
 
-    Q/K attend to current position via pos_encoding.
+    Q/K attend to the current position (Δ=0 self-match) — over the trig grid
+    (``const_one is None``) or the rotary constant-1 column (``const_one`` set).
     V reads from the Linear's input columns.
     O applies the Linear's weight matrix to target columns.
 
@@ -382,11 +436,11 @@ def _write_compute_linear(
     d_input = len(input_node)
 
     assert op.source_cols is not None, "compute_linear requires source_cols"
-    pe_idx = rmap.get_indices(pos_encoding)
+    qk_idx, q_mat, k_mat, rotary_width = _self_match_source(
+        pos_encoding, d_head, rmap, const_one
+    )
     v_idx = op.source_cols
     o_idx = op.target_cols
-
-    q_mat, k_mat = _current_pos_attn_matrices(pos_encoding, d_head)
 
     # Split input across ceil(d_input / d_head) heads
     for start in range(0, d_input, d_head):
@@ -401,11 +455,12 @@ def _write_compute_linear(
         o_mat = F.pad(weight_slice, (0, 0, 0, d_head - chunk_size))
 
         head = _allocate_head(attn)
+        _mark_rotary(attn, head, rotary_width)
         _scatter_attn_head(
             attn,
             head,
-            pe_idx,
-            pe_idx,
+            qk_idx,
+            qk_idx,
             v_chunk_idx,
             o_idx,
             q_mat,
@@ -425,13 +480,15 @@ def _write_compute_add(
     rmap: ResidualStreamMap,
     pos_encoding: PosEncoding,
     recorder: Optional[PlacementRecorder] = None,
+    const_one: Optional[Node] = None,
 ):
     """Compute Add(a, b) by copying both inputs to fresh columns via attention.
 
     Used when neither input is dead (so add_into can't reuse columns).
     Allocates new output columns and uses attention heads to copy both inputs.
     Since attention heads are additive, the result in the output columns is
-    0 + a + b = a + b.
+    0 + a + b = a + b.  Q/K self-match the current position over the trig grid
+    (``const_one is None``) or the rotary constant-1 column (``const_one`` set).
 
     When 2 * chunk_size <= d_head, both inputs are combined into a single
     head: a0 maps into head dims [0:cs] and a1 into [cs:2cs], with the
@@ -445,9 +502,10 @@ def _write_compute_add(
 
     d_head = attn.d_head
     d_output = len(node)
-    pe_idx = rmap.get_indices(pos_encoding)
     o_idx = op.target_cols
-    q_mat, k_mat = _current_pos_attn_matrices(pos_encoding, d_head)
+    qk_idx, q_mat, k_mat, rotary_width = _self_match_source(
+        pos_encoding, d_head, rmap, const_one
+    )
 
     v_idx_a = op.source_cols
     v_idx_b = op.source_cols_b
@@ -467,11 +525,12 @@ def _write_compute_add(
             o_mat[:chunk_size, :chunk_size] = torch.eye(chunk_size)
             o_mat[chunk_size : 2 * chunk_size, :chunk_size] = torch.eye(chunk_size)
             head = _allocate_head(attn)
+            _mark_rotary(attn, head, rotary_width)
             _scatter_attn_head(
                 attn,
                 head,
-                pe_idx,
-                pe_idx,
+                qk_idx,
+                qk_idx,
                 combined_v_idx,
                 o_chunk_idx,
                 q_mat,
@@ -490,11 +549,12 @@ def _write_compute_add(
                 v_mat = torch.eye(chunk_size, d_head)
                 o_mat = torch.eye(d_head, chunk_size)
                 head = _allocate_head(attn)
+                _mark_rotary(attn, head, rotary_width)
                 _scatter_attn_head(
                     attn,
                     head,
-                    pe_idx,
-                    pe_idx,
+                    qk_idx,
+                    qk_idx,
                     v_chunk_idx,
                     o_chunk_idx,
                     q_mat,
@@ -514,21 +574,23 @@ def _write_cancel(
     rmap: ResidualStreamMap,
     pos_encoding: PosEncoding,
     recorder: Optional[PlacementRecorder] = None,
+    const_one: Optional[Node] = None,
 ):
     """Cancel target_cols: V=identity, O=-identity. Skip adds x + (-x) = 0.
 
     Splits across multiple heads when wider than d_head.  Used both to
     zero a dead node's columns before reuse and to clear dirty columns
     that the caller's initial residual stream may have populated with
-    garbage.
+    garbage.  Q/K self-match the current position over the trig grid
+    (``const_one is None``) or the rotary constant-1 column (``const_one`` set).
     """
     d_head = attn.d_head
     d_width = len(op.target_cols)
 
-    pe_idx = rmap.get_indices(pos_encoding)
     node_idx = op.target_cols
-
-    q_mat, k_mat = _current_pos_attn_matrices(pos_encoding, d_head)
+    qk_idx, q_mat, k_mat, rotary_width = _self_match_source(
+        pos_encoding, d_head, rmap, const_one
+    )
 
     for start in range(0, d_width, d_head):
         end = min(start + d_head, d_width)
@@ -539,11 +601,12 @@ def _write_cancel(
         o_mat = -torch.eye(d_head, chunk_size)
 
         head = _allocate_head(attn)
+        _mark_rotary(attn, head, rotary_width)
         _scatter_attn_head(
             attn,
             head,
-            pe_idx,
-            pe_idx,
+            qk_idx,
+            qk_idx,
             chunk_idx,
             chunk_idx,
             q_mat,
@@ -563,12 +626,15 @@ def _write_add_into(
     rmap: ResidualStreamMap,
     pos_encoding: PosEncoding,
     recorder: Optional[PlacementRecorder] = None,
+    const_one: Optional[Node] = None,
 ):
     """Add(dead, live): copy live's values to dead's columns via attention.
 
     target_cols are the dead addend's columns (now owned by the Add node
     after reassign). The live addend is whichever input is still allocated
     in the residual map. Skip connection adds: dead + live = Add(dead, live).
+    Q/K self-match the current position over the trig grid (``const_one is
+    None``) or the rotary constant-1 column (``const_one`` set).
 
     Splits across multiple heads for operands wider than d_head.
     """
@@ -580,10 +646,10 @@ def _write_add_into(
     v_idx = op.source_cols  # live addend cols, captured at schedule time
     d_live = len(v_idx)
 
-    pe_idx = rmap.get_indices(pos_encoding)
     o_idx = op.target_cols  # dead addend's columns
-
-    q_mat, k_mat = _current_pos_attn_matrices(pos_encoding, d_head)
+    qk_idx, q_mat, k_mat, rotary_width = _self_match_source(
+        pos_encoding, d_head, rmap, const_one
+    )
 
     for start in range(0, d_live, d_head):
         end = min(start + d_head, d_live)
@@ -596,11 +662,12 @@ def _write_add_into(
         o_mat = torch.eye(d_head, chunk_size)
 
         head = _allocate_head(attn)
+        _mark_rotary(attn, head, rotary_width)
         _scatter_attn_head(
             attn,
             head,
-            pe_idx,
-            pe_idx,
+            qk_idx,
+            qk_idx,
             v_chunk_idx,
             o_chunk_idx,
             q_mat,

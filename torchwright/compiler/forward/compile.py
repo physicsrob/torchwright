@@ -47,6 +47,7 @@ from torchwright.compiler.groups.transformer_layer import TransformerLayer
 from torchwright.compiler.transformer import HeadlessTransformer
 from torchwright.compiler.residual_assignment import flatten_concat_nodes
 from torchwright.graph import Node, Linear, Concatenate
+from torchwright.graph.misc import LiteralValue
 from torchwright.graph.pos_encoding import PosEncoding
 from torchwright.graph.relu import ReLU
 
@@ -405,6 +406,7 @@ def forward_compile(
     cpsat_flex_routing: bool = True,
     assume_zero_init: bool = False,
     require_solver: bool = False,
+    rotary_self_match: bool = False,
 ) -> HeadlessTransformer:
     """Compile a computation graph into a HeadlessTransformer.
 
@@ -468,6 +470,16 @@ def forward_compile(
             (the default) the compile still falls back, but now emits a
             ``warnings.warn`` so the fallback is never silent.  Ignored
             when ``optimize=0``.
+        rotary_self_match: When True, the compiler-internal Δ=0 self-match
+            heads behind every ``Linear``/``Add``/``Cancel``/``add_into``
+            read a reserved constant-1 residual column and are marked rotary
+            (rotate_half over ``d_head``, by absolute position) instead of
+            matching on the ``PosEncoding`` trig block — the
+            ``docs/rope_port_plan.md`` Phase-2-part-2 migration.  Requires an
+            even ``d_head``.  Bit-identical transport (the diagonal softmax
+            weight is 1.0 to fp32); the rotation propagates to the ONNX/HF
+            surfaces via per-head ``rotary_width``.  Defaults to False (the
+            trig self-match).
 
     Returns:
         A HeadlessTransformer whose compute() method reproduces
@@ -511,6 +523,24 @@ def forward_compile(
     # pos_encoding + input_nodes are populated by get_input_res_stream at
     # forward-time, so those cols are guaranteed clean on entry.
     residual_map.mark_clean(residual_map.get_indices(pos_encoding))
+    # Rotary self-match (docs/rope_port_plan.md Phase 2 Part 2): reserve one
+    # constant-1 residual column for the Δ=0 self-match heads to read.  It is a
+    # LiteralValue input node, so all three runtime surfaces initialise it to
+    # 1.0 with no new emission code (in-process get_input_res_stream's
+    # LiteralValue branch; the ONNX/HF `constant_values` seed).  Like
+    # pos_encoding it is allocated once and never freed — no graph node owns it
+    # and no op targets it, so the column holds 1.0 unchanged through every
+    # layer.  rotate_half pairs dim p with dim p+d_head/2, so d_head must be even.
+    const_one: Optional[Node] = None
+    if rotary_self_match:
+        if d_head % 2 != 0:
+            raise ValueError(
+                f"rotary_self_match requires an even d_head (got {d_head}); "
+                f"rotate_half pairs dim p with dim p+d_head/2."
+            )
+        const_one = LiteralValue(torch.ones(1), name="rope_self_match_const_one")
+        residual_map.allocate(const_one)
+        residual_map.mark_clean(residual_map.get_indices(const_one))
     for node in input_nodes:
         if node is pos_encoding:
             continue
@@ -825,7 +855,7 @@ def forward_compile(
                 clusters=clusters,
                 admission_budget_fraction=admission_budget_fraction,
                 policy=policy,
-                    )
+            )
         else:
             if verbose and net.cpsat_solve_stats.status_name != "CACHED":
                 solve_time = time.perf_counter() - t_solve_start
@@ -843,7 +873,7 @@ def forward_compile(
                 clusters=clusters,
                 admission_budget_fraction=admission_budget_fraction,
                 policy=policy,
-                    )
+            )
     else:
         scheduler = LayerScheduler(
             graph,
@@ -854,7 +884,7 @@ def forward_compile(
             clusters=clusters,
             admission_budget_fraction=admission_budget_fraction,
             policy=policy,
-            )
+        )
 
     # Save input indices before scheduling (scheduling may free/reassign them)
     input_indices: dict[Node, list[int]] = {
@@ -862,6 +892,10 @@ def forward_compile(
     }
     for node in input_nodes:
         input_indices[node] = residual_map.get_indices(node)
+    if const_one is not None:
+        # In the in_state so get_input_res_stream / the ONNX+HF constant seed
+        # write 1.0 into its column (LiteralValue branch).
+        input_indices[const_one] = residual_map.get_indices(const_one)
 
     graph_params = sum(n.num_params() for n in graph.get_all_nodes())
 
@@ -928,7 +962,12 @@ def forward_compile(
         t_attn_start = time.perf_counter()
         placement_recorder.set_layer(i)
         write_attn_sublayer(
-            layer, attn_ops, residual_map, pos_encoding, recorder=placement_recorder
+            layer,
+            attn_ops,
+            residual_map,
+            pos_encoding,
+            recorder=placement_recorder,
+            const_one=const_one,
         )
         t_mlp_start = time.perf_counter()
         write_mlp_sublayer(

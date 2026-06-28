@@ -1182,6 +1182,7 @@ def compile_to_onnx(
     extra_metadata: Optional[dict] = None,
     cache_stride: Optional[int] = None,
     debug_sidecar: bool = True,
+    rotary_self_match: bool = False,
 ) -> OnnxArtifact:
     """Compile a token-I/O graph to a KV-cached ONNX model.
 
@@ -1281,6 +1282,7 @@ def compile_to_onnx(
         optimize=optimize,
         assume_zero_init=assume_zero_init,
         d_hidden=d_hidden,
+        rotary_self_match=rotary_self_match,
     )
     t_compile = time.perf_counter() - t0
     if verbose and per_layer_n_heads:
@@ -1953,6 +1955,7 @@ def compile_headless(
     trim_heads: bool = True,
     optimize: int = 0,
     assume_zero_init: bool = False,
+    rotary_self_match: bool = False,
 ) -> CompiledHeadless:
     """Compile a graph to an in-process callable.
 
@@ -2010,6 +2013,7 @@ def compile_headless(
         trim_heads=trim_heads,
         optimize=optimize,
         assume_zero_init=assume_zero_init,
+        rotary_self_match=rotary_self_match,
     )
 
     assert net.residual_assignment is not None

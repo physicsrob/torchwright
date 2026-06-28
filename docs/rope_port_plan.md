@@ -1,13 +1,13 @@
 # RoPE port — plan
 
-Status: **Phases 0, 1, 1b, 2-part-1 done** (branch `worktree-rope`). Phase 0 (rotary `Attn`,
+Status: **Phases 0, 1, 1b, 2 done** (branch `worktree-rope`). Phase 0 (rotary `Attn`,
 in-process/ONNX/HF), Phase 1 (bucket-1 near-marker count), Phase 1b (recency ramp: `soft_blend` +
-octant ramp, confirm-compile green), Phase 2 Part 1 (relative-offset all-Δ + sign lock). Remaining:
-Phase 2 Part 2 (compiler self-match → rotary), Phase 3 (content), Phase 4 (recency end-to-end),
-Phase 5 (delete PosEncoding). **`main` merged in (`f281ee8`)**: ONNX/HF now run in CI (the Modal
-image carries `onnxruntime`/`transformers` — the runtime-parity gap is closed), the float-I/O
-headless ONNX export and the delta-transfer compile mode were removed, and the token export uses a
-vanilla untied embedding.
+octant ramp, confirm-compile green), Phase 2 Part 1 (relative-offset all-Δ + sign lock), Phase 2
+Part 2 (compiler self-match → rotary, all three surfaces). Remaining: Phase 3 (content), Phase 4
+(recency end-to-end), Phase 5 (delete PosEncoding). **`main` merged in (`f281ee8`)**: ONNX/HF now
+run in CI (the Modal image carries `onnxruntime`/`transformers` — the runtime-parity gap is closed),
+the float-I/O headless ONNX export and the delta-transfer compile mode were removed, and the token
+export uses a vanilla untied embedding.
 
 > **RoPE** = rotary position embeddings: instead of adding a position vector to the
 > residual stream, attention rotates each query and key by an angle proportional to its
@@ -460,24 +460,40 @@ D1 stop.
 >   differently and harmlessly, so it's excluded. Sign locked by a directional test + `probe_compiled`
 >   on backward/wider/forward Δ. Forward offsets (`+N`) are causally degenerate (`j+N` masked → self),
 >   so not claimed trig-identical.
-> - **Part 2 — compiler self-match → rotary: NOT a graph capability; it's a compiler-core migration.**
->   At the graph level a self-match *is* just a `Linear`; the self-match only exists inside the
->   compiler's attention-based implementation of `Linear`/`Add`, so it can't be proven by a
->   torchwright graph test — the change must land in the compiler. **It needs a reserved constant-1
->   residual feature**: a rotary self-match is `logit(j,i) = c^T R(i−j) c` (peaks at `i=j`) for a
->   *constant* `c`, but Q/K are bias-free linear projections (`components/attn.py:92-93`) and no
->   constant column exists today. (The current trig self-match already *is* rotary-on-a-constant —
->   the trig columns are `R(i)·[1,0,1,0,…]` — so the migration is "stop reading pre-rotated trig
->   columns; read a constant column and let the runtime rotate it.") Required surfaces: the residual
->   reservation (`ResidualStreamMap`, a "computed-once-then-reserved" constant per §10), in-process
->   runtime input construction (`HeadlessTransformer.get_input_res_stream`), `_current_pos_attn_matrices`
->   (rotary branch behind the per-head flag), **and** the ONNX + HF mirrors. **All three surfaces are
->   now CI-tested** — `main` (`f281ee8` merge) added `onnxruntime`/`transformers` to the Modal image,
->   so a self-match migration *can* be validated end-to-end (the earlier CI-blind blocker is gone; the
->   reserved-constant-column prerequisite remains). This is still the highest-blast-radius change in the
->   port (every Linear/Add) with I1–I4 as D1-stop guardrails — it warrants its own focused effort and
->   compiler-invariant-tests-first, not a rushed partial land. (Note: `main` removed delta-transfer, so
->   four self-match callers now, not five.)
+> - ✅ **Part 2 — compiler self-match → rotary (all three surfaces).** The four self-match callers
+>   (`_write_compute_linear`/`_add`/`_cancel`/`_add_into` via `_current_pos_attn_matrices`) now build,
+>   behind the opt-in `rotary_self_match` flag, a rotary Δ=0 head: query/key read a **reserved
+>   constant-1 residual column** projected to `hardness·ones` / `ones` across `d_head`, marked rotary
+>   (full-width, `rope_base=5e5`), so the runtime rotation makes `logit(j,i) ∝ Σ_p cos((i−j)·θ_p)`
+>   peak at `i=j`. This is the offset head at Δ=0 — the trig self-match already *was*
+>   rotary-on-a-constant (trig cols = `R(i)·[1,0,…]`); the migration reads the un-rotated constant and
+>   lets the runtime rotate it.
+>   - **Reduced blast radius vs the plan's fear.** The const-1 feature is a `LiteralValue([1.0])`
+>     input node, and literal input columns are **already** initialised on all three surfaces
+>     (in-process `get_input_res_stream`; the ONNX/HF `constant_values` seed). So the "ONNX + HF
+>     mirrors" needed **no new emission code** — the rotation propagates via per-head `rotary_width`
+>     (Phase-0 infra), and the constant rides the existing seed. New code is confined to
+>     `weight_writer.py` (rotary branch + `_mark_rotary`) and `forward_compile` (the flag + the
+>     reserved column added to `input_indices`); the flag threads through `compile_headless` /
+>     `compile_to_onnx`.
+>   - **Concentration proven (D2).** The rotary self-match softmax puts weight **exactly 1.0** on the
+>     diagonal to fp32 out to position 61440 (sampled, `d_head` 16/32/256) — translation-invariant
+>     (depends only on `i−j`), so transport is bit-identical to a perfect Δ=0 selection. Matches the
+>     trig self-match's "diagonal at 1.0 past any realistic length" claim.
+>   - **Validation.** `tests/compile/forward/test_rope_self_match.py` (in-process: rotary == trig ==
+>     oracle on `add`/`signed_multiply`, prefill==decode, the path is actually taken, odd-`d_head`
+>     guard) and `tests/hf/test_rope_self_match_token.py` (ONNX→HF: predict-previous survives, the
+>     const-1 column reaches HF `constant_values`, prefill==cached-decode). **Full suite green; I1–I4
+>     held** (no D1 stop). `d_head` must be even (rotate_half).
+>   - **`assume_zero_init` note.** `compile_to_onnx` defaults `assume_zero_init=True`, which elides
+>     some BIRTH-layer cancels, so the rotary-head count on the ONNX/HF path is lower than the
+>     `compile_headless` (`assume_zero_init=False`) count for the same graph — the HF test asserts
+>     "more than the lone offset head", not a literal count.
+>
+>   The reserved column is allocated once and never freed (no graph node owns it, no op targets it),
+>   so it holds 1.0 unchanged through every layer — the `ResidualStreamMap` "computed-once-then-
+>   reserved" pattern §10 anticipated. `pos_encoding` is untouched (other position ops migrate in
+>   Phases 3–4); the trig self-match remains the default until Phase 5 makes rotary the only path.
 
 **Phase 3 — Content selection.** Migrate the `attend_*` family to place content on slow planes;
 fix `base` and `d_head` (§6). Validation: each selection head against **its own documented score
@@ -597,12 +613,12 @@ separate `torchwright_doom` branch** (post-Phase-5), not a per-phase gate in thi
   `1e6`-measured analyses with `5e5`.
 - **Offset sign convention.** ✅ DONE (Phase 0). `W_K = R_N W_Q` pinned by the offset-head test
   (which also pins the rotation layout).
-- **Compiler blast radius.** Linear/Add/Cancel/add_into self-match recompiles through rotary
-  self-match (Phase 2 Part 2; delta_transfer was removed on `main`, so **four** callers now, not
-  five). I1–I4 are the guardrails; any firing is a D1 stop. **Remaining prerequisite:** a reserved
-  constant-1 residual feature (Q/K are bias-free, so a rotary self-match has no constant to rotate
-  today). The earlier second prerequisite — the ONNX/HF CI gap — is now **closed** (see below). Part 1
-  (relative-offset, all Δ) is ✅ done (`feffb20`).
+- **Compiler blast radius.** ✅ DONE (Phase 2 Part 2). Linear/Add/Cancel/add_into self-match
+  recompiles through rotary self-match behind the opt-in `rotary_self_match` flag; the reserved
+  constant-1 residual feature is a `LiteralValue([1.0])` that rides the existing all-surface
+  `constant_values` seed (no new ONNX/HF emission), and the rotation propagates via per-head
+  `rotary_width`. Full suite green, **I1–I4 held** (no D1 stop). The trig self-match stays the default
+  until Phase 5 makes rotary the only path. Part 1 (relative-offset, all Δ) ✅ `feffb20`.
 - **Runtime rotation parity.** ✅ DONE (Phase 0) **and now CI-tested** — `main` (`f281ee8` merge) added
   `onnxruntime`/`transformers` to the Modal image, so the ONNX/HF rotation tests run in CI; the full
   suite is green (`test_rope_token.py` passes the token-ONNX/HF RoPE path through the untied
