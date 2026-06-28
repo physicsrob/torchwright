@@ -444,6 +444,32 @@ perturbations have caused real regressions). Migrate behind the smallest compile
 tests *before* broad suite runs; compiler invariants I1–I4 must keep passing — any firing is a
 D1 stop.
 
+> **Status (2026-06-27).**
+> - ✅ **Part 1 — relative-offset, all Δ + sign lock** (`feffb20`,
+>   `tests/compile/forward/test_rope_offset_all_deltas.py`). The rotary offset head (`W_K = R_N W_Q`,
+>   `rotary_offset_head`) is token-identical to the trig `attend_to_offset` at every *in-bounds*
+>   position across the real backward-Δ range (committed grep: −1, −2, −3; plus −5, −8). The
+>   out-of-bounds region (target before BOS) is a don't-care fallback the two schemes handle
+>   differently and harmlessly, so it's excluded. Sign locked by a directional test + `probe_compiled`
+>   on backward/wider/forward Δ. Forward offsets (`+N`) are causally degenerate (`j+N` masked → self),
+>   so not claimed trig-identical.
+> - **Part 2 — compiler self-match → rotary: NOT a graph capability; it's a compiler-core migration.**
+>   At the graph level a self-match *is* just a `Linear`; the self-match only exists inside the
+>   compiler's attention-based implementation of `Linear`/`Add`, so it can't be proven by a
+>   torchwright graph test — the change must land in the compiler. **It needs a reserved constant-1
+>   residual feature**: a rotary self-match is `logit(j,i) = c^T R(i−j) c` (peaks at `i=j`) for a
+>   *constant* `c`, but Q/K are bias-free linear projections (`components/attn.py:92-93`) and no
+>   constant column exists today. (The current trig self-match already *is* rotary-on-a-constant —
+>   the trig columns are `R(i)·[1,0,1,0,…]` — so the migration is "stop reading pre-rotated trig
+>   columns; read a constant column and let the runtime rotate it.") Required surfaces: the residual
+>   reservation (`ResidualStreamMap`, a "computed-once-then-reserved" constant per §10), in-process
+>   runtime input construction (`HeadlessTransformer.get_input_res_stream`), `_current_pos_attn_matrices`
+>   (rotary branch behind the per-head flag), **and** the ONNX + HF mirrors. Two of those three runtime
+>   surfaces are **CI-blind** (the Modal image lacks `onnxruntime`/`transformers` — see the §11
+>   runtime-parity gate), so a self-match migration cannot currently be validated end-to-end. This is
+>   the highest-blast-radius change in the port (every Linear/Add) with I1–I4 as D1-stop guardrails;
+>   it warrants its own focused effort with the ONNX/HF CI gap closed first, not a rushed partial land.
+
 **Phase 3 — Content selection.** Migrate the `attend_*` family to place content on slow planes;
 fix `base` and `d_head` (§6). Validation: each selection head against **its own documented score
 and validity bounds** (e.g. `_QUERY_GAIN=8`, the `attend_argmin_above_in_bucket` margins) — RoPE
@@ -561,7 +587,10 @@ separate `torchwright_doom` branch** (post-Phase-5), not a per-phase gate in thi
 - **Offset sign convention.** ✅ DONE (Phase 0). `W_K = R_N W_Q` pinned by the offset-head test
   (which also pins the rotation layout).
 - **Compiler blast radius.** Linear/Add/Cancel/add_into/delta_transfer recompile through rotary
-  self-match (Phase 2). I1–I4 are the guardrails; any firing is a D1 stop.
+  self-match (Phase 2 Part 2). I1–I4 are the guardrails; any firing is a D1 stop. **Blocked on two
+  prerequisites:** (1) a reserved constant-1 residual feature (Q/K are bias-free, so a rotary
+  self-match has no constant to rotate today), and (2) the ONNX/HF CI gap (the migration touches all
+  three runtime surfaces but two are CI-blind). Part 1 (relative-offset, all Δ) is ✅ done (`feffb20`).
 - **Runtime rotation parity.** ✅ DONE (Phase 0), but validated **locally only** — the Modal image
   lacks `onnxruntime`, so the ONNX/HF rotation tests skip in CI. **New blocking gate for later
   phases: add `onnxruntime` to the Modal test image** so Phases 2/3/5 can actually CI-test the
