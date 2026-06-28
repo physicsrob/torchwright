@@ -5,7 +5,7 @@ that added the HuggingFace export layer `torchwright/compiler/hf/`, removed the
 windowed KV-cache, and switched the token export to a vanilla untied
 llama3-style embedding — `embed_table` is now `(vocab, d)`, gathered straight
 into the seed, with no `embedding_proj` / `d_embed`). Decisions below are
-**leanings, not locked**, except the three marked **[LOCKED]**. Prototyped on
+**leanings, not locked**, except the four marked **[LOCKED]**. Prototyped on
 `calculator_simple`; not yet wired into any emitter. Branch:
 `worktree-rmsnorm-prototype`.
 
@@ -112,9 +112,8 @@ the fallback this commitment lets us avoid.
   (`embed_table[:, j] = 2^q`, replicated across every vocab row so the per-token
   lookup reproduces it at every position; see *the one unavoidable core hook*),
   so the RMS denominator stays `d`, **there is no width blowup**, and matmul
-  shapes are unchanged. The
-  two-column layout at 8192 is **pending prototype confirmation** (Evidence
-  gap 3 / Open questions).
+  shapes are unchanged. The two-column layout at 8192 is **confirmed bit-exact**
+  by the float-roundtrip prototype (see Evidence).
 - **Formula gain (fallback, not used)** `C = sqrt(K/d)` (K = constant energy).
   Bit-exact for exactly-representable values (the calculator's one-hots and
   integers), but ~`6e-8` relative error per norm on *arbitrary* floats (two
@@ -144,42 +143,43 @@ untouched everywhere.
 
 ## Evidence (prototypes under `scripts/`)
 
-> **Reproducibility note:** both prototypes predate the post-merge `main`. The
-> `<bos` → `<bos>` token rename (`graph/embedding.py:10`) has been applied to
-> `proto_rmsnorm_identity.py`; re-running it against the current
-> `compile_headless` / `HeadlessTransformer` surface is the first implementation
-> step (see Open questions). Numbers below are from the pre-merge runs.
-
-`scripts/proto_rmsnorm_identity.py` — full `calculator_simple` compile, baseline
-vs. normed forward:
-- 1- and 3-digit add/sub/mul: `rms_spread = 0`, `max|Δ|` at the denormal floor
-  (~1e-38..1e-45), decode identical. **Bit-exact.**
-- `M` sweep (999*999): bit-exact for `M ≥ 1e6`; still decodes correctly down to
-  `M=1e3`; **breaks at `M≈1e2`**, when `C` drops to the data's own RMS. Takeaway:
-  the constant must out-energy *all* live data.
+> **Reproducibility note:** both prototypes have been **re-run against post-merge
+> `main`** (current `compile_headless` / `HeadlessTransformer` surface, `<bos>`
+> token spelling). Numbers below are from those runs and reflect the committed
+> power-of-two-RMS, reserve-inside design.
 
 `scripts/proto_rmsnorm_float_roundtrip.py` — DOOM-like float stream (distances
-~±2000, reciprocals ~1e-3..1e-4, trig, signs, zeros):
-- Formula gain: `max_rel ≈ 6e-8` per norm; `drift@200 = 1.2e-4` (bounded — does
-  not compound).
-- Power-of-two gain: `max|Δ| = 0`, **bit-exact**, even with `eps=1e-6`.
+~±2000, reciprocals ~1e-3..1e-4, trig, mid-range, zeros), pure fp32 (the pow2
+claim is platform-independent), **power-of-two-RMS gain only**, **reserve-inside**
+(constant column(s) inside a power-of-two `d`, no width pad):
+- `d=1024` (even `b`, one column) **and `d=8192` (odd `b`, two equal columns —
+  DOOM's shipping width)**: `rms_spread = 0`, `max|Δ| = 0`, `drift@200 = 0` —
+  **bit-exact, with `eps=0` and `eps=1e-6`.**
+- Energy sweep at `d=8192`: bit-exact while `Σ data²` stays under the out-energy
+  bound (and ~15× past it, on the `sqrt`-rounding margin); the identity breaks
+  once the data energy is well over the bound — confirming the constraint is real
+  and where it bites.
 
-**Three gaps in the current evidence (hardening actions, not yet done):**
-1. The pow2 prototype measured bit-exactness at width **4096**, not the
-   committed reserve-inside-`1024` layout: it *appends* the constant to a full
-   1024-wide data block (width 1025) and pads up to the next even power of two
-   (4096). The reserve-inside-`1024` scheme is mechanically sound (1024 is an
-   even power of two, denominator stays 1024), but it was never the thing
-   measured. Re-run the prototype in the reserve-inside layout and re-measure.
-2. Both prototypes stress *input* energy only. RMS is re-pinned each layer only
-   while data energy stays swamped at *every* layer, and residual energy grows
-   with depth. Stress the constant against the **deepest-layer** residual energy,
-   not just the input — this is the real risk for DOOM's depth.
-3. Both prototypes ran at **even**-power-of-two widths (1024, 4096), so the
-   odd-power-of-two case was never exercised. DOOM runs at `d=8192=2^13` (odd),
-   where a single constant column cannot make the RMS a power of two. Prototype
-   the **two-equal-column** layout at 8192 and confirm `max|Δ| = 0` *and* that
-   cancel-heads survive, before committing the rule.
+`scripts/proto_rmsnorm_identity.py` — full `calculator_simple` compile, baseline
+vs. pre-norm forward with the pow2 gain seeded into free columns **inside** `d`,
+through the scheduler's real cancel heads:
+- `d=1024` (even `b`, one column) and `d=2048` (odd `b`, two equal columns):
+  `rms_spread = 0`, decode identical, `max|Δ|` only at the fp32 denormal floor
+  (~1e-38..1e-45) — the documented near-zero-data caveat, not drift; cancel-heads
+  survive. (`d=8192` itself is too memory-heavy for the dense in-process backend's
+  `O(d²)` attention matrices, so the real odd-`b`/two-column graph runs at
+  `d=2048` here and at `d=8192` in the roundtrip.)
+
+**Evidence-gap status (the three hardening actions are now done):**
+1. **Reserve-inside layout — closed.** Both prototypes reserve the constant
+   *inside* a power-of-two `d` (no pad to a larger width); bit-exact above.
+2. **Deepest-layer energy — exercised; one piece deferred.** The roundtrip energy
+   sweep validates the out-energy bound with margin, and the compiler proto runs
+   the calculator's real (deep-layer) residual energy bit-exactly. DOOM's *actual*
+   deepest-layer energy is exercised only by the real DOOM graph (Open questions,
+   DOOM validation).
+3. **Odd-power-of-two width — closed.** The two-equal-column rule is bit-exact at
+   `d=8192` (roundtrip) and survives real cancel heads at `d=2048` (compiler).
 
 ## Design decisions (LEANINGS unless marked)
 
@@ -207,12 +207,16 @@ vs. normed forward:
    debugging the math loses nothing, and this insulates the tolerance-sensitive
    test suite. Because the feature is a toggle, existing compiles (norm off)
    reserve no column and change in no way.
-3. **The gain representation is a real saved parameter** (lean): emit one
-   per-layer (+ final) RMSNorm `weight` initializer of width `d`, uniformly `C`,
-   mapped by `convert.py` to `model.layers.{i}.<norm>.weight`. The alternative —
-   synthesize the uniform gain from config at load time and emit no initializer —
-   keeps the ONNX graph smaller but makes the shipped model less literally a
-   "standard RMSNorm." Decide before implementing (Open questions).
+3. **[LOCKED] The gain is a real saved `weight` parameter, named the Llama3 way.**
+   Emit one per-norm (per-layer + final) RMSNorm `weight` initializer of width
+   `d`, uniformly `C`, mapped by `convert.py` to the standard Llama3 names —
+   `model.layers.{i}.input_layernorm.weight` (pre-attention),
+   `…post_attention_layernorm.weight` (pre-MLP), and `model.norm.weight` (final).
+   This is exactly how a stock Llama3 stores its RMSNorm gains; the alternative
+   (synthesize the uniform gain from config at load, no initializer) is smaller
+   but non-standard. Chosen because the shipped model must be as Llama3-like as
+   possible — the *magnitude* of `C` stays the unavoidable tell (the credibility
+   caveat above), but the *representation* is identical to Llama3's.
 4. **The constant's value folds into the embedding table; only its column
    reservation is compiler-internal.** The value is written directly into
    `embed_table` (replicated across vocab rows — see decision 6); it is the only
@@ -330,9 +334,9 @@ this is *lifetime + metadata*. The split:
 
 ## Open questions
 
-1. **Gain representation:** saved per-layer `weight` initializer (decision 3
-   lean) vs. synthesized-from-config at load. Decides how much `convert.py` and
-   the ONNX emitter grow.
+1. **Gain representation — RESOLVED** (decision 3, [LOCKED]): a saved Llama3-style
+   `weight` parameter (`input_layernorm` / `post_attention_layernorm` /
+   `model.norm`), emitted as an ONNX initializer that `convert.py` maps.
 2. **Allocator fork:** `ResidualStreamMap.reserve()` already exists
    (`residual_map.py:114`) but is unused; the norm constant is the only thing
    needing a never-freed reserved column (graph constants are JIT-materialized
@@ -348,11 +352,11 @@ this is *lifetime + metadata*. The split:
    `torchwright_doom` submodule, not tested here) by diffing a rendered frame
    against baseline — especially the cancel-heads paths and the deepest-layer
    energy bound.
-5. **Re-run/re-measure the prototypes** against post-merge APIs, in the committed
-   reserve-inside layout, and at DOOM's odd-power-of-two width with two columns
-   (Evidence gaps 1–3). Production HF export uses `calculator_v2`
-   (`examples/calculator_hf_export.py`), not the `calculator_simple` the prototype
-   compiles — validate on the graph that ships.
+5. **Validate on the shipping graph.** The prototypes are now re-run post-merge in
+   the reserve-inside layout at even and odd widths (Evidence above), but they
+   compile `calculator_simple`; production HF export uses `calculator_v2`
+   (`examples/calculator_hf_export.py`). Re-confirm bit-exactness on the graph
+   that actually ships.
 
 ## Out of scope / not done
 
