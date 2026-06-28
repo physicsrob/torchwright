@@ -21,6 +21,8 @@ In the Phase-5 end state every head uses ``w = d_head`` on one global ``base``,
 recovering the single global grid; this same formula covers that case.
 """
 
+import math
+
 import torch
 
 # LLaMA3-family base.  See docs/rope_port_plan.md §6 — reconcile downstream
@@ -37,6 +39,45 @@ def rope_inv_freq(width: int, base: float) -> torch.Tensor:
         raise ValueError(f"RoPE width must be even, got {width}")
     p = torch.arange(0, width, 2, dtype=torch.float64)
     return (base ** (-p / width)).to(torch.float32)
+
+
+def recency_plane_index(
+    d_head: int,
+    base: float,
+    max_positions: int,
+    *,
+    seam_frac: float = 0.05,
+) -> int:
+    """Pick the recency plane: the **fastest** grid plane whose phase still never
+    wraps over the whole rollout (``docs/rope_port_plan.md`` §3 bucket 2, §6).
+
+    The bucket-2 recency readout reads the BOS-relative phase ``phi(pos) =
+    pos · θ_p`` of one rotary plane.  The octant ramp built on it has a single
+    discontinuity at the seam ``phi = 0 mod 2π`` (the wrap), so the whole
+    rollout's phase must stay inside ``(seam_frac·2π, (1−seam_frac)·2π)``.  That
+    bounds the plane's angular frequency: one turn (``2π/θ_p``) must cover at
+    least ``max_positions / (1 − 2·seam_frac)`` positions.  Among the planes
+    that satisfy this, the **fastest** (largest ``θ_p``, smallest index) gives
+    the steepest per-token phase step, i.e. the most recency resolution.
+
+    ``θ_p = base^(−2p/d_head)`` decreases as ``p`` grows, so turn grows with
+    ``p``; the first ``p`` whose turn clears the bound is the answer.
+
+    Raises ``ValueError`` if no plane on the grid is slow enough (raise
+    ``d_head`` or ``base`` — the slowest plane ``θ_{d_head/2−1} ≈ 1/base`` still
+    wraps within the rollout).
+    """
+    need_turn = max_positions / (1.0 - 2.0 * seam_frac)
+    for p in range(d_head // 2):
+        theta_p = base ** (-2.0 * p / d_head)
+        turn = 2.0 * math.pi / theta_p
+        if turn >= need_turn:
+            return p
+    raise ValueError(
+        f"no rotary plane on the base={base} d_head={d_head} grid turns slowly "
+        f"enough for a {max_positions}-position rollout (need turn ≥ "
+        f"{need_turn:.0f}); raise d_head or base."
+    )
 
 
 def rope_cos_sin(

@@ -1580,3 +1580,109 @@ def attend_most_recent_matching(
     return _wrap_hard_selection_output(
         attn, value, assert_hardness_gt=assert_hardness_gt
     )
+
+
+def attend_most_recent_matching_via_ramp(
+    query_vector: Node,
+    key_vector: Node,
+    value: Node,
+    recency_rank: Node,
+    *,
+    match_gain: float = 200.0,
+    rank_gain: float = 2.0e5,
+    assert_hardness_gt: Optional[float] = None,
+) -> Node:
+    """RoPE-native twin of :func:`attend_most_recent_matching`.
+
+    Identical content-match-plus-recency-tiebreak selection, but the recency
+    rank is a graph-derived ``recency_rank`` node (the bucket-2 octant ramp,
+    :func:`torchwright.ops.recency_heads.recency_rank`) instead of the raw
+    integer counter in the positional encoding.  ``pos_encoding`` drops out of
+    the signature entirely — this is the form DOOM rewires onto at Phase 5
+    (``docs/rope_port_plan.md`` §7).
+
+    At each query position the logit at key ``i`` is
+
+        match_gain · (query_vector_j · key_vector_i) + rank_gain · recency_rank_i
+
+    so among keys whose content matches, the one with the largest
+    ``recency_rank`` (the most recent, since the ramp is strictly increasing in
+    absolute position) wins.
+
+    ``rank_gain`` (``G``) plays the role the counter's ``_QUERY_GAIN`` did, but
+    against a ramp whose per-token step is tiny (~2e-5) rather than 1: with the
+    default ``G = 2e5`` the worst-case adjacent-position recency gap is
+    ``G · min_step ≈ 4`` logits.  ``G`` is argmax-invariant for *which* key wins
+    (the ramp is monotone); it only sets the softmax sharpness and the
+    content/recency balance.
+
+    **Required invariant on ``match_gain`` (content dominance).**  A
+    content-matched but older key must still beat an unmatched but newer key, so
+
+        match_gain · (min_match_dot − max_no_match_dot) > rank_gain · rank_range
+
+    where ``rank_range`` is the ramp's total swing over the rollout (≈2.06 for
+    the default ``gain=2.0`` ramp).  At ``G = 2e5`` that is ``rank_gain ·
+    rank_range ≈ 4.1e5``; mirror the sizing guidance on
+    :func:`attend_most_recent_matching` with ``4.1e5`` in place of
+    ``_QUERY_GAIN · max_n_pos``.
+
+    **Caller contract.**  ``recency_rank`` must be the monotone-and-seam-safe
+    ramp built for the run's ``max_positions`` (see
+    :func:`~torchwright.ops.recency_heads.recency_rank`); past the seam the order
+    silently inverts.  As with the counter version, at least one matching key
+    must exist in every consumed window, else the head degrades to pure recency.
+    The ramp's reference positions (BOS/REF) carry **degenerate** ranks (they
+    attend only to themselves), which sit inside the ramp's value box but as
+    outliers; the content-dominance bound above is what keeps a content-
+    mismatched reference token from winning on its outlier rank, so honor it.
+
+    Args:
+        query_vector: Width-``W`` node — what we're looking for.
+        key_vector: Width-``W`` node — each key's identity.
+        value: Node to read at the selected key position.
+        recency_rank: length-1 node, the per-position recency ramp.
+        match_gain: Coefficient on the dot-product term (see the invariant).
+        rank_gain: ``G`` — coefficient on the recency ramp.
+        assert_hardness_gt: If set, wraps the output in a softmax hardness
+            assertion checked during ``debug=True`` passes.
+
+    Returns:
+        Attn node of width ``len(value)``.
+    """
+    assert len(query_vector) == len(key_vector), (
+        "query_vector and key_vector must have the same width "
+        f"(got {len(query_vector)} and {len(key_vector)})"
+    )
+    assert len(recency_rank) == 1, "recency_rank must be a length-1 node"
+    W = len(query_vector)
+    d_v = len(value)
+    d_qk = W + 1
+
+    # Q side: match_gain on the query vector, rank_gain on an exact 1.0 literal.
+    query_one = LiteralValue(torch.tensor([1.0]), name="recency_ramp_query_one")
+    query_in = Concatenate([query_vector, query_one])
+    query_matrix = torch.zeros((W + 1, d_qk))
+    for c in range(W):
+        query_matrix[c, c] = match_gain
+    query_matrix[W, W] = rank_gain
+
+    # K side: identity on the key vector, unit on the recency ramp.
+    key_in = Concatenate([key_vector, recency_rank])
+    key_matrix = torch.zeros((W + 1, d_qk))
+    for c in range(W):
+        key_matrix[c, c] = 1.0
+    key_matrix[W, W] = 1.0  # recency_rank row -> recency column
+
+    attn = Attn(
+        query_in=query_in,
+        key_in=key_in,
+        value_in=value,
+        query_matrix=query_matrix,
+        key_matrix=key_matrix,
+        value_matrix=torch.eye(d_v),
+        output_matrix=torch.eye(d_v),
+    )
+    return _wrap_hard_selection_output(
+        attn, value, assert_hardness_gt=assert_hardness_gt
+    )

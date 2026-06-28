@@ -1,11 +1,13 @@
 # RoPE port — plan
 
-Status: **Phases 0, 1, 1b, 2 done** (branch `worktree-rope`). Phase 0 (rotary `Attn`,
+Status: **Phases 0, 1, 1b, 2, 3, 4 done** (branch `worktree-rope`). Phase 0 (rotary `Attn`,
 in-process/ONNX/HF), Phase 1 (bucket-1 near-marker count), Phase 1b (recency ramp: `soft_blend` +
 octant ramp, confirm-compile green), Phase 2 Part 1 (relative-offset all-Δ + sign lock), Phase 2
 Part 2 (compiler self-match → rotary, all three surfaces), Phase 3 (content-selection capability on
-slow planes — proven; builder integration deferred to Phase 5). Remaining: Phase 4 (recency
-end-to-end), Phase 5 (delete PosEncoding + wire the content/self-match builders). **`main` merged in (`f281ee8`)**: ONNX/HF now
+slow planes — proven; builder integration deferred to Phase 5), Phase 4 (recency end-to-end: the two
+graded `{BOS, REF}` rotary heads → octant ramp → ramp-based selection, proven; DOOM rewrite + 42k
+real-log replay deferred to Phase 5 / cross-repo). Remaining: **Phase 5** (delete PosEncoding + wire
+the content/self-match/recency builders onto DOOM). **`main` merged in (`f281ee8`)**: ONNX/HF now
 run in CI (the Modal image carries `onnxruntime`/`transformers` — the runtime-parity gap is closed),
 the float-I/O headless ONNX export and the delta-transfer compile mode were removed, and the token
 export uses a vanilla untied embedding.
@@ -109,8 +111,12 @@ absolute position. A head controls its behavior by *which planes it places energ
     **Mechanism:** one rotary plane sized to turn once over the rollout (`θ ≈ 2π/max_positions`,
     seam out of range), read against BOS by **two** position-only heads — a cos-head
     (`score = M·cos φ`) and a sin-head (`M·sin φ`, 90°-rotated query feature) — each as a
-    **graded** 2-key softmax weight ({BOS, self}, operated mid-sigmoid so the weight tracks the
-    phase). At every `φ` at least one of `|sin φ|, |cos φ|` is steep, so **select the steep head
+    **graded** 2-key softmax weight (`{BOS, REF}`, operated mid-sigmoid so the weight tracks the
+    phase). *(The two keys are BOS — the phase carrier — and a second always-visible marked
+    reference token REF carrying a constant logit; **not** `{BOS, self}`. Phase 4 found `self` rides
+    the same recency plane as BOS and injects a constant `−M·cos ψ` shift that breaks the octant
+    cos/sin symmetry — see §8 Phase 4 status.)* At every `φ` at least one of `|sin φ|, |cos φ|` is
+    steep, so **select the steep head
     per octant** (via `compare`/`cond_gate` on the two weights), apply a fixed sign, and chain
     octants with constant `add` offsets into one monotone ramp. Slope never drops below the
     `φ = π/4` worst case (`sin45°`), giving **uniform** resolution — ~370× the fp32 noise floor
@@ -224,7 +230,10 @@ constraint). Position under RoPE is a rotation applied inside attention, never a
   One global grid; the partition is per-head placement.
 - **Recency signal** — the gain·amplitude `M` that keeps both heads graded (mid-sigmoid, no
   saturation), the octant-boundary handoff continuity, and the rank gain `G` (`~2e5`, content
-  balance: `match_gain · content_gap > G · span`).
+  balance: `match_gain · content_gap > G · span`). **✅ Settled (Phase 4):** `M = 2.0`; the recency
+  plane is the fastest grid plane that never wraps over the 61440 cap (`recency_plane_index` → plane
+  91 at base `5e5`/`d_head 256`, `θ ≈ 8.88e-5`); the constant reference is a marked **REF** token (DC
+  `L=25`) on the slowest plane (127); `G = 2e5`.
 - **Marker gate (bucket 1)** — per consumer, the recent marker token, the post-marker attention
   gate for its `1/(gap+1)` count, and the worst-case gap bound.
 
@@ -414,7 +423,10 @@ in-stream marker and value `= pos − marker_pos` recovered via the count, vs or
 >   `dC/dφ = ½(cond+1)(t′−f′)` leans on head derivatives at the crossover too: no guaranteed-smoother
 >   φ-slope for the multiply's cost. Use only if the sweep shows a real `soft_blend` φ-dip.
 
-Gates: (a) **BOS attendability** — trivially satisfied (§5); confirm the recency signal is
+Gates (a)/(c)/(d) are **✅ satisfied in Phase 4** (§8 Phase 4 status), gate (b) in the Phase-1b
+confirm-compile above; the gate text is kept for the rationale, with the one correction that the
+2-key set is `{BOS, REF}`, not `{BOS, self}` (Phase 4 finding). (a) **BOS attendability** — trivially
+satisfied (§5); confirm the recency signal is
 identical between prefill and unbounded decode out to the full rollout. (b) **Build the real
 two-weight assembly and confirm monotone with margin** — the replay derisk (§9) modeled the ramp
 as an *idealized uniform-slope line* (`ramp = c_min·θ·k`, no `compare`/`cond_gate`/`add` ops); this
@@ -434,14 +446,15 @@ nondeterminism. (ii) the compiled min slope matches the modeled ~2.2e-5/token, (
 full-frame replay. *Fallback if the hard select misfires at the crossover: a continuous blend of the
 two heads near each boundary (weight by closeness to `π/4`) removes the `compare`-at-zero entirely at
 some slope cost.* (c) **Graded
-head** — confirm a mid-sigmoid 2-key {BOS, self} head is expressible (`Attn` takes arbitrary
+head** — confirm a mid-sigmoid 2-key `{BOS, REF}` head is expressible (`Attn` takes arbitrary
 Q/K/V, no saturation constraint) and `M` keeps both heads graded. (d) **Leakage budget** — the
-readout must be an *effectively 2-key* {BOS, self} softmax, so all other causal keys are suppressed
+readout must be an *effectively 2-key* `{BOS, REF}` softmax, so all other causal keys are suppressed
 below the gap-1 signal. With `N` other keys each leaking weight `ε`, total leakage `N·ε` must stay
 well below the ~1e-5 gap-1 weight difference; at `N ~ 42k` that forces an exclusion score gap of
 ≈ `log(N / resolution)` ≈ 22+ logit units (×scale). Pin that number against the fp32 score dynamic
 range, and confirm the leakage — *and* its growth with key count (a position-dependent drift riding
-on the ramp) — stays below the gap-1 signal.
+on the ramp) — stays below the gap-1 signal. *(Phase 4: the DC gap is `L=25`; REF is the constant
+reference, and the deviation from the 2-key ideal does not grow with `N`.)*
 
 **Phase 2 — Relative-offset attention + compiler self-match.** Reimplement `attend_to_offset`
 (all Δ) on `W_K = R_N W_Q` (lock the sign convention — `j+N` vs `j−N` is an easy silent flip).
@@ -541,6 +554,52 @@ stays resolvable against the content gate (winner beats runner-up at gap-1, out 
 position); the ramp does not wrap; all keys are retained. Re-run the replay on a ~42k
 production-length log to confirm the headroom survives the tighter per-token step (it halves;
 octant stays ~180×).
+
+> **Status (2026-06-27): capability proven end-to-end; the in-place DOOM rewrite + 42k real-log
+> replay are deferred (Phase 5 / cross-repo).** Like Phases 1/1b/3, this builds and proves the
+> *capability* with torchwright-only graphs + confidence tests (`tests/compile/forward/
+> test_rope_recency_e2e.py`, 9 tests green on Modal). New code: `recency_plane_index` (`graph/rope.py`),
+> `recency_phase_heads` / `recency_rank` (`ops/recency_heads.py`), `attend_most_recent_matching_via_ramp`
+> (`ops/attention_ops.py`).
+>
+> - **The gate-(c) construction the plan left open — and the {BOS, self} dead end it corrects.** A
+>   naive 2-key `{BOS, self}` softmax does **not** give the clean `u = σ(M·cosφ)−0.5` the octant ramp
+>   requires: `self` rides the *same* recency plane as BOS, so its phase-0 contribution injects a
+>   constant `−M·cos ψ` shift that breaks the ramp's cos/sin symmetry (the
+>   `_assert_branches_meet_at_boundaries` precondition). The working head reads **two marked tokens**:
+>   **BOS** carries recency-plane energy (logit `L + M·cos(jθ+φ0)`) and **REF** (a second always-visible
+>   marked token) carries **no** recency energy (constant logit `L`). With `L ≫ ln N` the softmax is
+>   effectively 2-key and the BOS weight — read out by giving BOS value 1, everything else 0 — is
+>   `σ(M·cos φ)` exactly. **Validated on the compiled path to fp32** (~3e-7) at the real plane out to
+>   4096 positions; sin-head is the same with a 90°-rotated query.
+> - **Plane sized to the cache *cap*, not the frame.** `recency_plane_index` picks the **fastest** grid
+>   plane that still never wraps over `max_positions` with a seam margin: at base `5e5`, `d_head 256`,
+>   cap `61440` that is **plane 91** (`θ ≈ 8.88e-5`, one turn ≈ 70761 positions, rollout phase ≈0.87
+>   turns). Sizing to the ~42k frame instead (plane 87) **wraps past ~47k** and silently inverts the
+>   order — so the cap is the sizing target. DC marker on the slowest plane (127), quasi-static; leakage
+>   `L=25` (gate d's "≈22+"), ~150× margin over the gap-1 weight signal.
+> - **Gates.** (a) BOS attendability ✅ — recency rank bit-identical prefill vs unbounded cached decode.
+>   (c) graded head ✅ (above). (d) leakage ✅ — head output matches the 2-key ideal to fp32 and does
+>   **not** grow with the background key count (`N=256 → 4096`). Chain (`heads → octant ramp`) strictly
+>   monotone on the compiled path with `probe_compiled` parity.
+> - **Selection.** `attend_most_recent_matching_via_ramp` is the RoPE-native twin of
+>   `attend_most_recent_matching` — `pos_encoding`/counter drops out; a `recency_rank` node (the ramp)
+>   replaces the counter column. Picks the most-recent content match; **content-dominance bound**
+>   `match_gain·dot_gap > rank_gain·rank_range` (≈`2e5·2.06 ≈ 4.1e5` at the default `G=2e5`) — the same
+>   invariant the counter op documents, now against the ramp's value swing. **Degenerate finding:** the
+>   reference positions (BOS/REF attend only to themselves) carry an **outlier** rank (`0.5` vs the
+>   ~0.15 interior at small N), so the content-dominance bound is load-bearing precisely to keep a
+>   content-mismatched BOS from winning on its outlier rank. gap-1 concentration: `G·min_step ≈ 4`
+>   logits at the cap-density octant-boundary worst case (0.98-hard), ~8 at the typical step — the
+>   octant trade-off `G~2e5` accepts (argmax always correct; the *ordering*, hence "0 flips," is
+>   `G`-invariant).
+> - **Still to do (Phase 5 / cross-repo).** (1) The **42k real-log replay** with the real ramp needs a
+>   ~42k `torchwright_doom` instrumentation log; the committed log is the ~11.6k frame, and DOOM is
+>   untouched through Phase 4 (§7), so this lands with the Phase-5 `torchwright_doom` branch. The ramp's
+>   monotonicity/resolvability *at cap φ-density* is already proven (`test_recency_ramp_compiled.py` +
+>   the analytic gap-1 band test here). (2) The **in-place rewrite** of `attend_most_recent_matching` /
+>   `get_prev_value` onto `recency_rank` is Phase 5 — like the Phase-3 content heads it needs `d_head`
+>   at construction (the heads are full-width rotary), which arrives with the §7 signature change.
 
 **Phase 5 — Delete PosEncoding, reach the global end state.** Remove the sin/cos block and
 counter column; remove the per-head rotary flag (rotation becomes global); drop the
@@ -668,12 +727,19 @@ separate `torchwright_doom` branch** (post-Phase-5), not a per-phase gate in thi
   (`test_recency_ramp_compiled.py`, `65089c8`) are all landed and green. The compiled ramp is strictly
   monotone, worst boundary step ~2.19e-5/tok (~183× fp32 floor), matching the assembly model. The
   gate's correct form is **token-density across phase offsets**, not sub-token-dense (which hits fp32
-  output quantization — see Phase 1b status). **Still to do (Phase 4):** wire the ramp to the real
-  two graded `Attn` heads, `probe_compiled` parity end-to-end, and 0 full-frame replay flips with the
-  real ramp on a ~42k log.
-- **Recency leakage budget.** Pin the {BOS, self} exclusion score gap (≈ `log(N / resolution)` ≈
-  22+ logits at `N ~ 42k`) and confirm leakage — and its growth with key count — stays below the
-  gap-1 signal (Phase 1b gate d).
-- **Recency at production length.** Re-run the replay on a ~42k log (Phase 4).
+  output quantization — see Phase 1b status). ✅ **DONE (Phase 4):** the ramp is wired to the real two
+  graded `{BOS, REF}` rotary heads (`recency_phase_heads` / `recency_rank`, `ops/recency_heads.py`),
+  `probe_compiled` parity holds on the `heads → ramp` chain, and the heads produce `σ(M·cos/sin φ)−0.5`
+  to fp32. (The 0-flips replay with the real ramp moves to the 42k cross-repo follow-up below.)
+- **Recency leakage budget.** ✅ DONE (Phase 4, gate d). The reference is **REF**, not `self` (a
+  `{BOS, self}` softmax shifts the weight by a constant `−M·cos ψ` — see Phase 4 status). The DC
+  exclusion gap is `L=25` (≈ `log(N/resolution)` at the cap); the compiled head output matches the
+  2-key ideal to fp32 and does **not** grow with key count (`N=256 → 4096`), ~150× under the gap-1
+  weight signal.
+- **Recency at production length.** ⏳ Cross-repo follow-up (Phase 5). The ramp's resolvability *at the
+  cap φ-density* is proven (`test_recency_ramp_compiled.py` + the analytic gap-1 band in
+  `test_rope_recency_e2e.py`); the **0-flips replay against real selections at ~42k** needs a ~42k
+  `torchwright_doom` instrumentation log (committed log is the ~11.6k frame), so it lands with the
+  Phase-5 `torchwright_doom` branch (DOOM untouched through Phase 4, §7).
 - **Bucket-1 marker gates.** Per consumer, confirm the marker is graph-recognizable and the gap
   bound holds at production config.
