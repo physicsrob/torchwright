@@ -1,13 +1,27 @@
 # Plan: RMSNorm as a compiled-transformer identity
 
-**Status:** design exploration, hardened against post-merge `main` (the merges
-that added the HuggingFace export layer `torchwright/compiler/hf/`, removed the
-windowed KV-cache, and switched the token export to a vanilla untied
-llama3-style embedding — `embed_table` is now `(vocab, d)`, gathered straight
-into the seed, with no `embedding_proj` / `d_embed`). Decisions below are
-**leanings, not locked**, except the four marked **[LOCKED]**. Prototyped on
-`calculator_simple`; not yet wired into any emitter. Branch:
-`worktree-rmsnorm-prototype`.
+**Status: IMPLEMENTED** on branch `worktree-rmsnorm-prototype` (commits
+`ee78b5f` constant_values cleanup, `f0bf50f` the norm). The design below is what
+shipped, with two corrections recorded inline and in *Open questions*:
+
+- **The constant exponent is `q=44` by default, not 30.** The `q=30`
+  prototypes were validated only on `calculator_simple` (data energy ~1e8). The
+  *shipping* graph `calculator_v2` reaches `Σ data² ~ 2.6e13` on its squaring
+  path (`999*999`, `999+1`), which exceeds the `q=30` reduction half-ULP bound
+  (`~2^36`) and **silently broke the identity** (logits off by ~1e7). `q=44`
+  (gain `2^39` at `d=1024`, bound `2^64`) clears it with ~`2^19` margin; `q` is
+  now a tunable knob (`rms_norm_const_exp`) so a deeper-energy graph (DOOM,
+  untested) can raise it. The out-energy bound is the one real constraint —
+  see *Constraints* and Open question 5.
+- **The norm defaults on only at power-of-two `d`** (`compile_to_onnx(rms_norm=
+  None)` → on iff `d` is a power of two; explicit `True` raises on non-pow2 `d`;
+  `False` off). Arbitrary-width graphs are therefore unaffected by the default.
+
+Implemented across: `forward_compile` (reserve + `RmsNormSpec`),
+`compile_to_onnx` (seed + emit norm ops + gain initializers + meta),
+`convert.py` (Llama3 gain mapping), and the shipped HF model + config. Tests:
+`tests/compile/forward/test_rms_norm_reserve.py` and
+`tests/hf/test_rms_norm_identity.py`. The four **[LOCKED]** decisions all held.
 
 ## Goal & motivation
 
@@ -337,33 +351,31 @@ this is *lifetime + metadata*. The split:
 1. **Gain representation — RESOLVED** (decision 3, [LOCKED]): a saved Llama3-style
    `weight` parameter (`input_layernorm` / `post_attention_layernorm` /
    `model.norm`), emitted as an ONNX initializer that `convert.py` maps.
-2. **Allocator fork:** `ResidualStreamMap.reserve()` already exists
-   (`residual_map.py:114`) but is unused; the norm constant is the only thing
-   needing a never-freed reserved column (graph constants are JIT-materialized
-   into the MLP bias, not reserved). Does that reservation stay a norm-special
-   case or become a general "pinned column" primitive — and either way it needs a
-   value-surfacing path so the exporter can fold the reserved column. Decides
-   whether this is real allocator machinery or an emission-time one-off.
-3. **ONNX scope / debug interaction:** ONNX gets the norm (it must, since HF is
-   converted from it). Verify the added ops don't perturb `OnnxDebugSession`'s
-   structural fingerprint or its per-layer self-consistency check — pre-norm
-   should leave the residual snapshots un-normed, but confirm rather than assume.
-4. **DOOM validation:** confirm bit-exactness on the *actual* DOOM graph (in the
-   `torchwright_doom` submodule, not tested here) by diffing a rendered frame
-   against baseline — especially the cancel-heads paths and the deepest-layer
-   energy bound.
-5. **Validate on the shipping graph.** The prototypes are now re-run post-merge in
-   the reserve-inside layout at even and odd widths (Evidence above), but they
-   compile `calculator_simple`; production HF export uses `calculator_v2`
-   (`examples/calculator_hf_export.py`). Re-confirm bit-exactness on the graph
-   that actually ships.
+2. **Allocator fork — RESOLVED (norm-special case).** A norm-path-only caller
+   of `reserve()` in `forward_compile` plus an `RmsNormSpec` recorded on the net
+   (`reserved_cols`, `const_value`, `gain`, `eps`); the exporter reads it to fold
+   the constant into `embed_table`. Not generalized into a "pinned column"
+   primitive — there is still only one user. `reserve()` was used as-is.
+3. **ONNX scope / debug interaction — RESOLVED.** `debug_fingerprint`
+   (`graph_identity.py:129`) hashes only `{topology(output_node), pos_width, d,
+   d_head}` — not the emitted ONNX nodes or the residual assignment — so the norm
+   ops and the reserved column leave it unchanged, and `OnnxDebugSession` (which
+   reads the sidecar, no recompile) matches. The norm is the identity, so the
+   promoted `l{i}_res_*` snapshots stay un-normed and self-consistency holds.
+   `tests/debug/test_onnx_debug_session.py` (d=256, norm now on) passes.
+4. **DOOM validation — STILL OPEN.** Bit-exactness on the *actual* DOOM graph
+   (in the `torchwright_doom` submodule, not tested here) is unverified: diff a
+   rendered frame against baseline, and **measure the deepest-layer `Σ data²`**
+   to confirm `q=44` (bound `2^64`) clears it — raise `rms_norm_const_exp` if
+   not. This is the one remaining gap.
+5. **Shipping graph — RESOLVED.** `calculator_v2` (the production HF-export
+   graph) is bit-exact identity through the ONNX oracle including `999*999`
+   (`tests/hf/test_rms_norm_identity.py`), after raising `q` to 44 — see the
+   status note. The existing `tests/hf/test_calculator_parity.py` now compiles
+   with the norm on by default and stays bit-exact HF-vs-oracle.
 
 ## Out of scope / not done
 
-- Wiring the norm into the ONNX emitter, `convert.py`, and the shipped HF model.
-- Seeding the norm constant via `embed_table` and deleting the vestigial
-  `constant_values` buffer (decision 6), with the HF parity test as the gate.
-- The allocator "reserved column" support and its conditional core hook.
-- New `TorchwrightConfig` fields and the "no normalization" docstring rewrites.
-- Validation against a real DOOM frame.
-- Only the two prototype scripts exist; no production code changed.
+- **DOOM-frame validation (Open question 4)** — the only remaining gap. Needs a
+  rendered-frame diff and a deepest-layer energy measurement in the
+  `torchwright_doom` submodule.
