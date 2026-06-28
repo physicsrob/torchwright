@@ -349,9 +349,11 @@ def build_graph_model(output_node: Node, pos_encoding: PosEncoding) -> GraphMode
     output_node = graph.get_output_node()
     all_nodes = graph.get_all_nodes()
 
-    # Inputs are pre-allocated by compile.py's initialization; they
-    # don't need a time slot. LiteralValue is included by
-    # is_input_node; treat the same way.
+    # Inputs (Embedding, PosEncoding, InputNode) are pre-allocated by
+    # compile.py's initialization; they don't need a time slot. LiteralValue is
+    # deliberately NOT an input node — it's materialized just-in-time near its
+    # consumer (see is_input_node / constants_plan.md), so it lands in
+    # `schedulable` below, not here.
     input_nodes: List[Node] = [n for n in all_nodes if graph.is_input_node(n)]
 
     schedulable: List[Node] = sorted(
