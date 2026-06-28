@@ -53,11 +53,14 @@ import torch
 from onnx import TensorProto, helper
 
 from torchwright.compiler.forward.compile import forward_compile
-from torchwright.graph import Concatenate, Embedding, LiteralValue, Node, PosEncoding
+from torchwright.graph import Concatenate, Embedding, Node, PosEncoding
 from torchwright.graph.attn import CAUSAL_MASK_SENTINEL
 from torchwright.graph.misc import Assert, DebugWatch, InputNode
 
-TOKEN_META_FORMAT = "torchwright.token.v2"
+# v3: dropped the always-zero `constant_values` initializer from the token seed
+# (the seed is now exactly token + pos). The binary initializer set changed, so
+# a v2 artifact must be re-exported rather than loaded against this converter.
+TOKEN_META_FORMAT = "torchwright.token.v3"
 DEBUG_META_FORMAT = "torchwright.debug.v1"
 
 
@@ -1046,7 +1049,7 @@ def compile_to_onnx(
 
     Writes three files:
         ``<output_path>``     — the ONNX model
-        ``<stem>.meta.json``  — ``{"format": "torchwright.token.v1",
+        ``<stem>.meta.json``  — ``{"format": "torchwright.token.v3",
                                    "vocab": [...]}``
         ``<stem>.debug.json`` — the debug sidecar (residual assignment
                                 keyed by canonical node id, structural
@@ -1152,7 +1155,6 @@ def compile_to_onnx(
 
     embedding_indices: Optional[List[int]] = None
     pos_indices: Optional[List[int]] = None
-    constant_values = np.zeros(d, dtype=np.float32)
 
     for node in compiled.residual_assignment.get_nodes(in_state):
         indices = compiled.residual_assignment.get_node_indices(in_state, node)
@@ -1160,11 +1162,19 @@ def compile_to_onnx(
             embedding_indices = indices
         elif isinstance(node, PosEncoding):
             pos_indices = indices
-        elif isinstance(node, LiteralValue):
-            for k, idx in enumerate(indices):
-                constant_values[idx] = float(node.value[k])
         elif isinstance(node, Concatenate):
             pass
+        else:
+            # The only seeded input nodes are the token Embedding and the
+            # PosEncoding. Graph constants are NOT seeded — they are
+            # JIT-materialized into the per-layer MLP bias near their consumer
+            # (graph_analysis.is_input_node excludes LiteralValue), so they
+            # never appear in in_state. If one ever did, the vanilla-embedding
+            # seed below would silently drop it; fail loud instead.
+            raise AssertionError(
+                f"unexpected input-state node {type(node).__name__} in the "
+                f"token seed; only Embedding / PosEncoding / Concatenate are seeded"
+            )
 
     assert embedding_indices is not None, "No Embedding node in residual assignment"
     assert pos_indices is not None, "No PosEncoding node in residual assignment"
@@ -1213,7 +1223,6 @@ def compile_to_onnx(
     pos_encoding_full[:, pos_indices] = pos_encoding_compact
 
     # Initializers
-    _add_float_init("constant_values", constant_values, dense_inits, sparse_inits)
     _add_float_init("pos_encoding_full", pos_encoding_full, dense_inits, sparse_inits)
     _add_float_init("embed_table", embed_table, dense_inits, sparse_inits)
     _add_float_init("lm_head", lm_head, dense_inits, sparse_inits)
@@ -1240,10 +1249,11 @@ def compile_to_onnx(
     _emit_cached_preamble(nodes)
     # Vanilla token embedding: the (vocab, d) table is gathered straight into
     # the residual seed (no projection).  `pos` is the (n_new, d) PE rows the
-    # preamble gathered from the now-d-wide pos_encoding_full table.
+    # preamble gathered from the now-d-wide pos_encoding_full table.  The seed
+    # is exactly token + pos: graph constants are JIT-materialized into the MLP
+    # bias, not added here (the old all-zero `constant_values` term is gone).
     add("Gather", ["embed_table", "token_ids"], ["inp_res"], axis=0)
-    add("Add", ["inp_res", "pos"], ["res_pi"])
-    add("Add", ["res_pi", "constant_values"], ["res_0"])
+    add("Add", ["inp_res", "pos"], ["res_0"])
 
     current_res = "res_0"
     for i in range(n_layers):

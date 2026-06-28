@@ -18,7 +18,6 @@ Initializer → parameter map (ground truth: ``compiler/export.py``
     embed_table              -> model.embed_tokens.weight  (vocab, d)
     lm_head                  -> lm_head.weight              (vocab, d)  UNTIED
     pos_encoding_full        -> model.pos_encoding_full    (max_seq, d)
-    constant_values          -> model.constant_values      (d,)
     l{i}_WQ/WK/WV  (d, hd)   -> q/k/v_proj.weight  = M.T    (hd, d)
     l{i}_WO        (hd, d)   -> o_proj.weight      = M.T    (d, hd)
     l{i}_W1        (d, d_h)  -> linear1.weight     = M.T    (d_h, d)
@@ -203,7 +202,6 @@ def build_state_dict(config, inits: Dict[str, np.ndarray]) -> Tuple[dict, set]:
         "model.embed_tokens.weight": _t(embed_table),
         "lm_head.weight": _t(take("lm_head")),  # untied (vocab, d)
         "model.pos_encoding_full": _t(take("pos_encoding_full")),  # (max_seq, d)
-        "model.constant_values": _t(take("constant_values")),  # (d,)
     }
 
     for i in range(config.n_layers):

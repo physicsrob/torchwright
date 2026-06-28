@@ -15,7 +15,6 @@ The forward path is transcribed one-for-one from the compiler's ONNX emission
 
     res      = embed_table[input_ids]              # (B, T, d) — vanilla lookup
     res      = res + pos_encoding_full[cache_position]  # additive absolute PE
-    res      = res + constant_values               # constant seed term
     for each layer:
         res  = res + attn(res)                     # causal, scale=1.0, no bias
         res  = res + linear2(relu(linear1(res)))   # both linears biased
@@ -185,16 +184,15 @@ class TorchwrightModel(TorchwrightPreTrainedModel):
     def __init__(self, config: TorchwrightConfig):
         super().__init__(config)
         self.embed_tokens = nn.Embedding(config.vocab_size, config.d)
-        # Precomputed absolute positional-encoding table and the input constant
-        # vector are lookup/bias data, not matmul weights — registered as
-        # persistent buffers (still saved into the safetensors state dict). The
-        # PE table is full-width: a row is gathered straight into the residual.
+        # Precomputed absolute positional-encoding table — lookup data, not a
+        # matmul weight — registered as a persistent buffer (still saved into
+        # the safetensors state dict). The table is full-width: a row is
+        # gathered straight into the residual.
         self.register_buffer(
             "pos_encoding_full",
             torch.zeros(config.max_seq, config.d),
             persistent=True,
         )
-        self.register_buffer("constant_values", torch.zeros(config.d), persistent=True)
         self.layers = nn.ModuleList(
             [TorchwrightDecoderLayer(config, i) for i in range(config.n_layers)]
         )
@@ -273,9 +271,9 @@ class TorchwrightModel(TorchwrightPreTrainedModel):
             else:
                 cache_position = torch.arange(past_seen, past_seen + T, device=device)
 
-        # Vanilla token + absolute-PE + constant residual seed (all (·, d)).
+        # Vanilla token + absolute-PE residual seed (both (·, d)).
         pos = self.pos_encoding_full[cache_position]  # (T, d)
-        res = tok + pos + self.constant_values  # (B, T, d)
+        res = tok + pos  # (B, T, d)
 
         # Causal mask over absolute positions: key j visible to query p iff j<=p.
         total = past_seen + T
