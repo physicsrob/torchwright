@@ -175,9 +175,7 @@ def test_token_onnx_decode_step_matches_full_prefill():
             out_names += [f"delta_K_{i}", f"delta_V_{i}"]
 
         pk_full, pv_full = _zero_past(per_layer_n_heads, d_head, S)
-        full_logits = session.run(
-            ["logits"], _feeds(token_ids, pk_full, pv_full, 0)
-        )[0]
+        full_logits = session.run(["logits"], _feeds(token_ids, pk_full, pv_full, 0))[0]
 
         # Prefill all-but-last, persisting deltas into slots [0 : n-1).
         past_k, past_v = _zero_past(per_layer_n_heads, d_head, S)
@@ -334,7 +332,6 @@ def test_token_onnx_artifact_fields_load_and_generate():
         # vocab_size is the embedding TABLE's row count (the logits
         # width) — the table is padded past the tokenizer's vocab list.
         assert artifact.vocab_size == embedding.table.shape[0]
-        assert artifact.d_embed == embedding.table.shape[1]
         assert artifact.n_layers > 0
         assert artifact.per_layer_n_heads == tuple(
             OnnxTokenModule(onnx_path).per_layer_n_heads
@@ -432,8 +429,14 @@ def adder_artifact(tmp_path_factory):
     tmpdir = str(tmp_path_factory.mktemp("token_onnx_proto"))
     onnx_path = os.path.join(tmpdir, "adder.onnx")
     compile_to_onnx(
-        output_node, pos_encoding, embedding, onnx_path,
-        d=D, d_head=D_HEAD, max_seq_len=32, verbose=False,
+        output_node,
+        pos_encoding,
+        embedding,
+        onnx_path,
+        d=D,
+        d_head=D_HEAD,
+        max_seq_len=32,
+        verbose=False,
     )
     return onnx_path, embedding
 
@@ -459,9 +462,9 @@ def test_token_onnx_chunked_decode_matches_full_prefill(adder_artifact):
         past_v[i][0:2] = results[1 + 2 * i + 1]
 
     chunk = session.run(["logits"], _feeds(token_ids[2:5], past_k, past_v, 2))[0]
-    assert np.allclose(full[2:5], chunk, atol=1e-4), (
-        f"chunked decode diff: {np.abs(full[2:5] - chunk).max():.6f}"
-    )
+    assert np.allclose(
+        full[2:5], chunk, atol=1e-4
+    ), f"chunked decode diff: {np.abs(full[2:5] - chunk).max():.6f}"
 
 
 def test_token_onnx_static_tail_is_inert(adder_artifact):
@@ -487,7 +490,7 @@ def test_token_onnx_static_tail_is_inert(adder_artifact):
         past_v[i][:n] = results[1 + 2 * i + 1]
 
     def decode(pk, pv):
-        return session.run(["logits"], _feeds(token_ids[n:n + 1], pk, pv, n))[0]
+        return session.run(["logits"], _feeds(token_ids[n : n + 1], pk, pv, n))[0]
 
     exact = decode(past_k, past_v)
     assert np.allclose(full[n], exact[0], atol=1e-4)
@@ -527,7 +530,7 @@ def test_token_onnx_prefix_window_binding(adder_artifact):
     def decode_window(s_eff):
         pk = [k[:s_eff] for k in past_k]
         pv = [v[:s_eff] for v in past_v]
-        return session.run(out_names, _feeds(token_ids[n:n + 1], pk, pv, n))
+        return session.run(out_names, _feeds(token_ids[n : n + 1], pk, pv, n))
 
     ref = decode_window(S)
     for s_eff in (n + 1, n + 3, S - 1):
@@ -579,8 +582,15 @@ def _export_token(tmpdir, name="model.onnx", trim_heads=True):
     output_node, pos_encoding, embedding = _build_1digit()
     onnx_path = os.path.join(tmpdir, name)
     compile_to_onnx(
-        output_node, pos_encoding, embedding, onnx_path,
-        d=D, d_head=D_HEAD, max_seq_len=32, verbose=False, trim_heads=trim_heads,
+        output_node,
+        pos_encoding,
+        embedding,
+        onnx_path,
+        d=D,
+        d_head=D_HEAD,
+        max_seq_len=32,
+        verbose=False,
+        trim_heads=trim_heads,
     )
     return onnx_path, embedding
 
@@ -615,12 +625,12 @@ def test_token_onnx_trim_heads_shrinks_kv_cache():
         _, per_layer_n_heads, _, _ = _discover_meta(session, onnx_path)
     assert per_layer_n_heads, "no layers discovered"
     assert all(1 <= nh <= max_heads for nh in per_layer_n_heads)
-    assert min(per_layer_n_heads) < max_heads, (
-        f"no layer trimmed below full width {max_heads}: {per_layer_n_heads}"
-    )
-    assert len(set(per_layer_n_heads)) > 1, (
-        f"head counts are uniform across layers: {per_layer_n_heads}"
-    )
+    assert (
+        min(per_layer_n_heads) < max_heads
+    ), f"no layer trimmed below full width {max_heads}: {per_layer_n_heads}"
+    assert (
+        len(set(per_layer_n_heads)) > 1
+    ), f"head counts are uniform across layers: {per_layer_n_heads}"
 
 
 def test_token_onnx_no_trim_preserves_full_width():
@@ -631,9 +641,9 @@ def test_token_onnx_no_trim_preserves_full_width():
         session = onnxruntime.InferenceSession(onnx_path)
         _, per_layer_n_heads, _, _ = _discover_meta(session, onnx_path)
     assert per_layer_n_heads, "no layers discovered"
-    assert all(nh == max_heads for nh in per_layer_n_heads), (
-        f"expected all layers at full width {max_heads}: {per_layer_n_heads}"
-    )
+    assert all(
+        nh == max_heads for nh in per_layer_n_heads
+    ), f"expected all layers at full width {max_heads}: {per_layer_n_heads}"
 
 
 def test_token_onnx_trim_shrinks_mlp_slots():
@@ -645,9 +655,9 @@ def test_token_onnx_trim_shrinks_mlp_slots():
         trim_widths = _l_w1_d_hidden(trim_path)
         notrim_widths = _l_w1_d_hidden(notrim_path)
     assert all(1 <= w <= full_d_hidden for w in trim_widths)
-    assert min(trim_widths) < full_d_hidden, (
-        f"no layer's MLP trimmed below full d_hidden {full_d_hidden}: {trim_widths}"
-    )
+    assert (
+        min(trim_widths) < full_d_hidden
+    ), f"no layer's MLP trimmed below full d_hidden {full_d_hidden}: {trim_widths}"
     assert all(w == full_d_hidden for w in notrim_widths)
 
 
@@ -666,6 +676,6 @@ def test_token_onnx_trim_is_numerical_noop():
         out_trim = sess_trim.run(["logits"], _feeds(token_ids, pk, pv, 0))[0]
         pk, pv = _zero_past(hn, d_head, Sn)
         out_notrim = sess_notrim.run(["logits"], _feeds(token_ids, pk, pv, 0))[0]
-    assert np.allclose(out_trim, out_notrim, atol=1e-4), (
-        f"trim changed the output: max diff {np.abs(out_trim - out_notrim).max():.6e}"
-    )
+    assert np.allclose(
+        out_trim, out_notrim, atol=1e-4
+    ), f"trim changed the output: max diff {np.abs(out_trim - out_notrim).max():.6e}"

@@ -57,7 +57,7 @@ from torchwright.graph import Concatenate, Embedding, LiteralValue, Node, PosEnc
 from torchwright.graph.attn import CAUSAL_MASK_SENTINEL
 from torchwright.graph.misc import Assert, DebugWatch, InputNode
 
-TOKEN_META_FORMAT = "torchwright.token.v1"
+TOKEN_META_FORMAT = "torchwright.token.v2"
 DEBUG_META_FORMAT = "torchwright.debug.v1"
 
 
@@ -106,7 +106,7 @@ class OnnxArtifact:
     Returned by :func:`compile_to_onnx`
     so consumers stop reconstructing paths and build facts by convention
     (re-reading layer counts out of the ONNX file, rebuilding
-    ``d_embed``/``vocab_size`` from globals).
+    ``vocab_size`` from globals).
 
     HARD INVARIANT: built strictly from paths and scalars AFTER export
     completes — holds no graph, no weights, no exporter state.  The
@@ -124,7 +124,6 @@ class OnnxArtifact:
     d: int
     d_head: int
     cache_stride: int
-    d_embed: Optional[int] = None  # token kind only
     vocab_size: Optional[int] = None  # token kind only
 
     def load(self, providers=None):
@@ -202,9 +201,7 @@ def _diag_rects(matrix_id, rows, cols):
     i, n = 0, len(rows)
     while i < n:
         j = i
-        while (
-            j + 1 < n and rows[j + 1] == rows[j] + 1 and cols[j + 1] == cols[j] + 1
-        ):
+        while j + 1 < n and rows[j + 1] == rows[j] + 1 and cols[j + 1] == cols[j] + 1:
             j += 1
         length = j - i + 1
         rects.append(
@@ -761,7 +758,7 @@ def _emit_cached_preamble(nodes: list) -> None:
       - initializer ``arange_S``: int64 ``(S,)`` baked ``[0 .. S)``, where
         ``S = cache_stride`` is the FULL static slot count (the maximum
         any binding may use).
-      - initializer ``pos_encoding_full``: (max_seq_len, d_pos)
+      - initializer ``pos_encoding_full``: (max_seq_len, d)
       - helper initializers from :func:`_add_scalar_inits`
 
     Memcpy invariant (the CUDA-graph capture requirement): a single
@@ -782,7 +779,7 @@ def _emit_cached_preamble(nodes: list) -> None:
     the baked GPU-resident ``arange_S`` instead.
 
     Produces:
-      - ``pos``: (n_new, d_pos) float — ``pos_encoding_full`` rows gathered
+      - ``pos``: (n_new, d) float — ``pos_encoding_full`` rows gathered
         at ``cache_position``.
       - ``mask_bool_3d``: (1, n_new, S_eff) bool, True where blocked: slot
         ``j`` is hidden from the query at position ``p`` iff ``j > p``.
@@ -805,11 +802,13 @@ def _emit_cached_preamble(nodes: list) -> None:
     # _axes0_1d/_axes1_1d double as the [0]/[1] bounds constants.
     add("Shape", ["past_K_0"], ["_pastK0_shape"])  # (3,) int64, CPU
     add(
-        "Slice", ["_pastK0_shape", "_axes0_1d", "_axes1_1d", "_axes0_1d"],
+        "Slice",
+        ["_pastK0_shape", "_axes0_1d", "_axes1_1d", "_axes0_1d"],
         ["_s_eff_1d"],
     )  # (1,) = [S_eff], CPU
     add(
-        "Slice", ["arange_S", "_axes0_1d", "_s_eff_1d", "_axes0_1d"],
+        "Slice",
+        ["arange_S", "_axes0_1d", "_s_eff_1d", "_axes0_1d"],
         ["_slots"],
     )  # (S_eff,) GPU data, CPU bounds
     add("Unsqueeze", ["_slots", "_axes0_1d"], ["_slots_row"])  # (1, S_eff)
@@ -938,9 +937,7 @@ def _emit_cached_layer_nodes(
     return f"{p}_res_next"
 
 
-def _kv_io_value_info(
-    per_layer_n_heads: List[int], d_head: int
-) -> tuple[list, list]:
+def _kv_io_value_info(per_layer_n_heads: List[int], d_head: int) -> tuple[list, list]:
     """Build ValueInfoProto entries for the KV-cache inputs and outputs.
 
     ``per_layer_n_heads`` gives the (possibly trimmed) head count for
@@ -1175,20 +1172,10 @@ def compile_to_onnx(
     d_embed = len(embedding_indices)
     d_pos = len(pos_indices)
 
-    embedding_proj = np.zeros((d_embed, d), dtype=np.float32)
-    for k, idx in enumerate(embedding_indices):
-        embedding_proj[k, idx] = 1.0
-
-    pos_proj = np.zeros((d_pos, d), dtype=np.float32)
-    for k, idx in enumerate(pos_indices):
-        pos_proj[k, idx] = 1.0
-
-    pos_encoding_buf = _compute_pos_encoding(d_pos, max_seq_len)
-
-    embed_table_np = (
+    embed_table_compact = (
         embedding.table.detach().cpu().numpy().astype(np.float32, copy=False)
     )
-    vocab_size, d_embed_check = embed_table_np.shape
+    vocab_size, d_embed_check = embed_table_compact.shape
     assert d_embed_check == d_embed, (
         f"Embedding table last dim {d_embed_check} disagrees with "
         f"d_embed {d_embed} derived from feature assignment"
@@ -1197,15 +1184,39 @@ def compile_to_onnx(
     output_indices = compiled.residual_assignment.get_node_indices(
         out_state, _unwrap_output_node(output_node)
     )
-    output_gather_indices = np.asarray(output_indices, dtype=np.int64)
+    assert len(output_indices) == d_embed, (
+        f"output column count {len(output_indices)} != embedding width "
+        f"{d_embed}; the unembed reuses the embedding table, so the output "
+        f"node must be d_embed wide"
+    )
+
+    # Vanilla untied (llama3-style) layout: fold the residual column-placement
+    # scatters into the weights, so the runtime does a plain (vocab, d) table
+    # lookup and a full-width unembed — no embedding_proj / pos_proj / output
+    # column gather.  Each folded table is mostly zeros (only d_embed / d_pos of
+    # the d columns are populated), so _add_float_init stores them COO-sparse:
+    # the ONNX file stays compact even though the dense HF weights are (vocab, d).
+    embed_table = np.zeros((vocab_size, d), dtype=np.float32)
+    embed_table[:, embedding_indices] = embed_table_compact
+
+    # Untied unembed weight in nn.Linear (out, in) == (vocab, d) convention,
+    # nonzero only at the output node's residual columns.  logits = res @ W.T
+    # sums over all d columns, but W is exactly zero off the output columns, so
+    # the rest of the residual contributes nothing.
+    lm_head = np.zeros((vocab_size, d), dtype=np.float32)
+    lm_head[:, output_indices] = embed_table_compact
+
+    # Positional-encoding table folded to (max_seq, d): gathered directly into
+    # the residual seed, no pos_proj matmul.
+    pos_encoding_compact = _compute_pos_encoding(d_pos, max_seq_len)
+    pos_encoding_full = np.zeros((max_seq_len, d), dtype=np.float32)
+    pos_encoding_full[:, pos_indices] = pos_encoding_compact
 
     # Initializers
-    _add_float_init("embedding_proj", embedding_proj, dense_inits, sparse_inits)
-    _add_float_init("pos_proj", pos_proj, dense_inits, sparse_inits)
     _add_float_init("constant_values", constant_values, dense_inits, sparse_inits)
-    _add_float_init("pos_encoding_full", pos_encoding_buf, dense_inits, sparse_inits)
-    _add_float_init("embed_table", embed_table_np, dense_inits, sparse_inits)
-    _add_int64_init("output_gather_indices_init", output_gather_indices, dense_inits)
+    _add_float_init("pos_encoding_full", pos_encoding_full, dense_inits, sparse_inits)
+    _add_float_init("embed_table", embed_table, dense_inits, sparse_inits)
+    _add_float_init("lm_head", lm_head, dense_inits, sparse_inits)
     # Baked slot indices [0..S), S = the FULL stride: the preamble slices
     # this GPU-resident constant to the bound prefix length S_eff and the
     # causal mask compares the slice against cache_position.  Keeping the
@@ -1220,18 +1231,18 @@ def compile_to_onnx(
     _add_scalar_inits(dense_inits)
 
     # Nodes: preamble (mask + pos), token embed, residual stream, layers,
-    # output gather, unembed.
+    # full-width unembed.
     nodes: list = []
 
     def add(op, ins, outs, **attrs):
         nodes.append(helper.make_node(op, ins, outs, **attrs))
 
     _emit_cached_preamble(nodes)
-    # Token embedding lookup: (vocab, d_embed) gather rows by token_ids.
-    add("Gather", ["embed_table", "token_ids"], ["_token_emb"], axis=0)
-    add("MatMul", ["_token_emb", "embedding_proj"], ["inp_res"])
-    add("MatMul", ["pos", "pos_proj"], ["pos_res"])
-    add("Add", ["inp_res", "pos_res"], ["res_pi"])
+    # Vanilla token embedding: the (vocab, d) table is gathered straight into
+    # the residual seed (no projection).  `pos` is the (n_new, d) PE rows the
+    # preamble gathered from the now-d-wide pos_encoding_full table.
+    add("Gather", ["embed_table", "token_ids"], ["inp_res"], axis=0)
+    add("Add", ["inp_res", "pos"], ["res_pi"])
     add("Add", ["res_pi", "constant_values"], ["res_0"])
 
     current_res = "res_0"
@@ -1246,15 +1257,13 @@ def compile_to_onnx(
             scatter_idx_col="_cache_pos_col",
         )
 
-    add(
-        "Gather",
-        [current_res, "output_gather_indices_init"],
-        ["_output_emb"],
-        axis=1,
-    )
-    # logits = output_emb @ embed_table.T
-    add("Transpose", ["embed_table"], ["_embed_table_T"], perm=[1, 0])
-    add("MatMul", ["_output_emb", "_embed_table_T"], ["logits"])
+    # Untied unembed over the full residual stream: logits = res @ lm_head.T.
+    # lm_head is zero off the output node's columns, so the rest of the residual
+    # (live scratch, freed columns) multiplies to zero and never reaches the
+    # logits — provided those columns stay finite (a NaN/Inf in scratch would
+    # now poison every logit, where the old column gather ignored them).
+    add("Transpose", ["lm_head"], ["_lm_head_T"], perm=[1, 0])
+    add("MatMul", [current_res, "_lm_head_T"], ["logits"])
 
     # Graph I/O value infos
     token_ids_vi = helper.make_tensor_value_info(
@@ -1342,7 +1351,6 @@ def compile_to_onnx(
         d=d,
         d_head=d_head,
         cache_stride=cache_stride_resolved,
-        d_embed=d_embed,
         vocab_size=int(vocab_size),
     )
 
@@ -1756,9 +1764,7 @@ class CompiledHeadless:
         ra = net.residual_assignment
         assert ra is not None
 
-        res, new_kvs, state_tensor = self._capture_states(
-            res_stream, past_kvs=past_kvs
-        )
+        res, new_kvs, state_tensor = self._capture_states(res_stream, past_kvs=past_kvs)
         ordered_states = [s for _, _, s in _ordered_mlp_state_triples(net, ra)]
 
         self._debug_state = _DebugState(
