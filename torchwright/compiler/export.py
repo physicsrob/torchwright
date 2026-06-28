@@ -1,19 +1,12 @@
 """Compile a torchwright graph to a KV-cached ONNX model.
 
-Two exporters, symmetric, both returning an :class:`OnnxArtifact`
-(paths + small build metadata; ``artifact.load()`` /
-``artifact.debug_session(...)``):
+One exporter returning an :class:`OnnxArtifact` (paths + small build
+metadata; ``artifact.load()`` / ``artifact.debug_session(...)``):
 
     compile_to_onnx(output_node, pos_encoding, embedding, path, ...)
         Token I/O: token_ids -> logits.  Sidecar format
         ``torchwright.token.v1`` carries the vocab.  Consumer:
         ``OnnxTokenModule`` via
-        :func:`torchwright.compiler.onnx_load.load_onnx`.
-
-    compile_headless_to_onnx(output_node, pos_encoding, path, ...)
-        Float I/O: inputs -> outputs.  Sidecar format
-        ``torchwright.headless.v1`` carries the alphabetically-ordered
-        input column names.  Consumer: ``OnnxHeadlessModule`` via
         :func:`torchwright.compiler.onnx_load.load_onnx`.
 
 Both speak the STATIC-cache prefill/decode protocol (the vanilla
@@ -64,8 +57,7 @@ from torchwright.graph import Concatenate, Embedding, LiteralValue, Node, PosEnc
 from torchwright.graph.attn import CAUSAL_MASK_SENTINEL
 from torchwright.graph.misc import Assert, DebugWatch, InputNode
 
-HEADLESS_META_FORMAT = "torchwright.headless.v1"
-TOKEN_META_FORMAT = "torchwright.token.v1"
+TOKEN_META_FORMAT = "torchwright.token.v2"
 DEBUG_META_FORMAT = "torchwright.debug.v1"
 
 
@@ -102,34 +94,6 @@ def _write_meta(onnx_path: str, meta: dict) -> str:
     return meta_path
 
 
-def _write_headless_meta(
-    onnx_path: str,
-    input_names: List[str],
-    extra: Optional[dict] = None,
-    cache_stride: Optional[int] = None,
-) -> str:
-    """Write the headless sidecar JSON, optionally with an ``extra`` dict.
-
-    ``extra`` is a free-form dict for per-export metadata (e.g. DOOM's
-    ``rows_per_patch`` — surfaced to the host via
-    :class:`OnnxHeadlessModule.metadata`). Kept totally general so the
-    compiler layer has no project-specific keys.
-
-    ``cache_stride`` is the full static slot count ``S`` — the loaders
-    need it from the sidecar because ``past_K_i``'s first dim is the
-    symbolic ``cache_slots``, not a readable int.
-    """
-    meta: dict = {
-        "format": HEADLESS_META_FORMAT,
-        "input_names": list(input_names),
-    }
-    if cache_stride is not None:
-        meta["cache_stride"] = int(cache_stride)
-    if extra:
-        meta["extra"] = dict(extra)
-    return _write_meta(onnx_path, meta)
-
-
 def debug_meta_path_for(onnx_path: str) -> str:
     base, _ = os.path.splitext(onnx_path)
     return base + ".debug.json"
@@ -139,10 +103,10 @@ def debug_meta_path_for(onnx_path: str) -> str:
 class OnnxArtifact:
     """Paths + small build metadata for a finished ONNX export.
 
-    Returned by :func:`compile_to_onnx` and :func:`compile_headless_to_onnx`
+    Returned by :func:`compile_to_onnx`
     so consumers stop reconstructing paths and build facts by convention
     (re-reading layer counts out of the ONNX file, rebuilding
-    ``d_embed``/``vocab_size`` from globals).
+    ``vocab_size`` from globals).
 
     HARD INVARIANT: built strictly from paths and scalars AFTER export
     completes — holds no graph, no weights, no exporter state.  The
@@ -154,20 +118,18 @@ class OnnxArtifact:
     path: str
     meta_path: str
     debug_path: Optional[str]  # None when debug_sidecar=False
-    kind: str  # "token" | "headless"
+    kind: str  # always "token"
     n_layers: int
     per_layer_n_heads: Tuple[int, ...]  # tuple copy, not the exporter's live list
     d: int
     d_head: int
     cache_stride: int
-    d_embed: Optional[int] = None  # token kind only
     vocab_size: Optional[int] = None  # token kind only
 
     def load(self, providers=None):
         """Load the artifact via :func:`torchwright.compiler.onnx_load.load_onnx`.
 
-        Returns an ``OnnxTokenModule`` or ``OnnxHeadlessModule`` per
-        ``kind``.
+        Returns an ``OnnxTokenModule``.
         """
         # Function-level import: onnx_load imports from this module at
         # module level, so importing it at the top would be a cycle.
@@ -239,9 +201,7 @@ def _diag_rects(matrix_id, rows, cols):
     i, n = 0, len(rows)
     while i < n:
         j = i
-        while (
-            j + 1 < n and rows[j + 1] == rows[j] + 1 and cols[j + 1] == cols[j] + 1
-        ):
+        while j + 1 < n and rows[j + 1] == rows[j] + 1 and cols[j + 1] == cols[j] + 1:
             j += 1
         length = j - i + 1
         rects.append(
@@ -494,7 +454,7 @@ def _write_debug_sidecar(
         }
     payload = {
         "format": DEBUG_META_FORMAT,
-        "kind": kind,  # "token" | "headless"
+        "kind": kind,  # always "token"
         "fingerprint": debug_fingerprint(out, pos_encoding, d=d, d_head=d_head),
         "d": d,
         "d_head": d_head,
@@ -798,7 +758,7 @@ def _emit_cached_preamble(nodes: list) -> None:
       - initializer ``arange_S``: int64 ``(S,)`` baked ``[0 .. S)``, where
         ``S = cache_stride`` is the FULL static slot count (the maximum
         any binding may use).
-      - initializer ``pos_encoding_full``: (max_seq_len, d_pos)
+      - initializer ``pos_encoding_full``: (max_seq_len, d)
       - helper initializers from :func:`_add_scalar_inits`
 
     Memcpy invariant (the CUDA-graph capture requirement): a single
@@ -819,7 +779,7 @@ def _emit_cached_preamble(nodes: list) -> None:
     the baked GPU-resident ``arange_S`` instead.
 
     Produces:
-      - ``pos``: (n_new, d_pos) float — ``pos_encoding_full`` rows gathered
+      - ``pos``: (n_new, d) float — ``pos_encoding_full`` rows gathered
         at ``cache_position``.
       - ``mask_bool_3d``: (1, n_new, S_eff) bool, True where blocked: slot
         ``j`` is hidden from the query at position ``p`` iff ``j > p``.
@@ -842,11 +802,13 @@ def _emit_cached_preamble(nodes: list) -> None:
     # _axes0_1d/_axes1_1d double as the [0]/[1] bounds constants.
     add("Shape", ["past_K_0"], ["_pastK0_shape"])  # (3,) int64, CPU
     add(
-        "Slice", ["_pastK0_shape", "_axes0_1d", "_axes1_1d", "_axes0_1d"],
+        "Slice",
+        ["_pastK0_shape", "_axes0_1d", "_axes1_1d", "_axes0_1d"],
         ["_s_eff_1d"],
     )  # (1,) = [S_eff], CPU
     add(
-        "Slice", ["arange_S", "_axes0_1d", "_s_eff_1d", "_axes0_1d"],
+        "Slice",
+        ["arange_S", "_axes0_1d", "_s_eff_1d", "_axes0_1d"],
         ["_slots"],
     )  # (S_eff,) GPU data, CPU bounds
     add("Unsqueeze", ["_slots", "_axes0_1d"], ["_slots_row"])  # (1, S_eff)
@@ -975,9 +937,7 @@ def _emit_cached_layer_nodes(
     return f"{p}_res_next"
 
 
-def _kv_io_value_info(
-    per_layer_n_heads: List[int], d_head: int
-) -> tuple[list, list]:
+def _kv_io_value_info(per_layer_n_heads: List[int], d_head: int) -> tuple[list, list]:
     """Build ValueInfoProto entries for the KV-cache inputs and outputs.
 
     ``per_layer_n_heads`` gives the (possibly trimmed) head count for
@@ -1056,314 +1016,6 @@ def _resolve_cache_stride(
     return s
 
 
-def compile_headless_to_onnx(
-    output_node: Node,
-    pos_encoding: PosEncoding,
-    output_path: str,
-    d: int = 1024,
-    d_head: int = 16,
-    max_seq_len: int = 512,
-    max_layers: int = 400,
-    verbose: bool = False,
-    extra_metadata: Optional[dict] = None,
-    d_hidden: Optional[int] = None,
-    trim_heads: bool = True,
-    optimize: int = 0,
-    assume_zero_init: bool = True,
-    cache_stride: Optional[int] = None,
-    debug_sidecar: bool = True,
-) -> OnnxArtifact:
-    """Compile a float-I/O graph to a KV-cached ONNX model.
-
-    Returns an :class:`OnnxArtifact` (paths + small build metadata;
-    ``artifact.load()`` for the runtime, ``artifact.debug_session(...)``
-    for the debug surface).
-
-    Writes three files:
-        ``<output_path>``     — the ONNX model
-        ``<stem>.meta.json``  — ``{"format": "torchwright.headless.v1",
-                                   "input_names": [...]}``
-        ``<stem>.debug.json`` — the debug sidecar consumed by
-                                :class:`torchwright.debug.onnx_debug.
-                                OnnxDebugSession` (see
-                                :func:`compile_to_onnx`).  Disable with
-                                ``debug_sidecar=False``.
-
-    The graph speaks the static-cache prefill/decode protocol:
-        inputs:  inputs (n_new, d_input), cache_position (n_new,) int64,
-                 past_K_i, past_V_i (cache_slots, n_heads, d_head)
-                 [cache_slots SYMBOLIC: the bound prefix length S_eff]
-        outputs: outputs (n_new, d_output),
-                 delta_K_i, delta_V_i (n_new, n_heads, d_head)
-
-    K/V are sequence-major; ``past_K_i`` is a contiguous prefix view
-    ``cache[: S_eff]`` of the feeder's full-stride cache (slots at
-    positions >= the committed length zero-filled; any
-    ``base + n_new <= S_eff <= cache_stride`` is valid — stride
-    bucketing), ``delta_K_i`` is the new rows only, persisted by the
-    runtime into its owned cache slots after the run.  Prefill = zero
-    past + cache_position [0..n).  Decode = cache_position [base]
-    against a covering prefix binding.  Binding the full buffer
-    reproduces the previous static-dim behavior exactly.
-
-    ``cache_stride`` is the FULL slot count ``S`` (the ``arange_S`` mask
-    constant's length, the maximum any binding may use, and the sidecar
-    meta's ``cache_stride`` key); defaults to ``max_seq_len``.  A
-    compiled model hard-caps at ``prefill + decode <= S``.
-
-    ``d_hidden`` is the per-layer MLP hidden width.  Defaults to ``d``
-    when omitted; pass an explicit value to decouple the MLP intermediate
-    width from the residual stream width.
-
-    ``assume_zero_init`` defaults to ``True`` (see :func:`compile_to_onnx`):
-    the ONNX runtime always builds the residual stream from zeros plus the
-    input projections, so BIRTH-layer dirty-column cancels are unnecessary and
-    skipping them keeps the CP-SAT attention-head cumulative from being
-    over-tight under width pressure.
-    """
-    # Validate the cache config up front — a ValueError after the
-    # (potentially very long) streaming compile would waste the whole run.
-    cache_stride_resolved = _resolve_cache_stride(cache_stride, max_seq_len)
-
-    # Assert/DebugWatch coverage must be collected BEFORE forward_compile
-    # strips both wrapper kinds from the graph in-place.
-    from torchwright.graph.asserts import collect_debug_nodes
-
-    all_asserts, all_watches = collect_debug_nodes(output_node)
-
-    dense_inits: list = []
-    sparse_inits: list = []
-    per_layer_n_heads: list = []
-
-    on_layer_compiled = _make_stream_layer_weights_cb(
-        d,
-        d_head,
-        dense_inits,
-        sparse_inits,
-        per_layer_n_heads,
-        trim_heads=trim_heads,
-    )
-
-    # --- Phase 1: streaming compile ---------------------------------------
-    t0 = time.perf_counter()
-    compiled = forward_compile(
-        d=d,
-        d_head=d_head,
-        output_node=output_node,
-        pos_encoding=pos_encoding,
-        verbose=verbose,
-        max_layers=max_layers,
-        device=None,
-        on_layer_compiled=on_layer_compiled,
-        d_hidden=d_hidden,
-        trim_heads=trim_heads,
-        optimize=optimize,
-        assume_zero_init=assume_zero_init,
-    )
-    t_compile = time.perf_counter() - t0
-    if verbose and per_layer_n_heads:
-        _max_heads = d // d_head
-        _total = _max_heads * len(per_layer_n_heads)
-        _kept = sum(per_layer_n_heads)
-        print(
-            f"  Head pruning (ONNX): {_total - _kept}/{_total} heads pruned; "
-            f"per-layer heads range [{min(per_layer_n_heads)}, "
-            f"{max(per_layer_n_heads)}] of {_max_heads}"
-        )
-
-    # --- Phase 2: metadata + graph assembly -------------------------------
-    assert compiled.residual_assignment is not None
-    n_layers = len(compiled.layers)
-
-    t0 = time.perf_counter()
-    in_state = compiled.layers[0].attn.in_state
-    out_state = compiled.layers[-1].mlp.out_state
-
-    input_nodes_list: List[tuple] = []
-    pos_indices: Optional[List[int]] = None
-    constant_values = np.zeros(d, dtype=np.float32)
-
-    for node in compiled.residual_assignment.get_nodes(in_state):
-        indices = compiled.residual_assignment.get_node_indices(in_state, node)
-        if isinstance(node, InputNode):
-            input_nodes_list.append((node.name, indices))
-        elif isinstance(node, PosEncoding):
-            pos_indices = indices
-        elif isinstance(node, LiteralValue):
-            for k, idx in enumerate(indices):
-                constant_values[idx] = float(node.value[k])
-        elif isinstance(node, (Concatenate, Embedding)):
-            pass
-
-    assert len(input_nodes_list) > 0, "No InputNode found in residual assignment"
-    assert pos_indices is not None, "No PosEncoding node found in residual assignment"
-
-    input_nodes_list.sort(key=lambda x: x[0])
-    input_names = [name for name, _ in input_nodes_list]
-
-    all_input_indices: List[int] = []
-    for _, idx in input_nodes_list:
-        all_input_indices.extend(idx)
-    d_input = len(all_input_indices)
-
-    input_proj = np.zeros((d_input, d), dtype=np.float32)
-    for k, idx in enumerate(all_input_indices):
-        input_proj[k, idx] = 1.0
-
-    d_pos = len(pos_indices)
-    pos_proj = np.zeros((d_pos, d), dtype=np.float32)
-    for k, idx in enumerate(pos_indices):
-        pos_proj[k, idx] = 1.0
-
-    pos_encoding_buf = _compute_pos_encoding(d_pos, max_seq_len)
-
-    output_indices = compiled.residual_assignment.get_node_indices(
-        out_state, _unwrap_output_node(output_node)
-    )
-    output_gather_indices = np.asarray(output_indices, dtype=np.int64)
-    d_output = len(output_gather_indices)
-
-    # Initializers
-    _add_float_init("input_proj", input_proj, dense_inits, sparse_inits)
-    _add_float_init("pos_proj", pos_proj, dense_inits, sparse_inits)
-    _add_float_init("constant_values", constant_values, dense_inits, sparse_inits)
-    _add_float_init("pos_encoding_full", pos_encoding_buf, dense_inits, sparse_inits)
-    _add_int64_init("output_gather_indices_init", output_gather_indices, dense_inits)
-    # Baked slot indices [0..S), S = the FULL stride: the preamble slices
-    # this GPU-resident constant to the bound prefix length S_eff and the
-    # causal mask compares the slice against cache_position.  Keeping the
-    # arange baked (vs a Range op) is what keeps the slot data GPU-side —
-    # only scalar slice bounds live on CPU, so no Memcpy (the CUDA-graph
-    # capture requirement; see _emit_cached_preamble).
-    _add_int64_init(
-        "arange_S", np.arange(cache_stride_resolved, dtype=np.int64), dense_inits
-    )
-    # Per-layer reshape constants (l{i}_qkv_view_shape, l{i}_ctx_flat_shape)
-    # are emitted by the streaming weight callback.
-    _add_scalar_inits(dense_inits)
-
-    # Nodes: preamble (mask + pos), residual stream, layers, postamble.
-    nodes: list = []
-
-    def add(op, ins, outs, **attrs):
-        nodes.append(helper.make_node(op, ins, outs, **attrs))
-
-    _emit_cached_preamble(nodes)
-    add("MatMul", ["inputs", "input_proj"], ["inp_res"])
-    add("MatMul", ["pos", "pos_proj"], ["pos_res"])
-    add("Add", ["inp_res", "pos_res"], ["res_pi"])
-    add("Add", ["res_pi", "constant_values"], ["res_0"])
-
-    current_res = "res_0"
-    for i in range(n_layers):
-        current_res = _emit_cached_layer_nodes(
-            nodes,
-            i,
-            current_res,
-            d,
-            d_head,
-            per_layer_n_heads[i],
-            scatter_idx_col="_cache_pos_col",
-        )
-
-    add(
-        "Gather",
-        [current_res, "output_gather_indices_init"],
-        ["outputs"],
-        axis=1,
-    )
-
-    # Graph I/O value infos
-    inputs_vi = helper.make_tensor_value_info(
-        "inputs", TensorProto.FLOAT, ["n_new", d_input]
-    )
-    cache_position_vi = helper.make_tensor_value_info(
-        "cache_position", TensorProto.INT64, ["n_new"]
-    )
-    past_vis, new_vis = _kv_io_value_info(per_layer_n_heads, d_head)
-    outputs_vi = helper.make_tensor_value_info(
-        "outputs", TensorProto.FLOAT, ["n_new", d_output]
-    )
-
-    graph = helper.make_graph(
-        nodes,
-        "headless_transformer_cached",
-        inputs=[inputs_vi, cache_position_vi, *past_vis],
-        outputs=[outputs_vi, *new_vis],
-        initializer=dense_inits,
-        sparse_initializer=sparse_inits,
-    )
-    model = helper.make_model(
-        graph,
-        opset_imports=[helper.make_opsetid("", 14)],
-        producer_name="torchwright",
-    )
-    t_build = time.perf_counter() - t0
-
-    t0 = time.perf_counter()
-    onnx.save_model(model, output_path)
-    t_save = time.perf_counter() - t0
-
-    meta_path = _write_headless_meta(
-        output_path,
-        list(input_names),
-        extra=extra_metadata,
-        cache_stride=cache_stride_resolved,
-    )
-
-    if debug_sidecar:
-        # (name, offset, width) in the alphabetical order the flat
-        # ``inputs`` tensor is packed in (input_proj rows follow
-        # all_input_indices, which concatenates per-input indices in
-        # sorted-name order above).
-        debug_input_specs: List[tuple] = []
-        offset = 0
-        for name, idx in input_nodes_list:
-            debug_input_specs.append((name, offset, len(idx)))
-            offset += len(idx)
-        _write_debug_sidecar(
-            output_path,
-            compiled=compiled,
-            output_node=output_node,
-            pos_encoding=pos_encoding,
-            d=d,
-            d_head=d_head,
-            kind="headless",
-            input_specs=debug_input_specs,
-            asserts=all_asserts,
-            watches=all_watches,
-            cache_stride=cache_stride_resolved,
-            optimize=optimize,
-            extra=extra_metadata,
-            verbose=verbose,
-        )
-
-    if verbose:
-        print(
-            f"Phases: compile+emit {t_compile:.2f}s, "
-            f"build {t_build:.2f}s, save {t_save:.2f}s"
-        )
-        print(
-            f"{n_layers} layers, "
-            f"{len(sparse_inits)} sparse inits, {len(dense_inits)} dense inits"
-        )
-        model_size = os.path.getsize(output_path)
-        print(f"Wrote {output_path} ({model_size:,} bytes)")
-        print(f"Wrote {meta_path}")
-
-    return OnnxArtifact(
-        path=output_path,
-        meta_path=meta_path,
-        debug_path=debug_meta_path_for(output_path) if debug_sidecar else None,
-        kind="headless",
-        n_layers=n_layers,
-        per_layer_n_heads=tuple(per_layer_n_heads),
-        d=d,
-        d_head=d_head,
-        cache_stride=cache_stride_resolved,
-    )
-
-
 def compile_to_onnx(
     output_node: Node,
     pos_encoding: PosEncoding,
@@ -1389,8 +1041,8 @@ def compile_to_onnx(
     for the debug surface).
 
     ``extra_metadata`` is a free-form dict written under the sidecar's
-    ``"extra"`` key (surfaced via ``OnnxTokenModule.metadata``), mirroring
-    the headless exporter; top-level sidecar keys are unchanged.
+    ``"extra"`` key (surfaced via ``OnnxTokenModule.metadata``); top-level
+    sidecar keys are unchanged.
 
     Writes three files:
         ``<output_path>``     — the ONNX model
@@ -1520,20 +1172,10 @@ def compile_to_onnx(
     d_embed = len(embedding_indices)
     d_pos = len(pos_indices)
 
-    embedding_proj = np.zeros((d_embed, d), dtype=np.float32)
-    for k, idx in enumerate(embedding_indices):
-        embedding_proj[k, idx] = 1.0
-
-    pos_proj = np.zeros((d_pos, d), dtype=np.float32)
-    for k, idx in enumerate(pos_indices):
-        pos_proj[k, idx] = 1.0
-
-    pos_encoding_buf = _compute_pos_encoding(d_pos, max_seq_len)
-
-    embed_table_np = (
+    embed_table_compact = (
         embedding.table.detach().cpu().numpy().astype(np.float32, copy=False)
     )
-    vocab_size, d_embed_check = embed_table_np.shape
+    vocab_size, d_embed_check = embed_table_compact.shape
     assert d_embed_check == d_embed, (
         f"Embedding table last dim {d_embed_check} disagrees with "
         f"d_embed {d_embed} derived from feature assignment"
@@ -1542,15 +1184,39 @@ def compile_to_onnx(
     output_indices = compiled.residual_assignment.get_node_indices(
         out_state, _unwrap_output_node(output_node)
     )
-    output_gather_indices = np.asarray(output_indices, dtype=np.int64)
+    assert len(output_indices) == d_embed, (
+        f"output column count {len(output_indices)} != embedding width "
+        f"{d_embed}; the unembed reuses the embedding table, so the output "
+        f"node must be d_embed wide"
+    )
+
+    # Vanilla untied (llama3-style) layout: fold the residual column-placement
+    # scatters into the weights, so the runtime does a plain (vocab, d) table
+    # lookup and a full-width unembed — no embedding_proj / pos_proj / output
+    # column gather.  Each folded table is mostly zeros (only d_embed / d_pos of
+    # the d columns are populated), so _add_float_init stores them COO-sparse:
+    # the ONNX file stays compact even though the dense HF weights are (vocab, d).
+    embed_table = np.zeros((vocab_size, d), dtype=np.float32)
+    embed_table[:, embedding_indices] = embed_table_compact
+
+    # Untied unembed weight in nn.Linear (out, in) == (vocab, d) convention,
+    # nonzero only at the output node's residual columns.  logits = res @ W.T
+    # sums over all d columns, but W is exactly zero off the output columns, so
+    # the rest of the residual contributes nothing.
+    lm_head = np.zeros((vocab_size, d), dtype=np.float32)
+    lm_head[:, output_indices] = embed_table_compact
+
+    # Positional-encoding table folded to (max_seq, d): gathered directly into
+    # the residual seed, no pos_proj matmul.
+    pos_encoding_compact = _compute_pos_encoding(d_pos, max_seq_len)
+    pos_encoding_full = np.zeros((max_seq_len, d), dtype=np.float32)
+    pos_encoding_full[:, pos_indices] = pos_encoding_compact
 
     # Initializers
-    _add_float_init("embedding_proj", embedding_proj, dense_inits, sparse_inits)
-    _add_float_init("pos_proj", pos_proj, dense_inits, sparse_inits)
     _add_float_init("constant_values", constant_values, dense_inits, sparse_inits)
-    _add_float_init("pos_encoding_full", pos_encoding_buf, dense_inits, sparse_inits)
-    _add_float_init("embed_table", embed_table_np, dense_inits, sparse_inits)
-    _add_int64_init("output_gather_indices_init", output_gather_indices, dense_inits)
+    _add_float_init("pos_encoding_full", pos_encoding_full, dense_inits, sparse_inits)
+    _add_float_init("embed_table", embed_table, dense_inits, sparse_inits)
+    _add_float_init("lm_head", lm_head, dense_inits, sparse_inits)
     # Baked slot indices [0..S), S = the FULL stride: the preamble slices
     # this GPU-resident constant to the bound prefix length S_eff and the
     # causal mask compares the slice against cache_position.  Keeping the
@@ -1565,18 +1231,18 @@ def compile_to_onnx(
     _add_scalar_inits(dense_inits)
 
     # Nodes: preamble (mask + pos), token embed, residual stream, layers,
-    # output gather, unembed.
+    # full-width unembed.
     nodes: list = []
 
     def add(op, ins, outs, **attrs):
         nodes.append(helper.make_node(op, ins, outs, **attrs))
 
     _emit_cached_preamble(nodes)
-    # Token embedding lookup: (vocab, d_embed) gather rows by token_ids.
-    add("Gather", ["embed_table", "token_ids"], ["_token_emb"], axis=0)
-    add("MatMul", ["_token_emb", "embedding_proj"], ["inp_res"])
-    add("MatMul", ["pos", "pos_proj"], ["pos_res"])
-    add("Add", ["inp_res", "pos_res"], ["res_pi"])
+    # Vanilla token embedding: the (vocab, d) table is gathered straight into
+    # the residual seed (no projection).  `pos` is the (n_new, d) PE rows the
+    # preamble gathered from the now-d-wide pos_encoding_full table.
+    add("Gather", ["embed_table", "token_ids"], ["inp_res"], axis=0)
+    add("Add", ["inp_res", "pos"], ["res_pi"])
     add("Add", ["res_pi", "constant_values"], ["res_0"])
 
     current_res = "res_0"
@@ -1591,15 +1257,13 @@ def compile_to_onnx(
             scatter_idx_col="_cache_pos_col",
         )
 
-    add(
-        "Gather",
-        [current_res, "output_gather_indices_init"],
-        ["_output_emb"],
-        axis=1,
-    )
-    # logits = output_emb @ embed_table.T
-    add("Transpose", ["embed_table"], ["_embed_table_T"], perm=[1, 0])
-    add("MatMul", ["_output_emb", "_embed_table_T"], ["logits"])
+    # Untied unembed over the full residual stream: logits = res @ lm_head.T.
+    # lm_head is zero off the output node's columns, so the rest of the residual
+    # (live scratch, freed columns) multiplies to zero and never reaches the
+    # logits — provided those columns stay finite (a NaN/Inf in scratch would
+    # now poison every logit, where the old column gather ignored them).
+    add("Transpose", ["lm_head"], ["_lm_head_T"], perm=[1, 0])
+    add("MatMul", [current_res, "_lm_head_T"], ["logits"])
 
     # Graph I/O value infos
     token_ids_vi = helper.make_tensor_value_info(
@@ -1687,127 +1351,19 @@ def compile_to_onnx(
         d=d,
         d_head=d_head,
         cache_stride=cache_stride_resolved,
-        d_embed=d_embed,
         vocab_size=int(vocab_size),
     )
 
 
 # ---------------------------------------------------------------------------
 # In-process headless callable: a thin adapter over HeadlessTransformer.compute()
-# that presents the same (inputs) -> outputs interface as OnnxHeadlessModule.
+# presenting an (inputs) -> outputs interface.
 #
-# Used for compiler-output tests that don't need an ONNX round-trip.  For
-# production inference, export with compile_headless_to_onnx instead —
-# that path streams weights and runs under onnxruntime.
+# This is the in-process debug/test backend (the DebugRuntime behind
+# debug=True forwards and the probe_* tools) — no ONNX round-trip.  For
+# production inference, compile a token ONNX artifact with compile_to_onnx
+# and load it with load_onnx.
 # ---------------------------------------------------------------------------
-
-
-def _compute_io_layout(
-    io: Dict[str, Tuple[Optional[Node], Optional[Node]]],
-) -> Tuple[List[tuple], List[tuple], Dict[Node, Tuple[Optional[Node], List[int]]], int]:
-    """Compute column assignments from io spec.
-
-    The io dict declares the I/O contract:
-    - Key: field name (string) — used for alphabetical ordering
-    - Value: (input_node, output_node) tuple where:
-      - (in, out) → overlaid: output lands at input's columns via delta transfer
-      - (in, None) → input-only: columns hold input value, no output
-      - (None, out) → output-only: overflow columns appended after input region
-
-    Returns:
-        input_specs: List[(name, offset, width, input_node)] for input fields
-        output_specs: List[(name, offset, width, output_node)] for output fields
-        overlays: Dict[output_node -> (input_node or None, target_cols)] for delta transfer
-            - For overlaid: (input_node, target_cols) - subtract input before adding output
-            - For overflow: (None, target_cols) - just copy to target (subtract zero)
-        d_input: Total width of input region
-    """
-    # Sort by name (alphabetical)
-    sorted_names = sorted(io.keys())
-
-    # Input region: all entries with non-None input
-    input_specs = []
-    input_name_to_offset = {}
-    offset = 0
-    for name in sorted_names:
-        in_node, out_node = io[name]
-        if in_node is not None:
-            width = len(in_node)
-            input_specs.append((name, offset, width, in_node))
-            input_name_to_offset[name] = offset
-            offset += width
-    d_input = offset
-
-    # Output region: overlaid at input positions, overflow after
-    output_specs = []
-    overlays: Dict[Node, Tuple[Optional[Node], List[int]]] = {}
-    overflow_offset = d_input
-
-    for name in sorted_names:
-        in_node, out_node = io[name]
-        if out_node is not None:
-            width = len(out_node)
-            if in_node is not None:
-                # Overlaid: output at input's columns via delta transfer
-                in_offset = input_name_to_offset[name]
-                output_specs.append((name, in_offset, width, out_node))
-                target_cols = list(range(in_offset, in_offset + width))
-                overlays[out_node] = (in_node, target_cols)
-            else:
-                # Overflow: output after input region, also via delta
-                # transfer.  Like the overlay case, the delta layer
-                # subtracts whatever is currently at ``target_cols`` (see
-                # forward/compile.py where ``subtract_cols = target_cols``
-                # unconditionally), so the overflow path does not rely on
-                # the caller zero-initialising the overflow region.
-                output_specs.append((name, overflow_offset, width, out_node))
-                target_cols = list(range(overflow_offset, overflow_offset + width))
-                overlays[out_node] = (None, target_cols)
-                overflow_offset += width
-
-    return input_specs, output_specs, overlays, d_input
-
-
-def _validate_io_spec(io: Dict[str, Tuple[Optional[Node], Optional[Node]]]) -> None:
-    """Validate the io spec.
-
-    Raises ValueError if:
-    - Any entry has both nodes as None (empty tuple)
-    - Overlaid pairs have mismatched widths
-    - Duplicate nodes across different entries (same node in two different names)
-
-    Note: It's valid for in_node == out_node (identity case) within the same entry.
-    """
-    seen_input_nodes = set()
-    seen_output_nodes = set()
-
-    for name, (in_node, out_node) in io.items():
-        # Check for empty tuple
-        if in_node is None and out_node is None:
-            raise ValueError(f"io entry '{name}' has both input and output as None")
-
-        # Check for duplicate input nodes across entries
-        if in_node is not None:
-            if in_node in seen_input_nodes:
-                raise ValueError(f"Input node {in_node} appears in multiple io entries")
-            seen_input_nodes.add(in_node)
-
-        # Check for duplicate output nodes across entries
-        # Allow same node to appear as both input and output within the same entry
-        if out_node is not None and out_node is not in_node:
-            if out_node in seen_output_nodes:
-                raise ValueError(
-                    f"Output node {out_node} appears in multiple io entries"
-                )
-            seen_output_nodes.add(out_node)
-
-        # Check width mismatch for overlaid pairs
-        if in_node is not None and out_node is not None:
-            if len(in_node) != len(out_node):
-                raise ValueError(
-                    f"io entry '{name}' has width mismatch: "
-                    f"input width {len(in_node)} != output width {len(out_node)}"
-                )
 
 
 @dataclass
@@ -1842,10 +1398,10 @@ def _ordered_mlp_state_triples(net, ra) -> List[tuple]:
 
 
 class CompiledHeadless:
-    """Callable wrapper around :class:`HeadlessTransformer`.
+    """Callable wrapper around :class:`HeadlessTransformer` — the
+    in-process debug/test backend.
 
-    Exposes the same three-method surface as
-    :class:`torchwright.compiler.onnx_load.OnnxHeadlessModule`:
+    Exposes a three-method surface:
 
     - ``module(inputs)``: stateless per-query inference — runs the
       non-cached ``forward()`` path and returns outputs.
@@ -1862,7 +1418,6 @@ class CompiledHeadless:
         input_specs: List[tuple],
         output_indices: torch.Tensor,
         metadata: Optional[dict] = None,
-        output_specs: Optional[List[tuple]] = None,
         asserts: Optional[List] = None,
         watches: Optional[List] = None,
     ) -> None:
@@ -1870,10 +1425,6 @@ class CompiledHeadless:
         # input_specs: list of (name, start_col, width) in input-tensor column order.
         self._input_specs = list(input_specs)
         self._output_indices = output_indices
-        # output_specs: list of (name, offset_in_out, width) in gathered-output
-        # column order.  None for legacy callers that compile a single
-        # concatenated output_node and do not declare field names.
-        self._output_specs = list(output_specs) if output_specs is not None else []
         self.input_names: List[str] = [name for name, _, _ in input_specs]
         self.metadata: dict = dict(metadata or {})
         self._asserts = list(asserts) if asserts else []
@@ -2037,13 +1588,6 @@ class CompiledHeadless:
             if n == name:
                 return inputs[..., s : s + w]
         raise KeyError(f"input field {name!r} not found")
-
-    def output_slice(self, name: str, outputs: torch.Tensor) -> torch.Tensor:
-        """Return the slice of ``outputs`` (post-gather) for the named output field."""
-        for n, s, w in self._output_specs:
-            if n == name:
-                return outputs[..., s : s + w]
-        raise KeyError(f"output field {name!r} not found")
 
     def debug_value(self, node: "Node") -> Optional[torch.Tensor]:
         """Return the compiled value of ``node`` from the last debug=True forward.
@@ -2220,9 +1764,7 @@ class CompiledHeadless:
         ra = net.residual_assignment
         assert ra is not None
 
-        res, new_kvs, state_tensor = self._capture_states(
-            res_stream, past_kvs=past_kvs
-        )
+        res, new_kvs, state_tensor = self._capture_states(res_stream, past_kvs=past_kvs)
         ordered_states = [s for _, _, s in _ordered_mlp_state_triples(net, ra)]
 
         self._debug_state = _DebugState(
@@ -2240,7 +1782,7 @@ class CompiledHeadless:
 
 
 def compile_headless(
-    graph: Union[Node, Dict[str, Tuple[Optional[Node], Optional[Node]]]],
+    graph: Node,
     pos_encoding: PosEncoding,
     *,
     d: int = 1024,
@@ -2254,30 +1796,16 @@ def compile_headless(
     optimize: int = 0,
     assume_zero_init: bool = False,
 ) -> CompiledHeadless:
-    """Compile a headless graph to an in-process callable.
+    """Compile a graph to an in-process callable.
 
     Returns a :class:`CompiledHeadless` that evaluates the graph via
     :meth:`HeadlessTransformer.forward` behind the standard
-    ``module(inputs) -> outputs`` interface.  For production use (saved
-    artifact, autoregressive decode, fast startup), use
-    :func:`compile_headless_to_onnx` instead.
+    ``module(inputs) -> outputs`` interface.  This is the in-process
+    debug/test backend; for production inference, compile a token ONNX
+    artifact with :func:`compile_to_onnx`.
 
-    ``graph`` is either a single output :class:`Node` (outputs gathered
-    at the node's natural residual columns) or an ``io`` dict declaring
-    the I/O contract:
-
-    - Key: field name (string) — used for alphabetical ordering
-    - Value: ``(input_node, output_node)`` tuple where:
-      - ``(in, out)`` → overlaid: output lands at input's columns
-      - ``(in, None)`` → input-only: columns hold input value, no output
-      - ``(None, out)`` → output-only: overflow columns appended after input region
-
-    For overlaid entries, the output is placed at the same columns as the
-    input via delta transfer, enabling autoregressive feedback where the
-    transformer output IS the next input.  The two forms are NOT the
-    same compile: the io form passes column overlays to
-    ``forward_compile`` (outputs land at input columns); the node form
-    compiles without overlays.
+    ``graph`` is a single output :class:`Node`; its outputs are gathered
+    at the node's natural residual columns.
 
     ``d_hidden`` is the per-layer MLP hidden width.  Defaults to ``d``
     when omitted; pass an explicit value to decouple the MLP intermediate
@@ -2292,73 +1820,26 @@ def compile_headless(
     """
     from torchwright.graph.asserts import collect_debug_nodes
 
-    # --- Branch A: pre-compile (root + overlays + assert collection) ------
-    if isinstance(graph, dict):
-        io = graph
-        _validate_io_spec(io)
-
-        # Set names on InputNodes from io dict keys
-        # This enables HeadlessTransformer.get_input_res_stream to look
-        # up values
-        for name, (in_node, out_node) in io.items():
-            if in_node is not None and isinstance(in_node, InputNode):
-                in_node.name = name
-
-        input_specs, output_specs, overlays, d_input = _compute_io_layout(io)
-
-        # Build the combined output node for forward_compile
-        # Collect all output nodes (both overlaid and overflow)
-        output_nodes = [spec[3] for spec in output_specs]
-        if len(output_nodes) == 0:
-            raise ValueError("io must have at least one output")
-        elif len(output_nodes) == 1:
-            combined_output = output_nodes[0]
-        else:
-            combined_output = Concatenate(output_nodes)
-
-        # Collect Assert and DebugWatch nodes before forward_compile
-        # strips them, deduplicating across the io roots.
-        all_asserts = []
-        all_watches = []
-        _seen_ids: set = set()
-        for _name, (in_node, out_node) in io.items():
-            for root in (in_node, out_node):
-                if root is None:
-                    continue
-                node_asserts, node_watches = collect_debug_nodes(root)
-                for a in node_asserts:
-                    if a.node_id not in _seen_ids:
-                        _seen_ids.add(a.node_id)
-                        all_asserts.append(a)
-                for w in node_watches:
-                    if w.node_id not in _seen_ids:
-                        _seen_ids.add(w.node_id)
-                        all_watches.append(w)
-    elif isinstance(graph, PosEncoding):
-        # PosEncoding IS a Node — this check must precede the Node
-        # branch to catch stale old-order callers.
+    if isinstance(graph, PosEncoding):
+        # PosEncoding IS a Node — catch the stale (pos_encoding, graph)
+        # argument order before the Node branch below.
         raise TypeError(
-            "compile_headless(pos_encoding, io=...) is the old calling "
-            "convention — did you mean the new (graph, pos_encoding) "
-            "order?  Pass the io dict (or output node) first and the "
-            "PosEncoding second."
+            "compile_headless(pos_encoding, graph) is the old calling "
+            "convention — pass the output node first and the PosEncoding "
+            "second."
         )
-    elif isinstance(graph, Node):
-        # Unwrap Assert nodes at the output root — compilation strips
-        # them from the interior of the graph, but the caller's node
-        # reference may still point at one.  Downstream lookups
-        # (residual-stream indices, etc.) must match the compiled
-        # graph's effective terminal node.
-        all_asserts, all_watches = collect_debug_nodes(graph)
-        combined_output = _unwrap_output_node(graph)
-        overlays = None
-    else:
+    if not isinstance(graph, Node):
         raise TypeError(
-            f"compile_headless expects an output Node or an io dict as "
-            f"its first argument, got {type(graph).__name__}"
+            f"compile_headless expects an output Node as its first "
+            f"argument, got {type(graph).__name__}"
         )
 
-    # --- Shared compile ----------------------------------------------------
+    # Unwrap Assert nodes at the output root — compilation strips them from
+    # the interior of the graph, but the caller's reference may still point
+    # at one, and downstream lookups must match the compiled terminal node.
+    all_asserts, all_watches = collect_debug_nodes(graph)
+    combined_output = _unwrap_output_node(graph)
+
     net = forward_compile(
         d=d,
         d_head=d_head,
@@ -2369,42 +1850,12 @@ def compile_headless(
         device=device,
         d_hidden=d_hidden,
         trim_heads=trim_heads,
-        overlays=overlays,
         optimize=optimize,
         assume_zero_init=assume_zero_init,
     )
 
     assert net.residual_assignment is not None
     out_state = net.layers[-1].mlp.out_state
-
-    # --- Branch B: post-compile (input specs + output gather) --------------
-    if isinstance(graph, dict):
-        # Build input_specs for CompiledHeadless (name, offset, width)
-        ch_input_specs = [
-            (name, offset, width) for name, offset, width, _ in input_specs
-        ]
-
-        # Build output indices from output_specs
-        # For overlaid outputs, offset is the input's column offset
-        # For overflow outputs, offset is in the overflow region
-        output_indices: list[int] = []
-        ch_output_specs: List[tuple] = []
-        running = 0
-        for name, offset, width, out_node in output_specs:
-            output_indices.extend(range(offset, offset + width))
-            ch_output_specs.append((name, running, width))
-            running += width
-
-        return CompiledHeadless(
-            net,
-            ch_input_specs,
-            torch.tensor(output_indices, dtype=torch.long),
-            metadata=extra_metadata,
-            output_specs=ch_output_specs,
-            asserts=all_asserts,
-            watches=all_watches,
-        )
-
     in_state = net.layers[0].attn.in_state
 
     input_nodes_list: List[tuple] = []  # (name, width)

@@ -13,16 +13,13 @@ The forward path is transcribed one-for-one from the compiler's ONNX emission
 (``compiler/export.py`` ``compile_to_onnx`` token head +
 ``_emit_cached_layer_nodes``):
 
-    tok      = embed_table[input_ids]              # (B, T, d_embed)
-    inp_res  = tok @ embedding_proj                # (B, T, d)
-    pos      = pos_encoding_full[cache_position]   # gather PE by ABSOLUTE pos
-    pos_res  = pos @ pos_proj                      # (B, T, d)
-    res      = inp_res + pos_res + constant_values # additive absolute PE + const
+    res      = embed_table[input_ids]              # (B, T, d) — vanilla lookup
+    res      = res + pos_encoding_full[cache_position]  # additive absolute PE
+    res      = res + constant_values               # constant seed term
     for each layer:
         res  = res + attn(res)                     # causal, scale=1.0, no bias
         res  = res + linear2(relu(linear1(res)))   # both linears biased
-    gathered = res[:, :, output_gather_indices]    # (B, T, d_output == d_embed)
-    logits   = gathered @ embed_table.T            # TIED unembed, no bias
+    logits   = lm_head(res)                        # UNTIED, full-width, no bias
 
 Correctness invariants (all from the compiler source; see the config docstring):
 
@@ -187,32 +184,19 @@ class TorchwrightModel(TorchwrightPreTrainedModel):
 
     def __init__(self, config: TorchwrightConfig):
         super().__init__(config)
-        self.embed_tokens = nn.Embedding(config.vocab_size, config.d_embed)
-        # Fixed projection matrices the compiler emits (mostly scatter/permute);
-        # stored as parameters so they serialize with the model.
-        self.embedding_proj = nn.Parameter(torch.zeros(config.d_embed, config.d))
-        self.pos_proj = nn.Parameter(torch.zeros(config.d_pos, config.d))
+        self.embed_tokens = nn.Embedding(config.vocab_size, config.d)
         # Precomputed absolute positional-encoding table and the input constant
         # vector are lookup/bias data, not matmul weights — registered as
-        # persistent buffers (still saved into the safetensors state dict).
+        # persistent buffers (still saved into the safetensors state dict). The
+        # PE table is full-width: a row is gathered straight into the residual.
         self.register_buffer(
             "pos_encoding_full",
-            torch.zeros(config.max_seq, config.d_pos),
+            torch.zeros(config.max_seq, config.d),
             persistent=True,
         )
-        self.register_buffer(
-            "constant_values", torch.zeros(config.d), persistent=True
-        )
-        self.register_buffer(
-            "output_gather_indices",
-            torch.zeros(config.d_output, dtype=torch.long),
-            persistent=True,
-        )
+        self.register_buffer("constant_values", torch.zeros(config.d), persistent=True)
         self.layers = nn.ModuleList(
-            [
-                TorchwrightDecoderLayer(config, i)
-                for i in range(config.n_layers)
-            ]
+            [TorchwrightDecoderLayer(config, i) for i in range(config.n_layers)]
         )
         self.post_init()
 
@@ -234,9 +218,10 @@ class TorchwrightModel(TorchwrightPreTrainedModel):
         **kwargs,
     ) -> BaseModelOutputWithPast:
         if inputs_embeds is not None:
-            # The compiler emits a table lookup into d_embed, not a (B, T, d)
-            # hidden-state seed, so the usual inputs_embeds contract doesn't
-            # apply here. Reject it rather than silently misinterpret its width.
+            # The (B, T, d) embedding lookup IS the residual seed now, so the
+            # width would fit — but the seed also adds the absolute PE and the
+            # constant term, so a raw inputs_embeds contract is ambiguous. Reject
+            # it rather than guess whether the caller pre-added those.
             raise NotImplementedError(
                 "inputs_embeds is not supported for torchwright token models; "
                 "pass input_ids."
@@ -249,7 +234,7 @@ class TorchwrightModel(TorchwrightPreTrainedModel):
         if use_cache is None:
             use_cache = getattr(self.config, "use_cache", True)
 
-        tok = self.embed_tokens(input_ids)  # (B, T, d_embed)
+        tok = self.embed_tokens(input_ids)  # (B, T, d)
         B, T = tok.shape[0], tok.shape[1]
         device = tok.device
 
@@ -286,15 +271,11 @@ class TorchwrightModel(TorchwrightPreTrainedModel):
                 # so map position_ids onto it rather than silently ignoring it.
                 cache_position = position_ids[0].to(device=device, dtype=torch.long)
             else:
-                cache_position = torch.arange(
-                    past_seen, past_seen + T, device=device
-                )
+                cache_position = torch.arange(past_seen, past_seen + T, device=device)
 
-        # Token + absolute-PE + constant residual seed.
-        inp_res = tok @ self.embedding_proj  # (B, T, d)
-        pos = self.pos_encoding_full[cache_position]  # (T, d_pos)
-        pos_res = pos @ self.pos_proj  # (T, d)
-        res = inp_res + pos_res + self.constant_values  # (B, T, d)
+        # Vanilla token + absolute-PE + constant residual seed (all (·, d)).
+        pos = self.pos_encoding_full[cache_position]  # (T, d)
+        res = tok + pos + self.constant_values  # (B, T, d)
 
         # Causal mask over absolute positions: key j visible to query p iff j<=p.
         total = past_seen + T
@@ -330,17 +311,16 @@ class TorchwrightModel(TorchwrightPreTrainedModel):
 class TorchwrightForCausalLM(TorchwrightPreTrainedModel, GenerationMixin):
     """Compiled torchwright token model as a standard causal LM.
 
-    The unembed is tied to the embedding table: ``lm_head.weight`` shares
-    storage with ``model.embed_tokens.weight`` (both are the compiler's
-    ``embed_table``), so ``logits = gathered @ embed_table.T``.
+    The unembed is an untied ``lm_head``: a separate ``(vocab, d)`` Linear over
+    the full residual stream, ``logits = lm_head(res)``. Its weight is zero off
+    the output node's residual columns, so the rest of the residual contributes
+    nothing.
     """
-
-    _tied_weights_keys = {"lm_head.weight": "model.embed_tokens.weight"}
 
     def __init__(self, config: TorchwrightConfig):
         super().__init__(config)
         self.model = TorchwrightModel(config)
-        self.lm_head = nn.Linear(config.d_embed, config.vocab_size, bias=False)
+        self.lm_head = nn.Linear(config.d, config.vocab_size, bias=False)
         self.post_init()
 
     def get_input_embeddings(self):
@@ -393,9 +373,8 @@ class TorchwrightForCausalLM(TorchwrightPreTrainedModel, GenerationMixin):
             slice_idx = logits_to_keep
         hidden = hidden[:, slice_idx, :]
 
-        # Gather the output columns, then unembed against the tied table.
-        gathered = hidden[:, :, self.model.output_gather_indices]  # (B, T', d_embed)
-        logits = self.lm_head(gathered)  # (B, T', vocab)
+        # Untied unembed over the full residual stream.
+        logits = self.lm_head(hidden)  # (B, T', vocab)
 
         loss = None
         if labels is not None:

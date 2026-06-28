@@ -73,7 +73,8 @@ def test_config_matches_debug_sidecar(artifact_path, converted):
     # Per-layer trimmed hidden widths come straight from the debug sidecar list.
     assert cfg.d_hidden_per_layer == [int(x) for x in dbg["d_hidden"]]
     assert len(cfg.n_heads_per_layer) == cfg.n_layers
-    assert cfg.d_output == cfg.d_embed  # tied unembed needs gathered width==d_embed
+    # Untied vanilla layout: no separate embedding/output-gather width remains.
+    assert not cfg.tie_word_embeddings
 
 
 def test_prefill_and_decode_bit_exact(converted):
@@ -129,7 +130,9 @@ def test_fp32_only_guard(converted):
     from torchwright.compiler.hf.modeling_torchwright import TorchwrightForCausalLM
 
     model, oracle = converted
-    half = TorchwrightForCausalLM(model.config).half()  # fresh; guard fires pre-correctness
+    half = TorchwrightForCausalLM(
+        model.config
+    ).half()  # fresh; guard fires pre-correctness
     with _pytest.raises(RuntimeError, match="fp32"):
         half(input_ids=torch.tensor([_prefill_ids(oracle)]))
 
@@ -174,8 +177,8 @@ def test_save_load_round_trip(tmp_path, converted):
         a = model(input_ids=torch.tensor([prefill]), use_cache=True).logits
         b = reloaded(input_ids=torch.tensor([prefill]), use_cache=True).logits
     assert torch.equal(a, b)
-    # The tie survived serialization: one storage backs both names.
+    # Untied: lm_head and embed_tokens are independent tensors (separate storage).
     assert (
         reloaded.lm_head.weight.data_ptr()
-        == reloaded.model.embed_tokens.weight.data_ptr()
+        != reloaded.model.embed_tokens.weight.data_ptr()
     )

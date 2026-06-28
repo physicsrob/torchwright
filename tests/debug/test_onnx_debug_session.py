@@ -24,7 +24,6 @@ import torch
 from torchwright.compiler.export import (
     DEBUG_META_FORMAT,
     compile_headless,
-    compile_headless_to_onnx,
     compile_to_onnx,
     debug_meta_path_for,
 )
@@ -126,25 +125,38 @@ def test_sidecar_written_with_expected_schema(token_artifact):
 
 
 def _build_annotated_graph():
-    """Small graph whose nodes carry nested ``annotate()`` label paths."""
-    from torchwright.graph.node import annotate
+    """Small TOKEN graph whose nodes carry nested ``annotate()`` label paths.
 
-    a = create_input("a", 1)
-    b = create_input("b", 1)
+    The output is a d_embed-wide embedding pick (a valid 'next token') so
+    ``compile_to_onnx`` can unembed it.
+    """
+    from torchwright.graph.node import annotate
+    from torchwright.ops.inout_nodes import create_embedding, create_literal_value
+    from torchwright.ops.logic_ops import equals_vector
+    from torchwright.ops.map_select import select
+
+    vocab = list("0123456789+") + ["\n", "<bos>", "<eos>", "default"]
+    embedding = create_embedding(vocab=vocab)
+    pos = create_pos_encoding()
     with annotate("scene"):
-        prod = signed_multiply(a, b, max_abs1=10, max_abs2=10)
+        cond = equals_vector(inp=embedding, vector=embedding.get_embedding("+"))
         with annotate("scene/sum"):
-            out = add(prod, multiply_const(a, 2.0))
-    return out, create_pos_encoding(), prod, out
+            out = select(
+                cond,
+                create_literal_value(embedding.get_embedding("1")),
+                create_literal_value(embedding.get_embedding("0")),
+            )
+    return out, pos, embedding, cond, out
 
 
 def test_sidecar_carries_annotations(tmp_path):
     """The ``annotate()`` label path round-trips through the debug sidecar
     and onto OnnxDebugSession.annotation() against a fresh rebuild."""
-    out, pos, prod, top = _build_annotated_graph()
+    out, pos, embedding, prod, top = _build_annotated_graph()
     onnx_path = str(tmp_path / "annotated.onnx")
-    compile_headless_to_onnx(
-        out, pos, onnx_path, d=D, d_head=D_HEAD, max_seq_len=16, verbose=False
+    compile_to_onnx(
+        out, pos, embedding, onnx_path, d=D, d_head=D_HEAD, max_seq_len=16,
+        verbose=False,
     )
 
     with open(debug_meta_path_for(onnx_path)) as f:
@@ -160,7 +172,7 @@ def test_sidecar_carries_annotations(tmp_path):
     assert "scene/sum" in labels
 
     # Round-trip onto a fresh rebuild (new node ids) via the session.
-    out2, pos2, prod2, top2 = _build_annotated_graph()
+    out2, pos2, _emb2, prod2, top2 = _build_annotated_graph()
     sess = OnnxDebugSession(onnx_path, out2, pos2)
     assert sess.annotation(prod2) == "scene"
     assert sess.annotation(top2) == "scene/sum"
@@ -169,11 +181,12 @@ def test_sidecar_carries_annotations(tmp_path):
 def test_sidecar_nodes_table_schema(tmp_path):
     """The per-node table keys by canonical id (same space as placements /
     states) and carries op/width/weights/inputs/layer/sublayer per node."""
-    out, pos, prod, top = _build_annotated_graph()
+    out, pos, embedding, prod, top = _build_annotated_graph()
     onnx_path = str(tmp_path / "nodes.onnx")
-    compile_headless_to_onnx(
-        out, pos, onnx_path, d=D, d_head=D_HEAD, max_seq_len=16, verbose=False,
-        optimize=1, extra_metadata={"screen": {"width": 80, "height": 50}, "scale": 4},
+    compile_to_onnx(
+        out, pos, embedding, onnx_path, d=D, d_head=D_HEAD, max_seq_len=16,
+        verbose=False, optimize=1,
+        extra_metadata={"screen": {"width": 80, "height": 50}, "scale": 4},
     )
     with open(debug_meta_path_for(onnx_path)) as f:
         sidecar = json.load(f)
@@ -370,44 +383,6 @@ def test_corrupted_initializer_is_detected(token_artifact, tmp_path):
 
 
 # ---------------------------------------------------------------------------
-# Headless (float-I/O) artifact kind
-# ---------------------------------------------------------------------------
-
-
-def _build_headless_graph():
-    a = create_input("a", 1)
-    b = create_input("b", 1)
-    return signed_multiply(a, b, max_abs1=10, max_abs2=10), create_pos_encoding()
-
-
-def test_headless_kind_probe_and_residual(tmp_path):
-    onnx_path = str(tmp_path / "model.onnx")
-    out1, pos1 = _build_headless_graph()
-    compile_headless_to_onnx(
-        out1, pos1, onnx_path, d=256, d_head=D_HEAD, max_seq_len=32, verbose=False
-    )
-
-    out2, pos2 = _build_headless_graph()
-    session = OnnxDebugSession(onnx_path, out2, pos2)
-    assert session._input_specs == [("a", 0, 1), ("b", 1, 1)]
-
-    iv = {
-        "a": torch.tensor([[1.0], [2.0], [3.0], [-4.0]]),
-        "b": torch.tensor([[5.0], [6.0], [-7.0], [8.0]]),
-    }
-    report = probe_compiled(session, out2, iv, n_pos=4, atol=1e-2)
-    assert report.first_divergent is None, report.format_short()
-
-    prefill = session.build_prefill(iv, 4)
-    outputs = session(prefill, debug=True)
-    expected = torch.tensor([5.0, 12.0, -21.0, -32.0])
-    assert float((outputs[:, 0] - expected).abs().max()) < 1e-2
-
-    rp = probe_residual(session, prefill, out2)
-    assert rp.layers, "output node never materialised in any snapshot"
-
-
-# ---------------------------------------------------------------------------
 # Fingerprint stability guards
 # ---------------------------------------------------------------------------
 
@@ -466,24 +441,21 @@ def test_fingerprint_stable_across_rebuilds_and_wrappers():
 
 def test_artifact_debug_session_matches_direct(tmp_path):
     onnx_path = str(tmp_path / "model.onnx")
-    out1, pos1 = _build_headless_graph()
-    artifact = compile_headless_to_onnx(
-        out1, pos1, onnx_path, d=256, d_head=D_HEAD, max_seq_len=32, verbose=False
+    out1, pos1, emb1 = _build_adder()
+    artifact = compile_to_onnx(
+        out1, pos1, emb1, onnx_path, d=D, d_head=D_HEAD, verbose=False
     )
+    ids = _token_ids(emb1)
+    iv = {"embedding_input": ids}
 
-    iv = {
-        "a": torch.tensor([[1.0], [2.0], [3.0], [-4.0]]),
-        "b": torch.tensor([[5.0], [6.0], [-7.0], [8.0]]),
-    }
-
-    out2, pos2 = _build_headless_graph()
+    out2, pos2, _ = _build_adder()
     sess_handle = artifact.debug_session(out2, pos2)
     assert isinstance(sess_handle, OnnxDebugSession)
-    report = probe_compiled(sess_handle, out2, iv, n_pos=4, atol=1e-2)
+    report = probe_compiled(sess_handle, out2, iv, n_pos=len(TOKENS), atol=1e-3)
     assert report.first_divergent is None, report.format_short()
 
-    out3, pos3 = _build_headless_graph()
+    out3, pos3, _ = _build_adder()
     sess_direct = OnnxDebugSession(onnx_path, out3, pos3)
-    a = sess_handle(sess_handle.build_prefill(iv, 4))
-    b = sess_direct(sess_direct.build_prefill(iv, 4))
+    a = sess_handle(ids)
+    b = sess_direct(ids)
     assert torch.allclose(a, b, atol=0)

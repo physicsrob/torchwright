@@ -117,7 +117,6 @@ def _run_heuristic_warm_start(
     clusters,
     admission_budget_fraction: float,
     policy: Optional[SchedulingPolicy],
-    overlay_pinned_inputs: Set[Node],
     output_node: Node,
     max_layers: int,
 ) -> tuple[dict, dict, dict, int]:
@@ -141,7 +140,6 @@ def _run_heuristic_warm_start(
         clusters=clusters,
         admission_budget_fraction=admission_budget_fraction,
         policy=policy,
-        pinned_nodes=overlay_pinned_inputs,
         # The warm-start must hand CP-SAT a *model-representable* schedule.
         # Eager (within-layer) freeing produces a shallower schedule that frees
         # and reuses a column inside a consumer's layer — a density the
@@ -305,45 +303,6 @@ def _verify_end_of_layer_writes(
         )
 
 
-def _verify_overlay_target_protection(
-    overlays,
-    residual_map,
-    pos_encoding: Node,
-    overlay_pinned_inputs: Set[Node],
-) -> None:
-    """Pre-delta-transfer guard: every target column must be safe from reuse.
-
-    A safe column is one of:
-      - ``pos_encoding``'s (never freed by the scheduler),
-      - owned by a node in ``overlay_pinned_inputs`` (pinned against freeing),
-      - reserved in the allocator (never handed out by ``allocate``).
-
-    Any other owner means the allocator reused an overlay target position
-    for an unrelated live node — the delta write about to happen would
-    silently corrupt that node.  Raising here turns the silent value
-    corruption into a loud compile-time error.
-    """
-    for _out_node, (_in_node, target_cols) in overlays.items():
-        for col in target_cols:
-            if col in residual_map._reserved:
-                continue
-            owner = None
-            for candidate, cols in residual_map._node_to_indices.items():
-                if col in cols:
-                    owner = candidate
-                    break
-            if owner is pos_encoding:
-                continue
-            if owner in overlay_pinned_inputs:
-                continue
-            raise AssertionError(
-                f"Overlay target column {col} is owned by {owner!r} at "
-                f"delta-transfer time — the allocator reused a reserved "
-                f"position.  Expected: pos_encoding, a pinned overlay "
-                f"input, or an allocator-reserved column."
-            )
-
-
 def _count_heads_by_type(
     attn_ops: list[AttnHeadOp],
     d_head: int,
@@ -369,8 +328,6 @@ def _count_heads_by_type(
         elif attn_op.op_type == "add_into":
             assert attn_op.node is not None
             n = (len(attn_op.node) + d_head - 1) // d_head
-        elif attn_op.op_type == "delta_transfer":
-            n = (len(attn_op.target_cols) + d_head - 1) // d_head
         else:
             n = 0
         counts[attn_op.op_type] = counts.get(attn_op.op_type, 0) + n
@@ -438,7 +395,6 @@ def forward_compile(
     d_hidden: Optional[int] = None,
     on_node_scheduled: Optional[Callable[[Node, int], None]] = None,
     trim_heads: bool = True,
-    overlays: Optional[dict] = None,
     admission_control: bool = False,
     admission_budget_fraction: float = 0.4,
     admission_min_chains: int = 4,
@@ -472,11 +428,6 @@ def forward_compile(
             state objects (``layer.attn.in_state`` / ``layer.mlp.out_state``)
             stay valid regardless and are consumed later when building
             ``residual_assignment``.
-        overlays: Optional dict mapping output_node -> (input_node, target_cols)
-            for delta transfer. When provided, a final layer is added that
-            transfers each output's value to the specified target columns
-            via delta: target += (output - target). This enables overlaid
-            I/O where output replaces input in-place.
         optimize: Optimization level. ``0`` (default) uses the
             heuristic :class:`LayerScheduler` and skips CP-SAT
             entirely — fastest compile, predictable layer count.
@@ -529,17 +480,6 @@ def forward_compile(
     # matches the graph's actual terminal node.
     output_node = graph.get_output_node()
     input_nodes = [n for n in graph.get_all_nodes() if graph.is_input_node(n)]
-
-    # Unwrap any Assert keys in the overlays dict.
-    if overlays:
-        from torchwright.graph.misc import Assert
-
-        unwrapped: dict = {}
-        for k, v in overlays.items():
-            while isinstance(k, Assert):
-                k = k.inputs[0]
-            unwrapped[k] = v
-        overlays = unwrapped
 
     # Auto-create pos_encoding if needed (required for attention ops)
     if pos_encoding is None:
@@ -610,41 +550,6 @@ def forward_compile(
 
     if policy is None:
         policy = SchedulingPolicy()
-
-    # Protect overlay target columns from reuse by intermediate allocations.
-    # The delta-transfer layer at end of compile writes to these columns
-    # unconditionally (via attention heads), so any intermediate node
-    # whose residual-stream columns intersect target_cols would be silently
-    # overwritten.  target_cols are *output-writeback* columns (the residual
-    # positions the output reader pulls from), not the overlay input node's
-    # allocated columns — they may land in pos_encoding's range, an input's
-    # range, or the initially-free overflow region.  Protection strategy per
-    # column:
-    #   - In pos_encoding's cols: no-op, pos_encoding is never freed.
-    #   - In some input node's cols: pin that input so the scheduler never
-    #     marks it dead.  Its columns stay allocated to it and can't be
-    #     reused by intermediates.
-    #   - In _free (overflow region): reserve the column directly so the
-    #     allocator never picks it.
-    overlay_pinned_inputs: set[Node] = set()
-    if overlays:
-        col_to_owner: dict[int, Node] = {}
-        for owner, cols in residual_map._node_to_indices.items():
-            for c in cols:
-                col_to_owner[c] = owner
-
-        cols_to_reserve: set[int] = set()
-        for _out_node, (_in_node, target_cols) in overlays.items():
-            for col in target_cols:
-                col_owner = col_to_owner.get(col)
-                if col_owner is None:
-                    cols_to_reserve.add(col)
-                elif col_owner is pos_encoding:
-                    pass
-                else:
-                    overlay_pinned_inputs.add(col_owner)
-        if cols_to_reserve:
-            residual_map.reserve(cols_to_reserve)
 
     # Map optimize level to CP-SAT time budget.  Level 0 skips CP-SAT
     # entirely; higher levels accept best-feasible (not proven-optimal)
@@ -732,7 +637,6 @@ def forward_compile(
                     clusters=clusters,
                     admission_budget_fraction=admission_budget_fraction,
                     policy=policy,
-                    overlay_pinned_inputs=overlay_pinned_inputs,
                     output_node=output_node,
                     max_layers=max_layers,
                 )
@@ -921,8 +825,7 @@ def forward_compile(
                 clusters=clusters,
                 admission_budget_fraction=admission_budget_fraction,
                 policy=policy,
-                pinned_nodes=overlay_pinned_inputs,
-            )
+                    )
         else:
             if verbose and net.cpsat_solve_stats.status_name != "CACHED":
                 solve_time = time.perf_counter() - t_solve_start
@@ -940,8 +843,7 @@ def forward_compile(
                 clusters=clusters,
                 admission_budget_fraction=admission_budget_fraction,
                 policy=policy,
-                pinned_nodes=overlay_pinned_inputs,
-            )
+                    )
     else:
         scheduler = LayerScheduler(
             graph,
@@ -952,8 +854,7 @@ def forward_compile(
             clusters=clusters,
             admission_budget_fraction=admission_budget_fraction,
             policy=policy,
-            pinned_nodes=overlay_pinned_inputs,
-        )
+            )
 
     # Save input indices before scheduling (scheduling may free/reassign them)
     input_indices: dict[Node, list[int]] = {
@@ -1121,43 +1022,6 @@ def forward_compile(
             f"({pct_used:.1f}%), "
             f"{total_layer_time:.2f}s total layer time"
         )
-
-    # 3b. Delta transfer layer for overlaid I/O
-    # When overlays is provided, add a final layer that transfers each output
-    # value to the input's columns via delta: target += (output - target).
-    if overlays:
-        _verify_overlay_target_protection(
-            overlays, residual_map, pos_encoding, overlay_pinned_inputs
-        )
-        delta_layer = net.add_layer(append=True)
-        delta_ops = []
-        for out_node, (in_node, target_cols) in overlays.items():
-            # Source columns: where the output value was computed
-            source_cols = residual_map.get_indices(out_node)
-            # Subtract columns: same as target (the input columns)
-            subtract_cols = target_cols
-            delta_ops.append(
-                AttnHeadOp(
-                    op_type="delta_transfer",
-                    node=out_node,
-                    target_cols=target_cols,
-                    source_cols=source_cols,
-                    subtract_cols=subtract_cols,
-                )
-            )
-        placement_recorder.set_layer(len(net.layers) - 1)
-        write_attn_sublayer(
-            delta_layer,
-            delta_ops,
-            residual_map,
-            pos_encoding,
-            recorder=placement_recorder,
-        )
-        per_layer_head_counts.append(_count_heads_by_type(delta_ops, d_head))
-        if verbose:
-            print(f"  Delta transfer layer: {len(delta_ops)} overlays")
-        if on_layer_compiled is not None:
-            on_layer_compiled(len(net.layers) - 1, delta_layer)
 
     # Ensure at least one layer exists for ResidualAssignment states.
     # If compile produced zero layers (trivial graph), run the callback on

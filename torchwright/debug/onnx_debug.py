@@ -17,8 +17,7 @@ is structurally blind to.
 What it needs besides the ``.onnx`` file:
 
 * the ``<stem>.debug.json`` sidecar written by
-  :func:`~torchwright.compiler.export.compile_to_onnx` /
-  :func:`~torchwright.compiler.export.compile_headless_to_onnx`
+  :func:`~torchwright.compiler.export.compile_to_onnx`
   (``debug_sidecar=True``, the default) — the residual assignment keyed
   by canonical node id, plus a structural fingerprint;
 * the **rebuilt graph** (``output_node`` + ``pos_encoding``) — graph
@@ -93,8 +92,7 @@ def _sidecar_or_raise(onnx_path: str) -> dict:
     if not os.path.exists(path):
         raise FileNotFoundError(
             f"Missing debug sidecar {path}. Re-export with "
-            f"compile_to_onnx / compile_headless_to_onnx (debug_sidecar=True, "
-            f"the default) to produce it."
+            f"compile_to_onnx (debug_sidecar=True, the default) to produce it."
         )
     with open(path) as f:
         sidecar = json.load(f)

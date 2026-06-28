@@ -175,9 +175,7 @@ def test_token_onnx_decode_step_matches_full_prefill():
             out_names += [f"delta_K_{i}", f"delta_V_{i}"]
 
         pk_full, pv_full = _zero_past(per_layer_n_heads, d_head, S)
-        full_logits = session.run(
-            ["logits"], _feeds(token_ids, pk_full, pv_full, 0)
-        )[0]
+        full_logits = session.run(["logits"], _feeds(token_ids, pk_full, pv_full, 0))[0]
 
         # Prefill all-but-last, persisting deltas into slots [0 : n-1).
         past_k, past_v = _zero_past(per_layer_n_heads, d_head, S)
@@ -334,7 +332,6 @@ def test_token_onnx_artifact_fields_load_and_generate():
         # vocab_size is the embedding TABLE's row count (the logits
         # width) — the table is padded past the tokenizer's vocab list.
         assert artifact.vocab_size == embedding.table.shape[0]
-        assert artifact.d_embed == embedding.table.shape[1]
         assert artifact.n_layers > 0
         assert artifact.per_layer_n_heads == tuple(
             OnnxTokenModule(onnx_path).per_layer_n_heads
@@ -401,3 +398,284 @@ def test_token_onnx_meta_has_no_extra_key_when_omitted():
             meta = json.load(f)
         assert "extra" not in meta
         assert set(meta) == {"format", "vocab", "cache_stride"}
+
+
+# ===========================================================================
+# KV-cache protocol + head/slot-trim coverage.
+#
+# Ported from the retired float-I/O ("headless") ONNX exporter's tests: the
+# cached preamble (in-graph causal mask), the ScatterND static-tail, the
+# stride-bucket prefix-window binding, and the head/MLP trimming are all
+# SHARED machinery (compile_to_onnx and the removed compile_headless_to_onnx
+# emitted the identical graph), so they are exercised here on the surviving
+# token vehicle.  The single-row decode seam + prefill-vs-compute already live
+# above; these add the combinations those do not cover.
+# ===========================================================================
+
+_PROTO_TOKENS = ["<bos>", "1", "+", "2", "\n"]
+
+
+def _ids(embedding, tokens):
+    return np.array(
+        [embedding.tokenizer.get_token_id(t) for t in tokens], dtype=np.int64
+    )
+
+
+@pytest.fixture(scope="module")
+def adder_artifact(tmp_path_factory):
+    """A compiled 1-digit adder token artifact (max_seq_len=32) shared by the
+    cached-protocol self-consistency tests below."""
+    output_node, pos_encoding, embedding = _build_1digit()
+    tmpdir = str(tmp_path_factory.mktemp("token_onnx_proto"))
+    onnx_path = os.path.join(tmpdir, "adder.onnx")
+    compile_to_onnx(
+        output_node,
+        pos_encoding,
+        embedding,
+        onnx_path,
+        d=D,
+        d_head=D_HEAD,
+        max_seq_len=32,
+        verbose=False,
+    )
+    return onnx_path, embedding
+
+
+def test_token_onnx_chunked_decode_matches_full_prefill(adder_artifact):
+    """Prefill 2 rows, then decode a 3-row chunk (n_new>1 at base>0) — the
+    dynamic-mask seam the single-row decode test does not cover."""
+    onnx_path, embedding = adder_artifact
+    token_ids = _ids(embedding, _PROTO_TOKENS)
+    session = onnxruntime.InferenceSession(onnx_path)
+    n_layers, per_layer_n_heads, d_head, S = _discover_meta(session, onnx_path)
+    out_names = ["logits"]
+    for i in range(n_layers):
+        out_names += [f"delta_K_{i}", f"delta_V_{i}"]
+
+    pk_full, pv_full = _zero_past(per_layer_n_heads, d_head, S)
+    full = session.run(["logits"], _feeds(token_ids, pk_full, pv_full, 0))[0]
+
+    past_k, past_v = _zero_past(per_layer_n_heads, d_head, S)
+    results = session.run(out_names, _feeds(token_ids[:2], past_k, past_v, 0))
+    for i in range(n_layers):
+        past_k[i][0:2] = results[1 + 2 * i]
+        past_v[i][0:2] = results[1 + 2 * i + 1]
+
+    chunk = session.run(["logits"], _feeds(token_ids[2:5], past_k, past_v, 2))[0]
+    assert np.allclose(
+        full[2:5], chunk, atol=1e-4
+    ), f"chunked decode diff: {np.abs(full[2:5] - chunk).max():.6f}"
+
+
+def test_token_onnx_static_tail_is_inert(adder_artifact):
+    """Finite garbage in masked tail slots (positions > cache_position) must
+    not change the decode output — the in-graph mask zeroes those weights
+    exactly.  (Slot n itself is overwritten by the ScatterND diagonal.)"""
+    onnx_path, embedding = adder_artifact
+    token_ids = _ids(embedding, _PROTO_TOKENS)
+    n = 4
+    session = onnxruntime.InferenceSession(onnx_path)
+    n_layers, per_layer_n_heads, d_head, S = _discover_meta(session, onnx_path)
+    out_names = ["logits"]
+    for i in range(n_layers):
+        out_names += [f"delta_K_{i}", f"delta_V_{i}"]
+
+    pk_full, pv_full = _zero_past(per_layer_n_heads, d_head, S)
+    full = session.run(["logits"], _feeds(token_ids, pk_full, pv_full, 0))[0]
+
+    past_k, past_v = _zero_past(per_layer_n_heads, d_head, S)
+    results = session.run(out_names, _feeds(token_ids[:n], past_k, past_v, 0))
+    for i in range(n_layers):
+        past_k[i][:n] = results[1 + 2 * i]
+        past_v[i][:n] = results[1 + 2 * i + 1]
+
+    def decode(pk, pv):
+        return session.run(["logits"], _feeds(token_ids[n : n + 1], pk, pv, n))[0]
+
+    exact = decode(past_k, past_v)
+    assert np.allclose(full[n], exact[0], atol=1e-4)
+
+    garbage_k = [pk.copy() for pk in past_k]
+    garbage_v = [pv.copy() for pv in past_v]
+    for i in range(n_layers):
+        garbage_k[i][n:] = 7.0
+        garbage_v[i][n:] = -3.0
+    dirty = decode(garbage_k, garbage_v)
+    assert np.allclose(exact[0], dirty[0], atol=1e-6), (
+        "garbage in masked static-cache slots changed the output "
+        f"(max diff {np.abs(exact[0] - dirty[0]).max():.6e}) — the mask is "
+        "not zeroing the tail weights exactly"
+    )
+
+
+def test_token_onnx_prefix_window_binding(adder_artifact):
+    """Every covering prefix window cache[:S_eff] (base+n_new <= S_eff <= S)
+    must produce bit-identical outputs — the symbolic cache_slots dim derives
+    the mask width from Shape(past_K_0)."""
+    onnx_path, embedding = adder_artifact
+    token_ids = _ids(embedding, _PROTO_TOKENS)
+    n = 4
+    session = onnxruntime.InferenceSession(onnx_path)
+    n_layers, per_layer_n_heads, d_head, S = _discover_meta(session, onnx_path)
+    out_names = ["logits"]
+    for i in range(n_layers):
+        out_names += [f"delta_K_{i}", f"delta_V_{i}"]
+
+    past_k, past_v = _zero_past(per_layer_n_heads, d_head, S)
+    results = session.run(out_names, _feeds(token_ids[:n], past_k, past_v, 0))
+    for i in range(n_layers):
+        past_k[i][:n] = results[1 + 2 * i]
+        past_v[i][:n] = results[1 + 2 * i + 1]
+
+    def decode_window(s_eff):
+        pk = [k[:s_eff] for k in past_k]
+        pv = [v[:s_eff] for v in past_v]
+        return session.run(out_names, _feeds(token_ids[n : n + 1], pk, pv, n))
+
+    ref = decode_window(S)
+    for s_eff in (n + 1, n + 3, S - 1):
+        got = decode_window(s_eff)
+        for r, g, name in zip(ref, got, out_names):
+            assert np.array_equal(r, g), (
+                f"S_eff={s_eff}: {name} differs from the full-S binding "
+                f"(max diff {np.abs(r - g).max():.6e})"
+            )
+
+
+def test_token_onnx_module_step_matches_full_call(adder_artifact):
+    """OnnxTokenModule.step threads the cache: prefill 4 + decode 1 == one
+    full-sequence call."""
+    from torchwright.compiler.onnx_load import OnnxTokenModule
+
+    onnx_path, embedding = adder_artifact
+    token_ids = torch.tensor(_ids(embedding, _PROTO_TOKENS), dtype=torch.int64)
+    module = OnnxTokenModule(onnx_path)
+
+    full = module(token_ids)
+    past = module.empty_past()
+    prefill_out, past = module.step(token_ids[:4], past)
+    decode_out, past = module.step(token_ids[4:5], past)
+
+    assert torch.allclose(full[:4], prefill_out, atol=1e-4)
+    assert torch.allclose(full[4], decode_out[0], atol=1e-4)
+
+
+def test_token_onnx_module_empty_past_shape(adder_artifact):
+    from torchwright.compiler.onnx_load import OnnxTokenModule
+
+    onnx_path, _ = adder_artifact
+    module = OnnxTokenModule(onnx_path)
+    past = module.empty_past()
+    S = module.cache_stride
+    assert S == 32  # max_seq_len passed to the fixture; cache_stride defaults to it
+    assert past.length == 0
+    assert len(past.k) == module.n_layers
+    for i, K in enumerate(past.k):
+        assert K.shape == (S, module.per_layer_n_heads[i], module.d_head)
+        assert (K == 0).all(), "static cache must be zero-initialized"
+
+
+# ---- Head / MLP-slot trimming (compile_to_onnx trim_heads) ----------------
+
+
+def _export_token(tmpdir, name="model.onnx", trim_heads=True):
+    output_node, pos_encoding, embedding = _build_1digit()
+    onnx_path = os.path.join(tmpdir, name)
+    compile_to_onnx(
+        output_node,
+        pos_encoding,
+        embedding,
+        onnx_path,
+        d=D,
+        d_head=D_HEAD,
+        max_seq_len=32,
+        verbose=False,
+        trim_heads=trim_heads,
+    )
+    return onnx_path, embedding
+
+
+def _l_w1_d_hidden(onnx_path):
+    """Per-layer MLP hidden widths read off the l{i}_W1 initializers
+    (shape (d, d_hidden_i)); densify-aware (sparse protos carry full dims)."""
+    import onnx
+
+    model = onnx.load(onnx_path)
+    dims_by_name = {init.name: list(init.dims) for init in model.graph.initializer}
+    for sp in model.graph.sparse_initializer:
+        dims_by_name[sp.values.name] = list(sp.dims)
+    widths = []
+    i = 0
+    while f"l{i}_W1" in dims_by_name:
+        dims = dims_by_name[f"l{i}_W1"]
+        assert dims[0] == D, f"l{i}_W1 first dim {dims[0]} != d {D}"
+        widths.append(int(dims[1]))
+        i += 1
+    assert widths, "no l{i}_W1 initializers found"
+    return widths
+
+
+def test_token_onnx_trim_heads_shrinks_kv_cache():
+    """trim_heads=True drops per-layer past_K widths below the full head count
+    and leaves them non-uniform across layers."""
+    max_heads = D // D_HEAD
+    with tempfile.TemporaryDirectory() as tmpdir:
+        onnx_path, _ = _export_token(tmpdir, trim_heads=True)
+        session = onnxruntime.InferenceSession(onnx_path)
+        _, per_layer_n_heads, _, _ = _discover_meta(session, onnx_path)
+    assert per_layer_n_heads, "no layers discovered"
+    assert all(1 <= nh <= max_heads for nh in per_layer_n_heads)
+    assert (
+        min(per_layer_n_heads) < max_heads
+    ), f"no layer trimmed below full width {max_heads}: {per_layer_n_heads}"
+    assert (
+        len(set(per_layer_n_heads)) > 1
+    ), f"head counts are uniform across layers: {per_layer_n_heads}"
+
+
+def test_token_onnx_no_trim_preserves_full_width():
+    """trim_heads=False keeps every layer at the full d/d_head head count."""
+    max_heads = D // D_HEAD
+    with tempfile.TemporaryDirectory() as tmpdir:
+        onnx_path, _ = _export_token(tmpdir, trim_heads=False)
+        session = onnxruntime.InferenceSession(onnx_path)
+        _, per_layer_n_heads, _, _ = _discover_meta(session, onnx_path)
+    assert per_layer_n_heads, "no layers discovered"
+    assert all(
+        nh == max_heads for nh in per_layer_n_heads
+    ), f"expected all layers at full width {max_heads}: {per_layer_n_heads}"
+
+
+def test_token_onnx_trim_shrinks_mlp_slots():
+    """trim_heads=True shrinks some l{i}_W1 below full d_hidden; False keeps all."""
+    full_d_hidden = D  # d_hidden defaults to d
+    with tempfile.TemporaryDirectory() as tmpdir:
+        trim_path, _ = _export_token(tmpdir, "trim.onnx", trim_heads=True)
+        notrim_path, _ = _export_token(tmpdir, "notrim.onnx", trim_heads=False)
+        trim_widths = _l_w1_d_hidden(trim_path)
+        notrim_widths = _l_w1_d_hidden(notrim_path)
+    assert all(1 <= w <= full_d_hidden for w in trim_widths)
+    assert (
+        min(trim_widths) < full_d_hidden
+    ), f"no layer's MLP trimmed below full d_hidden {full_d_hidden}: {trim_widths}"
+    assert all(w == full_d_hidden for w in notrim_widths)
+
+
+def test_token_onnx_trim_is_numerical_noop():
+    """Trimmed and full-width ONNX produce the same logits on the same prefill
+    (trimming removes only all-zero heads/slots)."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        trim_path, emb = _export_token(tmpdir, "trim.onnx", trim_heads=True)
+        notrim_path, _ = _export_token(tmpdir, "notrim.onnx", trim_heads=False)
+        token_ids = _ids(emb, _PROTO_TOKENS)
+        sess_trim = onnxruntime.InferenceSession(trim_path)
+        sess_notrim = onnxruntime.InferenceSession(notrim_path)
+        _, ht, d_head, St = _discover_meta(sess_trim, trim_path)
+        _, hn, _, Sn = _discover_meta(sess_notrim, notrim_path)
+        pk, pv = _zero_past(ht, d_head, St)
+        out_trim = sess_trim.run(["logits"], _feeds(token_ids, pk, pv, 0))[0]
+        pk, pv = _zero_past(hn, d_head, Sn)
+        out_notrim = sess_notrim.run(["logits"], _feeds(token_ids, pk, pv, 0))[0]
+    assert np.allclose(
+        out_trim, out_notrim, atol=1e-4
+    ), f"trim changed the output: max diff {np.abs(out_trim - out_notrim).max():.6e}"
