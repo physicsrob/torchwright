@@ -68,6 +68,28 @@ the calculator's reliable range. At the very top of its multiply range the
 compiled piecewise-linear arithmetic runs at its numerical-noise budget, where
 two faithful fp32 backends can round one borderline output digit differently.
 
+## Normalization: a genuine RMSNorm that computes the identity
+
+Like a stock Llama-style decoder, every block applies an `RMSNorm` before
+attention and before the MLP, with a final `RMSNorm` before the unembedding —
+the standard `input_layernorm` / `post_attention_layernorm` / `model.norm`
+weights. They are real ops and run on any standard engine.
+
+Because the weights are **compiled, not trained**, the norm does not need to
+*do* anything. Training needs normalization to keep activations in range; this
+model emits exact values and must preserve them. So the residual stream is
+arranged so the norm is the **identity**: one residual column is pinned to a
+large constant whose energy fixes the per-position RMS to an exact power of two,
+and the gain is set to cancel that RMS exactly — `x / rms * gain == x`, bit for
+bit. The norm runs for real; it just returns its input.
+
+The one honest tell that this was compiled rather than trained: every gain is
+the same large constant (`2^39 ≈ 5.5e11` in this model), where a trained
+RMSNorm's gains cluster near 1. We keep the real norm — rather than dropping it
+and claiming "no normalization" — so the architecture is a faithful standard
+transformer; the atypical gain magnitude is the price of making the norm an
+exact identity, and we name it rather than hide it.
+
 ## Usage
 
 ```python
@@ -94,9 +116,7 @@ def ensure_artifact() -> str:
 
     module = importlib.import_module("examples.calculator_v2")
     output_node, pos_encoding, embedding = module.create_network_parts()
-    compile_to_onnx(
-        output_node, pos_encoding, embedding, ONNX_PATH, d=module.D_MODEL
-    )
+    compile_to_onnx(output_node, pos_encoding, embedding, ONNX_PATH, d=module.D_MODEL)
     return ONNX_PATH
 
 
@@ -115,9 +135,7 @@ def demo(out_dir: str) -> None:
     import torch
     from transformers import AutoModelForCausalLM, AutoTokenizer
 
-    model = AutoModelForCausalLM.from_pretrained(
-        out_dir, trust_remote_code=True
-    ).eval()
+    model = AutoModelForCausalLM.from_pretrained(out_dir, trust_remote_code=True).eval()
     tok = AutoTokenizer.from_pretrained(out_dir, trust_remote_code=True)
 
     print("\n=== clean-room trust_remote_code demo ===")
@@ -132,9 +150,7 @@ def demo(out_dir: str) -> None:
                 eos_token_id=tok.eos_token_id,
                 pad_token_id=tok.eos_token_id,
             )
-        out = tok.decode(
-            g[0, enc["input_ids"].shape[1]:], skip_special_tokens=True
-        )
+        out = tok.decode(g[0, enc["input_ids"].shape[1] :], skip_special_tokens=True)
         print(f"  {expr.strip():10s} -> {out}")
 
 
