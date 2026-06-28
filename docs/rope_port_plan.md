@@ -303,6 +303,29 @@ worst-case `gap` bound per consumer holds and `1/(gap+1)` resolves at that bound
 in-stream marker and value `= pos − marker_pos` recovered via the count, vs oracle, pushed to the
 ~350 gap bound over a deep rollout (no `torchwright_doom`).
 
+> **Status (2026-06-27): core capability built + proven; two follow-ups remain.**
+> - ✅ **The near-marker count capability** (`torchwright/ops/marker_count.py`,
+>   `count_since_marker`). `attend_mean_where` over the window `[marker, now]` reading a marker
+>   one-hot gives the uniform mean `1/(gap+1)`; `reciprocal` inverts to `gap+1`; subtract 1. It is
+>   **RoPE-clean** — `attend_mean_where` uses a literal query + validity-driven keys with no position
+>   term, so position enters only via the caller's `window_validity`/`marker_onehot` features.
+> - ✅ **Gate (b) — resolution at the bound.** The §9 confidence test
+>   (`tests/ops/test_marker_count.py`) pushes gap to **350** (mean `1/351`, adjacent gaps ~8e-6
+>   apart). Worst compiled error **0.06** (geometric-breakpoint reciprocal, 239 breakpoints,
+>   `_RECIP_REL_SAFETY=16`) → rounds to the right integer with **~8× margin**; compiled matches the
+>   oracle. Empty-window queries degrade to bounded garbage (`~max_gap`), not an error — the caller
+>   must only consume the gap where the marker is visible (documented contract).
+> - **Follow-up 1 — `prefix_*` is a separate, harder sub-problem.** `prefix_sum`/`prefix_and` use
+>   `get_position_scalar` only for an *absolute* `pos ≥ 2^k` out-of-bounds gate (k up to ~16). That is
+>   **not** a bounded near-marker difference, so the count doesn't apply. It needs its own RoPE-native
+>   OOB detector (e.g. "did the `attend_to_offset(-2^k)` read land on a real key / before BOS?"),
+>   designed separately — flagged so it isn't assumed solved.
+> - **Follow-up 2 — consumer rewiring is Phase 5.** `get_position_scalar` returns an *absolute*
+>   index with no RoPE meaning; its consumers must be rewritten to the marker-relative count, and the
+>   marker is consumer-specific. Per §7 (DOOM untouched through Phase 4) that rewiring lands at Phase 5.
+>   Gate (a) — each consumer's marker is graph-recognizable + the post-marker gate is constructible —
+>   is verified per-consumer then.
+
 **Phase 1b — Recency signal (bucket 2): the octant two-head readout.** Build the §3 mechanism.
 
 > **Status (2026-06-27): confirm-compile DONE — the unproven-mechanism crack is closed.** The
