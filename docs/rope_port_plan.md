@@ -1,8 +1,13 @@
 # RoPE port — plan
 
-Status: **Phase 0 implemented** (rotary `Attn` capability across in-process / ONNX / HF, validated;
-ONNX+HF validated locally only — Modal image lacks `onnxruntime`). Phases 1–5 remain. Branch:
-`worktree-rope`.
+Status: **Phases 0, 1, 1b, 2-part-1 done** (branch `worktree-rope`). Phase 0 (rotary `Attn`,
+in-process/ONNX/HF), Phase 1 (bucket-1 near-marker count), Phase 1b (recency ramp: `soft_blend` +
+octant ramp, confirm-compile green), Phase 2 Part 1 (relative-offset all-Δ + sign lock). Remaining:
+Phase 2 Part 2 (compiler self-match → rotary), Phase 3 (content), Phase 4 (recency end-to-end),
+Phase 5 (delete PosEncoding). **`main` merged in (`f281ee8`)**: ONNX/HF now run in CI (the Modal
+image carries `onnxruntime`/`transformers` — the runtime-parity gap is closed), the float-I/O
+headless ONNX export and the delta-transfer compile mode were removed, and the token export uses a
+vanilla untied embedding.
 
 > **RoPE** = rotary position embeddings: instead of adding a position vector to the
 > residual stream, attention rotates each query and key by an angle proportional to its
@@ -52,7 +57,7 @@ Attention is used in three structurally different ways:
 
 | Class | Heads | Position role |
 |---|---|---|
-| **Positional** | `attend_to_offset`; compiler-internal self-match via `_current_pos_attn_matrices` (Linear/Add/Cancel/add_into **and** delta_transfer — 5 callers) | fixed offset / self (Δ=0), trig dot product |
+| **Positional** | `attend_to_offset`; compiler-internal self-match via `_current_pos_attn_matrices` (Linear/Add/Cancel/add_into — 4 callers; delta_transfer removed on `main`) | fixed offset / self (Δ=0), trig dot product |
 | **Content selection** | `attend_argmin/argmax/_where/_above/_bucket/_unmasked/_dot` family; DOOM scene-fact lookups | none — winner chosen on content, any distance |
 | **Content + recency** | `attend_most_recent_matching` / `get_prev_value` family (clip-memory lookup is the hard case) | content gate **plus** monotone counter |
 
@@ -271,12 +276,14 @@ flag is removed at Phase 5.
 > width" is now an explicit parameter, not the single `θ_i = base^(-2i/d)` the plan assumed.
 >
 > **Validation.** `tests/compile/forward/test_rope_offset.py` (in-process: oracle == trig-shift,
-> `probe_compiled` clean, prefill == unbounded decode — all green on Modal; 2 ONNX tests) and
-> `tests/hf/test_rope_token.py` (a "predict-previous-token" model: config carried, predicts previous,
-> prefill == cached decode bit-exact). **CI caveat:** the Modal test image has no `onnxruntime`, so the
-> ONNX and HF tests `importorskip`/skip there and were validated **locally only** — two of the three
-> runtime surfaces are currently CI-blind (same gap that makes `tests/hf` show pre-existing errors).
-> Fix the image before Phases 2/3/5 lean on ONNX/HF validation. Full suite: 746 passed, no regressions.
+> `probe_compiled` clean, prefill == unbounded decode) and `tests/hf/test_rope_token.py` (a
+> "predict-previous-token" model: config carried, predicts previous, prefill == cached decode
+> bit-exact). **Post-`main`-merge (`f281ee8`):** the float-I/O headless ONNX export was removed, so the
+> Phase-0 headless-ONNX offset tests are dropped — the token-path ONNX RoPE emission (cos/sin from
+> `cache_position` in `compile_to_onnx`, full-width `d_qk==d_head` guard) is now covered by
+> `test_rope_token.py`. The Modal image now carries `onnxruntime`/`transformers`, so **all three
+> runtime surfaces are CI-tested** and green (full suite 927 passed, 0 errors). The earlier
+> "validated locally only / CI-blind" caveat is resolved.
 
 **Phase 0 — Rotary `Attn` capability, end to end.** Add an opt-in rotary mode across the graph
 node (`graph/attn.py`, **including its `compute()` oracle path**), compiler (`_write_compute_attn`,
@@ -437,8 +444,8 @@ on the ramp) — stays below the gap-1 signal.
 
 **Phase 2 — Relative-offset attention + compiler self-match.** Reimplement `attend_to_offset`
 (all Δ) on `W_K = R_N W_Q` (lock the sign convention — `j+N` vs `j−N` is an easy silent flip).
-Move the compiler-internal self-match (`_current_pos_attn_matrices`, Δ=0) for **all five callers
-— Linear/Add/Cancel/add_into and delta_transfer** — to rotary. **High blast radius: every
+Move the compiler-internal self-match (`_current_pos_attn_matrices`, Δ=0) for **all four callers
+— Linear/Add/Cancel/add_into** (delta_transfer was removed on `main`) — to rotary. **High blast radius: every
 Linear/Add compiles through this** (these paths are arithmetic transport; 1-LSB attention
 perturbations have caused real regressions). Migrate behind the smallest compiler-invariant
 tests *before* broad suite runs; compiler invariants I1–I4 must keep passing — any firing is a
@@ -464,11 +471,13 @@ D1 stop.
 >   columns; read a constant column and let the runtime rotate it.") Required surfaces: the residual
 >   reservation (`ResidualStreamMap`, a "computed-once-then-reserved" constant per §10), in-process
 >   runtime input construction (`HeadlessTransformer.get_input_res_stream`), `_current_pos_attn_matrices`
->   (rotary branch behind the per-head flag), **and** the ONNX + HF mirrors. Two of those three runtime
->   surfaces are **CI-blind** (the Modal image lacks `onnxruntime`/`transformers` — see the §11
->   runtime-parity gate), so a self-match migration cannot currently be validated end-to-end. This is
->   the highest-blast-radius change in the port (every Linear/Add) with I1–I4 as D1-stop guardrails;
->   it warrants its own focused effort with the ONNX/HF CI gap closed first, not a rushed partial land.
+>   (rotary branch behind the per-head flag), **and** the ONNX + HF mirrors. **All three surfaces are
+>   now CI-tested** — `main` (`f281ee8` merge) added `onnxruntime`/`transformers` to the Modal image,
+>   so a self-match migration *can* be validated end-to-end (the earlier CI-blind blocker is gone; the
+>   reserved-constant-column prerequisite remains). This is still the highest-blast-radius change in the
+>   port (every Linear/Add) with I1–I4 as D1-stop guardrails — it warrants its own focused effort and
+>   compiler-invariant-tests-first, not a rushed partial land. (Note: `main` removed delta-transfer, so
+>   four self-match callers now, not five.)
 
 **Phase 3 — Content selection.** Migrate the `attend_*` family to place content on slow planes;
 fix `base` and `d_head` (§6). Validation: each selection head against **its own documented score
@@ -505,7 +514,7 @@ is mergeable (§7). The three capabilities and their calibration targets:
 
 | Capability (DOOM consumer class) | torchwright confidence test | Calibrate to |
 |---|---|---|
-| **Offset / self-match** (`attend_to_offset`, the 5 compiler self-match callers) | rotary offset head; all-Δ + Δ=0 self-match (Phases 0/2) | token-identical vs trig-shift; I1–I4 hold |
+| **Offset / self-match** (`attend_to_offset`, the 4 compiler self-match callers) | rotary offset head; all-Δ + Δ=0 self-match (Phases 0/2) | token-identical vs trig-shift; I1–I4 hold |
 | **Bucket 1 — bounded near-marker count** (`get_position_scalar`, `prefix_*`) | marker token in-stream + value `= pos − marker_pos` via the `1/(gap+1)` count, vs oracle | gap **< ~350**; `1/350` vs `1/351` resolves |
 | **Bucket 2 — recency ordering** (`attend_most_recent_matching`, `get_prev_value`) | real `compare`/`cond_gate`/`add` octant ramp; "most recent matching key" selection | gap-1 at absolute pos out to **~42k**; Phase-1b gates (handoff continuity, min slope ≈2.2e-5/tok, 0 flips) |
 | **Content selection** (`attend_argmin/argmax/_where/...`) | each selector under RoPE slow planes, against its own score/validity bounds | real head gaps (`_QUERY_GAIN=8`, the bucket margins) |
@@ -551,8 +560,8 @@ separate `torchwright_doom` branch** (post-Phase-5), not a per-phase gate in thi
   ONNX initializer + `Gather(pos_encoding_full, cache_position)` in `export.py`; and the HF model
   `compiler/hf/modeling_torchwright.py`, which gathers `pos_encoding_full[cache_position]`.
 - **The compiler self-match gatekeeper.** `_current_pos_attn_matrices` (`weight_writer.py:338`) —
-  every Linear/Add/Cancel/add_into/delta_transfer self-match flows through it (Phase-2 blast
-  radius). Today it reads `counter_col` only to zero it out of the logit; under RoPE the Δ=0
+  every Linear/Add/Cancel/add_into self-match flows through it (Phase-2 blast radius; delta_transfer
+  removed on `main`). Today it reads `counter_col` only to zero it out of the logit; under RoPE the Δ=0
   self-match is identity, so this simplifies.
 - **Input-node classification & reservation.** `PosEncoding` is an input node
   (`graph_analysis.py:208`), pre-allocated and never freed (`compile.py:570/573`). The recency
@@ -575,10 +584,12 @@ separate `torchwright_doom` branch** (post-Phase-5), not a per-phase gate in thi
   per-site work (a direct grep found fewer literal `attend_most_recent_matching` sites than the
   census implied). Confirmed 2026-06-27: `pick_most_recent` does **not** exist in current code —
   the recency family is `attend_most_recent_matching` (`attention_ops.py:1383`) and
-  `get_prev_value` (`pos_encoding.py:129`). The 5 compiler self-match callers
-  (`weight_writer.py:338` def; callers `:390`/`:451`/`:532`/`:587`/`:654`) and the three
-  host-position-table sites (`transformer.py:103-106`; `export.py:856` Gather + `:1230`/`:1551`
-  initializer; `modeling_torchwright.py:295`) are re-verified.
+  `get_prev_value` (`pos_encoding.py:129`). The compiler self-match callers (now **four** —
+  delta_transfer removed on `main`) flow through `_current_pos_attn_matrices` (`weight_writer.py`),
+  and the host-position-table sites are in `transformer.py`, `export.py`, `modeling_torchwright.py`.
+  **All line numbers here predate the `main` merge — re-grep before per-site work** (the merge
+  refactored `export.py`/`modeling_torchwright.py`, e.g. the untied embedding and removed headless
+  export shifted those line numbers).
 - **RoPE convention (LLaMA3-aligned).** ✅ DONE (Phase 0). `rotate_half` layout (dropped the legacy
   interleaved `(2i,2i+1)` pairing), both Q and K rotated by absolute position (cache holds rotated K,
   matching HF), base = `5e5`, no long-context frequency scaling. Still open: the global grid must
@@ -586,15 +597,16 @@ separate `torchwright_doom` branch** (post-Phase-5), not a per-phase gate in thi
   `1e6`-measured analyses with `5e5`.
 - **Offset sign convention.** ✅ DONE (Phase 0). `W_K = R_N W_Q` pinned by the offset-head test
   (which also pins the rotation layout).
-- **Compiler blast radius.** Linear/Add/Cancel/add_into/delta_transfer recompile through rotary
-  self-match (Phase 2 Part 2). I1–I4 are the guardrails; any firing is a D1 stop. **Blocked on two
-  prerequisites:** (1) a reserved constant-1 residual feature (Q/K are bias-free, so a rotary
-  self-match has no constant to rotate today), and (2) the ONNX/HF CI gap (the migration touches all
-  three runtime surfaces but two are CI-blind). Part 1 (relative-offset, all Δ) is ✅ done (`feffb20`).
-- **Runtime rotation parity.** ✅ DONE (Phase 0), but validated **locally only** — the Modal image
-  lacks `onnxruntime`, so the ONNX/HF rotation tests skip in CI. **New blocking gate for later
-  phases: add `onnxruntime` to the Modal test image** so Phases 2/3/5 can actually CI-test the
-  runtime paths.
+- **Compiler blast radius.** Linear/Add/Cancel/add_into self-match recompiles through rotary
+  self-match (Phase 2 Part 2; delta_transfer was removed on `main`, so **four** callers now, not
+  five). I1–I4 are the guardrails; any firing is a D1 stop. **Remaining prerequisite:** a reserved
+  constant-1 residual feature (Q/K are bias-free, so a rotary self-match has no constant to rotate
+  today). The earlier second prerequisite — the ONNX/HF CI gap — is now **closed** (see below). Part 1
+  (relative-offset, all Δ) is ✅ done (`feffb20`).
+- **Runtime rotation parity.** ✅ DONE (Phase 0) **and now CI-tested** — `main` (`f281ee8` merge) added
+  `onnxruntime`/`transformers` to the Modal image, so the ONNX/HF rotation tests run in CI; the full
+  suite is green (`test_rope_token.py` passes the token-ONNX/HF RoPE path through the untied
+  embedding). The "add onnxruntime to the Modal image" blocking gate is resolved.
 - **Oracle-first.** ✅ DONE (Phase 0). `Attn.compute` rotary path landed before any head migration;
   `probe_compiled` parity confirmed.
 - **Recency confirm-compile.** ✅ **DONE.** The unproven-mechanism crack is closed. `soft_blend`
