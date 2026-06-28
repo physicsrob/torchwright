@@ -1248,18 +1248,21 @@ def compile_to_onnx(
             embedding_indices = indices
         elif isinstance(node, PosEncoding):
             pos_indices = indices
-        elif isinstance(node, Concatenate):
+        elif isinstance(node, (Concatenate, InputNode)):
+            # Concatenate is structural; a raw InputNode is populated at
+            # forward-time by get_input_res_stream, not folded into embed_table.
+            # Both are intentionally not seeded here (the pre-merge behaviour).
             pass
         else:
-            # The only seeded input nodes are the token Embedding and the
-            # PosEncoding. Graph constants are NOT seeded — they are
-            # JIT-materialized into the per-layer MLP bias near their consumer
-            # (graph_analysis.is_input_node excludes LiteralValue), so they
-            # never appear in in_state. If one ever did, the vanilla-embedding
-            # seed below would silently drop it; fail loud instead.
+            # The remaining input-node kind is LiteralValue, which is NOT seeded
+            # — graph constants are JIT-materialized into the per-layer MLP bias
+            # near their consumer (graph_analysis.is_input_node excludes
+            # LiteralValue), so one must never reach in_state. If it does, the
+            # vanilla-embedding seed below would silently drop it; fail loud.
             raise AssertionError(
                 f"unexpected input-state node {type(node).__name__} in the "
-                f"token seed; only Embedding / PosEncoding / Concatenate are seeded"
+                f"token seed; only Embedding / PosEncoding / Concatenate / "
+                f"InputNode are expected"
             )
 
     assert embedding_indices is not None, "No Embedding node in residual assignment"

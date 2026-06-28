@@ -75,7 +75,9 @@ class RmsNormSpec:
     power-of-two widths) holds a large constant ``2^q`` whose energy forces
     ``rms == 2^m`` exactly; the uniform gain ``2^m`` cancels it
     (``x / rms * gain == x``), so ``÷rms`` and ``×gain`` are pure fp32 exponent
-    shifts and the identity is bit-exact for all floats.  See
+    shifts and the identity is bit-exact for every normal float (a channel value
+    below ``~2^(m-126)`` underflows to a denormal under ``÷2^m`` and is not
+    recovered — the documented near-zero floor, far below any real data).  See
     ``docs/plan_rmsnorm.md``.
 
     Attributes:
@@ -120,6 +122,28 @@ def _reserve_rms_norm_columns(
     e_exp = 2 * q + (0 if n_const == 1 else 1)  # log2 of total pinned energy E
     assert (e_exp - b) % 2 == 0, "rms exponent not integer — pinned-RMS layout bug"
     m = (e_exp - b) // 2  # forced rms = 2^m
+
+    # Guard the exposed q / eps knobs so a bad value fails loudly here rather
+    # than silently producing a non-identity norm or fp32 overflow downstream.
+    # Check the energy exponent arithmetically (2^128 is +inf in fp32, so the
+    # total pinned energy 2^e_exp must have e_exp <= 127).
+    import numpy as _np
+
+    if e_exp > 127:
+        raise ValueError(
+            f"rms_norm_const_exp={q} overflows fp32: the pinned energy 2^{e_exp} "
+            f"(2^(2q{'+1' if n_const == 2 else ''})) exceeds the float32 range. "
+            f"Pick a smaller q."
+        )
+    # The forced mean-of-squares is exactly 2^(2m); eps must sit below its fp32
+    # LSB or it shifts ms+eps off the power of two and breaks the identity.
+    forced_ms = _np.float32(2.0 ** (2 * m))
+    if _np.float32(forced_ms + _np.float32(eps)) != forced_ms:
+        raise ValueError(
+            f"rms_norm_eps={eps} is too large for the forced RMS (mean-square "
+            f"2^{2 * m}): it perturbs ms+eps and breaks the identity. Use a "
+            f"smaller eps or a larger rms_norm_const_exp."
+        )
 
     free_sorted = sorted(residual_map._free)
     if len(free_sorted) < n_const:

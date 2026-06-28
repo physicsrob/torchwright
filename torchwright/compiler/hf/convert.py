@@ -177,7 +177,10 @@ def build_config(
         f"meta rms_norm={rms_norm} disagrees with the presence of a final_norm "
         f"initializer ({has_final_norm}); the artifact is inconsistent — re-export"
     )
-    rms_norm_eps = float(meta.get("rms_norm_eps") or 1e-5)
+    # Explicit None check, not `or`: a legitimately-recorded eps of 0.0 is
+    # falsy and must survive (coercing it to 1e-5 would mismatch the artifact).
+    _eps = meta.get("rms_norm_eps")
+    rms_norm_eps = 1e-5 if _eps is None else float(_eps)
 
     return TorchwrightConfig(
         d=int(d),

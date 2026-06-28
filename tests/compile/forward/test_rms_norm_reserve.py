@@ -70,6 +70,27 @@ def test_non_power_of_two_width_raises():
         _reserve_rms_norm_columns(rmap, 384, 1e-5, _RMS_NORM_CONST_EXP)
 
 
+def test_const_exp_overflow_raises():
+    """A q so large the pinned energy overflows fp32 fails loudly, not silently
+    to inf inside the norm's square."""
+    rmap = ResidualStreamMap(1024)
+    with pytest.raises(ValueError, match="overflows fp32"):
+        _reserve_rms_norm_columns(rmap, 1024, 1e-5, 64)  # 2^128 -> inf
+
+
+def test_eps_above_rms_lsb_raises_but_zero_is_fine():
+    """eps large enough to perturb the forced mean-square breaks the identity and
+    must raise; eps=0.0 (falsy but valid, below the LSB) must be accepted."""
+    rmap = ResidualStreamMap(1024)
+    with pytest.raises(ValueError, match="too large for the forced RMS"):
+        _reserve_rms_norm_columns(rmap, 1024, 1e20, _RMS_NORM_CONST_EXP)
+    # 0.0 is below the LSB and legitimate — must not be coerced or rejected.
+    spec = _reserve_rms_norm_columns(
+        ResidualStreamMap(1024), 1024, 0.0, _RMS_NORM_CONST_EXP
+    )
+    assert spec.eps == 0.0
+
+
 def _rmsnorm_identity_holds(d, n_const, q, data_energy, eps=1e-5):
     """Build a residual with the pinned constant + random data scaled to a given
     Sigma data^2, run a real RMSNorm with gain=2^m, and report whether the data
