@@ -75,24 +75,38 @@ implicit.
 
 ### Two gain variants
 
-We **[LOCKED: require an even power-of-two residual width]** (see Constraints),
-which makes the power-of-two-RMS gain bit-exact for *every* graph. The formula
-gain is recorded only as the fallback this commitment lets us avoid.
+The committed design **[LOCKED: pin the constant energy so the forced RMS is an
+exact power of two]** (see Constraints), which makes the gain bit-exact for
+*every* graph at any power-of-two width. The formula gain is recorded only as
+the fallback this commitment lets us avoid.
 
-- **Power-of-two-RMS gain (committed)** `C = 2^p`. With residual width
-  `d = 2^b` and `b` **even**, set the constant column `= 2^q`; the forced RMS is
-  `rms = sqrt(2^(2q)/2^b) = 2^(q - b/2)`, an exact power of two precisely
-  *because `b` is even*. Set the gain `= 2^(q - b/2)`. Then `÷C` and `×C` are
-  pure exponent shifts — **bit-exact for any float** (modulo a denormal-scale
-  floor for near-zero data). Required for DOOM (see Evidence). Reserve the
-  constant *inside* the existing even-power-of-two `d` (one of the `d=1024=2^10`
-  columns), so the RMS denominator stays `d`, **there is no width blowup**, and
-  matmul shapes are unchanged.
+- **Power-of-two-RMS gain (committed)** Pin the constant column(s) so the total
+  pinned energy is `d · 2^(2m)` for integer `m`; the forced
+  `rms = sqrt(d·2^(2m)/d) = 2^m` is then an exact power of two. Set the gain
+  `= 2^m`. Then `÷rms` and `×gain` are pure exponent shifts — **bit-exact for
+  any float** (modulo a denormal-scale floor for near-zero data). Required for
+  DOOM (see Evidence).
+
+  **How many constant columns** depends on the width `d = 2^b`. One column
+  `= 2^q` contributes energy `2^(2q)` (an *even* power of two), so its RMS
+  `2^(q - b/2)` is an exact power of two **only when `b` is even** (`d=1024=2^10`
+  ✓). When `b` is **odd** — DOOM runs at `d=8192=2^13` — a single column lands
+  the RMS on `2^(q-7)·√2`, which is not representable in fp32 and breaks
+  bit-exactness (the `1±ε` scaling the cancel-head analysis below warns about).
+  The fix: use **two equal columns** `= 2^q`. Their combined energy `2^(2q+1)`
+  is an *odd* power of two, so `rms = sqrt(2^(2q+1)/2^13) = 2^(q-6)` is again an
+  exact power of two. **General rule: one constant column for even-power-of-two
+  widths, two equal columns for odd-power-of-two widths.** Reserve the column(s)
+  *inside* the existing `d` (they ride in the embedding alongside the graph's
+  other baked-in constants — see the allocator note), so the RMS denominator
+  stays `d`, **there is no width blowup**, and matmul shapes are unchanged. The
+  two-column layout at 8192 is **pending prototype confirmation** (Evidence
+  gap 3 / Open questions).
 - **Formula gain (fallback, not used)** `C = sqrt(K/d)` (K = constant energy).
   Bit-exact for exactly-representable values (the calculator's one-hots and
   integers), but ~`6e-8` relative error per norm on *arbitrary* floats (two
   roundings: `÷C` then `×C`). Bounded, not compounding — but it would require a
-  per-graph cancel-heads re-validation (see below), which the even-power-of-two
+  per-graph cancel-heads re-validation (see below), which the power-of-two-RMS
   commitment removes.
 
 ### Cancel-heads: the reason DOOM needs bit-exactness
@@ -137,7 +151,7 @@ vs. normed forward:
   not compound).
 - Power-of-two gain: `max|Δ| = 0`, **bit-exact**, even with `eps=1e-6`.
 
-**Two gaps in the current evidence (hardening actions, not yet done):**
+**Three gaps in the current evidence (hardening actions, not yet done):**
 1. The pow2 prototype measured bit-exactness at width **4096**, not the
    committed reserve-inside-`1024` layout: it *appends* the constant to a full
    1024-wide data block (width 1025) and pads up to the next even power of two
@@ -148,6 +162,11 @@ vs. normed forward:
    while data energy stays swamped at *every* layer, and residual energy grows
    with depth. Stress the constant against the **deepest-layer** residual energy,
    not just the input — this is the real risk for DOOM's depth.
+3. Both prototypes ran at **even**-power-of-two widths (1024, 4096), so the
+   odd-power-of-two case was never exercised. DOOM runs at `d=8192=2^13` (odd),
+   where a single constant column cannot make the RMS a power of two. Prototype
+   the **two-equal-column** layout at 8192 and confirm `max|Δ| = 0` *and* that
+   cancel-heads survive, before committing the rule.
 
 ## Design decisions (LEANINGS unless marked)
 
@@ -213,19 +232,24 @@ why the constant cannot honestly live in the graph/embedding. The split:
 
 ## Constraints (state upfront)
 
-- **[LOCKED] Even-power-of-two residual width.** Bit-exactness needs
-  `rms = 2^(q - b/2)` to be an exact power of two, where width `= 2^b`; that
-  requires `b` **even**. `d=1024=2^10` qualifies (the default);
-  `d=2048=2^11` does **not** (it forces a non-power-of-two RMS and a width pad).
-  The compiler does not enforce this today (`d` only needs `d % d_head == 0`,
-  `compiler/components/attn.py`), so the norm path must assert it.
+- **[LOCKED] Pin the constant energy for an exact power-of-two RMS.**
+  Bit-exactness needs the forced `rms` to be an exact power of two. Pin the total
+  constant energy to `d · 2^(2m)`: **one** constant column `= 2^q` for
+  even-power-of-two widths, **two equal** columns for odd-power-of-two widths
+  (DOOM's `d=8192=2^13` needs two — see *Two gain variants*). The width must be a
+  power of two (so `E/d` is a power of two); the compiler does not require this
+  today (`d` only needs `d % d_head == 0`, `compiler/components/attn.py`), so the
+  norm path must assert `d` is a power of two and pick the column count from the
+  parity of `b = log2(d)`. A non-power-of-two width is unsupported and must raise.
 - **The constant must out-energy all live data, quantified.** For the mean of
-  squares to round to exactly `2^(2q-b)`, the total data energy must satisfy
-  `Σ data_i^2 < 2^(2q-24)` (the fp32 mantissa is 23 bits; this is roughly
-  "constant² exceeds total data energy by a factor of `2^24 ≈ 1.7e7`"). Pick `q`
-  with margin against the **deepest-layer** energy. Example: `q=30` →
-  `const² = 2^60`, tolerates `Σ data² < ~7e10`; well clear of fp32 overflow at
-  `~3.4e38`. Raise `q` if a deep layer's energy approaches the bound.
+  squares to round to exactly `2^(2m)`, the total data energy must satisfy
+  `Σ data_i^2 < E · 2^-24`, where `E = d·2^(2m)` is the pinned energy (the fp32
+  mantissa is 24 bits; this is roughly "pinned energy exceeds total data energy
+  by a factor of `2^24 ≈ 1.7e7`"). Pick the constant with margin against the
+  **deepest-layer** energy. Example at `d=8192` with two columns `= 2^30`:
+  `E = 2^61`, `rms = 2^24` (gain ≈ `1.7e7`), tolerates `Σ data² < ~1.4e11`; well
+  clear of fp32 overflow at `~3.4e38`. Raise the constant if a deep layer's
+  energy approaches the bound.
 - **RMSNorm, not LayerNorm** — LayerNorm subtracts the mean, which the large
   constants would dominate and which would shift every data column.
 - **Shipped-file hermeticity + converter gate** — restated from decisions 1/5:
@@ -248,10 +272,11 @@ why the constant cannot honestly live in the graph/embedding. The split:
    `torchwright_doom` submodule, not tested here) by diffing a rendered frame
    against baseline — especially the cancel-heads paths and the deepest-layer
    energy bound.
-5. **Re-run/re-measure the prototypes** against post-merge APIs and in the
-   committed reserve-inside-`1024` layout (Evidence gaps 1–2). Production HF
-   export uses `calculator_v2` (`examples/calculator_hf_export.py`), not the
-   `calculator_simple` the prototype compiles — validate on the graph that ships.
+5. **Re-run/re-measure the prototypes** against post-merge APIs, in the committed
+   reserve-inside layout, and at DOOM's odd-power-of-two width with two columns
+   (Evidence gaps 1–3). Production HF export uses `calculator_v2`
+   (`examples/calculator_hf_export.py`), not the `calculator_simple` the prototype
+   compiles — validate on the graph that ships.
 
 ## Out of scope / not done
 
