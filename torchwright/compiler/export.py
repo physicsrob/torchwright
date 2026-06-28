@@ -821,6 +821,24 @@ def _emit_cached_preamble(nodes: list) -> None:
     add("Gather", ["pos_encoding_full", "cache_position"], ["pos"], axis=0)
 
 
+def _emit_rmsnorm(node, x: str, gain: str, eps: str, out: str, scratch: str) -> None:
+    """Emit opset-14 RMSNorm ops: ``out = x / sqrt(mean(x^2, -1) + eps) * gain``.
+
+    ``node`` is the layer's ``make_node`` closure; ``scratch`` namespaces the
+    intermediate tensor names.  With the pinned constant forcing
+    ``mean(x^2) == 2^(2m)`` exactly, ``sqrt`` returns ``2^m`` and both the
+    ``Div`` and the final ``Mul`` (gain ``= 2^m``) are pure exponent shifts —
+    the norm is the bit-exact identity.  (ReduceMean takes ``axes`` as an
+    attribute in opset 14; it became an input only in opset 18.)
+    """
+    node("Mul", [x, x], [f"{scratch}_sq"])
+    node("ReduceMean", [f"{scratch}_sq"], [f"{scratch}_ms"], axes=[-1], keepdims=1)
+    node("Add", [f"{scratch}_ms", eps], [f"{scratch}_msx"])
+    node("Sqrt", [f"{scratch}_msx"], [f"{scratch}_rms"])
+    node("Div", [x, f"{scratch}_rms"], [f"{scratch}_normed"])
+    node("Mul", [f"{scratch}_normed", gain], [out])
+
+
 def _emit_cached_layer_nodes(
     nodes: list,
     layer_idx: int,
@@ -829,6 +847,8 @@ def _emit_cached_layer_nodes(
     d_head: int,
     n_heads: int,
     scatter_idx_col: str = "_cache_pos_col",
+    rms_norm: bool = False,
+    rms_eps_name: Optional[str] = None,
 ) -> str:
     """Emit cached attention + FFN nodes for one layer.
 
@@ -866,18 +886,33 @@ def _emit_cached_layer_nodes(
     def node(op, ins, outs, **attrs):
         nodes.append(helper.make_node(op, ins, outs, **attrs))
 
+    # Pre-norm: the attention sublayer reads norm(current_res); the residual
+    # skip (below) stays the un-normed current_res, so the stream is never
+    # overwritten with normed values.  The norm is the bit-exact identity.
+    attn_in = current_res
+    if rms_norm:
+        attn_in = f"{p}_attn_normed"
+        _emit_rmsnorm(
+            node,
+            current_res,
+            f"{p}_input_layernorm",
+            rms_eps_name,
+            attn_in,
+            f"{p}_attn_norm",
+        )
+
     # Project Q, K_new, V_new from the new rows in sequence-major
     # (n_new, n_heads, d_head).  The deltas (new rows only) are the graph
     # outputs the runtime writes into its owned cache tail; the reshape
     # constant l{i}_qkv_view_shape = [0, n_heads, d_head] copies n_new from
     # the flat (n_new, hd) projection.
-    node("MatMul", [current_res, f"{p}_WQ"], [f"{p}_Q_flat"])
+    node("MatMul", [attn_in, f"{p}_WQ"], [f"{p}_Q_flat"])
     node("Reshape", [f"{p}_Q_flat", f"{p}_qkv_view_shape"], [f"{p}_Q_sm"])
 
-    node("MatMul", [current_res, f"{p}_WK"], [f"{p}_K_flat"])
+    node("MatMul", [attn_in, f"{p}_WK"], [f"{p}_K_flat"])
     node("Reshape", [f"{p}_K_flat", f"{p}_qkv_view_shape"], [f"delta_K_{layer_idx}"])
 
-    node("MatMul", [current_res, f"{p}_WV"], [f"{p}_V_flat"])
+    node("MatMul", [attn_in, f"{p}_WV"], [f"{p}_V_flat"])
     node("Reshape", [f"{p}_V_flat", f"{p}_qkv_view_shape"], [f"delta_V_{layer_idx}"])
 
     # Attention runs in the ORIGINAL head-major Transpose+MatMul form — the
@@ -929,8 +964,22 @@ def _emit_cached_layer_nodes(
     node("MatMul", [f"{p}_ctx_flat", f"{p}_WO"], [f"{p}_attn_sum"])
     node("Add", [current_res, f"{p}_attn_sum"], [f"{p}_res_attn"])
 
+    # Pre-norm: the MLP reads norm(res_attn); the residual skip (below) stays
+    # the un-normed res_attn.  Bit-exact identity, same as the attention norm.
+    mlp_in = f"{p}_res_attn"
+    if rms_norm:
+        mlp_in = f"{p}_mlp_normed"
+        _emit_rmsnorm(
+            node,
+            f"{p}_res_attn",
+            f"{p}_post_attention_layernorm",
+            rms_eps_name,
+            mlp_in,
+            f"{p}_mlp_norm",
+        )
+
     # FFN + skip
-    node("MatMul", [f"{p}_res_attn", f"{p}_W1"], [f"{p}_l1_m"])
+    node("MatMul", [mlp_in, f"{p}_W1"], [f"{p}_l1_m"])
     node("Add", [f"{p}_l1_m", f"{p}_b1"], [f"{p}_l1_b"])
     node("Relu", [f"{p}_l1_b"], [f"{p}_l1_r"])
     node("MatMul", [f"{p}_l1_r", f"{p}_W2"], [f"{p}_l2_m"])
@@ -1036,6 +1085,9 @@ def compile_to_onnx(
     extra_metadata: Optional[dict] = None,
     cache_stride: Optional[int] = None,
     debug_sidecar: bool = True,
+    rms_norm: Optional[bool] = None,
+    rms_norm_eps: float = 1e-5,
+    rms_norm_const_exp: Optional[int] = None,
 ) -> OnnxArtifact:
     """Compile a token-I/O graph to a KV-cached ONNX model.
 
@@ -1094,10 +1146,34 @@ def compile_to_onnx(
     full-width dirty cancel, while the replay only clears the genuinely-dirty
     initial-pool subset).  No ONNX caller can supply a non-zero stream, so
     ``True`` is always sound for this entry point.
+
+    ``rms_norm`` emits a real RMSNorm — pre-norm on each sublayer input plus a
+    final norm — that acts as the bit-exact identity: a reserved column holds a
+    pinned constant so the forced RMS is an exact power of two and the uniform
+    gain cancels it.  This makes the artifact a stock Llama-style decoder (a
+    skeptic can't say "no normalization"); it adds the gain weights as
+    initializers (mapped by ``convert.py``) and folds the constant into
+    ``embed_table`` (no new buffer).  The construction requires a power-of-two
+    ``d``, so the default (``None``) emits the norm exactly when ``d`` is a
+    power of two and is otherwise a no-op; ``True`` forces it (and raises on a
+    non-power-of-two ``d``); ``False`` disables it.  ``rms_norm_eps`` (Llama
+    default ``1e-5``) is recorded in the meta; it sits below the forced RMS's
+    LSB, so it does not affect bit-exactness.  ``rms_norm_const_exp`` (``q``)
+    overrides the pinned-constant exponent for a graph whose deepest-layer
+    energy needs more margin (see ``forward_compile``).
     """
     # Validate the cache config up front — a ValueError after the
     # (potentially very long) streaming compile would waste the whole run.
     cache_stride_resolved = _resolve_cache_stride(cache_stride, max_seq_len)
+
+    # Resolve the norm policy.  The pinned-constant RMS is exact only at a
+    # power-of-two ``d``; the default (None) therefore emits the norm exactly
+    # when ``d`` is a power of two (every shipped artifact — calculator 1024,
+    # DOOM 8192 — is), and otherwise behaves as before (no norm).  An explicit
+    # ``rms_norm=True`` at a non-power-of-two ``d`` is a contradiction
+    # forward_compile raises on; ``rms_norm=False`` is always off.
+    d_is_pow2 = d > 0 and (d & (d - 1)) == 0
+    rms_norm_on = d_is_pow2 if rms_norm is None else bool(rms_norm)
 
     # Assert/DebugWatch coverage must be collected BEFORE forward_compile
     # strips both wrapper kinds from the graph in-place.
@@ -1133,7 +1209,17 @@ def compile_to_onnx(
         optimize=optimize,
         assume_zero_init=assume_zero_init,
         d_hidden=d_hidden,
+        rms_norm=rms_norm_on,
+        rms_norm_eps=rms_norm_eps,
+        # None -> forward_compile's default q; an explicit value tunes the
+        # pinned constant for a graph whose deepest-layer energy needs it.
+        **(
+            {}
+            if rms_norm_const_exp is None
+            else {"rms_norm_const_exp": rms_norm_const_exp}
+        ),
     )
+    rms_spec = compiled.rms_norm_spec
     t_compile = time.perf_counter() - t0
     if verbose and per_layer_n_heads:
         _max_heads = d // d_head
@@ -1209,6 +1295,16 @@ def compile_to_onnx(
     embed_table = np.zeros((vocab_size, d), dtype=np.float32)
     embed_table[:, embedding_indices] = embed_table_compact
 
+    # Pinned-constant RMSNorm seed: write 2^q into the reserved column(s) for
+    # EVERY vocab row, so the per-token gather reproduces the constant at every
+    # position.  The reserved columns are allocated to no node, so every weight
+    # row that reads them is zero — the constant contributes nothing to any
+    # matmul or to lm_head, yet it dominates mean(x^2) so the forced RMS is an
+    # exact power of two.  This is the only genuine new seed constant.
+    if rms_spec is not None:
+        for j in rms_spec.reserved_cols:
+            embed_table[:, j] = rms_spec.const_value
+
     # Untied unembed weight in nn.Linear (out, in) == (vocab, d) convention,
     # nonzero only at the output node's residual columns.  logits = res @ W.T
     # sums over all d columns, but W is exactly zero off the output columns, so
@@ -1226,6 +1322,26 @@ def compile_to_onnx(
     _add_float_init("pos_encoding_full", pos_encoding_full, dense_inits, sparse_inits)
     _add_float_init("embed_table", embed_table, dense_inits, sparse_inits)
     _add_float_init("lm_head", lm_head, dense_inits, sparse_inits)
+    # Pinned-constant RMSNorm gain weights (Llama3-named on the HF side): one
+    # per pre-attention norm, one per pre-MLP norm, and a final norm.  Each is a
+    # uniform (d,) vector = 2^m, which cancels the forced rms = 2^m exactly.  A
+    # single shared eps scalar feeds every norm.
+    if rms_spec is not None:
+        gain_vec = np.full(d, rms_spec.gain, dtype=np.float32)
+        for i in range(n_layers):
+            _add_float_init(
+                f"l{i}_input_layernorm", gain_vec, dense_inits, sparse_inits
+            )
+            _add_float_init(
+                f"l{i}_post_attention_layernorm", gain_vec, dense_inits, sparse_inits
+            )
+        _add_float_init("final_norm", gain_vec, dense_inits, sparse_inits)
+        _add_float_init(
+            "_rms_eps",
+            np.array([rms_spec.eps], dtype=np.float32),
+            dense_inits,
+            sparse_inits,
+        )
     # Baked slot indices [0..S), S = the FULL stride: the preamble slices
     # this GPU-resident constant to the bound prefix length S_eff and the
     # causal mask compares the slice against cache_position.  Keeping the
@@ -1265,7 +1381,18 @@ def compile_to_onnx(
             d_head,
             per_layer_n_heads[i],
             scatter_idx_col="_cache_pos_col",
+            rms_norm=rms_spec is not None,
+            rms_eps_name="_rms_eps" if rms_spec is not None else None,
         )
+
+    # Final norm before the unembed (Llama-style), the bit-exact identity.  It
+    # reads ALL d columns for mean(x^2), so every column must stay finite — the
+    # pinned constant is finite and scratch/freed columns are zero.
+    if rms_spec is not None:
+        _emit_rmsnorm(
+            add, current_res, "final_norm", "_rms_eps", "_final_normed", "_final_norm"
+        )
+        current_res = "_final_normed"
 
     # Untied unembed over the full residual stream: logits = res @ lm_head.T.
     # lm_head is zero off the output node's columns, so the rest of the residual
@@ -1312,6 +1439,11 @@ def compile_to_onnx(
         # The full static slot count S: with the symbolic cache_slots
         # first dim on past_K_i, loaders read S from here.
         "cache_stride": cache_stride_resolved,
+        # Whether a real (identity) RMSNorm is emitted, and its epsilon — the HF
+        # converter needs the eps to build the config (the gain weights it reads
+        # from the initializers, but eps is not a tensor).
+        "rms_norm": rms_spec is not None,
+        "rms_norm_eps": rms_spec.eps if rms_spec is not None else None,
     }
     if extra_metadata:
         token_meta["extra"] = dict(extra_metadata)

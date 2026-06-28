@@ -16,13 +16,19 @@ The forward path is transcribed one-for-one from the compiler's ONNX emission
     res      = embed_table[input_ids]              # (B, T, d) — vanilla lookup
     res      = res + pos_encoding_full[cache_position]  # additive absolute PE
     for each layer:
-        res  = res + attn(res)                     # causal, scale=1.0, no bias
-        res  = res + linear2(relu(linear1(res)))   # both linears biased
-    logits   = lm_head(res)                        # UNTIED, full-width, no bias
+        res  = res + attn(norm(res))               # causal, scale=1.0, no bias
+        res  = res + linear2(relu(linear1(norm(res))))  # both linears biased
+    logits   = lm_head(norm(res))                  # UNTIED, full-width, no bias
+
+The ``norm`` is a real RMSNorm that computes the **identity** (the compiler
+pins the residual RMS to a power of two and sets the gain to cancel it; see
+:class:`TorchwrightRMSNorm`).  When ``config.rms_norm`` is off it is
+``nn.Identity`` and the path reduces to plain ``res + attn(res)``.
 
 Correctness invariants (all from the compiler source; see the config docstring):
 
-* No normalization anywhere; no final norm.
+* Normalization is a pre-norm RMSNorm (plus a final norm) that is the exact
+  identity, or absent (``rms_norm`` off) — never a value-changing norm.
 * Attention uses ``scale=1.0`` (no ``1/sqrt(d_head)``) and the exact-math SDPA
   backend. The cancel-heads trick the compiler uses relies on
   ``attn_out + skip == 0`` *algebraically*; a single fp32-LSB perturbation from
@@ -130,13 +136,48 @@ class TorchwrightMLP(nn.Module):
         return self.linear2(F.relu(self.linear1(x)))
 
 
+class TorchwrightRMSNorm(nn.Module):
+    """RMSNorm ``x / sqrt(mean(x^2, -1) + eps) * weight`` — exactly Llama's.
+
+    In a compiled torchwright model it computes the **identity**: a reserved
+    residual column pins ``mean(x^2)`` to a power of two and ``weight`` is the
+    uniform gain that cancels it, so ``norm(x) == x`` bit-for-bit. It is still a
+    genuine RMSNorm op (runs on any standard engine); the magnitude of
+    ``weight`` is the only tell that it was compiled rather than trained. fp32
+    only, like the rest of the model.
+    """
+
+    def __init__(self, d: int, eps: float):
+        super().__init__()
+        self.weight = nn.Parameter(torch.ones(d))
+        self.eps = float(eps)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        ms = x.pow(2).mean(-1, keepdim=True)
+        return x * torch.rsqrt(ms + self.eps) * self.weight
+
+
 class TorchwrightDecoderLayer(nn.Module):
-    """One block: ``x = x + attn(x); x = x + mlp(x)`` — no normalization."""
+    """One block. Pre-norm Llama-style when ``config.rms_norm`` (the norm is an
+    identity — see :class:`TorchwrightRMSNorm`): ``x = x + attn(norm(x)); x = x
+    + mlp(norm(x))``. With ``rms_norm`` off the norms are ``nn.Identity`` and it
+    is plain ``x = x + attn(x); x = x + mlp(x)``."""
 
     def __init__(self, config: TorchwrightConfig, layer_idx: int):
         super().__init__()
         self.self_attn = TorchwrightAttention(config, layer_idx)
         self.mlp = TorchwrightMLP(config, layer_idx)
+        # Pre-norm on each sublayer input; the residual skip stays un-normed.
+        # Identity when the artifact has no norm, so no stray weights appear in
+        # the state dict (the converter emits gains only when rms_norm is on).
+        if config.rms_norm:
+            self.input_layernorm = TorchwrightRMSNorm(config.d, config.rms_norm_eps)
+            self.post_attention_layernorm = TorchwrightRMSNorm(
+                config.d, config.rms_norm_eps
+            )
+        else:
+            self.input_layernorm = nn.Identity()
+            self.post_attention_layernorm = nn.Identity()
 
     def forward(
         self,
@@ -146,9 +187,14 @@ class TorchwrightDecoderLayer(nn.Module):
         cache_position: torch.Tensor,
     ) -> torch.Tensor:
         hidden_states = hidden_states + self.self_attn(
-            hidden_states, attn_mask, past_key_values, cache_position
+            self.input_layernorm(hidden_states),
+            attn_mask,
+            past_key_values,
+            cache_position,
         )
-        hidden_states = hidden_states + self.mlp(hidden_states)
+        hidden_states = hidden_states + self.mlp(
+            self.post_attention_layernorm(hidden_states)
+        )
         return hidden_states
 
 
@@ -195,6 +241,14 @@ class TorchwrightModel(TorchwrightPreTrainedModel):
         )
         self.layers = nn.ModuleList(
             [TorchwrightDecoderLayer(config, i) for i in range(config.n_layers)]
+        )
+        # Final norm before the unembed (Llama-style). Identity when off, like
+        # the per-layer norms — and an identity even when on (see
+        # TorchwrightRMSNorm).
+        self.norm = (
+            TorchwrightRMSNorm(config.d, config.rms_norm_eps)
+            if config.rms_norm
+            else nn.Identity()
         )
         self.post_init()
 
@@ -299,6 +353,8 @@ class TorchwrightModel(TorchwrightPreTrainedModel):
 
         for layer in self.layers:
             res = layer(res, mask, past_key_values, cache_position)
+
+        res = self.norm(res)  # final norm (identity); no-op when rms_norm off
 
         return BaseModelOutputWithPast(
             last_hidden_state=res,

@@ -15,10 +15,17 @@ of ``compile_to_onnx``). The values are filled in by
 ``compiler/hf/convert.py`` from the ONNX artifact's initializer shapes; nothing
 here is a free hyperparameter.
 
+Normalization is the one knob here: ``rms_norm`` toggles a real RMSNorm
+(pre-norm on each sublayer input plus a final norm, Llama-style). It is *not*
+a free hyperparameter — it computes the identity. The compiler pins the
+residual RMS to a power of two with a reserved constant column and sets the
+gain to cancel it, so ``norm(x) == x`` bit-for-bit; the norm is there for
+architectural faithfulness (a stock decoder has normalization), not to change
+any value. ``rms_norm_eps`` is the standard epsilon, recorded for fidelity.
+
 Architecture invariants this config does NOT carry a knob for, because the
 compiler never varies them:
 
-* No normalization anywhere (no LayerNorm / RMSNorm, no final norm).
 * Attention is causal with ``scale=1.0`` (no ``1/sqrt(d_head)``), no bias.
 * MLP is ``linear2(relu(linear1(x)))``, both linears biased.
 * Positional encoding is plain additive absolute PE.
@@ -40,9 +47,10 @@ class TorchwrightConfig(PretrainedConfig):
     head trimming keeps it uniform; only the internal head count and MLP hidden
     width vary per layer). The token head looks up a ``(vocab_size, d)``
     embedding table straight into the residual stream, adds a ``(max_seq, d)``
-    absolute positional encoding and a constant vector, runs ``n_layers``
-    attention+MLP blocks, and unembeds with an untied ``(vocab_size, d)``
-    ``lm_head`` over the full residual.
+    absolute positional encoding, runs ``n_layers`` attention+MLP blocks (each
+    pre-normed by an identity RMSNorm when ``rms_norm``), and unembeds with an
+    untied ``(vocab_size, d)`` ``lm_head`` over the full residual (after a final
+    identity RMSNorm when ``rms_norm``).
 
     Args:
         d: Residual stream width (also the embedding/unembedding table width).
@@ -59,6 +67,11 @@ class TorchwrightConfig(PretrainedConfig):
         cache_stride: The static KV-cache slot count ``S`` baked into the
             source ONNX artifact, kept for provenance. The native model uses a
             stock unbounded cache.
+        rms_norm: Whether the model has a real (identity) RMSNorm — pre-norm on
+            each sublayer plus a final norm. The gain weights live in the state
+            dict; the norm computes the identity (see the module docstring).
+        rms_norm_eps: RMSNorm epsilon (Llama default ``1e-5``). Recorded for
+            fidelity; it sits below the pinned RMS's LSB, so it changes nothing.
     """
 
     model_type = "torchwright"
@@ -74,6 +87,8 @@ class TorchwrightConfig(PretrainedConfig):
         max_seq: int = 0,
         head_kind: str = "token",
         cache_stride: int | None = None,
+        rms_norm: bool = False,
+        rms_norm_eps: float = 1e-5,
         **kwargs,
     ):
         self.d = int(d)
@@ -85,6 +100,8 @@ class TorchwrightConfig(PretrainedConfig):
         self.max_seq = int(max_seq)
         self.head_kind = head_kind
         self.cache_stride = None if cache_stride is None else int(cache_stride)
+        self.rms_norm = bool(rms_norm)
+        self.rms_norm_eps = float(rms_norm_eps)
         # Aliases so generic transformers utilities that reach for the canonical
         # field names (cache sizing, repr, sharding heuristics) find them. We own
         # them here and recompute from our own fields, so drop any (possibly

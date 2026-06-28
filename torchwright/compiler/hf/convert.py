@@ -18,6 +18,9 @@ Initializer → parameter map (ground truth: ``compiler/export.py``
     embed_table              -> model.embed_tokens.weight  (vocab, d)
     lm_head                  -> lm_head.weight              (vocab, d)  UNTIED
     pos_encoding_full        -> model.pos_encoding_full    (max_seq, d)
+    l{i}_input_layernorm     -> model.layers.{i}.input_layernorm.weight          (d,)
+    l{i}_post_attention_layernorm -> model.layers.{i}.post_attention_layernorm.weight (d,)
+    final_norm               -> model.norm.weight          (d,)   [rms_norm only]
     l{i}_WQ/WK/WV  (d, hd)   -> q/k/v_proj.weight  = M.T    (hd, d)
     l{i}_WO        (hd, d)   -> o_proj.weight      = M.T    (d, hd)
     l{i}_W1        (d, d_h)  -> linear1.weight     = M.T    (d_h, d)
@@ -54,6 +57,9 @@ _IGNORABLE_EXACT = {
     "_f32_causal_sentinel_s",
     "_axes0_1d",
     "_axes1_1d",
+    # RMSNorm epsilon scalar: a structural constant, not a weight — the eps
+    # rides into the HF config via the meta, so this initializer is unmapped.
+    "_rms_eps",
 }
 _IGNORABLE_SUFFIX = ("_qkv_view_shape", "_ctx_flat_shape")
 
@@ -161,6 +167,18 @@ def build_config(
     bos_id = _token_id(bos_token, "bos")
     eos_id = _token_id(eos_token, "eos")
 
+    # RMSNorm: the gain weights are read from the initializers (build_state_dict);
+    # the eps is not a tensor, so it rides in via the meta.  A norm-on artifact
+    # carries a `final_norm` weight — cross-check the meta flag against it so a
+    # malformed pairing fails loudly rather than silently dropping the norm.
+    rms_norm = bool(meta.get("rms_norm", False))
+    has_final_norm = "final_norm" in inits
+    assert rms_norm == has_final_norm, (
+        f"meta rms_norm={rms_norm} disagrees with the presence of a final_norm "
+        f"initializer ({has_final_norm}); the artifact is inconsistent — re-export"
+    )
+    rms_norm_eps = float(meta.get("rms_norm_eps") or 1e-5)
+
     return TorchwrightConfig(
         d=int(d),
         d_head=int(d_head),
@@ -175,6 +193,8 @@ def build_config(
         eos_token_id=eos_id,
         tie_word_embeddings=False,
         use_cache=True,
+        rms_norm=rms_norm,
+        rms_norm_eps=rms_norm_eps,
     )
 
 
@@ -214,6 +234,15 @@ def build_state_dict(config, inits: Dict[str, np.ndarray]) -> Tuple[dict, set]:
         sd[f"{p}.mlp.linear1.bias"] = _t(take(f"l{i}_b1"))
         sd[f"{p}.mlp.linear2.weight"] = _t(take(f"l{i}_W2").T)  # (d, d_h)
         sd[f"{p}.mlp.linear2.bias"] = _t(take(f"l{i}_b2"))
+        # RMSNorm gains (Llama3 names): uniform (d,) = 2^m.  Present iff norm on.
+        if config.rms_norm:
+            sd[f"{p}.input_layernorm.weight"] = _t(take(f"l{i}_input_layernorm"))
+            sd[f"{p}.post_attention_layernorm.weight"] = _t(
+                take(f"l{i}_post_attention_layernorm")
+            )
+
+    if config.rms_norm:
+        sd["model.norm.weight"] = _t(take("final_norm"))
 
     return sd, consumed
 

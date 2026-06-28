@@ -397,7 +397,13 @@ def test_token_onnx_meta_has_no_extra_key_when_omitted():
         with open(meta_path_for(onnx_path)) as f:
             meta = json.load(f)
         assert "extra" not in meta
-        assert set(meta) == {"format", "vocab", "cache_stride"}
+        assert set(meta) == {
+            "format",
+            "vocab",
+            "cache_stride",
+            "rms_norm",
+            "rms_norm_eps",
+        }
 
 
 # ===========================================================================

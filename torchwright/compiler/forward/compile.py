@@ -9,7 +9,8 @@ import copy
 import os
 import time
 import warnings
-from typing import Callable, Optional, Set
+from dataclasses import dataclass
+from typing import Callable, Optional, Set, Tuple
 
 import torch
 
@@ -49,6 +50,93 @@ from torchwright.compiler.residual_assignment import flatten_concat_nodes
 from torchwright.graph import Node, Linear, Concatenate
 from torchwright.graph.pos_encoding import PosEncoding
 from torchwright.graph.relu import ReLU
+
+# Default constant magnitude exponent q for the pinned-RMS norm: each reserved
+# column holds 2^q.  Bit-exactness of the identity requires the data energy to
+# stay below the constant's reduction half-ULP: roughly Sigma data^2 <
+# 2^(2q - 24) (the tighter, partial-sum bound; see docs/plan_rmsnorm.md,
+# Constraints).  This bound is GRAPH-DEPENDENT, so q is a tunable knob
+# (rms_norm_const_exp); this is only the default.
+#
+# q=44 (gain 2^39 at d=1024) clears the shipping graph with margin: calculator_v2
+# reaches Sigma data^2 ~ 2.6e13 (2^44.6) on its squaring path (999*999, 999+1),
+# and 2^(2*44-24) = 2^64 ~ 1.8e19 leaves ~2^19 of headroom.  The earlier q=30
+# was validated only on calculator_simple (energy ~1e8) and SILENTLY broke the
+# identity on calculator_v2 — raise q (or measure the deepest-layer energy)
+# before trusting the norm on a new graph.
+_RMS_NORM_CONST_EXP = 44
+
+
+@dataclass(frozen=True)
+class RmsNormSpec:
+    """The pinned-constant RMSNorm layout chosen at compile time.
+
+    The norm is the identity.  A reserved residual column (two at odd
+    power-of-two widths) holds a large constant ``2^q`` whose energy forces
+    ``rms == 2^m`` exactly; the uniform gain ``2^m`` cancels it
+    (``x / rms * gain == x``), so ``÷rms`` and ``×gain`` are pure fp32 exponent
+    shifts and the identity is bit-exact for all floats.  See
+    ``docs/plan_rmsnorm.md``.
+
+    Attributes:
+        reserved_cols: the never-allocated residual columns holding the
+            constant; seeded into ``embed_table`` at export time.
+        const_value: ``2^q``, the per-column constant.
+        gain: ``2^m``, the uniform RMSNorm weight (every channel, every norm).
+        eps: ``rms_norm_eps`` (below the forced RMS's LSB, so bit-exactness is
+            eps-independent in the pinned regime).
+    """
+
+    reserved_cols: Tuple[int, ...]
+    const_value: float
+    gain: float
+    eps: float
+
+
+def _reserve_rms_norm_columns(
+    residual_map: ResidualStreamMap, d: int, eps: float, const_exp: int
+) -> RmsNormSpec:
+    """Reserve the pinned-constant column(s) and return the norm layout.
+
+    Reserves from the free pool *before* the layer loop, so the columns are
+    protected from allocation for the whole compile — never written, hence
+    holding the constant at every layer.  ``d`` must be a power of two (so the
+    forced ``rms = sqrt(E/d)`` is an exact power of two): one column for even
+    ``b = log2(d)``, two equal columns for odd ``b``.  ``const_exp`` is ``q``
+    (each reserved column holds ``2^q``); pick it with margin over the
+    deepest-layer data energy (see :data:`_RMS_NORM_CONST_EXP`).
+    """
+    b = d.bit_length() - 1
+    if (1 << b) != d:
+        raise ValueError(
+            f"rms_norm requires a power-of-two residual width; got d={d}. "
+            f"The pinned-constant RMS is exact only when E/d is a power of two."
+        )
+    # One column's energy 2^(2q) is an even power of two: rms = 2^(q-b/2) is a
+    # power of two only when b is even.  For odd b, two equal columns give
+    # combined energy 2^(2q+1) (odd power), restoring an exact power-of-two rms.
+    n_const = 1 if b % 2 == 0 else 2
+    q = const_exp
+    e_exp = 2 * q + (0 if n_const == 1 else 1)  # log2 of total pinned energy E
+    assert (e_exp - b) % 2 == 0, "rms exponent not integer — pinned-RMS layout bug"
+    m = (e_exp - b) // 2  # forced rms = 2^m
+
+    free_sorted = sorted(residual_map._free)
+    if len(free_sorted) < n_const:
+        raise RuntimeError(
+            f"rms_norm needs {n_const} free residual column(s) to pin the RMS at "
+            f"d={d}, but only {len(free_sorted)} are free after seeding inputs."
+        )
+    # The top free columns are highest-indexed; pos/input nodes allocate low, so
+    # these are reliably unused.  reserve() asserts they are in the free pool.
+    reserved = tuple(free_sorted[-n_const:])
+    residual_map.reserve(reserved)
+    return RmsNormSpec(
+        reserved_cols=reserved,
+        const_value=float(2**q),
+        gain=float(2**m),
+        eps=float(eps),
+    )
 
 
 class _TrackingResidualStreamMap(ResidualStreamMap):
@@ -405,6 +493,9 @@ def forward_compile(
     cpsat_flex_routing: bool = True,
     assume_zero_init: bool = False,
     require_solver: bool = False,
+    rms_norm: bool = False,
+    rms_norm_eps: float = 1e-5,
+    rms_norm_const_exp: int = _RMS_NORM_CONST_EXP,
 ) -> HeadlessTransformer:
     """Compile a computation graph into a HeadlessTransformer.
 
@@ -468,6 +559,19 @@ def forward_compile(
             (the default) the compile still falls back, but now emits a
             ``warnings.warn`` so the fallback is never silent.  Ignored
             when ``optimize=0``.
+        rms_norm: When True, reserve the pinned-constant column(s) and record
+            an :class:`RmsNormSpec` on the returned net (``net.rms_norm_spec``)
+            so the ONNX exporter can emit a real RMSNorm that acts as the
+            identity.  ``d`` must be a power of two.  Default False — the
+            in-process forward never applies the norm (it is a no-op), so this
+            only changes the column reservation and the recorded spec.
+        rms_norm_eps: The RMSNorm epsilon recorded on the spec (Llama default
+            ``1e-5``).  Below the forced RMS's LSB, so it does not affect
+            bit-exactness.  Ignored when ``rms_norm`` is False.
+        rms_norm_const_exp: ``q`` — each reserved column holds ``2^q``.  Must
+            give the deepest-layer data energy margin under ``2^(2q-24)`` or the
+            identity silently breaks (see :data:`_RMS_NORM_CONST_EXP`).  Ignored
+            when ``rms_norm`` is False.
 
     Returns:
         A HeadlessTransformer whose compute() method reproduces
@@ -529,6 +633,18 @@ def forward_compile(
     if assume_zero_init:
         residual_map.mark_clean(set(residual_map._free))
     computed = set(input_nodes)
+
+    # Pinned-constant RMSNorm: reserve the constant column(s) NOW, before the
+    # layer loop, so they are never allocated (hence never written) and hold the
+    # constant at every layer.  Off by default — a norm-off compile reserves
+    # nothing and is unchanged.  The reserved (column, value) + gain are recorded
+    # on the net for the ONNX exporter to fold into embed_table and the gain
+    # weights; the in-process forward never applies the norm (it is the identity).
+    net.rms_norm_spec = None
+    if rms_norm:
+        net.rms_norm_spec = _reserve_rms_norm_columns(
+            residual_map, d, rms_norm_eps, rms_norm_const_exp
+        )
 
     # Static sibling-cluster analysis for admission control.  When
     # disabled or no clusters are found, the scheduler behaves exactly
@@ -825,7 +941,7 @@ def forward_compile(
                 clusters=clusters,
                 admission_budget_fraction=admission_budget_fraction,
                 policy=policy,
-                    )
+            )
         else:
             if verbose and net.cpsat_solve_stats.status_name != "CACHED":
                 solve_time = time.perf_counter() - t_solve_start
@@ -843,7 +959,7 @@ def forward_compile(
                 clusters=clusters,
                 admission_budget_fraction=admission_budget_fraction,
                 policy=policy,
-                    )
+            )
     else:
         scheduler = LayerScheduler(
             graph,
@@ -854,7 +970,7 @@ def forward_compile(
             clusters=clusters,
             admission_budget_fraction=admission_budget_fraction,
             policy=policy,
-            )
+        )
 
     # Save input indices before scheduling (scheduling may free/reassign them)
     input_indices: dict[Node, list[int]] = {
