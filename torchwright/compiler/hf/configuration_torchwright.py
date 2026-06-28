@@ -22,8 +22,8 @@ compiler never varies them:
 * Attention is causal with ``scale=1.0`` (no ``1/sqrt(d_head)``), no bias.
 * MLP is ``linear2(relu(linear1(x)))``, both linears biased.
 * Positional encoding is plain additive absolute PE.
-* The unembedding is tied to ``embed_table.T`` after a column gather; no
-  output bias.
+* The unembedding is an untied ``lm_head`` Linear over the full residual
+  stream; no output bias.
 * fp32 throughout — a downcast to fp16/bf16 breaks correctness (the
   cancel-heads trick relies on exact algebraic cancellation).
 """
@@ -38,17 +38,15 @@ class TorchwrightConfig(PretrainedConfig):
 
     The residual stream is a uniform width ``d`` across all layers (per-layer
     head trimming keeps it uniform; only the internal head count and MLP hidden
-    width vary per layer). The token head projects a ``d_embed``-wide table
-    lookup into ``d``, adds a ``d_pos``-wide absolute positional encoding
-    projected into ``d``, runs ``n_layers`` attention+MLP blocks, gathers
-    ``d_output`` columns, and unembeds against the tied ``(vocab_size, d_embed)``
-    table.
+    width vary per layer). The token head looks up a ``(vocab_size, d)``
+    embedding table straight into the residual stream, adds a ``(max_seq, d)``
+    absolute positional encoding and a constant vector, runs ``n_layers``
+    attention+MLP blocks, and unembeds with an untied ``(vocab_size, d)``
+    ``lm_head`` over the full residual.
 
     Args:
-        d: Residual stream width.
+        d: Residual stream width (also the embedding/unembedding table width).
         d_head: Per-head dimension (shared across all layers and heads).
-        d_embed: Token embedding table width (also the gathered output width).
-        d_pos: Positional-encoding width (before projection into ``d``).
         vocab_size: Number of rows in the embedding table.
         n_layers: Number of attention+MLP blocks.
         n_heads_per_layer: List of length ``n_layers`` — trimmed head count
@@ -57,10 +55,7 @@ class TorchwrightConfig(PretrainedConfig):
             width for each layer.
         max_seq: Number of precomputed positional-encoding rows (the largest
             absolute position the model can encode).
-        d_output: Width of the output column gather feeding the unembed; equals
-            ``d_embed`` for a token model.
-        head_kind: ``"token"`` — the only head built today (a headless
-            float-I/O head is a noted future extension).
+        head_kind: ``"token"`` — the only head built today.
         cache_stride: The static KV-cache slot count ``S`` baked into the
             source ONNX artifact, kept for provenance. The native model uses a
             stock unbounded cache.
@@ -72,14 +67,11 @@ class TorchwrightConfig(PretrainedConfig):
         self,
         d: int = 0,
         d_head: int = 0,
-        d_embed: int = 0,
-        d_pos: int = 0,
         vocab_size: int = 0,
         n_layers: int = 0,
         n_heads_per_layer: list[int] | None = None,
         d_hidden_per_layer: list[int] | None = None,
         max_seq: int = 0,
-        d_output: int = 0,
         head_kind: str = "token",
         cache_stride: int | None = None,
         rope_base: float = 0.0,
@@ -88,14 +80,11 @@ class TorchwrightConfig(PretrainedConfig):
     ):
         self.d = int(d)
         self.d_head = int(d_head)
-        self.d_embed = int(d_embed)
-        self.d_pos = int(d_pos)
         self.vocab_size = int(vocab_size)
         self.n_layers = int(n_layers)
         self.n_heads_per_layer = [int(n) for n in (n_heads_per_layer or [])]
         self.d_hidden_per_layer = [int(n) for n in (d_hidden_per_layer or [])]
         self.max_seq = int(max_seq)
-        self.d_output = int(d_output)
         self.head_kind = head_kind
         self.cache_stride = None if cache_stride is None else int(cache_stride)
         # RoPE: rope_base 0.0 means "no rotary" (back-compat for the sinusoidal
@@ -114,4 +103,9 @@ class TorchwrightConfig(PretrainedConfig):
         kwargs.pop("hidden_size", None)
         self.num_hidden_layers = self.n_layers
         self.hidden_size = self.d
+        # Untied embeddings by default: the compiler emits a separate lm_head.
+        # PretrainedConfig defaults this to True, which would make HF's
+        # tie_weights() clone lm_head onto embed_tokens and corrupt the unembed
+        # (the two tables live at different residual columns).
+        kwargs.setdefault("tie_word_embeddings", False)
         super().__init__(**kwargs)

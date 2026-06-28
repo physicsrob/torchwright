@@ -13,15 +13,17 @@ subtractions at any magnitude; multiplications with comfortable digit margin).
 
 Why "reliable range": the multiply path computes ``a*b = ((a+b)^2 - (a-b)^2)/4``
 with a thermometer-coded piecewise-linear squaring whose intermediate reaches
-~4e6 for large operands. onnxruntime and torch accumulate that fp32 matmul
-reduction in different orders; once the difference exceeds a digit-quantization
+~4e6 for large operands. onnxruntime and torch can accumulate that fp32 matmul
+reduction in different orders (whether they actually differ depends on the
+backend builds); when they do and the difference exceeds a digit-quantization
 level's half-width (operands roughly >= 900), the two backends round one output
 digit to adjacent levels — a fixed ~1600 logit gap that flips a borderline
 argmax. There the compiled circuit is already at its numerical-noise budget
 (the ONNX oracle itself is wrong on e.g. 999*999). That is a property of the
 compiled arithmetic at the edge of its range, not of this reimplementation:
 additions/subtractions (no squaring) and smaller products are bit-identical, as
-the gate below asserts. See ``test_extreme_multiply_is_the_only_divergence``.
+the gate below asserts. See
+``test_extreme_multiply_at_most_one_digit_level_divergence``.
 
 CPU-only and deterministic, so the bar is exact-bit, not merely argmax.
 """
@@ -47,9 +49,24 @@ _EOS = "<eos>"
 # In-range gate: add/sub at any magnitude, mult with comfortable digit margin.
 # Every entry is bit-exact AND lands the correct answer (confirmed empirically).
 _GATE = [
-    "0+0\n", "7+8\n", "12+34\n", "999+1\n", "500+499\n", "123+456\n",
-    "9-4\n", "100-99\n", "45-67\n", "0-7\n", "999-1\n", "320-200\n",
-    "12*34\n", "9*9\n", "25*25\n", "100*7\n", "321*3\n", "123*4\n",
+    "0+0\n",
+    "7+8\n",
+    "12+34\n",
+    "999+1\n",
+    "500+499\n",
+    "123+456\n",
+    "9-4\n",
+    "100-99\n",
+    "45-67\n",
+    "0-7\n",
+    "999-1\n",
+    "320-200\n",
+    "12*34\n",
+    "9*9\n",
+    "25*25\n",
+    "100*7\n",
+    "321*3\n",
+    "123*4\n",
 ]
 
 # Documented edge cases: large-operand multiplies where the two fp32 backends
@@ -93,9 +110,7 @@ def _oracle_gen(oracle, text):
 
 
 def _hf_gen(model, tok2id, vocab, text):
-    ids = torch.tensor(
-        [[tok2id[t] for t in ([_BOS] + list(text))]], dtype=torch.int64
-    )
+    ids = torch.tensor([[tok2id[t] for t in ([_BOS] + list(text))]], dtype=torch.int64)
     with torch.no_grad():
         g = model.generate(
             ids,
@@ -105,7 +120,7 @@ def _hf_gen(model, tok2id, vocab, text):
             eos_token_id=tok2id[_EOS],
             pad_token_id=tok2id[_EOS],
         )
-    new = g[0, ids.shape[1]:].tolist()
+    new = g[0, ids.shape[1] :].tolist()
     return "".join(vocab[i] for i in new if i != tok2id[_EOS])
 
 
@@ -125,30 +140,32 @@ def test_greedy_token_identical_and_correct(model, oracle, tok2id, artifact_path
     assert h_out == expected, f"{text!r}: got {h_out!r}, want {expected!r}"
 
 
-def test_extreme_multiply_is_the_only_divergence(model, oracle, tok2id):
-    """Document that divergence appears ONLY at the squaring-path noise budget.
+def test_extreme_multiply_at_most_one_digit_level_divergence(model, oracle, tok2id):
+    """Extreme multiplies stay within one digit-level of the ONNX oracle.
 
     A structural bug (wrong cache, mask, or weight map) would corrupt every
-    expression; instead divergence is confined to large-operand multiplies, and
-    when it appears it is exactly one digit-level (a ~1600 logit gap) — the
-    fingerprint of a piecewise-linear boundary rounded differently by the two
-    fp32 backends, not noise in this reimplementation.
+    expression by a free-floating amount.  Instead, on the largest-operand
+    multiplies the native model and the ONNX oracle either agree bit-for-bit or
+    differ by exactly one digit-quantization level (a ~1600 logit gap) — the
+    fingerprint of a piecewise-linear boundary the two fp32 backends round to
+    adjacent levels.
+
+    Whether the gap actually appears is backend-dependent: it turns on the order
+    the squaring-path fp32 reduction is accumulated, which differs across
+    onnxruntime/torch builds (e.g. the CPU pair on Modal agrees bit-for-bit even
+    on 999*999, while other build pairs flip one level).  So we assert the
+    *bound*, not the gap's presence — never free-floating noise, never more than
+    one level — which is the property that actually distinguishes the squaring
+    boundary from a structural bug.
     """
-    diverged = []
     for text in _EXTREME:
         o, h = _prefill_logits(model, oracle, tok2id, text)
         d = (o - h).abs().max().item()
-        if d != 0.0:
-            diverged.append((text, d))
-            assert d == pytest.approx(1600.0, abs=1.0), (
-                f"{text}: unexpected divergence magnitude {d} — expected a single "
-                f"digit-level (~1600) boundary flip, not free-floating noise"
-            )
-    assert diverged, (
-        "expected the extreme multiplies to exercise the squaring-path boundary; "
-        "if they no longer diverge the calculator's precision improved — update "
-        "this test and the module docstring"
-    )
+        assert d == 0.0 or d == pytest.approx(1600.0, abs=1.0), (
+            f"{text}: divergence {d} is neither bit-exact nor a single "
+            f"digit-level (~1600) boundary flip — that signals free-floating "
+            f"noise or a structural bug, not the squaring-path quantization edge"
+        )
 
 
 def test_save_load_generate_round_trip(tmp_path, artifact_path, model, oracle, tok2id):
@@ -179,6 +196,6 @@ def test_save_load_generate_round_trip(tmp_path, artifact_path, model, oracle, t
             pad_token_id=reloaded_tok.eos_token_id,
         )
     out = reloaded_tok.decode(
-        g[0, enc["input_ids"].shape[1]:], skip_special_tokens=True
+        g[0, enc["input_ids"].shape[1] :], skip_special_tokens=True
     )
     assert out == "408", f"round-trip generate gave {out!r}"

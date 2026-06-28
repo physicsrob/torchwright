@@ -87,7 +87,6 @@ class AttnHeadOp:
         "compute_add",
         "cancel",
         "add_into",
-        "delta_transfer",
     ]
     node: Optional[Node]
     target_cols: List[int]
@@ -97,15 +96,12 @@ class AttnHeadOp:
     #   compute_linear: input columns
     #   compute_add: first addend's columns
     #   add_into: live addend's columns
-    #   delta_transfer: source columns (where the output value is)
     source_cols: Optional[List[int]] = None
     # compute_add: second addend's columns.
     source_cols_b: Optional[List[int]] = None
     # compute_attn: Q and K input columns (V is in source_cols).
     q_source_cols: Optional[List[int]] = None
     k_source_cols: Optional[List[int]] = None
-    # delta_transfer: subtract columns (same as target for overlay).
-    subtract_cols: Optional[List[int]] = None
 
 
 @dataclass
@@ -146,8 +142,6 @@ def write_attn_sublayer(
             _write_compute_add(attn, op, residual_map, pos_encoding, recorder)
         elif op.op_type == "add_into":
             _write_add_into(attn, op, residual_map, pos_encoding, recorder)
-        elif op.op_type == "delta_transfer":
-            _write_delta_transfer(attn, op, residual_map, pos_encoding, recorder)
         else:
             raise ValueError(f"Unknown attn op_type: {op.op_type}")
 
@@ -618,117 +612,6 @@ def _write_add_into(
             node=op.node,
             op_type=op.op_type,
         )
-
-
-def _write_delta_transfer(
-    attn,
-    op: AttnHeadOp,
-    rmap: ResidualStreamMap,
-    pos_encoding: PosEncoding,
-    recorder: Optional[PlacementRecorder] = None,
-):
-    """Transfer (source - subtract) to target columns via attention.
-
-    This operation computes: target_cols += (source_cols - subtract_cols)
-
-    After the skip connection, if target_cols originally held the same value
-    as subtract_cols (i.e., the input value), then:
-        result = original + (source - subtract)
-               = subtract + (source - subtract)
-               = source
-
-    This enables overlaid I/O where the output replaces the input in-place.
-
-    When 2 * chunk_size <= d_head, source (+1) and subtract (-1) are combined
-    into a single head: source maps into head dims [0:cs] with +1 output
-    coefficients, subtract into [cs:2*cs] with -1 output coefficients.
-    Otherwise falls back to one head per group.
-
-    Net effect: target_cols += source - subtract
-    """
-    assert op.source_cols is not None, "delta_transfer requires source_cols"
-    assert op.subtract_cols is not None, "delta_transfer requires subtract_cols"
-
-    d_head = attn.d_head
-    d_width = len(op.target_cols)
-
-    assert len(op.source_cols) == d_width
-    assert len(op.subtract_cols) == d_width
-
-    pe_idx = rmap.get_indices(pos_encoding)
-    q_mat, k_mat = _current_pos_attn_matrices(pos_encoding, d_head)
-
-    for start in range(0, d_width, d_head):
-        end = min(start + d_head, d_width)
-        chunk_size = end - start
-        o_chunk_idx = op.target_cols[start:end]
-
-        if 2 * chunk_size <= d_head:
-            # Combine source (+1) and subtract (-1) into a single head.
-            # source occupies head dims [0:cs] with +1, subtract [cs:2*cs] with -1.
-            combined_v_idx = op.source_cols[start:end] + op.subtract_cols[start:end]
-            v_mat = torch.eye(2 * chunk_size, d_head)
-            o_mat = torch.zeros(d_head, chunk_size)
-            o_mat[:chunk_size, :chunk_size] = torch.eye(chunk_size)  # +1
-            o_mat[chunk_size : 2 * chunk_size, :chunk_size] = -torch.eye(
-                chunk_size
-            )  # -1
-            head = _allocate_head(attn)
-            _scatter_attn_head(
-                attn,
-                head,
-                pe_idx,
-                pe_idx,
-                combined_v_idx,
-                o_chunk_idx,
-                q_mat,
-                k_mat,
-                v_mat,
-                o_mat,
-                d_head,
-                recorder=recorder,
-                node=op.node,
-                op_type=op.op_type,
-            )
-        else:
-            # Too wide to combine — one head per group.
-            v_mat = torch.eye(chunk_size, d_head)
-            o_mat = torch.eye(d_head, chunk_size)  # +1 coefficient
-            head = _allocate_head(attn)
-            _scatter_attn_head(
-                attn,
-                head,
-                pe_idx,
-                pe_idx,
-                op.source_cols[start:end],
-                o_chunk_idx,
-                q_mat,
-                k_mat,
-                v_mat,
-                o_mat,
-                d_head,
-                recorder=recorder,
-                node=op.node,
-                op_type=op.op_type,
-            )
-            o_mat = -torch.eye(d_head, chunk_size)  # -1 coefficient
-            head = _allocate_head(attn)
-            _scatter_attn_head(
-                attn,
-                head,
-                pe_idx,
-                pe_idx,
-                op.subtract_cols[start:end],
-                o_chunk_idx,
-                q_mat,
-                k_mat,
-                v_mat,
-                o_mat,
-                d_head,
-                recorder=recorder,
-                node=op.node,
-                op_type=op.op_type,
-            )
 
 
 # ---------------------------------------------------------------------------

@@ -64,7 +64,7 @@ def test_probe_residual_reads_intermediate_node():
     """Compile a tiny chain and confirm ``probe_residual`` reports the
     intermediate node's value at the layer that materialises it.
 
-    Graph: y = 3*x, z = y + 1.  Compile overlaid on x, probe y.  Every
+    Graph: y = 3*x, z = y + 1.  Compile with output z, probe y.  Every
     layer that has y live must hold 3*x; empty per_layer would indicate
     the probe failed to surface the node.
     """
@@ -73,7 +73,7 @@ def test_probe_residual_reads_intermediate_node():
     y = multiply_const(x, 3.0)
     z = add_const(y, 1.0)
     module = compile_headless(
-        {"x": (x, z)},
+        z,
         pos,
         d=64,
         verbose=False,
@@ -115,7 +115,7 @@ def test_probe_attention_captures_softmax_weights():
         output_matrix=torch.randn(4, 4),
     )
     module = compile_headless(
-        {"x": (x, attn)},
+        attn,
         pos,
         d=256,
         d_head=16,
@@ -161,7 +161,7 @@ def test_probe_layer_diff_drift_and_sentinel():
     x = create_input("x", 2)
     y = multiply_const(x, 3.0)
     module = compile_headless(
-        {"x": (x, y)},
+        y,
         pos,
         d=64,
         verbose=False,

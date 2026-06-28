@@ -73,7 +73,7 @@ def test_nonzero_init_intermediate_col(monkeypatch):
     x = create_input(4)
     y = multiply_const(x, 2.0)
 
-    module = compile_headless({"x": (x, y)}, pos, d=64, verbose=False)
+    module = compile_headless(y, pos, d=64, verbose=False)
     inp = torch.tensor([[1.0, 2.0, 3.0, 4.0]])
     expected = torch.tensor([[2.0, 4.0, 6.0, 8.0]])
 
@@ -82,43 +82,6 @@ def test_nonzero_init_intermediate_col(monkeypatch):
     assert torch.allclose(
         noisy, expected, atol=0.1
     ), f"noisy init broke output: got {noisy}, expected {expected}"
-
-
-# ---------------------------------------------------------------------------
-# Test 2 — overflow output path (delta_transfer onto unused slot)
-# ---------------------------------------------------------------------------
-
-
-def test_nonzero_init_overflow_output(monkeypatch):
-    """An output with no input overlay lands at an overflow column
-    after the input region.  The current code's overflow path is OK
-    (subtract_cols = target_cols), but source_cols for the output
-    node live in an intermediate column which still relies on
-    zero-init."""
-    pos = create_pos_encoding()
-    x = create_input(4)
-    y = add_const(x, 10.0)
-
-    module = compile_headless(
-        {"a": (x, None), "b": (None, y)},
-        pos,
-        d=64,
-        verbose=False,
-    )
-    inp = torch.tensor([[1.0, 2.0, 3.0, 4.0]])
-    expected_y = torch.tensor([[11.0, 12.0, 13.0, 14.0]])
-
-    clean = module(inp)
-    _patch_noisy_init(monkeypatch)
-    noisy = module(inp)
-
-    # Output slice corresponding to field "b" — use output_slice helper.
-    clean_b = module.output_slice("b", clean)
-    noisy_b = module.output_slice("b", noisy)
-    assert torch.allclose(clean_b, expected_y, atol=0.1)
-    assert torch.allclose(
-        noisy_b, expected_y, atol=0.1
-    ), f"noisy init broke overflow output: got {noisy_b}, expected {expected_y}"
 
 
 # ---------------------------------------------------------------------------
@@ -134,7 +97,7 @@ def test_nonzero_init_mlp_path(monkeypatch):
     x = create_input(4)
     y = relu_add(x, multiply_const(x, -1.0))  # ReLU(x) + ReLU(-x) = |x|
 
-    module = compile_headless({"x": (x, y)}, pos, d=128, verbose=False)
+    module = compile_headless(y, pos, d=128, verbose=False)
     inp = torch.tensor([[1.0, -2.0, 3.0, -4.0]])
     expected = torch.tensor([[1.0, 2.0, 3.0, 4.0]])
 

@@ -1,5 +1,3 @@
-![CI](https://github.com/physicsrob/torchwright/actions/workflows/ci.yml/badge.svg)
-
 # TorchWright
 
 TorchWright is a compiler that transforms computation graphs into transformer

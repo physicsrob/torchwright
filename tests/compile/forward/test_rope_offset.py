@@ -13,10 +13,6 @@ attends to itself under the causal mask).  That makes the selection directly
 observable.
 """
 
-import os
-import tempfile
-
-import pytest
 import torch
 
 from torchwright.compiler.export import compile_headless
@@ -100,61 +96,10 @@ def test_rotary_offset_prefill_decode_identical():
     assert torch.allclose(full, decoded, atol=1e-4), (full, decoded)
 
 
-# The ONNX/HF runtime paths apply RoPE full-width (rotate_half over d_head), so
-# the rotary head must have d_qk == d_head there.  These use a full-width
-# (d_qk == D_HEAD) offset graph.
-
-
-def _onnx_offset_graph():
-    pos = create_pos_encoding()
-    payload = create_input("payload", 1)
-    rotary = rotary_offset_head(payload, delta_pos=-1, d_qk=D_HEAD)
-    return rotary, pos
-
-
-def test_rotary_offset_onnx_prefill_and_decode():
-    """The ONNX export rotates Q and stores rotated K, so the offset head
-    selects the previous position on both prefill and cached decode (the
-    runtime mirror of the in-process invariant)."""
-    pytest.importorskip("onnxruntime")
-    from torchwright.compiler.export import compile_headless_to_onnx
-    from torchwright.compiler.onnx_load import OnnxHeadlessModule
-
-    rotary, pos = _onnx_offset_graph()
-    vals = _payload(N_POS)
-    expected = _expected_prev(vals)
-
-    with tempfile.TemporaryDirectory() as tmp:
-        path = os.path.join(tmp, "rope_offset.onnx")
-        compile_headless_to_onnx(
-            rotary, pos, path, d=D, d_head=D_HEAD, max_seq_len=64, verbose=False
-        )
-        module = OnnxHeadlessModule(path)
-
-        full = module(vals).squeeze(1)
-        assert torch.allclose(full, expected, atol=1e-2), full
-
-        past = module.empty_past()
-        decoded = []
-        for t in range(N_POS):
-            out_t, past = module.step(vals[t : t + 1], past)
-            decoded.append(float(out_t.squeeze()))
-        assert torch.allclose(torch.tensor(decoded), expected, atol=1e-2), decoded
-
-
-def test_rotary_offset_onnx_partial_width_rejected():
-    """ONNX RoPE requires full-width rotary heads (rotate_half over d_head); a
-    partial-width rotary head fails loud rather than rotating the wrong dims."""
-    pytest.importorskip("onnxruntime")
-    from torchwright.compiler.export import compile_headless_to_onnx
-
-    pos = create_pos_encoding()
-    payload = create_input("payload", 1)
-    rotary = rotary_offset_head(payload, delta_pos=-1, d_qk=8)  # < D_HEAD
-
-    with tempfile.TemporaryDirectory() as tmp:
-        path = os.path.join(tmp, "partial.onnx")
-        with pytest.raises(NotImplementedError, match="rotary_width == d_head"):
-            compile_headless_to_onnx(
-                rotary, pos, path, d=D, d_head=D_HEAD, max_seq_len=64, verbose=False
-            )
+# NOTE: the float-I/O headless ONNX export (compile_headless_to_onnx /
+# OnnxHeadlessModule) was removed on main, so the offset head's ONNX RoPE
+# validation no longer lives here.  The token-path ONNX RoPE emission (the
+# rotate_half cos/sin from cache_position in compile_to_onnx, plus the
+# full-width d_qk==d_head guard) is exercised by tests/hf/test_rope_token.py,
+# which exports a token model via compile_to_onnx and checks prefill ==
+# cached decode through the converted HF model.

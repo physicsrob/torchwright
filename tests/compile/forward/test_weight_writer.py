@@ -89,7 +89,6 @@ def _make_op(rmap: ResidualStreamMap, op_type: str, node, target_cols, **kwargs)
                 "compute_add",
                 "cancel",
                 "add_into",
-                "delta_transfer",
             ],
             op_type,
         ),

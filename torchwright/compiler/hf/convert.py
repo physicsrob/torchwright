@@ -12,16 +12,13 @@ native module's parameters/buffers, and asserts that no initializer is left
 unmapped — so a future exporter weight that this converter doesn't know about
 fails loudly instead of silently dropping.
 
-Initializer → parameter map (ground truth: ``compiler/export.py`` lines
-798-846 / 1714-1744; layouts confirmed against ``components/*``):
+Initializer → parameter map (ground truth: ``compiler/export.py``
+``compile_to_onnx``; layouts confirmed against ``components/*``):
 
-    embed_table              -> model.embed_tokens.weight  (vocab, d_embed)
-                                + lm_head.weight (TIED)
-    embedding_proj           -> model.embedding_proj       (d_embed, d)
-    pos_proj                 -> model.pos_proj             (d_pos, d)
-    pos_encoding_full        -> model.pos_encoding_full    (max_seq, d_pos)
+    embed_table              -> model.embed_tokens.weight  (vocab, d)
+    lm_head                  -> lm_head.weight              (vocab, d)  UNTIED
+    pos_encoding_full        -> model.pos_encoding_full    (max_seq, d)
     constant_values          -> model.constant_values      (d,)
-    output_gather_indices_init-> model.output_gather_indices(d_output,) int64
     l{i}_WQ/WK/WV  (d, hd)   -> q/k/v_proj.weight  = M.T    (hd, d)
     l{i}_WO        (hd, d)   -> o_proj.weight      = M.T    (d, hd)
     l{i}_W1        (d, d_h)  -> linear1.weight     = M.T    (d_h, d)
@@ -44,7 +41,11 @@ import numpy as np
 import onnx
 from onnx import numpy_helper
 
-from torchwright.compiler.export import meta_path_for, debug_meta_path_for
+from torchwright.compiler.export import (
+    TOKEN_META_FORMAT,
+    debug_meta_path_for,
+    meta_path_for,
+)
 
 # These initializers are the cached-protocol scaffolding (mask sentinel, slot
 # arange, reshape constants) — structural, not weights. Every other initializer
@@ -101,27 +102,30 @@ def build_config(
     """Derive a :class:`TorchwrightConfig` from the ONNX initializer shapes."""
     from .configuration_torchwright import TorchwrightConfig
 
+    fmt = meta.get("format")
+    assert fmt == TOKEN_META_FORMAT, (
+        f"artifact meta format {fmt!r} != expected {TOKEN_META_FORMAT!r}; this "
+        f"converter reads the vanilla untied token layout — re-export the "
+        f"artifact with the current exporter."
+    )
+
     vocab: List[str] = list(meta["vocab"])
 
     # The embedding table is over-allocated: its row count is the model's logit
-    # width (the tied unembed produces one logit per row), which the compiler
-    # pads beyond the meaningful token count. Rows past len(vocab) are zero
+    # width (the unembed produces one logit per row), which the compiler pads
+    # beyond the meaningful token count. Rows past len(vocab) are zero
     # embeddings → zero logits → never argmax-selected over a real token, and
     # are never valid INPUT ids. So vocab_size (the model's output dimension) is
     # the table's row count, not the tokenizer's token count.
     embed_table = inits["embed_table"]
-    vocab_size, d_embed = embed_table.shape
+    # Vanilla untied layout: embed_table is (vocab, d) — the full residual width
+    # — and the unembed is a separate (vocab, d) lm_head, so there is no
+    # d_embed / d_pos / output-gather width left to read.
+    vocab_size, d = embed_table.shape
     assert (
         len(vocab) <= vocab_size
     ), f"meta vocab len {len(vocab)} exceeds embed_table rows {vocab_size}"
-    d = inits["embedding_proj"].shape[1]
-    d_pos = inits["pos_proj"].shape[0]
     max_seq = inits["pos_encoding_full"].shape[0]
-    d_output = inits["output_gather_indices_init"].shape[0]
-    assert d_output == d_embed, (
-        f"output gather width {d_output} != d_embed {d_embed}; the tied unembed "
-        f"requires the gathered residual columns to be d_embed wide"
-    )
 
     n_layers = sum(1 for k in inits if re.fullmatch(r"l\d+_WQ", k))
     assert n_layers > 0, "no l{i}_WQ initializers — not a token transformer?"
@@ -175,21 +179,18 @@ def build_config(
     return TorchwrightConfig(
         d=int(d),
         d_head=int(d_head),
-        d_embed=int(d_embed),
-        d_pos=int(d_pos),
         vocab_size=int(vocab_size),
         n_layers=int(n_layers),
         n_heads_per_layer=n_heads_per_layer,
         d_hidden_per_layer=d_hidden_per_layer,
         max_seq=int(max_seq),
-        d_output=int(d_output),
         head_kind="token",
         cache_stride=meta.get("cache_stride"),
         rope_base=rope_base,
         rotary_enable_per_layer=rotary_enable_per_layer,
         bos_token_id=bos_id,
         eos_token_id=eos_id,
-        tie_word_embeddings=True,
+        tie_word_embeddings=False,
         use_cache=True,
     )
 
@@ -207,27 +208,18 @@ def build_state_dict(config, inits: Dict[str, np.ndarray]) -> Tuple[dict, set]:
     ``consumed`` is the set of initializer names this used, so the caller can
     assert nothing weight-like was left behind.
     """
-    import torch
-
     consumed: set = set()
 
     def take(name: str) -> np.ndarray:
         consumed.add(name)
         return inits[name]
 
-    embed_table = take("embed_table")  # (vocab, d_embed)
+    embed_table = take("embed_table")  # (vocab, d)
     sd: dict = {
         "model.embed_tokens.weight": _t(embed_table),
-        "lm_head.weight": _t(embed_table),  # tied
-        "model.embedding_proj": _t(take("embedding_proj")),  # (d_embed, d)
-        "model.pos_proj": _t(take("pos_proj")),  # (d_pos, d)
-        "model.pos_encoding_full": _t(take("pos_encoding_full")),  # (max_seq,d_pos)
+        "lm_head.weight": _t(take("lm_head")),  # untied (vocab, d)
+        "model.pos_encoding_full": _t(take("pos_encoding_full")),  # (max_seq, d)
         "model.constant_values": _t(take("constant_values")),  # (d,)
-        "model.output_gather_indices": torch.from_numpy(
-            np.ascontiguousarray(
-                take("output_gather_indices_init"), dtype=np.int64
-            ).copy()
-        ),
     }
 
     for i in range(config.n_layers):
@@ -300,14 +292,12 @@ def convert_onnx_to_hf(
 
     model = TorchwrightForCausalLM(config)
     missing, unexpected = model.load_state_dict(sd, strict=False)
-    # Tied lm_head/embed share storage, so one of the two keys may report as the
-    # canonical name depending on torch version; anything else is a real error.
-    missing = [k for k in missing if k != "lm_head.weight"]
+    # Untied: embed_tokens.weight and lm_head.weight are loaded as two separate
+    # tensors, so neither may be missing.
     assert not missing, f"missing params after load: {missing}"
     assert not unexpected, f"unexpected params in state dict: {unexpected}"
 
     model = model.to(torch.float32).eval()
-    model.tie_weights()
     return model
 
 
