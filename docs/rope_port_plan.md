@@ -3,8 +3,9 @@
 Status: **Phases 0, 1, 1b, 2 done** (branch `worktree-rope`). Phase 0 (rotary `Attn`,
 in-process/ONNX/HF), Phase 1 (bucket-1 near-marker count), Phase 1b (recency ramp: `soft_blend` +
 octant ramp, confirm-compile green), Phase 2 Part 1 (relative-offset all-Δ + sign lock), Phase 2
-Part 2 (compiler self-match → rotary, all three surfaces). Remaining: Phase 3 (content), Phase 4
-(recency end-to-end), Phase 5 (delete PosEncoding). **`main` merged in (`f281ee8`)**: ONNX/HF now
+Part 2 (compiler self-match → rotary, all three surfaces), Phase 3 (content-selection capability on
+slow planes — proven; builder integration deferred to Phase 5). Remaining: Phase 4 (recency
+end-to-end), Phase 5 (delete PosEncoding + wire the content/self-match builders). **`main` merged in (`f281ee8`)**: ONNX/HF now
 run in CI (the Modal image carries `onnxruntime`/`transformers` — the runtime-parity gap is closed),
 the float-I/O headless ONNX export and the delta-transfer compile mode were removed, and the token
 export uses a vanilla untied embedding.
@@ -501,6 +502,39 @@ and validity bounds** (e.g. `_QUERY_GAIN=8`, the `attend_argmin_above_in_bucket`
 slow planes add distance-dependent cosine attenuation and possible cross-plane mixing that must
 stay inside each head's gap.
 
+> **Status (2026-06-27): capability proven; builder/DOOM integration deferred to Phase 5.** Like
+> Phases 1 and 1b, this builds and proves the *capability* with a torchwright helper + confidence
+> tests; the in-place rewrite of the 12 production `attend_*` builders waits for Phase 5 (it needs
+> `d_head` at graph-construction time — see "the architectural finding" below — which arrives with the
+> §7 signature change).
+> - **Mechanism.** A content head's logit `Σ_c q_c·k_c` becomes, under the global rotation,
+>   `Σ_c q_c·k_c·cos((i−j)·θ_{p_c})`. Placing each content column on a **slow** plane (tiny θ) keeps
+>   `cos((i−j)θ)≈1` over the rollout, so the match is effectively position-free — standard RoPE on the
+>   global grid, **not** NoPE. New `torchwright/graph/rope.py` helpers: `place_on_slow_planes` (relocate
+>   a `(rows, W)` content projection onto the slowest `W` planes — col `d_head/2−1−c`, rotate_half
+>   partner left zero so planes don't mix) and `rotary_content_head` (build the full-width rotary `Attn`).
+> - **The architectural finding — content heads must be full-width `d_head` rotary, so they need the
+>   grid.** Because ONNX/HF require `d_qk == d_head`, a content head is a full-width rotary `Attn` with
+>   content relocated onto the slowest planes — it must know `d_head`/`base` at construction. The
+>   current `attend_*` signatures carry only `pos_encoding` (no `d_head`), so the in-place mechanism
+>   swap can't happen "internally" the way §7 envisioned for Phases 1–4; it lands with the Phase-5
+>   signature change (`pos_encoding` → a RoPE config carrying `d_head`/`base`). Phase 3 therefore
+>   proves the capability head-by-head; Phase 5 wires the 12 builders + DOOM.
+> - **`d_head`/`base` settled.** `base = 5e5` (locked, LLaMA3). Key result: the slowest-plane
+>   attenuation at 42k (~0.9965) is set by **base, not `d_head`** (θ_min → 1/base as `d_head`→∞), so
+>   `d_head` only buys *plane count* for wider content. **`d_head = 256`** (the recency-analysis grid)
+>   gives 128 planes — ample for the widest content head (`attend_argmin_above_in_bucket`,
+>   `d_qk = 2+n_buckets+n_thresholds`; `attend_argmax_dot`, `d_qk = W`).
+> - **Validation — selection survives rotation to the 42k production distance** (calibrated per §9, via
+>   single logit rows since a 42k×42k matrix would OOM; `_rotary_logits` is anchored to `Attn.compute`).
+>   `tests/compile/forward/test_rope_content_slow_planes.py`: dot-match (W=8, `match_gain=200`) margin
+>   **198**; bucket rendezvous (`bonus=256`) margin **253**; the binding fine-score gate (unit Δ at the
+>   max `_MAX_SCORE_ABS=120` range, winner far/runner adjacent — worst case) margin **3.8 → 47× softmax
+>   concentration**, still a clean pick; typical score ranges give near-nominal `_QUERY_GAIN=8`. Plus
+>   `probe_compiled` parity on a compiled rotary content head (rotation wired through the compiler at
+>   full-width `d_head`). The recency family (`attend_most_recent_matching`, the one position-dependent
+>   head) is Phase 4, not here.
+
 **Phase 4 — Recency end-to-end (validates Phase 1b).** Wire the `attend_most_recent_matching` / `get_prev_value` family onto
 the octant ramp and validate the clip-memory lookup against the full-frame log (§9): the rank
 stays resolvable against the content gate (winner beats runner-up at gap-1, out to the max
@@ -594,8 +628,11 @@ separate `torchwright_doom` branch** (post-Phase-5), not a per-phase gate in thi
 
 ## 11. Open gates (live)
 
-- **Content plane budget.** Each content head needs enough slow planes for its key's
-  discrimination at its range. Per-head check in Phase 3.
+- **Content plane budget.** ✅ DONE (Phase 3). The slowest-plane attenuation at 42k (~0.9965) is set
+  by `base` (5e5), not `d_head`; `d_head = 256` (128 planes) covers the widest content head with
+  margin. Per-head selection-at-distance gates green (dot 198, bucket 253, worst-case fine-score 3.8 →
+  47× concentration). **Builder/DOOM integration (the 12 `attend_*` funcs → full-width rotary on slow
+  planes) is Phase 5** — it needs `d_head` at construction, which arrives with the §7 signature change.
 - **Re-grep per-class call sites.** Replace the sub-agent census with committed greps before
   per-site work (a direct grep found fewer literal `attend_most_recent_matching` sites than the
   census implied). Confirmed 2026-06-27: `pick_most_recent` does **not** exist in current code —

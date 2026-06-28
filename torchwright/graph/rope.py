@@ -72,6 +72,78 @@ def apply_rope(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.T
     return x * cos + rotate_half(x) * sin
 
 
+def place_on_slow_planes(mat: torch.Tensor, d_head: int) -> torch.Tensor:
+    """Relocate a content head's ``(rows, W)`` Q/K projection onto the **slowest**
+    ``W`` planes of the full ``d_head`` ``rotate_half`` grid.
+
+    A content-selection head (``attend_argmin``/``argmax``/``_where``/``dot``/
+    ``_bucket`` …) matches on content, not position: its logit is
+    ``Σ_c q_c · k_c`` with the content in a few small columns ``c = 0 .. W-1``.
+    Under the end-state global rotation every head's Q/K is rotated by absolute
+    position, turning that logit into ``Σ_c q_c · k_c · cos((i − j)·θ_{p_c})`` —
+    so a content column on a *fast* plane (large ``θ``) is scrambled by the
+    relative offset.  Placing each content column on a **slow** plane (tiny
+    ``θ``) keeps ``cos((i − j)·θ) ≈ 1`` over the rollout, so the match is
+    effectively position-free (``docs/rope_port_plan.md`` §3 — standard RoPE on
+    the global grid, not NoPE).
+
+    Layout: content column ``c`` goes to the first-half dim ``d_head/2 − 1 − c``
+    (the slowest plane first), with its ``rotate_half`` partner ``d_head − 1 − c``
+    left zero, so each plane carries exactly one content scalar and the planes do
+    not mix under rotation.  Requires ``W ≤ d_head/2``.
+
+    Returns a ``(rows, d_head)`` matrix; pass it to a ``rotary=True`` ``Attn``.
+    """
+    rows, w = mat.shape
+    half = d_head // 2
+    if w > half:
+        raise ValueError(
+            f"content width {w} exceeds the {half} planes available at "
+            f"d_head={d_head}; raise d_head or narrow the content."
+        )
+    full = mat.new_zeros((rows, d_head))
+    for c in range(w):
+        full[:, half - 1 - c] = mat[:, c]
+    return full
+
+
+def rotary_content_head(
+    query_in,
+    key_in,
+    value,
+    query_matrix: torch.Tensor,
+    key_matrix: torch.Tensor,
+    *,
+    d_head: int,
+    base: float = ROPE_BASE,
+):
+    """A content-selection ``Attn`` made **rotary on slow planes**.
+
+    Takes a content head's compact ``(·, W)`` ``query_matrix`` / ``key_matrix``
+    (the same layout the ``attend_*`` builders construct — score in col 0,
+    validity / bucket / dot dims in later cols) and rebuilds it as a full-width
+    ``d_head`` rotary head with the content relocated onto the slowest ``W``
+    planes via :func:`place_on_slow_planes`.  V/O pass the payload through
+    unchanged.  This is the Phase-3 content capability (``docs/rope_port_plan.md``
+    §3, §8): selection by content survives the global rotation because the match
+    rides quasi-static planes.
+    """
+    from torchwright.graph import Attn
+
+    d_v = len(value)
+    return Attn(
+        query_in=query_in,
+        key_in=key_in,
+        value_in=value,
+        query_matrix=place_on_slow_planes(query_matrix, d_head),
+        key_matrix=place_on_slow_planes(key_matrix, d_head),
+        value_matrix=torch.eye(d_v),
+        output_matrix=torch.eye(d_v),
+        rotary=True,
+        rope_base=base,
+    )
+
+
 def rotary_offset_head(
     value,
     delta_pos: int = -1,
