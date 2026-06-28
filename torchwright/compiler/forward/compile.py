@@ -75,10 +75,10 @@ class RmsNormSpec:
     power-of-two widths) holds a large constant ``2^q`` whose energy forces
     ``rms == 2^m`` exactly; the uniform gain ``2^m`` cancels it
     (``x / rms * gain == x``), so ``÷rms`` and ``×gain`` are pure fp32 exponent
-    shifts and the identity is bit-exact for every normal float (a channel value
-    below ``~2^(m-126)`` underflows to a denormal under ``÷2^m`` and is not
-    recovered — the documented near-zero floor, far below any real data).  See
-    ``docs/plan_rmsnorm.md``.
+    shifts and the identity is bit-exact for every float at or above
+    ``~2^(m-126)`` (a channel value below that underflows to a denormal under
+    ``÷2^m`` and is not recovered by the ``×gain`` — the documented near-zero
+    floor, far below any real data).  See ``docs/plan_rmsnorm.md``.
 
     Attributes:
         reserved_cols: the never-allocated residual columns holding the
@@ -181,6 +181,19 @@ def _certify_rms_norm_energy(ra, spec: RmsNormSpec) -> None:
     non-pinned columns.  That upper-bounds ``Σ data²`` at every norm.  Raises
     ``ValueError`` (with the smallest sufficient ``q``) if the bound is not met,
     or if any contributing node lacks a finite value range to certify against.
+
+    Why the post-MLP snapshots suffice (the unstated invariant this leans on):
+    the norm physically reduces over three residual states — the layer-input
+    residual (= the previous layer's post-MLP snapshot), the post-attn residual
+    (read by the pre-MLP norm), and the final post-MLP residual — yet only the
+    post-MLP states are snapshotted (``sublayer_snapshots``).  This is still a
+    sound upper bound because the scheduler never frees a *written* node during
+    the MLP sublayer without either driving its columns to exactly zero (a cancel
+    head, so the post-attn value there is 0) or transferring ownership via
+    ``reassign`` to a live node that survives to the snapshot.  Eager input-frees
+    live only in the attn sublayer and zero before freeing.  So every value live
+    at any norm read-point is either captured in some post-MLP snapshot or is
+    exactly zero — and the per-column max bounds it.
     """
     reserved = set(spec.reserved_cols)
     budget = spec.const_value * spec.const_value * 2.0**-24  # const²·2⁻²⁴
@@ -758,6 +771,15 @@ def forward_compile(
     use_cpsat = optimize > 0
     cpsat_time_budget_s = _OPTIMIZE_BUDGETS.get(optimize, 0.0)
 
+    # Columns the pinned-constant RMSNorm reserved out of the free pool above,
+    # before scheduling.  The CP-SAT model never sees ``residual_map``, so it
+    # must subtract these from its residual budget (and key its schedule cache
+    # on them) or it over-counts capacity and can emit a schedule that is
+    # infeasible on replay against the reservation-reduced pool.
+    n_reserved_residual = (
+        len(net.rms_norm_spec.reserved_cols) if net.rms_norm_spec is not None else 0
+    )
+
     if use_cpsat:
         # Architecture doc §3 marks admission_control as a model
         # precondition; the CP-SAT cumulative does not represent the
@@ -791,6 +813,7 @@ def forward_compile(
             assume_zero_init=assume_zero_init,
             cancel_slack=2,
             policy=policy,
+            reserve_residual=n_reserved_residual,
         )
         cached = load_assignment(schedule_fp, output_node)
         if cached is not None:
@@ -897,6 +920,7 @@ def forward_compile(
                         time_budget_s=probe_budget,
                         max_layers=cp_layers + 1,
                         policy=policy,
+                        reserve_residual=n_reserved_residual,
                         assume_zero_init=assume_zero_init,
                         tighten_domains=True,
                         log_search_progress=verbose,
@@ -931,6 +955,7 @@ def forward_compile(
                     time_budget_s=cpsat_time_budget_s,
                     max_layers=solver_max_layers,
                     policy=policy,
+                    reserve_residual=n_reserved_residual,
                     assume_zero_init=assume_zero_init,
                     # Sound by construction: the warm-start hint is
                     # feasible, so it always satisfies the tightened

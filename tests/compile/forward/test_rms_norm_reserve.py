@@ -23,8 +23,17 @@ from torchwright.compiler.forward.compile import (
     _certify_rms_norm_energy,
     _reserve_rms_norm_columns,
 )
+from torchwright.compiler.forward.cpsat_scheduler import (
+    build_cpsat_model,
+    solve_schedule,
+)
 from torchwright.compiler.forward.residual_map import ResidualStreamMap
+from torchwright.compiler.graph_identity import graph_fingerprint
+from torchwright.graph import Linear
+from torchwright.graph.pos_encoding import PosEncoding
+from torchwright.graph.relu import ReLU
 from torchwright.graph.value_type import Range
+from torchwright.ops.inout_nodes import create_input
 
 
 class _FakeVT:
@@ -187,3 +196,105 @@ def test_energy_bound_identity_holds_below_and_breaks_above():
     # the default q clears the same high energy with margin
     assert _rmsnorm_identity_holds(d, n_const, _RMS_NORM_CONST_EXP, data_energy=2.6e13)
     assert 2.6e13 < 2.0 ** (2 * _RMS_NORM_CONST_EXP - 24)  # the margin is real
+
+
+# ===========================================================================
+# The CP-SAT scheduler reserves the norm column(s) BEFORE scheduling, but the
+# solver never sees ``residual_map`` — so its residual-capacity model and its
+# schedule-cache key must both account for the reservation independently, or it
+# over-counts capacity by ``n_const`` and can emit a schedule that is infeasible
+# on replay against the reservation-reduced pool (a loud out-of-columns /
+# liveness failure under width pressure — exactly where DOOM-class graphs run).
+# These pin that wiring; they run on CPU sub-second (tiny graph, no certify).
+# ===========================================================================
+
+
+def _tiny_graph():
+    """x -> Linear -> ReLU -> Linear; small enough to solve sub-second."""
+    torch.manual_seed(0)
+    x = create_input("x", 8)
+    l1 = Linear(x, torch.randn(8, 16), torch.zeros(16), name="l1")
+    r = ReLU(l1, name="r")
+    return Linear(r, torch.randn(16, 4), torch.zeros(4), name="l2")
+
+
+_CPSAT_KW = dict(d=64, d_head=8, d_hidden=128)
+
+
+def test_cpsat_available_residual_excludes_reserved():
+    """build_cpsat_model subtracts reserve_residual from the residual budget,
+    matching how the reservation shrinks the replay pool (GAP 1 root cause)."""
+    out = _tiny_graph()
+    pos = PosEncoding(9)
+    base = build_cpsat_model(out, pos, **_CPSAT_KW).available_residual
+    for k in (1, 2):
+        got = build_cpsat_model(out, pos, reserve_residual=k, **_CPSAT_KW)
+        assert got.available_residual == base - k
+
+
+def test_cpsat_residual_oversubscription_raises():
+    """Reserving every data column fails loud at model build, not as a confusing
+    downstream solve failure, and the message names the reserved columns."""
+    out = _tiny_graph()
+    pos = PosEncoding(9)
+    with pytest.raises(RuntimeError, match="reserved columns"):
+        build_cpsat_model(out, pos, reserve_residual=64 - 9, **_CPSAT_KW)
+
+
+def test_solve_schedule_threads_reserve_residual():
+    """reserve_residual flows end-to-end through solve_schedule and the solver
+    still produces a feasible schedule under the reduced budget."""
+    out = _tiny_graph()
+    pos = PosEncoding(9)
+    assignment, _ = solve_schedule(
+        out, pos, reserve_residual=2, time_budget_s=10.0, max_layers=20, **_CPSAT_KW
+    )
+    assert assignment is not None
+
+
+def test_schedule_fingerprint_keys_on_reserved_residual():
+    """The schedule cache must distinguish a norm-on (reserved) compile from a
+    norm-off one (GAP 2), while keeping the no-reservation hash byte-identical
+    so existing cache entries still hit (the conditional payload field)."""
+    out = _tiny_graph()
+    pos = PosEncoding(9)
+    fp_kw = dict(
+        d=64,
+        d_head=8,
+        d_hidden=64,
+        flex_routing=True,
+        assume_zero_init=True,
+        cancel_slack=2,
+        policy=None,
+    )
+    fp_none = graph_fingerprint(out, pos, **fp_kw)
+    fp_zero = graph_fingerprint(out, pos, reserve_residual=0, **fp_kw)
+    fp_one = graph_fingerprint(out, pos, reserve_residual=1, **fp_kw)
+    fp_two = graph_fingerprint(out, pos, reserve_residual=2, **fp_kw)
+    # reserve_residual=0 must hash exactly as if the arg were never passed.
+    assert fp_zero == fp_none
+    # A reservation must change the key, and different counts must differ.
+    assert fp_one != fp_none
+    assert fp_two != fp_one
+
+
+def test_certify_uses_per_column_max_across_states():
+    """The certification bound is the per-column max over ALL sublayer snapshots,
+    not one state: a column small in one snapshot and large in another is bounded
+    by the large one.  Here neither state alone exceeds the budget, but the
+    per-column max over both does — so the cross-snapshot reduction must catch
+    it (the soundness-bearing path, untested before)."""
+    spec = _spec(reserved=(9999,))  # q=44 -> budget 2^64; reserved col disjoint
+    big = _FakeNode(-(2.0**27), 2.0**27)  # energy 2^54 per column
+    small = _FakeNode(-1.0, 1.0)
+    lo = list(range(768))  # 768 * 2^54 ~ 1.4e19 < budget 1.8e19
+    hi = list(range(768, 1536))
+    s0 = {big: lo, small: hi}  # big on the low half
+    s1 = {small: lo, big: hi}  # big on the high half — mirror image
+    # Each state ALONE is under budget...
+    _certify_rms_norm_energy(_FakeRA({"s0": s0}), spec)
+    _certify_rms_norm_energy(_FakeRA({"s1": s1}), spec)
+    # ...but the per-column max over BOTH puts all 1536 columns at 2^54;
+    # 1536 * 2^54 ~ 2.8e19 > budget, so the combined certify must raise.
+    with pytest.raises(ValueError, match="not certified"):
+        _certify_rms_norm_energy(_FakeRA({"s0": s0, "s1": s1}), spec)

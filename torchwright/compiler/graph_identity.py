@@ -102,6 +102,7 @@ def graph_fingerprint(
     assume_zero_init: bool,
     cancel_slack: Optional[int],
     policy,
+    reserve_residual: int = 0,
 ) -> str:
     """Topology + geometry + solver-knob hash for the CP-SAT schedule cache.
 
@@ -110,6 +111,12 @@ def graph_fingerprint(
     construction).  The payload layout is frozen — it must keep hashing
     byte-identically for existing graphs or every cached schedule entry
     silently misses.
+
+    ``reserve_residual`` (residual columns withheld from the solver, e.g. the
+    pinned-constant RMSNorm's 1–2) changes the modeled residual capacity, hence
+    the schedule, so it MUST participate in the key.  It is added only when
+    non-zero so the common case (no reservation) keeps hashing byte-identically
+    to the pre-feature layout and existing cache entries still hit.
     """
     payload = {
         "topology": topology_entries(output_node),
@@ -122,6 +129,8 @@ def graph_fingerprint(
         "cancel_slack": cancel_slack,
         "policy": asdict(policy) if policy is not None else None,
     }
+    if reserve_residual:
+        payload["reserve_residual"] = reserve_residual
     encoded = json.dumps(payload, sort_keys=True, default=str).encode("utf-8")
     return hashlib.sha256(encoded).hexdigest()
 

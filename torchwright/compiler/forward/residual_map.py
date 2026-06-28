@@ -20,12 +20,13 @@ class ResidualStreamMap:
         self.d = d
         self._free: Set[int] = set(range(d))
         self._node_to_indices: Dict[Node, List[int]] = {}
-        # Columns reserved for the end-of-compile delta-transfer layer.
-        # They must not be allocated to ordinary nodes during compile —
-        # the delta transfer writes to them unconditionally.  Used only
-        # for overflow-output target columns (overlaid-input columns are
-        # protected by pinning their input node in the scheduler
-        # instead; their columns stay allocated to the input node).
+        # Columns permanently withheld from the free pool: never allocated to
+        # any node, never freed, for the whole compile.  The sole current user
+        # is the pinned-constant RMSNorm (``_reserve_rms_norm_columns``), which
+        # reserves 1–2 columns up front to hold the constant that forces the
+        # RMS to a power of two — they are seeded once (into ``embed_table``) and
+        # read but never written.  (The primitive was first built for an
+        # end-of-compile delta-transfer layer, since removed.)
         self._reserved: Set[int] = set()
         # Cols whose current value is unknown (may contain garbage from a
         # caller-provided residual stream).  A write op whose target lands on
@@ -41,7 +42,9 @@ class ResidualStreamMap:
         if n > len(self._free):
             raise ValueError(
                 f"Cannot allocate {n} columns for {node}: "
-                f"only {len(self._free)} free of {self.d}"
+                f"only {len(self._free)} free of {self.d} "
+                f"({len(self._reserved)} reserved, e.g. by the rms_norm "
+                f"pinned constant)"
             )
         indices = sorted(list(self._free)[:n])
         already_owned = {
@@ -114,10 +117,13 @@ class ResidualStreamMap:
     def reserve(self, cols) -> None:
         """Remove ``cols`` from the free pool without assigning them to any node.
 
-        Used to protect end-of-compile delta-transfer target columns (overflow
-        outputs) from being reused by intermediate allocations.  Reserved
-        columns are disjoint from both ``_free`` and ``_node_to_indices`` and
-        stay that way for the rest of the compile.
+        Protects columns that must hold a fixed value for the whole compile from
+        being reused by intermediate allocations — currently the pinned-constant
+        RMSNorm columns (see ``_reserve_rms_norm_columns``).  Reserved columns are
+        disjoint from both ``_free`` and ``_node_to_indices`` and stay that way
+        for the rest of the compile.  Callers that withhold columns from the
+        scheduler must also tell the CP-SAT model (``reserve_residual``), which
+        does not see this map.
         """
         cols = set(cols)
         unowned = cols - self._free

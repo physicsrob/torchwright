@@ -706,6 +706,7 @@ def build_cpsat_model(
     cancel_slack: Optional[int] = 2,
     policy: Optional[SchedulingPolicy] = None,
     reserve_heads: int = 0,
+    reserve_residual: int = 0,
     assume_zero_init: bool = False,
     tighten_domains: bool = False,
     _disabled_families: frozenset = frozenset(),
@@ -755,11 +756,20 @@ def build_cpsat_model(
     freeable_inputs = [
         n for n in gm.input_nodes if n is not pos and n is not gm.output_node
     ]
-    reserved_residual = len(pos)
+    # ``reserve_residual`` columns are permanently removed from the free pool by
+    # ``forward_compile`` *before* scheduling (the pinned-constant RMSNorm
+    # reserves 1–2 columns there — see ``_reserve_rms_norm_columns``).  The
+    # solver never sees ``residual_map``, so it must subtract them here too, or
+    # the modeled capacity over-counts by ``reserve_residual`` and the solver
+    # can emit a peak-occupancy schedule that is infeasible on replay against
+    # the reservation-reduced pool (a loud out-of-columns / liveness failure
+    # under width pressure, exactly where DOOM-class graphs run).
+    reserved_residual = len(pos) + reserve_residual
     available_residual = d - reserved_residual
     if available_residual <= 0:
         raise RuntimeError(
-            f"pos_encoding alone requires {reserved_residual} residual "
+            f"pos_encoding ({len(pos)}) plus reserved columns "
+            f"({reserve_residual}) require {reserved_residual} residual "
             f"columns, but d={d}. No room for inputs or intermediates."
         )
 
@@ -1371,6 +1381,7 @@ def solve_schedule(
     policy: Optional[SchedulingPolicy] = None,
     log_search_progress: bool = False,
     reserve_heads: int = 0,
+    reserve_residual: int = 0,
     assume_zero_init: bool = False,
     tighten_domains: bool = False,
     solver_params: Optional[Dict[str, object]] = None,
@@ -1429,6 +1440,12 @@ def solve_schedule(
             beyond the modeled compute + cancel + dirty terms.
             Defaults to 0.  Raise it for graphs whose attention heads
             are saturated by ops outside the model.
+        reserve_residual: residual columns permanently removed from the
+            free pool before scheduling and therefore unavailable to the
+            solver (the pinned-constant RMSNorm reserves 1–2; see
+            ``forward_compile``).  Subtracted from the residual budget so
+            the modeled capacity matches the reservation-reduced replay
+            pool.  Defaults to 0.
         assume_zero_init: if True, the model assumes the runtime
             zero-initialises the residual stream (so the heuristic
             emits no BIRTH-layer dirty-column cancels for fresh
@@ -1455,6 +1472,7 @@ def solve_schedule(
         cancel_slack=cancel_slack,
         policy=policy,
         reserve_heads=reserve_heads,
+        reserve_residual=reserve_residual,
         assume_zero_init=assume_zero_init,
         tighten_domains=tighten_domains,
     )
