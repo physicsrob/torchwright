@@ -20,8 +20,11 @@ soft step cannot saturate.  ``select``'s ``(M+v)-M`` core then dips to ``~-M``
 construction (``_assert_branches_meet_at_boundaries``), so a straight convex
 interpolation ``out = f + g*(t-f)`` (``g`` a saturating soft step in ``[0,1]``)
 is exactly ``t == f`` there — in-box and continuous — and collapses to an exact
-branch value in every octant interior (``g`` saturates to 0/1), preserving the
-gap-1 resolution.  Phase 1b originally rejected this multiply on a "no
+branch value in every octant interior (``g`` saturates to 0/1, where
+``multiply_2d(g, t-f)`` is exact — ``g=1`` is a grid node and ``g=0`` sits at the
+symmetric grid's midpoint, so the quarter-square's interpolation error cancels
+there; *not* because 0/1 are grid vertices), preserving the gap-1
+resolution.  Phase 1b originally rejected this multiply on a "no
 guaranteed-smoother slope" argument and used a deep median-of-three
 ``soft_blend`` instead; the gate-b sweep run directly on the convex form shows
 it is strictly monotone with the *same* min step at **half the depth** (one

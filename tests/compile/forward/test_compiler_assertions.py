@@ -186,6 +186,36 @@ def test_B_attn_rejects_q_source_cols_wrong_length():
 
 
 # ---------------------------------------------------------------------------
+# Full-width rotary — d_qk == d_head (an I3-sibling; NOT one of the canonical
+# I1–I4).  Every head is full-width rotary on the global grid; export.py always
+# rotates the full d_head with no width guard of its own, so the in-process
+# assert in _scatter_compute_attn is the only barrier against a partial-width
+# head (silently NoPE on the un-filled planes).  Guard BOTH directions: the
+# pre-existing test_forward_compile coverage only exercised d_qk > d_head, but
+# the dangerous regression is relaxing the `==` to `<=`, which would let
+# d_qk < d_head through and zero-pad/rotate dead planes with no divergence
+# signal.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("d_qk", [8, 32])  # below and above d_head=16
+def test_attn_rejects_d_qk_not_equal_d_head(d_qk):
+    """_scatter_compute_attn requires d_qk == d_head (full-width rotary)."""
+    x = InputNode("x", 4, value_range=(-100.0, 100.0))
+    out = Attn(
+        query_in=x,
+        key_in=x,
+        value_in=x,
+        query_matrix=torch.randn(len(x), d_qk),
+        key_matrix=torch.randn(len(x), d_qk),
+        value_matrix=torch.randn(len(x), 4),
+        output_matrix=torch.randn(4, 4),
+    )
+    with pytest.raises(AssertionError, match=r"d_qk == d_head"):
+        forward_compile(d=256, d_head=16, output_node=out, verbose=False)
+
+
+# ---------------------------------------------------------------------------
 # A — end-of-layer liveness (gated)
 # ---------------------------------------------------------------------------
 

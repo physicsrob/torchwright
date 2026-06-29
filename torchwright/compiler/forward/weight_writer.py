@@ -302,18 +302,21 @@ def _write_compute_attn(
 
     # RoPE is full-width on the global grid (LLaMA3): every head is rotary and
     # rotates the entire d_head, so its Q/K projection must fill d_head exactly —
-    # there is no partial-width and no non-rotary (NoPE) head.  This matches the
-    # ONNX/HF contract enforced in export.py (rotary_width == d_head), so the
-    # in-process and exported runtimes rotate identical dims.
+    # there is no partial-width and no non-rotary (NoPE) head.  export.py always
+    # rotates the full d_head (it has no separate width guard of its own), so this
+    # assert is the only thing keeping the in-process and exported runtimes
+    # rotating identical dims.  Negative test (both directions) lives in
+    # tests/compile/forward/test_compiler_assertions.py.
     assert node.d_qk == layer_d_head, (
         f"Attn '{node.name}' requires d_qk == d_head; got "
         f"d_qk={node.d_qk}, d_head={layer_d_head}.  Build the head full-width "
         f"(d_qk={layer_d_head}); partial-width rotary is not supported."
     )
 
-    # Q/K are shared across all V/O chunk heads, padded to layer d_head
-    q_mat = F.pad(node.query_matrix, (0, layer_d_head - node.d_qk))
-    k_mat = F.pad(node.key_matrix, (0, layer_d_head - node.d_qk))
+    # Q/K fill the rotary grid exactly (d_qk == d_head, asserted above), so they
+    # need no padding and are shared across all V/O chunk heads.
+    q_mat = node.query_matrix
+    k_mat = node.key_matrix
 
     # Split V/O across ceil(d_v / layer_d_head) heads
     n_vo_heads = (node.d_v + layer_d_head - 1) // layer_d_head

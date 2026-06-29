@@ -88,10 +88,12 @@ def test_prefill_and_decode_bit_exact(converted):
       algebraic guarantee. It holds for every normal-magnitude logit, but a row
       where the compiled cancel-heads drive the residual to denormal magnitude
       (~1e-40) differs by a single denormal ULP (~1e-43) — the near-zero row
-      magnifies a sub-ULP rounding difference between the two backends (e.g. an
-      FMA contraction one applies and the other does not). We bound those rows
-      far below any real cancellation failure (~1e-4+) instead of demanding
-      equality.
+      magnifies a sub-ULP rounding difference between the two backends.  The gap
+      is denormal-magnitude *regardless of the rotation formula*; the exact
+      mechanism of the sub-ULP difference is unconfirmed (one plausible candidate
+      is an FMA contraction one runtime applies and the other does not).  We bound
+      those rows far below any real cancellation failure (~1e-4+) instead of
+      demanding equality.
     * We teacher-force the native model on the *oracle's* token stream rather
       than letting each backend free-run on its own argmax. Past the meaningful
       output the logits are all-denormal noise whose argmax is arbitrary, so two

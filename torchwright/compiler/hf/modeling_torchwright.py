@@ -68,7 +68,13 @@ from .configuration_torchwright import TorchwrightConfig
 # The compiler emits attention against the exact-math softmax+matmul. On A100 the
 # default fp32 SDPA backend is EFFICIENT_ATTENTION, which perturbs values by a
 # single fp32 mantissa-LSB on some inputs — enough to break the algebraic
-# cancellation the compiled heads depend on. MATH matches the compiler bit-for-bit.
+# cancellation the compiled heads depend on (concretely: at a large operand
+# q ~= 22855 one fp32 ULP is ~1/512, which leaks into a cancel-head's residual
+# column and flips a Gray-code bit at boundary q values; see components/attn.py).
+# The exact zero a cancel-head produces is consumed categorically downstream, so
+# this is a regime change, not tolerable noise — which is why model.forward
+# hard-raises on any non-fp32 dtype / autocast rather than warning (a silent
+# wrong forward has no symptom). MATH matches the compiler bit-for-bit.
 _SDPA_BACKEND = [SDPBackend.MATH]
 
 

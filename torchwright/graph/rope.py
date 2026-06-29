@@ -236,8 +236,10 @@ def rotary_offset_head(
 
     Construction.  Query and key both read a constant ``1.0`` feature.  The
     query projects it to ``hardness · 1`` across all ``d_qk`` dims; the key
-    projects it to that same vector **pre-rotated by ``-delta_pos``** (the
-    static ``W_K = R_{-delta_pos} W_Q`` of §3).  With the runtime rotation
+    projects the **unit** vector ``1`` (no ``hardness``) **pre-rotated by
+    ``-delta_pos``** — i.e. ``W_K = R_{-delta_pos} W_Q / hardness``, so
+    ``hardness`` rides the query alone and sets the softmax sharpness (the static
+    rotation of §3).  With the runtime rotation
     ``R(j)`` on Q and ``R(i)`` on K, the logit becomes
 
         logit(j, i) ∝ Σ_p cos((i - j - delta_pos) · θ_p),
