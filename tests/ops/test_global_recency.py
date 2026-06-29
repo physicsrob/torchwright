@@ -16,11 +16,15 @@ Compiled-path parity / prefill==decode tests live in
 ``tests/compile/forward/test_rope_global_recency.py``.
 """
 
+import math
+
 import torch
 
 from torchwright.graph import InputNode
 from torchwright.graph.spherical_codes import index_to_vector
 from torchwright.ops.global_recency import (
+    _theta_slow,
+    _w_of_m,
     attend_most_recent_globally,
     global_position_from_bos,
 )
@@ -46,7 +50,7 @@ def test_bos_weight_gives_correct_position():
     Tests n=80 positions to keep oracle compute fast.
 
     The validation script (scripts/rope_global_recency_validate.py) confirms
-    PWL-only error < 0.013 when sampled every 10 positions.  However, the
+    PWL-only error < 0.009 when sampled every 10 positions.  However, the
     piecewise_linear implementation uses a sum of 1024 ReLU slope-changes
     in float32; fp32 accumulation in this sum adds up to ~0.09 at small
     positions (the initial slope is O(250000), and each of the ~1022 active
@@ -247,4 +251,38 @@ def test_exclude_self_does_not_pick_self():
         assert abs(out[p].item() - expected) < 0.5, (
             f"query {p} (exclude_self): expected previous-match value {expected}, "
             f"got {out[p].item():.2f}"
+        )
+
+
+# ---------------------------------------------------------------------------
+# Formula correctness at large m — regression guard for exp vs linear bug
+# ---------------------------------------------------------------------------
+
+
+def test_w_of_m_uses_exponential_formula():
+    """_w_of_m must compute MAX_LEN^cos(m·θ), not MAX_LEN*cos(m·θ).
+
+    For m ≤ 1000 the two formulas agree to five decimal places (cos ≈ 1,
+    so MAX_LEN^cos ≈ MAX_LEN and MAX_LEN*cos ≈ MAX_LEN).  Past m ≈ 5000
+    they diverge sharply: the error in recovered position reaches ~670 at
+    m=30,000 and ~3,100 at m=50,000 with the linear formula — both well
+    beyond the 0.5 rounding threshold.
+
+    This test directly checks the formula against the exact exponential at
+    several large m values, so a regression to MAX_LEN*cos fails loudly
+    rather than silently (all currently committed oracle tests use n ≤ 700).
+    """
+    rope = _rope()
+    theta = _theta_slow(rope)
+    max_len = rope.max_positions
+
+    for m in [1000, 5000, 20000, 50000]:
+        cos_m = math.cos(m * theta)
+        eff_correct = math.pow(max_len, cos_m)
+        w_expected = eff_correct / (eff_correct + m)
+        w_actual = _w_of_m(m, max_len, theta)
+        assert abs(w_actual - w_expected) < 1e-9, (
+            f"At m={m}: _w_of_m={w_actual:.12f} but MAX_LEN^cos/(MAX_LEN^cos+m)="
+            f"{w_expected:.12f}.  "
+            f"Check for MAX_LEN*cos vs MAX_LEN^cos formula mismatch in _w_of_m."
         )

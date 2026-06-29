@@ -45,7 +45,9 @@ def w_of_m(m: float, max_len: int, theta: float) -> float:
     if m <= 0:
         return 1.0
     cos_m = math.cos(m * theta)
-    eff = max_len * cos_m  # effective BOS exp score = MAX_LEN^cos(m*θ)
+    eff = math.pow(
+        max_len, cos_m
+    )  # MAX_LEN^cos(m·θ) — matches the actual attention score
     if eff <= 0.0:
         return 0.0
     return eff / (eff + m)

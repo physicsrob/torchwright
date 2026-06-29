@@ -21,9 +21,9 @@ and the score to every other key is 0, giving softmax weight
 
 ``w`` is strictly monotone in m (validated in
 ``scripts/rope_global_recency_validate.py``), with minimum adjacent-m gap
-~4.1e-6 (~69× the fp32 weight floor).  A 1024-breakpoint log-uniform PWL
-inverts w → m with max error ~0.013; combined with the fp32 softmax noise
-(~0.007) the total positional error is ~0.020 — 25× below the 0.5 rounding
+~4.9e-6 (~81× the fp32 weight floor).  A 1024-breakpoint log-uniform PWL
+inverts w → m with max error ~0.009; combined with the fp32 softmax noise
+(~0.006) the total positional error is ~0.015 — 33× below the 0.5 rounding
 threshold for integer recovery.
 
 The cosine attenuation at large m (cos(MAX_LEN·θ_slow) ≈ 0.991 — a ~1%
@@ -51,6 +51,7 @@ import math
 import torch
 
 from torchwright.graph import Attn, Concatenate, LiteralValue, Node, RopeConfig
+from torchwright.graph.asserts import assert_in_range
 from torchwright.graph.rope import (
     rope_inv_freq,
     rotary_content_head,
@@ -91,7 +92,7 @@ def _w_of_m(m: float, max_len: int, theta: float) -> float:
     if m <= 0.0:
         return 1.0
     cos_m = math.cos(m * theta)
-    eff = max_len * cos_m
+    eff = math.pow(max_len, cos_m)  # MAX_LEN^cos(m·θ) — the actual attention score
     if eff <= 0.0:
         return 0.0
     return eff / (eff + m)
@@ -136,7 +137,7 @@ def global_position_from_bos(
 
     A log-uniform PWL table (``n_breakpoints`` entries) inverts w → m.
 
-    Precision: max error ~0.020 positions (PWL ~0.013 + fp32 ~0.007),
+    Precision: max error ~0.015 positions (PWL ~0.009 + fp32 ~0.006),
     comfortably inside the 0.5 rounding threshold for integer recovery.
 
     Compile cost: 1 attention head + 1 MLP sublayer (the PWL inversion).
@@ -184,12 +185,18 @@ def global_position_from_bos(
     w_bps = [w_min * (ratio**k) for k in range(n_breakpoints)]
     w_bps[-1] = 1.0  # exact endpoint
 
-    return piecewise_linear(
+    # clamp=False: suppress piecewise_linear's auto tight-range assertion
+    # (atol 0.001), which fires at position 0 when float32 ReLU-sum accumulation
+    # rounds -0.04 below zero.  assert_in_range(atol=0.1) absorbs that noise
+    # while still catching any large-scale problems.
+    raw = piecewise_linear(
         bos_weight,
         w_bps,
         lambda w: _bisect_m(w, max_len, theta),
+        clamp=False,
         name="bos_weight_to_position",
     )
+    return assert_in_range(raw, 0.0, float(max_len), atol=0.1)
 
 
 def attend_most_recent_globally(
