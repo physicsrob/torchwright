@@ -1,12 +1,19 @@
 # RoPE port — plan
 
-Status: **Phases 0–5 done; Phase 6 (`torchwright_doom`) remaining** (branch `worktree-rope`). Phase 0
+Status: **Phases 0–5 done; Phases 6–8 remaining** (branch `worktree-rope`). Phase 0
 (rotary `Attn`, in-process/ONNX/HF), Phase 1 (bucket-1 near-marker count), Phase 1b (recency ramp:
 `soft_blend` + octant ramp, confirm-compile green), Phase 2 Part 1 (relative-offset all-Δ + sign
 lock), Phase 2 Part 2 (compiler self-match → rotary, all three surfaces), Phase 3 (content-selection
 capability on slow planes — proven; builder rewrite landed in Phase 5), Phase 4 (recency end-to-end:
 the two graded `{BOS, REF}` rotary heads → octant ramp → ramp-based selection, proven; in-place
 builder rewrite landed in Phase 5).
+
+**Design change (2026-06-28, post-Phase-5): the global `{BOS, REF}` octant-ramp recency above is being
+superseded** (see Phases 6–8 in §8). It proved the capability but requires an artificial `<ref>` token
+and is far heavier than bounded consumers need: new **Phase 6** moves every consumer to a **local**
+rotary-lobe recency (no `<ref>`, no ramp, monotone within the lobe), new **Phase 7** redesigns the
+unbounded/global case without an injected token (and may live outside the compiler), and the
+`torchwright_doom` port becomes **Phase 8**.
 
 **Phase 5 done (2026-06-28, committed on `worktree-rope` as `d9f4272` + `7a92c72`).** All strands complete and the full
 `make test` suite is **green** on Modal: Strand A (RoPE-native library) + B1 (PosEncoding deletion),
@@ -15,10 +22,13 @@ a save→load NaN bug found and fixed), and Strand B2 (**universal full-width ro
 the `Attn.rotary` flag removed, `d_qk == d_head` enforced, wall attention migrated to a slow-plane
 rotary content head to keep the DOOM-port derisk valid). Two real bugs were found and fixed with D6
 repros along the way: an I1 `const_one` node-id collision and the HF save→load NaN. See the Phase-5
-status block in §8. `torchwright_doom` is untouched (Phase 6).
+status block in §8. `torchwright_doom` is untouched (Phase 8).
 
-Remaining: **Phase 6** (`torchwright_doom` — rewire the DOOM call sites + the BOS/REF tokens, full render
-parity, and the 42k real-log recency replay). **`main` merged in (`f281ee8`)**: ONNX/HF now
+Remaining: **Phase 6** (local rotary-lobe recency; delete `<ref>` and the global octant mechanism;
+migrate the examples — torchwright), **Phase 7** (design + demo the unbounded global most-recent without
+`<ref>`, possibly outside the compiler — torchwright), and **Phase 8** (`torchwright_doom` — rewire the
+DOOM call sites, full render parity, and the 42k real-log recency replay). **`main` merged in
+(`f281ee8`)**: ONNX/HF now
 run in CI (the Modal image carries `onnxruntime`/`transformers` — the runtime-parity gap is closed),
 the float-I/O headless ONNX export and the delta-transfer compile mode were removed, and the token
 export uses a vanilla untied embedding.
@@ -110,6 +120,14 @@ absolute position. A head controls its behavior by *which planes it places energ
     is load-bearing in 95% of real selections and must split gaps as small as **1 token at any
     absolute position** (§9), so a signal whose resolution degrades or collapses anywhere fails.
     It does **not** need an exact integer (order is all the argmax uses).
+
+    > **⚠ Superseded (2026-06-28) — see Phases 6–7 in §8.** The bucket-2 design below (the global
+    > `{BOS, REF}` octant-ramp readout, the `<ref>` token, the seam/leakage/gain calibration) is **no
+    > longer the plan of record.** Bounded consumers move to a **local** rotary-lobe recency (Phase 6 —
+    > no `<ref>`, monotone within the lobe width `W`); the unbounded/global case is redesigned without an
+    > injected token in Phase 7 (and may live outside the compiler). The bucket-2 text from here through
+    > §6's recency-signal bullet and §11's recency gates is retained as the **Phase-7 design reference**,
+    > not a build commitment.
 
     *Premise — the softmax is a true (non-PL) softmax on every path.* The recency phase is read
     out of an attention *weight* (RoPE rotates Q/K not V, so the phase lives only in the score).
@@ -271,7 +289,7 @@ mechanism swaps *internally* (no call-site churn); **Phase 5 makes the `pos_enco
 signatures change** — still entirely within torchwright (its own tests and `examples/` migrate in the
 same phase). *(Phase-5 status: the signature change — `pos_encoding` → `RopeConfig` — and the
 `PosEncoding` deletion are ✅ done on `worktree-rope`; the tests/`examples/` migration is ✅ done.
-See §8 Phase-5 status.)* **DOOM consumer edits + render parity are Phase 6** — a separate
+See §8 Phase-5 status.)* **DOOM consumer edits + render parity are Phase 8** — a separate
 `torchwright_doom` branch, coordinated with the Phase-5 torchwright branch via the umbrella pointer
 bump.
 
@@ -363,11 +381,11 @@ in-stream marker and value `= pos − marker_pos` recovered via the count, vs or
 >   implied) — plus their tests. (A count-to-BOS boolean `compare(1/(pos+1), 1/(2^k+1))` resolves
 >   small k but hits the `1/m²` collapse for large k — confirming this needs a different mechanism,
 >   deferred had we kept them.)
-> - **DOOM consumer rewiring is Phase 6.** The one DOOM `get_position_scalar` site rewires to
+> - **DOOM consumer rewiring is Phase 8.** The one DOOM `get_position_scalar` site rewires to
 >   `count_since_marker(span_v0_marker, …)`; per §7 (DOOM untouched through Phase 5) that lands at
->   Phase 6, where gate (a) — the marker is graph-recognizable + the post-marker window is
+>   Phase 8, where gate (a) — the marker is graph-recognizable + the post-marker window is
 >   constructible — is verified against the real span-v0 publish. (Phase 5 lands the torchwright-side
->   `get_position_scalar` → `count_since_marker` signature change; Phase 6 is the DOOM call site.)
+>   `get_position_scalar` → `count_since_marker` signature change; Phase 8 is the DOOM call site.)
 
 **Phase 1b — Recency signal (bucket 2): the octant two-head readout.** Build the §3 mechanism.
 
@@ -541,7 +559,7 @@ slow planes add distance-dependent cosine attenuation and possible cross-plane m
 stay inside each head's gap.
 
 > **Status (2026-06-27): capability proven; builder rewrite ✅ landed in Phase 5 (this branch, see §8
-> status), DOOM wiring to Phase 6.** Like Phases 1 and 1b, this builds and proves the *capability* with
+> status), DOOM wiring to Phase 8.** Like Phases 1 and 1b, this builds and proves the *capability* with
 > a torchwright helper + confidence tests; the in-place rewrite of the production `attend_*` builders
 > (it needs `d_head` at graph-construction time — see "the architectural finding" below — which arrives
 > with the §7 `RopeConfig` signature change) is **done** as of Phase 5: every builder takes `RopeConfig`
@@ -558,7 +576,7 @@ stay inside each head's gap.
 >   current `attend_*` signatures carry only `pos_encoding` (no `d_head`), so the in-place mechanism
 >   swap can't happen "internally" the way §7 envisioned for Phases 1–4; it lands with the Phase-5
 >   signature change (`pos_encoding` → a RoPE config carrying `d_head`/`base`). Phase 3 therefore
->   proves the capability head-by-head; Phase 5 rewires the 12 builders (torchwright); Phase 6 wires DOOM.
+>   proves the capability head-by-head; Phase 5 rewires the 12 builders (torchwright); Phase 8 wires DOOM.
 > - **`d_head`/`base` settled.** `base = 5e5` (locked, LLaMA3). Key result: the slowest-plane
 >   attenuation at 42k (~0.9965) is set by **base, not `d_head`** (θ_min → 1/base as `d_head`→∞), so
 >   `d_head` only buys *plane count* for wider content. **`d_head = 256`** (the recency-analysis grid)
@@ -582,7 +600,7 @@ production-length log to confirm the headroom survives the tighter per-token ste
 octant stays ~180×).
 
 > **Status (2026-06-27): capability proven end-to-end; the in-place builder rewrite is Phase 5
-> (torchwright), the DOOM wiring + 42k real-log replay are Phase 6 (cross-repo).** Like Phases 1/1b/3,
+> (torchwright), the DOOM wiring + 42k real-log replay are Phase 8 (cross-repo).** Like Phases 1/1b/3,
 > this builds and proves the
 > *capability* with torchwright-only graphs + confidence tests (`tests/compile/forward/
 > test_rope_recency_e2e.py`, 9 tests green on Modal). New code: `recency_plane_index` (`graph/rope.py`),
@@ -621,9 +639,9 @@ octant stays ~180×).
 >   logits at the cap-density octant-boundary worst case (0.98-hard), ~8 at the typical step — the
 >   octant trade-off `G~2e5` accepts (argmax always correct; the *ordering*, hence "0 flips," is
 >   `G`-invariant).
-> - **Still to do.** (1, **Phase 6**) The **42k real-log replay** with the real ramp needs a
+> - **Still to do.** (1, **Phase 8**) The **42k real-log replay** with the real ramp needs a
 >   ~42k `torchwright_doom` instrumentation log; the committed log is the ~11.6k frame, and DOOM is
->   untouched through Phase 5 (§7), so this lands on the Phase-6 `torchwright_doom` branch. The ramp's
+>   untouched through Phase 5 (§7), so this lands on the Phase-8 `torchwright_doom` branch. The ramp's
 >   monotonicity/resolvability *at cap φ-density* is already proven (`test_recency_ramp_compiled.py` +
 >   the analytic gap-1 band test here). (2, **Phase 5 — ✅ DONE on this branch, see §8 status**) The
 >   **in-place rewrite** of `attend_most_recent_matching` / `get_prev_value` onto `recency_rank` landed
@@ -694,7 +712,7 @@ changes land in torchwright and are validated by the §9 confidence suite + the 
 >   geometric content head (was `d_head=3`, content on fast planes — incompatible with rotation) is now a
 >   full-width `rotary_content_head` at `d_head=256` with its angular/distance/role content on the three
 >   slowest planes (rotation ≈ identity over the small token offsets, so the analytical reference holds
->   unchanged). This **derisks the Phase-6 `torchwright_doom` port**; the prototype's docstring records
+>   unchanged). This **derisks the Phase-8 `torchwright_doom` port**; the prototype's docstring records
 >   the open production-difficulty questions (distance normalisation, real angular resolution, Δ-regime,
 >   interval-containment vs midpoint-cos) that need the not-yet-existing walls-as-tokens spec.
 > - **Strand B2 tail — emission dead-code cleanup + cross-backend parity. ✅ DONE.** With the
@@ -747,22 +765,79 @@ changes land in torchwright and are validated by the §9 confidence suite + the 
   emission risk than the content heads; this is the early Phase-5 gate (a token-model export through
   `compile_to_onnx` → HF, prefill == cached decode), *before* any DOOM dependency.
 
-**Define the BOS/REF interface here, supply the tokens in Phase 6.** The recency readout needs two
-always-causally-visible marked tokens — BOS (the phase carrier) and a second constant **REF**. The
-Phase-4 capability planted synthetic `bos_marker` / `ref_marker` inputs; Phase 5 fixes the builder
-*interface* (which graph features identify BOS and REF), Phase 6 wires the actual DOOM tokens to it.
-Choosing the real REF token (e.g. position 1, always present after BOS) is a Phase-6 decision.
+**~~Define the BOS/REF interface here…~~ — superseded by Phases 6–7.** Phase 5 built the `{BOS, REF}`
+two-token readout (synthetic `bos_marker`/`ref_marker` in Phase 4; the builder interface in Phase 5).
+The `<ref>` token and that global readout are **removed in Phase 6**; the unbounded/global case is
+redesigned without an injected token in Phase 7. The note is kept only to mark what Phases 6–7 unwind.
 
-**Phase 6 — `torchwright_doom`: consumer rewiring + render parity (cross-repo).** A separate
+**Phase 6 — Local recency; delete `<ref>` and the global octant mechanism (torchwright only).**
+Replace the bucket-2 recency machinery with a **local** mechanism and remove the `<ref>` token. "Most
+recent matching key" becomes a content match plus the **natural rotary distance-decay**: `Σ_p
+cos(Δ·θ_p)` (the rotary self-similarity between a query and a key `Δ` positions back) is maximal at
+`Δ=0` and decreases monotonically over the main lobe, so a nearer key of equal content outranks a
+farther one — no BOS-relative phase, no two-token `{BOS, REF}` readout, no octant ramp.
+
+- **Delete:** the `<ref>` token and the two-token interface; `recency_phase_heads` / `recency_rank` /
+  `recency_rank_from_tokens` (`ops/recency_heads.py`); the octant ramp (`ops/recency_ramp.py`); and
+  `soft_blend` (`ops/map_select.py`) if the ramp was its only consumer. `<bos>` **stays** (a natural
+  sequence start, not an artificial scaffold); only `<ref>` and the global readout go.
+- **Rewire every consumer to local recency.** `attend_most_recent_matching` / `get_prev_value` take a
+  local rotary-lobe recency bias instead of a `recency_rank` node (the `recency_rank` parameter drops
+  from their signatures and from `sequence_ops` / `NumericSequence`); the calculator examples migrate.
+  This is what removes `<ref>` from everything that lands.
+- **The breakdown is measured and comfortable — document it precisely (load-bearing).** Local recency
+  is monotone only within the lobe width `W` (the largest distance at which a nearer key always beats
+  *every* farther key); past `W` the similarity is non-monotone and "most recent" can *silently* pick a
+  wrong key. **Target: ~100 tokens.** Measured (`scripts/rope_window_frontier.py`, base `5e5`, `d_head
+  256`, Hann taper): **`W ≈ 415`** at the natural plane set — **~4× the target** — with per-step
+  resolution at distance 100 of `~2.4e-3` (≈ 4×10⁴ the fp32 weight floor `~6e-8`), so a 100-token
+  window is trivially resolvable. **`W` is set by the plane cutoff, not the base** (≈ unchanged from the
+  base-`1e6` `W ≈ 414`); restricting to slower planes trades up to `W ≈ 6800` for coarser near-Δ
+  resolution. Put the chosen `W` + breakdown in the op docstring; a confidence test exhibits the
+  non-monotone region past `W` (so the limit is tested, not a footnote). *(Parameterize `BASE` in
+  `rope_window_frontier.py` when Phase 6 lands — it currently hard-codes `1e6`.)*
+- **Validation.** The example suite (now `<ref>`-free, green) + a local-recency confidence test that
+  proves monotone "most recent" to ~100 tokens **and exhibits the breakdown past `W`**; `probe_compiled`
+  parity; I1–I4 hold; D6 repro at the op layer.
+- DOOM's *bounded* reads use this (Phase 8); DOOM's clip-memory (look-back `> W`) needs Phase 7.
+
+**Phase 7 — Global most-recent: design + targeted demo, possibly outside the compiler (torchwright).**
+Solve **unbounded** "most recent matching key" — the one place the local lobe is insufficient (DOOM
+clip look-backs exceed `W`) — **without an injected `<ref>` token.** This is a design phase: find a
+constant phase reference that is not a scaffold token. Candidates, roughly in order of how clean they
+are if they hold:
+
+- **(a) `self` carrying DC-only.** `{BOS, self}` was rejected in Phase 4 because `self` carried
+  recency-plane energy, so its logit *moved* with the query position (the `−M·cos ψ` shift) — a moving
+  reference. But if `self`'s key is projected to the **near-static DC plane only** (no recency energy)
+  it is a true constant `L`, and it is already always-visible via the existing const-1 self-match
+  column — **no token at all.** The cross-terms (does the single-plane DC self-match stay clean against
+  BOS's recency feature?) need verifying; this is the first thing to test, not a proven answer.
+- **(b) A real always-present token** in the stream designated as the reference and projected DC-only
+  — REF's *role* without REF the *token*. Clean and certain if the stream guarantees such a token at a
+  fixed early position (a DOOM frame header / fixed first tile).
+- **(c) BOS-only mixed-radix position decode** (`scripts/rope_position_decode.py`, validated 0..64k) —
+  a perfect integer rank from BOS-relative phases alone, no second key. Heavier than the ramp but needs
+  no reference token by construction.
+
+- **It may live outside the compiler.** It is plausible the global recency index is a host-side /
+  post-processing mechanism (clip-memory served by an external index) rather than a compiled per-token
+  attention weight. Phase 7 decides this; the compiler-internal octant-ramp work (Phases 1b/4, now in
+  git history + the §3/§4 design notes) is the reference design, **not** a build commitment.
+- **Deliverable: a targeted demo** proving the capability on whichever mechanism wins — monotone,
+  gap-1-resolvable recency out to the 61440 cap, 0-flips on a long replay — decoupled from DOOM, in the
+  style of the Phase 0–5 confidence suite.
+
+**Phase 8 — `torchwright_doom`: consumer rewiring + render parity (cross-repo).** A separate
 `torchwright_doom` branch, coordinated with the Phase-5 torchwright branch via the umbrella pointer
 bump (§7). Rewire the DOOM call sites onto the new signatures (the one `render_main.py`
-`get_position_scalar` site → `count_since_marker` against the span-v0 marker; the recency-family and
-content call sites onto the migrated builders), supply the BOS/REF tokens to the recency interface,
-and validate: **(1)** full DOOM render matches the reference renderer within the documented op-noise
-budget; **(2)** the recency 0-flips replay with the *real* ramp on a freshly captured ~42k
-instrumentation log (the committed log is the ~11.6k frame; this is the only place a 42k real-log
-replay can run, since it needs the DOOM renderer). This is the final integration gate for the whole
-port.
+`get_position_scalar` site → `count_since_marker` against the span-v0 marker; the bounded
+recency-family and content call sites onto the **local** mechanism (Phase 6); the clip-memory
+look-backs that exceed the lobe onto the **Phase-7 global mechanism**), and validate: **(1)** full DOOM
+render matches the reference renderer within the documented op-noise budget; **(2)** the recency
+0-flips replay with the Phase-7 global mechanism on a freshly captured ~42k instrumentation log (the
+committed log is the ~11.6k frame; this is the only place a 42k real-log replay can run, since it needs
+the DOOM renderer). This is the final integration gate for the whole port.
 
 ## 9. Validation and evidence
 
@@ -773,7 +848,7 @@ with a torchwright-only test graph that reproduces the class's essential shape *
 worst-case difficulty**. If the suite passes, the eventual DOOM migration is mechanical (swap each
 consumer onto an already-proven capability), not a question of whether RoPE can do it. The census
 of which DOOM call sites map to which capability is **read-only** analysis of `torchwright_doom`
-(no edits from a torchwright worktree); consumer edits and full DOOM render parity are **Phase 6** — a
+(no edits from a torchwright worktree); consumer edits and full DOOM render parity are **Phase 8** — a
 separate `torchwright_doom` branch, coordinated via the umbrella pointer-bump, after the torchwright
 branch (through Phase 5) is mergeable (§7). The three capabilities and their calibration targets:
 
@@ -781,7 +856,7 @@ branch (through Phase 5) is mergeable (§7). The three capabilities and their ca
 |---|---|---|
 | **Offset / self-match** (`attend_to_offset`, the 4 compiler self-match callers) | rotary offset head; all-Δ + Δ=0 self-match (Phases 0/2) | token-identical vs trig-shift; I1–I4 hold |
 | **Bucket 1 — bounded near-marker count** (`get_position_scalar`, `prefix_*`) | marker token in-stream + value `= pos − marker_pos` via the `1/(gap+1)` count, vs oracle | gap **< ~350**; `1/350` vs `1/351` resolves |
-| **Bucket 2 — recency ordering** (`attend_most_recent_matching`, `get_prev_value`) | real `compare`/`cond_gate`/`add` octant ramp; "most recent matching key" selection | gap-1 at absolute pos out to **~42k**; Phase-1b gates (handoff continuity, min slope ≈2.2e-5/tok, 0 flips) |
+| **Bucket 2 — recency ordering** (`attend_most_recent_matching`, `get_prev_value`) | **local** rotary-lobe "most recent" (Phase 6); global octant ramp superseded → Phase 7 | local: monotone to **~100 tokens** (lobe `W`, measured) + breakdown past `W` exhibited; global: Phase-7 demo to the cap |
 | **Content selection** (`attend_argmin/argmax/_where/...`) | each selector under RoPE slow planes, against its own score/validity bounds | real head gaps (`_QUERY_GAIN=8`, the bucket margins) |
 
 **Calibration discipline (the rule that makes this real, not theater):** every confidence test
@@ -798,7 +873,7 @@ Cache invariant test (Phase 0): prefill and unbounded decode produce identical o
 logits. Compiler-invariant tests for the self-match migration before broad suite runs.
 `make measure-noise` + update `numerical_noise_findings.md` for any new PL op (D7). Per-phase
 validation is the torchwright-internal confidence suite above (deep-rollout parity for Phases 1/4
-via representative graphs, not DOOM). Full **DOOM render parity is Phase 6 — the final integration
+via representative graphs, not DOOM). Full **DOOM render parity is Phase 8 — the final integration
 step on a separate `torchwright_doom` branch**, not a per-phase gate in this repo.
 
 **Load-bearing numbers and their sources.**
@@ -855,7 +930,7 @@ step on a separate `torchwright_doom` branch**, not a per-phase gate in this rep
   margin. Per-head selection-at-distance gates green (dot 198, bucket 253, worst-case fine-score 3.8 →
   47× concentration). **The builder rewrite (the `attend_*` funcs → full-width rotary on slow planes)
   ✅ DONE (Phase 5, this branch)** — every builder takes `RopeConfig` and routes through
-  `rotary_content_head`; oracle-validated. **DOOM call-site wiring is Phase 6**.
+  `rotary_content_head`; oracle-validated. **DOOM call-site wiring is Phase 8**.
 - **Re-grep per-class call sites.** Replace the sub-agent census with committed greps before
   per-site work (a direct grep found fewer literal `attend_most_recent_matching` sites than the
   census implied). Confirmed 2026-06-27: `pick_most_recent` does **not** exist in current code —
@@ -907,13 +982,13 @@ step on a separate `torchwright_doom` branch**, not a per-phase gate in this rep
   2-key ideal to fp32 and does **not** grow with key count (`N=256 → 4096`), ~23× under the gap-1
   weight signal at the 61440 cap (~350× at N=4096; cap bound pinned by
   `test_leakage_below_gap1_signal_at_cap`).
-- **Recency at production length.** ⏳ Phase 6 (cross-repo). The ramp's resolvability *at the
+- **Recency at production length.** ⏳ Phase 8 (cross-repo). The ramp's resolvability *at the
   cap φ-density* is proven (`test_recency_ramp_compiled.py` + the analytic gap-1 band in
   `test_rope_recency_e2e.py`); the **0-flips replay against real selections at ~42k** needs a ~42k
   `torchwright_doom` instrumentation log (committed log is the ~11.6k frame), so it lands on the
-  Phase-6 `torchwright_doom` branch (DOOM untouched through Phase 5, §7).
+  Phase-8 `torchwright_doom` branch (DOOM untouched through Phase 5, §7).
 - **Bucket-1 marker gates.** Per consumer, confirm the marker is graph-recognizable and the gap
-  bound holds at production config (the marker check is the Phase-6 DOOM call-site rewire).
+  bound holds at production config (the marker check is the Phase-8 DOOM call-site rewire).
 - **ONNX/HF emission validation (Phase 5, Strand D).** ✅ **DONE.** Exercised end-to-end on Modal
   (`compile_to_onnx` → HF; prefill == cached decode; save→load round trip). A real save→load NaN bug
   (non-persistent rotary buffers not materialised under `from_pretrained`'s meta-device load) was found
@@ -926,6 +1001,6 @@ step on a separate `torchwright_doom` branch**, not a per-phase gate in this rep
 - **Per-head rotary flag removal (Phase 5, Strand B2).** ✅ **DONE.** The `Attn.rotary` flag is gone
   (every head rotates) and the in-process path asserts `d_qk == d_head`, so NoPE **and** partial-width
   rotary are both structurally impossible — universal full-width LLaMA3 rotation, no escape hatch. Wall
-  attention was migrated (not deleted) to a slow-plane `rotary_content_head` to keep the Phase-6
+  attention was migrated (not deleted) to a slow-plane `rotary_content_head` to keep the Phase-8
   DOOM-port derisk valid (`test_wall_attention.py`); its docstring records the production-difficulty
-  open questions for Phase 6.
+  open questions for Phase 8.
