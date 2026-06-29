@@ -888,7 +888,7 @@ def _emit_by_slot_index(
 
     A drop-in replacement for :func:`~torchwright.ops.sequence_ops.output_sequence`
     that avoids ``attend_to_offset`` for the slot-index gating — the same helper
-    ``sort_digits_v1`` / ``sort_digits_v4`` carry, lifted here for the same
+    ``sort_digits_v1`` carries, lifted here for the same
     reason.  ``output_sequence`` gates slot ``k`` with
     ``attend_to_offset(is_trigger, delta_pos=-k)``; at an early emit position the
     deep slots target a position *before the sequence start*, where — with no

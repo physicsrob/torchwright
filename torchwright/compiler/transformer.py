@@ -74,11 +74,14 @@ class HeadlessTransformer:
     ):
         """Build the initial residual stream for ``n_pos`` positions.
 
-        ``past_len`` shifts the positional encoding so the new rows
-        correspond to absolute positions ``past_len .. past_len + n_pos - 1``
-        — used by cached decode to continue from an existing past.
-        Literals, InputNode values, and Embedding lookups are
-        position-independent so they are unaffected by ``past_len``.
+        ``past_len`` is **vestigial** under RoPE: position now enters only
+        through the rotary attention rotation (applied inside the layers from
+        ``cache_position``), not through any residual feature built here.
+        Literals, InputNode values, and Embedding lookups are all
+        position-independent, so the residual stream this builds does not
+        depend on ``past_len`` — the parameter is accepted for call-site
+        compatibility but no longer used (a candidate for removal; left as-is
+        to avoid a signature change).
         """
         assert self.residual_assignment
         in_state = self.layers[0].attn.in_state

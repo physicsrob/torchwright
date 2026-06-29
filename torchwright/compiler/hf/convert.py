@@ -17,8 +17,8 @@ Initializer → parameter map (ground truth: ``compiler/export.py``
 
     embed_table              -> model.embed_tokens.weight  (vocab, d)
     lm_head                  -> lm_head.weight              (vocab, d)  UNTIED
-    pos_encoding_full        -> model.pos_encoding_full    (max_seq, d)
     constant_values          -> model.constant_values      (d,)
+    rope_freq/_base/_split   -> TorchwrightConfig.rope_base (config-derived; not a param)
     l{i}_WQ/WK/WV  (d, hd)   -> q/k/v_proj.weight  = M.T    (hd, d)
     l{i}_WO        (hd, d)   -> o_proj.weight      = M.T    (d, hd)
     l{i}_W1        (d, d_h)  -> linear1.weight     = M.T    (d_h, d)

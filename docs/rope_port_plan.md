@@ -8,7 +8,7 @@ capability on slow planes — proven; builder rewrite landed in Phase 5), Phase 
 the two graded `{BOS, REF}` rotary heads → octant ramp → ramp-based selection, proven; in-place
 builder rewrite landed in Phase 5).
 
-**Phase 5 done (2026-06-28, uncommitted on `worktree-rope`).** All strands complete and the full
+**Phase 5 done (2026-06-28, committed on `worktree-rope` as `d9f4272` + `7a92c72`).** All strands complete and the full
 `make test` suite is **green** on Modal: Strand A (RoPE-native library) + B1 (PosEncoding deletion),
 Strand C (tests/examples migrated, `prefix_*` retired), Strand D (ONNX/HF gate validated end-to-end —
 a save→load NaN bug found and fixed), and Strand B2 (**universal full-width rotary, no escape hatch** —
@@ -17,8 +17,7 @@ rotary content head to keep the DOOM-port derisk valid). Two real bugs were foun
 repros along the way: an I1 `const_one` node-id collision and the HF save→load NaN. See the Phase-5
 status block in §8. `torchwright_doom` is untouched (Phase 6).
 
-Remaining: finish **Phase 5** (torchwright only — Strands C/D/B2 above; `torchwright_doom` untouched)
-and **Phase 6** (`torchwright_doom` — rewire the DOOM call sites + the BOS/REF tokens, full render
+Remaining: **Phase 6** (`torchwright_doom` — rewire the DOOM call sites + the BOS/REF tokens, full render
 parity, and the 42k real-log recency replay). **`main` merged in (`f281ee8`)**: ONNX/HF now
 run in CI (the Modal image carries `onnxruntime`/`transformers` — the runtime-parity gap is closed),
 the float-I/O headless ONNX export and the delta-transfer compile mode were removed, and the token
@@ -271,7 +270,7 @@ edited, from a torchwright worktree. Through Phases 1–4 each helper's signatur
 mechanism swaps *internally* (no call-site churn); **Phase 5 makes the `pos_encoding`-drops-from-
 signatures change** — still entirely within torchwright (its own tests and `examples/` migrate in the
 same phase). *(Phase-5 status: the signature change — `pos_encoding` → `RopeConfig` — and the
-`PosEncoding` deletion are ✅ done on `worktree-rope`; the tests/`examples/` migration is in progress.
+`PosEncoding` deletion are ✅ done on `worktree-rope`; the tests/`examples/` migration is ✅ done.
 See §8 Phase-5 status.)* **DOOM consumer edits + render parity are Phase 6** — a separate
 `torchwright_doom` branch, coordinated with the Phase-5 torchwright branch via the umbrella pointer
 bump.
@@ -284,7 +283,7 @@ per-head capability, not a global switch** — a global flip would rotate today'
 selectors (whose correctness depends on position-free logits) before Phase 3 migrates them. The
 flag is removed at Phase 5.
 
-> **Status: DONE (2026-06-27, uncommitted on `worktree-rope`).** Implemented across all three
+> **Status: DONE (2026-06-27, committed on `worktree-rope`).** Implemented across all three
 > runtime surfaces. New `torchwright/graph/rope.py` is the single source of truth (`rotate_half`,
 > half-split, `ROPE_BASE=500000`, `apply_rope`, `rotary_offset_head`) imported by both the oracle and
 > the in-process component so they can't drift. `Attn(rotary=, rope_base=)` + oracle row-index
@@ -517,7 +516,13 @@ D1 stop.
 >     oracle on `add`/`signed_multiply`, prefill==decode, the path is actually taken, odd-`d_head`
 >     guard) and `tests/hf/test_rope_self_match_token.py` (ONNX→HF: predict-previous survives, the
 >     const-1 column reaches HF `constant_values`, prefill==cached-decode). **Full suite green; I1–I4
->     held** (no D1 stop). `d_head` must be even (rotate_half).
+>     held** (no D1 stop). `d_head` must be even (rotate_half). **(Phase-5 update:** the in-process
+>     `test_rope_self_match.py` was **removed** when Phase 5 deleted the trig self-match path — a
+>     `rotary == trig` assertion is no longer constructible. Direct in-process compiled self-match
+>     transport is now covered only indirectly (any compiled model; the `const_one` mint in
+>     `test_recompile_node_id_collision.py`); cross-surface coverage via `test_rope_self_match_token.py`
+>     is retained. **Open decision:** re-add a direct in-process compiled self-match assertion, or
+>     accept the indirect + cross-surface coverage.)**
 >   - **`assume_zero_init` note.** `compile_to_onnx` defaults `assume_zero_init=True`, which elides
 >     some BIRTH-layer cancels, so the rotary-head count on the ONNX/HF path is lower than the
 >     `compile_headless` (`assume_zero_init=False`) count for the same graph — the HF test asserts
@@ -627,7 +632,7 @@ octant stays ~180×).
 changes land in torchwright and are validated by the §9 confidence suite + the ONNX/HF export path
 — **no DOOM render in this phase.** Three strands:
 
-> **Status (2026-06-28, uncommitted on `worktree-rope`): ✅ ALL STRANDS DONE — full `make test` green
+> **Status (2026-06-28, committed on `worktree-rope` as `d9f4272` + `7a92c72`): ✅ ALL STRANDS DONE — full `make test` green
 > on Modal.** Library + PosEncoding-deletion, tests/examples migration, ONNX/HF end-to-end validation,
 > and the universal-rotary flag removal are all complete. Tracked as four working strands (A/B map onto
 > the plan's strand 1+2; C/D onto strand 3 + the test/example migration):
@@ -713,8 +718,9 @@ changes land in torchwright and are validated by the §9 confidence suite + the 
 >   enough to exclude the BOS/REF **degenerate outlier rank** (≈0.5 vs the ~0.15 interior — a
 >   content-mismatched reference token will otherwise win on its rank) *and* `rank_gain` must be large
 >   enough to concentrate the tiebreak softmax. The two pull opposite ways; each consumer (examples and
->   DOOM) must size them per-graph, not trust defaults. Smallest-layer repro lives in the Strand-C
->   recency tests to be written.
+>   DOOM) must size them per-graph, not trust defaults. Smallest-layer repro lives in
+>   `tests/compile/forward/test_rope_recency_e2e.py` (the content-dominance bound + the degenerate
+>   BOS/REF outlier-rank cases).
 
 - **Rewire the production builders onto the proven capabilities** (each needs `d_head` at
   construction — the §7 signature change). The ~12 `attend_*` content builders → full-width rotary on
@@ -813,10 +819,11 @@ step on a separate `torchwright_doom` branch**, not a per-phase gate in this rep
 ## 10. Code change sites
 
 > **Phase-5 status (this branch): all torchwright-side sites below are ✅ done** (the deletions and the
-> `pos_encoding` → `RopeConfig` signature change landed and import clean; in-process validated). Line
-> numbers predate the edits. The ONNX/HF emission edits among them are written but **not yet validated
-> end-to-end** (Strand D), and the per-head rotary-flag removal (Strand B2) is **not yet done**. See
-> §8 Phase-5 status and §11.
+> `pos_encoding` → `RopeConfig` signature change landed and import clean). Line
+> numbers predate the edits. The ONNX/HF emission edits among them are **validated end-to-end**
+> (Strand D — `compile_to_onnx` → HF, prefill == cached decode, save→load round trip), and the
+> per-head rotary-flag removal (Strand B2) is **done** (universal full-width rotary, `d_qk == d_head`
+> enforced). See §8 Phase-5 status and §11.
 
 - **Delete the host position table (three sites).** `transformer.py:103-106` (writes
   `get_pos_encoding(...)` rows into reserved residual columns each forward); the `pos_encoding_full`
@@ -861,9 +868,10 @@ step on a separate `torchwright_doom` branch**, not a per-phase gate in this rep
   and `_current_pos_attn_matrices` / `graph/pos_encoding.py` no longer exist.
 - **RoPE convention (LLaMA3-aligned).** ✅ DONE (Phase 0). `rotate_half` layout (dropped the legacy
   interleaved `(2i,2i+1)` pairing), both Q and K rotated by absolute position (cache holds rotated K,
-  matching HF), base = `5e5`, no long-context frequency scaling. Still open: the global grid must
-  contain a sub-one-turn recency plane (a Phase-1b/3 `base`/`d_head` choice), and reconcile the
-  `1e6`-measured analyses with `5e5`.
+  matching HF), base = `5e5`, no long-context frequency scaling. ✅ Resolved (Phase 4): the global
+  grid contains a sub-one-turn recency plane — plane 91 at base `5e5`/`d_head 256` (`θ ≈ 8.88e-5`,
+  one turn ≈ 70761 positions, never wrapping over the 61440 cap); the `1e6`-measured analyses were
+  re-confirmed at `5e5` (the octant headroom survives).
 - **Offset sign convention.** ✅ DONE (Phase 0). `W_K = R_N W_Q` pinned by the offset-head test
   (which also pins the rotation layout).
 - **Compiler blast radius.** ✅ DONE (Phase 2 Part 2). Linear/Add/Cancel/add_into self-match

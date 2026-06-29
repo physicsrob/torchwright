@@ -777,8 +777,8 @@ def _emit_cached_preamble(nodes: list) -> None:
     Requires:
       - graph input ``cache_position``: int64 ``(n_new,)`` — the absolute
         positions of the new rows (``[base, base+1, …]``).  The ONLY
-        position fact the host provides; the causal mask and the
-        positional-encoding rows both derive from it in-graph.
+        position fact the host provides; the causal mask and the RoPE
+        cos/sin rotation both derive from it in-graph.
       - graph inputs ``past_K_0``…: sequence-major KV cache with a
         SYMBOLIC first dim ``cache_slots`` — the bound length ``S_eff``
         (a prefix window of the runtime's full-stride cache buffer) sets
@@ -787,7 +787,8 @@ def _emit_cached_preamble(nodes: list) -> None:
       - initializer ``arange_S``: int64 ``(S,)`` baked ``[0 .. S)``, where
         ``S = cache_stride`` is the FULL static slot count (the maximum
         any binding may use).
-      - initializer ``pos_encoding_full``: (max_seq_len, d)
+      - initializer ``rope_freq``: (d_head,) — the half-split per-dim RoPE
+        frequencies (every head is full-width rotary on the one global grid).
       - helper initializers from :func:`_add_scalar_inits`
 
     Memcpy invariant (the CUDA-graph capture requirement): a single
@@ -808,8 +809,9 @@ def _emit_cached_preamble(nodes: list) -> None:
     the baked GPU-resident ``arange_S`` instead.
 
     Produces:
-      - ``pos``: (n_new, d) float — ``pos_encoding_full`` rows gathered
-        at ``cache_position``.
+      - ``_rope_cos`` / ``_rope_sin``: (n_new, d_head) — the RoPE rotation
+        factors at ``cache_position`` (``cos``/``sin`` of ``pos · rope_freq``),
+        broadcast per layer onto Q and the new K rows.
       - ``mask_bool_3d``: (1, n_new, S_eff) bool, True where blocked: slot
         ``j`` is hidden from the query at position ``p`` iff ``j > p``.
         Applied via ``Where(mask_bool_3d, CAUSAL_MASK_SENTINEL, logits)``
@@ -1084,15 +1086,17 @@ def _resolve_cache_stride(
 ) -> int:
     """Resolve the static cache slot count ``S`` (default: max_seq_len).
 
-    ``S`` must be <= max_seq_len because ``Gather(pos_encoding_full,
-    cache_position)`` indexes a table sized by max_seq_len, and a compiled
-    model can never serve positions beyond its pos-encoding buffer anyway.
+    ``S`` must be <= max_seq_len, the model's maximum supported absolute
+    position.  Under RoPE the cos/sin rotation is computed from
+    ``cache_position`` on the fly (there is no longer a ``pos_encoding_full``
+    table to index), but a compiled model still cannot serve positions beyond
+    ``max_seq_len``.
     """
     s = max_seq_len if cache_stride is None else int(cache_stride)
     if not (1 <= s <= max_seq_len):
         raise ValueError(
             f"cache_stride {s} must be in [1, max_seq_len={max_seq_len}]: the "
-            f"static cache cannot hold positions the pos-encoding table lacks"
+            f"static cache cannot hold positions beyond the model's maximum"
         )
     return s
 
