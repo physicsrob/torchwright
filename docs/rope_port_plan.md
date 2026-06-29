@@ -1,6 +1,6 @@
 # RoPE port — plan
 
-Status: **Phases 0–6 done; Phases 7–8 remaining** (branch `worktree-rope`). Phase 0
+Status: **Phases 0–7 done; Phase 8 remaining** (branch `worktree-rope`). Phase 0
 (rotary `Attn`, in-process/ONNX/HF), Phase 1 (bucket-1 near-marker count), Phase 1b (recency ramp:
 `soft_blend` + octant ramp, confirm-compile green), Phase 2 Part 1 (relative-offset all-Δ + sign
 lock), Phase 2 Part 2 (compiler self-match → rotary, all three surfaces), Phase 3 (content-selection
