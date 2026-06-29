@@ -23,8 +23,9 @@ and the score to every other key is 0, giving softmax weight
 ``scripts/rope_global_recency_validate.py``), with minimum adjacent-m gap
 ~4.9e-6 (~81× the fp32 weight floor).  A 1024-breakpoint log-uniform PWL
 inverts w → m with max error ~0.009; combined with the fp32 softmax noise
-(~0.006) the total positional error is ~0.015 — 33× below the 0.5 rounding
-threshold for integer recovery.
+(~0.006) the total positional error is ~0.15 (fp32 ReLU accumulation in the PWL sum
+dominates at small positions — see ``tests/ops/test_global_recency.py``) —
+still 3.3× below the 0.5 rounding threshold for integer recovery.
 
 The cosine attenuation at large m (cos(MAX_LEN·θ_slow) ≈ 0.991 — a ~1%
 variation) is **baked into the PWL fit**: the table is built against the true
@@ -50,7 +51,7 @@ import math
 
 import torch
 
-from torchwright.graph import Attn, Concatenate, LiteralValue, Node, RopeConfig
+from torchwright.graph import Concatenate, LiteralValue, Node, RopeConfig
 from torchwright.graph.asserts import assert_in_range
 from torchwright.graph.rope import (
     rope_inv_freq,
@@ -137,8 +138,10 @@ def global_position_from_bos(
 
     A log-uniform PWL table (``n_breakpoints`` entries) inverts w → m.
 
-    Precision: max error ~0.015 positions (PWL ~0.009 + fp32 ~0.006),
-    comfortably inside the 0.5 rounding threshold for integer recovery.
+    Precision: max error ~0.15 positions (PWL fitting ~0.009; fp32 softmax
+    ~0.006; fp32 ReLU accumulation in the PWL sum up to ~0.09 at small
+    positions — empirically measured in ``tests/ops/test_global_recency.py``),
+    still 3.3× below the 0.5 rounding threshold for integer recovery.
 
     Compile cost: 1 attention head + 1 MLP sublayer (the PWL inversion).
 
@@ -293,6 +296,21 @@ def attend_most_recent_globally(
         value = attend_to_offset(rope, value, delta_pos=-1)
 
     W = len(query_vector)
+    # Guard: the position column occupies the (W+1)-th slowest plane.  That
+    # plane's frequency θ_pos must satisfy max_positions × θ_pos < π/2 so the
+    # RoPE attenuation cos((i−j)·θ_pos) remains positive for all key offsets;
+    # a negative cosine would reverse the tiebreak ordering.
+    theta_pos = float(rope_inv_freq(rope.d_head, rope.base)[rope.d_head // 2 - 1 - W])
+    if rope.max_positions * theta_pos >= math.pi / 2:
+        raise ValueError(
+            f"attend_most_recent_globally: content width W={W} places the "
+            f"position tiebreak on plane {rope.d_head // 2 - 1 - W} "
+            f"(θ={theta_pos:.3e}); max_positions={rope.max_positions} × θ = "
+            f"{rope.max_positions * theta_pos:.3f} ≥ π/2 ({math.pi/2:.3f}).  "
+            f"Narrow the content vector, increase d_head/base, or reduce "
+            f"max_positions."
+        )
+
     # Per-position logit gain: each unit of absolute position contributes
     # recency_scale to the logit.  NOT divided by max_positions — the raw
     # position value ≈ i is used directly so adjacent positions differ by

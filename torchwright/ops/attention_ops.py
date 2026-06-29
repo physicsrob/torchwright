@@ -1083,7 +1083,7 @@ def attend_mean_where(
     query_matrix = torch.zeros((1, d_qk))
     query_matrix[0, 0] = 1.0
 
-    # pos_encoding doesn't appear in key_in — only validity drives K.
+    # Only validity drives K — no additional position feature in key_in.
     key_matrix = torch.zeros((len(validity), d_qk))
     key_matrix[0, 0] = _VALIDITY_DIRECT
 

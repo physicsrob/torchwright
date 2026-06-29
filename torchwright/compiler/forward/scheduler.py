@@ -1080,7 +1080,7 @@ class LayerScheduler:
                 continue
             if self.graph.is_input_node(cur):
                 # Graph source nodes (InputNode, Embedding, LiteralValue,
-                # PosEncoding) must stay in the residual stream so
+                # RopeConfig) must stay in the residual stream so
                 # callers can read their values via the compiled model's
                 # snapshot-based lookup.  Existing dead-node cancellation
                 # also leaves them alone until a later layer, so eager-

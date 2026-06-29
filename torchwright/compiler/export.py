@@ -3,7 +3,7 @@
 One exporter returning an :class:`OnnxArtifact` (paths + small build
 metadata; ``artifact.load()`` / ``artifact.debug_session(...)``):
 
-    compile_to_onnx(output_node, pos_encoding, embedding, path, ...)
+    compile_to_onnx(output_node, embedding, path, ...)
         Token I/O: token_ids -> logits.  Sidecar format
         ``torchwright.token.v1`` carries the vocab.  Consumer:
         ``OnnxTokenModule`` via

@@ -1386,8 +1386,8 @@ def solve_schedule(
     Args:
         output_node: graph output. Defines the ancestor cone the
             scheduler operates over.
-        pos_encoding: positional encoding node (always allocated by
-            ``forward_compile``; subtracted from the residual budget).
+        pos_encoding: vestigial — always ``None`` under RoPE; retained for
+            call-site compatibility.
         d, d_head, d_hidden: transformer geometry. ``n_heads_per_layer
             = d // d_head``.  Residual budget is
             ``d - input_residual_cols``.
