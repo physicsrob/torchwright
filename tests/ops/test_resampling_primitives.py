@@ -119,7 +119,6 @@ def test_table_lookup_2d_every_integer_cell():
 
     report = probe_graph(
         out_node,
-        pos_encoding=None,
         input_values=inputs,
         n_pos=n_pos,
         d=1024,
@@ -214,7 +213,6 @@ def test_table_lookup_2d_accepts_transition_band_inputs():
 
     report = probe_graph(
         out_node,
-        pos_encoding=None,
         input_values=inputs,
         n_pos=1,
         d=256,
@@ -338,7 +336,6 @@ def test_table_lookup_3d_every_integer_cell():
 
     report = probe_graph(
         out_node,
-        pos_encoding=None,
         input_values=inputs,
         n_pos=n_pos,
         d=2048,
@@ -427,7 +424,6 @@ def test_table_lookup_3d_inner_axis_amplification():
 
     report = probe_graph(
         out_node,
-        pos_encoding=None,
         input_values=inputs,
         n_pos=len(coords),
         d=2048,
@@ -450,9 +446,7 @@ def test_table_lookup_3d_near_integer_inputs_remain_in_bin():
     j_val = torch.tensor([[b] for _a, b, _c in coords], dtype=torch.float32)
     k_val = torch.tensor([[c] for _a, _b, c in coords], dtype=torch.float32)
     inputs = {"i": i_val, "j": j_val, "k": k_val}
-    expected = _table_lookup_3d_reference(
-        table, i_val, j_val, k_val, sharpness=10.0
-    )
+    expected = _table_lookup_3d_reference(table, i_val, j_val, k_val, sharpness=10.0)
 
     cache = reference_eval(out_node, inputs, len(coords))
     assert torch.allclose(cache[out_node], expected, atol=5e-3)
@@ -485,7 +479,6 @@ def test_table_lookup_3d_inner_and_vector_transition_match_reference():
 
     report = probe_graph(
         out_node,
-        pos_encoding=None,
         input_values=inputs,
         n_pos=3,
         d=512,
@@ -627,7 +620,6 @@ def test_dynamic_extract_every_index(n_entries, d_fill):
     # Compiled must match the oracle at every node (no divergence).
     report = probe_graph(
         out_node,
-        pos_encoding=None,
         input_values=inputs,
         n_pos=n_pos,
         d=1024,
@@ -661,7 +653,6 @@ def test_dynamic_extract_random_indices():
 
     report = probe_graph(
         out_node,
-        pos_encoding=None,
         input_values=inputs,
         n_pos=n_pos,
         d=1024,
@@ -807,7 +798,6 @@ def test_linear_bin_index_centers_and_out_of_range(n_bins, x_min_val, x_max_val)
     # guarded.
     report = probe_graph(
         out_node,
-        pos_encoding=None,
         input_values=inputs,
         n_pos=n_pos,
         d=2048,
@@ -858,7 +848,6 @@ def test_linear_bin_index_non_integer_values():
 
     report = probe_graph(
         out_node,
-        pos_encoding=None,
         input_values=inputs,
         n_pos=n_pos,
         d=2048,
@@ -955,7 +944,6 @@ def test_linear_bin_index_into_dynamic_extract():
     # pass criterion.
     report = probe_graph(
         rgb,
-        pos_encoding=None,
         input_values=inputs,
         n_pos=n_pos,
         d=2048,
@@ -1119,7 +1107,6 @@ def test_linear_bin_index_inv_range_probe():
 
     report = probe_graph(
         out_node,
-        pos_encoding=None,
         input_values=inputs,
         n_pos=n_pos,
         d=2048,
@@ -1171,7 +1158,6 @@ def test_table_lookup_2d_out_of_range_index_clamps_to_edge():
     # ...and the min-clamp + saturating-step chain compiles precisely.
     report = probe_graph(
         out_node,
-        pos_encoding=None,
         input_values=inputs,
         n_pos=i_val.shape[0],
         d=1024,
@@ -1211,9 +1197,7 @@ def test_table_lookup_index_staircase_clamps_and_rounds_at_any_magnitude():
 
     for n, s in [(256, 100.0), (256, 1000.0), (20000, 1000.0)]:
         x = create_input("x", 1)
-        node = _table_lookup_index_staircase(
-            x, n, sharpness=s, d_max=1024, name="st"
-        )
+        node = _table_lookup_index_staircase(x, n, sharpness=s, d_max=1024, name="st")
         cases = [
             (-1.0e6, 0.0),
             (-0.4, 0.0),

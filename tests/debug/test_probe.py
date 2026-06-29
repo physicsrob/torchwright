@@ -17,7 +17,7 @@ from torchwright.debug.probe import (
 )
 from torchwright.graph import Attn
 from torchwright.ops.arithmetic_ops import add_const, multiply_const
-from torchwright.ops.inout_nodes import create_input, create_pos_encoding
+from torchwright.ops.inout_nodes import create_input
 
 
 def test_reference_eval_matches_direct_compute_tiny():
@@ -68,13 +68,11 @@ def test_probe_residual_reads_intermediate_node():
     layer that has y live must hold 3*x; empty per_layer would indicate
     the probe failed to surface the node.
     """
-    pos = create_pos_encoding()
     x = create_input(2)
     y = multiply_const(x, 3.0)
     z = add_const(y, 1.0)
     module = compile_headless(
         z,
-        pos,
         d=64,
         verbose=False,
     )
@@ -102,21 +100,20 @@ def test_probe_attention_captures_softmax_weights():
     row.  This exercises the monkey-patch + forward path end-to-end on
     a graph small enough that layer-hosting lookup is unambiguous.
     """
-    pos = create_pos_encoding()
     x = create_input("x", 4)
     torch.manual_seed(0)
     attn = Attn(
         query_in=x,
         key_in=x,
         value_in=x,
-        query_matrix=torch.randn(4, 4),
-        key_matrix=torch.randn(4, 4),
+        # Q/K are full-width d_head=16 (every head is rotary on the global grid).
+        query_matrix=torch.randn(4, 16),
+        key_matrix=torch.randn(4, 16),
         value_matrix=torch.randn(4, 4),
         output_matrix=torch.randn(4, 4),
     )
     module = compile_headless(
         attn,
-        pos,
         d=256,
         d_head=16,
         verbose=False,
@@ -157,12 +154,10 @@ def test_probe_layer_diff_drift_and_sentinel():
       the node equals a caller-supplied sentinel (set to the first
       per-layer value).
     """
-    pos = create_pos_encoding()
     x = create_input("x", 2)
     y = multiply_const(x, 3.0)
     module = compile_headless(
         y,
-        pos,
         d=64,
         verbose=False,
     )

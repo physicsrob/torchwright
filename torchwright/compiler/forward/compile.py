@@ -48,7 +48,8 @@ from torchwright.compiler.groups.transformer_layer import TransformerLayer
 from torchwright.compiler.transformer import HeadlessTransformer
 from torchwright.compiler.residual_assignment import flatten_concat_nodes
 from torchwright.graph import Node, Linear, Concatenate
-from torchwright.graph.pos_encoding import PosEncoding
+from torchwright.graph.node import reserve_node_id_above
+from torchwright.graph.misc import LiteralValue
 from torchwright.graph.relu import ReLU
 
 # Default constant magnitude exponent q for the pinned-RMS norm: each reserved
@@ -292,7 +293,7 @@ def _run_heuristic_warm_start(
     graph: GraphAnalyzer,
     d: int,
     d_head: int,
-    pos_encoding: PosEncoding,
+    pos_encoding,
     d_hidden: int,
     residual_map: ResidualStreamMap,
     computed: Set[Node],
@@ -569,7 +570,6 @@ def forward_compile(
     d: int,
     d_head: int,
     output_node: Node,
-    pos_encoding: Optional[PosEncoding] = None,
     verbose: bool = True,
     max_layers: int = 100,
     device: Optional[str] = "auto",
@@ -597,7 +597,6 @@ def forward_compile(
         d: Residual stream dimension.
         d_head: Attention head dimension.
         output_node: The graph node whose value should appear in the output.
-        pos_encoding: Positional encoding node (required for attention ops).
         verbose: Print compilation progress.
         max_layers: Safety limit on number of layers.
         device: Target device — "auto" (default) uses GPU if available,
@@ -679,39 +678,52 @@ def forward_compile(
     output_node = graph.get_output_node()
     input_nodes = [n for n in graph.get_all_nodes() if graph.is_input_node(n)]
 
-    # Auto-create pos_encoding if needed (required for attention ops)
-    if pos_encoding is None:
-        pos_encoding = PosEncoding(17)
+    # RoPE end state (docs/rope_port_plan.md §1, Phase 5): position is a
+    # rotation applied inside attention, not a residual node — there is no
+    # PosEncoding.  ``pos_encoding`` is kept as an internal ``None`` so the
+    # downstream scheduler / fingerprint / weight-writer call sites that still
+    # accept it pass through harmlessly (they no longer read any position
+    # substrate).
+    pos_encoding = None
 
-    # Same-position copy heads match over the full trig grid, so d_head must
-    # admit every trig column.  Reject early with an actionable message
-    # rather than failing deep in the weight writer.
-    if d_head < pos_encoding.trig_width:
-        # Largest odd d_pos with trig_width (= d_pos - 1) <= d_head.
-        suggested_d_pos = d_head + 1 if d_head % 2 == 0 else d_head
+    # rotate_half pairs dim p with dim p+d_head/2, so every rotary head (which
+    # under the end-state global rotation is *every* head) needs an even d_head.
+    if d_head % 2 != 0:
         raise ValueError(
-            f"d_head ({d_head}) must be >= pos_encoding.trig_width "
-            f"({pos_encoding.trig_width}). Either raise d_head, or pass a "
-            f"smaller positional encoding (an odd d_pos with "
-            f"d_pos - 1 <= d_head, e.g. PosEncoding({suggested_d_pos}))."
+            f"d_head must be even (got {d_head}); rotate_half pairs dim p with "
+            f"dim p+d_head/2 and every head is rotary on the global grid."
         )
 
     if d_hidden is None:
         d_hidden = d
 
     # 2. Initialize
-    net = HeadlessTransformer(d, d_head, pos_encoding, d_hidden=d_hidden)
+    net = HeadlessTransformer(d, d_head, d_hidden=d_hidden)
     # Solver provenance, populated only when CP-SAT runs (optimize>0); stays
     # None for the heuristic path so callers can always query it.
     net.cpsat_solve_stats = None
     residual_map = ResidualStreamMap(d)
-    residual_map.allocate(pos_encoding)
-    # pos_encoding + input_nodes are populated by get_input_res_stream at
-    # forward-time, so those cols are guaranteed clean on entry.
-    residual_map.mark_clean(residual_map.get_indices(pos_encoding))
+    # Reserve one constant-1 residual column for the Δ=0 self-match heads behind
+    # every Linear/Add/Cancel/add_into.  It is a LiteralValue input node, so all
+    # three runtime surfaces initialise it to 1.0 with no new emission code
+    # (in-process get_input_res_stream's LiteralValue branch; the ONNX/HF
+    # `constant_values` seed).  It is allocated once and never freed — no graph
+    # node owns it and no op targets it — so the column holds 1.0 unchanged
+    # through every layer.  The runtime rotates it by absolute position
+    # (rotate_half over d_head), making the self-match logit ∝ Σ_p cos((i−j)·θ_p)
+    # peak at i==j — a bit-identical Δ=0 transport.
+    # Before minting any compile-internal node, push the global id counter past
+    # every graph node so the mint cannot share an id (and thus compare equal)
+    # with a graph node.  In production the counter is already ahead (it is
+    # monotonic and never reset), so this is a no-op; it only fires when a test
+    # has reset the counter to 0 and re-compiles a long-lived graph, where a
+    # naive mint would collide with a graph node and corrupt the residual map
+    # (invariant I1).  See ``reserve_node_id_above``.
+    reserve_node_id_above(graph.get_all_nodes())
+    const_one: Node = LiteralValue(torch.ones(1), name="rope_self_match_const_one")
+    residual_map.allocate(const_one)
+    residual_map.mark_clean(residual_map.get_indices(const_one))
     for node in input_nodes:
-        if node is pos_encoding:
-            continue
         residual_map.allocate(node)
         residual_map.mark_clean(residual_map.get_indices(node))
     # When the caller asserts the runtime zero-initialises the residual
@@ -805,7 +817,6 @@ def forward_compile(
         t_solve_start = time.perf_counter()
         schedule_fp = graph_fingerprint(
             output_node,
-            pos_encoding,
             d=d,
             d_head=d_head,
             d_hidden=d_hidden if d_hidden else d,
@@ -1079,11 +1090,12 @@ def forward_compile(
         )
 
     # Save input indices before scheduling (scheduling may free/reassign them)
-    input_indices: dict[Node, list[int]] = {
-        pos_encoding: residual_map.get_indices(pos_encoding)
-    }
+    input_indices: dict[Node, list[int]] = {}
     for node in input_nodes:
         input_indices[node] = residual_map.get_indices(node)
+    # const_one is in the in_state so get_input_res_stream / the ONNX+HF
+    # constant seed write 1.0 into its column (LiteralValue branch).
+    input_indices[const_one] = residual_map.get_indices(const_one)
 
     graph_params = sum(n.num_params() for n in graph.get_all_nodes())
 
@@ -1150,7 +1162,12 @@ def forward_compile(
         t_attn_start = time.perf_counter()
         placement_recorder.set_layer(i)
         write_attn_sublayer(
-            layer, attn_ops, residual_map, pos_encoding, recorder=placement_recorder
+            layer,
+            attn_ops,
+            residual_map,
+            pos_encoding,
+            recorder=placement_recorder,
+            const_one=const_one,
         )
         t_mlp_start = time.perf_counter()
         write_mlp_sublayer(

@@ -36,7 +36,7 @@ from torchwright.graph.asserts import (
     assert_unique_values,
     collect_asserts,
 )
-from torchwright.ops.inout_nodes import create_input, create_pos_encoding
+from torchwright.ops.inout_nodes import create_input
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -264,29 +264,26 @@ def _build_simple_graph(with_assert: bool):
     """Simple compilable graph: ``y = clamp(x, -1, 1)`` optionally asserted."""
     from torchwright.ops.arithmetic_ops import clamp
 
-    pos = create_pos_encoding()
     x = create_input("x", 1)
     clamped = clamp(x, -1.0, 1.0)
     if with_assert:
         clamped = assert_in_range(clamped, -1.0, 1.0)
-    return pos, x, clamped
+    return x, clamped
 
 
 def test_compile_strips_asserts_and_preserves_output():
-    pos_a, _, out_a = _build_simple_graph(with_assert=False)
+    _, out_a = _build_simple_graph(with_assert=False)
     mod_a = compile_headless(
         out_a,
-        pos_a,
         d=256,
         d_head=16,
         max_layers=40,
         verbose=False,
     )
 
-    pos_b, _, out_b = _build_simple_graph(with_assert=True)
+    _, out_b = _build_simple_graph(with_assert=True)
     mod_b = compile_headless(
         out_b,
-        pos_b,
         d=256,
         d_head=16,
         max_layers=40,
@@ -322,7 +319,6 @@ def test_check_asserts_on_compiled_passes_when_invariant_holds():
     """A predicate that the compiled value satisfies should not raise."""
     from torchwright.ops.arithmetic_ops import clamp
 
-    pos = create_pos_encoding()
     x = create_input("x", 1)
     clamped = clamp(x, -1.0, 1.0)
     # Assert that the clamped value is in [-1, 1] — it always is.
@@ -330,7 +326,6 @@ def test_check_asserts_on_compiled_passes_when_invariant_holds():
     asserts = collect_asserts(out)
     mod = compile_headless(
         out,
-        pos,
         d=256,
         d_head=16,
         max_layers=40,
@@ -364,7 +359,6 @@ def test_check_asserts_on_compiled_raises_when_compiled_violates():
     """
     from torchwright.ops.arithmetic_ops import piecewise_linear
 
-    pos = create_pos_encoding()
     x = create_input("x", 1)
     # Jagged function with sharp slope changes — PL approximation will
     # differ meaningfully from the exact cubic between breakpoints.
@@ -387,7 +381,6 @@ def test_check_asserts_on_compiled_raises_when_compiled_violates():
     # so compile succeeds without running the predicate.
     mod = compile_headless(
         out,
-        pos,
         d=256,
         d_head=16,
         max_layers=40,

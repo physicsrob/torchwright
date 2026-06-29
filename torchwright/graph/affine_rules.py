@@ -40,7 +40,6 @@ def compute_affine_bound(node: "Node") -> AffineBound:
     from torchwright.graph.linear import Linear
     from torchwright.graph.relu import ReLU
     from torchwright.graph.embedding import Embedding
-    from torchwright.graph.pos_encoding import PosEncoding
     from torchwright.graph.attn import Attn
 
     if isinstance(node, InputNode):
@@ -77,11 +76,6 @@ def compute_affine_bound(node: "Node") -> AffineBound:
     if isinstance(node, Embedding):
         ab = _embedding_rule(node)
         assert ab.n_cols > 0, "Embedding must produce non-degenerate affine bound"
-        return ab
-
-    if isinstance(node, PosEncoding):
-        ab = _pos_encoding_rule(node)
-        assert ab.n_cols > 0, "PosEncoding must produce non-degenerate affine bound"
         return ab
 
     from torchwright.graph.misc import Placeholder
@@ -225,7 +219,6 @@ def _assert_rule(node) -> AffineBound:
     """Assert: pass through coefficients, optionally tighten input_ranges."""
     from torchwright.graph.misc import Assert, InputNode
     from torchwright.graph.embedding import Embedding
-    from torchwright.graph.pos_encoding import PosEncoding
 
     inp_ab = node.inputs[0]._affine_bound
     if node.claimed_type is not None:
@@ -235,7 +228,7 @@ def _assert_rule(node) -> AffineBound:
         while isinstance(target, Assert):
             target = target.inputs[0]
 
-        if isinstance(target, (InputNode, Embedding, PosEncoding)):
+        if isinstance(target, (InputNode, Embedding)):
             new_ranges = dict(inp_ab.input_ranges)
             if target.node_id in new_ranges:
                 old_lo, old_hi = new_ranges[target.node_id]
@@ -334,29 +327,6 @@ def _embedding_rule(node) -> AffineBound:
         b_hi=b.clone(),
         columns={node.node_id: (0, d)},
         input_ranges={node.node_id: (col_lo, col_hi)},
-    )
-
-
-def _pos_encoding_rule(node) -> AffineBound:
-    """Identity A-matrix: [-1, 1] for sinusoidal columns, [0, 100000] for
-    the raw position counter at ``counter_col`` (the last column)."""
-    import torch
-
-    d = node.d_output
-    counter_col = node.counter_col
-    A = torch.eye(d, dtype=torch.float64)
-    b = torch.zeros(d, dtype=torch.float64)
-    lo = torch.full((d,), -1.0, dtype=torch.float64)
-    hi = torch.full((d,), 1.0, dtype=torch.float64)
-    lo[counter_col] = 0.0
-    hi[counter_col] = 100000.0
-    return AffineBound(
-        A_lo=A.clone(),
-        A_hi=A.clone(),
-        b_lo=b.clone(),
-        b_hi=b.clone(),
-        columns={node.node_id: (0, d)},
-        input_ranges={node.node_id: (lo, hi)},
     )
 
 

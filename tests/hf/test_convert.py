@@ -32,7 +32,7 @@ from torchwright.compiler.onnx_load import load_onnx
 
 from tests.hf._hf_parity import (
     compile_example,
-    hf_decode,
+    hf_teacher_forced,
     max_logit_diff,
     oracle_decode,
 )
@@ -78,12 +78,41 @@ def test_config_matches_debug_sidecar(artifact_path, converted):
 
 
 def test_prefill_and_decode_bit_exact(converted):
+    """ONNX oracle (onnxruntime) vs native HF model (torch): the meaningful
+    logits are bit-identical and decode the same tokens; the cancel-head rows
+    that cancel to denormal magnitude differ only by a denormal ULP.
+
+    Two things make this robust rather than a flaky ``== 0.0``:
+
+    * The backends are *different runtimes*, so bit-for-bit agreement is not an
+      algebraic guarantee. It holds for every normal-magnitude logit, but a row
+      where the compiled cancel-heads drive the residual to denormal magnitude
+      (~1e-40) differs by a single denormal ULP (~1e-43) — the near-zero row
+      magnifies a sub-ULP rounding difference between the two backends.  The gap
+      is denormal-magnitude *regardless of the rotation formula*; the exact
+      mechanism of the sub-ULP difference is unconfirmed (one plausible candidate
+      is an FMA contraction one runtime applies and the other does not).  We bound
+      those rows far below any real cancellation failure (~1e-4+) instead of
+      demanding equality.
+    * We teacher-force the native model on the *oracle's* token stream rather
+      than letting each backend free-run on its own argmax. Past the meaningful
+      output the logits are all-denormal noise whose argmax is arbitrary, so two
+      free-running loops would pick different garbage and diverge; teacher
+      forcing keeps every compared row on identical inputs.
+    """
     model, oracle = converted
     prefill = _prefill_ids(oracle)
     o_ids, o_logits = oracle_decode(oracle, prefill, _N_STEPS)
-    h_ids, h_logits = hf_decode(model, prefill, _N_STEPS)
-    assert h_ids == o_ids, f"decode tokens diverged: hf={h_ids} oracle={o_ids}"
-    assert max_logit_diff(o_logits, h_logits) == 0.0
+    h_logits = hf_teacher_forced(model, prefill, o_ids)
+    for i, (o, h) in enumerate(zip(o_logits, h_logits)):
+        normal = o.abs() >= 1e-30  # exclude the denormal cancel-head noise floor
+        assert torch.equal(o[normal], h[normal]), f"row {i}: normal logits diverged"
+        # Where the row carries real signal, both backends decode the same token.
+        if normal.any():
+            assert int(o.argmax()) == int(h.argmax()), f"row {i}: argmax diverged"
+    assert (
+        max_logit_diff(o_logits, h_logits) < 1e-30
+    ), "cross-backend logit divergence exceeds the denormal noise floor"
 
 
 def test_bare_forward_without_use_cache(converted):

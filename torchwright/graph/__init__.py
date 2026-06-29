@@ -13,6 +13,6 @@ from .misc import (
     Predicate,
     ValueLogger,
 )
-from .pos_encoding import PosEncoding
 from .relu import ReLU
+from .rope import ROPE_BASE, RopeConfig
 from .session import fresh_graph_session

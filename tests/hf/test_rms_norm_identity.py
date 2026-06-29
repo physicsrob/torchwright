@@ -40,11 +40,10 @@ _EXPRS = ["12*34\n", "999+1\n", "0-7\n", "999*999\n", "321*3\n"]
 def _compile(rms_norm: bool) -> str:
     from examples import calculator_v2
 
-    out_node, pos, emb = calculator_v2.create_network_parts()
+    out_node, emb = calculator_v2.create_network_parts()
     d_dir = tempfile.mkdtemp(prefix=f"tw_rmsnorm_{rms_norm}_")
     art = compile_to_onnx(
         out_node,
-        pos,
         emb,
         os.path.join(d_dir, "m.onnx"),
         d=calculator_v2.D_MODEL,

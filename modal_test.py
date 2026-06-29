@@ -27,15 +27,68 @@ app = modal.App("torchwright-test", image=IMAGE)
 
 _HEAVY_FILES: list[str] = [
     "tests/compile/forward/test_most_recent_long_span.py",
+    # The deepest token model (d=3072, 96 heads, chain-of-thought transcript) —
+    # its own container.  RoPE recency graphs compile far deeper than the old
+    # counter scheme, so the example/calculator tests are now the wall-time
+    # drivers and must be spread across containers (they piled into the
+    # catch-all and timed it out).
+    "tests/compile/forward/test_forward_calculator_scratchpad.py",
 ]
 
 # Each inner list becomes one container.  Splitting medium files across
-# multiple groups keeps any single shard from dominating wall time.
+# multiple groups keeps any single shard from dominating wall time.  The
+# RoPE-era example/calculator compiles are the heavy items, grouped by the
+# example family they exercise so the load spreads evenly.
 _MEDIUM_FILE_GROUPS: list[list[str]] = [
     [
         "tests/debug/test_probe.py",
         "tests/compile/forward/test_sort_digits.py",
         "tests/ops/test_resampling_primitives.py",
+    ],
+    # Calculator family (d=1024–3072, ~90 layers each).
+    [
+        "tests/compile/forward/test_forward_calculator.py",
+    ],
+    [
+        "tests/compile/forward/test_forward_calculator_v2.py",
+        "tests/compile/forward/test_kv_cache.py",
+        "tests/compile/forward/test_batched_decode_with_past.py",
+    ],
+    # Token-stream examples (d=1024, ~44 layers each).
+    [
+        "tests/compile/forward/test_forward_adder.py",
+        "tests/compile/forward/test_caesar_cipher.py",
+        "tests/compile/forward/test_fibonacci.py",
+        "tests/compile/forward/test_binary_increment.py",
+    ],
+    # Tests that compile the adder via its create_network_parts.
+    [
+        "tests/compile/forward/test_module.py",
+        "tests/compile/forward/test_matrix_occupancy.py",
+        "tests/compile/forward/test_graph_analysis.py",
+        "tests/debug/test_onnx_debug_session.py",
+    ],
+    # HF / ONNX parity exports.
+    [
+        "tests/hf/test_rope_token.py",
+        "tests/hf/test_rope_self_match_token.py",
+        "tests/hf/test_calculator_parity.py",
+    ],
+    # RoPE capability compiles (recency ramp, content slow-planes, offset).
+    [
+        "tests/compile/forward/test_rope_recency_e2e.py",
+        "tests/compile/forward/test_rope_content_slow_planes.py",
+        "tests/compile/forward/test_recency_ramp_compiled.py",
+        "tests/compile/forward/test_rope_offset.py",
+        "tests/compile/forward/test_rope_offset_all_deltas.py",
+        "tests/compile/forward/test_bucketed_argmin.py",
+    ],
+    # Example-level reference-eval + range-printer compile.
+    [
+        "tests/examples/test_calculator_arithmetic.py",
+        "tests/examples/test_calculator_scratchpad.py",
+        "tests/examples/test_range_printer.py",
+        "tests/examples/test_adder_v2.py",
     ],
 ]
 
@@ -51,7 +104,7 @@ SHARDS = [
 # ── Remote function ───────────────────────────────────────────────
 
 
-@app.function(gpu="a100-80gb", cpu=8, memory=32768, timeout=1800)
+@app.function(gpu="a100-80gb", cpu=8, memory=32768, timeout=2400)
 def run_pytest(pytest_args: str, shard_id: int = 0, extra_args: str = "") -> int:
     tag = f"[shard {shard_id}]"
     t0 = time.time()

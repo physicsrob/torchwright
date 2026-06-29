@@ -13,7 +13,11 @@ Scope (deliberately narrow):
   test is not about computing cos/sin/dist from raw ``(x1, y1, x2, y2)``
   and a player position, just about whether attention can *select*
   the right wall given them.
-* Single attention head, single layer, ``d_head = 3``.
+* A single full-width rotary content head (``d_head = 256``, the production
+  grid), single layer.  The 3 geometry scalars ride the three slowest planes
+  via the production ``rotary_content_head`` builder; the global positional
+  rotation is ≈ identity over the small wall/query token offsets here, so the
+  selection logits are preserved.  See the RoPE note at the end.
 * Walls live at input positions ``0..N-1``, queries at ``N..N+M-1``.
   Causal masking plus zero-K on the non-matching role is what
   prevents cross-role contamination; the tests include explicit
@@ -58,6 +62,39 @@ fixed positive offset at wall rows (but not at query rows, where the
 ``is_wall`` slot is zero), keeping the gap to the zero-logit
 baseline wide enough that any realistic ``wall_dist`` still yields
 a strongly positive logit.
+
+RoPE form (universal full-width rotary).  Every head in the end-state compiler
+is full-width rotary on one global grid, so this head is built via
+``rotary_content_head`` at ``d_head = 256`` with the three content scalars
+(angular cos, angular sin, role/distance) relocated onto the three slowest
+planes.  Two distinct cos/sin pairs are in play and must NOT be conflated: the
+angular ``cos``/``sin`` above are a *content* dot product (geometry fed as input
+numbers — ``cos(ray - wall_midpoint)``); RoPE's positional ``cos``/``sin`` is a
+rotation by *token position* applied on top.  Slow planes make that positional
+rotation quasi-static (``cos(Δ·θ) ≈ 1`` for the tiny token offsets here, error
+~1e-9), so it does not corrupt the angular content and the un-rotated analytical
+reference below stays exact within the tests' tolerances.
+
+Open questions for the Phase-6 ``torchwright_doom`` port.  This prototype proves
+the *mechanism* (rotary attention can do angular + distance selection on slow
+planes); the following need the walls-as-tokens token-stream spec, which does
+not exist yet, so they are NOT derisked here:
+
+* **Distance dynamic range.**  The distance penalty rides a slow plane that
+  attenuates ~0.8% at the 42k rollout — 0.8% of the *absolute* penalty, which
+  can swamp a small Δ-distance tiebreak.  Real wall distances must be normalised
+  to a bounded score (cf. ``_MAX_SCORE_ABS`` in the Phase-3 content tests), not
+  raw map units.
+* **Angular resolution.**  Real DOOM adjacent-column separation (~0.36° at full
+  width) is ~1000× tighter than this toy's ~11°, forcing a much larger
+  ``logit_scale`` (~3e5); calibrate to the real per-column ``cos`` gap.
+* **Δ-regime.**  Whether walls re-emit per frame (token offset Δ ≈ 300, easy) or
+  persist (Δ ≈ 42k, the Phase-3-hard regime) decides the whole difficulty class.
+* **Geometric fidelity.**  Real DOOM assigns a column to the wall whose angular
+  *interval* contains the ray (with occlusion), not by midpoint-cosine
+  similarity.  Midpoint-cos is a derisking proxy for "can rotary attention do
+  angular selection at all", not how DOOM picks walls; a faithful version needs
+  an in-interval test in the MLP feeding a validity head (a larger graph).
 """
 
 import math
@@ -68,7 +105,8 @@ import pytest
 import torch
 
 from torchwright.debug.probe import probe_graph, reference_eval
-from torchwright.graph import Attn, Concatenate
+from torchwright.graph import Concatenate
+from torchwright.graph.rope import ROPE_BASE, rotary_content_head
 from torchwright.ops.inout_nodes import create_input
 
 # ---------------------------------------------------------------------------
@@ -86,7 +124,7 @@ _SLOT_WALL_DIST = 6
 _SLOT_WALL_ID = 7
 
 D_INPUT = 8
-D_HEAD = 3
+WALL_D_HEAD = 256  # rotary grid (production d_head); content rides the 3 slowest planes
 D_OUTPUT = 3  # (attended_wall_id, attended_wall_cos_mid, attended_wall_sin_mid)
 
 INPUT_NAMES = (
@@ -114,56 +152,62 @@ def _build_wall_attention_graph(
     logit_scale: float = 100.0,
     dist_scale: float = 1.0,
     wall_bias: float = 30.0,
-) -> Attn:
-    """Build the wall-attention graph with hand-designed Q/K/V/O matrices.
+):
+    """Build the wall-attention head as a full-width rotary content head.
 
-    The graph has exactly one ``Attn`` node.  Its input nodes are a
-    ``Concatenate`` of the eight 1-wide slot inputs, packed in the
-    order declared by ``INPUT_NAMES``.
+    The three geometric content scalars are fed to ``rotary_content_head`` (the
+    production slow-plane content builder), which relocates them onto the three
+    slowest planes of a ``d_head = WALL_D_HEAD`` rotary grid and builds the
+    ``Attn``.  Over the small wall/query token offsets here the positional
+    rotation is ≈ identity (see the module docstring), so the logits are the
+    same un-rotated ``logit_scale * (cos_diff + wall_bias - dist_scale*wall_dist)``
+    the analytical reference computes.
 
-    ``wall_bias`` is a positive constant routed into K's distance
-    dimension via ``is_wall``.  It keeps every wall logit
-    comfortably above the zero-logit query-self baseline — see the
-    module docstring for why this matters.
+    Q/K read the 7 geometry slots (everything but ``wall_id``); the payload
+    ``value_in`` is a separate ``(wall_id, wall_cos_mid, wall_sin_mid)`` node
+    because ``rotary_content_head`` uses identity V/O.  ``wall_id`` is therefore
+    NOT in the shared Q/K residual (it is read only by V), which also keeps the
+    Q/K ``Concatenate`` free of dead children.
+
+    ``wall_bias`` is a positive constant routed into the role/distance content
+    column via ``is_wall``.  It keeps every wall logit comfortably above the
+    zero-logit query-self baseline — see the module docstring for why.
     """
     inputs = [create_input(name, 1) for name in INPUT_NAMES]
-    residual = Concatenate(inputs)
 
-    # Q: extracts logit_scale * (ray_cos, ray_sin, is_query) from the
-    # residual stream.  Q at a wall row is (0, 0, 0) because ray_cos,
-    # ray_sin, and is_query are all zero there.
-    q_matrix = torch.zeros(D_INPUT, D_HEAD)
-    q_matrix[_SLOT_RAY_COS, 0] = logit_scale
-    q_matrix[_SLOT_RAY_SIN, 1] = logit_scale
-    q_matrix[_SLOT_IS_QUERY, 2] = logit_scale
+    # Shared Q/K source: the 7 geometry slots (wall_id excluded — it is payload,
+    # read only by V).  Every slot here is read by Q or K (no dead children).
+    qk_residual = Concatenate(inputs[:_SLOT_WALL_ID])
 
-    # K: extracts (wall_cos_mid, wall_sin_mid,
-    #              is_wall * wall_bias - dist_scale * wall_dist).
-    # K at a query row is (0, 0, 0) — every wall slot including is_wall
-    # is zero there.
-    k_matrix = torch.zeros(D_INPUT, D_HEAD)
-    k_matrix[_SLOT_WALL_COS, 0] = 1.0
-    k_matrix[_SLOT_WALL_SIN, 1] = 1.0
-    k_matrix[_SLOT_IS_WALL, 2] = wall_bias
-    k_matrix[_SLOT_WALL_DIST, 2] = -dist_scale
+    # Q content (compact, W=3): logit_scale * (ray_cos, ray_sin, is_query).
+    # Zero on wall rows because ray_cos/ray_sin/is_query are all zero there.
+    q_content = torch.zeros(_SLOT_WALL_ID, D_OUTPUT)
+    q_content[_SLOT_RAY_COS, 0] = logit_scale
+    q_content[_SLOT_RAY_SIN, 1] = logit_scale
+    q_content[_SLOT_IS_QUERY, 2] = logit_scale
 
-    # V: extracts (wall_id, wall_cos_mid, wall_sin_mid).  Zero on query rows.
-    v_matrix = torch.zeros(D_INPUT, D_HEAD)
-    v_matrix[_SLOT_WALL_ID, 0] = 1.0
-    v_matrix[_SLOT_WALL_COS, 1] = 1.0
-    v_matrix[_SLOT_WALL_SIN, 2] = 1.0
+    # K content (compact, W=3): (wall_cos_mid, wall_sin_mid,
+    #   is_wall*wall_bias - dist_scale*wall_dist).  Zero on query rows.
+    k_content = torch.zeros(_SLOT_WALL_ID, D_OUTPUT)
+    k_content[_SLOT_WALL_COS, 0] = 1.0
+    k_content[_SLOT_WALL_SIN, 1] = 1.0
+    k_content[_SLOT_IS_WALL, 2] = wall_bias
+    k_content[_SLOT_WALL_DIST, 2] = -dist_scale
 
-    # O: identity — d_head == d_output == 3.
-    o_matrix = torch.eye(D_HEAD, D_OUTPUT)
+    # Payload (identity V/O): (wall_id, wall_cos_mid, wall_sin_mid).  Zero on
+    # query rows (all wall slots are zero there), so role-gating is preserved.
+    payload = Concatenate(
+        [inputs[_SLOT_WALL_ID], inputs[_SLOT_WALL_COS], inputs[_SLOT_WALL_SIN]]
+    )
 
-    return Attn(
-        query_in=residual,
-        key_in=residual,
-        value_in=residual,
-        query_matrix=q_matrix,
-        key_matrix=k_matrix,
-        value_matrix=v_matrix,
-        output_matrix=o_matrix,
+    return rotary_content_head(
+        qk_residual,
+        qk_residual,
+        payload,
+        query_matrix=q_content,
+        key_matrix=k_content,
+        d_head=WALL_D_HEAD,
+        base=ROPE_BASE,
     )
 
 
@@ -625,8 +669,8 @@ def test_probe_compiled_matches_oracle():
 
     We use this test sparingly — compilation takes seconds — but it
     catches classes of bugs the oracle alone can't see: bad
-    Q/K/V/O packing, residual assignment errors, attention head
-    padding issues at ``d_head=3``.
+    Q/K/V/O packing, residual assignment errors, and the slow-plane
+    rotary content head wiring through the compiler at full-width d_head.
     """
     logit_scale = 200.0
     dist_scale = 1.0
@@ -647,11 +691,10 @@ def test_probe_compiled_matches_oracle():
 
     report = probe_graph(
         attn,
-        pos_encoding=None,
         input_values=inputs,
         n_pos=n_pos,
         d=512,
-        d_head=16,
+        d_head=WALL_D_HEAD,
         verbose=False,
         atol=1e-3,
     )

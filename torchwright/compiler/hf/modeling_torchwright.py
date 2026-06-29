@@ -14,9 +14,9 @@ The forward path is transcribed one-for-one from the compiler's ONNX emission
 ``_emit_cached_layer_nodes``):
 
     res      = embed_table[input_ids]              # (B, T, d) — vanilla lookup
-    res      = res + pos_encoding_full[cache_position]  # additive absolute PE
+    res      = res + constant_values               # const seed (self-match col)
     for each layer:
-        res  = res + attn(norm(res))               # causal, scale=1.0, no bias
+        res  = res + attn(norm(res))               # causal, scale=1.0, RoPE, no bias
         res  = res + linear2(relu(linear1(norm(res))))  # both linears biased
     logits   = lm_head(norm(res))                  # UNTIED, full-width, no bias
 
@@ -24,6 +24,10 @@ The ``norm`` is a real RMSNorm that computes the **identity** (the compiler
 pins the residual RMS to a power of two and sets the gain to cancel it; see
 :class:`TorchwrightRMSNorm`).  When ``config.rms_norm`` is off it is
 ``nn.Identity`` and the path reduces to plain ``res + attn(res)``.
+
+Position is a rotation applied inside attention (RoPE, ``rotate_half`` over
+``d_head`` by absolute ``cache_position``) — there is no additive positional
+encoding table.
 
 Correctness invariants (all from the compiler source; see the config docstring):
 
@@ -70,7 +74,13 @@ from .configuration_torchwright import TorchwrightConfig
 # The compiler emits attention against the exact-math softmax+matmul. On A100 the
 # default fp32 SDPA backend is EFFICIENT_ATTENTION, which perturbs values by a
 # single fp32 mantissa-LSB on some inputs — enough to break the algebraic
-# cancellation the compiled heads depend on. MATH matches the compiler bit-for-bit.
+# cancellation the compiled heads depend on (concretely: at a large operand
+# q ~= 22855 one fp32 ULP is ~1/512, which leaks into a cancel-head's residual
+# column and flips a Gray-code bit at boundary q values; see components/attn.py).
+# The exact zero a cancel-head produces is consumed categorically downstream, so
+# this is a regime change, not tolerable noise — which is why model.forward
+# hard-raises on any non-fp32 dtype / autocast rather than warning (a silent
+# wrong forward has no symptom). MATH matches the compiler bit-for-bit.
 _SDPA_BACKEND = [SDPBackend.MATH]
 
 
@@ -96,6 +106,43 @@ class TorchwrightAttention(nn.Module):
         self.v_proj = nn.Linear(self.d, hd, bias=False)
         self.o_proj = nn.Linear(hd, self.d, bias=False)
 
+        # RoPE (LLaMA3 rotate_half, half-split, scale baked into base). EVERY head
+        # is full-width rotary on the one global grid — rotation is full-width over
+        # d_head, by ABSOLUTE position (cache_position). There is no non-rotary
+        # (NoPE) head and no per-head enable.
+        #
+        # The rotary frequency grid is derived purely from the serialized config
+        # and is cheap, so it is recomputed in ``forward`` on the input's device
+        # rather than stored as a buffer. A buffer would be the obvious choice, but
+        # ``from_pretrained``'s meta-device (low_cpu_mem_usage) load path does NOT
+        # materialize a non-persistent buffer — it is absent from the checkpoint
+        # and never re-run — so it would reload full of uninitialized garbage and
+        # the rotary multiply would propagate NaN to every logit. A plain Python
+        # scalar is immune to that path.
+        self.rope_base = float(config.rope_base)
+
+    @staticmethod
+    def _rotate_half(x: torch.Tensor) -> torch.Tensor:
+        half = x.shape[-1] // 2
+        return torch.cat([-x[..., half:], x[..., :half]], dim=-1)
+
+    def _apply_rope(
+        self,
+        x: torch.Tensor,
+        cos: torch.Tensor,
+        sin: torch.Tensor,
+    ) -> torch.Tensor:
+        # x: (B, n_heads, T, d_head); cos/sin: (T, d_head) -> (1, 1, T, d_head).
+        # Every head rotates full-width (no per-head enable). Emitted directly,
+        # matching export.py: cross-backend ONNX/torch agreement is not algebraic
+        # (the cancel-head rows that cancel to denormal magnitude differ by one
+        # denormal ULP regardless of the form, which the test_convert parity bound
+        # tolerates — no token or meaningful logit moves), so the `x + (rot - x)`
+        # reconstruction bought nothing and is gone.
+        cos = cos[None, None]
+        sin = sin[None, None]
+        return x * cos + self._rotate_half(x) * sin
+
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -108,6 +155,19 @@ class TorchwrightAttention(nn.Module):
         q = self.q_proj(hidden_states).view(shape).transpose(1, 2)
         k = self.k_proj(hidden_states).view(shape).transpose(1, 2)
         v = self.v_proj(hidden_states).view(shape).transpose(1, 2)
+
+        # RoPE rotates Q and the NEW K by absolute position, before the cache
+        # update, so the cache stores already-rotated K (slot == position).  Every
+        # head is full-width rotary on the one global grid.
+        device = hidden_states.device
+        p = torch.arange(0, self.d_head, 2, dtype=torch.float64, device=device)
+        inv = (self.rope_base ** (-p / self.d_head)).to(torch.float32)
+        rope_freq = torch.cat([inv, inv])  # (d_head,)
+        ang = cache_position.to(torch.float32)[:, None] * rope_freq[None, :]
+        cos = torch.cos(ang)  # (T, d_head)
+        sin = torch.sin(ang)
+        q = self._apply_rope(q, cos, sin)
+        k = self._apply_rope(k, cos, sin)
 
         if past_key_values is not None:
             k, v = past_key_values.update(k, v, self.layer_idx)
@@ -230,15 +290,11 @@ class TorchwrightModel(TorchwrightPreTrainedModel):
     def __init__(self, config: TorchwrightConfig):
         super().__init__(config)
         self.embed_tokens = nn.Embedding(config.vocab_size, config.d)
-        # Precomputed absolute positional-encoding table — lookup data, not a
-        # matmul weight — registered as a persistent buffer (still saved into
-        # the safetensors state dict). The table is full-width: a row is
-        # gathered straight into the residual.
-        self.register_buffer(
-            "pos_encoding_full",
-            torch.zeros(config.max_seq, config.d),
-            persistent=True,
-        )
+        # Position is a rotation applied inside attention (RoPE) — there is no
+        # additive positional-encoding table.  The input constant vector
+        # (including the reserved const-1 self-match column) is lookup/bias data,
+        # not a matmul weight — a persistent buffer saved into the state dict.
+        self.register_buffer("constant_values", torch.zeros(config.d), persistent=True)
         self.layers = nn.ModuleList(
             [TorchwrightDecoderLayer(config, i) for i in range(config.n_layers)]
         )
@@ -325,9 +381,10 @@ class TorchwrightModel(TorchwrightPreTrainedModel):
             else:
                 cache_position = torch.arange(past_seen, past_seen + T, device=device)
 
-        # Vanilla token + absolute-PE residual seed (both (·, d)).
-        pos = self.pos_encoding_full[cache_position]  # (T, d)
-        res = tok + pos  # (B, T, d)
+        # Vanilla token + constant residual seed (all (·, d)); position enters
+        # only through the rotary rotation inside attention.  The token embedding
+        # also carries the pinned RMSNorm constant in its reserved column(s).
+        res = tok + self.constant_values  # (B, T, d)
 
         # Causal mask over absolute positions: key j visible to query p iff j<=p.
         total = past_seen + T

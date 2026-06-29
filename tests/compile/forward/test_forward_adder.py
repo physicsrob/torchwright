@@ -43,7 +43,10 @@ def adder_3digit(tmp_path_factory):
 
 def test_1digit_adder(adder_1digit):
     model, artifact = adder_1digit
-    assert artifact.n_layers <= 20, f"Too many layers: {artifact.n_layers}"
+    # RoPE recency: the octant ramp + two graded {BOS, REF} heads behind
+    # recency_rank are structurally deeper than the old counter column, so the
+    # budget is higher than the pre-port ≤20 (docs/rope_port_plan.md §8 Phase 5).
+    assert artifact.n_layers <= 50, f"Too many layers: {artifact.n_layers}"
 
     test_cases = [
         ("1+1\n", "2"),
@@ -54,7 +57,7 @@ def test_1digit_adder(adder_1digit):
         ("6+3\n", "9"),
     ]
     for input_str, expected in test_cases:
-        result = run(model, input_str)
+        result = run(model, input_str, ref_token="<ref>")
         assert (
             result == expected
         ), f"For {input_str!r}: expected {expected!r} but got {result!r}"
@@ -78,7 +81,7 @@ def test_3digit_adder(adder_3digit):
         ("99+1\n", "100"),
     ]
     for input_str, expected in test_cases:
-        result = run(model, input_str)
+        result = run(model, input_str, ref_token="<ref>")
         assert (
             result == expected
         ), f"For {input_str!r}: expected {expected!r} but got {result!r}"
@@ -94,7 +97,7 @@ def test_3digit_autoregressive(adder_3digit):
         ("456+123\n", "579"),
     ]
     for input_str, expected in test_cases:
-        result = run(model, input_str)
+        result = run(model, input_str, ref_token="<ref>")
         assert (
             result == expected
         ), f"For {input_str!r}: expected {expected!r} but got {result!r}"

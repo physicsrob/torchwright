@@ -5,9 +5,8 @@ sidecar, checks its format key, and returns an ``OnnxTokenModule`` — an
 ``onnxruntime``-backed callable speaking the static-cache prefill/decode
 protocol:
 
-- ``OnnxTokenModule`` — token I/O (``TOKEN_META_FORMAT``, currently
-  ``torchwright.token.v3``), produced by
-  :func:`torchwright.compiler.export.compile_to_onnx`; adds the
+- ``OnnxTokenModule`` — token I/O (``torchwright.token.v4``), produced
+  by :func:`torchwright.compiler.export.compile_to_onnx`; adds the
   vocab tokenizer and an argmax :meth:`OnnxTokenModule.generate` loop.
 
 Two usage shapes:
@@ -104,8 +103,8 @@ class OnnxTokenModule:
 
     Args:
         onnx_path: Path to the ``.onnx`` file.  A sidecar
-            ``<stem>.meta.json`` with format ``TOKEN_META_FORMAT``
-            (currently ``torchwright.token.v3``) must exist alongside it.
+            ``<stem>.meta.json`` with format ``torchwright.token.v4``
+            must exist alongside it.
         providers: ``onnxruntime`` execution providers list.  Defaults
             to CPU.
     """
@@ -280,14 +279,24 @@ class OnnxTokenModule:
         max_new_tokens: int = 10,
         bos_token: str = "<bos>",
         eos_token: str = "<eos>",
+        ref_token: Optional[str] = None,
     ) -> Iterator[str]:
         """Autoregressive argmax generation over the cached protocol.
 
-        Prefills ``[bos_token] + list(input_text)``, then decodes one
-        token per :meth:`step`, yielding each generated token string as
-        it is produced.  Stops at ``eos_token`` or ``max_new_tokens``.
+        Prefills ``[bos_token] (+ [ref_token]) + list(input_text)``, then
+        decodes one token per :meth:`step`, yielding each generated token
+        string as it is produced.  Stops at ``eos_token`` or
+        ``max_new_tokens``.
+
+        ``ref_token`` is the bucket-2 recency reference marker (``docs/
+        rope_port_plan.md`` §3 / Phase 4): a RoPE graph that ranks recency
+        via :func:`~torchwright.ops.recency_heads.recency_rank_from_tokens`
+        needs a second always-visible marked token at position 1, so such a
+        model is generated with ``ref_token="<ref>"``.  Models that do not
+        use recency leave it ``None`` (prefix is ``[bos] + input`` as before).
         """
-        tokens = [bos_token] + list(input_text)
+        prefix = [bos_token] + ([ref_token] if ref_token is not None else [])
+        tokens = prefix + list(input_text)
         ids = torch.tensor([self.token_to_id(t) for t in tokens], dtype=torch.int64)
 
         logits, past = self.step(ids, self.empty_past())
@@ -307,8 +316,7 @@ def load_onnx(onnx_path: str, providers=None) -> OnnxTokenModule:
     """Load a torchwright token-I/O ONNX export.
 
     Reads ``<stem>.meta.json`` next to ``onnx_path`` and returns an
-    :class:`OnnxTokenModule` (format ``TOKEN_META_FORMAT``, currently
-    ``torchwright.token.v3``).
+    :class:`OnnxTokenModule` (``torchwright.token.v4``).
     """
     meta_path = meta_path_for(onnx_path)
     if not os.path.exists(meta_path):

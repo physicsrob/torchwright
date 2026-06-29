@@ -17,12 +17,11 @@ D_HEAD = 16
 def compiled_calc():
     from examples.calculator_v2 import create_network_parts
 
-    output_node, pos_encoding, embedding = create_network_parts(1)
+    output_node, embedding = create_network_parts(1)
     net = forward_compile(
         d=D,
         d_head=D_HEAD,
         output_node=output_node,
-        pos_encoding=pos_encoding,
         verbose=False,
     )
     return net, output_node, embedding

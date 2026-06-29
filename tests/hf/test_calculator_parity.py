@@ -45,6 +45,10 @@ from tests.hf._hf_parity import compile_example
 
 _BOS = "<bos>"
 _EOS = "<eos>"
+# Bucket-2 recency reference marker: the calculator ranks "most recent" via
+# recency_rank_from_tokens, which needs <ref> at position 1 (see
+# torchwright.ops.recency_heads.recency_rank_from_tokens).
+_REF = "<ref>"
 
 # In-range gate: add/sub at any magnitude, mult with comfortable digit margin.
 # Every entry is bit-exact AND lands the correct answer (confirmed empirically).
@@ -96,7 +100,7 @@ def tok2id(artifact_path):
 
 
 def _prefill_logits(model, oracle, tok2id, text):
-    ids = [tok2id[t] for t in ([_BOS] + list(text))]
+    ids = [tok2id[t] for t in ([_BOS, _REF] + list(text))]
     o = oracle(torch.tensor(ids, dtype=torch.int64))
     with torch.no_grad():
         h = model(input_ids=torch.tensor([ids], dtype=torch.int64), use_cache=True)
@@ -105,12 +109,16 @@ def _prefill_logits(model, oracle, tok2id, text):
 
 def _oracle_gen(oracle, text):
     return "".join(
-        oracle.generate(text, max_new_tokens=10, bos_token=_BOS, eos_token=_EOS)
+        oracle.generate(
+            text, max_new_tokens=10, bos_token=_BOS, eos_token=_EOS, ref_token=_REF
+        )
     )
 
 
 def _hf_gen(model, tok2id, vocab, text):
-    ids = torch.tensor([[tok2id[t] for t in ([_BOS] + list(text))]], dtype=torch.int64)
+    ids = torch.tensor(
+        [[tok2id[t] for t in ([_BOS, _REF] + list(text))]], dtype=torch.int64
+    )
     with torch.no_grad():
         g = model.generate(
             ids,

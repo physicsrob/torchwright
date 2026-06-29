@@ -6,7 +6,11 @@ is tested at the integration level (Phase 4/5).
 
 Conventions:
 - D=64, D_HEAD=16 → n_heads=4 attention heads per layer.
-- pos_encoding is always allocated but may not be a graph node.
+- A 17-wide reserved block stands in for the always-allocated columns the
+  scheduler keeps pinned (under RoPE there is no PosEncoding; the production
+  reserved region is the 1-wide const-1 self-match column, but these tests use
+  a 17-wide block so the column-pressure arithmetic below is unchanged). It is
+  passed as the scheduler's never-free sentinel, exactly as pos_encoding was.
 - "dead-for-add" means all consumers except the pending Add are computed.
 """
 
@@ -23,15 +27,33 @@ from torchwright.compiler.forward.scheduling_policy import (
 from torchwright.compiler.forward.weight_writer import AttnHeadOp, MLPOp
 from torchwright.graph import Linear, ReLU, Attn, Add, Concatenate
 from torchwright.graph.misc import InputNode, LiteralValue
-from torchwright.graph.pos_encoding import PosEncoding
 
 D = 64
 D_HEAD = 16
 N_HEADS = D // D_HEAD  # 4
 
 
-def _make_pos_encoding():
-    return PosEncoding(17)  # trig_width 16 == D_HEAD
+def _make_reserved_block():
+    # A generic always-allocated stand-in for the scheduler's pinned reserved
+    # columns (17 wide so the column-pressure tests' arithmetic is unchanged).
+    return InputNode("reserved", 17, value_range=(-1.0, 1.0))
+
+
+def _make_attn(v):
+    # A minimal self-reading Attn node — ready as soon as ``v`` is computed —
+    # standing in for the old ``pos.attend_to_offset(v)`` (a rotary offset head
+    # has a different input shape; the scheduler only cares that this is an Attn
+    # node that produces a ``compute_attn`` op).
+    d = len(v)
+    return Attn(
+        query_in=v,
+        key_in=v,
+        value_in=v,
+        query_matrix=torch.eye(d),
+        key_matrix=torch.eye(d),
+        value_matrix=torch.eye(d),
+        output_matrix=torch.eye(d),
+    )
 
 
 def _make_linear(inp, d_out, name=""):
@@ -61,9 +83,9 @@ def _make_relu_chain(inp, d_hidden, d_out, name=""):
 
 def test_schedule_attn_node():
     """Attn node produces AttnHeadOp('compute_attn')."""
-    pos = _make_pos_encoding()
+    pos = _make_reserved_block()
     v = InputNode("v", 4, value_range=(-100.0, 100.0))
-    attn_node = pos.attend_to_offset(v, delta_pos=-1)
+    attn_node = _make_attn(v)
 
     graph = GraphAnalyzer(attn_node)
     rmap = ResidualStreamMap(D)
@@ -82,7 +104,7 @@ def test_schedule_attn_node():
 
 def test_schedule_relu_chain():
     """L->R->L chain produces MLPOp('compute_relu'); all 3 nodes marked computed."""
-    pos = _make_pos_encoding()
+    pos = _make_reserved_block()
     x = InputNode("x", 4, value_range=(-100.0, 100.0))
     l2, r, l1 = _make_relu_chain(x, 8, 3, "chain")
 
@@ -111,7 +133,7 @@ def test_schedule_constant():
     Note: in the compile loop, Constants are typically pre-populated as input nodes.
     This tests the scheduler's capability to handle Constants that aren't pre-populated.
     """
-    pos = _make_pos_encoding()
+    pos = _make_reserved_block()
     const = LiteralValue(torch.tensor([1.0, -2.0, 3.5]))
 
     graph = GraphAnalyzer(const)
@@ -131,7 +153,7 @@ def test_schedule_constant():
 
 def test_schedule_zero_bias_linear():
     """Zero-bias Linear: legacy policy uses attention, default uses MLP bypass."""
-    pos = _make_pos_encoding()
+    pos = _make_reserved_block()
     x = InputNode("x", 4, value_range=(-100.0, 100.0))
     linear = _make_linear(x, 3, "lin")
 
@@ -152,7 +174,7 @@ def test_schedule_zero_bias_linear():
 
 def test_schedule_zero_bias_linear_bypass():
     """Zero-bias Linear with default policy produces MLPOp('compute_linear_bypass')."""
-    pos = _make_pos_encoding()
+    pos = _make_reserved_block()
     x = InputNode("x", 4, value_range=(-100.0, 100.0))
     linear = _make_linear(x, 3, "lin")
 
@@ -176,7 +198,7 @@ def test_schedule_zero_bias_linear_bypass():
 
 def test_schedule_large_input_linear():
     """Zero-bias Linear with input dim > d_head: legacy uses attention, default uses bypass."""
-    pos = _make_pos_encoding()
+    pos = _make_reserved_block()
     inputs = [InputNode(f"x{i}", 8, value_range=(-100.0, 100.0)) for i in range(4)]
     cat = Concatenate(inputs)
     d_out = 8
@@ -202,7 +224,7 @@ def test_schedule_large_input_linear():
 
 def test_schedule_biased_linear():
     """Biased Linear: legacy uses attn Wx + MLP b, default uses bypass Wx+b."""
-    pos = _make_pos_encoding()
+    pos = _make_reserved_block()
     x = InputNode("x", 4, value_range=(-100.0, 100.0))
     linear = _make_biased_linear(x, 3, "biased")
 
@@ -225,7 +247,7 @@ def test_schedule_biased_linear():
 
 def test_schedule_biased_linear_bypass():
     """Biased Linear with default policy: bypass handles full Wx+b, no compute_bias."""
-    pos = _make_pos_encoding()
+    pos = _make_reserved_block()
     x = InputNode("x", 4, value_range=(-100.0, 100.0))
     linear = _make_biased_linear(x, 3, "biased")
 
@@ -248,7 +270,7 @@ def test_schedule_biased_linear_bypass():
 
 def test_schedule_cancellation():
     """Dead node (all consumers computed) produces cancel AttnHeadOp."""
-    pos = _make_pos_encoding()
+    pos = _make_reserved_block()
     x = InputNode("x", 4, value_range=(-100.0, 100.0))
     a = _make_linear(x, 4, "a")
     l2, r, l1 = _make_relu_chain(a, 8, 3, "out")
@@ -288,7 +310,7 @@ def test_schedule_free_add():
     dead_node's only consumer (besides add_node) is nothing — dead for add.
     live_node has another consumer (other) that isn't computed — NOT dead for add.
     """
-    pos = _make_pos_encoding()
+    pos = _make_reserved_block()
     dead_node = InputNode("dead", 4, value_range=(-100.0, 100.0))
     live_node = InputNode("live", 4, value_range=(-100.0, 100.0))
     add_node = Add(dead_node, live_node)
@@ -325,7 +347,7 @@ def test_schedule_deferred_add_via_compute():
     # D=64 there are only 4 heads per layer, which is a tight fit that
     # cancellation can push over.
     d_test = 128
-    pos = _make_pos_encoding()
+    pos = _make_reserved_block()
     a = InputNode("a", 4, value_range=(-100.0, 100.0))
     b = InputNode("b", 4, value_range=(-100.0, 100.0))
     add_node = Add(a, b)
@@ -359,7 +381,7 @@ def test_schedule_add_into_preferred_over_compute_add():
     add_into reuses existing columns (free), while compute_add allocates new
     ones. The scheduler should prefer the cheaper option.
     """
-    pos = _make_pos_encoding()
+    pos = _make_reserved_block()
     a = InputNode("a", 4, value_range=(-100.0, 100.0))
     b = InputNode("b", 4, value_range=(-100.0, 100.0))
     add_node = Add(a, b)
@@ -387,7 +409,7 @@ def test_schedule_add_both_addends_dead():
 
     Both a and b have no consumers besides add_node → both dead-for-add.
     """
-    pos = _make_pos_encoding()
+    pos = _make_reserved_block()
     a = InputNode("a", 4, value_range=(-100.0, 100.0))
     b = InputNode("b", 4, value_range=(-100.0, 100.0))
     add_node = Add(a, b)
@@ -415,7 +437,7 @@ def test_schedule_add_both_addends_dead():
 
 def test_head_budget_exhaustion():
     """More ready attn ops than available heads: respects budget, defers excess."""
-    pos = _make_pos_encoding()
+    pos = _make_reserved_block()
     x = InputNode("x", 4, value_range=(-100.0, 100.0))
     # 6 zero-bias Linears, but only N_HEADS=4 attention heads available
     linears = [_make_linear(x, 2, f"lin{i}") for i in range(6)]
@@ -440,7 +462,7 @@ def test_head_budget_exhaustion():
 
 def test_mlp_slot_exhaustion():
     """More L->R->L chains than MLP slots: respects slot budget."""
-    pos = _make_pos_encoding()
+    pos = _make_reserved_block()
     x = InputNode("x", 4, value_range=(-100.0, 100.0))
     # 4 chains × 20 slots each = 80 > D=64
     chains = []
@@ -480,7 +502,7 @@ def test_schedule_under_column_pressure():
     x is dead (consumer a is computed). Relu chain needs 3 output cols.
     Scheduler must cancel x to free space, then schedule the chain.
     """
-    pos = _make_pos_encoding()
+    pos = _make_reserved_block()
     filler = InputNode(
         "filler", D - len(pos) - 8, value_range=(-100.0, 100.0)
     )  # fills the stream to 0 free alongside pos + x + a
@@ -525,7 +547,7 @@ def test_multi_layer_progression():
 
     Chain B depends on Chain A's output — must be scheduled in a later layer.
     """
-    pos = _make_pos_encoding()
+    pos = _make_reserved_block()
     x = InputNode("x", 4, value_range=(-100.0, 100.0))
     l2a, ra, l1a = _make_relu_chain(x, 8, 4, "a")
     l2b, rb, l1b = _make_relu_chain(l2a, 6, 3, "b")
@@ -554,7 +576,7 @@ def test_deferred_add_fires_via_compute_add():
     Both addends have non-Add consumers (relu chains), so add_into can't be used.
     The compute_add path copies both inputs to fresh columns alongside the chains.
     """
-    pos = _make_pos_encoding()
+    pos = _make_reserved_block()
     a = InputNode("a", 4, value_range=(-100.0, 100.0))
     b = InputNode("b", 4, value_range=(-100.0, 100.0))
     a_chain, _, _ = _make_relu_chain(a, 8, 2, "ac")
@@ -588,7 +610,7 @@ def test_scheduling_with_concatenate_input():
     cat = Concatenate([a, b, c]). The relu chain depending on cat is not ready
     until all three children are computed.
     """
-    pos = _make_pos_encoding()
+    pos = _make_reserved_block()
     a = InputNode("a", 4, value_range=(-100.0, 100.0))
     b = InputNode("b", 4, value_range=(-100.0, 100.0))
     c = InputNode("c", 4, value_range=(-100.0, 100.0))
@@ -624,10 +646,10 @@ def test_scheduling_with_concatenate_input():
 
 def test_mixed_attn_and_mlp():
     """Both Attn node and L->R->L chain ready: both scheduled in same layer."""
-    pos = _make_pos_encoding()
+    pos = _make_reserved_block()
     v = InputNode("v", 4, value_range=(-100.0, 100.0))
     x = InputNode("x", 4, value_range=(-100.0, 100.0))
-    attn_node = pos.attend_to_offset(v, delta_pos=-1)
+    attn_node = _make_attn(v)
     l2, r, l1 = _make_relu_chain(x, 8, 3, "chain")
     out_cat = Concatenate([attn_node, l2])
     out = _make_linear(out_cat, 1, "out")
@@ -659,7 +681,7 @@ def test_schedule_standalone_relu():
     This pattern occurs in cond_gate: ReLU(Add(...)) where the ReLU's consumer
     is an Add, not a Linear — so it's not part of any chain.
     """
-    pos = _make_pos_encoding()
+    pos = _make_reserved_block()
     x = InputNode("x", 4, value_range=(-100.0, 100.0))
     relu_node = ReLU(x, name="standalone")
     # ReLU feeds into an Add, not a Linear → not part of a chain
@@ -690,7 +712,7 @@ def test_relu_chain_broken_by_fanout():
     The scheduler must handle this (e.g., schedule L1 separately, use alternative
     strategy, or compute the chain while also placing L1 in the stream).
     """
-    pos = _make_pos_encoding()
+    pos = _make_reserved_block()
     x = InputNode("x", 4, value_range=(-100.0, 100.0))
     l1 = Linear(x, torch.randn(4, 8), torch.randn(8), name="l1")
     r = ReLU(l1, name="r")
@@ -717,7 +739,7 @@ def test_relu_chain_broken_by_fanout():
 
 def test_relu_chain_broken_by_fanout_bypass():
     """Same as above but with default bypass policy — still makes progress."""
-    pos = _make_pos_encoding()
+    pos = _make_reserved_block()
     x = InputNode("x", 4, value_range=(-100.0, 100.0))
     l1 = Linear(x, torch.randn(4, 8), torch.randn(8), name="l1")
     r = ReLU(l1, name="r")
@@ -750,7 +772,7 @@ def test_relu_chain_broken_by_fanout_bypass_emits_l1_standalone():
     op that wrote a value into them — leaving consumers of L1 to
     read uninitialized data.
     """
-    pos = _make_pos_encoding()
+    pos = _make_reserved_block()
     x = InputNode("x", 4, value_range=(-100.0, 100.0))
     l1 = Linear(x, torch.randn(4, 8), torch.randn(8), name="l1")
     r = ReLU(l1, name="r")
@@ -777,8 +799,7 @@ def test_relu_chain_broken_by_fanout_bypass_emits_l1_standalone():
     # the same MLP sublayer — without it, L1's residual cols are
     # allocated but never written and consumers read garbage.
     bypass_ops = [
-        op for op in mlp_ops
-        if op.op_type == "compute_linear_bypass" and op.node is l1
+        op for op in mlp_ops if op.op_type == "compute_linear_bypass" and op.node is l1
     ]
     assert len(bypass_ops) == 1, (
         f"Expected a compute_linear_bypass(L1) op in the same MLP "
@@ -807,7 +828,7 @@ def test_linear_with_computed_relu_input():
     that's already in the residual stream, so L2 should be schedulable as a
     standalone Linear rather than as part of a chain.
     """
-    pos = _make_pos_encoding()
+    pos = _make_reserved_block()
     x = InputNode("x", 4, value_range=(-100.0, 100.0))
     l1 = Linear(x, torch.randn(4, 8), torch.randn(8), name="l1")
     r = ReLU(l1, name="r")
@@ -833,7 +854,7 @@ def test_linear_with_computed_relu_input():
 
 def test_linear_with_computed_relu_input_bypass():
     """Same scenario with default policy — scheduled via MLP bypass."""
-    pos = _make_pos_encoding()
+    pos = _make_reserved_block()
     x = InputNode("x", 4, value_range=(-100.0, 100.0))
     l1 = Linear(x, torch.randn(4, 8), torch.randn(8), name="l1")
     r = ReLU(l1, name="r")
@@ -871,7 +892,7 @@ def test_no_progress_raises_error():
     Residual stream is full (0 free cols). Ready nodes need columns.
     No dead nodes to cancel. → deadlock → error.
     """
-    pos = _make_pos_encoding()
+    pos = _make_reserved_block()
     a = InputNode("a", 4, value_range=(-100.0, 100.0))
     b = InputNode("b", 4, value_range=(-100.0, 100.0))
     a_consumer = _make_linear(a, 2, "ac")
@@ -911,7 +932,7 @@ def test_add_into_shared_addend_not_reassigned():
 
     This is the exact bug from the calculator's switch() pattern.
     """
-    pos = _make_pos_encoding()
+    pos = _make_reserved_block()
     shared = LiteralValue(torch.randn(4))
 
     # 3 Add nodes sharing the same LiteralValue, each with a unique dead addend
@@ -956,7 +977,7 @@ def test_add_into_shared_addend_not_reassigned():
 
 def test_output_already_computed():
     """When all graph nodes are already computed, schedule_layer doesn't error."""
-    pos = _make_pos_encoding()
+    pos = _make_reserved_block()
     x = InputNode("x", 4, value_range=(-100.0, 100.0))
     out = _make_linear(x, 2, "out")
 
@@ -979,7 +1000,7 @@ def test_eager_free_flag_gates_within_layer_freeing():
     default ``eager_free=True`` (used by the heuristic fallback) surfaces the
     freshly-dead intermediate so its column can be reclaimed in the same layer.
     """
-    pos = _make_pos_encoding()
+    pos = _make_reserved_block()
     x = InputNode("x", D, value_range=(-100.0, 100.0))
     a = _make_linear(x, D, "a")  # intermediate: a's only consumer is b
     b = _make_linear(a, D, "b")

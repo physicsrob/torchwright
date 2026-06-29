@@ -26,7 +26,6 @@ ordering guard: the post-loop trim must not slice already-nulled weights.
 import torch
 
 from torchwright.compiler.forward.compile import forward_compile
-from torchwright.graph import PosEncoding
 from torchwright.ops.inout_nodes import create_input
 from torchwright.ops.linear_relu_linear import linear_relu_linear
 
@@ -43,7 +42,6 @@ def _null_layer_weights(layer) -> None:
 
 def test_streaming_callback_skips_inplace_trim():
     inp = create_input("x", 16)
-    pos = PosEncoding(9)  # trig_width 8 == d_head below
     torch.manual_seed(0)
     out = linear_relu_linear(
         inp,
@@ -67,7 +65,6 @@ def test_streaming_callback_skips_inplace_trim():
         d=64,
         d_head=8,
         output_node=out,
-        pos_encoding=pos,
         on_layer_compiled=on_layer_compiled,
         trim_heads=True,
         verbose=False,

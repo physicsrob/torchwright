@@ -18,7 +18,6 @@ from torchwright.compiler.forward.scheduling_policy import SchedulingPolicy
 from torchwright.compiler.forward.weight_writer import AttnHeadOp, MLPOp
 from torchwright.graph import Node, Linear, Attn, Add, Concatenate
 from torchwright.graph.misc import LiteralValue
-from torchwright.graph.pos_encoding import PosEncoding
 from torchwright.graph.relu import ReLU
 
 
@@ -43,7 +42,7 @@ class LayerScheduler:
         graph: GraphAnalyzer,
         d: int,
         d_head: int,
-        pos_encoding: PosEncoding,
+        pos_encoding=None,
         d_hidden: Optional[int] = None,
         clusters: Optional[SiblingClusters] = None,
         admission_budget_fraction: float = 0.4,
@@ -1332,7 +1331,7 @@ class DirectedLayerScheduler(LayerScheduler):
         graph: GraphAnalyzer,
         d: int,
         d_head: int,
-        pos_encoding: PosEncoding,
+        pos_encoding,
         assignment: ScheduleAssignment,
         d_hidden: Optional[int] = None,
         clusters: Optional[SiblingClusters] = None,

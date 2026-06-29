@@ -24,20 +24,34 @@ from torchwright.compiler.forward.weight_writer import (
     MLPOp,
     write_attn_sublayer,
     write_mlp_sublayer,
-    _current_pos_attn_matrices,
 )
 from torchwright.compiler.groups.transformer_layer import TransformerLayer
 from torchwright.graph import Linear, ReLU, Attn, Add, Concatenate
 from torchwright.graph.misc import InputNode, LiteralValue
-from torchwright.graph.pos_encoding import PosEncoding, attention_hardness
 
 D = 64
 D_HEAD = 16
 N_POS = 4
+# Old PosEncoding constant — the self-match query gain.  Kept locally now that
+# graph/pos_encoding.py is gone (RoPE: position is a rotation, not a node).
+attention_hardness = 100.0
 
 
-def _make_pos_encoding():
-    return PosEncoding(17)  # trig_width 16 == D_HEAD
+def _make_reserved_block():
+    # Generic 17-wide always-allocated stand-in for the reserved columns a
+    # layer keeps (under RoPE there is no PosEncoding; the attention tests read
+    # this as a plain Q/K source, the transport tests use it only as filler).
+    return InputNode("reserved", 17, value_range=(-1.0, 1.0))
+
+
+def _const_one(residual_map: ResidualStreamMap) -> LiteralValue:
+    """Allocate the reserved constant-1 self-match column the transport ops
+    (compute_linear/compute_add/cancel/add_into) read.  ``write_attn_sublayer``
+    requires it; :func:`_build_residual_stream` fills its column with 1.0 so the
+    rotary Δ=0 self-match concentrates on the diagonal."""
+    const_one = LiteralValue(torch.ones(1), name="const_one")
+    residual_map.allocate(const_one)
+    return const_one
 
 
 def _build_residual_stream(
@@ -46,6 +60,12 @@ def _build_residual_stream(
     """Build a residual stream tensor with known values at each node's columns."""
     device = device_mod.get_device(verbose=False)
     res = torch.zeros(N_POS, D, device=device)
+    # The reserved const-1 self-match column must carry 1.0 (the transport ops'
+    # rotary self-match reads it); fill it automatically wherever allocated.
+    for node in residual_map.get_allocated_nodes():
+        if getattr(node, "name", "") == "const_one":
+            for idx in residual_map.get_indices(node):
+                res[:, idx] = 1.0
     for node, values in node_values.items():
         indices = residual_map.get_indices(node)
         values = values.to(res.device)
@@ -154,7 +174,7 @@ def test_identity_layer():
 
 def test_attn_compute():
     """Compile a basic Attn node into one attention head."""
-    pos = _make_pos_encoding()
+    pos = _make_reserved_block()
     value_in = InputNode("v", 4, value_range=(-100.0, 100.0))
     # Build an Attn node that does current-position attention and passes through value
     d_head = D_HEAD
@@ -173,52 +193,42 @@ def test_attn_compute():
     v_cols = rmap.allocate(value_in)
     out_cols = rmap.allocate(attn_node)
 
-    layer = TransformerLayer(D, D_HEAD, pos)
+    layer = TransformerLayer(D, D_HEAD)
     op = _make_op(rmap, "compute_attn", attn_node, out_cols)
-    write_attn_sublayer(layer, [op], rmap, pos)
+    const_one = _const_one(rmap)
+    write_attn_sublayer(layer, [op], rmap, const_one=const_one)
     layer.to(device_mod.get_device(verbose=False))
 
     # Build input residual stream
     v_values = torch.randn(N_POS, len(value_in))
-    pe_values = pos.compute(N_POS, {})
+    pe_values = torch.randn(N_POS, len(pos))
     res = _build_residual_stream(rmap, {pos: pe_values, value_in: v_values})
 
     # Run attention sublayer only (skip adds input, so output cols get 0 + attn_output)
     out = layer.attn.forward(res)
     result = out[:, out_cols]
 
-    expected = attn_node.compute(N_POS, {"v": v_values})
+    expected = attn_node.compute(N_POS, {"v": v_values, "reserved": pe_values})
     assert torch.allclose(result.cpu(), expected, atol=1e-4)
 
 
-def test_current_pos_matrices_exclude_counter():
-    """Same-position copy heads must match on the trig block only — the raw
-    counter column is zeroed regardless of how d_head compares to d_pos."""
-    pe = PosEncoding(17)  # counter_col == 16
-    counter_col = pe.counter_col
-    for d_head in (8, 16, 17, 20):
-        q, k = _current_pos_attn_matrices(pe, d_head)
-        assert torch.all(q[counter_col] == 0.0), f"q counter not zero at d_head={d_head}"
-        assert torch.all(k[counter_col] == 0.0), f"k counter not zero at d_head={d_head}"
-    # A trig row IS matched (non-degenerate diagonal).
-    q16, k16 = _current_pos_attn_matrices(pe, 16)
-    assert q16[0, 0] != 0.0 and k16[0, 0] != 0.0
-
-
-def test_attn_compute_small_d_head():
-    """Attn node with d_head smaller than layer d_head — needs padding."""
-    pos = _make_pos_encoding()
+def test_attn_compute_small_d_v():
+    """Attn node whose value width d_v is smaller than the layer d_head — the
+    V/O projection is padded up to d_head.  (Q/K are full-width d_head: every
+    head is rotary on the one global grid, so partial-width Q/K no longer
+    exists.)"""
+    pos = _make_reserved_block()
     value_in = InputNode("v", 4, value_range=(-100.0, 100.0))
-    small_d_head = 8  # smaller than D_HEAD=16
+    small_d_v = 8  # smaller than D_HEAD=16 -> V/O padded up to d_head
 
     attn_node = Attn(
         query_in=pos,
         key_in=pos,
         value_in=value_in,
-        query_matrix=attention_hardness * torch.eye(len(pos), small_d_head),
-        key_matrix=torch.eye(len(pos), small_d_head),
-        value_matrix=torch.eye(len(value_in), small_d_head),
-        output_matrix=torch.eye(small_d_head, len(value_in)),
+        query_matrix=attention_hardness * torch.eye(len(pos), D_HEAD),
+        key_matrix=torch.eye(len(pos), D_HEAD),
+        value_matrix=torch.eye(len(value_in), small_d_v),
+        output_matrix=torch.eye(small_d_v, len(value_in)),
     )
 
     rmap = ResidualStreamMap(D)
@@ -226,70 +236,100 @@ def test_attn_compute_small_d_head():
     v_cols = rmap.allocate(value_in)
     out_cols = rmap.allocate(attn_node)
 
-    layer = TransformerLayer(D, D_HEAD, pos)
+    layer = TransformerLayer(D, D_HEAD)
     op = _make_op(rmap, "compute_attn", attn_node, out_cols)
-    write_attn_sublayer(layer, [op], rmap, pos)
+    const_one = _const_one(rmap)
+    write_attn_sublayer(layer, [op], rmap, const_one=const_one)
     layer.to(device_mod.get_device(verbose=False))
 
     v_values = torch.randn(N_POS, len(value_in))
-    pe_values = pos.compute(N_POS, {})
+    pe_values = torch.randn(N_POS, len(pos))
     res = _build_residual_stream(rmap, {pos: pe_values, value_in: v_values})
 
     out = layer.attn.forward(res)
     result = out[:, out_cols]
 
-    expected = attn_node.compute(N_POS, {"v": v_values})
+    expected = attn_node.compute(N_POS, {"v": v_values, "reserved": pe_values})
     assert torch.allclose(result.cpu(), expected, atol=1e-4)
 
 
 def test_attn_compute_shared_inputs():
     """Attn node where query_in == key_in (like attend_to_offset)."""
-    pos = _make_pos_encoding()
+    pos = _make_reserved_block()
     value_in = InputNode("v", 4, value_range=(-100.0, 100.0))
 
-    # attend_to_offset pattern: query and key both use pos_encoding
-    attn_node = pos.attend_to_offset(value_in, delta_pos=-1)
+    # Shared Q/K source: query_in and key_in are the SAME node (the weight
+    # writer must capture one source for both sides — the structural property
+    # the old attend_to_offset exercised).
+    attn_node = Attn(
+        query_in=pos,
+        key_in=pos,
+        value_in=value_in,
+        query_matrix=attention_hardness * torch.eye(len(pos), D_HEAD),
+        key_matrix=torch.eye(len(pos), D_HEAD),
+        value_matrix=torch.eye(len(value_in), D_HEAD),
+        output_matrix=torch.eye(D_HEAD, len(value_in)),
+    )
 
     rmap = ResidualStreamMap(D)
     rmap.allocate(pos)
     rmap.allocate(value_in)
     out_cols = rmap.allocate(attn_node)
 
-    layer = TransformerLayer(D, D_HEAD, pos)
+    layer = TransformerLayer(D, D_HEAD)
     op = _make_op(rmap, "compute_attn", attn_node, out_cols)
-    write_attn_sublayer(layer, [op], rmap, pos)
+    const_one = _const_one(rmap)
+    write_attn_sublayer(layer, [op], rmap, const_one=const_one)
     layer.to(device_mod.get_device(verbose=False))
 
     v_values = torch.randn(N_POS, len(value_in))
-    pe_values = pos.compute(N_POS, {})
+    pe_values = torch.randn(N_POS, len(pos))
     res = _build_residual_stream(rmap, {pos: pe_values, value_in: v_values})
 
     out = layer.attn.forward(res)
     result = out[:, out_cols]
 
-    expected = attn_node.compute(N_POS, {"v": v_values})
+    expected = attn_node.compute(N_POS, {"v": v_values, "reserved": pe_values})
     assert torch.allclose(result.cpu(), expected, atol=1e-4)
 
 
 def test_attn_compute_multiposition():
     """Attn node with cross-position attention (get_prev_value pattern)."""
-    pos = _make_pos_encoding()
     value_in = InputNode("v", 4, value_range=(-100.0, 100.0))
     cond_in = InputNode("c", 1, value_range=(-100.0, 100.0))
 
-    attn_node = pos.get_prev_value(value_in, cond_in)
-    query_one = attn_node.inputs[0]  # LiteralValue([1.0]) query constant
+    # Cross-position attention with a Concatenate key_in and a literal query
+    # (the structural property the old get_prev_value exercised): the query is
+    # a constant 1.0, the key is Concatenate([cond]), value passes through.
+    # Under RoPE there is no position block in the key — position is a rotation,
+    # not a key feature — so the old vestigial `pos` leaf is dropped.
+    query_one = LiteralValue(torch.tensor([1.0]))
+    key_in = Concatenate([cond_in])
+    d_qk = D_HEAD
+    query_matrix = torch.zeros(1, d_qk)
+    query_matrix[0, 0] = attention_hardness
+    key_matrix = torch.zeros(len(key_in), d_qk)
+    key_matrix[0, 0] = 1.0  # gate on cond
+    attn_node = Attn(
+        query_in=query_one,
+        key_in=key_in,
+        value_in=value_in,
+        query_matrix=query_matrix,
+        key_matrix=key_matrix,
+        value_matrix=torch.eye(len(value_in), d_qk),
+        output_matrix=torch.eye(d_qk, len(value_in)),
+    )
 
     rmap = ResidualStreamMap(D)
-    rmap.allocate(pos)
     rmap.allocate(value_in)
     rmap.allocate(cond_in)
     rmap.allocate(query_one)
     out_cols = rmap.allocate(attn_node)
 
-    layer = TransformerLayer(D, D_HEAD, pos)
+    layer = TransformerLayer(D, D_HEAD)
     op = _make_op(rmap, "compute_attn", attn_node, out_cols)
-    write_attn_sublayer(layer, [op], rmap, pos)
+    const_one = _const_one(rmap)
+    write_attn_sublayer(layer, [op], rmap, const_one=const_one)
     layer.to(device_mod.get_device(verbose=False))
 
     v_values = torch.tensor(
@@ -301,14 +341,12 @@ def test_attn_compute_multiposition():
         ]
     )
     c_values = torch.tensor([[1.0], [0.0], [0.0], [1.0]])
-    pe_values = pos.compute(N_POS, {})
 
-    # get_prev_value's key_in is Concatenate([cond, pos]); the query is an
-    # exact 1.0 literal.  Place every leaf/constant the head reads.
+    # get_prev_value's key_in is Concatenate([cond]); the query is an exact 1.0
+    # literal.  Place every leaf/constant the head reads.
     res = _build_residual_stream(
         rmap,
         {
-            pos: pe_values,
             value_in: v_values,
             cond_in: c_values,
             query_one: query_one.compute(N_POS, {}),
@@ -329,7 +367,7 @@ def test_attn_compute_multiposition():
 
 def test_linear_zero_bias():
     """Zero-bias Linear compiled via current-position attention."""
-    pos = _make_pos_encoding()
+    pos = _make_reserved_block()
     x = InputNode("x", 4, value_range=(-100.0, 100.0))
     W = torch.randn(4, 3)
     linear_node = Linear(x, W, torch.zeros(3), name="lin")
@@ -339,13 +377,14 @@ def test_linear_zero_bias():
     rmap.allocate(x)
     out_cols = rmap.allocate(linear_node)
 
-    layer = TransformerLayer(D, D_HEAD, pos)
+    layer = TransformerLayer(D, D_HEAD)
     op = _make_op(rmap, "compute_linear", linear_node, out_cols)
-    write_attn_sublayer(layer, [op], rmap, pos)
+    const_one = _const_one(rmap)
+    write_attn_sublayer(layer, [op], rmap, const_one=const_one)
     layer.to(device_mod.get_device(verbose=False))
 
     x_values = torch.randn(N_POS, 4)
-    pe_values = pos.compute(N_POS, {})
+    pe_values = torch.randn(N_POS, len(pos))
     res = _build_residual_stream(rmap, {pos: pe_values, x: x_values})
 
     out = layer.attn.forward(res)
@@ -361,7 +400,7 @@ def test_linear_large_input():
     This is the sum_nodes pattern from the adder: Concatenate(4 × 8-dim) → Linear.
     With d_input=32 and d_head=16, needs ceil(32/16) = 2 heads.
     """
-    pos = _make_pos_encoding()
+    pos = _make_reserved_block()
     # 4 inputs of 8 dims each, concatenated → 32-dim input
     inputs = [InputNode(f"x{i}", 8, value_range=(-100.0, 100.0)) for i in range(4)]
     cat = Concatenate(inputs)
@@ -378,13 +417,14 @@ def test_linear_large_input():
         rmap.allocate(inp)
     out_cols = rmap.allocate(linear_node)
 
-    layer = TransformerLayer(D, D_HEAD, pos)
+    layer = TransformerLayer(D, D_HEAD)
     op = _make_op(rmap, "compute_linear", linear_node, out_cols)
-    write_attn_sublayer(layer, [op], rmap, pos)
+    const_one = _const_one(rmap)
+    write_attn_sublayer(layer, [op], rmap, const_one=const_one)
     layer.to(device_mod.get_device(verbose=False))
 
     input_values = {f"x{i}": torch.randn(N_POS, 8) for i in range(4)}
-    pe_values = pos.compute(N_POS, {})
+    pe_values = torch.randn(N_POS, len(pos))
     node_values = {pos: pe_values}
     for inp in inputs:
         node_values[inp] = input_values[inp.name]
@@ -399,7 +439,7 @@ def test_linear_large_input():
 
 def test_linear_different_dims():
     """Zero-bias Linear where input dim != output dim."""
-    pos = _make_pos_encoding()
+    pos = _make_reserved_block()
     x = InputNode("x", 8, value_range=(-100.0, 100.0))
     W = torch.randn(8, 3)
     linear_node = Linear(x, W, torch.zeros(3), name="lin")
@@ -409,13 +449,14 @@ def test_linear_different_dims():
     rmap.allocate(x)
     out_cols = rmap.allocate(linear_node)
 
-    layer = TransformerLayer(D, D_HEAD, pos)
+    layer = TransformerLayer(D, D_HEAD)
     op = _make_op(rmap, "compute_linear", linear_node, out_cols)
-    write_attn_sublayer(layer, [op], rmap, pos)
+    const_one = _const_one(rmap)
+    write_attn_sublayer(layer, [op], rmap, const_one=const_one)
     layer.to(device_mod.get_device(verbose=False))
 
     x_values = torch.randn(N_POS, 8)
-    pe_values = pos.compute(N_POS, {})
+    pe_values = torch.randn(N_POS, len(pos))
     res = _build_residual_stream(rmap, {pos: pe_values, x: x_values})
 
     out = layer.attn.forward(res)
@@ -432,20 +473,21 @@ def test_linear_different_dims():
 
 def test_cancel():
     """Cancel a node: columns should become zero after attn sublayer."""
-    pos = _make_pos_encoding()
+    pos = _make_reserved_block()
     x = InputNode("x", 4, value_range=(-100.0, 100.0))
 
     rmap = ResidualStreamMap(D)
     rmap.allocate(pos)
     x_cols = rmap.allocate(x)
 
-    layer = TransformerLayer(D, D_HEAD, pos)
+    layer = TransformerLayer(D, D_HEAD)
     op = AttnHeadOp(op_type="cancel", node=x, target_cols=x_cols)
-    write_attn_sublayer(layer, [op], rmap, pos)
+    const_one = _const_one(rmap)
+    write_attn_sublayer(layer, [op], rmap, const_one=const_one)
     layer.to(device_mod.get_device(verbose=False))
 
     x_values = torch.randn(N_POS, 4)
-    pe_values = pos.compute(N_POS, {})
+    pe_values = torch.randn(N_POS, len(pos))
     res = _build_residual_stream(rmap, {pos: pe_values, x: x_values})
 
     # After attn sublayer (includes skip): x + (-x) = 0
@@ -457,7 +499,7 @@ def test_cancel():
 
 def test_cancel_multiple():
     """Cancel two nodes in the same layer using different heads."""
-    pos = _make_pos_encoding()
+    pos = _make_reserved_block()
     a = InputNode("a", 3, value_range=(-100.0, 100.0))
     b = InputNode("b", 5, value_range=(-100.0, 100.0))
 
@@ -466,17 +508,18 @@ def test_cancel_multiple():
     a_cols = rmap.allocate(a)
     b_cols = rmap.allocate(b)
 
-    layer = TransformerLayer(D, D_HEAD, pos)
+    layer = TransformerLayer(D, D_HEAD)
     ops = [
         AttnHeadOp(op_type="cancel", node=a, target_cols=a_cols),
         AttnHeadOp(op_type="cancel", node=b, target_cols=b_cols),
     ]
-    write_attn_sublayer(layer, ops, rmap, pos)
+    const_one = _const_one(rmap)
+    write_attn_sublayer(layer, ops, rmap, const_one=const_one)
     layer.to(device_mod.get_device(verbose=False))
 
     a_values = torch.randn(N_POS, 3)
     b_values = torch.randn(N_POS, 5)
-    pe_values = pos.compute(N_POS, {})
+    pe_values = torch.randn(N_POS, len(pos))
     res = _build_residual_stream(rmap, {pos: pe_values, a: a_values, b: b_values})
 
     out = layer.attn.forward(res)
@@ -491,7 +534,7 @@ def test_cancel_multiple():
 
 def test_add_into():
     """Add(A, B) where A is dead — write B into A's columns via skip."""
-    pos = _make_pos_encoding()
+    pos = _make_reserved_block()
     a = InputNode("a", 4, value_range=(-100.0, 100.0))
     b = InputNode("b", 4, value_range=(-100.0, 100.0))
     # inputs[0]=a is dead (at target_cols), inputs[1]=b is live (copied via attention)
@@ -505,14 +548,15 @@ def test_add_into():
     # Simulate scheduler: reassign dead addend's columns to the Add node
     rmap.reassign(a, add_node)
 
-    layer = TransformerLayer(D, D_HEAD, pos)
+    layer = TransformerLayer(D, D_HEAD)
     op = _make_op(rmap, "add_into", add_node, a_cols)
-    write_attn_sublayer(layer, [op], rmap, pos)
+    const_one = _const_one(rmap)
+    write_attn_sublayer(layer, [op], rmap, const_one=const_one)
     layer.to(device_mod.get_device(verbose=False))
 
     a_values = torch.randn(N_POS, 4)
     b_values = torch.randn(N_POS, 4)
-    pe_values = pos.compute(N_POS, {})
+    pe_values = torch.randn(N_POS, len(pos))
     # a's columns now belong to add_node, but still hold a's values
     res = _build_residual_stream(
         rmap, {pos: pe_values, add_node: a_values, b: b_values}
@@ -532,7 +576,7 @@ def test_add_into_dead_at_inputs1():
     This matches the adder's cond_add_vector pattern: Add(inp, chain_output)
     where chain_output is dead but lives at inputs[1].
     """
-    pos = _make_pos_encoding()
+    pos = _make_reserved_block()
     live = InputNode("live", 4, value_range=(-100.0, 100.0))
     dead = InputNode("dead", 4, value_range=(-100.0, 100.0))
     # Dead addend is inputs[1], not inputs[0]
@@ -546,14 +590,15 @@ def test_add_into_dead_at_inputs1():
     # Simulate what the scheduler does: reassign dead's columns to the Add node
     rmap.reassign(dead, add_node)
 
-    layer = TransformerLayer(D, D_HEAD, pos)
+    layer = TransformerLayer(D, D_HEAD)
     op = _make_op(rmap, "add_into", add_node, dead_cols)
-    write_attn_sublayer(layer, [op], rmap, pos)
+    const_one = _const_one(rmap)
+    write_attn_sublayer(layer, [op], rmap, const_one=const_one)
     layer.to(device_mod.get_device(verbose=False))
 
     live_values = torch.randn(N_POS, 4)
     dead_values = torch.randn(N_POS, 4)
-    pe_values = pos.compute(N_POS, {})
+    pe_values = torch.randn(N_POS, len(pos))
     # dead's columns now belong to add_node, but still hold dead's values
     res = _build_residual_stream(
         rmap, {pos: pe_values, live: live_values, add_node: dead_values}
@@ -573,7 +618,7 @@ def test_add_into_dead_at_inputs1():
 
 def test_compute_add():
     """Add(a, b) with neither input dead — copies both via separate heads."""
-    pos = _make_pos_encoding()
+    pos = _make_reserved_block()
     a = InputNode("a", 4, value_range=(-100.0, 100.0))
     b = InputNode("b", 4, value_range=(-100.0, 100.0))
     add_node = Add(a, b)
@@ -584,14 +629,15 @@ def test_compute_add():
     rmap.allocate(b)
     out_cols = rmap.allocate(add_node)
 
-    layer = TransformerLayer(D, D_HEAD, pos)
+    layer = TransformerLayer(D, D_HEAD)
     op = _make_op(rmap, "compute_add", add_node, out_cols)
-    write_attn_sublayer(layer, [op], rmap, pos)
+    const_one = _const_one(rmap)
+    write_attn_sublayer(layer, [op], rmap, const_one=const_one)
     layer.to(device_mod.get_device(verbose=False))
 
     a_values = torch.randn(N_POS, 4)
     b_values = torch.randn(N_POS, 4)
-    pe_values = pos.compute(N_POS, {})
+    pe_values = torch.randn(N_POS, len(pos))
     res = _build_residual_stream(rmap, {pos: pe_values, a: a_values, b: b_values})
 
     out = layer.attn.forward(res)
@@ -603,7 +649,7 @@ def test_compute_add():
 
 def test_compute_add_wide():
     """compute_add with vectors wider than d_head — requires multiple head groups."""
-    pos = _make_pos_encoding()
+    pos = _make_reserved_block()
     # 20 > D_HEAD=16, so needs 2 heads per input (4 heads total)
     a = InputNode("a", 20, value_range=(-100.0, 100.0))
     b = InputNode("b", 20, value_range=(-100.0, 100.0))
@@ -616,17 +662,25 @@ def test_compute_add_wide():
     rmap.allocate(b)
     out_cols = rmap.allocate(add_node)
 
-    layer = TransformerLayer(d_wide, D_HEAD, pos)
+    layer = TransformerLayer(d_wide, D_HEAD)
     op = _make_op(rmap, "compute_add", add_node, out_cols)
-    write_attn_sublayer(layer, [op], rmap, pos)
+    const_one = _const_one(rmap)
+    write_attn_sublayer(layer, [op], rmap, const_one=const_one)
     layer.to(device_mod.get_device(verbose=False))
 
     a_values = torch.randn(N_POS, 20)
     b_values = torch.randn(N_POS, 20)
-    pe_values = pos.compute(N_POS, {})
+    pe_values = torch.randn(N_POS, len(pos))
     device = device_mod.get_device(verbose=False)
     res = torch.zeros(N_POS, d_wide, device=device)
-    for node, values in {pos: pe_values, a: a_values, b: b_values}.items():
+    # const_one carries 1.0 so the transport's rotary self-match concentrates
+    # (this test builds the stream by hand rather than via _build_residual_stream).
+    for node, values in {
+        pos: pe_values,
+        a: a_values,
+        b: b_values,
+        const_one: torch.ones(N_POS, 1),
+    }.items():
         indices = rmap.get_indices(node)
         values = values.to(res.device)
         for i, idx in enumerate(indices):
@@ -840,35 +894,38 @@ def test_compute_literal_value_clears_dirty_column():
     const_value = torch.tensor([5.0, -7.0, 3.0])
     const = LiteralValue(const_value)
 
-    pos = _make_pos_encoding()
+    pos = _make_reserved_block()
     rmap = ResidualStreamMap(D)
     rmap.allocate(pos)
     const_cols = rmap.allocate(const)
 
-    layer = TransformerLayer(D, D_HEAD, pos)
+    layer = TransformerLayer(D, D_HEAD)
+    const_one = _const_one(rmap)
     # Attn sublayer: dirty-cancel the recycled target columns.
     write_attn_sublayer(
         layer,
         [AttnHeadOp(op_type="cancel", node=const, target_cols=const_cols)],
         rmap,
-        pos,
+        const_one=const_one,
     )
     # MLP sublayer: write the constant via output bias.
     write_mlp_sublayer(
         layer,
-        [MLPOp(
-            op_type="compute_literal_value",
-            node=const,
-            target_cols=const_cols,
-            mlp_slots=[],
-        )],
+        [
+            MLPOp(
+                op_type="compute_literal_value",
+                node=const,
+                target_cols=const_cols,
+                mlp_slots=[],
+            )
+        ],
         rmap,
     )
     layer.to(device_mod.get_device(verbose=False))
 
     # Seed the target columns with a dead node's non-zero leftover value.
     garbage = torch.tensor([[111.0, -222.0, 333.0]]).repeat(N_POS, 1)
-    pe_values = pos.compute(N_POS, {})
+    pe_values = torch.randn(N_POS, len(pos))
     res = _build_residual_stream(rmap, {pos: pe_values, const: garbage})
 
     out = layer.attn.forward(res)  # cancel zeroes the dirty column
@@ -889,7 +946,7 @@ def test_compute_literal_value_clears_dirty_column():
 
 def test_biased_linear_split():
     """Linear with non-zero bias: attention computes Wx, MLP adds b."""
-    pos = _make_pos_encoding()
+    pos = _make_reserved_block()
     x = InputNode("x", 4, value_range=(-100.0, 100.0))
     W = torch.randn(4, 3)
     b = torch.randn(3)
@@ -900,11 +957,12 @@ def test_biased_linear_split():
     rmap.allocate(x)
     out_cols = rmap.allocate(linear_node)
 
-    layer = TransformerLayer(D, D_HEAD, pos)
+    layer = TransformerLayer(D, D_HEAD)
 
     # Attention writes Wx (zero-bias part)
     attn_op = _make_op(rmap, "compute_linear", linear_node, out_cols)
-    write_attn_sublayer(layer, [attn_op], rmap, pos)
+    const_one = _const_one(rmap)
+    write_attn_sublayer(layer, [attn_op], rmap, const_one=const_one)
 
     # MLP adds bias
     mlp_op = MLPOp(
@@ -914,7 +972,7 @@ def test_biased_linear_split():
     layer.to(device_mod.get_device(verbose=False))
 
     x_values = torch.randn(N_POS, 4)
-    pe_values = pos.compute(N_POS, {})
+    pe_values = torch.randn(N_POS, len(pos))
     res = _build_residual_stream(rmap, {pos: pe_values, x: x_values})
 
     # Run full layer: attn sublayer then mlp sublayer
@@ -933,7 +991,7 @@ def test_biased_linear_split():
 
 def test_non_contiguous_columns():
     """Operations work with scattered (non-contiguous) column indices."""
-    pos = _make_pos_encoding()
+    pos = _make_reserved_block()
     x = InputNode("x", 4, value_range=(-100.0, 100.0))
     W = torch.randn(4, 3)
     linear_node = Linear(x, W, torch.zeros(3), name="lin")
@@ -952,13 +1010,14 @@ def test_non_contiguous_columns():
     # (they're in different regions of the stream)
     assert set(rmap.get_indices(x)) & set(out_cols) == set()
 
-    layer = TransformerLayer(D, D_HEAD, pos)
+    layer = TransformerLayer(D, D_HEAD)
     op = _make_op(rmap, "compute_linear", linear_node, out_cols)
-    write_attn_sublayer(layer, [op], rmap, pos)
+    const_one = _const_one(rmap)
+    write_attn_sublayer(layer, [op], rmap, const_one=const_one)
     layer.to(device_mod.get_device(verbose=False))
 
     x_values = torch.randn(N_POS, 4)
-    pe_values = pos.compute(N_POS, {})
+    pe_values = torch.randn(N_POS, len(pos))
     res = _build_residual_stream(rmap, {pos: pe_values, x: x_values})
 
     out = layer.attn.forward(res)
@@ -975,7 +1034,7 @@ def test_non_contiguous_columns():
 
 def test_mixed_layer():
     """One layer with both attention ops and MLP ops, verifying composition."""
-    pos = _make_pos_encoding()
+    pos = _make_reserved_block()
     x = InputNode("x", 4, value_range=(-100.0, 100.0))
 
     # Attention: zero-bias linear
@@ -992,11 +1051,12 @@ def test_mixed_layer():
     attn_out_cols = rmap.allocate(lin_attn)
     const_cols = rmap.allocate(const)
 
-    layer = TransformerLayer(D, D_HEAD, pos)
+    layer = TransformerLayer(D, D_HEAD)
 
     # Write attention ops
     attn_op = _make_op(rmap, "compute_linear", lin_attn, attn_out_cols)
-    write_attn_sublayer(layer, [attn_op], rmap, pos)
+    const_one = _const_one(rmap)
+    write_attn_sublayer(layer, [attn_op], rmap, const_one=const_one)
 
     # Write MLP ops
     mlp_op = MLPOp(
@@ -1009,7 +1069,7 @@ def test_mixed_layer():
     layer.to(device_mod.get_device(verbose=False))
 
     x_values = torch.randn(N_POS, 4)
-    pe_values = pos.compute(N_POS, {})
+    pe_values = torch.randn(N_POS, len(pos))
     res = _build_residual_stream(rmap, {pos: pe_values, x: x_values})
 
     # Run full layer
@@ -1178,13 +1238,13 @@ def test_mlp_linear_bypass_wide_output():
 
 def test_mlp_linear_bypass_matches_attention():
     """Same Linear produces identical result via MLP bypass vs attention path."""
-    pos = _make_pos_encoding()
+    pos = _make_reserved_block()
     x = InputNode("x", 4, value_range=(-100.0, 100.0))
     W = torch.randn(4, 3)
     linear_node = Linear(x, W, torch.zeros(3), name="lin")
 
     x_values = torch.randn(N_POS, 4)
-    pe_values = pos.compute(N_POS, {})
+    pe_values = torch.randn(N_POS, len(pos))
 
     # Attention path
     rmap_attn = ResidualStreamMap(D)
@@ -1192,9 +1252,10 @@ def test_mlp_linear_bypass_matches_attention():
     rmap_attn.allocate(x)
     attn_out_cols = rmap_attn.allocate(linear_node)
 
-    layer_attn = TransformerLayer(D, D_HEAD, pos)
+    layer_attn = TransformerLayer(D, D_HEAD)
     attn_op = _make_op(rmap_attn, "compute_linear", linear_node, attn_out_cols)
-    write_attn_sublayer(layer_attn, [attn_op], rmap_attn, pos)
+    const_one = _const_one(rmap_attn)
+    write_attn_sublayer(layer_attn, [attn_op], rmap_attn, const_one=const_one)
     layer_attn.to(device_mod.get_device(verbose=False))
 
     res_attn = _build_residual_stream(rmap_attn, {pos: pe_values, x: x_values})

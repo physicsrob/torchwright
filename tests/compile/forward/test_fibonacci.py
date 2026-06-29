@@ -8,7 +8,7 @@ attention (at least n_terms * digit_width tokens).  Converted from
 
 import pytest
 
-from examples.fibonacci import create_network_parts
+from examples.fibonacci import D_HEAD, create_network_parts
 
 from ._example_onnx import load_example, run
 
@@ -16,7 +16,10 @@ from ._example_onnx import load_example, run
 @pytest.fixture(scope="module")
 def fibonacci(tmp_path_factory):
     return load_example(
-        create_network_parts, tmp_path_factory.mktemp("fib"), name="fib"
+        create_network_parts,
+        tmp_path_factory.mktemp("fib"),
+        d_head=D_HEAD,
+        name="fib",
     )
 
 
@@ -31,5 +34,9 @@ def test_fibonacci(fibonacci):
     expected_fibs = [1, 1, 2, 3, 5, 8, 13, 21]
     expected = "".join(f"{f:02d}" for f in expected_fibs)
 
-    result = run(model, "fibonacci\n", bos_token="<bos>", max_new_tokens=20)
+    # Fibonacci ranks recency via the bucket-2 octant ramp, so it needs the
+    # <ref> marker at position 1.
+    result = run(
+        model, "fibonacci\n", bos_token="<bos>", ref_token="<ref>", max_new_tokens=20
+    )
     assert result == expected, f"Expected {expected!r} but got {result!r}"

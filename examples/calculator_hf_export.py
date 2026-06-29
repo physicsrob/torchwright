@@ -115,8 +115,8 @@ def ensure_artifact() -> str:
     from torchwright.compiler.export import compile_to_onnx
 
     module = importlib.import_module("examples.calculator_v2")
-    output_node, pos_encoding, embedding = module.create_network_parts()
-    compile_to_onnx(output_node, pos_encoding, embedding, ONNX_PATH, d=module.D_MODEL)
+    output_node, embedding = module.create_network_parts()
+    compile_to_onnx(output_node, embedding, ONNX_PATH, d=module.D_MODEL)
     return ONNX_PATH
 
 

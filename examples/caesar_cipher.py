@@ -20,18 +20,19 @@ from typing import Tuple
 
 import torch
 
-from torchwright.graph import Node, Embedding, Concatenate
+from torchwright.graph import Node, Embedding, Concatenate, RopeConfig
 from torchwright.graph.embedding import Unembedding
-from torchwright.graph.pos_encoding import PosEncoding
 from torchwright.ops.arithmetic_ops import concat
+from torchwright.ops.attention_ops import attend_to_offset, get_prev_value
 from torchwright.ops.inout_nodes import (
     create_literal_value,
     create_embedding,
-    create_pos_encoding,
+    create_rope_config,
     create_unembedding,
 )
 from torchwright.ops.logic_ops import equals_vector
 from torchwright.ops.map_select import map_to_table
+from torchwright.ops.recency_heads import recency_rank_from_tokens
 from torchwright.ops.sequence_ops import output_sequence
 
 # Letters in the alphabet
@@ -39,33 +40,41 @@ LETTERS = "abcdefghijklmnopqrstuvwxyz"
 
 D_MODEL = 512
 MAX_LETTERS = 5
+# Rotary width the graph is built against; must match the d_head it is
+# compiled at (the token-example harness compiles at this d_head).
+D_HEAD = 16
+MAX_POSITIONS = 512
 
 
 def create_network_parts(
     max_letters: int = MAX_LETTERS,
-) -> Tuple[Node, PosEncoding, Embedding]:
+) -> Tuple[Node, Embedding]:
     """Build the Caesar cipher computation graph.
 
     Args:
         max_letters: Fixed number of letter positions in the input.
             Shorter inputs should be space-padded on the right.
     """
-    vocab = list(LETTERS) + list("0123456789") + [" ", "\n", "<bos>", "<eos>"]
+    vocab = list(LETTERS) + list("0123456789") + [" ", "\n", "<bos>", "<ref>", "<eos>"]
     embedding = create_embedding(vocab=vocab)
-    pos_encoding = create_pos_encoding()
+    rope = create_rope_config(d_head=D_HEAD, max_positions=MAX_POSITIONS)
     embed = embedding.get_embedding
+
+    # Bucket-2 recency rank from the <bos>/<ref> markers — replaces the old
+    # position counter that drove "most recent" selection.
+    recency_rank = recency_rank_from_tokens(rope, embedding)
 
     is_trigger = equals_vector(embedding, embed("\n"))
 
     # --- Detect and propagate the shift digit ---
-    # The shift digit is at position 1 (after <bos>). Detect it with a
-    # digit lookup, then latch it to all subsequent positions.
+    # The shift digit is the first digit token (after <bos>/<ref>). Detect it
+    # with a digit lookup, then latch it to all subsequent positions.
     is_digit = map_to_table(
         inp=embedding,
         key_to_value={embed(str(i)): torch.tensor([1.0]) for i in range(10)},
         default=torch.tensor([-1.0]),
     )
-    latched_shift = pos_encoding.get_prev_value(embedding, is_digit)
+    latched_shift = get_prev_value(rope, embedding, is_digit, recency_rank)
 
     # --- Per-position shifted letter via combined lookup ---
     # Concatenate current letter embedding (8D) + latched shift embedding (8D)
@@ -89,22 +98,23 @@ def create_network_parts(
     output_letters = []
     for i in range(max_letters):
         offset = -(max_letters - i)  # -5, -4, -3, -2, -1 for max_letters=5
-        raw = pos_encoding.attend_to_offset(shifted_letter, delta_pos=offset)
-        latched = pos_encoding.get_prev_value(raw, is_trigger)
+        raw = attend_to_offset(rope, shifted_letter, delta_pos=offset)
+        latched = get_prev_value(rope, raw, is_trigger, recency_rank)
         output_letters.append(latched)
 
     output_letters.append(create_literal_value(embed("<eos>")))
 
     output_node = output_sequence(
-        pos_encoding,
+        rope,
         is_trigger,
         output_letters,
         embed(" "),
+        recency_rank,
     )
-    return output_node, pos_encoding, embedding
+    return output_node, embedding
 
 
 def create_network(max_letters: int = MAX_LETTERS) -> Unembedding:
     """Create a Caesar cipher network."""
-    output_node, pos_encoding, embedding = create_network_parts(max_letters)
+    output_node, embedding = create_network_parts(max_letters)
     return create_unembedding(output_node, embedding)

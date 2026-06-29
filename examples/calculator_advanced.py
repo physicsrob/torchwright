@@ -43,7 +43,7 @@ from typing import Dict, List, Tuple
 
 import torch
 
-from torchwright.graph import Embedding, Linear, Node, PosEncoding
+from torchwright.graph import Embedding, Linear, Node
 from torchwright.ops.arithmetic_ops import add_const, bool_to_01, concat, sum_nodes
 from torchwright.ops.inout_nodes import create_literal_value
 from torchwright.ops.map_select import in_range
@@ -392,7 +392,7 @@ def multiply_digit_seqs(
 
 def create_network_parts(
     max_digits: int = 3,
-) -> Tuple[Node, PosEncoding, Embedding]:
+) -> Tuple[Node, Embedding]:
     """The advanced calculator: the depth-optimized arithmetic wired up by
     :func:`examples._calculator_common.build_calculator`."""
     return build_calculator(

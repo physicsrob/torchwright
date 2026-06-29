@@ -18,7 +18,6 @@ from torchwright.graph import (
     Linear,
     LiteralValue,
     NodeValueType,
-    PosEncoding,
     Range,
     ReLU,
     ValueLogger,
@@ -36,14 +35,6 @@ def test_input_node_has_declared_range():
 def test_placeholder_is_unknown():
     n = Placeholder(d=3)
     assert n.value_type == NodeValueType.unknown()
-
-
-def test_pos_encoding_bounded():
-    n = PosEncoding(d_pos=9)
-    vt = n.value_type
-    # Sinusoidal columns are [-1, 1]; the counter column (the last one)
-    # has range [0, 100000].  The scalar range is the envelope.
-    assert vt.value_range == Range(-1.0, 100000.0)
 
 
 def test_literal_range():
@@ -150,7 +141,9 @@ def test_value_logger_passes_through():
 def test_attn_propagates_value_range_from_value_input():
     from torchwright.graph.value_type import Range
 
-    pe = PosEncoding(d_pos=9)
+    # Plain bounded input standing in for the query/key source; the test
+    # only checks that Attn propagates the value range from value_in.
+    pe = InputNode("pe", 9, value_range=(-1.0, 1.0))
     value = LiteralValue(torch.tensor([2.0, 3.0]))
     attn = Attn(
         query_in=pe,

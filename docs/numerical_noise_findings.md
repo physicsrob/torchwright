@@ -38,6 +38,22 @@ their distributions are width-1, where per-column M equals the old scalar M — 
 this carries no noise-number drift. (Motivation: the Plan-K Step-1 edge-key
 precision fix, `/data/torchdoom/k_step1_divergence_characterization.md`.)
 
+### `soft_blend` is exact-by-construction (fp32 round-off only)
+
+`soft_blend(cond, t, f)` measures **1.19e-07 abs / 1.67e-07 rel** — the
+float32 unit, not a piecewise-linear approximation floor. That is by design:
+unlike `select`, it adds no approximation of its own. It reuses
+`broadcast_select`'s carrier core with **zero** output bias
+(`raw = ReLU(M·cond+t) − ReLU(M·cond) + ReLU(−M·cond+f) − ReLU(−M·cond)`,
+exact for crisp cond) and then clamps with the elementwise `min`/`max` ops
+(each ~3.8e-06 abs, but only active when they change the value). The worst
+input is the octant-boundary case it was built for — soft `cond≈0.04` with
+`t≈f` (`0.7122`/`0.7132`) — and even there the error stays at fp32 round-off,
+confirming the median-of-three clamp introduces no dip. Contrast `select`,
+whose `(M+v)−M` cancellation loses `|v| ≪ ULP(M)` and collapses to ≈`−M` when
+its `compare` cond can't saturate (the failure that motivated this op; see
+`docs/rope_port_plan.md` Phase 1b). M=2.0 here (safety 2.0 × the [-1,1] bound).
+
 ### `piecewise_linear_2d` oscillates on non-uniform grids
 
 `diff_trig_nonuniform` hits **7.78 absolute error** on a product whose

@@ -30,7 +30,6 @@ from torchwright.compiler.forward.cpsat_scheduler import (
 from torchwright.compiler.forward.residual_map import ResidualStreamMap
 from torchwright.compiler.graph_identity import graph_fingerprint
 from torchwright.graph import Linear
-from torchwright.graph.pos_encoding import PosEncoding
 from torchwright.graph.relu import ReLU
 from torchwright.graph.value_type import Range
 from torchwright.ops.inout_nodes import create_input
@@ -225,29 +224,30 @@ def test_cpsat_available_residual_excludes_reserved():
     """build_cpsat_model subtracts reserve_residual from the residual budget,
     matching how the reservation shrinks the replay pool (GAP 1 root cause)."""
     out = _tiny_graph()
-    pos = PosEncoding(9)
-    base = build_cpsat_model(out, pos, **_CPSAT_KW).available_residual
+    # Position is rotary post-RoPE, so build_cpsat_model takes no pos node (its
+    # ``pos_encoding`` param is vestigial); the self-match column is the fixed
+    # base reservation that reserve_residual adds on top of.
+    base = build_cpsat_model(out, **_CPSAT_KW).available_residual
     for k in (1, 2):
-        got = build_cpsat_model(out, pos, reserve_residual=k, **_CPSAT_KW)
+        got = build_cpsat_model(out, reserve_residual=k, **_CPSAT_KW)
         assert got.available_residual == base - k
 
 
 def test_cpsat_residual_oversubscription_raises():
     """Reserving every data column fails loud at model build, not as a confusing
-    downstream solve failure, and the message names the reserved columns."""
+    downstream solve failure, and the message names the reserved columns. With
+    the RoPE self-match base of 1, reserving d-1 leaves zero room."""
     out = _tiny_graph()
-    pos = PosEncoding(9)
     with pytest.raises(RuntimeError, match="reserved columns"):
-        build_cpsat_model(out, pos, reserve_residual=64 - 9, **_CPSAT_KW)
+        build_cpsat_model(out, reserve_residual=64 - 1, **_CPSAT_KW)
 
 
 def test_solve_schedule_threads_reserve_residual():
     """reserve_residual flows end-to-end through solve_schedule and the solver
     still produces a feasible schedule under the reduced budget."""
     out = _tiny_graph()
-    pos = PosEncoding(9)
     assignment, _ = solve_schedule(
-        out, pos, reserve_residual=2, time_budget_s=10.0, max_layers=20, **_CPSAT_KW
+        out, reserve_residual=2, time_budget_s=10.0, max_layers=20, **_CPSAT_KW
     )
     assert assignment is not None
 
@@ -257,7 +257,6 @@ def test_schedule_fingerprint_keys_on_reserved_residual():
     norm-off one (GAP 2), while keeping the no-reservation hash byte-identical
     so existing cache entries still hit (the conditional payload field)."""
     out = _tiny_graph()
-    pos = PosEncoding(9)
     fp_kw = dict(
         d=64,
         d_head=8,
@@ -267,10 +266,10 @@ def test_schedule_fingerprint_keys_on_reserved_residual():
         cancel_slack=2,
         policy=None,
     )
-    fp_none = graph_fingerprint(out, pos, **fp_kw)
-    fp_zero = graph_fingerprint(out, pos, reserve_residual=0, **fp_kw)
-    fp_one = graph_fingerprint(out, pos, reserve_residual=1, **fp_kw)
-    fp_two = graph_fingerprint(out, pos, reserve_residual=2, **fp_kw)
+    fp_none = graph_fingerprint(out, **fp_kw)
+    fp_zero = graph_fingerprint(out, reserve_residual=0, **fp_kw)
+    fp_one = graph_fingerprint(out, reserve_residual=1, **fp_kw)
+    fp_two = graph_fingerprint(out, reserve_residual=2, **fp_kw)
     # reserve_residual=0 must hash exactly as if the arg were never passed.
     assert fp_zero == fp_none
     # A reservation must change the key, and different counts must differ.

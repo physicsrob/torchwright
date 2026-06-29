@@ -4,6 +4,8 @@ decode (converted from ``forward_compile``; see ``_example_onnx``).
 
 import pytest
 
+from examples.calculator_v2 import D_HEAD
+
 from ._example_onnx import load_example, run
 
 
@@ -16,7 +18,10 @@ def _build(digits):
 @pytest.fixture(scope="module")
 def calc_1digit(tmp_path_factory):
     return load_example(
-        lambda: _build(1), tmp_path_factory.mktemp("calcv2_1"), name="calcv2_1"
+        lambda: _build(1),
+        tmp_path_factory.mktemp("calcv2_1"),
+        d_head=D_HEAD,
+        name="calcv2_1",
     )
 
 
@@ -24,12 +29,16 @@ def calc_1digit(tmp_path_factory):
 def calc_3digit(tmp_path_factory):
     # square splits across layers when needed, so d=1024 suffices
     return load_example(
-        lambda: _build(3), tmp_path_factory.mktemp("calcv2_3"), name="calcv2_3"
+        lambda: _build(3),
+        tmp_path_factory.mktemp("calcv2_3"),
+        d_head=D_HEAD,
+        name="calcv2_3",
     )
 
 
 def _check(model, input_str, expected):
-    result = run(model, input_str)
+    # Recency calculator: <ref> must land at position 1 (bucket-2 readout).
+    result = run(model, input_str, ref_token="<ref>")
     assert (
         result == expected
     ), f"For {input_str!r}: expected {expected!r} but got {result!r}"

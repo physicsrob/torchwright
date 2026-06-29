@@ -17,7 +17,8 @@ Initializer → parameter map (ground truth: ``compiler/export.py``
 
     embed_table              -> model.embed_tokens.weight  (vocab, d)
     lm_head                  -> lm_head.weight              (vocab, d)  UNTIED
-    pos_encoding_full        -> model.pos_encoding_full    (max_seq, d)
+    constant_values          -> model.constant_values      (d,)
+    rope_freq/_base/_split   -> TorchwrightConfig.rope_base (config-derived; not a param)
     l{i}_input_layernorm     -> model.layers.{i}.input_layernorm.weight          (d,)
     l{i}_post_attention_layernorm -> model.layers.{i}.post_attention_layernorm.weight (d,)
     final_norm               -> model.norm.weight          (d,)   [rms_norm only]
@@ -130,7 +131,9 @@ def build_config(
     assert (
         len(vocab) <= vocab_size
     ), f"meta vocab len {len(vocab)} exceeds embed_table rows {vocab_size}"
-    max_seq = inits["pos_encoding_full"].shape[0]
+    # No additive PE table under RoPE; the rollout bound is the baked slot
+    # count arange_S (= cache_stride).  config.max_seq is otherwise vestigial.
+    max_seq = inits["arange_S"].shape[0]
 
     n_layers = sum(1 for k in inits if re.fullmatch(r"l\d+_WQ", k))
     assert n_layers > 0, "no l{i}_WQ initializers — not a token transformer?"
@@ -149,6 +152,11 @@ def build_config(
         ), f"layer {i}: WQ width {hd} != n_heads {nh} * d_head {d_head}"
         n_heads_per_layer.append(nh)
         d_hidden_per_layer.append(int(inits[f"l{i}_W1"].shape[1]))
+
+    # RoPE: every head is full-width rotary on one global grid; the exporter
+    # records the single shared `rope_base` in the sidecar meta and the converter
+    # rebuilds the rotation from it (no per-head enable).
+    rope_base = float(meta.get("rope_base", 500000.0))
 
     # Resolve bos/eos ids. A token of None means "this model has no bos/eos";
     # a non-None token that isn't in the vocab is a caller error (e.g. wrong
@@ -192,6 +200,7 @@ def build_config(
         max_seq=int(max_seq),
         head_kind="token",
         cache_stride=meta.get("cache_stride"),
+        rope_base=rope_base,
         bos_token_id=bos_id,
         eos_token_id=eos_id,
         tie_word_embeddings=False,
@@ -224,7 +233,7 @@ def build_state_dict(config, inits: Dict[str, np.ndarray]) -> Tuple[dict, set]:
     sd: dict = {
         "model.embed_tokens.weight": _t(embed_table),
         "lm_head.weight": _t(take("lm_head")),  # untied (vocab, d)
-        "model.pos_encoding_full": _t(take("pos_encoding_full")),  # (max_seq, d)
+        "model.constant_values": _t(take("constant_values")),  # (d,)
     }
 
     for i in range(config.n_layers):
@@ -246,6 +255,13 @@ def build_state_dict(config, inits: Dict[str, np.ndarray]) -> Tuple[dict, set]:
 
     if config.rms_norm:
         sd["model.norm.weight"] = _t(take("final_norm"))
+
+    # RoPE constants are config-derived (the model rebuilds the rotation from
+    # rope_base; every head is full-width rotary), not state-dict weights — mark
+    # them consumed so the all-mapped check passes.
+    for name in ("rope_freq", "rope_base", "rope_split"):
+        if name in inits:
+            consumed.add(name)
 
     return sd, consumed
 

@@ -719,34 +719,14 @@ class TestEmbeddingRule:
             assert iv.hi <= global_hi + 1e-10
 
 
-class TestPosEncodingRule:
-    def test_pos_encoding_identity_bound(self):
-        """PosEncoding produces an identity A-matrix with [-1, 1] per column."""
-        from torchwright.graph import PosEncoding
-
-        pe = PosEncoding(d_pos=9)
-        ab = pe.affine_bound
-        assert ab.n_cols > 0, "PosEncoding must have non-degenerate bound"
-        assert ab.d_output == 9
-        assert pe.node_id in ab.columns
-        assert pe.node_id in ab.input_ranges
-        assert torch.equal(ab.A_lo, torch.eye(9, dtype=torch.float64))
-        intervals = ab.to_interval()
-        for i, iv in enumerate(intervals):
-            if i == pe.counter_col:  # last column: raw position counter
-                assert iv.lo == pytest.approx(0.0)
-                assert iv.hi == pytest.approx(100000.0)
-            else:
-                assert iv.lo == pytest.approx(-1.0)
-                assert iv.hi == pytest.approx(1.0)
-
-
 class TestAttnRule:
     def test_attn_propagates_value_range(self):
         with fresh_graph_session():
-            from torchwright.graph import PosEncoding, Attn
+            from torchwright.graph import Attn
 
-            pe = PosEncoding(d_pos=9)
+            # Plain bounded input standing in for the query/key source; the
+            # test only checks Attn propagates value range from value_in.
+            pe = InputNode(9, name="pe", value_range=(-1.0, 1.0))
             value = LiteralValue(torch.tensor([2.0, 3.0]))
             attn = Attn(
                 query_in=pe,

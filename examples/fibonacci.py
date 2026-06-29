@@ -26,15 +26,16 @@ import torch
 
 from torchwright.graph import Node, Embedding
 from torchwright.graph.embedding import Unembedding
-from torchwright.graph.pos_encoding import PosEncoding
 from torchwright.ops.arithmetic_ops import add
+from torchwright.ops.attention_ops import attend_to_offset
 from torchwright.ops.inout_nodes import (
     create_literal_value,
     create_embedding,
-    create_pos_encoding,
+    create_rope_config,
     create_unembedding,
 )
 from torchwright.ops.logic_ops import equals_vector
+from torchwright.ops.recency_heads import recency_rank_from_tokens
 from torchwright.ops.scalar_encoding import (
     digits_to_number,
     number_to_digit_scalars,
@@ -43,6 +44,10 @@ from torchwright.ops.scalar_encoding import (
 from torchwright.ops.sequence_ops import output_sequence
 
 D_MODEL = 512
+# Rotary width the graph is built against; must match the d_head it is
+# compiled at (the token-example harness default is d_head=16).
+D_HEAD = 16
+MAX_POSITIONS = 512
 
 # Fixed digit width per Fibonacci number. W=2 handles values up to 99.
 DIGIT_WIDTH = 2
@@ -54,7 +59,7 @@ N_TERMS = 8
 def create_network_parts(
     digit_width: int = DIGIT_WIDTH,
     n_terms: int = N_TERMS,
-) -> Tuple[Node, PosEncoding, Embedding]:
+) -> Tuple[Node, Embedding]:
     """Build the Fibonacci generator computation graph.
 
     Args:
@@ -65,10 +70,14 @@ def create_network_parts(
     vocab = list("0123456789 abcdefghijklmnopqrstuvwxyz") + [
         "\n",
         "<bos>",
+        "<ref>",
         "<eos>",
     ]
     embedding = create_embedding(vocab=vocab)
-    pos_encoding = create_pos_encoding()
+    rope = create_rope_config(d_head=D_HEAD, max_positions=MAX_POSITIONS)
+    # Bucket-2 recency rank from the <bos>/<ref> markers — drives the
+    # "has the trigger fired" latch inside output_sequence.
+    recency_rank = recency_rank_from_tokens(rope, embedding)
     embed = embedding.get_embedding
 
     is_trigger = equals_vector(embedding, embed("\n"))
@@ -85,12 +94,12 @@ def create_network_parts(
     for d in range(W):
         # Read all W digits of F(n-1) (MSB first)
         prev1 = [
-            pos_encoding.attend_to_offset(embedding, delta_pos=-(W - 1 + d - i))
+            attend_to_offset(rope, embedding, delta_pos=-(W - 1 + d - i))
             for i in range(W)
         ]
         # Read all W digits of F(n-2) (MSB first)
         prev2 = [
-            pos_encoding.attend_to_offset(embedding, delta_pos=-(2 * W - 1 + d - i))
+            attend_to_offset(rope, embedding, delta_pos=-(2 * W - 1 + d - i))
             for i in range(W)
         ]
         # Convert to scalar numbers and add
@@ -122,17 +131,18 @@ def create_network_parts(
     )
 
     output_node = output_sequence(
-        pos_encoding,
+        rope,
         is_trigger,
         all_tokens,
         embed(" "),
+        recency_rank,
     )
-    return output_node, pos_encoding, embedding
+    return output_node, embedding
 
 
 def create_network(
     digit_width: int = DIGIT_WIDTH, n_terms: int = N_TERMS
 ) -> Unembedding:
     """Create a Fibonacci generator network."""
-    output_node, pos_encoding, embedding = create_network_parts(digit_width, n_terms)
+    output_node, embedding = create_network_parts(digit_width, n_terms)
     return create_unembedding(output_node, embedding)

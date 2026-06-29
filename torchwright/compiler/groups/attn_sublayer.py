@@ -1,10 +1,7 @@
-from typing import Optional
-
 import torch
 
 from torchwright.compiler.components.attn import AttnLayerComponent
 from torchwright.compiler.residual_assignment import ResidualStreamState
-from torchwright.graph import PosEncoding
 
 
 class AttnSubLayer:
@@ -17,12 +14,11 @@ class AttnSubLayer:
         self,
         d: int,
         d_head: int,
-        pos_encoding: Optional[PosEncoding] = None,
     ):
         self.d = d
         self.in_state = ResidualStreamState(name="AttnSubLayer In State")
         self.out_state = ResidualStreamState(name="AttnSubLayer Out State")
-        self.attn = AttnLayerComponent(d, d_head, pos_encoding, name="attn")
+        self.attn = AttnLayerComponent(d, d_head, name="attn")
 
     def forward(self, inp: torch.Tensor, return_states=False):
         states = {}

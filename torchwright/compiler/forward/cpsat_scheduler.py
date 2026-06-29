@@ -51,7 +51,6 @@ from torchwright.graph import (
     Node,
 )
 from torchwright.graph.misc import LiteralValue
-from torchwright.graph.pos_encoding import PosEncoding
 from torchwright.graph.relu import ReLU
 
 # ---------------------------------------------------------------------------
@@ -253,7 +252,7 @@ class GraphModel:
     chains: List[Chain]
     node_to_chain: Dict[Node, Chain]  # any of L1/R/L2 -> Chain
     output_node: Node
-    pos_encoding: PosEncoding
+    pos_encoding: object  # vestigial (always None) — position is rotary, no node
     input_nodes: List[Node]  # pre-allocated inputs (incl. LiteralValue)
     pinned_nodes: Set[Node]  # never freed
 
@@ -343,7 +342,7 @@ def _detect_chains_static(
     return chains
 
 
-def build_graph_model(output_node: Node, pos_encoding: PosEncoding) -> GraphModel:
+def build_graph_model(output_node: Node, pos_encoding=None) -> GraphModel:
     """Run all the static preprocessing the CP-SAT builder needs."""
     graph = GraphAnalyzer(output_node)
     output_node = graph.get_output_node()
@@ -672,7 +671,7 @@ def _compute_layer_bounds(
 
 def critical_path_layers(
     output_node: Node,
-    pos_encoding: PosEncoding,
+    pos_encoding=None,
     *,
     policy: Optional[SchedulingPolicy] = None,
     flex_routing: bool = True,
@@ -695,7 +694,7 @@ def critical_path_layers(
 
 def build_cpsat_model(
     output_node: Node,
-    pos_encoding: PosEncoding,
+    pos_encoding=None,
     *,
     d: int,
     d_head: int,
@@ -752,23 +751,24 @@ def build_cpsat_model(
     # rather than being reserved forever.  Reserving every input forever (the
     # previous behaviour) starved intermediates under width pressure and made
     # the residual cumulative reject schedules the heuristic compiles fine.
-    pos = gm.pos_encoding
-    freeable_inputs = [
-        n for n in gm.input_nodes if n is not pos and n is not gm.output_node
-    ]
-    # ``reserve_residual`` columns are permanently removed from the free pool by
-    # ``forward_compile`` *before* scheduling (the pinned-constant RMSNorm
-    # reserves 1–2 columns there — see ``_reserve_rms_norm_columns``).  The
-    # solver never sees ``residual_map``, so it must subtract them here too, or
-    # the modeled capacity over-counts by ``reserve_residual`` and the solver
-    # can emit a peak-occupancy schedule that is infeasible on replay against
-    # the reservation-reduced pool (a loud out-of-columns / liveness failure
-    # under width pressure, exactly where DOOM-class graphs run).
-    reserved_residual = len(pos) + reserve_residual
+    # The Δ=0 self-match reads one reserved constant-1 column that stays
+    # resident for the whole schedule (the RoPE end state — position is a
+    # rotation, no PosEncoding substrate); every input node is freeable
+    # (recycled once its last consumer runs).  Additionally, ``reserve_residual``
+    # columns are permanently removed from the free pool by ``forward_compile``
+    # *before* scheduling (the pinned-constant RMSNorm reserves 1–2 there — see
+    # ``_reserve_rms_norm_columns``).  The solver never sees ``residual_map``, so
+    # it must subtract BOTH the self-match column and ``reserve_residual`` here,
+    # or the modeled capacity over-counts and the solver can emit a peak-occupancy
+    # schedule that is infeasible on replay against the reservation-reduced pool
+    # (a loud out-of-columns / liveness failure under width pressure, exactly
+    # where DOOM-class graphs run).
+    freeable_inputs = [n for n in gm.input_nodes if n is not gm.output_node]
+    reserved_residual = 1 + reserve_residual
     available_residual = d - reserved_residual
     if available_residual <= 0:
         raise RuntimeError(
-            f"pos_encoding ({len(pos)}) plus reserved columns "
+            f"the self-match column (1) plus reserved columns "
             f"({reserve_residual}) require {reserved_residual} residual "
             f"columns, but d={d}. No room for inputs or intermediates."
         )
@@ -1365,7 +1365,7 @@ class _IncumbentTrace(cp_model.CpSolverSolutionCallback):
 
 def solve_schedule(
     output_node: Node,
-    pos_encoding: PosEncoding,
+    pos_encoding=None,
     *,
     d: int,
     d_head: int,

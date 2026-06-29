@@ -81,8 +81,8 @@ def normed_forward(net, res0, free_cols, n_const, gain, eps):
 def run_case(d, max_digits, prompt):
     n_const, m = pow2_layout(d)
     gain = 2.0**m
-    output_node, pos_encoding, embedding = create_network_parts(max_digits=max_digits)
-    compiled = compile_headless(output_node, pos_encoding, d=d, d_head=D_HEAD)
+    output_node, embedding = create_network_parts(max_digits=max_digits)
+    compiled = compile_headless(output_node, d=d, d_head=D_HEAD)
     net = compiled._net
     out_idx = compiled._output_indices
     res0 = net.get_input_res_stream(len(prompt), {"embedding_input": prompt})

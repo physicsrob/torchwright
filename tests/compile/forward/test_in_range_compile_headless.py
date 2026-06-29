@@ -8,20 +8,19 @@ import torch
 
 from torchwright.compiler.export import compile_headless
 from torchwright.compiler.forward.compile import forward_compile
-from torchwright.ops.inout_nodes import create_input, create_pos_encoding
+from torchwright.ops.inout_nodes import create_input
 from torchwright.ops.map_select import in_range
 
 
 def test_in_range_headless_values_are_pm1():
     """compile_headless in_range output must be ±1."""
-    pos = create_pos_encoding()
     lo = create_input("lo", 1)
     hi = create_input("hi", 1)
 
     N = 32
     masks = in_range(lo, hi, N)
 
-    module = compile_headless(masks, pos, d=256, verbose=False)
+    module = compile_headless(masks, d=256, verbose=False)
 
     # Alphabetical order: hi=8, lo=4 → in_range(4, 8, 32)
     # Slots 4,5,6,7 should be +1, rest -1
@@ -37,7 +36,6 @@ def test_in_range_headless_values_are_pm1():
 
 def test_in_range_headless_matches_forward_compile():
     """compile_headless and forward_compile must agree on in_range output."""
-    pos = create_pos_encoding()
     lo = create_input("lo", 1)
     hi = create_input("hi", 1)
 
@@ -45,14 +43,12 @@ def test_in_range_headless_matches_forward_compile():
     masks = in_range(lo, hi, N)
 
     # forward_compile path
-    net = forward_compile(
-        d=256, d_head=16, output_node=masks, pos_encoding=pos, verbose=False
-    )
+    net = forward_compile(d=256, d_head=16, output_node=masks, verbose=False)
     vals = {"lo": torch.tensor([[4.0]]), "hi": torch.tensor([[8.0]])}
     fc_out = net.compute(1, vals)[masks].squeeze(0)
 
     # compile_headless path (alphabetical: hi first)
-    module = compile_headless(masks, pos, d=256, verbose=False)
+    module = compile_headless(masks, d=256, verbose=False)
     ch_out = module(torch.tensor([[8.0, 4.0]])).squeeze(0)
 
     for i in range(N):

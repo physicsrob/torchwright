@@ -9,7 +9,6 @@ from torchwright.graph import (
     Concatenate,
     DebugWatch,
     InputNode,
-    PosEncoding,
     Embedding,
 )
 from torchwright.graph.value_type import tightened_with
@@ -205,7 +204,7 @@ class GraphAnalyzer:
         # compute_literal_value op near their consumer and freed after use —
         # not residual columns pre-allocated at layer 0 and held for the whole
         # network.  See constants_plan.md.
-        return isinstance(node, (Embedding, PosEncoding, InputNode))
+        return isinstance(node, (Embedding, InputNode))
 
     def is_ready(self, node: Node, available: Set[Node]) -> bool:
         """Check if all of a node's inputs are available.

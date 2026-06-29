@@ -26,7 +26,6 @@ from torchwright.ops.arithmetic_ops import (
 )
 from torchwright.ops.inout_nodes import create_input, create_literal_value
 
-
 D = 256
 D_HEAD = 16
 
@@ -292,10 +291,18 @@ def test_cpsat_compiles_fanout_chain():
     inputs = {"x": torch.randn(2, 8)}
 
     net_heur = forward_compile(
-        d=D, d_head=D_HEAD, output_node=out, verbose=False, optimize=0,
+        d=D,
+        d_head=D_HEAD,
+        output_node=out,
+        verbose=False,
+        optimize=0,
     )
     net_cpsat = forward_compile(
-        d=D, d_head=D_HEAD, output_node=out, verbose=False, optimize=1,
+        d=D,
+        d_head=D_HEAD,
+        output_node=out,
+        verbose=False,
+        optimize=1,
     )
     out_heur = net_heur.compute(2, inputs)[out].cpu()
     out_cpsat = net_cpsat.compute(2, inputs)[out].cpu()
@@ -323,11 +330,19 @@ def test_cpsat_compiles_shared_input_adds():
     inputs = {"x": torch.randn(2, width), "y": torch.randn(2, width)}
 
     net_heur = forward_compile(
-        d=D, d_head=D_HEAD, output_node=out, verbose=False, optimize=0,
+        d=D,
+        d_head=D_HEAD,
+        output_node=out,
+        verbose=False,
+        optimize=0,
         max_layers=10,
     )
     net_cpsat = forward_compile(
-        d=D, d_head=D_HEAD, output_node=out, verbose=False, optimize=1,
+        d=D,
+        d_head=D_HEAD,
+        output_node=out,
+        verbose=False,
+        optimize=1,
         max_layers=10,
     )
     out_heur = net_heur.compute(2, inputs)[out].cpu()
@@ -358,7 +373,11 @@ def test_cpsat_compiles_three_adds_shared_inputs():
     }
 
     net_cpsat = forward_compile(
-        d=D, d_head=D_HEAD, output_node=out, verbose=False, optimize=1,
+        d=D,
+        d_head=D_HEAD,
+        output_node=out,
+        verbose=False,
+        optimize=1,
         max_layers=10,
     )
     out_cpsat = net_cpsat.compute(2, inputs)[out].cpu()
@@ -382,7 +401,11 @@ def test_cpsat_compiles_concatenate_input_add():
     out = add(concat([c1, c2]), c3)
 
     net_cpsat = forward_compile(
-        d=D, d_head=D_HEAD, output_node=out, verbose=False, optimize=1,
+        d=D,
+        d_head=D_HEAD,
+        output_node=out,
+        verbose=False,
+        optimize=1,
     )
     actual = net_cpsat.compute(1, {})[out].cpu()
     expected = out.compute(1, {})
@@ -438,22 +461,21 @@ def test_cpsat_frees_wide_input_for_intermediate():
     Regression for the input-freeing fix.  The token-`Embedding`-shaped
     case in miniature: a 24-wide input ``x`` feeds one narrow ``Linear``
     and is then dead, after which a 40-wide standalone ``Linear`` ``b``
-    must materialise.  At ``d=64`` with a 9-wide ``pos_encoding``:
+    must materialise.  At ``d=64``:
 
-      * Pinning ``x`` forever (the pre-fix model) leaves only
-        ``64 - 24 - 9 = 31`` residual columns for intermediates — less
-        than ``b``'s 40, so the residual cumulative is INFEASIBLE and
-        CP-SAT falls back.  ``require_solver=True`` turns that silent
-        regression into a hard error.
-      * Freeing ``x`` once its consumer runs (the fix) frees its 24
-        columns, leaving ``64 - 9 = 55`` for ``b`` (40) plus the narrow
-        ``a`` (4) — a comfortable fit, so CP-SAT solves.
+      * Pinning ``x`` forever (the pre-fix model) keeps ``x`` (24) and
+        its consumer ``a`` (4) live while ``b`` (40) materialises —
+        ``24 + 4 + 40 = 68 > 64`` residual columns, so the residual
+        cumulative is INFEASIBLE and CP-SAT falls back.
+        ``require_solver=True`` turns that silent regression into a
+        hard error.
+      * Freeing ``x`` once its consumer ``a`` runs (the fix) frees its
+        24 columns, leaving ``a`` (4) plus ``b`` (40) = 44 <= 64 — a
+        comfortable fit, so CP-SAT solves.
 
     The compiled output must match the graph oracle: the directed replay
     has to actually reclaim ``x``'s columns and reuse them for ``b``.
     """
-    from torchwright.graph.pos_encoding import PosEncoding
-
     torch.manual_seed(0)
     x = create_input("x", 24)
     a = Linear(x, torch.randn(24, 4), torch.zeros(4), name="a")
@@ -464,7 +486,6 @@ def test_cpsat_frees_wide_input_for_intermediate():
         d=64,
         d_head=8,
         output_node=out,
-        pos_encoding=PosEncoding(9),
         verbose=False,
         optimize=1,
         require_solver=True,

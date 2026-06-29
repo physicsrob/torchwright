@@ -50,7 +50,7 @@ import torch
 from torchwright.compiler.export import compile_headless
 from torchwright.graph import Concatenate
 from torchwright.ops.arithmetic_ops import clamp, low_rank_2d
-from torchwright.ops.inout_nodes import create_input, create_pos_encoding
+from torchwright.ops.inout_nodes import create_input
 
 # Non-uniform grid that motivated low_rank_2d (TODO.md pathological case).
 _BP_X = [
@@ -80,7 +80,6 @@ def _build_atan_graph(rank: int, clamp_inputs: bool):
     interaction between surrounding structure and the fanout, not
     ``low_rank_2d`` alone.
     """
-    pos = create_pos_encoding()
     x = create_input("x", 1)
     y = create_input("y", 1)
 
@@ -99,7 +98,7 @@ def _build_atan_graph(rank: int, clamp_inputs: bool):
         rank=rank,
         name="atan_lr",
     )
-    return Concatenate([result]), pos
+    return Concatenate([result])
 
 
 def test_low_rank_2d_bare_rank3_compiles():
@@ -110,8 +109,8 @@ def test_low_rank_2d_bare_rank3_compiles():
     ``InputNode``, so the deadlock is coming from ``low_rank_2d``'s own
     internal graph shape — not from interaction with preceding ops.
     """
-    out, pos = _build_atan_graph(rank=3, clamp_inputs=False)
-    compile_headless(out, pos, d=512, d_head=32, max_layers=200, verbose=False)
+    out = _build_atan_graph(rank=3, clamp_inputs=False)
+    compile_headless(out, d=512, d_head=32, max_layers=200, verbose=False)
 
 
 def test_low_rank_2d_rank1_with_clamped_inputs_compiles():
@@ -120,8 +119,8 @@ def test_low_rank_2d_rank1_with_clamped_inputs_compiles():
     Currently fails: ``RuntimeError: No progress: 4 nodes remaining,
     493 free columns``.
     """
-    out, pos = _build_atan_graph(rank=1, clamp_inputs=True)
-    compile_headless(out, pos, d=512, d_head=32, max_layers=20, verbose=False)
+    out = _build_atan_graph(rank=1, clamp_inputs=True)
+    compile_headless(out, d=512, d_head=32, max_layers=20, verbose=False)
 
 
 def test_low_rank_2d_rank3_with_clamped_inputs_compiles_at_shallow_depth():
@@ -133,8 +132,8 @@ def test_low_rank_2d_rank3_with_clamped_inputs_compiles_at_shallow_depth():
     fires.  Currently fails: ``No progress: 13 nodes remaining, 487
     free columns``.
     """
-    out, pos = _build_atan_graph(rank=3, clamp_inputs=True)
-    compile_headless(out, pos, d=512, d_head=32, max_layers=20, verbose=False)
+    out = _build_atan_graph(rank=3, clamp_inputs=True)
+    compile_headless(out, d=512, d_head=32, max_layers=20, verbose=False)
 
 
 def test_low_rank_2d_rank3_with_clamped_inputs_compiles_at_generous_depth():
@@ -144,5 +143,5 @@ def test_low_rank_2d_rank3_with_clamped_inputs_compiles_at_generous_depth():
     scheduler gets stuck regardless of how much room it has.  Currently
     fails with the same ``13 nodes remaining`` signature.
     """
-    out, pos = _build_atan_graph(rank=3, clamp_inputs=True)
-    compile_headless(out, pos, d=512, d_head=32, max_layers=200, verbose=False)
+    out = _build_atan_graph(rank=3, clamp_inputs=True)
+    compile_headless(out, d=512, d_head=32, max_layers=200, verbose=False)

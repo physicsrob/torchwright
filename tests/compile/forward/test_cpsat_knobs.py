@@ -19,7 +19,6 @@ from torchwright.compiler.forward.cpsat_scheduler import (
 from torchwright.compiler.forward.scheduling_policy import SchedulingPolicy
 from torchwright.graph import Linear
 from torchwright.graph.optimize import fuse_consecutive_linears
-from torchwright.graph.pos_encoding import PosEncoding
 from torchwright.graph.relu import ReLU
 from torchwright.ops.inout_nodes import create_input
 
@@ -43,10 +42,8 @@ _SOLVE_KW = dict(d=64, d_head=8, d_hidden=128, time_budget_s=10.0, max_layers=20
 
 def test_tighten_domains_preserves_optimum():
     out = _repro_graph()
-    plain, _ = solve_schedule(out, PosEncoding(9), **_SOLVE_KW)
-    tight, tight_stats = solve_schedule(
-        out, PosEncoding(9), tighten_domains=True, **_SOLVE_KW
-    )
+    plain, _ = solve_schedule(out, **_SOLVE_KW)
+    tight, tight_stats = solve_schedule(out, tighten_domains=True, **_SOLVE_KW)
     assert plain is not None and tight is not None
     assert tight_stats.status_name == "OPTIMAL"
     assert tight.n_layers == plain.n_layers
@@ -55,10 +52,9 @@ def test_tighten_domains_preserves_optimum():
 def test_layer_bounds_sound_against_solved_schedule():
     """Every layer in an actual feasible schedule satisfies [es, ls]."""
     out = _repro_graph()
-    pos = PosEncoding(9)
-    assignment, _ = solve_schedule(out, pos, **_SOLVE_KW)
+    assignment, _ = solve_schedule(out, **_SOLVE_KW)
     assert assignment is not None
-    gm = build_graph_model(out, pos)
+    gm = build_graph_model(out)
     es, ls = _compute_layer_bounds(
         gm, SchedulingPolicy(), True, _SOLVE_KW["max_layers"]
     )
@@ -72,7 +68,6 @@ def test_solver_params_applied_and_solve_unchanged():
     out = _repro_graph()
     assignment, stats = solve_schedule(
         out,
-        PosEncoding(9),
         solver_params={
             "random_seed": 7,
             "shared_tree_num_workers": 0,
@@ -87,9 +82,7 @@ def test_solver_params_applied_and_solve_unchanged():
 def test_solution_trace_captures_incumbents():
     out = _repro_graph()
     trace: list = []
-    assignment, _ = solve_schedule(
-        out, PosEncoding(9), solution_trace=trace, **_SOLVE_KW
-    )
+    assignment, _ = solve_schedule(out, solution_trace=trace, **_SOLVE_KW)
     assert assignment is not None
     assert len(trace) >= 1
     last = trace[-1]
@@ -114,8 +107,8 @@ def test_secondary_objectives_are_lexicographic(costs):
     """Secondaries must never trade a layer: primary optimum is preserved
     and ``objective_value // objective_scale`` recovers it exactly."""
     out = _repro_graph()
-    plain, _ = solve_schedule(out, PosEncoding(9), **_SOLVE_KW)
-    sec, stats = solve_schedule(out, PosEncoding(9), costs=costs, **_SOLVE_KW)
+    plain, _ = solve_schedule(out, **_SOLVE_KW)
+    sec, stats = solve_schedule(out, costs=costs, **_SOLVE_KW)
     assert plain is not None and sec is not None
     assert sec.n_layers == plain.n_layers
     assert stats.objective_scale > 1
@@ -124,7 +117,7 @@ def test_secondary_objectives_are_lexicographic(costs):
 
 def test_plain_costs_keep_scale_one():
     out = _repro_graph()
-    _, stats = solve_schedule(out, PosEncoding(9), **_SOLVE_KW)
+    _, stats = solve_schedule(out, **_SOLVE_KW)
     assert stats.objective_scale == 1
 
 
@@ -142,12 +135,11 @@ def test_floor_probe_succeeds_at_slack_width():
     )
 
     out = _repro_graph()
-    cp = critical_path_layers(out, PosEncoding(9))
+    cp = critical_path_layers(out)
     net = forward_compile(
         d=64,
         d_head=8,
         output_node=out,
-        pos_encoding=PosEncoding(9),
         device="cpu",
         verbose=False,
         optimize=2,
@@ -166,7 +158,6 @@ def test_schedule_cache_round_trip(tmp_path, monkeypatch):
     kw = dict(
         d=64,
         d_head=8,
-        pos_encoding=PosEncoding(9),
         device="cpu",
         verbose=False,
         optimize=2,
@@ -232,12 +223,11 @@ def test_floor_probe_infeasible_falls_back_to_descent():
         li = Linear(x, torch.randn(4, 12), torch.zeros(12), name=f"L{i}")
         mids.append(Linear(li, torch.randn(12, 2), torch.zeros(2), name=f"M{i}"))
     out = Linear(Concatenate(mids), torch.randn(16, 4), torch.zeros(4), name="out")
-    cp = critical_path_layers(out, PosEncoding(9))
+    cp = critical_path_layers(out)
     net = forward_compile(
         d=48,
         d_head=8,
         output_node=out,
-        pos_encoding=PosEncoding(9),
         device="cpu",
         verbose=False,
         optimize=2,

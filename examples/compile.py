@@ -18,10 +18,8 @@ def main():
         print(f"Error: examples.{name} has no create_network_parts()")
         sys.exit(1)
 
-    output_node, pos_encoding, embedding = module.create_network_parts()
-    compile_to_onnx(
-        output_node, pos_encoding, embedding, f"{name}.onnx", d=module.D_MODEL
-    )
+    output_node, embedding = module.create_network_parts()
+    compile_to_onnx(output_node, embedding, f"{name}.onnx", d=module.D_MODEL)
 
 
 if __name__ == "__main__":

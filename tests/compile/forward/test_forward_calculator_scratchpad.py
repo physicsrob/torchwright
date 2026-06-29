@@ -13,7 +13,7 @@ flat-depth invariant itself is guarded without a compile in
 
 import pytest
 
-from examples.calculator_scratchpad import D_MODEL, RESULT, create_network_parts
+from examples.calculator_scratchpad import D_HEAD, D_MODEL, RESULT, create_network_parts
 
 from ._example_onnx import load_example, run
 
@@ -23,11 +23,14 @@ def calc3(tmp_path_factory):
     # D_MODEL (not the _example_onnx default 1024): the dispatched graph's peak
     # live width exceeds 1024 — the three streamed ops run in parallel and each
     # carries wide one-hot column totals (see calculator_scratchpad.D_MODEL).
+    # d_head=D_HEAD (32): the family's rope width (the multiply pointer gather is
+    # the widest content head); the compile d_head must match the rope.
     return load_example(
         lambda: create_network_parts(max_digits=3),
         tmp_path_factory.mktemp("scratch3"),
         name="scratch3",
         d=D_MODEL,
+        d_head=D_HEAD,
     )
 
 
@@ -39,8 +42,9 @@ def _answer(model, prompt):
     proves the trim works.
     """
     # Full transcript is at most 8n+3 tokens (multiply, incl. the scratch-digit
-    # region); 32 clears it for n=3 with margin.
-    text = run(model, prompt, max_new_tokens=32)
+    # region); 32 clears it for n=3 with margin.  ref_token="<ref>": recency
+    # example — <ref> must land at position 1 for the RoPE recency rank.
+    text = run(model, prompt, max_new_tokens=32, ref_token="<ref>")
     assert RESULT in text, f"no {RESULT!r} in decoded output {text!r}"
     return text.split(RESULT, 1)[1]
 

@@ -24,7 +24,7 @@ A few things worth knowing before reading the assertions:
 
 import torch
 
-from torchwright.graph import InputNode, PosEncoding
+from torchwright.graph import InputNode
 from torchwright.graph.asserts import assert_01, assert_integer, assert_onehot
 from torchwright.ops.attention_ops import (
     attend_argmin,
@@ -48,10 +48,40 @@ from torchwright.ops.attention_ops import (
 )
 from torchwright.graph.attn import Attn
 from torchwright.graph.misc import Assert
+from torchwright.ops.inout_nodes import create_rope_config
+
+# Uniform rotary substrate for these oracle (``node.compute``) tests.  Under
+# RoPE every content head is full-width rotary on the ``d_head`` ``rotate_half``
+# grid, with the content relocated onto the slowest planes
+# (:func:`place_on_slow_planes`), so the match is position-quasi-static over a
+# bounded window.  d_head=64 is wide enough for every content head in this file
+# (the widest is the build-only wide ``exclude_self`` matcher at content width
+# 25, which needs ``d_head/2 >= 25``) and keeps the slow planes slow enough that
+# the selection is unaffected by the rotation over these short windows.
+D_HEAD = 64
+MAX_POSITIONS = 2048
 
 
-def _pe() -> PosEncoding:
-    return PosEncoding(17)
+def _rope():
+    return create_rope_config(d_head=D_HEAD, max_positions=MAX_POSITIONS)
+
+
+# Synthetic monotone recency rank for the ``attend_most_recent_matching``
+# selection tests.  The op used to read recency from the position encoding; it
+# now reads a graph-derived ``recency_rank`` node (built for real from the
+# octant ramp in the recency e2e tests).  These unit tests exercise only the
+# selection logic, so they feed a clean monotone ramp ``rank[p] = p * _RANK_STEP``
+# as an input node instead.  The step is sized for the default selection gains
+# (``match_gain=200``, ``rank_gain=2e5``): ``rank_gain * _RANK_STEP = 20`` logits
+# resolves adjacent positions hard, while ``match_gain * dot_gap`` still beats
+# ``rank_gain * (window span) * _RANK_STEP`` over every test's window (the
+# windows here are short, and the sparse-match scale test keeps its newest
+# non-match within one match-stride of the most-recent match).
+_RANK_STEP = 1.0e-4
+
+
+def _rank_ramp(n_pos):
+    return (torch.arange(n_pos, dtype=torch.float32) * _RANK_STEP).unsqueeze(1)
 
 
 def _run(out_node, n_pos, **inputs):
@@ -66,10 +96,10 @@ def _run(out_node, n_pos, **inputs):
 
 def test_attend_argmin_happy_path():
     """Unique scores — argmin lands on the single minimum position."""
-    pe = _pe()
+    rope = _rope()
     score = assert_integer(InputNode("score", 1, value_range=(-100.0, 100.0)))
     value = InputNode("value", 4, value_range=(-100.0, 100.0))
-    out = attend_argmin(pe, score, value)
+    out = attend_argmin(rope, score, value)
 
     n_pos = 5
     # Scores are distinct.
@@ -93,10 +123,10 @@ def test_attend_argmin_happy_path():
 
 def test_attend_argmin_scalar_value():
     """Width-1 value — smoke test with small unique scores."""
-    pe = _pe()
+    rope = _rope()
     score = assert_integer(InputNode("score", 1, value_range=(-100.0, 100.0)))
     value = InputNode("value", 1, value_range=(-100.0, 100.0))
-    out = attend_argmin(pe, score, value)
+    out = attend_argmin(rope, score, value)
 
     n_pos = 3
     score_in = torch.tensor([[2.0], [1.0], [5.0]])
@@ -111,10 +141,10 @@ def test_attend_argmin_scalar_value():
 
 def test_attend_argmin_negative_scores():
     """argmin works with negative scores too (they're larger in -score space)."""
-    pe = _pe()
+    rope = _rope()
     score = assert_integer(InputNode("score", 1, value_range=(-100.0, 100.0)))
     value = InputNode("value", 3, value_range=(-100.0, 100.0))
-    out = attend_argmin(pe, score, value)
+    out = attend_argmin(rope, score, value)
 
     n_pos = 3
     # Most negative score = minimum → argmin picks it.
@@ -134,10 +164,10 @@ def test_attend_argmin_negative_scores():
 
 def test_attend_argmax_happy_path():
     """Unique scores — argmax lands on the single maximum position."""
-    pe = _pe()
+    rope = _rope()
     score = assert_integer(InputNode("score", 1, value_range=(-100.0, 100.0)))
     value = InputNode("value", 4, value_range=(-100.0, 100.0))
-    out = attend_argmax(pe, score, value)
+    out = attend_argmax(rope, score, value)
 
     n_pos = 5
     score_in = torch.tensor([[3.0], [1.0], [4.0], [2.0], [5.0]])
@@ -159,10 +189,10 @@ def test_attend_argmax_happy_path():
 
 def test_attend_argmax_dual_of_argmin():
     """``attend_argmax(score)`` equals ``attend_argmin(-score)``."""
-    pe = _pe()
+    rope = _rope()
     score = assert_integer(InputNode("score", 1, value_range=(-100.0, 100.0)))
     value = InputNode("value", 3, value_range=(-100.0, 100.0))
-    out_max = attend_argmax(pe, score, value)
+    out_max = attend_argmax(rope, score, value)
 
     # Build an argmin on negated scores by flipping the input.
     score_in = torch.tensor([[1.0], [5.0], [3.0]])
@@ -182,11 +212,11 @@ def test_attend_argmax_dual_of_argmin():
 
 def test_attend_argmin_where_mask_overrides_score():
     """A valid high score beats an invalid low score."""
-    pe = _pe()
+    rope = _rope()
     score = assert_integer(InputNode("score", 1, value_range=(-100.0, 100.0)))
     validity = InputNode("validity", 1, value_range=(-100.0, 100.0))
     value = InputNode("value", 4, value_range=(-100.0, 100.0))
-    out = attend_argmin_where(pe, score, validity, value)
+    out = attend_argmin_where(rope, score, validity, value)
 
     n_pos = 4
     # Position 1 has the lowest score (0) but is invalid.
@@ -204,11 +234,11 @@ def test_attend_argmin_where_mask_overrides_score():
 
 def test_attend_argmin_where_single_valid_wins_any_score():
     """A single valid position is selected regardless of other scores."""
-    pe = _pe()
+    rope = _rope()
     score = assert_integer(InputNode("score", 1, value_range=(-100.0, 100.0)))
     validity = InputNode("validity", 1, value_range=(-100.0, 100.0))
     value = InputNode("value", 4, value_range=(-100.0, 100.0))
-    out = attend_argmin_where(pe, score, validity, value)
+    out = attend_argmin_where(rope, score, validity, value)
 
     n_pos = 4
     # Only position 1 is valid, and it has a moderate score (kept under
@@ -227,11 +257,11 @@ def test_attend_argmin_where_single_valid_wins_any_score():
 
 def test_attend_argmin_where_advances_with_mask():
     """As more positions become valid over time, the selection advances."""
-    pe = _pe()
+    rope = _rope()
     score = assert_integer(InputNode("score", 1, value_range=(-100.0, 100.0)))
     validity = InputNode("validity", 1, value_range=(-100.0, 100.0))
     value = InputNode("value", 4, value_range=(-100.0, 100.0))
-    out = attend_argmin_where(pe, score, validity, value)
+    out = attend_argmin_where(rope, score, validity, value)
 
     n_pos = 4
     # Scores: 4, 2, 1, 3. Validity: T, T, F, T.
@@ -257,11 +287,11 @@ def test_attend_argmin_where_advances_with_mask():
 
 def test_attend_argmax_where_mask_overrides_score():
     """A valid low score beats an invalid high score."""
-    pe = _pe()
+    rope = _rope()
     score = assert_integer(InputNode("score", 1, value_range=(-100.0, 100.0)))
     validity = InputNode("validity", 1, value_range=(-100.0, 100.0))
     value = InputNode("value", 4, value_range=(-100.0, 100.0))
-    out = attend_argmax_where(pe, score, validity, value)
+    out = attend_argmax_where(rope, score, validity, value)
 
     n_pos = 4
     # Invalid high score at pos 1 should be ignored; max among
@@ -276,11 +306,11 @@ def test_attend_argmax_where_mask_overrides_score():
 
 def test_attend_argmax_where_single_valid_wins_any_score():
     """A single valid position is selected even with a tiny score."""
-    pe = _pe()
+    rope = _rope()
     score = assert_integer(InputNode("score", 1, value_range=(-100.0, 100.0)))
     validity = InputNode("validity", 1, value_range=(-100.0, 100.0))
     value = InputNode("value", 4, value_range=(-100.0, 100.0))
-    out = attend_argmax_where(pe, score, validity, value)
+    out = attend_argmax_where(rope, score, validity, value)
 
     n_pos = 4
     # Only pos 2 is valid; other positions have higher but invalid scores.
@@ -300,12 +330,12 @@ def test_attend_argmax_where_single_valid_wins_any_score():
 
 def test_attend_argmin_unmasked_empty_mask_picks_min_score():
     """With an all-zero mask, this degenerates to a plain argmin."""
-    pe = _pe()
+    rope = _rope()
     score = assert_integer(InputNode("score", 1, value_range=(-100.0, 100.0)))
     mask = assert_01(InputNode("mask", 4, value_range=(-100.0, 100.0)))
     onehot = assert_onehot(InputNode("onehot", 4, value_range=(-100.0, 100.0)))
     value = InputNode("value", 4, value_range=(-100.0, 100.0))
-    out = attend_argmin_unmasked(pe, score, mask, onehot, value)
+    out = attend_argmin_unmasked(rope, score, mask, onehot, value)
 
     n_pos = 4
     # Scores: min is pos 2 (score 1.0).
@@ -329,12 +359,12 @@ def test_attend_argmin_unmasked_empty_mask_picks_min_score():
 
 def test_attend_argmin_unmasked_skips_masked_index():
     """Masking a specific input slot skips it in favour of the next-best."""
-    pe = _pe()
+    rope = _rope()
     score = assert_integer(InputNode("score", 1, value_range=(-100.0, 100.0)))
     mask = assert_01(InputNode("mask", 4, value_range=(-100.0, 100.0)))
     onehot = assert_onehot(InputNode("onehot", 4, value_range=(-100.0, 100.0)))
     value = InputNode("value", 4, value_range=(-100.0, 100.0))
-    out = attend_argmin_unmasked(pe, score, mask, onehot, value)
+    out = attend_argmin_unmasked(rope, score, mask, onehot, value)
 
     n_pos = 4
     # Position 2 is the global min, but it's already been "used": its slot
@@ -378,12 +408,12 @@ def _build_indicators(scores, thresholds):
 def test_attend_argmin_above_integer_picks_smallest_above_threshold():
     """At each query position, pick the smallest score strictly above the
     threshold indicated by the one-hot query."""
-    pe = _pe()
+    rope = _rope()
     score = assert_integer(InputNode("score", 1, value_range=(-100.0, 100.0)))
     indicators = InputNode("indicators", 10, value_range=(-100.0, 100.0))
     threshold_onehot = InputNode("threshold_onehot", 10, value_range=(-100.0, 100.0))
     value = InputNode("value", 4, value_range=(-100.0, 100.0))
-    out = attend_argmin_above_integer(pe, score, indicators, threshold_onehot, value)
+    out = attend_argmin_above_integer(rope, score, indicators, threshold_onehot, value)
 
     n_pos = 5
     scores_list = [4.0, 2.0, 6.0, 1.0, 5.0]  # distinct integer-ish scores
@@ -423,12 +453,12 @@ def test_attend_argmin_above_integer_picks_smallest_above_threshold():
 def test_attend_argmin_above_integer_threshold_varies_per_query():
     """The one-hot threshold can differ per query position, giving
     different selections at each."""
-    pe = _pe()
+    rope = _rope()
     score = assert_integer(InputNode("score", 1, value_range=(-100.0, 100.0)))
     indicators = InputNode("indicators", 10, value_range=(-100.0, 100.0))
     threshold_onehot = InputNode("threshold_onehot", 10, value_range=(-100.0, 100.0))
     value = InputNode("value", 4, value_range=(-100.0, 100.0))
-    out = attend_argmin_above_integer(pe, score, indicators, threshold_onehot, value)
+    out = attend_argmin_above_integer(rope, score, indicators, threshold_onehot, value)
 
     n_pos = 4
     scores_list = [3.0, 1.0, 5.0, 2.0]
@@ -464,12 +494,12 @@ def test_attend_argmin_above_integer_threshold_varies_per_query():
 
 def test_attend_argmin_unmasked_advances_through_all_slots():
     """Simulate selection sort: each step masks the previous winner."""
-    pe = _pe()
+    rope = _rope()
     score = assert_integer(InputNode("score", 1, value_range=(-100.0, 100.0)))
     mask = assert_01(InputNode("mask", 4, value_range=(-100.0, 100.0)))
     onehot = assert_onehot(InputNode("onehot", 4, value_range=(-100.0, 100.0)))
     value = InputNode("value", 4, value_range=(-100.0, 100.0))
-    out = attend_argmin_unmasked(pe, score, mask, onehot, value)
+    out = attend_argmin_unmasked(rope, score, mask, onehot, value)
 
     n_pos = 4
     # Scores: 9, 3, 5, 1. Ascending sort order: pos 3 (1), pos 1 (3),
@@ -508,13 +538,13 @@ def test_attend_argmin_unmasked_advances_through_all_slots():
 
 def test_attend_argmin_valid_unmasked_all_valid_empty_mask_picks_min():
     """All keys valid, empty mask — behaves like a plain argmin."""
-    pe = _pe()
+    rope = _rope()
     score = assert_integer(InputNode("score", 1, value_range=(-100.0, 100.0)))
     validity = InputNode("validity", 1, value_range=(-100.0, 100.0))
     mask = assert_01(InputNode("mask", 4, value_range=(-100.0, 100.0)))
     onehot = assert_onehot(InputNode("onehot", 4, value_range=(-100.0, 100.0)))
     value = InputNode("value", 4, value_range=(-100.0, 100.0))
-    out = attend_argmin_valid_unmasked(pe, score, validity, mask, onehot, value)
+    out = attend_argmin_valid_unmasked(rope, score, validity, mask, onehot, value)
 
     n_pos = 4
     score_in = torch.tensor([[5.0], [3.0], [1.0], [4.0]])
@@ -541,13 +571,13 @@ def test_attend_argmin_valid_unmasked_all_valid_empty_mask_picks_min():
 
 def test_attend_argmin_valid_unmasked_validity_overrides_low_score():
     """The lowest-score key is invalid — attention picks the next-lowest valid."""
-    pe = _pe()
+    rope = _rope()
     score = assert_integer(InputNode("score", 1, value_range=(-100.0, 100.0)))
     validity = InputNode("validity", 1, value_range=(-100.0, 100.0))
     mask = assert_01(InputNode("mask", 4, value_range=(-100.0, 100.0)))
     onehot = assert_onehot(InputNode("onehot", 4, value_range=(-100.0, 100.0)))
     value = InputNode("value", 4, value_range=(-100.0, 100.0))
-    out = attend_argmin_valid_unmasked(pe, score, validity, mask, onehot, value)
+    out = attend_argmin_valid_unmasked(rope, score, validity, mask, onehot, value)
 
     n_pos = 4
     # pos 2 has lowest score (1.0) but is invalid.  Next-lowest valid = pos 1 (3.0).
@@ -573,13 +603,13 @@ def test_attend_argmin_valid_unmasked_validity_overrides_low_score():
 
 def test_attend_argmin_valid_unmasked_mask_excludes_picked():
     """All valid, but the min-score slot is masked — expect next-best unmasked."""
-    pe = _pe()
+    rope = _rope()
     score = assert_integer(InputNode("score", 1, value_range=(-100.0, 100.0)))
     validity = InputNode("validity", 1, value_range=(-100.0, 100.0))
     mask = assert_01(InputNode("mask", 4, value_range=(-100.0, 100.0)))
     onehot = assert_onehot(InputNode("onehot", 4, value_range=(-100.0, 100.0)))
     value = InputNode("value", 4, value_range=(-100.0, 100.0))
-    out = attend_argmin_valid_unmasked(pe, score, validity, mask, onehot, value)
+    out = attend_argmin_valid_unmasked(rope, score, validity, mask, onehot, value)
 
     n_pos = 4
     score_in = torch.tensor([[5.0], [3.0], [1.0], [4.0]])
@@ -613,13 +643,13 @@ def test_attend_argmin_valid_unmasked_mask_excludes_picked():
 
 def test_attend_argmin_valid_unmasked_mask_and_validity_combined():
     """Lowest score is masked, second-lowest invalid — pick third (valid + unmasked)."""
-    pe = _pe()
+    rope = _rope()
     score = assert_integer(InputNode("score", 1, value_range=(-100.0, 100.0)))
     validity = InputNode("validity", 1, value_range=(-100.0, 100.0))
     mask = assert_01(InputNode("mask", 4, value_range=(-100.0, 100.0)))
     onehot = assert_onehot(InputNode("onehot", 4, value_range=(-100.0, 100.0)))
     value = InputNode("value", 4, value_range=(-100.0, 100.0))
-    out = attend_argmin_valid_unmasked(pe, score, validity, mask, onehot, value)
+    out = attend_argmin_valid_unmasked(rope, score, validity, mask, onehot, value)
 
     n_pos = 4
     # Scores: 5 (pos 0), 3 (pos 1), 1 (pos 2), 4 (pos 3).
@@ -660,13 +690,13 @@ def test_attend_argmin_valid_unmasked_all_valid_masked_repicks_masked():
     gets back one of the previously-picked valid values rather than
     garbage from an invalid position.
     """
-    pe = _pe()
+    rope = _rope()
     score = assert_integer(InputNode("score", 1, value_range=(-100.0, 100.0)))
     validity = InputNode("validity", 1, value_range=(-100.0, 100.0))
     mask = assert_01(InputNode("mask", 4, value_range=(-100.0, 100.0)))
     onehot = assert_onehot(InputNode("onehot", 4, value_range=(-100.0, 100.0)))
     value = InputNode("value", 4, value_range=(-100.0, 100.0))
-    out = attend_argmin_valid_unmasked(pe, score, validity, mask, onehot, value)
+    out = attend_argmin_valid_unmasked(rope, score, validity, mask, onehot, value)
 
     n_pos = 4
     # Only pos 1 is valid — and its slot is masked.
@@ -705,10 +735,10 @@ def test_attend_argmin_valid_unmasked_all_valid_masked_repicks_masked():
 
 def test_attend_mean_where_averages_valid_positions():
     """Mean of value across valid positions, ignoring invalid ones."""
-    pe = _pe()
+    rope = _rope()
     validity = InputNode("validity", 1, value_range=(-100.0, 100.0))
     value = InputNode("value", 3, value_range=(-100.0, 100.0))
-    out = attend_mean_where(pe, validity, value)
+    out = attend_mean_where(rope, validity, value)
 
     n_pos = 5
     # Positions 0, 1, 3 are valid; 2, 4 are invalid.
@@ -733,10 +763,10 @@ def test_attend_mean_where_averages_valid_positions():
 
 def test_attend_mean_where_single_valid():
     """With one valid position, the mean is that position's value."""
-    pe = _pe()
+    rope = _rope()
     validity = InputNode("validity", 1, value_range=(-100.0, 100.0))
     value = InputNode("value", 2, value_range=(-100.0, 100.0))
-    out = attend_mean_where(pe, validity, value)
+    out = attend_mean_where(rope, validity, value)
 
     n_pos = 3
     validity_in = torch.tensor([[-1.0], [1.0], [-1.0]])
@@ -749,11 +779,11 @@ def test_attend_mean_where_single_valid():
 
 
 def test_attend_mean_where_wide_value():
-    """Value wider than d_pos — exercises the no-width-constraint path."""
-    pe = _pe()  # d_pos = 16
+    """Value wider than d_head — exercises the no-width-constraint path."""
+    rope = _rope()
     validity = InputNode("validity", 1, value_range=(-100.0, 100.0))
-    value = InputNode("value", 32, value_range=(-100.0, 100.0))  # wider than d_pos
-    out = attend_mean_where(pe, validity, value)
+    value = InputNode("value", 32, value_range=(-100.0, 100.0))  # wider than d_head
+    out = attend_mean_where(rope, validity, value)
 
     n_pos = 3
     validity_in = torch.tensor([[1.0], [1.0], [-1.0]])
@@ -769,10 +799,10 @@ def test_attend_mean_where_wide_value():
 
 def test_attend_mean_where_all_valid_uniform():
     """With all positions valid, result is the running cumulative mean."""
-    pe = _pe()
+    rope = _rope()
     validity = InputNode("validity", 1, value_range=(-100.0, 100.0))
     value = InputNode("value", 1, value_range=(-100.0, 100.0))
-    out = attend_mean_where(pe, validity, value)
+    out = attend_mean_where(rope, validity, value)
 
     n_pos = 4
     validity_in = torch.ones(n_pos, 1)
@@ -796,11 +826,11 @@ def test_attend_mean_where_all_valid_uniform():
 
 def test_attend_argmax_dot_selects_best_match():
     """Selects the key position whose key_vector best matches query_vector."""
-    pe = _pe()
+    rope = _rope()
     query_vector = InputNode("qv", 4, value_range=(-100.0, 100.0))
     key_vector = InputNode("kv", 4, value_range=(-100.0, 100.0))
     value = InputNode("value", 2, value_range=(-100.0, 100.0))
-    out = attend_argmax_dot(query_vector, key_vector, value)
+    out = attend_argmax_dot(rope, query_vector, key_vector, value)
 
     n_pos = 4
     # Query: one-hot selecting column 2 (0/1 convention)
@@ -852,11 +882,11 @@ def test_attend_argmax_dot_selects_best_match():
 def test_attend_argmax_dot_zero_key_isolation():
     """Zero key_vector (from cond_gate) produces dot product 0, losing to
     any matching position."""
-    pe = _pe()
+    rope = _rope()
     query_vector = InputNode("qv", 3, value_range=(-100.0, 100.0))
     key_vector = InputNode("kv", 3, value_range=(-100.0, 100.0))
     value = InputNode("value", 2, value_range=(-100.0, 100.0))
-    out = attend_argmax_dot(query_vector, key_vector, value)
+    out = attend_argmax_dot(rope, query_vector, key_vector, value)
 
     n_pos = 3
     # Query: one-hot column 0
@@ -891,11 +921,11 @@ def test_attend_argmax_dot_zero_key_isolation():
 
 def test_attend_argmax_dot_different_queries_per_position():
     """Different query positions can select different matches."""
-    pe = _pe()
+    rope = _rope()
     query_vector = InputNode("qv", 3, value_range=(-100.0, 100.0))
     key_vector = InputNode("kv", 3, value_range=(-100.0, 100.0))
     value = InputNode("value", 1, value_range=(-100.0, 100.0))
-    out = attend_argmax_dot(query_vector, key_vector, value)
+    out = attend_argmax_dot(rope, query_vector, key_vector, value)
 
     n_pos = 4
     # Key positions 0-2 each have a different column set to +1.
@@ -941,7 +971,8 @@ def test_attend_argmax_dot_where_validity_dominates_supported_range():
     key_vector = InputNode("kv", 1, value_range=(-100.0, 100.0))
     validity = InputNode("validity", 1, value_range=(-100.0, 100.0))
     value = InputNode("value", 2, value_range=(-100.0, 100.0))
-    out = attend_argmax_dot_where(query_vector, key_vector, validity, value)
+    rope = _rope()
+    out = attend_argmax_dot_where(rope, query_vector, key_vector, validity, value)
 
     n_pos = 2
     qv_in = torch.ones(n_pos, 1)
@@ -968,7 +999,8 @@ def test_attend_argmin_dot_where_validity_dominates_supported_range():
     key_vector = InputNode("kv", 1, value_range=(-100.0, 100.0))
     validity = InputNode("validity", 1, value_range=(-100.0, 100.0))
     value = InputNode("value", 2, value_range=(-100.0, 100.0))
-    out = attend_argmin_dot_where(query_vector, key_vector, validity, value)
+    rope = _rope()
+    out = attend_argmin_dot_where(rope, query_vector, key_vector, validity, value)
 
     n_pos = 2
     qv_in = torch.ones(n_pos, 1)
@@ -993,7 +1025,8 @@ def test_attend_argmin_dot_where_zero_key_regression():
     key_vector = InputNode("kv", 2, value_range=(-100.0, 100.0))
     validity = InputNode("validity", 1, value_range=(-100.0, 100.0))
     value = InputNode("value", 3, value_range=(-100.0, 100.0))
-    out = attend_argmin_dot_where(query_vector, key_vector, validity, value)
+    rope = _rope()
+    out = attend_argmin_dot_where(rope, query_vector, key_vector, validity, value)
 
     n_pos = 3
     qv_in = torch.tensor(
@@ -1035,11 +1068,12 @@ def test_attend_argmin_dot_where_zero_key_regression():
 def test_most_recent_matching_single_match():
     """When only one causal-window position matches, the output equals
     that position's value."""
-    pe = _pe()
+    rope = _rope()
     query = InputNode("query", 4, value_range=(-1.0, 1.0))
     key = InputNode("key", 4, value_range=(-1.0, 1.0))
     value = InputNode("value", 1, value_range=(-100.0, 100.0))
-    out = attend_most_recent_matching(pe, query, key, value)
+    rank = InputNode("rank", 1, value_range=(0.0, 1.0))
+    out = attend_most_recent_matching(rope, query, key, value, rank)
 
     n_pos = 5
     # One-hot types, only position 2 has type 0.
@@ -1048,7 +1082,9 @@ def test_most_recent_matching_single_match():
     query_in = torch.eye(4)[torch.tensor([0, 0, 0, 0, 0])]
     value_in = torch.tensor([[10.0], [20.0], [30.0], [40.0], [50.0]])
 
-    result = _run(out, n_pos, query=query_in, key=key_in, value=value_in)
+    result = _run(
+        out, n_pos, query=query_in, key=key_in, value=value_in, rank=_rank_ramp(n_pos)
+    )
     # From pos 2 onwards, position 2 is the only match → value 30.
     for p in range(2, n_pos):
         assert abs(result[p].item() - 30.0) < 1e-2, f"pos {p}: {result[p]}"
@@ -1056,11 +1092,12 @@ def test_most_recent_matching_single_match():
 
 def test_most_recent_matching_picks_most_recent_of_ties():
     """With multiple matches, recency breaks the tie."""
-    pe = _pe()
+    rope = _rope()
     query = InputNode("query", 4, value_range=(-1.0, 1.0))
     key = InputNode("key", 4, value_range=(-1.0, 1.0))
     value = InputNode("value", 1, value_range=(-100.0, 100.0))
-    out = attend_most_recent_matching(pe, query, key, value)
+    rank = InputNode("rank", 1, value_range=(0.0, 1.0))
+    out = attend_most_recent_matching(rope, query, key, value, rank)
 
     n_pos = 6
     # pos 0,3 = type 0; pos 1,4 = type 1; pos 2,5 = type 2.
@@ -1070,7 +1107,9 @@ def test_most_recent_matching_picks_most_recent_of_ties():
     # Distinct values so tied matches are distinguishable.
     value_in = torch.tensor([[10.0], [20.0], [30.0], [40.0], [50.0], [60.0]])
 
-    result = _run(out, n_pos, query=query_in, key=key_in, value=value_in)
+    result = _run(
+        out, n_pos, query=query_in, key=key_in, value=value_in, rank=_rank_ramp(n_pos)
+    )
     # Each position is the most recent match for its own query.
     expected = torch.tensor([[10.0], [20.0], [30.0], [40.0], [50.0], [60.0]])
     assert torch.allclose(
@@ -1080,11 +1119,12 @@ def test_most_recent_matching_picks_most_recent_of_ties():
 
 def test_most_recent_matching_recency_advances_with_time():
     """As new matches appear, the attended position advances."""
-    pe = _pe()
+    rope = _rope()
     query = InputNode("query", 4, value_range=(-1.0, 1.0))
     key = InputNode("key", 4, value_range=(-1.0, 1.0))
     value = InputNode("value", 1, value_range=(-100.0, 100.0))
-    out = attend_most_recent_matching(pe, query, key, value)
+    rank = InputNode("rank", 1, value_range=(0.0, 1.0))
+    out = attend_most_recent_matching(rope, query, key, value, rank)
 
     n_pos = 6
     # All positions have type 0 — every position matches every query.
@@ -1093,7 +1133,9 @@ def test_most_recent_matching_recency_advances_with_time():
     value_in = torch.tensor([[1.0], [2.0], [3.0], [4.0], [5.0], [6.0]])
 
     # Every query's "most recent match" is the query's own position.
-    result = _run(out, n_pos, query=query_in, key=key_in, value=value_in)
+    result = _run(
+        out, n_pos, query=query_in, key=key_in, value=value_in, rank=_rank_ramp(n_pos)
+    )
     for p in range(n_pos):
         assert abs(result[p].item() - float(p + 1)) < 1e-2, f"pos {p}: {result[p]}"
 
@@ -1111,7 +1153,7 @@ def test_most_recent_matching_e8_type_lookup():
     """
     from torchwright.graph.spherical_codes import index_to_vector
 
-    pe = _pe()
+    rope = _rope()
     # Use a few DOOM-used E8 indices.  Only index 3 is treated as "match".
     TYPES = [1, 3, 5, 7, 3, 4, 3]  # positions 1, 4, 6 are type 3
     target_e8 = index_to_vector(3)
@@ -1119,7 +1161,8 @@ def test_most_recent_matching_e8_type_lookup():
     query = InputNode("query", 8, value_range=(-20.0, 20.0))
     key = InputNode("key", 8, value_range=(-20.0, 20.0))
     value = InputNode("value", 1, value_range=(-100.0, 100.0))
-    out = attend_most_recent_matching(pe, query, key, value)
+    rank = InputNode("rank", 1, value_range=(0.0, 1.0))
+    out = attend_most_recent_matching(rope, query, key, value, rank)
 
     n_pos = 7
     key_in = torch.stack([index_to_vector(t) for t in TYPES])
@@ -1127,7 +1170,9 @@ def test_most_recent_matching_e8_type_lookup():
     query_in = target_e8.unsqueeze(0).expand(n_pos, -1).contiguous()
     value_in = torch.arange(10.0, 10.0 + n_pos).unsqueeze(1)  # 10, 11, ..., 16
 
-    result = _run(out, n_pos, query=query_in, key=key_in, value=value_in)
+    result = _run(
+        out, n_pos, query=query_in, key=key_in, value=value_in, rank=_rank_ramp(n_pos)
+    )
     # Type-3 positions: 1, 4, 6.  Their values: 11, 14, 16.
     # From pos 1→3: most recent match is pos 1 → value 11.
     # From pos 4→5: most recent match is pos 4 → value 14.
@@ -1152,7 +1197,7 @@ def test_most_recent_matching_scale_1500_tokens():
     """
     from torchwright.graph.spherical_codes import index_to_vector
 
-    pe = _pe()
+    rope = _rope()
     n_pos = 1500
     match_every = 30  # one match every 30 positions
     target_e8 = index_to_vector(3)
@@ -1161,7 +1206,8 @@ def test_most_recent_matching_scale_1500_tokens():
     query = InputNode("query", 8, value_range=(-20.0, 20.0))
     key = InputNode("key", 8, value_range=(-20.0, 20.0))
     value = InputNode("value", 1, value_range=(-2000.0, 2000.0))
-    out = attend_most_recent_matching(pe, query, key, value)
+    rank = InputNode("rank", 1, value_range=(0.0, 1.0))
+    out = attend_most_recent_matching(rope, query, key, value, rank)
 
     # Place matches at every `match_every`-th position.
     key_in = torch.stack(
@@ -1171,7 +1217,9 @@ def test_most_recent_matching_scale_1500_tokens():
     # Encode position into value so we can verify which one we picked.
     value_in = torch.arange(0.0, float(n_pos)).unsqueeze(1)
 
-    result = _run(out, n_pos, query=query_in, key=key_in, value=value_in)
+    result = _run(
+        out, n_pos, query=query_in, key=key_in, value=value_in, rank=_rank_ramp(n_pos)
+    )
     # Check a sample of query positions across the range.
     for p in (50, 200, 500, 900, 1499):
         expected_pick = (p // match_every) * match_every
@@ -1184,19 +1232,22 @@ def test_most_recent_matching_scale_1500_tokens():
 def test_most_recent_matching_value_wider_than_d_pos():
     """Value can be wider than the positional encoding — the compiler
     splits V/O across physical heads, same as ``attend_argmax_dot``."""
-    pe = _pe()  # d_pos = 16
+    rope = _rope()
     query = InputNode("query", 4, value_range=(-1.0, 1.0))
     key = InputNode("key", 4, value_range=(-1.0, 1.0))
-    # Width 24 > d_pos = 16.
+    # Width 24 > d_head/2.
     value = InputNode("value", 24, value_range=(-100.0, 100.0))
-    out = attend_most_recent_matching(pe, query, key, value)
+    rank = InputNode("rank", 1, value_range=(0.0, 1.0))
+    out = attend_most_recent_matching(rope, query, key, value, rank)
 
     n_pos = 3
     key_in = torch.eye(4)[torch.tensor([0, 1, 0])]
     query_in = torch.eye(4)[torch.tensor([0, 0, 0])]
     value_in = torch.arange(0.0, float(n_pos * 24)).reshape(n_pos, 24)
 
-    result = _run(out, n_pos, query=query_in, key=key_in, value=value_in)
+    result = _run(
+        out, n_pos, query=query_in, key=key_in, value=value_in, rank=_rank_ramp(n_pos)
+    )
     # pos 0: match is pos 0 → value row 0.
     # pos 1: match is pos 0 → value row 0.
     # pos 2: match is pos 2 → value row 2.
@@ -1228,13 +1279,16 @@ def test_most_recent_matching_exclude_self():
     Position 0 is degenerate under the shift (no prior position exists)
     and is not asserted.
     """
-    pe = _pe()
+    rope = _rope()
     query = InputNode("query", 4, value_range=(-1.0, 1.0))
     key = InputNode("key", 4, value_range=(-1.0, 1.0))
     value = InputNode("value", 1, value_range=(-100.0, 100.0))
+    rank = InputNode("rank", 1, value_range=(0.0, 1.0))
 
-    out_default = attend_most_recent_matching(pe, query, key, value)
-    out_excl = attend_most_recent_matching(pe, query, key, value, exclude_self=True)
+    out_default = attend_most_recent_matching(rope, query, key, value, rank)
+    out_excl = attend_most_recent_matching(
+        rope, query, key, value, rank, exclude_self=True
+    )
 
     n_pos = 4
     # types per position: 0, 1, 0, 0 — positions 0, 2, 3 match type 0.
@@ -1244,9 +1298,21 @@ def test_most_recent_matching_exclude_self():
     value_in = torch.tensor([[10.0], [20.0], [30.0], [40.0]])
 
     result_default = _run(
-        out_default, n_pos, query=query_in, key=key_in, value=value_in
+        out_default,
+        n_pos,
+        query=query_in,
+        key=key_in,
+        value=value_in,
+        rank=_rank_ramp(n_pos),
     )
-    result_excl = _run(out_excl, n_pos, query=query_in, key=key_in, value=value_in)
+    result_excl = _run(
+        out_excl,
+        n_pos,
+        query=query_in,
+        key=key_in,
+        value=value_in,
+        rank=_rank_ramp(n_pos),
+    )
 
     # Sanity: default mode picks self when self matches.
     assert abs(result_default[1].item() - 10.0) < 1e-2, result_default[1]
@@ -1265,21 +1331,22 @@ def test_most_recent_matching_exclude_self_accepts_wide_width():
     uses ``attend_to_offset``, whose V/O auto-splits across heads.  Both modes
     build for widths wider than the encoding (regression for the removed caps).
     """
-    pe = _pe()  # PosEncoding(17), trig_width 16
+    rope = _rope()
     query = InputNode("query", 4, value_range=(-1.0, 1.0))
     key = InputNode("key", 4, value_range=(-1.0, 1.0))
     wide_value = InputNode("value", 24, value_range=(-100.0, 100.0))
+    rank = InputNode("rank", 1, value_range=(0.0, 1.0))
 
-    # Wide value (24 > trig_width 16) builds in both modes.
-    attend_most_recent_matching(pe, query, key, wide_value)
-    attend_most_recent_matching(pe, query, key, wide_value, exclude_self=True)
+    # Wide value (24 > d_head/2) builds in both modes.
+    attend_most_recent_matching(rope, query, key, wide_value, rank)
+    attend_most_recent_matching(rope, query, key, wide_value, rank, exclude_self=True)
 
     # Wide key_vector likewise.
     wide_query = InputNode("query", 24, value_range=(-1.0, 1.0))
     wide_key = InputNode("key", 24, value_range=(-1.0, 1.0))
     narrow_value = InputNode("value", 1, value_range=(-100.0, 100.0))
     attend_most_recent_matching(
-        pe, wide_query, wide_key, narrow_value, exclude_self=True
+        rope, wide_query, wide_key, narrow_value, rank, exclude_self=True
     )
 
 
@@ -1323,6 +1390,36 @@ def _unwrap_attn(node):
     return node
 
 
+# --- slow-plane layout helpers (RoPE) ------------------------------------- #
+# Under RoPE a content head is a full-width rotary Attn: its compact ``(rows, W)``
+# query/key matrices are relocated onto the slowest ``W`` planes of the
+# ``d_head`` grid (``place_on_slow_planes``), so ``attn.d_qk == d_head`` and
+# compact content column ``c`` lands at first-half physical column
+# ``d_head/2 - 1 - c`` (its rotate_half partner left zero).  The structural
+# regressions below therefore read cells through ``_slow_col`` and recover the
+# logical content width via ``_content_width`` rather than indexing the old
+# compact layout directly.
+
+
+def _slow_col(attn, c):
+    """Physical column holding compact content column ``c`` after relocation."""
+    return attn.d_qk // 2 - 1 - c
+
+
+def _content_width(attn):
+    """The logical content width W = number of slow planes carrying content.
+
+    ``place_on_slow_planes`` fills first-half columns ``half-1 .. half-W`` (one
+    per content scalar) and leaves the rest zero, so W is ``half`` minus the
+    lowest nonzero first-half column across the query and key matrices.
+    """
+    half = attn.d_qk // 2
+    first_half = torch.cat([attn.query_matrix, attn.key_matrix], dim=0)[:, :half]
+    used = torch.nonzero((first_half.abs() > 0).any(dim=0)).reshape(-1)
+    assert used.numel() > 0, "no content columns found on the slow planes"
+    return half - int(used.min())
+
+
 def _baib_nodes(nb, nt, value_width=4, *, assert_hardness_gt=None):
     score = assert_integer(InputNode("baib_score", 1, value_range=(-100.0, 100.0)))
     validity = InputNode("baib_validity", 1, value_range=(-2.0, 2.0))
@@ -1332,7 +1429,7 @@ def _baib_nodes(nb, nt, value_width=4, *, assert_hardness_gt=None):
     threshold = InputNode("baib_th", nt, value_range=(-2.0, 2.0))
     value = InputNode("baib_value", value_width, value_range=(-100.0, 100.0))
     return attend_argmin_above_in_bucket(
-        _pe(),
+        _rope(),
         score,
         validity,
         key_bucket,
@@ -1580,12 +1677,15 @@ def test_baib_threshold_boundary_equal_is_not_above():
 
 
 def test_baib_arbitrary_value_width_does_not_grow_dqk():
-    """A wide `value` does not change the logical Q/K width."""
+    """A wide `value` does not change the logical Q/K (content) width."""
     nb, nt = 3, 4
     for vw in (1, 4, 20):
         out = _baib_nodes(nb, nt, value_width=vw)
         attn = _unwrap_attn(out)
-        assert attn.d_qk == 2 + nb + nt, (vw, attn.d_qk)
+        # Full-width rotary head: physical d_qk is the grid width, and the
+        # content rides exactly 2 + nb + nt slow planes regardless of vw.
+        assert attn.d_qk == D_HEAD, (vw, attn.d_qk)
+        assert _content_width(attn) == 2 + nb + nt, (vw, _content_width(attn))
         assert attn.d_v == vw, (vw, attn.d_v)
     # And selection still works with a wide payload.
     out = _baib_nodes(nb, nt, value_width=20)
@@ -1783,22 +1883,23 @@ def test_baib_assert_hardness_passes_on_clean_matches():
 
 
 def test_baib_d_qk_is_two_plus_buckets_plus_thresholds():
-    """Width regression: logical Q/K width is exactly 2 + n_buckets + n_thresholds."""
+    """Width regression: the logical content width (slow planes used) is exactly
+    2 + n_buckets + n_thresholds."""
     for nb, nt in [(1, 1), (3, 5), (8, 6)]:
         attn = _unwrap_attn(_baib_nodes(nb, nt, value_width=7))
-        assert attn.d_qk == 2 + nb + nt, (nb, nt, attn.d_qk)
+        assert _content_width(attn) == 2 + nb + nt, (nb, nt, _content_width(attn))
 
 
 def test_baib_identity_vo_is_decoupled_from_dqk():
     """V/O regression: value passes through identity matrices of width
-    len(value), decoupled from d_qk."""
+    len(value), decoupled from the content width."""
     nb, nt, vw = 2, 3, 11
     attn = _unwrap_attn(_baib_nodes(nb, nt, value_width=vw))
     assert attn.d_v == vw
     assert torch.equal(attn.value_matrix, torch.eye(vw))
     assert torch.equal(attn.output_matrix, torch.eye(vw))
-    # d_qk does not include the value width.
-    assert attn.d_qk == 2 + nb + nt
+    # The content width does not include the value width.
+    assert _content_width(attn) == 2 + nb + nt
 
 
 def test_baib_bonus_magnitudes_are_op_local_not_inherited_1000():
@@ -1809,18 +1910,20 @@ def test_baib_bonus_magnitudes_are_op_local_not_inherited_1000():
     nb, nt = 3, 4
     attn = _unwrap_attn(_baib_nodes(nb, nt))
     q, k = attn.query_matrix, attn.key_matrix
-    # col 0: score gain;  col 1: validity (Q=1.0, K=±_VALIDITY_BONUS).
-    assert q[0, 0].item() == _QUERY_GAIN
-    assert q[0, 1].item() == 1.0
-    assert k[1, 1].item() == _VALIDITY_BONUS
-    # bucket cols start at 2: query side carries the bonus, key side a bare 1.0.
+    # Compact content columns are relocated onto slow planes; read them through
+    # _slow_col(attn, content_col).  Content layout (compact): col 0 score gain,
+    # col 1 validity, cols 2..1+nb bucket, cols 2+nb.. above.
+    assert q[0, _slow_col(attn, 0)].item() == _QUERY_GAIN
+    assert q[0, _slow_col(attn, 1)].item() == 1.0
+    assert k[1, _slow_col(attn, 1)].item() == _VALIDITY_BONUS
+    # bucket cols start at content col 2: query carries the bonus, key a bare 1.0.
     for c in range(nb):
-        assert q[1 + c, 2 + c].item() == _BUCKET_BONUS
-        assert k[2 + c, 2 + c].item() == 1.0
-    # above cols start at 2 + n_buckets; same query/key split.
+        assert q[1 + c, _slow_col(attn, 2 + c)].item() == _BUCKET_BONUS
+        assert k[2 + c, _slow_col(attn, 2 + c)].item() == 1.0
+    # above cols start at content col 2 + n_buckets; same query/key split.
     for c in range(nt):
-        assert q[1 + nb + c, 2 + nb + c].item() == _ABOVE_MATCH_BONUS
-        assert k[2 + nb + c, 2 + nb + c].item() == 1.0
+        assert q[1 + nb + c, _slow_col(attn, 2 + nb + c)].item() == _ABOVE_MATCH_BONUS
+        assert k[2 + nb + c, _slow_col(attn, 2 + nb + c)].item() == 1.0
     # The load-bearing invariant: each bonus must dominate the worst-case
     # gained score swing over the documented range S <= 12, i.e.
     # min(2*_VALIDITY_BONUS, _BUCKET_BONUS, _ABOVE_MATCH_BONUS) > _QUERY_GAIN*12.

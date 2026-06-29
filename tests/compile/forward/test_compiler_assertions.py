@@ -26,7 +26,6 @@ from torchwright.compiler.forward.weight_writer import (
 from torchwright.compiler.groups.transformer_layer import TransformerLayer
 from torchwright.graph import Attn, Linear
 from torchwright.graph.misc import InputNode, LiteralValue
-from torchwright.graph.pos_encoding import PosEncoding, attention_hardness
 
 D = 64
 D_HEAD = 16
@@ -125,29 +124,31 @@ def test_C_literal_write_rejects_extra_target_cols():
 def test_B_attn_rejects_v_source_cols_wrong_length():
     """_write_compute_attn raises when V source_cols length doesn't match
     value_in width."""
-    pos = PosEncoding(17)
+    # A plain residual node feeding both Q and K (it stands in for whatever
+    # the head reads; position is now a rotation inside attention, not an input).
+    qk = InputNode("qk", 17, value_range=(-100.0, 100.0))
     v_in = InputNode("v", 4, value_range=(-100.0, 100.0))
     node = Attn(
-        query_in=pos,
-        key_in=pos,
+        query_in=qk,
+        key_in=qk,
         value_in=v_in,
-        query_matrix=attention_hardness * torch.eye(len(pos), D_HEAD),
-        key_matrix=torch.eye(len(pos), D_HEAD),
+        query_matrix=torch.eye(len(qk), D_HEAD),
+        key_matrix=torch.eye(len(qk), D_HEAD),
         value_matrix=torch.eye(len(v_in), D_HEAD),
         output_matrix=torch.eye(D_HEAD, len(v_in)),
     )
     rmap = ResidualStreamMap(D)
-    rmap.allocate(pos)
+    rmap.allocate(qk)
     rmap.allocate(v_in)
     out_cols = rmap.allocate(node)
 
-    layer = TransformerLayer(D, D_HEAD, pos)
+    layer = TransformerLayer(D, D_HEAD)
     bogus = AttnHeadOp(
         op_type="compute_attn",
         node=node,
         target_cols=out_cols,
-        q_source_cols=rmap.resolve_indices(pos),
-        k_source_cols=rmap.resolve_indices(pos),
+        q_source_cols=rmap.resolve_indices(qk),
+        k_source_cols=rmap.resolve_indices(qk),
         source_cols=rmap.resolve_indices(v_in)[:2],  # too short — truncated
     )
     with pytest.raises(AssertionError, match=r"V row-width mismatch"):
@@ -155,33 +156,63 @@ def test_B_attn_rejects_v_source_cols_wrong_length():
 
 
 def test_B_attn_rejects_q_source_cols_wrong_length():
-    pos = PosEncoding(17)
+    qk = InputNode("qk", 17, value_range=(-100.0, 100.0))
     v_in = InputNode("v", 4, value_range=(-100.0, 100.0))
     node = Attn(
-        query_in=pos,
-        key_in=pos,
+        query_in=qk,
+        key_in=qk,
         value_in=v_in,
-        query_matrix=attention_hardness * torch.eye(len(pos), D_HEAD),
-        key_matrix=torch.eye(len(pos), D_HEAD),
+        query_matrix=torch.eye(len(qk), D_HEAD),
+        key_matrix=torch.eye(len(qk), D_HEAD),
         value_matrix=torch.eye(len(v_in), D_HEAD),
         output_matrix=torch.eye(D_HEAD, len(v_in)),
     )
     rmap = ResidualStreamMap(D)
-    rmap.allocate(pos)
+    rmap.allocate(qk)
     rmap.allocate(v_in)
     out_cols = rmap.allocate(node)
 
-    layer = TransformerLayer(D, D_HEAD, pos)
+    layer = TransformerLayer(D, D_HEAD)
     bogus = AttnHeadOp(
         op_type="compute_attn",
         node=node,
         target_cols=out_cols,
-        q_source_cols=rmap.resolve_indices(pos)[:4],  # too short
-        k_source_cols=rmap.resolve_indices(pos),
+        q_source_cols=rmap.resolve_indices(qk)[:4],  # too short
+        k_source_cols=rmap.resolve_indices(qk),
         source_cols=rmap.resolve_indices(v_in),
     )
     with pytest.raises(AssertionError, match=r"Q row-width mismatch"):
         _write_compute_attn(layer.attn.attn, bogus, rmap)
+
+
+# ---------------------------------------------------------------------------
+# Full-width rotary — d_qk == d_head (an I3-sibling; NOT one of the canonical
+# I1–I4).  Every head is full-width rotary on the global grid; export.py always
+# rotates the full d_head with no width guard of its own, so the in-process
+# assert in _scatter_compute_attn is the only barrier against a partial-width
+# head (silently NoPE on the un-filled planes).  Guard BOTH directions: the
+# pre-existing test_forward_compile coverage only exercised d_qk > d_head, but
+# the dangerous regression is relaxing the `==` to `<=`, which would let
+# d_qk < d_head through and zero-pad/rotate dead planes with no divergence
+# signal.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("d_qk", [8, 32])  # below and above d_head=16
+def test_attn_rejects_d_qk_not_equal_d_head(d_qk):
+    """_scatter_compute_attn requires d_qk == d_head (full-width rotary)."""
+    x = InputNode("x", 4, value_range=(-100.0, 100.0))
+    out = Attn(
+        query_in=x,
+        key_in=x,
+        value_in=x,
+        query_matrix=torch.randn(len(x), d_qk),
+        key_matrix=torch.randn(len(x), d_qk),
+        value_matrix=torch.randn(len(x), 4),
+        output_matrix=torch.randn(4, 4),
+    )
+    with pytest.raises(AssertionError, match=r"d_qk == d_head"):
+        forward_compile(d=256, d_head=16, output_node=out, verbose=False)
 
 
 # ---------------------------------------------------------------------------
@@ -198,11 +229,9 @@ def test_A_end_of_layer_catches_freed_too_early(monkeypatch):
     weight = torch.eye(4, 4)
     bias = torch.zeros(4)
     l = Linear(x, weight, bias)
-    pos = PosEncoding(17)
 
     graph = GraphAnalyzer(l)
     rmap = ResidualStreamMap(D)
-    rmap.allocate(pos)
     rmap.allocate(x)
 
     # x is allocated, l is uncomputed — invariant holds here.
@@ -225,16 +254,14 @@ def test_A_require_live_raises_for_unallocated_input():
     op context before the downstream KeyError."""
     from torchwright.compiler.forward.scheduler import LayerScheduler
 
-    pos = PosEncoding(17)
     x = InputNode("x", 4, value_range=(-100.0, 100.0))
     weight = torch.eye(4, 4)
     bias = torch.zeros(4)
     l = Linear(x, weight, bias)
 
     graph = GraphAnalyzer(l)
-    scheduler = LayerScheduler(graph, D, D_HEAD, pos)
+    scheduler = LayerScheduler(graph, D, D_HEAD)
     rmap = ResidualStreamMap(D)
-    rmap.allocate(pos)
     # Deliberately do NOT allocate x — this should be caught by _require_live.
 
     with pytest.raises(AssertionError, match=r"Live-column invariant violated"):
