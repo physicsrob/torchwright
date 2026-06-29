@@ -24,7 +24,6 @@ from torchwright.ops.inout_nodes import (
 )
 from torchwright.ops.logic_ops import equals_vector
 from torchwright.ops.map_select import map_to_table, select
-from torchwright.ops.recency_heads import recency_rank_from_tokens
 
 # Rotary width the graph is built against; must match the d_head it is
 # compiled at (the token-example harness compiles at d_head=16).
@@ -73,13 +72,9 @@ def create_network() -> Unembedding:
     # --- Phase 1: Vocabulary and parsing ---
     vocab = list(
         "0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ!@#$%^&*()-+="
-    ) + ["\n", "<bos>", "<ref>", "<eos>", "default"]
+    ) + ["\n", "<bos>", "<eos>", "default"]
     embedding = create_embedding(vocab=vocab)
     rope = create_rope_config(d_head=D_HEAD, max_positions=MAX_POSITIONS)
-
-    # Bucket-2 recency rank from the <bos>/<ref> markers — drives the
-    # "most recent" latches (get_prev_value) that capture each operand.
-    recency_rank = recency_rank_from_tokens(rope, embedding)
 
     # Determine the current digit (default to "0" for non-digit tokens).
     zero_constant = create_literal_value(embedding.get_embedding("0"))
@@ -94,9 +89,9 @@ def create_network() -> Unembedding:
     # Look one position back to get the digit that just completed.
     just_completed_num = attend_to_offset(rope, current_num, delta_pos=-1)
     # Latch: remember the digit at "+", carry it forward to all later positions.
-    first_num = get_prev_value(rope, just_completed_num, is_first_num, recency_rank)
+    first_num = get_prev_value(rope, just_completed_num, is_first_num)
     # Latch: remember the digit at "=".
-    second_num = get_prev_value(rope, just_completed_num, is_second_num, recency_rank)
+    second_num = get_prev_value(rope, just_completed_num, is_second_num)
 
     summed, carry = sum_numbers(embedding, first_num, second_num)
 

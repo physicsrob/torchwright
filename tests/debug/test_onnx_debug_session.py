@@ -51,6 +51,14 @@ D = 1024
 D_HEAD = 16
 TOKENS = ["<bos>", "1", "+", "2", "\n"]
 
+# onnxruntime-execution probe tolerance. The in-process headless backend matches
+# the graph oracle to fp32 round-off (~2e-6, kept at 1e-3 below), but the real
+# onnxruntime artifact rounds ~4e-5 relative on the large-magnitude attention the
+# Phase-6 local-recency head introduces (~1.2e-3 absolute on this adder) — an
+# execution-provider floor, not a compiled-circuit error. See
+# docs/numerical_noise_findings.md.
+_ONNX_PROBE_ATOL = 2.5e-3
+
 
 def _build_adder():
     """Fresh 1-digit adder graph — new node ids every call."""
@@ -246,10 +254,13 @@ def test_probe_and_debug_value_parity_with_headless(token_artifact):
     session = OnnxDebugSession(token_artifact, out_onnx)
     ids = _token_ids(emb_onnx)
     iv = {"embedding_input": ids}
-    report_onnx = probe_compiled(session, out_onnx, iv, n_pos=len(TOKENS), atol=1e-3)
+    report_onnx = probe_compiled(
+        session, out_onnx, iv, n_pos=len(TOKENS), atol=_ONNX_PROBE_ATOL
+    )
     assert report_onnx.first_divergent is None, report_onnx.format_short()
 
-    # In-process backend over another fresh rebuild.
+    # In-process backend over another fresh rebuild — the compiled circuit matches
+    # the oracle to fp32 round-off, so this stays tight (no onnxruntime rounding).
     out_h, emb_h = _build_adder()
     headless = compile_headless(out_h, d=D, d_head=D_HEAD, verbose=False)
     report_h = probe_compiled(headless, out_h, iv, n_pos=len(TOKENS), atol=1e-3)
@@ -454,7 +465,11 @@ def test_artifact_debug_session_matches_direct(tmp_path):
     out2, _ = _build_adder()
     sess_handle = artifact.debug_session(out2)
     assert isinstance(sess_handle, OnnxDebugSession)
-    report = probe_compiled(sess_handle, out2, iv, n_pos=len(TOKENS), atol=1e-3)
+    # onnxruntime execution floor (see _ONNX_PROBE_ATOL) — this probes the real
+    # artifact, not the in-process compiled circuit.
+    report = probe_compiled(
+        sess_handle, out2, iv, n_pos=len(TOKENS), atol=_ONNX_PROBE_ATOL
+    )
     assert report.first_divergent is None, report.format_short()
 
     out3, _ = _build_adder()

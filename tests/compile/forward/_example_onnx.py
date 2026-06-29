@@ -44,21 +44,18 @@ def load_example(build_fn, out_dir, *, d=D, d_head=D_HEAD, name="example"):
     return load_onnx(onnx_path), artifact
 
 
-def run(model, input_text, *, bos_token="<bos>", ref_token=None, max_new_tokens=24):
+def run(model, input_text, *, bos_token="<bos>", max_new_tokens=24):
     """Argmax-decode one prompt; return the joined output string.
 
-    ``input_text`` is everything after the marker prefix: the prompt is
-    ``[bos_token] (+ [ref_token]) + list(input_text)``.  Recency examples (those
-    whose graph builds a :func:`~torchwright.ops.recency_heads.
-    recency_rank_from_tokens`) pass ``ref_token="<ref>"`` so the bucket-2
-    readout has its second always-visible marked token at position 1; others
-    leave it ``None``.
+    ``input_text`` is everything after the BOS marker: the prompt is
+    ``[bos_token] + list(input_text)``.  (RoPE recency is the intrinsic local
+    rotary lobe now — there is no injected ``<ref>`` token; ``docs/
+    rope_port_plan.md`` Phase 6.)
     """
     return "".join(
         model.generate(
             input_text,
             bos_token=bos_token,
-            ref_token=ref_token,
             max_new_tokens=max_new_tokens,
         )
     )

@@ -34,9 +34,5 @@ def test_fibonacci(fibonacci):
     expected_fibs = [1, 1, 2, 3, 5, 8, 13, 21]
     expected = "".join(f"{f:02d}" for f in expected_fibs)
 
-    # Fibonacci ranks recency via the bucket-2 octant ramp, so it needs the
-    # <ref> marker at position 1.
-    result = run(
-        model, "fibonacci\n", bos_token="<bos>", ref_token="<ref>", max_new_tokens=20
-    )
+    result = run(model, "fibonacci\n", bos_token="<bos>", max_new_tokens=20)
     assert result == expected, f"Expected {expected!r} but got {result!r}"

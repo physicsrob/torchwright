@@ -37,8 +37,7 @@ def calc_3digit(tmp_path_factory):
 
 
 def _check(model, input_str, expected):
-    # Recency calculator: <ref> must land at position 1 (bucket-2 readout).
-    result = run(model, input_str, ref_token="<ref>")
+    result = run(model, input_str)
     assert (
         result == expected
     ), f"For {input_str!r}: expected {expected!r} but got {result!r}"

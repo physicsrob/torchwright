@@ -32,7 +32,6 @@ from torchwright.ops.inout_nodes import (
 )
 from torchwright.ops.logic_ops import equals_vector
 from torchwright.ops.map_select import map_to_table
-from torchwright.ops.recency_heads import recency_rank_from_tokens
 from torchwright.ops.sequence_ops import output_sequence
 
 # Letters in the alphabet
@@ -55,26 +54,22 @@ def create_network_parts(
         max_letters: Fixed number of letter positions in the input.
             Shorter inputs should be space-padded on the right.
     """
-    vocab = list(LETTERS) + list("0123456789") + [" ", "\n", "<bos>", "<ref>", "<eos>"]
+    vocab = list(LETTERS) + list("0123456789") + [" ", "\n", "<bos>", "<eos>"]
     embedding = create_embedding(vocab=vocab)
     rope = create_rope_config(d_head=D_HEAD, max_positions=MAX_POSITIONS)
     embed = embedding.get_embedding
 
-    # Bucket-2 recency rank from the <bos>/<ref> markers — replaces the old
-    # position counter that drove "most recent" selection.
-    recency_rank = recency_rank_from_tokens(rope, embedding)
-
     is_trigger = equals_vector(embedding, embed("\n"))
 
     # --- Detect and propagate the shift digit ---
-    # The shift digit is the first digit token (after <bos>/<ref>). Detect it
+    # The shift digit is the first digit token (after <bos>). Detect it
     # with a digit lookup, then latch it to all subsequent positions.
     is_digit = map_to_table(
         inp=embedding,
         key_to_value={embed(str(i)): torch.tensor([1.0]) for i in range(10)},
         default=torch.tensor([-1.0]),
     )
-    latched_shift = get_prev_value(rope, embedding, is_digit, recency_rank)
+    latched_shift = get_prev_value(rope, embedding, is_digit)
 
     # --- Per-position shifted letter via combined lookup ---
     # Concatenate current letter embedding (8D) + latched shift embedding (8D)
@@ -99,7 +94,7 @@ def create_network_parts(
     for i in range(max_letters):
         offset = -(max_letters - i)  # -5, -4, -3, -2, -1 for max_letters=5
         raw = attend_to_offset(rope, shifted_letter, delta_pos=offset)
-        latched = get_prev_value(rope, raw, is_trigger, recency_rank)
+        latched = get_prev_value(rope, raw, is_trigger)
         output_letters.append(latched)
 
     output_letters.append(create_literal_value(embed("<eos>")))
@@ -109,7 +104,6 @@ def create_network_parts(
         is_trigger,
         output_letters,
         embed(" "),
-        recency_rank,
     )
     return output_node, embedding
 

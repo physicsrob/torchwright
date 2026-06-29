@@ -44,7 +44,6 @@ from torchwright.ops.logic_ops import (
 )
 from torchwright.ops.map_select import select, switch
 from torchwright.ops.onehot_table import onehot_lookup
-from torchwright.ops.recency_heads import recency_rank_from_tokens
 from torchwright.ops.sequence_ops import (
     NumericSequence,
     output_sequence,
@@ -63,9 +62,8 @@ D_HEAD = 32
 MAX_POSITIONS = 512
 
 # Compact, calculator-only vocabulary: 10 digits, 3 operators, the newline that
-# ends the input, a space (the pre-result placeholder), a BOS, a REF (the second
-# always-visible marker the RoPE recency rank reads), and an EOS that
-# pads / terminates the result.  18 tokens -> d_embed = 18 one-hot columns.
+# ends the input, a space (the pre-result placeholder), a BOS, and an EOS that
+# pads / terminates the result.  17 tokens -> d_embed = 17 one-hot columns.
 CALC_VOCAB = [str(d) for d in range(10)] + [
     "+",
     "-",
@@ -73,7 +71,6 @@ CALC_VOCAB = [str(d) for d in range(10)] + [
     "\n",
     " ",
     bos_token,
-    "<ref>",
     "<eos>",
 ]
 
@@ -175,7 +172,6 @@ def parse_expression(
     rope: RopeConfig,
     embedding: Embedding,
     max_digits: int,
-    recency_rank: Node,
 ) -> Tuple[List[Node], List[Node], Node, Node, Node, Node]:
     """Parse ``"A op B\\n"`` from the token stream.
 
@@ -184,7 +180,7 @@ def parse_expression(
     operator appeared, and the ±1 newline trigger that ends the input and
     starts result emission.
     """
-    num_seq = NumericSequence(rope, embedding, max_digits, recency_rank)
+    num_seq = NumericSequence(rope, embedding, max_digits)
 
     is_plus = equals_vector(embedding, embedding.get_embedding("+"))
     is_minus = equals_vector(embedding, embedding.get_embedding("-"))
@@ -194,14 +190,16 @@ def parse_expression(
 
     # Only treat an operator as such *before* the newline, so a "-" emitted as
     # a negative sign during decoding does not re-trigger operator parsing.
-    seen_newline = get_prev_value(rope, saw_newline, saw_newline, recency_rank)
+    # (Single-trigger get_prev_value: the content gate selects the one matching
+    # key regardless of distance, so this latch holds for the whole rollout.)
+    seen_newline = get_prev_value(rope, saw_newline, saw_newline)
     is_input_operator = bool_all_true([is_operator, bool_not(seen_newline)])
 
     # Latch which operator was used (captured at the operator position, held
     # forward to every later position by attention).
-    which_plus = get_prev_value(rope, is_plus, is_input_operator, recency_rank)
-    which_minus = get_prev_value(rope, is_minus, is_input_operator, recency_rank)
-    which_times = get_prev_value(rope, is_times, is_input_operator, recency_rank)
+    which_plus = get_prev_value(rope, is_plus, is_input_operator)
+    which_minus = get_prev_value(rope, is_minus, is_input_operator)
+    which_times = get_prev_value(rope, is_times, is_input_operator)
 
     # First operand's window is complete at the operator; second's at newline.
     first = num_seq.get_digits_at_event(is_input_operator)
@@ -224,12 +222,11 @@ def emit_result(
     embedding: Embedding,
     saw_newline: Node,
     result_digits: List[Node],
-    recency_rank: Node,
 ) -> Node:
     """Emit ``result_digits`` autoregressively once the newline fires, printing
     a space at every position before then."""
     return output_sequence(
-        rope, saw_newline, result_digits, embedding.get_embedding(" "), recency_rank
+        rope, saw_newline, result_digits, embedding.get_embedding(" ")
     )
 
 
@@ -252,13 +249,10 @@ def build_calculator(
     embedding = create_onehot_embedding(CALC_VOCAB)
     rope = create_rope_config(d_head=D_HEAD, max_positions=MAX_POSITIONS)
 
-    # Bucket-2 recency rank from the <bos>/<ref> markers — replaces the old
-    # position counter that drove "most recent" selection in get_prev_value /
-    # NumericSequence / output_sequence.
-    recency_rank = recency_rank_from_tokens(rope, embedding)
-
+    # Recency ("most recent") is the intrinsic rotary lobe inside get_prev_value /
+    # NumericSequence / output_sequence — no rank node, no <ref> token, local-only.
     first, second, is_plus, is_minus, is_times, saw_newline = parse_expression(
-        rope, embedding, max_digits, recency_rank
+        rope, embedding, max_digits
     )
 
     # Multiplication is the widest result (2*max_digits digits); the others are
@@ -291,5 +285,5 @@ def build_calculator(
         switch([is_plus, is_minus, is_times], [add_seq[i], sub_seq[i], mul_seq[i]])
         for i in range(seq_len)
     ]
-    output_node = emit_result(rope, embedding, saw_newline, result_digits, recency_rank)
+    output_node = emit_result(rope, embedding, saw_newline, result_digits)
     return output_node, embedding

@@ -62,7 +62,12 @@ from torchwright.graph.asserts import (
     assert_matches_value_type,
     assert_softmax_hardness,
 )
-from torchwright.graph.rope import rotary_content_head, rotary_offset_head
+from torchwright.graph.rope import (
+    rope_lobe_band,
+    rotary_content_head,
+    rotary_offset_head,
+    rotary_recency_head,
+)
 from torchwright.graph.value_type import NodeValueType
 
 # Default tolerance for hard-selection output assertions.  At
@@ -204,6 +209,23 @@ _ABOVE_BONUS = 1000.0
 _VALIDITY_BONUS = 256.0
 _BUCKET_BONUS = 256.0
 _ABOVE_MATCH_BONUS = 256.0
+
+
+# Default coefficient on the intrinsic rotary recency lobe (the local "most
+# recent" tiebreak in ``get_prev_value`` / ``attend_most_recent_matching``).
+# The lobe peak is ``Σ amp_p ≈ 42.6`` (:func:`~torchwright.graph.rope.rope_lobe_band`
+# at the production config), so ``recency_gain · peak ≈ 2.5e4``.  Sized against
+# the *smallest* near-Δ step over the working window: the Hann taper rounds the
+# peak, so the Δ=0→1 step (self vs immediate predecessor, normalized ``≈ 3.0e-4``)
+# is smaller than the Δ=1→2 gap-1 step (``≈ 8.8e-4``); at ``600`` the worst step
+# over the ~100-token target is ``≈ 7.5`` logits → ``exp(7.5) ≈ 1.8e3`` softmax
+# ratio (≥ 99.9 % concentration).  Unlike the old octant ramp's ``rank_gain ≈
+# 2e5``, the lobe is bounded (does not grow with sequence length), so the content
+# gate that must dominate it is small (``get_prev_value`` sets it automatically;
+# :func:`attend_most_recent_matching` callers size ``match_gain`` per the
+# content-dominance bound in its docstring — low-dot content needs a large
+# ``match_gain``, high-dot E8 content clears it at the default).
+_LOCAL_RECENCY_GAIN = 600.0
 
 
 def _build_selection_attn(
@@ -1364,24 +1386,30 @@ def get_prev_value(
     rope: RopeConfig,
     value: Node,
     cond: Node,
-    recency_rank: Node,
     *,
-    rank_gain: float = 2.0e5,
+    recency_gain: float = _LOCAL_RECENCY_GAIN,
 ) -> Node:
     """Most-recent previous ``value`` at a position where ``cond`` is true.
 
-    The RoPE-native replacement for the old ``PosEncoding.get_prev_value``:
-    recency is ranked by the graph-derived octant ramp
-    (:func:`~torchwright.ops.recency_heads.recency_rank`) instead of a host
-    position counter.  For each query position it selects ``value`` at the most
-    recent causal position where ``cond`` is true.  ``cond`` follows the usual
-    torchwright boolean convention (true ``= +1``; false ``<= 0``).
+    The RoPE-native most-recent read: recency is the **intrinsic rotary
+    distance-decay lobe** (:func:`~torchwright.graph.rope.rotary_recency_head`),
+    not a precomputed rank (``docs/rope_port_plan.md`` Phase 6 — local recency,
+    superseding the octant ramp).  For each query position it selects ``value``
+    at the most recent causal position where ``cond`` is true.  ``cond`` follows
+    the usual torchwright boolean convention (true ``= +1``; false ``<= 0``).
 
-    The logit at key ``i`` is ``gate · cond_i + rank_gain · recency_rank_i``
-    with ``gate = 4 · rank_gain`` so the condition dominates the recency swing
-    (``rank_range ≈ 2.06 < 4``): any true key beats any false key, and among
-    true keys the most recent (largest ramp) wins.  Content and rank ride slow
-    planes (full-width rotary).
+    The logit at key ``i`` is ``gate · cond_i + recency_gain · lobe(Δ_i)`` where
+    ``lobe(Δ) = Σ_p amp_p cos(Δ·θ_p)`` (peak ``≈ 42.6``).  ``gate = 4 ·
+    recency_gain · lobe(0)`` so the condition dominates the bounded lobe swing:
+    any true key beats any false key, and among true keys the **most recent**
+    (largest lobe, i.e. smallest Δ) wins.
+
+    **Recency is local.**  The nearest true key is guaranteed to win only within
+    the lobe window ``W ≈ 415`` (the default config); a single true key that is
+    farther back is still selected because the content gate dominates (the lobe
+    only *ranks* among multiple true keys).  When **two or more** true keys sit
+    more than ``W`` apart, the ordering can silently invert — use the Phase-7
+    global mechanism there.
 
     **All-false window.**  If no causal position has ``cond`` true, the gate is
     uniform and the head degrades to pure recency (the most recent position's
@@ -1389,34 +1417,33 @@ def get_prev_value(
     window, or gate the result.
 
     Args:
-        rope: the RoPE config (``d_head`` / ``base``).
+        rope: the RoPE config (``d_head`` / ``base`` / ``max_positions``).
         value: node to read at the selected position.
         cond: length-1 boolean (true = +1).
-        recency_rank: length-1 monotone recency ramp (built once per graph via
-            :func:`~torchwright.ops.recency_heads.recency_rank`).
-        rank_gain: ``G`` — coefficient on the recency ramp.
+        recency_gain: coefficient on the rotary recency lobe; sets the softmax
+            sharpness of the tiebreak among true keys.
     """
     assert len(cond) == 1, "get_prev_value expects a 1-D boolean cond"
-    assert len(recency_rank) == 1, "recency_rank must be a length-1 node"
-    gate = 4.0 * rank_gain  # cond dominates the ramp's ~2.06 swing
+    _, amps = rope_lobe_band(rope.d_head, rope.base, rope.max_positions)
+    lobe_peak = recency_gain * float(amps.sum())
+    gate = 4.0 * lobe_peak  # cond dominates the bounded lobe swing
 
-    # Content cols: [cond gate, recency rank], relocated onto slow planes.
+    # Content col: the cond gate, relocated onto the slowest plane.  The recency
+    # lobe is added by rotary_recency_head on a disjoint faster-plane band.
     query_one = LiteralValue(torch.tensor([1.0]), name="prev_value_query_one")
-    query_matrix = torch.tensor([[gate, rank_gain]])  # (1, 2)
+    query_matrix = torch.tensor([[gate]])  # (1, 1)
+    key_matrix = torch.tensor([[1.0]])  # (1, 1): cond -> gate column
 
-    key_in = Concatenate([cond, recency_rank])
-    key_matrix = torch.zeros((len(key_in), 2))
-    key_matrix[0, 0] = 1.0  # cond -> gate column
-    key_matrix[1, 1] = 1.0  # recency_rank -> recency column
-
-    return rotary_content_head(
+    return rotary_recency_head(
         query_one,
-        key_in,
+        cond,
         value,
         query_matrix,
         key_matrix,
         d_head=rope.d_head,
+        max_positions=rope.max_positions,
         base=rope.base,
+        recency_gain=recency_gain,
     )
 
 
@@ -1425,69 +1452,64 @@ def attend_most_recent_matching(
     query_vector: Node,
     key_vector: Node,
     value: Node,
-    recency_rank: Node,
     *,
     match_gain: float = 200.0,
-    rank_gain: float = 2.0e5,
+    recency_gain: float = _LOCAL_RECENCY_GAIN,
     exclude_self: bool = False,
     assert_hardness_gt: Optional[float] = None,
 ) -> Node:
     """Attend to the **most recent** key whose ``key_vector`` matches
-    ``query_vector`` — RoPE-native (the recency tiebreak is the octant ramp).
+    ``query_vector`` — RoPE-native, with **local** recency.
 
-    The content match rides slow planes and the recency tiebreak is a
-    graph-derived ``recency_rank`` node (the bucket-2 octant ramp,
-    :func:`torchwright.ops.recency_heads.recency_rank`) instead of a host
-    position counter — ``docs/rope_port_plan.md`` §7.  (Before the RoPE port
-    this was two functions: a counter-based ``attend_most_recent_matching`` and
-    a ``_via_ramp`` twin; the counter version is gone and this is the single
-    RoPE-native form.)
+    The content match rides slow planes and the recency tiebreak is the
+    **intrinsic rotary distance-decay lobe** built into the rotation itself
+    (:func:`~torchwright.graph.rope.rotary_recency_head`) — no precomputed rank,
+    no reference token (``docs/rope_port_plan.md`` Phase 6, superseding the
+    octant ramp / ``{BOS, REF}`` readout).
 
-    At each query position the logit at key ``i`` is
+    At each query position ``j`` the logit at key ``i`` is
 
-        match_gain · (query_vector_j · key_vector_i) + rank_gain · recency_rank_i
+        match_gain · (query_vector_j · key_vector_i) + recency_gain · lobe(Δ)
 
-    so among keys whose content matches, the one with the largest
-    ``recency_rank`` (the most recent, since the ramp is strictly increasing in
-    absolute position) wins.
+    where ``Δ = j − i`` and ``lobe(Δ) = Σ_p amp_p cos(Δ·θ_p)`` is the Hann-tapered
+    self-similarity of the recency plane band (peak ``≈ 42.6``, strictly
+    decreasing over the window ``W``).  So among keys whose content matches, the
+    one with the smallest ``Δ`` (the **most recent**) wins.
 
-    ``rank_gain`` (``G``) plays the role the counter's ``_QUERY_GAIN`` did, but
-    against a ramp whose per-token step is tiny (~2e-5) rather than 1: with the
-    default ``G = 2e5`` the worst-case adjacent-position recency gap is
-    ``G · min_step ≈ 4`` logits.  ``G`` is argmax-invariant for *which* key wins
-    (the ramp is monotone); it only sets the softmax sharpness and the
-    content/recency balance.
+    **Recency is local — the load-bearing limit.**  ``lobe`` is monotone only
+    within the window ``W ≈ 415`` (the default config — measured by
+    ``scripts/rope_window_frontier.py``; ~4× the ~100-token Phase-6 target).  If
+    two or more matching keys lie more than ``W`` apart, a *farther* key can
+    outscore a nearer one and "most recent" silently picks the wrong key.
+    Consumers whose matching-key separation can exceed ``W`` need the Phase-7
+    global mechanism.  (A *single* matching key far back is still selected: the
+    content gate dominates the bounded lobe; the lobe only ranks *among* matches.)
 
     **Required invariant on ``match_gain`` (content dominance).**  A
     content-matched but older key must still beat an unmatched but newer key, so
 
-        match_gain · (min_match_dot − max_no_match_dot) > rank_gain · rank_range
+        match_gain · (min_match_dot − max_no_match_dot) > recency_gain · lobe(0)
 
-    where ``rank_range`` is the ramp's total swing over the rollout (≈2.06 for
-    the default ``gain=2.0`` ramp).  At ``G = 2e5`` that is ``rank_gain ·
-    rank_range ≈ 4.1e5``; mirror the sizing guidance on
-    :func:`attend_most_recent_matching` with ``4.1e5`` in place of
-    ``_QUERY_GAIN · max_n_pos``.
+    where ``recency_gain · lobe(0) ≈ recency_gain · 42.6`` is the *bounded* lobe
+    peak (it does **not** grow with sequence length — the key advantage over the
+    old ``rank_gain · rank_range ≈ 4.1e5`` octant ramp).  At the default
+    ``recency_gain = 600`` that is ``≈ 2.5e4``, so **low-dot content needs a
+    large ``match_gain``** (one-hot, dot gap 1, needs ``match_gain > 2.5e4``);
+    high-dot E8 codes (self-dot 1600, off-diagonal ~800, gap ~800) clear it at
+    the default ``match_gain = 200`` (``200·800 = 1.6e5 ≫ 2.5e4``).
 
-    **Caller contract.**  ``recency_rank`` must be the monotone-and-seam-safe
-    ramp built for the run's ``max_positions`` (see
-    :func:`~torchwright.ops.recency_heads.recency_rank`); past the seam the order
-    silently inverts.  As with the counter version, at least one matching key
-    must exist in every consumed window, else the head degrades to pure recency.
-    The ramp's reference positions (BOS/REF) carry **degenerate** ranks (they
-    attend only to themselves), which sit inside the ramp's value box but as
-    outliers; the content-dominance bound above is what keeps a content-
-    mismatched reference token from winning on its outlier rank, so honor it.
+    **All-matching / no-match windows.**  At least one matching key must exist in
+    every consumed window, else the head degrades to pure recency (most recent
+    position).
 
     Args:
-        rope: the RoPE config (``d_head`` / ``base`` for the slow-plane
-            placement; every head is full-width rotary in the end state).
+        rope: the RoPE config (``d_head`` / ``base`` / ``max_positions``).
         query_vector: Width-``W`` node — what we're looking for.
         key_vector: Width-``W`` node — each key's identity.
         value: Node to read at the selected key position.
-        recency_rank: length-1 node, the per-position recency ramp.
         match_gain: Coefficient on the dot-product term (see the invariant).
-        rank_gain: ``G`` — coefficient on the recency ramp.
+        recency_gain: Coefficient on the rotary recency lobe; sets the softmax
+            sharpness of the tiebreak among matching keys.
         exclude_self: If ``True``, the current query position is excluded —
             the head returns ``value`` at the most recent matching position
             strictly before self.  Implemented by pre-shifting ``key_vector``
@@ -1504,39 +1526,28 @@ def attend_most_recent_matching(
         "query_vector and key_vector must have the same width "
         f"(got {len(query_vector)} and {len(key_vector)})"
     )
-    assert len(recency_rank) == 1, "recency_rank must be a length-1 node"
     if exclude_self:
         # Shift key and value back one position so slot i carries the
         # predecessor's data — self can no longer contribute its own match.
         key_vector = attend_to_offset(rope, key_vector, delta_pos=-1)
         value = attend_to_offset(rope, value, delta_pos=-1)
     W = len(query_vector)
-    d_qk = W + 1
 
-    # Content Q/K (relocated onto slow planes by rotary_content_head):
-    #   Q side: match_gain on the query vector, rank_gain on an exact 1.0 literal.
-    query_one = LiteralValue(torch.tensor([1.0]), name="recency_ramp_query_one")
-    query_in = Concatenate([query_vector, query_one])
-    query_matrix = torch.zeros((W + 1, d_qk))
-    for c in range(W):
-        query_matrix[c, c] = match_gain
-    query_matrix[W, W] = rank_gain
+    # Content Q/K (relocated onto slow planes by rotary_recency_head); the
+    # recency lobe is added by rotary_recency_head on a disjoint faster band.
+    query_matrix = match_gain * torch.eye(W)
+    key_matrix = torch.eye(W)
 
-    #   K side: identity on the key vector, unit on the recency ramp.
-    key_in = Concatenate([key_vector, recency_rank])
-    key_matrix = torch.zeros((W + 1, d_qk))
-    for c in range(W):
-        key_matrix[c, c] = 1.0
-    key_matrix[W, W] = 1.0  # recency_rank row -> recency column
-
-    attn = rotary_content_head(
-        query_in,
-        key_in,
+    attn = rotary_recency_head(
+        query_vector,
+        key_vector,
         value,
         query_matrix,
         key_matrix,
         d_head=rope.d_head,
+        max_positions=rope.max_positions,
         base=rope.base,
+        recency_gain=recency_gain,
     )
     return _wrap_hard_selection_output(
         attn, value, assert_hardness_gt=assert_hardness_gt

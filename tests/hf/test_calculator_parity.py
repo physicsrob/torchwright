@@ -5,11 +5,20 @@ artifact is gitignored, never committed), converts it to a native
 :class:`TorchwrightForCausalLM`, and asserts the native model reproduces the
 ONNX runtime's behaviour on real arithmetic:
 
-* **bit-exact** prefill logits versus :class:`OnnxTokenModule`, and
+* **token-identical** prefill (per-position argmax) versus :class:`OnnxTokenModule`,
+  with logits within a small cross-backend fp floor, and
 * **token-identical** greedy generation that matches the correct answer,
 
 on a curated set spanning the calculator's reliable range (additions and
 subtractions at any magnitude; multiplications with comfortable digit margin).
+
+Why "within an fp floor" and not bit-exact: the RoPE local-recency port (Phase 6)
+reshaped the graph, and onnxruntime vs torch now round a few logits differently
+at the operator-latch positions — a cross-backend fp floor (~5 logits, amplitude-
+independent, *not* the squaring path; see ``docs/numerical_noise_findings.md``
+"local-recency cross-path fp floor"). It changes no argmax, so generation stays
+token-identical; the prefill check asserts per-position argmax-equality (the real
+token bar) plus a bounded logit floor.
 
 Why "reliable range": the multiply path computes ``a*b = ((a+b)^2 - (a-b)^2)/4``
 with a thermometer-coded piecewise-linear squaring whose intermediate reaches
@@ -45,10 +54,14 @@ from tests.hf._hf_parity import compile_example
 
 _BOS = "<bos>"
 _EOS = "<eos>"
-# Bucket-2 recency reference marker: the calculator ranks "most recent" via
-# recency_rank_from_tokens, which needs <ref> at position 1 (see
-# torchwright.ops.recency_heads.recency_rank_from_tokens).
-_REF = "<ref>"
+
+# Cross-backend (onnxruntime vs torch) logit floor introduced by the Phase-6
+# local-recency graph reshape: amplitude-independent, ~5 logits observed on the
+# gate set (Modal CPU pair ~2.3, other build pairs ~4.7), flips no argmax.  The
+# real correctness bar is per-position argmax-equality; this bounds the residual
+# logit divergence so a structural regression (free-floating 10s–1000s) still
+# fails.  See docs/numerical_noise_findings.md.
+_PARITY_FP_FLOOR = 8.0
 
 # In-range gate: add/sub at any magnitude, mult with comfortable digit margin.
 # Every entry is bit-exact AND lands the correct answer (confirmed empirically).
@@ -100,7 +113,7 @@ def tok2id(artifact_path):
 
 
 def _prefill_logits(model, oracle, tok2id, text):
-    ids = [tok2id[t] for t in ([_BOS, _REF] + list(text))]
+    ids = [tok2id[t] for t in ([_BOS] + list(text))]
     o = oracle(torch.tensor(ids, dtype=torch.int64))
     with torch.no_grad():
         h = model(input_ids=torch.tensor([ids], dtype=torch.int64), use_cache=True)
@@ -109,16 +122,12 @@ def _prefill_logits(model, oracle, tok2id, text):
 
 def _oracle_gen(oracle, text):
     return "".join(
-        oracle.generate(
-            text, max_new_tokens=10, bos_token=_BOS, eos_token=_EOS, ref_token=_REF
-        )
+        oracle.generate(text, max_new_tokens=10, bos_token=_BOS, eos_token=_EOS)
     )
 
 
 def _hf_gen(model, tok2id, vocab, text):
-    ids = torch.tensor(
-        [[tok2id[t] for t in ([_BOS, _REF] + list(text))]], dtype=torch.int64
-    )
+    ids = torch.tensor([[tok2id[t] for t in ([_BOS] + list(text))]], dtype=torch.int64)
     with torch.no_grad():
         g = model.generate(
             ids,
@@ -133,9 +142,18 @@ def _hf_gen(model, tok2id, vocab, text):
 
 
 @pytest.mark.parametrize("text", _GATE)
-def test_prefill_bit_exact(model, oracle, tok2id, text):
+def test_prefill_token_identical_within_fp_floor(model, oracle, tok2id, text):
     o, h = _prefill_logits(model, oracle, tok2id, text)
-    assert (o - h).abs().max().item() == 0.0
+    # Real bar: native HF and the ONNX oracle pick the same token at every
+    # teacher-forced position (no argmax flip).
+    assert (
+        o.argmax(-1) == h.argmax(-1)
+    ).all(), (
+        f"{text!r}: native/oracle argmax differs at a prefill position (token flip)"
+    )
+    # Residual logit divergence stays within the cross-backend fp floor (Phase-6
+    # local-recency reshape) — a structural regression would blow past it.
+    assert (o - h).abs().max().item() <= _PARITY_FP_FLOOR
 
 
 @pytest.mark.parametrize("text", _GATE)
@@ -160,19 +178,21 @@ def test_extreme_multiply_at_most_one_digit_level_divergence(model, oracle, tok2
 
     Whether the gap actually appears is backend-dependent: it turns on the order
     the squaring-path fp32 reduction is accumulated, which differs across
-    onnxruntime/torch builds (e.g. the CPU pair on Modal agrees bit-for-bit even
-    on 999*999, while other build pairs flip one level).  So we assert the
-    *bound*, not the gap's presence — never free-floating noise, never more than
-    one level — which is the property that actually distinguishes the squaring
-    boundary from a structural bug.
+    onnxruntime/torch builds (e.g. the CPU pair on Modal agrees on the squaring
+    path even on 999*999, while other build pairs flip one level).  So we assert
+    the *bound*, not the gap's presence — within the cross-backend fp floor (the
+    Phase-6 local-recency reshape, ``_PARITY_FP_FLOOR``), or that floor plus
+    exactly one ~1600 digit-level — which distinguishes the squaring boundary
+    from a free-floating structural bug.
     """
     for text in _EXTREME:
         o, h = _prefill_logits(model, oracle, tok2id, text)
         d = (o - h).abs().max().item()
-        assert d == 0.0 or d == pytest.approx(1600.0, abs=1.0), (
-            f"{text}: divergence {d} is neither bit-exact nor a single "
-            f"digit-level (~1600) boundary flip — that signals free-floating "
-            f"noise or a structural bug, not the squaring-path quantization edge"
+        assert d <= _PARITY_FP_FLOOR or abs(d - 1600.0) <= _PARITY_FP_FLOOR, (
+            f"{text}: divergence {d} is neither within the cross-backend fp floor "
+            f"(~{_PARITY_FP_FLOOR}) nor a single digit-level (~1600) boundary flip "
+            f"— that signals free-floating noise or a structural bug, not the "
+            f"squaring-path quantization edge"
         )
 
 

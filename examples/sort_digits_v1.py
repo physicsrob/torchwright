@@ -73,7 +73,6 @@ from torchwright.ops.logic_ops import (
     equals_vector,
 )
 from torchwright.ops.map_select import in_range, select
-from torchwright.ops.recency_heads import recency_rank_from_tokens
 from torchwright.ops.scalar_encoding import digit_to_scaled_scalar
 from torchwright.ops.sequence_ops import check_is_digit, output_sequence
 
@@ -147,13 +146,10 @@ def create_network_parts(
     max_out: int = MAX_OUT,
 ) -> Tuple[Node, Embedding]:
     """Build the V1 distinct-digit selection-sort graph."""
-    vocab = list("0123456789") + [" ", "\n", "<bos>", "<ref>", "<eos>"]
+    vocab = list("0123456789") + [" ", "\n", "<bos>", "<eos>"]
     embedding = create_embedding(vocab=vocab)
     rope = create_rope_config(d_head=D_HEAD, max_positions=MAX_POSITIONS)
 
-    # Bucket-2 recency rank from the <bos>/<ref> markers — drives the
-    # "has the trigger fired" latch and the most-recent prev_digit selection.
-    recency_rank = recency_rank_from_tokens(rope, embedding)
     embed = embedding.get_embedding
 
     is_trigger = equals_vector(embedding, embed("\n"))
@@ -161,7 +157,7 @@ def create_network_parts(
     # --- Per-position input features ---
     digit_scalar = digit_to_scaled_scalar(embedding, embedding, place_value=1.0)
     is_digit_pos = check_is_digit(embedding)
-    has_triggered = get_prev_value(rope, is_trigger, is_trigger, recency_rank)
+    has_triggered = get_prev_value(rope, is_trigger, is_trigger)
     is_pre_trigger = bool_not(has_triggered)
     is_input_digit = bool_all_true([is_digit_pos, is_pre_trigger])
 
@@ -215,16 +211,13 @@ def create_network_parts(
             threshold_onehot=threshold_onehot,
             value=digit_scalar,
         )
-        prev_digit = get_prev_value(
-            rope, selected_digit_scalar, is_trigger, recency_rank
-        )
+        prev_digit = get_prev_value(rope, selected_digit_scalar, is_trigger)
 
     output_node = output_sequence(
         rope,
         is_trigger,
         seq,
         embed(" "),
-        recency_rank,
     )
     return output_node, embedding
 

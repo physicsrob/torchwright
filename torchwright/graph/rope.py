@@ -47,9 +47,9 @@ class RopeConfig:
         d_head: the rotary width (= the compiled ``d_head``).  Every head is
             full-width rotary on this grid; the compile entry points assert the
             ``d_head`` passed to them matches this.  Must be even.
-        max_positions: the rollout length the recency plane is sized never to
-            wrap over (the cache cap, not the typical frame — past the wrap the
-            recency order silently inverts).  Used only by the recency rank.
+        max_positions: the rollout length (the cache cap, not the typical
+            frame).  Used by :func:`rope_lobe_band` to set the local-recency
+            band's near-DC floor (``θ > π/max_positions``).
         base: the rotary base (LLaMA3-family ``5e5`` by default).
     """
 
@@ -74,45 +74,6 @@ def rope_inv_freq(width: int, base: float) -> torch.Tensor:
         raise ValueError(f"RoPE width must be even, got {width}")
     p = torch.arange(0, width, 2, dtype=torch.float64)
     return (base ** (-p / width)).to(torch.float32)
-
-
-def recency_plane_index(
-    d_head: int,
-    base: float,
-    max_positions: int,
-    *,
-    seam_frac: float = 0.05,
-) -> int:
-    """Pick the recency plane: the **fastest** grid plane whose phase still never
-    wraps over the whole rollout (``docs/rope_port_plan.md`` §3 bucket 2, §6).
-
-    The bucket-2 recency readout reads the BOS-relative phase ``phi(pos) =
-    pos · θ_p`` of one rotary plane.  The octant ramp built on it has a single
-    discontinuity at the seam ``phi = 0 mod 2π`` (the wrap), so the whole
-    rollout's phase must stay inside ``(seam_frac·2π, (1−seam_frac)·2π)``.  That
-    bounds the plane's angular frequency: one turn (``2π/θ_p``) must cover at
-    least ``max_positions / (1 − 2·seam_frac)`` positions.  Among the planes
-    that satisfy this, the **fastest** (largest ``θ_p``, smallest index) gives
-    the steepest per-token phase step, i.e. the most recency resolution.
-
-    ``θ_p = base^(−2p/d_head)`` decreases as ``p`` grows, so turn grows with
-    ``p``; the first ``p`` whose turn clears the bound is the answer.
-
-    Raises ``ValueError`` if no plane on the grid is slow enough (raise
-    ``d_head`` or ``base`` — the slowest plane ``θ_{d_head/2−1} ≈ 1/base`` still
-    wraps within the rollout).
-    """
-    need_turn = max_positions / (1.0 - 2.0 * seam_frac)
-    for p in range(d_head // 2):
-        theta_p = base ** (-2.0 * p / d_head)
-        turn = 2.0 * math.pi / theta_p
-        if turn >= need_turn:
-            return p
-    raise ValueError(
-        f"no rotary plane on the base={base} d_head={d_head} grid turns slowly "
-        f"enough for a {max_positions}-position rollout (need turn ≥ "
-        f"{need_turn:.0f}); raise d_head or base."
-    )
 
 
 def rope_cos_sin(
@@ -214,6 +175,155 @@ def rotary_content_head(
         value_in=value,
         query_matrix=place_on_slow_planes(query_matrix, d_head),
         key_matrix=place_on_slow_planes(key_matrix, d_head),
+        value_matrix=torch.eye(d_v),
+        output_matrix=torch.eye(d_v),
+        rope_base=base,
+    )
+
+
+# Upper θ cutoff for the local-recency lobe band.  The default 0.3 is the
+# "natural" mid-band that gives W ≈ 415 at base 5e5 / d_head 256 (measured by
+# scripts/rope_window_frontier.py).  Lowering it drops more fast planes and
+# widens W at the cost of coarser near-Δ resolution (docs/rope_port_plan.md
+# Phase 6); raising it shrinks W.
+LOBE_THETA_MAX = 0.3
+
+
+def rope_lobe_band(
+    d_head: int,
+    base: float,
+    max_positions: int,
+    *,
+    theta_max: float = LOBE_THETA_MAX,
+) -> tuple[list[int], torch.Tensor]:
+    """Planes + Hann amplitudes for the **local-recency distance-decay lobe**.
+
+    The recency dual of :func:`place_on_slow_planes`.  A constant feature placed
+    identically on Q and K across a *band* of planes, rotated by absolute
+    position, gives the self-similarity logit ``Σ_p amp_p · cos(Δ·θ_p)`` for two
+    tokens ``Δ`` positions apart (the per-plane identity :func:`apply_rope`
+    realises: one scalar on plane ``p`` with its ``rotate_half`` partner zeroed
+    becomes ``(cos pos·θ_p, sin pos·θ_p)``, and two such dot to ``cos(Δ·θ_p)``).
+    At ``Δ=0`` every cosine is 1 (the peak); as ``Δ`` grows the planes dephase
+    and the sum decays — the main lobe.  Within the lobe width ``W`` a nearer key
+    always outscores a farther one, so "most recent matching" falls out of the
+    global rotation with **no value path and no precomputed rank**
+    (``docs/rope_port_plan.md`` Phase 6 — the local recency that supersedes the
+    octant ramp).
+
+    Band: planes with ``π/max_positions < θ_p < theta_max``.  Drop the *fastest*
+    planes (``θ ≥ theta_max``): they alias within a few positions and are what
+    sets where decay begins, i.e. the window ``W``.  Drop the *near-DC* planes
+    (``θ ≤ π/max_positions``): they barely decay over the rollout and are left
+    for content (:func:`place_on_slow_planes` puts content on the very slowest
+    planes, so excluding the near-DC band keeps the lobe disjoint from content).
+    A **Hann taper** over the kept band suppresses the Dirichlet-kernel sidelobes
+    that would let a farther key tie/beat a nearer one, extending the clean
+    monotone window (the ``+1e-3`` floor keeps the endpoint planes nonzero).
+    Lowering ``theta_max`` widens ``W`` at the cost of coarser near-Δ resolution.
+
+    At ``base 5e5``, ``d_head 256``, ``max_positions 61440``, ``theta_max 0.3``
+    the band is planes 12..96 (85 planes), peak ``Σ amp_p ≈ 42.6``, with a
+    measured monotone window ``W ≈ 415`` — ~4× the ~100-token target.  Returns
+    ``(planes, amps)`` where ``amps`` is a ``(len(planes),)`` float32 tensor.
+
+    Raises ``ValueError`` if fewer than two planes survive the band (raise
+    ``d_head`` / ``base`` or widen ``theta_max``).
+    """
+    inv = rope_inv_freq(d_head, base)  # (d_head/2,), θ_p decreasing in p
+    floor = math.pi / max_positions
+    planes = [p for p in range(d_head // 2) if floor < float(inv[p]) < theta_max]
+    if len(planes) < 2:
+        raise ValueError(
+            f"local-recency lobe band has <2 planes at base={base} "
+            f"d_head={d_head} max_positions={max_positions} theta_max={theta_max}; "
+            f"raise d_head/base or widen theta_max."
+        )
+    n = len(planes)
+    k = torch.arange(n, dtype=torch.float32)
+    amps = 0.5 - 0.5 * torch.cos(2.0 * math.pi * k / (n - 1)) + 1e-3
+    return planes, amps
+
+
+def rotary_recency_head(
+    query_in,
+    key_in,
+    value,
+    query_matrix: torch.Tensor,
+    key_matrix: torch.Tensor,
+    *,
+    d_head: int,
+    max_positions: int,
+    base: float = ROPE_BASE,
+    recency_gain: float,
+    theta_max: float = LOBE_THETA_MAX,
+):
+    """A "most recent matching" content head with **intrinsic rotary recency**.
+
+    Like :func:`rotary_content_head` — the compact ``(·, W)`` content
+    ``query_matrix`` / ``key_matrix`` is relocated onto the slowest ``W`` planes
+    (position-free match) — but it *also* appends a constant-``1`` feature placed
+    on the Hann-tapered mid-band from :func:`rope_lobe_band`, identical on Q and
+    K, with ``recency_gain`` riding the query side.  Under the global rotation the
+    logit gains the local distance-decay lobe ::
+
+        recency_gain · Σ_{p∈band} amp_p · cos(Δ·θ_p)
+
+    so among keys whose content matches, the **nearest (most recent)** wins —
+    monotone within the window ``W`` (``docs/rope_port_plan.md`` Phase 6).
+
+    **Recency is local.**  Past ``W`` the lobe is non-monotone and "most recent"
+    can *silently* pick a wrong key; consumers whose look-back can exceed ``W``
+    need the Phase-7 global mechanism.  ``W`` and the per-step resolution are
+    properties of :func:`rope_lobe_band` (≈415 / ~2.4e-3 at distance 100 for the
+    default config).
+
+    The recency band is **disjoint** from the content slow planes; this raises if
+    the content width would reach into the band (content occupies planes
+    ``d_head/2−W .. d_head/2−1`` — keep ``W`` small, ≲30 at the default config).
+    The head is full-width rotary on the ``d_head`` grid, so it carries **no new
+    ONNX/HF emission** — it rides the Phase-0 rotary path exactly like
+    :func:`rotary_content_head`.
+    """
+    from torchwright.graph import Attn, Concatenate, LiteralValue
+
+    half = d_head // 2
+    w_content = max(query_matrix.shape[1], key_matrix.shape[1])
+    planes, amps = rope_lobe_band(d_head, base, max_positions, theta_max=theta_max)
+    content_planes = set(range(half - w_content, half))
+    overlap = content_planes & set(planes)
+    if overlap:
+        raise ValueError(
+            f"content width {w_content} overlaps the recency lobe band "
+            f"(planes {min(planes)}..{max(planes)}); raise d_head or narrow "
+            f"the content (overlapping planes: {sorted(overlap)})."
+        )
+
+    q_full = place_on_slow_planes(query_matrix, d_head)  # (rows_q, d_head)
+    k_full = place_on_slow_planes(key_matrix, d_head)  # (rows_k, d_head)
+
+    # Constant-1 recency feature on the lobe band: one scalar per plane, the
+    # rotate_half partner (p + half) left zero so the planes do not mix.
+    q_rec = torch.zeros((1, d_head))
+    k_rec = torch.zeros((1, d_head))
+    for p, a in zip(planes, amps):
+        q_rec[0, p] = recency_gain * float(a)
+        k_rec[0, p] = 1.0
+
+    one_q = LiteralValue(torch.tensor([1.0]), name="recency_lobe_query_one")
+    one_k = LiteralValue(torch.tensor([1.0]), name="recency_lobe_key_one")
+    query_in = Concatenate([query_in, one_q])
+    key_in = Concatenate([key_in, one_k])
+    q_full = torch.cat([q_full, q_rec], dim=0)
+    k_full = torch.cat([k_full, k_rec], dim=0)
+
+    d_v = len(value)
+    return Attn(
+        query_in=query_in,
+        key_in=key_in,
+        value_in=value,
+        query_matrix=q_full,
+        key_matrix=k_full,
         value_matrix=torch.eye(d_v),
         output_matrix=torch.eye(d_v),
         rope_base=base,

@@ -28,8 +28,9 @@ def _caesar(text: str, shift: int) -> str:
 
 def test_caesar_cipher(caesar):
     model, artifact = caesar
-    # RoPE recency (octant ramp + two graded heads) is deeper than the old
-    # counter column, so this budget is above the pre-RoPE 40 (observed 44).
+    # RoPE local recency is a single rotary head (intrinsic distance-decay lobe,
+    # shallower than the deleted octant ramp; docs/rope_port_plan.md Phase 6) —
+    # comfortable upper bound with margin.
     assert artifact.n_layers <= 48, f"Too many layers: {artifact.n_layers}"
 
     test_cases = [
@@ -55,9 +56,7 @@ def test_caesar_cipher(caesar):
             _caesar(plaintext, int(shift)) == expected
         ), f"Reference mismatch for shift={shift}, text={plaintext}"
         # Prompt: bos, shift token, plaintext chars, newline trigger.
-        result = run(
-            model, shift + plaintext + "\n", bos_token="<bos>", ref_token="<ref>"
-        )
+        result = run(model, shift + plaintext + "\n", bos_token="<bos>")
         assert result == expected, (
             f"For shift={shift}, {plaintext!r}: "
             f"expected {expected!r} but got {result!r}"

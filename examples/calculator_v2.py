@@ -37,7 +37,6 @@ from torchwright.ops.inout_nodes import (
     create_rope_config,
     create_unembedding,
 )
-from torchwright.ops.recency_heads import recency_rank_from_tokens
 from torchwright.ops.logic_ops import (
     equals_vector,
     bool_any_true,
@@ -79,16 +78,12 @@ def create_network_parts(
     """
     vocab = list(
         " 0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ!@#$%^&*()-+="
-    ) + ["\n", "<bos>", "<ref>", "<eos>", "default"]
+    ) + ["\n", "<bos>", "<eos>", "default"]
     embedding = create_embedding(vocab=vocab)
     rope = create_rope_config(d_head=D_HEAD, max_positions=MAX_POSITIONS)
 
-    # Bucket-2 recency rank from the <bos>/<ref> markers — replaces the old
-    # position counter that drove "most recent" selection.
-    recency_rank = recency_rank_from_tokens(rope, embedding)
-
     # --- Phase 1: Parse operands and operator ---
-    num_seq = NumericSequence(rope, embedding, max_digits, recency_rank)
+    num_seq = NumericSequence(rope, embedding, max_digits)
 
     # Detect which operator token appears
     is_plus = equals_vector(embedding, embedding.get_embedding("+"))
@@ -99,15 +94,15 @@ def create_network_parts(
 
     # Guard: only detect operators before "=" — output tokens like "-" must
     # not re-trigger operator signals during autoregressive decoding.
-    has_seen_equals = get_prev_value(rope, is_equals, is_equals, recency_rank)
+    has_seen_equals = get_prev_value(rope, is_equals, is_equals)
     before_equals = bool_not(has_seen_equals)
     is_operator_input = bool_all_true([is_operator, before_equals])
 
     # Latch which operator was seen (captured at the operator position,
     # carried forward to all later positions via attention).
-    which_plus = get_prev_value(rope, is_plus, is_operator_input, recency_rank)
-    which_minus = get_prev_value(rope, is_minus, is_operator_input, recency_rank)
-    which_times = get_prev_value(rope, is_times, is_operator_input, recency_rank)
+    which_plus = get_prev_value(rope, is_plus, is_operator_input)
+    which_minus = get_prev_value(rope, is_minus, is_operator_input)
+    which_times = get_prev_value(rope, is_times, is_operator_input)
 
     # Extract operand digits (MSB first)
     first_num_digits = num_seq.get_digits_at_event(is_operator_input)
@@ -189,7 +184,6 @@ def create_network_parts(
         is_equals,
         result_digits,
         embedding.get_embedding(" "),
-        recency_rank,
     )
     return output_node, embedding
 

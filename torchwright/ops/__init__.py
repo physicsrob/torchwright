@@ -52,7 +52,6 @@ from torchwright.ops.map_select import (
     in_range,
     map_to_table,
     select,
-    soft_blend,
     switch,
     table_lookup_2d,
     table_lookup_3d,
@@ -93,13 +92,6 @@ from torchwright.ops.sequence_ops import (
     check_is_digit,
     output_sequence,
     remove_leading_0s,
-)
-
-# Recency (bucket-2 RoPE position rank)
-from torchwright.ops.recency_heads import (
-    recency_phase_heads,
-    recency_rank,
-    recency_rank_from_tokens,
 )
 
 # Loop

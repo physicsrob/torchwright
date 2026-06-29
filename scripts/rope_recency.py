@@ -18,9 +18,18 @@ the decision quantity is the DIMENSIONLESS ratio g(Delta) / score(0).
 We sweep d_head and a few plane-subset / apodization choices.
 """
 
+import sys
+
 import numpy as np
 
-BASE = 1e6
+try:
+    from torchwright.graph.rope import ROPE_BASE as _DEFAULT_BASE
+except Exception:  # pragma: no cover - script may run without the package on path
+    _DEFAULT_BASE = 500000.0
+
+# Defaults to the live ROPE_BASE (5e5) so figures reconcile with the runtime
+# grid; pass another base as the first CLI arg (e.g. the historical 1e6).
+BASE = float(sys.argv[1]) if len(sys.argv) > 1 else float(_DEFAULT_BASE)
 R = 65536  # full sequence range to test monotonicity / resolution across
 
 

@@ -1,6 +1,6 @@
 # RoPE port — plan
 
-Status: **Phases 0–5 done; Phases 6–8 remaining** (branch `worktree-rope`). Phase 0
+Status: **Phases 0–6 done; Phases 7–8 remaining** (branch `worktree-rope`). Phase 0
 (rotary `Attn`, in-process/ONNX/HF), Phase 1 (bucket-1 near-marker count), Phase 1b (recency ramp:
 `soft_blend` + octant ramp, confirm-compile green), Phase 2 Part 1 (relative-offset all-Δ + sign
 lock), Phase 2 Part 2 (compiler self-match → rotary, all three surfaces), Phase 3 (content-selection
@@ -24,8 +24,16 @@ rotary content head to keep the DOOM-port derisk valid). Two real bugs were foun
 repros along the way: an I1 `const_one` node-id collision and the HF save→load NaN. See the Phase-5
 status block in §8. `torchwright_doom` is untouched (Phase 8).
 
-Remaining: **Phase 6** (local rotary-lobe recency; delete `<ref>` and the global octant mechanism;
-migrate the examples — torchwright), **Phase 7** (design + demo the unbounded global most-recent without
+**Phase 6 done (2026-06-29, `worktree-rope`).** Local rotary-lobe recency (`rope_lobe_band` +
+`rotary_recency_head`, `W≈414`) replaced the octant ramp; `<ref>`, `recency_heads.py`,
+`recency_ramp.py`, `soft_blend`, and `recency_plane_index` deleted; consumers (`attend_most_recent_matching`,
+`get_prev_value`, `NumericSequence`, `output_sequence`) dropped `recency_rank`; examples migrated. Full
+`make test` green on Modal (all 10 shards). Three bit-exact cross-execution-path parity tests (onnx-vs-torch,
+onnxruntime-vs-headless, batched-vs-sequential) were relaxed to bounded fp floors — execution-path rounding
+from the graph reshape, generation token-identical, independently reviewed (Claude + Codex); see the Phase-6
+status block in §8 and `docs/numerical_noise_findings.md`.
+
+Remaining: **Phase 7** (design + demo the unbounded global most-recent without
 `<ref>`, possibly outside the compiler — torchwright), and **Phase 8** (`torchwright_doom` — rewire the
 DOOM call sites, full render parity, and the 42k real-log recency replay). **`main` merged in
 (`f281ee8`)**: ONNX/HF now
@@ -777,6 +785,46 @@ cos(Δ·θ_p)` (the rotary self-similarity between a query and a key `Δ` positi
 `Δ=0` and decreases monotonically over the main lobe, so a nearer key of equal content outranks a
 farther one — no BOS-relative phase, no two-token `{BOS, REF}` readout, no octant ramp.
 
+> **Status: DONE (2026-06-29, `worktree-rope`). Full `make test` green on Modal (all 10 shards).**
+> - **Mechanism.** New `rope_lobe_band(d_head, base, max_positions, *, theta_max=0.3)` +
+>   `rotary_recency_head` in `graph/rope.py`: a constant feature on a Hann-tapered mid-band of planes
+>   (disjoint from the content slow planes) gives logit `recency_gain·Σ_p amp_p·cos(Δθ_p)`, peak at
+>   `Δ=0`, strictly decreasing over the window `W`. Measured at base `5e5` / `d_head 256` / cap `61440`,
+>   `theta_max 0.3`: band = planes 12–96, peak `≈42.1`, **`W = 414`** (breakdown pair Δ=419 loses to
+>   Δ=429) — the plan's `~415` holds. Default `_LOCAL_RECENCY_GAIN = 600` (sized to the lobe's flat-peak
+>   `Δ=0→1` step so the `exclude_self` predecessor case is hard; `get_prev_value` auto-sets
+>   `gate = 4·recency_gain·peak`, always content-dominant).
+> - **Deleted.** `<ref>` token (+ `ref_token` from `onnx_load.generate` / the example harness),
+>   `ops/recency_heads.py` (phase heads / `recency_rank` / `recency_rank_from_tokens`),
+>   `ops/recency_ramp.py` (octant ramp), `soft_blend` (`map_select.py` — its only consumer was the ramp;
+>   removed from the noise data + `measure_op_noise.py`), `recency_plane_index` (`rope.py`),
+>   `scripts/rope_octant_assembly.py`. `<bos>` stays.
+> - **Consumers rewired** (`recency_rank` dropped from signatures): `attend_most_recent_matching`,
+>   `get_prev_value`, `NumericSequence`, `output_sequence`. Examples migrated (calculator family, adders,
+>   cipher, fibonacci, sort_digits). The scratchpad's column gather moved to content-only
+>   `attend_argmax_dot` (each scratch column is written once → unique match, recency-irrelevant, and its
+>   width-`N` content would otherwise collide with the lobe band) — this also restored its flat-depth
+>   invariant. `scripts/rope_window_frontier.py` / `rope_recency.py` parameterized off the live `base`.
+> - **Validation.** New confidence tests: `tests/ops/test_local_recency.py` (lobe monotone-to-`W` +
+>   breakdown past `W` + nearest-match selection + the disjointness guard) and
+>   `tests/compile/forward/test_rope_local_recency.py` (compiled: immediate-predecessor selection,
+>   `probe_compiled` parity, prefill == cached decode). I1–I4 held (no D1 stop). The octant/ramp/soft_blend
+>   and `<ref>` tests were deleted; the synthetic-rank `attend_most_recent_matching` block and the Tier-3/4
+>   `ref_token` tests were migrated.
+> - **One numerical finding (independently reviewed — Claude + Codex).** The graph reshape broke three
+>   tests that asserted **bit-exactness across two execution paths** (onnxruntime-vs-torch ~2–5 logits;
+>   onnxruntime-vs-in-process-headless ~1.2e-3; batched-vs-sequential ~0.016). All are execution-path fp
+>   rounding, **not** logic/compiler bugs — generation stays token-identical and correct, I1–I4 held. Key
+>   facts (verified, not assumed): the onnx-vs-torch divergence is **amplitude-independent** (not the lobe
+>   magnitude — it's the documented topology-sensitive onnxruntime FMA fusion, now on a normal-magnitude
+>   logit); the headless compiled circuit matches the oracle to ~2e-6 (only the real onnxruntime artifact
+>   rounds); the batched floor is **gain-independent** and emerges only at full-graph depth (a lone
+>   recency *or* content head is bit-exact batched-vs-sequential), from the different SDPA mask/shape of
+>   the `n_new=1` vs `n_new>1` paths. Resolved by relaxing those three to bounded fp floors while keeping
+>   the token-identical + correct-answer assertions strict; documented in
+>   `docs/numerical_noise_findings.md` ("Local-recency cross-execution-path fp floor"). `make measure-noise`
+>   showed only SHA + sub-ULP wiggle (no op changed).
+
 - **Delete:** the `<ref>` token and the two-token interface; `recency_phase_heads` / `recency_rank` /
   `recency_rank_from_tokens` (`ops/recency_heads.py`); the octant ramp (`ops/recency_ramp.py`); and
   `soft_blend` (`ops/map_select.py`) if the ramp was its only consumer. `<bos>` **stays** (a natural
@@ -819,6 +867,20 @@ are if they hold:
 - **(c) BOS-only mixed-radix position decode** (`scripts/rope_position_decode.py`, validated 0..64k) —
   a perfect integer rank from BOS-relative phases alone, no second key. Heavier than the ramp but needs
   no reference token by construction.
+- **(d) Boosted-BOS weight inversion.** Place a one-hot feature on the slowest RoPE plane at BOS with
+  value `sqrt(ln(MAX_LEN))` and use a matching constant query. All other keys carry zero on this
+  dimension. The Q·K score to BOS is then `ln(MAX_LEN)·cos(m·θ_slow)` and all other keys score 0,
+  giving softmax weight `w = MAX_LEN·cos(m·θ_slow) / (MAX_LEN·cos(m·θ_slow) + m)`. The minimum
+  gap between adjacent-m weights is `≥ 1/(4·MAX_LEN) ≈ 3.9e-6` — about 65× the fp32 weight floor
+  (~6e-8). The function is strictly monotone over [0, MAX_LEN] because `θ·m·sin(m·θ)+cos(m·θ) > 0`
+  holds whenever `m·θ_slow < π/2`; at the slowest natural plane (θ_slow ≈ 2.22e-6) the maximum
+  `m·θ_slow ≈ 0.142`, well inside that bound. The inverse `m = g(w)` is a smooth monotone function
+  on [1/2, 1] that can be precomputed and fit as a PWL table. The cosine attenuation factor bakes
+  into the PWL — there is no separate correction step. With ~1800 log-uniform breakpoints the PWL
+  error is ≈ 0.005; the fp32 softmax floor contributes ≈ 0.008; combined ≈ 0.013, well within the
+  0.5 rounding threshold for integer recovery. *(Prototype to validate: measure the actual weight
+  gaps and PWL fit quality; confirm monotonicity test at MAX_LEN; 1800 BPs is compile-time cost
+  only.)*
 
 - **It may live outside the compiler.** It is plausible the global recency index is a host-side /
   post-processing mechanism (clip-memory served by an external index) rather than a compiled per-token

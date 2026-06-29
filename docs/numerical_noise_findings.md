@@ -38,22 +38,6 @@ their distributions are width-1, where per-column M equals the old scalar M — 
 this carries no noise-number drift. (Motivation: the Plan-K Step-1 edge-key
 precision fix, `/data/torchdoom/k_step1_divergence_characterization.md`.)
 
-### `soft_blend` is exact-by-construction (fp32 round-off only)
-
-`soft_blend(cond, t, f)` measures **1.19e-07 abs / 1.67e-07 rel** — the
-float32 unit, not a piecewise-linear approximation floor. That is by design:
-unlike `select`, it adds no approximation of its own. It reuses
-`broadcast_select`'s carrier core with **zero** output bias
-(`raw = ReLU(M·cond+t) − ReLU(M·cond) + ReLU(−M·cond+f) − ReLU(−M·cond)`,
-exact for crisp cond) and then clamps with the elementwise `min`/`max` ops
-(each ~3.8e-06 abs, but only active when they change the value). The worst
-input is the octant-boundary case it was built for — soft `cond≈0.04` with
-`t≈f` (`0.7122`/`0.7132`) — and even there the error stays at fp32 round-off,
-confirming the median-of-three clamp introduces no dip. Contrast `select`,
-whose `(M+v)−M` cancellation loses `|v| ≪ ULP(M)` and collapses to ≈`−M` when
-its `compare` cond can't saturate (the failure that motivated this op; see
-`docs/rope_port_plan.md` Phase 1b). M=2.0 here (safety 2.0 × the [-1,1] bound).
-
 ### `piecewise_linear_2d` oscillates on non-uniform grids
 
 `diff_trig_nonuniform` hits **7.78 absolute error** on a product whose
@@ -142,6 +126,44 @@ designed to concentrate the softmax on a single key (e.g., `_QUERY_GAIN =
 8.0` gives a runner-up weight of ~3e-4 when scores differ by ≥ 1). That
 property belongs in an attention-design reference, not an op noise
 reference; see plan 2 (compiler assertions) for a better home.
+
+### Local-recency cross-execution-path fp floor (RoPE Phase 6)
+
+The Phase-6 local-recency port (`docs/rope_port_plan.md`) replaced the global
+octant-ramp recency with the intrinsic rotary distance-decay lobe
+(`rope_lobe_band` / `rotary_recency_head`). This is a graph **reshape** — it adds
+a constant feature on a Hann-tapered band of *actively-rotating* mid-band planes
+and raises the recency heads' logit magnitudes. The reshape does not change any
+op's measured noise (no PL op or breakpoint grid changed), and it does not change
+any generated token (teacher-forced argmax stays identical, answers stay correct).
+But it perturbs the fp32 accumulation enough to break three tests that asserted
+**bit-exactness across two different execution paths** — a fragility those tests
+inherited, distinct from the squaring-path / denormal cross-backend findings:
+
+- **onnxruntime vs torch** (`tests/hf/test_calculator_parity.py`): ~2–5 logits at
+  the operator-latch positions, **amplitude-independent** (swept `recency_gain`
+  600→2.34, 200→2.27, 50→4.61; not the lobe magnitude). It is the topology-
+  sensitive onnxruntime FMA-fusion difference (same mechanism as the existing
+  "ONNX-oracle ≡ native-HF is not algebraic" finding), now landing on a normal-
+  magnitude logit instead of a denormal one. No argmax flips. The test now asserts
+  per-position argmax-equality + a bounded `_PARITY_FP_FLOOR`.
+- **onnxruntime vs in-process headless** (`tests/debug/test_onnx_debug_session.py`):
+  ~1.2e-3 absolute on the adder. The *headless* compiled circuit matches the graph
+  oracle to ~2e-6 (kept tight); only the real onnxruntime artifact rounds (~4e-5
+  relative on the large-magnitude attention). Gain-sensitive. The ONNX-backend
+  probes use `_ONNX_PROBE_ATOL`; the headless probe stays at 1e-3.
+- **batched vs sequential decode** (`tests/compile/forward/test_batched_decode_with_past.py`):
+  ~0.016, **gain-independent**, and **not** attributable to any single head (a lone
+  recency head *and* a lone content head are each bit-exact batched-vs-sequential;
+  the floor only emerges at the full graph's depth). Cause: single-step decode
+  (`n_new=1`, no mask) and batched-with-past (`n_new>1`, explicit past+tril mask)
+  take different-shaped SDPA/matmul calls, so the fp32 reductions round
+  differently. Bounded by `_BATCHED_FP_FLOOR`.
+
+None is a logic or compiler-invariant bug (I1–I4 held). The real correctness bar
+— token-identical, correct-answer generation — is asserted strictly and passes;
+these three now bound the residual cross-path divergence so a structural
+regression (O(value-magnitude), or an argmax flip) still fails.
 
 ### Input-amplification hazards in gate ops
 
