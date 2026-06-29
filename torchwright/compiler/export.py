@@ -909,28 +909,24 @@ def _emit_cached_layer_nodes(
 
     def rope_rotate(src: str, dst: str, cos: str, sin: str) -> None:
         """rotate_half RoPE: ``dst = src*cos + rotate_half(src)*sin`` over the
-        last (d_head) axis, emitted as ``src + (rot - src)``.  Every head is
+        last (d_head) axis, emitted directly as ``rot``.  Every head is
         full-width rotary on the one global grid (no per-head enable).  Matches
         graph/rope.py (rotate_half, half-split); modeling_torchwright.py mirrors
         this op sequence.
 
-        ``src + (rot - src)`` is bit-identical to ``rot`` (Sterbenz: ``rot - src``
-        is exact when ``rot ≈ src``).  It does NOT force onnxruntime/torch
-        agreement — the near-zero cancel-head rows differ by one denormal ULP
-        either way, which the test_convert parity bound now tolerates (no token
-        or meaningful logit moves).  Kept in this form only to mirror the HF
-        transcription and avoid perturbing the calculator's exact-parity test;
-        collapsing it to a direct ``dst = rot`` is a safe follow-up once that
-        test is re-confirmed.
+        No ``src + (rot - src)`` reconstruction: cross-backend onnxruntime/torch
+        agreement is not algebraic — the cancel-head rows that cancel to denormal
+        magnitude differ by one denormal ULP regardless of the form (the
+        test_convert parity bound tolerates it; no token or meaningful logit
+        moves), and the full suite is bit-exact with the direct form, so the
+        extra Sub/Add bought nothing.
         """
         node("Split", [src, "rope_split"], [f"{dst}_h1", f"{dst}_h2"], axis=-1)
         node("Neg", [f"{dst}_h2"], [f"{dst}_h2n"])
         node("Concat", [f"{dst}_h2n", f"{dst}_h1"], [f"{dst}_rh"], axis=-1)
         node("Mul", [src, cos], [f"{dst}_c"])
         node("Mul", [f"{dst}_rh", sin], [f"{dst}_s"])
-        node("Add", [f"{dst}_c", f"{dst}_s"], [f"{dst}_rot"])
-        node("Sub", [f"{dst}_rot", src], [f"{dst}_diff"])
-        node("Add", [src, f"{dst}_diff"], [dst])
+        node("Add", [f"{dst}_c", f"{dst}_s"], [dst])
 
     # Project Q, K_new, V_new from the new rows in sequence-major
     # (n_new, n_heads, d_head).  The deltas (new rows only) are the graph

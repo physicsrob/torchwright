@@ -121,19 +121,15 @@ class TorchwrightAttention(nn.Module):
         sin: torch.Tensor,
     ) -> torch.Tensor:
         # x: (B, n_heads, T, d_head); cos/sin: (T, d_head) -> (1, 1, T, d_head).
-        # Every head rotates full-width (no per-head enable).
+        # Every head rotates full-width (no per-head enable). Emitted directly,
+        # matching export.py: cross-backend ONNX/torch agreement is not algebraic
+        # (the cancel-head rows that cancel to denormal magnitude differ by one
+        # denormal ULP regardless of the form, which the test_convert parity bound
+        # tolerates — no token or meaningful logit moves), so the `x + (rot - x)`
+        # reconstruction bought nothing and is gone.
         cos = cos[None, None]
         sin = sin[None, None]
-        rot = x * cos + self._rotate_half(x) * sin
-        # Mirror the ONNX export's op sequence: x + (rot - x), bit-identical to
-        # `rot` by Sterbenz (rot ≈ x after a small rotation, so rot - x is exact).
-        # This does NOT force ONNX/torch agreement — the near-zero cancel-head
-        # rows differ by one denormal ULP either way, which the test_convert
-        # parity bound tolerates (no token or meaningful logit moves). It only
-        # keeps this transcription op-for-op with export.py; simplifying to
-        # `return rot` is a safe follow-up once the calculator exact-parity test
-        # is re-confirmed.
-        return x + (rot - x)
+        return x * cos + self._rotate_half(x) * sin
 
     def forward(
         self,

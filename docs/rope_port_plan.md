@@ -704,7 +704,11 @@ changes land in torchwright and are validated by the §9 confidence suite + the 
 >   backends) and tolerate the denormal floor (`tests/hf/test_convert.py`, mirroring the already-robust
 >   `test_calculator_parity`). The earlier "the always-1 enable `Mul` blocked the FMA fusion" story was
 >   **wrong** — multiply-by-1.0 is the IEEE identity (`fma(x,1,y)==add(x,y)`); the cause is onnxruntime's
->   topology-sensitive fusion, not the enable node.
+>   topology-sensitive fusion, not the enable node. Follow-up: the rotation is now emitted **directly as
+>   `rot`** in both backends (the `src + (rot - src)` reconstruction — once thought load-bearing for
+>   cross-backend exactness — was removed after the full suite, including every strict cross-backend
+>   `== 0.0` parity assertion, stayed green with the direct form; it bought nothing and only added a
+>   `Sub`+`Add` per rotation).
 > - **Finding — gain calibration is load-bearing for recency selection.** `match_gain` must be large
 >   enough to exclude the BOS/REF **degenerate outlier rank** (≈0.5 vs the ~0.15 interior — a
 >   content-mismatched reference token will otherwise win on its rank) *and* `rank_gain` must be large
