@@ -32,7 +32,6 @@ from torchwright.ops.inout_nodes import (
 )
 from torchwright.ops.logic_ops import bool_all_true, equals_vector
 from torchwright.ops.map_select import map_to_table, select
-from torchwright.ops.recency_heads import recency_rank_from_tokens
 from torchwright.ops.sequence_ops import output_sequence, remove_leading_0s
 
 D_MODEL = 256
@@ -51,14 +50,10 @@ def create_network_parts(
         max_bits: Maximum number of input bits (handles up to max_bits-bit
             binary numbers). Output may be max_bits+1 bits on overflow.
     """
-    vocab = list("01 ") + ["\n", "<bos>", "<ref>", "<eos>"]
+    vocab = list("01 ") + ["\n", "<bos>", "<eos>"]
     embedding = create_embedding(vocab=vocab)
     rope = create_rope_config(d_head=D_HEAD, max_positions=MAX_POSITIONS)
     embed = embedding.get_embedding
-
-    # Bucket-2 recency rank from the <bos>/<ref> markers — replaces the old
-    # position counter that drove "most recent" selection.
-    recency_rank = recency_rank_from_tokens(rope, embedding)
 
     is_trigger = equals_vector(embedding, embed("\n"))
 
@@ -71,7 +66,7 @@ def create_network_parts(
     bits_raw = []
     for i in range(max_bits):
         raw = attend_to_offset(rope, embedding, delta_pos=-(i + 1))
-        latched = get_prev_value(rope, raw, is_trigger, recency_rank)
+        latched = get_prev_value(rope, raw, is_trigger)
         bits_raw.append(latched)
 
     # --- Normalize padding to "0" ---
@@ -107,7 +102,6 @@ def create_network_parts(
         is_trigger,
         output_seq,
         embed(" "),
-        recency_rank,
     )
     return output_node, embedding
 

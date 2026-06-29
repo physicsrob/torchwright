@@ -34,7 +34,6 @@ from torchwright.ops.attention_ops import (
     attend_to_offset,
     get_prev_value,
 )
-from torchwright.ops.recency_heads import recency_rank
 
 D = 256
 D_HEAD = 16
@@ -43,25 +42,6 @@ MAX_POSITIONS = 512
 
 def _rope():
     return create_rope_config(d_head=D_HEAD, max_positions=MAX_POSITIONS)
-
-
-def _rope_and_rank():
-    """A rope config plus a recency rank built from synthetic <bos>/<ref> marker
-    channels (the bucket-2 substrate that replaces the old position counter)."""
-    rope = _rope()
-    bos = create_input("bos_marker", 1)
-    ref = create_input("ref_marker", 1)
-    rank = recency_rank(bos, ref, d_head=D_HEAD, max_positions=MAX_POSITIONS)
-    return rope, rank
-
-
-def _markers(n_pos):
-    """Marker input channels: <bos> at position 0, <ref> at position 1."""
-    bos = torch.zeros(n_pos, 1)
-    ref = torch.zeros(n_pos, 1)
-    bos[0, 0] = 1.0
-    ref[1, 0] = 1.0
-    return {"bos_marker": bos, "ref_marker": ref}
 
 
 def _verify(
@@ -262,11 +242,12 @@ def test_compile_cond_gate():
 
 def test_compile_get_prev_value():
     """get_prev_value() — most recent value where cond was true, ranked by the
-    RoPE recency ramp (compiled == oracle; both use the same rotary rank)."""
-    rope, rank = _rope_and_rank()
+    intrinsic rotary recency lobe (compiled == oracle; both apply the same
+    rotation)."""
+    rope = _rope()
     v = create_input("v", 4)
     cond = create_input("cond", 1)
-    out = get_prev_value(rope, v, cond, rank)
+    out = get_prev_value(rope, v, cond)
 
     n_pos = 5
     _verify(
@@ -283,7 +264,6 @@ def test_compile_get_prev_value():
                 ]
             ),
             "cond": torch.tensor([[1.0], [0.0], [0.0], [1.0], [0.0]]),
-            **_markers(n_pos),
         },
     )
 
@@ -434,13 +414,13 @@ def test_compile_multi_switch_shared_constants():
     from torchwright.ops.map_select import switch
     from torchwright.ops.logic_ops import cond_gate
 
-    rope, rank = _rope_and_rank()
+    rope = _rope()
     flag = create_input("flag", 1)
 
     # Three conditions via attention (like which_plus, which_minus, which_times)
-    c1 = get_prev_value(rope, flag, flag, rank)
-    c2 = get_prev_value(rope, flag, flag, rank)
-    c3 = get_prev_value(rope, flag, flag, rank)
+    c1 = get_prev_value(rope, flag, flag)
+    c2 = get_prev_value(rope, flag, flag)
+    c3 = get_prev_value(rope, flag, flag)
 
     # Real values for c1, placeholder zeros for c2/c3
     zero = create_literal_value(torch.zeros(4))
@@ -459,7 +439,6 @@ def test_compile_multi_switch_shared_constants():
         n_pos=n_pos,
         input_values={
             "flag": torch.tensor([[1.0], [-1.0], [1.0]]),
-            **_markers(n_pos),
         },
     )
 
@@ -475,7 +454,7 @@ def test_compile_switch_with_attention_conditions():
     from torchwright.ops.map_select import switch
     from torchwright.ops.logic_ops import equals_vector
 
-    rope, rank = _rope_and_rank()
+    rope = _rope()
     embedding_dim = 8
     v1 = create_literal_value(torch.randn(embedding_dim))
     v2 = create_literal_value(torch.randn(embedding_dim))
@@ -483,9 +462,9 @@ def test_compile_switch_with_attention_conditions():
 
     # Conditions via attention — like equals_vector + get_prev_value
     flag = create_input("flag", 1)
-    c1 = get_prev_value(rope, flag, flag, rank)
-    c2 = get_prev_value(rope, flag, flag, rank)
-    c3 = get_prev_value(rope, flag, flag, rank)
+    c1 = get_prev_value(rope, flag, flag)
+    c2 = get_prev_value(rope, flag, flag)
+    c3 = get_prev_value(rope, flag, flag)
 
     out = switch([c1, c2, c3], [v1, v2, v3])
 
@@ -495,7 +474,6 @@ def test_compile_switch_with_attention_conditions():
         n_pos=n_pos,
         input_values={
             "flag": torch.tensor([[1.0], [-1.0], [1.0]]),
-            **_markers(n_pos),
         },
     )
 
@@ -758,14 +736,18 @@ def test_compile_attend_argmax_dot():
 
 
 def test_compile_attend_most_recent_matching():
-    """attend_most_recent_matching — content match + recency tiebreak."""
+    """attend_most_recent_matching — content match + local recency tiebreak.
+
+    One-hot content (dot gap 1) against the d_head=16 lobe peak (~1.0) needs
+    match_gain > recency_gain·peak ≈ 600 for content to dominate; 2000 clears it
+    so the op picks the most-recent *matching* key (compiled == oracle)."""
     from torchwright.ops.attention_ops import attend_most_recent_matching
 
-    rope, rank = _rope_and_rank()
+    rope = _rope()
     qv = create_input("qv", 4)
     kv = create_input("kv", 4)
     value = create_input("value", 3)
-    out = attend_most_recent_matching(rope, qv, kv, value, rank)
+    out = attend_most_recent_matching(rope, qv, kv, value, match_gain=2000.0)
 
     # Construct a small sequence where position 2 and position 4 both
     # match the query's type; the op must pick position 4 at every
@@ -782,6 +764,5 @@ def test_compile_attend_most_recent_matching():
             "qv": query_in,
             "kv": key_in,
             "value": value_in,
-            **_markers(n_pos),
         },
     )

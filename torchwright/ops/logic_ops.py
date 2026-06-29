@@ -102,7 +102,7 @@ def bool_any_true(inp_list: List[Node]) -> Node:
     .. noise-footer::
 
        Max error: 0 abs, 0 rel over 4096 samples;
-       measured at commit 2e04d93. See docs/numerical_noise.md.
+       measured at commit aafc5f3. See docs/numerical_noise.md.
     """
     # Strategy:
     # Convert all the values to 1.0 if they're > 0.0 and 0.0 otherwise
@@ -130,7 +130,7 @@ def bool_all_true(inp_list: List[Node]) -> Node:
     .. noise-footer::
 
        Max error: 0 abs, 0 rel over 4096 samples;
-       measured at commit 2e04d93. See docs/numerical_noise.md.
+       measured at commit aafc5f3. See docs/numerical_noise.md.
     """
     return compare(
         sum_nodes(inp_list),
@@ -153,7 +153,7 @@ def bool_not(inp: Node) -> Node:
     .. noise-footer::
 
        Max error: 0 abs, 0 rel over 4096 samples;
-       measured at commit 2e04d93. See docs/numerical_noise.md.
+       measured at commit aafc5f3. See docs/numerical_noise.md.
     """
     return compare(inp, thresh=0.0, true_level=-1.0, false_level=1.0)
 
@@ -172,7 +172,7 @@ def equals_vector(inp: Node, vector: torch.Tensor) -> Node:
     .. noise-footer::
 
        Max error: 0 abs, 0 rel over 4096 samples;
-       measured at commit 2e04d93. See docs/numerical_noise.md.
+       measured at commit aafc5f3. See docs/numerical_noise.md.
     """
     # If value1 == c, result is 1
     # else result is -1
@@ -287,7 +287,7 @@ def cond_gate(
     .. noise-footer::
 
        Max error: 0.0009766 abs, 0.3885 rel over 4096 samples;
-       measured at commit 2e04d93. See docs/numerical_noise.md.
+       measured at commit aafc5f3. See docs/numerical_noise.md.
     """
     assert len(cond) == 1
     d = len(inp)

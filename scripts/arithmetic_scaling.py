@@ -64,7 +64,6 @@ from torchwright.ops.inout_nodes import (
     create_onehot_embedding,
     create_rope_config,
 )
-from torchwright.ops.recency_heads import recency_rank_from_tokens
 
 # Registered implementations, in figure order: the legible serial folds vs the
 # depth-optimized carry-lookahead / carry-save versions.  Each calculator module
@@ -205,13 +204,12 @@ def measure_scratchpad_op(op_fn, n):
         d_head=calculator_scratchpad.D_HEAD,
         max_positions=calculator_scratchpad.MAX_POSITIONS,
     )
-    recency_rank = recency_rank_from_tokens(rope, embedding)
     steps_since = calculator_scratchpad._steps_since_newline(
-        rope, embedding, recency_rank, max_gap=calculator_scratchpad.decode_steps(n) + 2
+        rope, embedding, max_gap=calculator_scratchpad.decode_steps(n) + 2
     )
     a = _operand(embedding, n)
     b = _operand(embedding, n)
-    thinking, answer = op_fn(rope, embedding, a, b, n, recency_rank, steps_since)
+    thinking, answer = op_fn(rope, embedding, a, b, n, steps_since)
     outputs = thinking + answer
     return critical_path_depth(outputs), total_neurons(outputs)
 

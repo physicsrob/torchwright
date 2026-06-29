@@ -216,7 +216,7 @@ def test_token_onnx_autoregressive_1digit():
         model = load_onnx(onnx_path)
         test_cases = [("1+1\n", "2"), ("2+3\n", "5"), ("4+5\n", "9")]
         for input_str, expected in test_cases:
-            result = "".join(model.generate(input_str, ref_token="<ref>"))
+            result = "".join(model.generate(input_str))
             assert (
                 result == expected
             ), f"{input_str}: expected {expected!r}, got {result!r}"
@@ -252,7 +252,7 @@ def test_token_onnx_autoregressive_3digit():
             ("456+123\n", "579"),
         ]
         for input_str, expected in test_cases:
-            result = "".join(model.generate(input_str, ref_token="<ref>"))
+            result = "".join(model.generate(input_str))
             assert (
                 result == expected
             ), f"{input_str}: expected {expected!r}, got {result!r}"
@@ -332,7 +332,7 @@ def test_token_onnx_artifact_fields_load_and_generate():
 
         model = artifact.load()
         assert isinstance(model, OnnxTokenModule)
-        assert "".join(model.generate("2+3\n", ref_token="<ref>")) == "5"
+        assert "".join(model.generate("2+3\n")) == "5"
 
 
 def test_token_onnx_extra_metadata_roundtrip():

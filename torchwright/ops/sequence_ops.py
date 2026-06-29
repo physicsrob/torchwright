@@ -66,10 +66,6 @@ class NumericSequence:
         rope: RoPE config for the rotary offset / recency attention ops.
         embedding: Embedding table (must contain "0"-"9").
         digits: Number of digits to track in the sliding window.
-        recency_rank: length-1 monotone recency ramp (built once per graph via
-            :func:`~torchwright.ops.recency_heads.recency_rank` from the graph's
-            BOS / REF markers) — drives :func:`get_prev_value`'s most-recent
-            selection in :meth:`get_digits_at_event`.
     """
 
     def __init__(
@@ -77,10 +73,8 @@ class NumericSequence:
         rope: RopeConfig,
         embedding: Embedding,
         digits: int,
-        recency_rank: Node,
     ):
         self.rope = rope
-        self.recency_rank = recency_rank
         zero_constant = create_literal_value(embedding.get_embedding("0"))
         is_digit = check_is_digit(embedding)
 
@@ -120,7 +114,7 @@ class NumericSequence:
             List of embedding-valued digit nodes, MSB-first.
         """
         return [
-            get_prev_value(self.rope, digit, termination_event, self.recency_rank)
+            get_prev_value(self.rope, digit, termination_event)
             for digit in reversed(self.digit_values)
         ]
 
@@ -130,7 +124,6 @@ def output_sequence(
     trigger_condition: Node,
     seq: List[Node],
     default_output: torch.Tensor,
-    recency_rank: Node,
 ):
     """Gate a sequence of values for left-to-right autoregressive emission.
 
@@ -145,13 +138,12 @@ def output_sequence(
         trigger_condition: Boolean node — emission starts when this is true.
         seq: List of embedding-valued nodes to emit in order.
         default_output: Tensor to output before the trigger fires.
-        recency_rank: length-1 monotone recency ramp (see :class:`NumericSequence`)
-            driving the "has the trigger fired yet" latch.
     """
-    # has_triggered is true at all positions from the trigger onward.
-    has_triggered = get_prev_value(
-        rope, trigger_condition, trigger_condition, recency_rank
-    )
+    # has_triggered is true at all positions from the trigger onward.  The
+    # trigger fires once, so this is a single-match get_prev_value: the content
+    # gate selects that one key regardless of distance (local recency only ranks
+    # *among* matches), so the latch holds for the whole rollout.
+    has_triggered = get_prev_value(rope, trigger_condition, trigger_condition)
 
     out_values = []
     for i, value in enumerate(seq):

@@ -1,7 +1,7 @@
 {
   "schema_version": 1,
-  "commit": "2e04d93",
-  "measured_at": "2026-06-02",
+  "commit": "aafc5f3",
+  "measured_at": "2026-06-29",
   "ops": [
     {
       "name": "abs",
@@ -233,11 +233,11 @@
           "description": "exp(x) over [-5, 5] — output spans [exp(-5), exp(5)] ≈ [0.0067, 148.4], the natural pairing for log over [0.01, 100]. Uniform 256-BP grid (`Δx ≈ 0.0392`); per-cell relative-error bound is `(Δx)²/8 ≈ 1.9e-4`.",
           "n_samples": 4096,
           "max_abs_error": 0.0279694,
-          "mean_abs_error": 0.00171612,
+          "mean_abs_error": 0.00171608,
           "p99_abs_error": 0.0209377,
-          "max_rel_error": 0.00019238,
-          "mean_rel_error": 0.000120446,
-          "p99_rel_error": 0.000192204,
+          "max_rel_error": 0.000192375,
+          "mean_rel_error": 0.000120445,
+          "p99_rel_error": 0.000192209,
           "rel_valid_samples": 4096,
           "worst_input": {
             "x": 4.98001
@@ -292,14 +292,14 @@
           "description": "16-bin quantisation of x ∈ [0, 64] with x_min=0, x_max=64.",
           "n_samples": 4096,
           "max_abs_error": 1.0,
-          "mean_abs_error": 0.0630863,
-          "p99_abs_error": 0.6875,
-          "max_rel_error": 0.985352,
-          "mean_rel_error": 0.0133874,
-          "p99_rel_error": 0.224121,
+          "mean_abs_error": 0.0747671,
+          "p99_abs_error": 0.921875,
+          "max_rel_error": 1.0,
+          "mean_rel_error": 0.0152883,
+          "p99_rel_error": 0.246094,
           "rel_valid_samples": 3715,
           "worst_input": {
-            "x": 59.9995,
+            "x": 7.99831,
             "x_min": 0.0,
             "x_max": 64.0
           }
@@ -315,12 +315,12 @@
           "name": "log_4decades_001_100",
           "description": "log(x) over [0.01, 100] — 4 decades. With per-decade sectioning (default), each section's pre-cancellation magnitude is bounded by `section_factor=10`, so float32 ULP noise is ~1.2e-6 per section. The dominant residual error comes from the multiply_2d blending grid in routing.",
           "n_samples": 4096,
-          "max_abs_error": 0.000247478,
-          "mean_abs_error": 0.000111867,
-          "p99_abs_error": 0.000168088,
-          "max_rel_error": 0.00370548,
-          "mean_rel_error": 4.2368e-05,
-          "p99_rel_error": 0.000263829,
+          "max_abs_error": 0.000247955,
+          "mean_abs_error": 0.000111881,
+          "p99_abs_error": 0.000167853,
+          "max_rel_error": 0.00371932,
+          "mean_rel_error": 4.23695e-05,
+          "p99_rel_error": 0.000264197,
           "rel_valid_samples": 4096,
           "worst_input": {
             "x": 0.0179683
@@ -330,15 +330,15 @@
           "name": "log_6decades_wide",
           "description": "log(x) over [0.01, 30000] — 6 decades. Stresses the sectioning path: a single-section piecewise log over this range fails outright (cancellation floor `(x_max/x_min) · 2⁻²³ ≈ 0.36 absolute, observed worst ~1.0 abs). Sectioning drops the floor to ~5e-3 absolute, dominated by compare-cancellation noise at large `x` propagating through multiply_2d blending.",
           "n_samples": 4096,
-          "max_abs_error": 0.00302315,
-          "mean_abs_error": 0.00152277,
-          "p99_abs_error": 0.00279686,
-          "max_rel_error": 0.00114823,
-          "mean_rel_error": 0.000169627,
-          "p99_rel_error": 0.000398892,
+          "max_abs_error": 0.00315189,
+          "mean_abs_error": 0.00154114,
+          "p99_abs_error": 0.00281918,
+          "max_rel_error": 0.00115095,
+          "mean_rel_error": 0.000171528,
+          "p99_rel_error": 0.000407437,
           "rel_valid_samples": 4096,
           "worst_input": {
-            "x": 27070.5
+            "x": 16817.4
           }
         }
       ]
@@ -352,15 +352,15 @@
           "name": "log_abs_3decades_pm100",
           "description": "log_abs(x) for x ∈ [-100, 100] with min_abs=0.1, max_abs=100 (3 decades on |x|). Signed log-uniform |x| samples plus a V-bottom grid concentrated in [-0.2, 0.2] to stress the flat-zone transition at ±min_abs. Single-piecewise path (ratio 1000 < single-piecewise threshold).",
           "n_samples": 4096,
-          "max_abs_error": 0.000699043,
-          "mean_abs_error": 0.000252403,
-          "p99_abs_error": 0.000462079,
-          "max_rel_error": 0.142801,
-          "mean_rel_error": 0.000631795,
-          "p99_rel_error": 0.00778941,
+          "max_abs_error": 0.00060606,
+          "mean_abs_error": 0.000251085,
+          "p99_abs_error": 0.000429201,
+          "max_rel_error": 0.142606,
+          "mean_rel_error": 0.000631695,
+          "p99_rel_error": 0.00773819,
           "rel_valid_samples": 4096,
           "worst_input": {
-            "x": 87.1548
+            "x": 77.7515
           }
         }
       ]
@@ -374,12 +374,12 @@
           "name": "atan_cross_dot_nonuniform",
           "description": "atan2(cross/dot) over [-2, 2] × [0.5, 10] on a non-uniform grid — rank-3 SVD via `low_rank_2d`.",
           "n_samples": 4096,
-          "max_abs_error": 0.0651015,
+          "max_abs_error": 0.0651017,
           "mean_abs_error": 0.0158553,
-          "p99_abs_error": 0.0574396,
-          "max_rel_error": 0.331451,
+          "p99_abs_error": 0.0574395,
+          "max_rel_error": 0.331317,
           "mean_rel_error": 0.0803216,
-          "p99_rel_error": 0.21716,
+          "p99_rel_error": 0.217159,
           "rel_valid_samples": 4096,
           "worst_input": {
             "a": -2.0,
@@ -466,10 +466,10 @@
           "description": "a·b over [-10, 10]² with step=1 — generic uniform product grid; analytical bound `step1*step2/4 = 0.25`.",
           "n_samples": 4096,
           "max_abs_error": 0.0624883,
-          "mean_abs_error": 0.0201983,
-          "p99_abs_error": 0.0584726,
+          "mean_abs_error": 0.0201981,
+          "p99_abs_error": 0.0584574,
           "max_rel_error": 2.14985,
-          "mean_rel_error": 0.00729313,
+          "mean_rel_error": 0.00729308,
           "p99_rel_error": 0.0661755,
           "rel_valid_samples": 4096,
           "worst_input": {
@@ -511,7 +511,7 @@
           "name": "parabola_0_10_step1",
           "description": "f(x)=x² on [0, 10] with integer breakpoints — probes generic `piecewise_linear` precision between grid points.",
           "n_samples": 4096,
-          "max_abs_error": 0.250008,
+          "max_abs_error": 0.250004,
           "mean_abs_error": 0.163799,
           "p99_abs_error": 0.249977,
           "max_rel_error": 231.114,
@@ -519,7 +519,7 @@
           "p99_rel_error": 11.396,
           "rel_valid_samples": 4094,
           "worst_input": {
-            "x": 8.49967
+            "x": 6.49947
           }
         }
       ]
@@ -533,12 +533,12 @@
           "name": "diff_trig_nonuniform",
           "description": "Two-input product over DIFF_BP × TRIG_BP — DIFF in [-40, 40] (non-uniform), TRIG in [-1, 1] (non-uniform).",
           "n_samples": 4096,
-          "max_abs_error": 7.77784,
+          "max_abs_error": 7.77785,
           "mean_abs_error": 1.30067,
           "p99_abs_error": 6.54323,
-          "max_rel_error": 0.601363,
-          "mean_rel_error": 0.117966,
-          "p99_rel_error": 0.35001,
+          "max_rel_error": 0.60163,
+          "mean_rel_error": 0.117967,
+          "p99_rel_error": 0.350006,
           "rel_valid_samples": 4096,
           "worst_input": {
             "a": 22.2222,
@@ -550,11 +550,11 @@
           "description": "Two-input product over DIFF_BP × VEL_BP — DIFF in [-40, 40] (non-uniform), VEL in [-0.7, 0.7] (non-uniform).",
           "n_samples": 4096,
           "max_abs_error": 5.44453,
-          "mean_abs_error": 0.93746,
+          "mean_abs_error": 0.937458,
           "p99_abs_error": 4.72484,
-          "max_rel_error": 0.602409,
-          "mean_rel_error": 0.123235,
-          "p99_rel_error": 0.35002,
+          "max_rel_error": 0.601709,
+          "mean_rel_error": 0.123236,
+          "p99_rel_error": 0.350014,
           "rel_valid_samples": 4096,
           "worst_input": {
             "a": 22.2222,
@@ -572,15 +572,15 @@
           "name": "reciprocal_03_200",
           "description": "1/x over [0.3, 200.0], step=1.0.",
           "n_samples": 4096,
-          "max_abs_error": 0.000913722,
-          "mean_abs_error": 0.000126387,
-          "p99_abs_error": 0.000580514,
-          "max_rel_error": 0.16856,
-          "mean_rel_error": 0.0164945,
-          "p99_rel_error": 0.102703,
+          "max_abs_error": 0.000824451,
+          "mean_abs_error": 0.000113957,
+          "p99_abs_error": 0.000477473,
+          "max_rel_error": 0.136051,
+          "mean_rel_error": 0.0144352,
+          "p99_rel_error": 0.078974,
           "rel_valid_samples": 4096,
           "worst_input": {
-            "x": 160.06
+            "x": 0.315914
           }
         }
       ]
@@ -595,7 +595,7 @@
           "description": "a·b over [-10, 10]² via polarization identity, step=1.0 — analytical bound `step × (max_abs1 + max_abs2) / 4 = 5.0` absolute, much smaller relative.",
           "n_samples": 4096,
           "max_abs_error": 0.062484,
-          "mean_abs_error": 0.0201977,
+          "mean_abs_error": 0.0201976,
           "p99_abs_error": 0.0584545,
           "max_rel_error": 2.15001,
           "mean_rel_error": 0.00729324,
@@ -609,30 +609,6 @@
       ]
     },
     {
-      "name": "soft_blend",
-      "module": "torchwright.ops.map_select",
-      "notes": "Bounded crisp-handoff switch: median(raw, min(t,f), max(t,f)) with raw = broadcast_select's carrier core (no -M bias). Crisp cond returns t/f exactly; soft cond stays in-box; the min/max clamp restores in-box-ness on same-sign overshoot. Noise is the PL error of the linear-relu-linear core plus the two min/max clamp ops. M=2.0 (safety 2.0 x bound 1.0).",
-      "distributions": [
-        {
-          "name": "soft_blend_boundary",
-          "description": "Mixed crisp/soft conditions with t,f in [-1,1]; a grid concentrating on soft cond with t≈f (octant boundary) and same-sign t,f (carrier overshoot, clamp load-bearing).",
-          "n_samples": 4096,
-          "max_abs_error": 1.19209e-07,
-          "mean_abs_error": 1.26943e-09,
-          "p99_abs_error": 5.96046e-08,
-          "max_rel_error": 1.67157e-07,
-          "mean_rel_error": 2.67301e-09,
-          "p99_rel_error": 9.36412e-08,
-          "rel_valid_samples": 4096,
-          "worst_input": {
-            "cond": 0.0445098,
-            "t": 0.712157,
-            "f": 0.713157
-          }
-        }
-      ]
-    },
-    {
       "name": "square",
       "module": "torchwright.ops.arithmetic_ops",
       "notes": "Always an underestimate of x² between grid points. Max segment error is `(step/2)²` at half-integers.",
@@ -641,7 +617,7 @@
           "name": "square_unsigned_0_10",
           "description": "x² over [0, 10] with step=1.0 — exact at integers, worst error at half-integers.",
           "n_samples": 4096,
-          "max_abs_error": 0.250008,
+          "max_abs_error": 0.250004,
           "mean_abs_error": 0.163799,
           "p99_abs_error": 0.249977,
           "max_rel_error": 231.114,
@@ -649,7 +625,7 @@
           "p99_rel_error": 11.396,
           "rel_valid_samples": 4094,
           "worst_input": {
-            "x": 8.49967
+            "x": 6.49947
           }
         }
       ]
@@ -663,15 +639,15 @@
           "name": "square_signed_pm10",
           "description": "x² over [-10, 10] with step=1.0 — covers the negative half the unsigned variant cannot reach.",
           "n_samples": 4096,
-          "max_abs_error": 0.25005,
+          "max_abs_error": 0.250023,
           "mean_abs_error": 0.163952,
           "p99_abs_error": 0.249971,
           "max_rel_error": 276.695,
-          "mean_rel_error": 0.748853,
-          "p99_rel_error": 13.2382,
+          "mean_rel_error": 0.748596,
+          "p99_rel_error": 13.238,
           "rel_valid_samples": 4096,
           "worst_input": {
-            "x": 7.50228
+            "x": 9.49681
           }
         }
       ]

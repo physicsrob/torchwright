@@ -23,7 +23,6 @@ from torchwright.ops.inout_nodes import (
 )
 from torchwright.ops.logic_ops import equals_vector
 from torchwright.ops.embedding_arithmetic import sum_digit_seqs
-from torchwright.ops.recency_heads import recency_rank_from_tokens
 from torchwright.ops.sequence_ops import (
     NumericSequence,
     output_sequence,
@@ -42,18 +41,15 @@ def create_network_parts() -> Tuple[Node, Embedding]:
     """Build the 3-digit adder graph and return (output_node, embedding)."""
     vocab = list(
         " 0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ!@#$%^&*()-+="
-    ) + ["\n", "<bos>", "<ref>", "<eos>", "default"]
+    ) + ["\n", "<bos>", "<eos>", "default"]
     embedding = create_embedding(vocab=vocab)
     rope = create_rope_config(d_head=D_HEAD, max_positions=MAX_POSITIONS)
 
-    # Bucket-2 recency rank from the <bos>/<ref> markers — replaces the old
-    # position counter that drove "most recent" selection.
-    recency_rank = recency_rank_from_tokens(rope, embedding)
-
     # --- Phase 1: Parse operand digits from the token stream ---
     # NumericSequence tracks a sliding window of digits as tokens arrive.
-    # get_digits_at_event captures the window when the trigger token appears.
-    num_seq = NumericSequence(rope, embedding, max_digits, recency_rank)
+    # get_digits_at_event captures the window when the trigger token appears
+    # (recency is the intrinsic rotary lobe — no rank node, local-only).
+    num_seq = NumericSequence(rope, embedding, max_digits)
 
     is_end_of_first_num = equals_vector(
         inp=embedding, vector=embedding.get_embedding("+")
@@ -77,7 +73,6 @@ def create_network_parts() -> Tuple[Node, Embedding]:
         is_end_of_second_num,
         sum_digits,
         embedding.get_embedding(" "),
-        recency_rank,
     )
     return output_node, embedding
 

@@ -26,7 +26,6 @@ app = modal.App("torchwright-test", image=IMAGE)
 # New test files are caught by the catch-all shard automatically.
 
 _HEAVY_FILES: list[str] = [
-    "tests/compile/forward/test_most_recent_long_span.py",
     # The deepest token model (d=3072, 96 heads, chain-of-thought transcript) —
     # its own container.  RoPE recency graphs compile far deeper than the old
     # counter scheme, so the example/calculator tests are now the wall-time
@@ -74,11 +73,10 @@ _MEDIUM_FILE_GROUPS: list[list[str]] = [
         "tests/hf/test_rope_self_match_token.py",
         "tests/hf/test_calculator_parity.py",
     ],
-    # RoPE capability compiles (recency ramp, content slow-planes, offset).
+    # RoPE capability compiles (local recency lobe, content slow-planes, offset).
     [
-        "tests/compile/forward/test_rope_recency_e2e.py",
+        "tests/compile/forward/test_rope_local_recency.py",
         "tests/compile/forward/test_rope_content_slow_planes.py",
-        "tests/compile/forward/test_recency_ramp_compiled.py",
         "tests/compile/forward/test_rope_offset.py",
         "tests/compile/forward/test_rope_offset_all_deltas.py",
         "tests/compile/forward/test_bucketed_argmin.py",

@@ -35,7 +35,6 @@ from torchwright.ops.inout_nodes import (
     create_unembedding,
 )
 from torchwright.ops.logic_ops import equals_vector
-from torchwright.ops.recency_heads import recency_rank_from_tokens
 from torchwright.ops.scalar_encoding import (
     digits_to_number,
     number_to_digit_scalars,
@@ -70,14 +69,10 @@ def create_network_parts(
     vocab = list("0123456789 abcdefghijklmnopqrstuvwxyz") + [
         "\n",
         "<bos>",
-        "<ref>",
         "<eos>",
     ]
     embedding = create_embedding(vocab=vocab)
     rope = create_rope_config(d_head=D_HEAD, max_positions=MAX_POSITIONS)
-    # Bucket-2 recency rank from the <bos>/<ref> markers — drives the
-    # "has the trigger fired" latch inside output_sequence.
-    recency_rank = recency_rank_from_tokens(rope, embedding)
     embed = embedding.get_embedding
 
     is_trigger = equals_vector(embedding, embed("\n"))
@@ -135,7 +130,6 @@ def create_network_parts(
         is_trigger,
         all_tokens,
         embed(" "),
-        recency_rank,
     )
     return output_node, embedding
 

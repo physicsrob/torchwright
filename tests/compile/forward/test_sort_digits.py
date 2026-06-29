@@ -11,8 +11,7 @@ see ``docs/rope_port_plan.md`` §8 Phase 1 / §11.)
 
 The sort example emits its sorted output starting at the trigger position
 (the ``"\\n"``), with no guaranteed ``<eos>``, so each rollout is capped at
-``len(input)`` decoded tokens.  V1 ranks recency via the bucket-2 octant ramp,
-so it needs the ``<ref>`` marker at position 1.
+``len(input)`` decoded tokens.
 """
 
 import pytest
@@ -27,7 +26,6 @@ def _check_case(model, input_str: str, expected: str):
         model,
         input_str + "\n",
         bos_token="<bos>",
-        ref_token="<ref>",
         max_new_tokens=len(input_str),
     )
     assert (

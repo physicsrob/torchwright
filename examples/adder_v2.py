@@ -26,7 +26,6 @@ from torchwright.ops.inout_nodes import (
     create_unembedding,
 )
 from torchwright.ops.logic_ops import equals_vector
-from torchwright.ops.recency_heads import recency_rank_from_tokens
 from torchwright.ops.scalar_encoding import (
     digits_to_number,
     number_to_digit_scalars,
@@ -54,16 +53,12 @@ def create_network(max_digits: int = 3) -> Unembedding:
     """
     vocab = list(
         " 0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ!@#$%^&*()-+="
-    ) + ["\n", "<bos>", "<ref>", "<eos>", "default"]
+    ) + ["\n", "<bos>", "<eos>", "default"]
     embedding = create_embedding(vocab=vocab)
     rope = create_rope_config(d_head=D_HEAD, max_positions=MAX_POSITIONS)
 
-    # Bucket-2 recency rank from the <bos>/<ref> markers — replaces the old
-    # position counter that drove "most recent" selection.
-    recency_rank = recency_rank_from_tokens(rope, embedding)
-
     # --- Phase 1: Parse operand digits from the token stream ---
-    num_seq = NumericSequence(rope, embedding, max_digits, recency_rank)
+    num_seq = NumericSequence(rope, embedding, max_digits)
 
     is_end_of_first_num = equals_vector(
         inp=embedding, vector=embedding.get_embedding("+")
@@ -99,7 +94,6 @@ def create_network(max_digits: int = 3) -> Unembedding:
             is_end_of_second_num,
             result_digits,
             embedding.get_embedding(" "),
-            recency_rank,
         ),
         embedding,
     )

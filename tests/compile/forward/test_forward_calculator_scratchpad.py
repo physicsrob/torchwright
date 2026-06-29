@@ -42,9 +42,8 @@ def _answer(model, prompt):
     proves the trim works.
     """
     # Full transcript is at most 8n+3 tokens (multiply, incl. the scratch-digit
-    # region); 32 clears it for n=3 with margin.  ref_token="<ref>": recency
-    # example — <ref> must land at position 1 for the RoPE recency rank.
-    text = run(model, prompt, max_new_tokens=32, ref_token="<ref>")
+    # region); 32 clears it for n=3 with margin.
+    text = run(model, prompt, max_new_tokens=32)
     assert RESULT in text, f"no {RESULT!r} in decoded output {text!r}"
     return text.split(RESULT, 1)[1]
 

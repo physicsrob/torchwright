@@ -23,8 +23,9 @@ def binary_increment(tmp_path_factory):
 
 def test_binary_increment(binary_increment):
     model, artifact = binary_increment
-    # RoPE recency (octant ramp + two graded heads) is deeper than the old
-    # counter column, so this budget is above the pre-RoPE 40 (observed 60).
+    # RoPE local recency is a single rotary head (intrinsic distance-decay lobe,
+    # shallower than the deleted octant ramp; docs/rope_port_plan.md Phase 6) —
+    # comfortable upper bound with margin.
     assert artifact.n_layers <= 64, f"Too many layers: {artifact.n_layers}"
 
     test_cases = [
@@ -42,7 +43,7 @@ def test_binary_increment(binary_increment):
         ("1111", "10000"),
     ]
     for binary_in, expected in test_cases:
-        result = run(model, binary_in + "\n", bos_token="<bos>", ref_token="<ref>")
+        result = run(model, binary_in + "\n", bos_token="<bos>")
         assert (
             result == expected
         ), f"For {binary_in!r}: expected {expected!r} but got {result!r}"
