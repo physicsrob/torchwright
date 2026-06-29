@@ -267,7 +267,6 @@ def test_multiply_2d_probe():
     # Compiled check
     report = probe_graph(
         node,
-        pos_encoding=None,
         input_values=inputs,
         n_pos=n_pos,
         d=512,
@@ -303,9 +302,7 @@ def test_multiply_2d_build_is_linear_in_breakpoints():
 
     tracemalloc.start()
     t0 = time.perf_counter()
-    node = multiply_2d(
-        a, b, max_abs1=max_abs, max_abs2=max_abs, step1=step, step2=step
-    )
+    node = multiply_2d(a, b, max_abs1=max_abs, max_abs2=max_abs, step1=step, step2=step)
     elapsed = time.perf_counter() - t0
     _cur, peak = tracemalloc.get_traced_memory()
     tracemalloc.stop()
@@ -328,9 +325,9 @@ def test_multiply_2d_build_is_linear_in_breakpoints():
         ).item()
         expected = x * y
         # Bilinear interpolation error bound is step²/4 at this grid.
-        assert abs(result - expected) < step * step / 4 + 1.0, (
-            f"{x}*{y} = {expected}, got {result}"
-        )
+        assert (
+            abs(result - expected) < step * step / 4 + 1.0
+        ), f"{x}*{y} = {expected}, got {result}"
 
 
 def test_multiply_2d_chunks_across_d_max():
@@ -342,9 +339,7 @@ def test_multiply_2d_chunks_across_d_max():
     """
     a = create_input("a", 1)
     b = create_input("b", 1)
-    node = multiply_2d(
-        a, b, max_abs1=5.0, max_abs2=5.0, step1=1.0, step2=1.0, d_max=4
-    )
+    node = multiply_2d(a, b, max_abs1=5.0, max_abs2=5.0, step1=1.0, step2=1.0, d_max=4)
     for x in range(-5, 6):
         for y in range(-5, 6):
             result = node.compute(

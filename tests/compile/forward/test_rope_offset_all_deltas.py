@@ -18,7 +18,8 @@ import torch
 from torchwright.compiler.export import compile_headless
 from torchwright.debug.probe import probe_compiled
 from torchwright.graph.rope import rotary_offset_head
-from torchwright.ops.inout_nodes import create_input, create_pos_encoding
+from torchwright.ops.attention_ops import attend_to_offset
+from torchwright.ops.inout_nodes import create_input, create_rope_config
 
 N_POS = 16
 D = 256
@@ -39,12 +40,12 @@ def _payload(n_pos: int) -> torch.Tensor:
 def test_rotary_offset_token_identical_to_trig(delta):
     """Oracle: the rotary head selects the same key as trig ``attend_to_offset``
     at every in-bounds position — the sign-convention lock across all Δ."""
-    pos = create_pos_encoding()
+    rope = create_rope_config(d_head=D_HEAD, max_positions=512)
     payload = create_input("payload", 1)
     vals = _payload(N_POS)
 
-    rotary = rotary_offset_head(payload, delta_pos=delta)
-    trig = pos.attend_to_offset(payload, delta_pos=delta)
+    rotary = rotary_offset_head(payload, delta_pos=delta, d_qk=D_HEAD)
+    trig = attend_to_offset(rope, payload, delta_pos=delta)
 
     rotary_out = rotary.compute(N_POS, {"payload": vals}).squeeze(1)
     trig_out = trig.compute(N_POS, {"payload": vals}).squeeze(1)
@@ -60,12 +61,11 @@ def test_rotary_offset_token_identical_to_trig(delta):
 def test_rotary_offset_compiled_matches_oracle_all_deltas(delta):
     """probe_compiled: the compiled rotary head matches its oracle at
     representative backward, wider-backward, and forward Δ."""
-    pos = create_pos_encoding()
     payload = create_input("payload", 1)
     vals = _payload(N_POS)
-    rotary = rotary_offset_head(payload, delta_pos=delta)
+    rotary = rotary_offset_head(payload, delta_pos=delta, d_qk=D_HEAD)
 
-    compiled = compile_headless(rotary, pos, d=D, d_head=D_HEAD, verbose=False)
+    compiled = compile_headless(rotary, d=D, d_head=D_HEAD, verbose=False)
     report = probe_compiled(compiled, rotary, {"payload": vals}, N_POS, atol=1e-2)
     assert report.first_divergent is None, report.format_short()
 
@@ -77,17 +77,16 @@ def test_rotary_offset_sign_is_directional():
     but the two heads must not produce identical output — that would mean the
     sign collapsed.
     """
-    pos = create_pos_encoding()
     payload = create_input("payload", 1)
     vals = _payload(N_POS)
 
     back = (
-        rotary_offset_head(payload, delta_pos=-1)
+        rotary_offset_head(payload, delta_pos=-1, d_qk=D_HEAD)
         .compute(N_POS, {"payload": vals})
         .squeeze(1)
     )
     fwd = (
-        rotary_offset_head(payload, delta_pos=1)
+        rotary_offset_head(payload, delta_pos=1, d_qk=D_HEAD)
         .compute(N_POS, {"payload": vals})
         .squeeze(1)
     )

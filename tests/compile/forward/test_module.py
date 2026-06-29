@@ -34,10 +34,10 @@ def _build_1digit():
     original = adder_module.max_digits
     try:
         adder_module.max_digits = 1
-        output_node, pos_encoding, embedding = create_network_parts()
+        output_node, embedding = create_network_parts()
     finally:
         adder_module.max_digits = original
-    return output_node, pos_encoding, embedding
+    return output_node, embedding
 
 
 def _discover_meta(session, onnx_path):
@@ -83,7 +83,7 @@ def _feeds(token_ids: np.ndarray, past_k, past_v, base: int) -> dict:
     return feeds
 
 
-def _reference_logits(output_node, pos_encoding, embedding, tokens):
+def _reference_logits(output_node, embedding, tokens):
     """Run compute() and return full logits (seq_len, vocab_size).
 
     Applies the same ``out_emb @ embedding.table.T`` unembed as the ONNX
@@ -94,7 +94,6 @@ def _reference_logits(output_node, pos_encoding, embedding, tokens):
         d=D,
         d_head=D_HEAD,
         output_node=output_node,
-        pos_encoding=pos_encoding,
         verbose=False,
     )
     result = net.compute(
@@ -111,13 +110,12 @@ def _reference_logits(output_node, pos_encoding, embedding, tokens):
 
 
 def test_token_onnx_prefill_matches_compute():
-    output_node, pos_encoding, embedding = _build_1digit()
+    output_node, embedding = _build_1digit()
 
     with tempfile.TemporaryDirectory() as tmpdir:
         onnx_path = os.path.join(tmpdir, "adder.onnx")
         compile_to_onnx(
             output_node,
-            pos_encoding,
             embedding,
             onnx_path,
             d=D,
@@ -126,7 +124,7 @@ def test_token_onnx_prefill_matches_compute():
         )
 
         tokens = ["<bos>", "1", "+", "2", "\n"]
-        ref_logits = _reference_logits(output_node, pos_encoding, embedding, tokens)
+        ref_logits = _reference_logits(output_node, embedding, tokens)
 
         session = onnxruntime.InferenceSession(onnx_path)
         n_layers, per_layer_n_heads, d_head, S = _discover_meta(session, onnx_path)
@@ -148,13 +146,12 @@ def test_token_onnx_prefill_matches_compute():
 
 
 def test_token_onnx_decode_step_matches_full_prefill():
-    output_node, pos_encoding, embedding = _build_1digit()
+    output_node, embedding = _build_1digit()
 
     with tempfile.TemporaryDirectory() as tmpdir:
         onnx_path = os.path.join(tmpdir, "adder.onnx")
         compile_to_onnx(
             output_node,
-            pos_encoding,
             embedding,
             onnx_path,
             d=D,
@@ -203,13 +200,12 @@ def test_token_onnx_decode_step_matches_full_prefill():
 def test_token_onnx_autoregressive_1digit():
     from torchwright.compiler.onnx_load import load_onnx
 
-    output_node, pos_encoding, embedding = _build_1digit()
+    output_node, embedding = _build_1digit()
 
     with tempfile.TemporaryDirectory() as tmpdir:
         onnx_path = os.path.join(tmpdir, "adder.onnx")
         compile_to_onnx(
             output_node,
-            pos_encoding,
             embedding,
             onnx_path,
             d=D,
@@ -220,7 +216,7 @@ def test_token_onnx_autoregressive_1digit():
         model = load_onnx(onnx_path)
         test_cases = [("1+1\n", "2"), ("2+3\n", "5"), ("4+5\n", "9")]
         for input_str, expected in test_cases:
-            result = "".join(model.generate(input_str))
+            result = "".join(model.generate(input_str, ref_token="<ref>"))
             assert (
                 result == expected
             ), f"{input_str}: expected {expected!r}, got {result!r}"
@@ -234,13 +230,12 @@ def test_token_onnx_autoregressive_1digit():
 def test_token_onnx_autoregressive_3digit():
     from torchwright.compiler.onnx_load import load_onnx
 
-    output_node, pos_encoding, embedding = create_network_parts()
+    output_node, embedding = create_network_parts()
 
     with tempfile.TemporaryDirectory() as tmpdir:
         onnx_path = os.path.join(tmpdir, "adder3.onnx")
         compile_to_onnx(
             output_node,
-            pos_encoding,
             embedding,
             onnx_path,
             d=D,
@@ -257,7 +252,7 @@ def test_token_onnx_autoregressive_3digit():
             ("456+123\n", "579"),
         ]
         for input_str, expected in test_cases:
-            result = "".join(model.generate(input_str))
+            result = "".join(model.generate(input_str, ref_token="<ref>"))
             assert (
                 result == expected
             ), f"{input_str}: expected {expected!r}, got {result!r}"
@@ -271,13 +266,12 @@ def test_token_onnx_autoregressive_3digit():
 def test_token_onnx_sidecar_schema_and_metadata():
     from torchwright.compiler.onnx_load import OnnxTokenModule, load_onnx
 
-    output_node, pos_encoding, embedding = _build_1digit()
+    output_node, embedding = _build_1digit()
 
     with tempfile.TemporaryDirectory() as tmpdir:
         onnx_path = os.path.join(tmpdir, "adder.onnx")
         compile_to_onnx(
             output_node,
-            pos_encoding,
             embedding,
             onnx_path,
             d=D,
@@ -308,13 +302,12 @@ def test_token_onnx_artifact_fields_load_and_generate():
     from torchwright.compiler.export import debug_meta_path_for
     from torchwright.compiler.onnx_load import OnnxTokenModule
 
-    output_node, pos_encoding, embedding = _build_1digit()
+    output_node, embedding = _build_1digit()
 
     with tempfile.TemporaryDirectory() as tmpdir:
         onnx_path = os.path.join(tmpdir, "adder.onnx")
         artifact = compile_to_onnx(
             output_node,
-            pos_encoding,
             embedding,
             onnx_path,
             d=D,
@@ -339,21 +332,20 @@ def test_token_onnx_artifact_fields_load_and_generate():
 
         model = artifact.load()
         assert isinstance(model, OnnxTokenModule)
-        assert "".join(model.generate("2+3\n")) == "5"
+        assert "".join(model.generate("2+3\n", ref_token="<ref>")) == "5"
 
 
 def test_token_onnx_extra_metadata_roundtrip():
     from torchwright.compiler.onnx_load import load_onnx
     from torchwright.debug.onnx_debug import OnnxDebugSession
 
-    output_node, pos_encoding, embedding = _build_1digit()
+    output_node, embedding = _build_1digit()
     extra = {"rows_per_patch": 7, "note": "hello"}
 
     with tempfile.TemporaryDirectory() as tmpdir:
         onnx_path = os.path.join(tmpdir, "adder.onnx")
         compile_to_onnx(
             output_node,
-            pos_encoding,
             embedding,
             onnx_path,
             d=D,
@@ -375,19 +367,18 @@ def test_token_onnx_extra_metadata_roundtrip():
         assert model.metadata == extra
 
         # ...and by the debug session (full sidecar dict there).
-        out2, pos2, _emb2 = _build_1digit()
-        sess = OnnxDebugSession(onnx_path, out2, pos2)
+        out2, _emb2 = _build_1digit()
+        sess = OnnxDebugSession(onnx_path, out2)
         assert sess.metadata["extra"] == extra
 
 
 def test_token_onnx_meta_has_no_extra_key_when_omitted():
-    output_node, pos_encoding, embedding = _build_1digit()
+    output_node, embedding = _build_1digit()
 
     with tempfile.TemporaryDirectory() as tmpdir:
         onnx_path = os.path.join(tmpdir, "adder.onnx")
         compile_to_onnx(
             output_node,
-            pos_encoding,
             embedding,
             onnx_path,
             d=D,
@@ -397,7 +388,9 @@ def test_token_onnx_meta_has_no_extra_key_when_omitted():
         with open(meta_path_for(onnx_path)) as f:
             meta = json.load(f)
         assert "extra" not in meta
-        assert set(meta) == {"format", "vocab", "cache_stride"}
+        # rope_base is present for every rotary model (every model post-RoPE-port);
+        # "extra" (asserted absent above) is the optional key this guards against.
+        assert set(meta) == {"format", "vocab", "cache_stride", "rope_base"}
 
 
 # ===========================================================================
@@ -425,12 +418,11 @@ def _ids(embedding, tokens):
 def adder_artifact(tmp_path_factory):
     """A compiled 1-digit adder token artifact (max_seq_len=32) shared by the
     cached-protocol self-consistency tests below."""
-    output_node, pos_encoding, embedding = _build_1digit()
+    output_node, embedding = _build_1digit()
     tmpdir = str(tmp_path_factory.mktemp("token_onnx_proto"))
     onnx_path = os.path.join(tmpdir, "adder.onnx")
     compile_to_onnx(
         output_node,
-        pos_encoding,
         embedding,
         onnx_path,
         d=D,
@@ -579,11 +571,10 @@ def test_token_onnx_module_empty_past_shape(adder_artifact):
 
 
 def _export_token(tmpdir, name="model.onnx", trim_heads=True):
-    output_node, pos_encoding, embedding = _build_1digit()
+    output_node, embedding = _build_1digit()
     onnx_path = os.path.join(tmpdir, name)
     compile_to_onnx(
         output_node,
-        pos_encoding,
         embedding,
         onnx_path,
         d=D,

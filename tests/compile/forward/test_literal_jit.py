@@ -26,10 +26,11 @@ from torchwright.compiler.forward.compile import forward_compile
 from torchwright.compiler.forward.graph_analysis import GraphAnalyzer
 from torchwright.graph import Linear
 from torchwright.ops.arithmetic_ops import add, concat
+from torchwright.ops.attention_ops import attend_to_offset
 from torchwright.ops.inout_nodes import (
     create_input,
     create_literal_value,
-    create_pos_encoding,
+    create_rope_config,
 )
 from torchwright.ops.map_select import select
 
@@ -42,9 +43,7 @@ def _idchain(x, depth, name):
     dependency without changing the value (each ``Linear(h, I, 0) == h``)."""
     h = x
     for i in range(depth):
-        h = Linear(
-            h, torch.eye(len(x)), torch.zeros(len(x)), name=f"{name}{i}"
-        )
+        h = Linear(h, torch.eye(len(x)), torch.zeros(len(x)), name=f"{name}{i}")
     return h
 
 
@@ -52,7 +51,8 @@ def _live_layers(net, node):
     """Layer indices whose post-MLP residual snapshot holds ``node``."""
     ra = net.residual_assignment
     return [
-        i for i, layer in enumerate(net.layers)
+        i
+        for i, layer in enumerate(net.layers)
         if ra.has_node(layer.mlp.out_state, node)
     ]
 
@@ -79,7 +79,6 @@ def test_literal_is_not_an_input_node():
 
 
 def test_deep_literal_not_prefilled_and_materialized_in_interior():
-    pos = create_pos_encoding()
     x = create_input("x", 2, value_range=(-5.0, 5.0))
     h = _idchain(x, 3, "pre")  # consumer lands several layers in
     lit = create_literal_value(torch.tensor([7.0, -3.0]))
@@ -87,7 +86,7 @@ def test_deep_literal_not_prefilled_and_materialized_in_interior():
     out = _idchain(consumed, 3, "post")  # downstream work after the consumer
 
     net = forward_compile(
-        d=D, d_head=D_HEAD, output_node=out, pos_encoding=pos, verbose=False
+        d=D, d_head=D_HEAD, output_node=out, verbose=False
     )
     ra = net.residual_assignment
 
@@ -109,9 +108,7 @@ def test_deep_literal_not_prefilled_and_materialized_in_interior():
     # (3) Output is still correct.
     xv = torch.randn(4, 2)
     result = net.compute(4, {"x": xv})
-    assert torch.allclose(
-        result[out].cpu(), out.compute(4, {"x": xv}), atol=1e-3
-    )
+    assert torch.allclose(result[out].cpu(), out.compute(4, {"x": xv}), atol=1e-3)
 
 
 # ---------------------------------------------------------------------------
@@ -125,7 +122,6 @@ def test_deep_select_literal_matches_oracle(optimize):
     consumed deep in the network.  Compiled output must match exact math
     under the heuristic (optimize=0) and CP-SAT (optimize=1) schedulers, and
     the false-branch positions must equal the constant."""
-    pos = create_pos_encoding()
     cond = create_input("cond", 1, value_range=(-1.0, 1.0))
     base = create_input("t", 2, value_range=(-4.0, 4.0))
     deep_true = _idchain(base, 3, "t")
@@ -136,7 +132,6 @@ def test_deep_select_literal_matches_oracle(optimize):
         d=D,
         d_head=D_HEAD,
         output_node=out,
-        pos_encoding=pos,
         verbose=False,
         optimize=optimize,
     )
@@ -148,9 +143,9 @@ def test_deep_select_literal_matches_oracle(optimize):
     }
     actual = net.compute(n_pos, inputs)[out].cpu()
     expected = out.compute(n_pos, inputs)
-    assert torch.allclose(actual, expected, atol=1e-3), (
-        f"optimize={optimize} max diff {(actual - expected).abs().max():.5f}"
-    )
+    assert torch.allclose(
+        actual, expected, atol=1e-3
+    ), f"optimize={optimize} max diff {(actual - expected).abs().max():.5f}"
     # The false-branch row must equal the just-in-time-materialized constant.
     assert torch.allclose(actual[1], lit.value, atol=1e-2)
 
@@ -176,7 +171,6 @@ def test_pure_constant_subgraph_compiles():
 
 
 def test_shared_literal_two_consumers_correct():
-    pos = create_pos_encoding()
     x = create_input("x", 2, value_range=(-5.0, 5.0))
     lit = create_literal_value(torch.tensor([1.5, -2.5]))
     shallow = add(x, lit)  # needs the constant near layer 0
@@ -186,13 +180,11 @@ def test_shared_literal_two_consumers_correct():
     out = Linear(concat([shallow, deep]), torch.eye(4), torch.zeros(4), name="out")
 
     net = forward_compile(
-        d=D, d_head=D_HEAD, output_node=out, pos_encoding=pos, verbose=False
+        d=D, d_head=D_HEAD, output_node=out, verbose=False
     )
     xv = torch.randn(3, 2)
     result = net.compute(3, {"x": xv})
-    assert torch.allclose(
-        result[out].cpu(), out.compute(3, {"x": xv}), atol=1e-3
-    )
+    assert torch.allclose(result[out].cpu(), out.compute(3, {"x": xv}), atol=1e-3)
     # The constant is materialized at least once and lives long enough to
     # serve both consumers.
     assert _live_layers(net, lit), "shared constant was never materialized"
@@ -209,27 +201,25 @@ def test_deep_attention_fed_constant_matches_oracle():
     constant could never be folded — JIT is the only mechanism that handles
     it.  The constant is part of the attention value via a Concatenate, needed
     only when the (deep) attention op runs."""
-    pos = create_pos_encoding()
+    rope = create_rope_config(d_head=D_HEAD, max_positions=512)
     x = create_input("x", 2, value_range=(-5.0, 5.0))
     h = _idchain(x, 3, "d")
     lit = create_literal_value(torch.tensor([4.0, -2.0]))
     v = concat([h, lit])  # the constant is part of the attention value
-    out = pos.attend_to_offset(v, delta_pos=-1)
+    out = attend_to_offset(rope, v, delta_pos=-1)
 
     net = forward_compile(
-        d=D, d_head=D_HEAD, output_node=out, pos_encoding=pos, verbose=False
+        d=D, d_head=D_HEAD, output_node=out, verbose=False
     )
     # Not prefilled — materialized as a schedulable node.
-    assert lit not in net.residual_assignment.get_nodes(
-        net.layers[0].attn.in_state
-    )
+    assert lit not in net.residual_assignment.get_nodes(net.layers[0].attn.in_state)
     n_pos = 5
     xv = torch.randn(n_pos, 2)
     actual = net.compute(n_pos, {"x": xv})[out].cpu()
     expected = out.compute(n_pos, {"x": xv})
-    assert torch.allclose(actual, expected, atol=1e-2), (
-        f"max diff {(actual - expected).abs().max():.5f}"
-    )
+    assert torch.allclose(
+        actual, expected, atol=1e-2
+    ), f"max diff {(actual - expected).abs().max():.5f}"
 
 
 # ---------------------------------------------------------------------------
@@ -248,7 +238,6 @@ def test_literal_into_recycled_column_is_clean():
     A small ``d`` forces recycling; correctness of the output (the constant
     is a saturated value the stale data would visibly corrupt) validates the
     cancel."""
-    pos = create_pos_encoding()
     x = create_input("x", 8, value_range=(-3.0, 3.0))
     # ``early`` is consumed immediately and then dies, freeing its (now
     # dirty) columns back into the pool.
@@ -259,13 +248,11 @@ def test_literal_into_recycled_column_is_clean():
     out = add(deep, lit)
 
     net = forward_compile(
-        d=64, d_head=16, output_node=out, pos_encoding=pos, verbose=False
+        d=64, d_head=16, output_node=out, verbose=False
     )
     xv = torch.randn(5, 8)
     result = net.compute(5, {"x": xv})
-    assert torch.allclose(
-        result[out].cpu(), out.compute(5, {"x": xv}), atol=1e-3
-    )
+    assert torch.allclose(result[out].cpu(), out.compute(5, {"x": xv}), atol=1e-3)
 
 
 # ---------------------------------------------------------------------------
@@ -278,7 +265,6 @@ def _consumer_layer(other_kind):
     materialized at.  ``other`` is either a constant (JIT-materialized) or a
     pre-seeded input (available from layer 0).  Structurally identical
     otherwise, so the Add's layer reveals whether the JIT gate delayed it."""
-    pos = create_pos_encoding()
     x = create_input("x", 2, value_range=(-5.0, 5.0))
     deep = _idchain(x, 3, "d")
     if other_kind == "literal":
@@ -287,7 +273,7 @@ def _consumer_layer(other_kind):
         other = create_input("c", 2, value_range=(-5.0, 5.0))
     out = add(deep, other)
     net = forward_compile(
-        d=D, d_head=D_HEAD, output_node=out, pos_encoding=pos, verbose=False
+        d=D, d_head=D_HEAD, output_node=out, verbose=False
     )
     return _first_layer(net, out)
 
@@ -319,14 +305,13 @@ def test_jit_graph_passes_end_of_layer_liveness(monkeypatch):
     uncomputed.  Exercising it directly validates the new free-after-use
     behavior for constants."""
     monkeypatch.setenv("TW_COMPILER_VERIFY", "1")
-    pos = create_pos_encoding()
     x = create_input("x", 2, value_range=(-5.0, 5.0))
     deep = _idchain(x, 3, "d")
     lit = create_literal_value(torch.tensor([7.0, -3.0]))
     out = add(deep, lit)
 
     net = forward_compile(
-        d=D, d_head=D_HEAD, output_node=out, pos_encoding=pos, verbose=False
+        d=D, d_head=D_HEAD, output_node=out, verbose=False
     )
     xv = torch.randn(3, 2)
     assert torch.allclose(
@@ -351,7 +336,6 @@ def test_cpsat_treats_constant_as_schedulable_not_prefilled():
     is harmless, since the column is uncontended and the layer count is
     unchanged.  The pressure-bound "places late" behavior is exercised on a
     real, residual-bound graph (the DOOM graph), not here."""
-    pos = create_pos_encoding()
     x = create_input("x", 2, value_range=(-5.0, 5.0))
     deep = _idchain(x, 4, "d")
     lit = create_literal_value(torch.tensor([1.0, 2.0]))
@@ -361,15 +345,14 @@ def test_cpsat_treats_constant_as_schedulable_not_prefilled():
         d=D,
         d_head=D_HEAD,
         output_node=out,
-        pos_encoding=pos,
         verbose=False,
         optimize=2,
     )
     ra = net.residual_assignment
     # Schedulable, not a prefilled source.
-    assert lit not in ra.get_nodes(net.layers[0].attn.in_state), (
-        "CP-SAT prefilled the constant into layer-0 in_state (still a source)"
-    )
+    assert lit not in ra.get_nodes(
+        net.layers[0].attn.in_state
+    ), "CP-SAT prefilled the constant into layer-0 in_state (still a source)"
     assert _live_layers(net, lit), "CP-SAT never materialized the constant"
     # Correct.
     xv = torch.randn(3, 2)

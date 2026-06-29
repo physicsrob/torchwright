@@ -2,7 +2,6 @@ from typing import Optional
 
 from torchwright.compiler.groups.attn_sublayer import AttnSubLayer
 from torchwright.compiler.groups.mlp_sublayer import MLPSubLayer
-from torchwright.graph import PosEncoding
 
 
 class TransformerLayer:
@@ -13,10 +12,9 @@ class TransformerLayer:
         self,
         d: int,
         d_head: int,
-        pos_encoding: Optional[PosEncoding] = None,
         d_hidden: Optional[int] = None,
     ):
-        self.attn = AttnSubLayer(d, d_head, pos_encoding)
+        self.attn = AttnSubLayer(d, d_head)
         self.mlp = MLPSubLayer(d, d_hidden)
 
     def to(self, device):

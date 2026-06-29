@@ -41,8 +41,9 @@ value emitted at iteration ``k - 1``, latched at the trigger via
 ``get_prev_value``. Iteration 0 uses ``prev_digit = -1`` so every input
 digit is strictly greater than it (unconstrained argmin). We chain
 these through ``MAX_OUT`` unrolled iterations; the output sequence is
-gated by the same scalar-arithmetic slot gating used by V4 (see
-``_emit_by_slot_index`` there for rationale).
+emitted left-to-right via ``output_sequence``, whose per-slot gating
+rides RoPE rotary offset heads (``attend_to_offset``) that resolve
+``trigger + k`` exactly for every ``k`` up to ``MAX_OUT``.
 
 Residual footprint. 10 key-side indicator columns + 1 score column +
 1 position scalar + value passthrough. No per-input mask. V1 is the
@@ -55,71 +56,37 @@ import torch
 
 from torchwright.graph import Concatenate, Node, Embedding
 from torchwright.graph.embedding import Unembedding
-from torchwright.graph.pos_encoding import PosEncoding
 from torchwright.ops.arithmetic_ops import (
     add_scaled_nodes,
     compare,
-    negate,
-    sum_nodes,
 )
-from torchwright.ops.attention_ops import attend_argmin_above_integer
+from torchwright.ops.attention_ops import attend_argmin_above_integer, get_prev_value
 from torchwright.ops.inout_nodes import (
     create_embedding,
     create_literal_value,
-    create_pos_encoding,
+    create_rope_config,
     create_unembedding,
 )
 from torchwright.ops.logic_ops import (
     bool_all_true,
     bool_not,
-    cond_gate,
     equals_vector,
 )
 from torchwright.ops.map_select import in_range, select
+from torchwright.ops.recency_heads import recency_rank_from_tokens
 from torchwright.ops.scalar_encoding import digit_to_scaled_scalar
-from torchwright.ops.sequence_ops import check_is_digit
+from torchwright.ops.sequence_ops import check_is_digit, output_sequence
 
 D_MODEL = 384
+# Rotary width the graph is built against; must match the d_head it is compiled
+# at.  The indicator-basis content head spans W = 1 + 10 = 11 columns, which
+# must fit the slow planes (W <= d_head/2), so d_head must be >= 22 -> 32.
+D_HEAD = 32
+MAX_POSITIONS = 512
 MAX_OUT = 10
 # The 10 thresholds our indicator basis covers: d ∈ {-1, 0, 1, …, 8}.
 # Slot c in the indicator / one-hot corresponds to threshold d = c - 1.
 _N_SLOTS = 10
-
-
-def _emit_by_slot_index(
-    pos_encoding: PosEncoding,
-    is_trigger: Node,
-    seq: list,
-    default_output: torch.Tensor,
-) -> Node:
-    """Same helper as in ``sort_digits_v4.py``; see the docstring there
-    for the full rationale. Short version: ``output_sequence``'s slot
-    gating uses ``attend_to_offset(is_trigger, delta_pos=-k)`` which
-    aliases when ``k`` approaches the period of the fastest sine
-    component (≈ 6). We replace it with an exact integer comparison on
-    ``pos_scalar - trigger_pos_scalar``.
-    """
-    max_out = len(seq)
-    has_triggered = pos_encoding.get_prev_value(is_trigger, is_trigger)
-    pos_scalar = pos_encoding.get_position_scalar()
-    trigger_pos_scalar = pos_encoding.get_prev_value(pos_scalar, is_trigger)
-    steps_since = add_scaled_nodes(1.0, pos_scalar, -1.0, trigger_pos_scalar)
-
-    gated = []
-    for k in range(max_out):
-        cond_k = bool_all_true(
-            [
-                compare(steps_since, k - 0.5),
-                compare(negate(steps_since), -(k + 0.5)),
-            ]
-        )
-        gated.append(cond_gate(cond_k, seq[k]))
-
-    return select(
-        cond=has_triggered,
-        true_node=sum_nodes(gated),
-        false_node=create_literal_value(default_output),
-    )
 
 
 def _build_indicators_above(digit_scalar: Node, is_input_digit: Node) -> Node:
@@ -178,11 +145,15 @@ def _threshold_onehot(prev_digit: Node) -> Node:
 
 def create_network_parts(
     max_out: int = MAX_OUT,
-) -> Tuple[Node, PosEncoding, Embedding]:
+) -> Tuple[Node, Embedding]:
     """Build the V1 distinct-digit selection-sort graph."""
-    vocab = list("0123456789") + [" ", "\n", "<bos>", "<eos>"]
+    vocab = list("0123456789") + [" ", "\n", "<bos>", "<ref>", "<eos>"]
     embedding = create_embedding(vocab=vocab)
-    pos_encoding = create_pos_encoding()
+    rope = create_rope_config(d_head=D_HEAD, max_positions=MAX_POSITIONS)
+
+    # Bucket-2 recency rank from the <bos>/<ref> markers — drives the
+    # "has the trigger fired" latch and the most-recent prev_digit selection.
+    recency_rank = recency_rank_from_tokens(rope, embedding)
     embed = embedding.get_embedding
 
     is_trigger = equals_vector(embedding, embed("\n"))
@@ -190,7 +161,7 @@ def create_network_parts(
     # --- Per-position input features ---
     digit_scalar = digit_to_scaled_scalar(embedding, embedding, place_value=1.0)
     is_digit_pos = check_is_digit(embedding)
-    has_triggered = pos_encoding.get_prev_value(is_trigger, is_trigger)
+    has_triggered = get_prev_value(rope, is_trigger, is_trigger, recency_rank)
     is_pre_trigger = bool_not(has_triggered)
     is_input_digit = bool_all_true([is_digit_pos, is_pre_trigger])
 
@@ -227,7 +198,7 @@ def create_network_parts(
     for _ in range(max_out):
         threshold_onehot = _threshold_onehot(prev_digit)
         selected_embed = attend_argmin_above_integer(
-            pos_encoding=pos_encoding,
+            rope,
             score=digit_scalar,
             indicators_above=indicators_above,
             threshold_onehot=threshold_onehot,
@@ -238,23 +209,26 @@ def create_network_parts(
         # Same argmin-above attention but with value=digit_scalar so
         # the scalar threads cleanly through the chain.
         selected_digit_scalar = attend_argmin_above_integer(
-            pos_encoding=pos_encoding,
+            rope,
             score=digit_scalar,
             indicators_above=indicators_above,
             threshold_onehot=threshold_onehot,
             value=digit_scalar,
         )
-        prev_digit = pos_encoding.get_prev_value(selected_digit_scalar, is_trigger)
+        prev_digit = get_prev_value(
+            rope, selected_digit_scalar, is_trigger, recency_rank
+        )
 
-    output_node = _emit_by_slot_index(
-        pos_encoding,
+    output_node = output_sequence(
+        rope,
         is_trigger,
         seq,
         embed(" "),
+        recency_rank,
     )
-    return output_node, pos_encoding, embedding
+    return output_node, embedding
 
 
 def create_network() -> Unembedding:
-    output_node, pos_encoding, embedding = create_network_parts()
+    output_node, embedding = create_network_parts()
     return create_unembedding(output_node, embedding)

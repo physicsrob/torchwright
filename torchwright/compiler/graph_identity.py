@@ -27,7 +27,6 @@ from typing import Dict, List, Optional, Tuple
 
 from torchwright.graph import Node
 from torchwright.graph.misc import Assert, DebugWatch
-from torchwright.graph.pos_encoding import PosEncoding
 
 
 def unwrap_debug(node: Node) -> Node:
@@ -93,7 +92,6 @@ def topology_entries(output_node: Node) -> List[tuple]:
 
 def graph_fingerprint(
     output_node: Node,
-    pos_encoding: PosEncoding,
     *,
     d: int,
     d_head: int,
@@ -113,7 +111,6 @@ def graph_fingerprint(
     """
     payload = {
         "topology": topology_entries(output_node),
-        "pos_width": len(pos_encoding),
         "d": d,
         "d_head": d_head,
         "d_hidden": d_hidden,
@@ -128,7 +125,6 @@ def graph_fingerprint(
 
 def debug_fingerprint(
     output_node: Node,
-    pos_encoding: PosEncoding,
     *,
     d: int,
     d_head: int,
@@ -149,7 +145,6 @@ def debug_fingerprint(
     payload = {
         "format": "torchwright.debug.v1",
         "topology": topology_entries(output_node),
-        "pos_width": len(pos_encoding),
         "d": d,
         "d_head": d_head,
     }

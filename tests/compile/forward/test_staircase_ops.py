@@ -22,7 +22,7 @@ import torch
 from torchwright.compiler.export import compile_headless
 from torchwright.graph import Concatenate
 from torchwright.ops.arithmetic_ops import mod_const, thermometer_floor_div
-from torchwright.ops.inout_nodes import create_input, create_pos_encoding
+from torchwright.ops.inout_nodes import create_input
 
 # Representative (divisor, max_value) sweep:
 #   (2, 32)    — baseline, small divisor/small scale
@@ -43,13 +43,11 @@ def _compile_unary(op_fn, input_name: str = "x", d: int = 1024):
     compile_headless always sees a proper output node even when op_fn
     returns a single-width node.
     """
-    pos_encoding = create_pos_encoding()
     x = create_input(input_name, 1)
     y = op_fn(x)
     output = Concatenate([y])
     return compile_headless(
         output,
-        pos_encoding,
         d=d,
         d_head=16,
         max_layers=20,

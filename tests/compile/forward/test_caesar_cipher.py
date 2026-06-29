@@ -6,7 +6,7 @@ Tests various shift amounts and letter combinations.  Converted from
 
 import pytest
 
-from examples.caesar_cipher import create_network_parts
+from examples.caesar_cipher import D_HEAD, create_network_parts
 
 from ._example_onnx import load_example, run
 
@@ -14,7 +14,10 @@ from ._example_onnx import load_example, run
 @pytest.fixture(scope="module")
 def caesar(tmp_path_factory):
     return load_example(
-        create_network_parts, tmp_path_factory.mktemp("caesar"), name="caesar"
+        create_network_parts,
+        tmp_path_factory.mktemp("caesar"),
+        d_head=D_HEAD,
+        name="caesar",
     )
 
 
@@ -25,7 +28,9 @@ def _caesar(text: str, shift: int) -> str:
 
 def test_caesar_cipher(caesar):
     model, artifact = caesar
-    assert artifact.n_layers <= 40, f"Too many layers: {artifact.n_layers}"
+    # RoPE recency (octant ramp + two graded heads) is deeper than the old
+    # counter column, so this budget is above the pre-RoPE 40 (observed 44).
+    assert artifact.n_layers <= 48, f"Too many layers: {artifact.n_layers}"
 
     test_cases = [
         # shift=0: identity
@@ -50,7 +55,9 @@ def test_caesar_cipher(caesar):
             _caesar(plaintext, int(shift)) == expected
         ), f"Reference mismatch for shift={shift}, text={plaintext}"
         # Prompt: bos, shift token, plaintext chars, newline trigger.
-        result = run(model, shift + plaintext + "\n", bos_token="<bos>")
+        result = run(
+            model, shift + plaintext + "\n", bos_token="<bos>", ref_token="<ref>"
+        )
         assert result == expected, (
             f"For shift={shift}, {plaintext!r}: "
             f"expected {expected!r} but got {result!r}"

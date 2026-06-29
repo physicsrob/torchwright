@@ -21,35 +21,44 @@ from typing import Tuple
 
 import torch
 
-from torchwright.graph import Node, Embedding
+from torchwright.graph import Node, Embedding, RopeConfig
 from torchwright.graph.embedding import Unembedding
-from torchwright.graph.pos_encoding import PosEncoding
+from torchwright.ops.attention_ops import attend_to_offset, get_prev_value
 from torchwright.ops.inout_nodes import (
     create_literal_value,
     create_embedding,
-    create_pos_encoding,
+    create_rope_config,
     create_unembedding,
 )
 from torchwright.ops.logic_ops import bool_all_true, equals_vector
 from torchwright.ops.map_select import map_to_table, select
+from torchwright.ops.recency_heads import recency_rank_from_tokens
 from torchwright.ops.sequence_ops import output_sequence, remove_leading_0s
 
 D_MODEL = 256
+# Rotary width the graph is built against; must match the d_head it is
+# compiled at (the token-example harness compiles at this d_head).
+D_HEAD = 16
+MAX_POSITIONS = 512
 
 
 def create_network_parts(
     max_bits: int = 4,
-) -> Tuple[Node, PosEncoding, Embedding]:
+) -> Tuple[Node, Embedding]:
     """Build the binary increment computation graph.
 
     Args:
         max_bits: Maximum number of input bits (handles up to max_bits-bit
             binary numbers). Output may be max_bits+1 bits on overflow.
     """
-    vocab = list("01 ") + ["\n", "<bos>", "<eos>"]
+    vocab = list("01 ") + ["\n", "<bos>", "<ref>", "<eos>"]
     embedding = create_embedding(vocab=vocab)
-    pos_encoding = create_pos_encoding()
+    rope = create_rope_config(d_head=D_HEAD, max_positions=MAX_POSITIONS)
     embed = embedding.get_embedding
+
+    # Bucket-2 recency rank from the <bos>/<ref> markers — replaces the old
+    # position counter that drove "most recent" selection.
+    recency_rank = recency_rank_from_tokens(rope, embedding)
 
     is_trigger = equals_vector(embedding, embed("\n"))
 
@@ -61,8 +70,8 @@ def create_network_parts(
     # bits[0] = LSB (rightmost), bits[max_bits-1] = MSB (leftmost)
     bits_raw = []
     for i in range(max_bits):
-        raw = pos_encoding.attend_to_offset(embedding, delta_pos=-(i + 1))
-        latched = pos_encoding.get_prev_value(raw, is_trigger)
+        raw = attend_to_offset(rope, embedding, delta_pos=-(i + 1))
+        latched = get_prev_value(rope, raw, is_trigger, recency_rank)
         bits_raw.append(latched)
 
     # --- Normalize padding to "0" ---
@@ -94,15 +103,16 @@ def create_network_parts(
     output_seq = remove_leading_0s(embedding, output_seq, max_removals=max_bits)
 
     output_node = output_sequence(
-        pos_encoding,
+        rope,
         is_trigger,
         output_seq,
         embed(" "),
+        recency_rank,
     )
-    return output_node, pos_encoding, embedding
+    return output_node, embedding
 
 
 def create_network(max_bits: int = 4) -> Unembedding:
     """Create a binary increment network."""
-    output_node, pos_encoding, embedding = create_network_parts(max_bits)
+    output_node, embedding = create_network_parts(max_bits)
     return create_unembedding(output_node, embedding)

@@ -6,7 +6,7 @@ Converted from ``forward_compile``; see ``_example_onnx``.
 
 import pytest
 
-from examples.binary_increment import create_network_parts
+from examples.binary_increment import D_HEAD, create_network_parts
 
 from ._example_onnx import load_example, run
 
@@ -14,13 +14,18 @@ from ._example_onnx import load_example, run
 @pytest.fixture(scope="module")
 def binary_increment(tmp_path_factory):
     return load_example(
-        create_network_parts, tmp_path_factory.mktemp("binc"), name="binc"
+        create_network_parts,
+        tmp_path_factory.mktemp("binc"),
+        d_head=D_HEAD,
+        name="binc",
     )
 
 
 def test_binary_increment(binary_increment):
     model, artifact = binary_increment
-    assert artifact.n_layers <= 40, f"Too many layers: {artifact.n_layers}"
+    # RoPE recency (octant ramp + two graded heads) is deeper than the old
+    # counter column, so this budget is above the pre-RoPE 40 (observed 60).
+    assert artifact.n_layers <= 64, f"Too many layers: {artifact.n_layers}"
 
     test_cases = [
         # Simple increments
@@ -37,7 +42,7 @@ def test_binary_increment(binary_increment):
         ("1111", "10000"),
     ]
     for binary_in, expected in test_cases:
-        result = run(model, binary_in + "\n", bos_token="<bos>")
+        result = run(model, binary_in + "\n", bos_token="<bos>", ref_token="<ref>")
         assert (
             result == expected
         ), f"For {binary_in!r}: expected {expected!r} but got {result!r}"

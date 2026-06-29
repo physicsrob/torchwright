@@ -13,10 +13,15 @@ All primitives here follow this template:
   ``_above_integer`` / ``_unmasked`` / ``_dot`` variants, also the
   per-query signal that rendezvous with a key-side vector).
   ``query_matrix`` scales that ``1.0`` by ``_QUERY_GAIN`` into column 0 of
-  the logit, giving a stable positive per-query gain.  (The position-aware
-  primitives — ``attend_most_recent_matching`` and
-  ``PosEncoding.attend_to_offset`` — also take ``pos_encoding`` for its
-  counter / trig columns.)
+  the logit, giving a stable positive per-query gain.
+- Every head is **full-width rotary on slow planes**: the content columns are
+  relocated onto the slowest planes of the ``rope.d_head`` ``rotate_half`` grid
+  (:func:`~torchwright.graph.rope.rotary_content_head`), so the match survives
+  the end-state global rotation (``docs/rope_port_plan.md`` §3).  The builders
+  therefore take a :class:`~torchwright.graph.RopeConfig` (carrying
+  ``d_head`` / ``base``) where they used to take a ``PosEncoding`` node —
+  position is a rotation applied inside attention, no longer a residual
+  feature.
 - ``key_in`` contains **only** what ``key_matrix`` reads from: the
   content nodes that drive selection (score, validity, indicators,
   onehot, etc.).  Never concat a node into ``key_in`` without wiring up
@@ -51,13 +56,13 @@ from typing import Optional
 
 import torch
 
-from torchwright.graph import Node, Concatenate, Attn, LiteralValue
+from torchwright.graph import Node, Concatenate, Attn, LiteralValue, RopeConfig
 from torchwright.graph.asserts import (
     assert_in_range,
     assert_matches_value_type,
     assert_softmax_hardness,
 )
-from torchwright.graph.pos_encoding import PosEncoding
+from torchwright.graph.rope import rotary_content_head, rotary_offset_head
 from torchwright.graph.value_type import NodeValueType
 
 # Default tolerance for hard-selection output assertions.  At
@@ -202,49 +207,46 @@ _ABOVE_MATCH_BONUS = 256.0
 
 
 def _build_selection_attn(
-    pos_encoding: PosEncoding,
+    rope: RopeConfig,
     key_in: Node,
     key_matrix: torch.Tensor,
     value: Node,
 ) -> Attn:
-    """Wire up a selection-style attention head.
+    """Wire up a selection-style attention head — rotary on slow planes.
 
     Callers supply ``key_in`` (the content node(s) driving selection) and a
-    populated ``key_matrix`` of width ``d_qk``; this helper fills in the
-    query / value / output matrices.  The score logit lives in column 0:
-    ``Q`` projects an exact constant ``1.0`` (a ``LiteralValue``) scaled by
-    ``_QUERY_GAIN``, so ``Q[·, 0]`` is a stable positive gain independent of
-    query position.  A unit score delta is then decisive
-    (``exp(8) ≈ 3000``).  Value passes through identity V/O and is split
-    across physical heads by the compiler when wider than ``d_head``.
+    populated ``key_matrix`` of content width ``W``; this helper fills in the
+    query matrix and relocates the content onto the slowest ``W`` planes of the
+    full ``rope.d_head`` ``rotate_half`` grid via :func:`rotary_content_head`,
+    so selection survives the end-state global rotation (the match rides
+    quasi-static planes — ``docs/rope_port_plan.md`` §3).  The score logit lives
+    in content column 0: ``Q`` projects an exact constant ``1.0`` (a
+    ``LiteralValue``) scaled by ``_QUERY_GAIN``, so ``Q[·, 0]`` is a stable
+    positive gain independent of query position.  A unit score delta is then
+    decisive (``exp(8) ≈ 3000``).  Value passes through identity V/O and is
+    split across physical heads by the compiler when wider than ``d_head``.
 
-    ``pos_encoding`` is accepted for API symmetry but no longer read — the
-    query constant is a ``LiteralValue``, so the head's ``d_qk`` does not
-    scale with ``d_pos``.
+    ``rope`` carries the ``d_head`` / ``base`` the slow-plane placement needs.
     """
     d_qk = key_matrix.shape[1]
-    d_v = len(value)
 
     query_one = LiteralValue(torch.tensor([1.0]), name="selection_query_one")
     query_matrix = torch.zeros((1, d_qk))
     query_matrix[0, 0] = _QUERY_GAIN
 
-    value_matrix = torch.eye(d_v)
-    output_matrix = torch.eye(d_v)
-
-    return Attn(
-        query_in=query_one,
-        key_in=key_in,
-        value_in=value,
-        query_matrix=query_matrix,
-        key_matrix=key_matrix,
-        value_matrix=value_matrix,
-        output_matrix=output_matrix,
+    return rotary_content_head(
+        query_one,
+        key_in,
+        value,
+        query_matrix,
+        key_matrix,
+        d_head=rope.d_head,
+        base=rope.base,
     )
 
 
 def _build_where_attn(
-    pos_encoding: PosEncoding,
+    rope: RopeConfig,
     score: Node,
     validity: Node,
     value: Node,
@@ -253,17 +255,16 @@ def _build_where_attn(
 ) -> Attn:
     """Shared construction for ``attend_argmin_where`` / ``attend_argmax_where``.
 
-    ``d_qk`` layout:
+    Content (``d_qk``) layout, relocated onto slow planes by
+    :func:`rotary_content_head`:
       * col 0: gained score (``Q = _QUERY_GAIN``).
       * col 1: additive validity (``Q = 1.0``, ``K = ± _VALIDITY_DIRECT``),
         not multiplied by the gain.
 
     ``score_sign`` is ``-1`` for argmin (small score → large logit) and
-    ``+1`` for argmax.  ``pos_encoding`` is accepted for API symmetry but
-    not read; the query constant is an exact ``LiteralValue([1.0])``.
+    ``+1`` for argmax.  ``rope`` carries the ``d_head`` / ``base`` for the
+    slow-plane placement; the query constant is an exact ``LiteralValue([1.0])``.
     """
-    d_v = len(value)
-
     # key_in row layout: [score (1), validity (1)]
     key_in = Concatenate([score, validity])
 
@@ -278,23 +279,19 @@ def _build_where_attn(
     key_matrix[0, 0] = score_sign
     key_matrix[1, 1] = _VALIDITY_DIRECT
 
-    # --- Value / output pass-through (auto-split when wide). ---
-    value_matrix = torch.eye(d_v)
-    output_matrix = torch.eye(d_v)
-
-    return Attn(
-        query_in=query_one,
-        key_in=key_in,
-        value_in=value,
-        query_matrix=query_matrix,
-        key_matrix=key_matrix,
-        value_matrix=value_matrix,
-        output_matrix=output_matrix,
+    return rotary_content_head(
+        query_one,
+        key_in,
+        value,
+        query_matrix,
+        key_matrix,
+        d_head=rope.d_head,
+        base=rope.base,
     )
 
 
 def attend_argmin(
-    pos_encoding: PosEncoding,
+    rope: RopeConfig,
     score: Node,
     value: Node,
     assert_hardness_gt: Optional[float] = None,
@@ -314,7 +311,7 @@ def attend_argmin(
     Compile cost: exactly one vanilla attention head.
 
     Args:
-        pos_encoding: The graph's positional encoding node.
+        rope: RoPE config (``d_head`` / ``base``) for the slow-plane placement.
         score: 1D scalar node (``len(score) == 1``).
         value: Node whose value to read at the winning position.
             No width constraint — wide V/O is auto-split across physical
@@ -332,14 +329,14 @@ def attend_argmin(
     key_matrix = torch.zeros((len(score), 1))
     key_matrix[0, 0] = -1.0  # smaller score → larger logit
 
-    attn = _build_selection_attn(pos_encoding, score, key_matrix, value)
+    attn = _build_selection_attn(rope, score, key_matrix, value)
     return _wrap_hard_selection_output(
         attn, value, assert_hardness_gt=assert_hardness_gt
     )
 
 
 def attend_argmax(
-    pos_encoding: PosEncoding,
+    rope: RopeConfig,
     score: Node,
     value: Node,
     assert_hardness_gt: Optional[float] = None,
@@ -349,7 +346,7 @@ def attend_argmax(
     Sign-flipped twin of :func:`attend_argmin`.
 
     Args:
-        pos_encoding: The graph's positional encoding node.
+        rope: RoPE config (``d_head`` / ``base``) for the slow-plane placement.
         score: 1D scalar node.
         value: Node whose value to read. No width constraint (wide V/O
             auto-splits across heads).
@@ -363,14 +360,14 @@ def attend_argmax(
     key_matrix = torch.zeros((len(score), 1))
     key_matrix[0, 0] = 1.0  # larger score → larger logit
 
-    attn = _build_selection_attn(pos_encoding, score, key_matrix, value)
+    attn = _build_selection_attn(rope, score, key_matrix, value)
     return _wrap_hard_selection_output(
         attn, value, assert_hardness_gt=assert_hardness_gt
     )
 
 
 def attend_argmin_where(
-    pos_encoding: PosEncoding,
+    rope: RopeConfig,
     score: Node,
     validity: Node,
     value: Node,
@@ -405,7 +402,7 @@ def attend_argmin_where(
     Compile cost: exactly one vanilla attention head.
 
     Args:
-        pos_encoding: The graph's positional encoding node.
+        rope: RoPE config (``d_head`` / ``base``) for the slow-plane placement.
         score: 1D scalar node.
         validity: 1D boolean node (+1 valid, −1 invalid).
         value: Node to read. No width constraint (wide V/O auto-splits
@@ -420,7 +417,7 @@ def attend_argmin_where(
     assert len(score) == 1, "attend_argmin_where expects a 1D scalar score"
     assert len(validity) == 1, "attend_argmin_where expects a 1D boolean validity"
     attn = _build_where_attn(
-        pos_encoding,
+        rope,
         score,
         validity,
         value,
@@ -432,7 +429,7 @@ def attend_argmin_where(
 
 
 def attend_argmax_where(
-    pos_encoding: PosEncoding,
+    rope: RopeConfig,
     score: Node,
     validity: Node,
     value: Node,
@@ -444,7 +441,7 @@ def attend_argmax_where(
     all-invalid windows.
 
     Args:
-        pos_encoding: The graph's positional encoding node.
+        rope: RoPE config (``d_head`` / ``base``) for the slow-plane placement.
         score: 1D scalar node.
         validity: 1D boolean node (+1 valid, −1 invalid).
         value: Node to read.
@@ -455,7 +452,7 @@ def attend_argmax_where(
     assert len(score) == 1, "attend_argmax_where expects a 1D scalar score"
     assert len(validity) == 1, "attend_argmax_where expects a 1D boolean validity"
     attn = _build_where_attn(
-        pos_encoding,
+        rope,
         score,
         validity,
         value,
@@ -467,7 +464,7 @@ def attend_argmax_where(
 
 
 def attend_argmin_above_integer(
-    pos_encoding: PosEncoding,
+    rope: RopeConfig,
     score: Node,
     indicators_above: Node,
     threshold_onehot: Node,
@@ -525,7 +522,7 @@ def attend_argmin_above_integer(
     ``1 + N + len(value)``).
 
     Args:
-        pos_encoding: The graph's positional encoding node.
+        rope: RoPE config (``d_head`` / ``base``) for the slow-plane placement.
         score: 1D scalar node (score at each key position).
         indicators_above: Width-``N`` node where slot ``c`` is the
             precomputed indicator ``I(score_i > threshold_c)``.
@@ -542,12 +539,11 @@ def attend_argmin_above_integer(
         f"(got {len(indicators_above)} and {len(threshold_onehot)})"
     )
     n_thresholds = len(indicators_above)
-    d_value = len(value)
-    # d_head layout:
-    #   col 0:                             score logit
-    #   cols 1..n_thresholds:              threshold_onehot · indicators_above terms
-    #   cols n_thresholds+1 .. +d_value:   value pass-through
-    d_head = 1 + n_thresholds + d_value
+    # Content Q/K layout (relocated onto slow planes by rotary_content_head;
+    # value rides identity V/O, decoupled from this width):
+    #   col 0:                  score logit
+    #   cols 1..n_thresholds:   threshold_onehot · indicators_above terms
+    W = 1 + n_thresholds
 
     # Query: an exact 1.0 for the score gain (col 0) plus the threshold
     # one-hot for the bilinear above-test.  No position info needed.
@@ -555,8 +551,8 @@ def attend_argmin_above_integer(
     query_in = Concatenate([query_one, threshold_onehot])
     key_in = Concatenate([score, indicators_above])
 
-    # --- Query matrix, shape (1 + n_thresholds, d_head) ---
-    query_matrix = torch.zeros((len(query_in), d_head))
+    # --- Query matrix, shape (1 + n_thresholds, W) ---
+    query_matrix = torch.zeros((len(query_in), W))
     # Col 0: stable positive gain for the scoring logit (from the 1.0 literal).
     query_matrix[0, 0] = _QUERY_GAIN
     # Cols 1..n_thresholds: _ABOVE_BONUS · threshold_onehot[c] routed
@@ -565,8 +561,8 @@ def attend_argmin_above_integer(
     for c in range(n_thresholds):
         query_matrix[1 + c, 1 + c] = _ABOVE_BONUS
 
-    # --- Key matrix, shape (1 + n_thresholds, d_head) ---
-    key_matrix = torch.zeros((len(key_in), d_head))
+    # --- Key matrix, shape (1 + n_thresholds, W) ---
+    key_matrix = torch.zeros((len(key_in), W))
     score_row = 0
     indicators_start_row = 1
     # Col 0: -score.
@@ -575,21 +571,14 @@ def attend_argmin_above_integer(
     for c in range(n_thresholds):
         key_matrix[indicators_start_row + c, 1 + c] = 1.0
 
-    # --- Value pass-through into the tail cols of d_head. ---
-    value_matrix = torch.zeros((d_value, d_head))
-    output_matrix = torch.zeros((d_head, d_value))
-    for v in range(d_value):
-        value_matrix[v, 1 + n_thresholds + v] = 1.0
-        output_matrix[1 + n_thresholds + v, v] = 1.0
-
-    attn = Attn(
-        query_in=query_in,
-        key_in=key_in,
-        value_in=value,
-        query_matrix=query_matrix,
-        key_matrix=key_matrix,
-        value_matrix=value_matrix,
-        output_matrix=output_matrix,
+    attn = rotary_content_head(
+        query_in,
+        key_in,
+        value,
+        query_matrix,
+        key_matrix,
+        d_head=rope.d_head,
+        base=rope.base,
     )
     return _wrap_hard_selection_output(
         attn, value, assert_hardness_gt=assert_hardness_gt
@@ -597,7 +586,7 @@ def attend_argmin_above_integer(
 
 
 def attend_argmin_above_in_bucket(
-    pos_encoding: PosEncoding,
+    rope: RopeConfig,
     score: Node,
     validity: Node,
     key_bucket_onehot: Node,
@@ -667,9 +656,9 @@ def attend_argmin_above_in_bucket(
     scores blend their ``value`` payloads.
 
     Args:
-        pos_encoding: graph positional encoding.  Accepted for API symmetry
-            with the other selection heads; this op is purely content-based
-            and reads no position columns.
+        rope: RoPE config (``d_head`` / ``base``) for the slow-plane placement;
+            the content match is purely bilinear, the rotation rides quasi-
+            static planes.
         score: width-1 scalar; lower wins.  Integer-valued for hard
             selection.  Bounded score DIAMETER: a predicate bonus only
             dominates the gained score term while ``_QUERY_GAIN *
@@ -760,19 +749,16 @@ def attend_argmin_above_in_bucket(
     for c in range(n_thresholds):
         key_matrix[above_row0 + c, above_col0 + c] = 1.0
 
-    # --- Decoupled identity V/O: value passes through unchanged and may be
-    #     wider than d_qk; the compiler splits it over physical heads. ---
-    value_matrix = torch.eye(d_v)
-    output_matrix = torch.eye(d_v)
-
-    attn = Attn(
-        query_in=query_in,
-        key_in=key_in,
-        value_in=value,
-        query_matrix=query_matrix,
-        key_matrix=key_matrix,
-        value_matrix=value_matrix,
-        output_matrix=output_matrix,
+    # Content relocated onto slow planes; identity V/O passes ``value`` through
+    # unchanged and may be wider than d_qk (compiler splits over physical heads).
+    attn = rotary_content_head(
+        query_in,
+        key_in,
+        value,
+        query_matrix,
+        key_matrix,
+        d_head=rope.d_head,
+        base=rope.base,
     )
     return _wrap_hard_selection_output(
         attn, value, assert_hardness_gt=assert_hardness_gt
@@ -780,7 +766,7 @@ def attend_argmin_above_in_bucket(
 
 
 def attend_argmin_unmasked(
-    pos_encoding: PosEncoding,
+    rope: RopeConfig,
     score: Node,
     mask_vector: Node,
     position_onehot: Node,
@@ -841,7 +827,7 @@ def attend_argmin_unmasked(
     (``d_head = 1 + N + len(value)``).
 
     Args:
-        pos_encoding: The graph's positional encoding node.
+        rope: RoPE config (``d_head`` / ``base``) for the slow-plane placement.
         score: 1D scalar node.
         mask_vector: Width-``N`` node whose value at query position ``j``
             is a ``{0, 1}`` mask — bit ``c`` set means "input slot ``c``
@@ -849,9 +835,8 @@ def attend_argmin_unmasked(
         position_onehot: Width-``N`` node whose value at key position
             ``i`` is the one-hot of that position's *input slot index*.
             Must have the same width as ``mask_vector``.
-        value: Node to read. ``len(value)`` can be larger than
-            ``pos_encoding.d_pos`` here — ``d_head`` scales with value
-            width rather than being capped at ``d_pos``.
+        value: Node to read.  Any width — V/O is identity and the compiler
+            splits a wide value across physical heads.
 
     Returns:
         Attn node of width ``len(value)`` equal to ``value`` at the
@@ -863,52 +848,43 @@ def attend_argmin_unmasked(
         f"(got {len(mask_vector)} and {len(position_onehot)})"
     )
     n_slots = len(mask_vector)
-    d_value = len(value)
-    # Layout of d_head:
-    #   col 0:                         score logit
-    #   cols 1 .. n_slots:             mask · position_onehot dot-product terms
-    #   cols n_slots+1 .. n_slots+d_value:  value pass-through
-    d_head = 1 + n_slots + d_value
+    # Content Q/K layout (relocated onto slow planes; value rides identity V/O):
+    #   col 0:               score logit
+    #   cols 1 .. n_slots:   mask · position_onehot dot-product terms
+    W = 1 + n_slots
 
     # Query: an exact 1.0 for the score gain (col 0) plus the per-query mask.
     query_one = LiteralValue(torch.tensor([1.0]), name="unmasked_query_one")
     query_in = Concatenate([query_one, mask_vector])
     key_in = Concatenate([score, position_onehot])
 
-    # --- Query matrix, shape (1 + n_slots, d_head) ---
-    query_matrix = torch.zeros((len(query_in), d_head))
+    # --- Query matrix, shape (1 + n_slots, W) ---
+    query_matrix = torch.zeros((len(query_in), W))
     # Col 0: stable positive gain from the exact 1.0 literal.
     query_matrix[0, 0] = _QUERY_GAIN
     # Cols 1 .. n_slots: -_UNMASKED_PENALTY · mask_vector[c].
     for c in range(n_slots):
         query_matrix[1 + c, 1 + c] = -_UNMASKED_PENALTY
 
-    # --- Key matrix, shape (1 + n_slots, d_head) ---
-    key_matrix = torch.zeros((len(key_in), d_head))
+    # --- Key matrix, shape (1 + n_slots, W) ---
+    key_matrix = torch.zeros((len(key_in), W))
     # Row order in key_in: [score (1), onehot (n_slots)]
     score_row = 0
     onehot_start_row = 1
     # Col 0: -score.
     key_matrix[score_row, 0] = -1.0
-    # Cols 1 .. n_slots: position_onehot[c]  (identity into d_head cols 1..n_slots).
+    # Cols 1 .. n_slots: position_onehot[c]  (identity into cols 1..n_slots).
     for c in range(n_slots):
         key_matrix[onehot_start_row + c, 1 + c] = 1.0
 
-    # --- Value pass-through into the tail cols of d_head. ---
-    value_matrix = torch.zeros((d_value, d_head))
-    output_matrix = torch.zeros((d_head, d_value))
-    for v in range(d_value):
-        value_matrix[v, 1 + n_slots + v] = 1.0
-        output_matrix[1 + n_slots + v, v] = 1.0
-
-    attn = Attn(
-        query_in=query_in,
-        key_in=key_in,
-        value_in=value,
-        query_matrix=query_matrix,
-        key_matrix=key_matrix,
-        value_matrix=value_matrix,
-        output_matrix=output_matrix,
+    attn = rotary_content_head(
+        query_in,
+        key_in,
+        value,
+        query_matrix,
+        key_matrix,
+        d_head=rope.d_head,
+        base=rope.base,
     )
     return _wrap_hard_selection_output(
         attn, value, assert_hardness_gt=assert_hardness_gt
@@ -916,7 +892,7 @@ def attend_argmin_unmasked(
 
 
 def attend_argmin_valid_unmasked(
-    pos_encoding: PosEncoding,
+    rope: RopeConfig,
     score: Node,
     validity: Node,
     mask_vector: Node,
@@ -965,7 +941,7 @@ def attend_argmin_valid_unmasked(
     ``d_head = 1 + n_slots + len(value)``.
 
     Args:
-        pos_encoding: The graph's positional encoding node.
+        rope: RoPE config (``d_head`` / ``base``) for the slow-plane placement.
         score: 1D scalar node.
         validity: 1D boolean node (+1 valid, −1 invalid).
         mask_vector: Width-``N`` per-query ``{0, 1}`` mask.
@@ -984,27 +960,25 @@ def attend_argmin_valid_unmasked(
         f"(got {len(mask_vector)} and {len(position_onehot)})"
     )
     n_slots = len(mask_vector)
-    d_value = len(value)
-    # Layout of d_head:
-    #   col 0:                              score + gained validity
-    #   cols 1 .. n_slots:                  mask · position_onehot terms
-    #   cols n_slots+1 .. n_slots+d_value:  value pass-through
-    d_head = 1 + n_slots + d_value
+    # Content Q/K layout (relocated onto slow planes; value rides identity V/O):
+    #   col 0:               score + gained validity
+    #   cols 1 .. n_slots:   mask · position_onehot terms
+    W = 1 + n_slots
 
     # Query: an exact 1.0 for the score/validity gain (col 0) plus the mask.
     query_one = LiteralValue(torch.tensor([1.0]), name="valid_unmasked_query_one")
     query_in = Concatenate([query_one, mask_vector])
     key_in = Concatenate([score, validity, position_onehot])
 
-    # --- Query matrix, shape (1 + n_slots, d_head) ---
-    query_matrix = torch.zeros((len(query_in), d_head))
+    # --- Query matrix, shape (1 + n_slots, W) ---
+    query_matrix = torch.zeros((len(query_in), W))
     query_matrix[0, 0] = _QUERY_GAIN
     for c in range(n_slots):
         query_matrix[1 + c, 1 + c] = -_UNMASKED_PENALTY
 
-    # --- Key matrix, shape (2 + n_slots, d_head) ---
+    # --- Key matrix, shape (2 + n_slots, W) ---
     # Row order in key_in: [score (1), validity (1), onehot (n_slots)]
-    key_matrix = torch.zeros((len(key_in), d_head))
+    key_matrix = torch.zeros((len(key_in), W))
     score_row = 0
     validity_row = 1
     onehot_start_row = 2
@@ -1015,21 +989,14 @@ def attend_argmin_valid_unmasked(
     for c in range(n_slots):
         key_matrix[onehot_start_row + c, 1 + c] = 1.0
 
-    # --- Value pass-through into the tail cols of d_head. ---
-    value_matrix = torch.zeros((d_value, d_head))
-    output_matrix = torch.zeros((d_head, d_value))
-    for v in range(d_value):
-        value_matrix[v, 1 + n_slots + v] = 1.0
-        output_matrix[1 + n_slots + v, v] = 1.0
-
-    attn = Attn(
-        query_in=query_in,
-        key_in=key_in,
-        value_in=value,
-        query_matrix=query_matrix,
-        key_matrix=key_matrix,
-        value_matrix=value_matrix,
-        output_matrix=output_matrix,
+    attn = rotary_content_head(
+        query_in,
+        key_in,
+        value,
+        query_matrix,
+        key_matrix,
+        d_head=rope.d_head,
+        base=rope.base,
     )
     return _wrap_hard_selection_output(
         attn, value, assert_hardness_gt=assert_hardness_gt
@@ -1037,7 +1004,7 @@ def attend_argmin_valid_unmasked(
 
 
 def attend_mean_where(
-    pos_encoding: PosEncoding,
+    rope: RopeConfig,
     validity: Node,
     value: Node,
 ) -> Node:
@@ -1066,7 +1033,7 @@ def attend_mean_where(
     ``d_qk = 1``, ``d_v = len(value)``.
 
     Args:
-        pos_encoding: The graph's positional encoding node.
+        rope: RoPE config (``d_head`` / ``base``) for the slow-plane placement.
         validity: 1D boolean node (+1 valid, −1 invalid).
         value: Node to average.  No width constraint — the compiler
             splits wide V/O across multiple physical heads.
@@ -1081,13 +1048,14 @@ def attend_mean_where(
     """
     assert len(validity) == 1, "attend_mean_where expects a 1D boolean validity"
 
-    # d_qk = 1: the only column carries the direct validity bonus.
-    # Q is an exact 1.0 (a LiteralValue) — unscaled, since validity here is a
-    # direct logit contribution, not combined with any gained score.  K reads
-    # only validity.  All valid positions get the same logit → uniform
-    # softmax → exact mean.
+    # Content width 1: the only column carries the direct validity bonus,
+    # relocated onto the slowest plane by rotary_content_head so the rotation
+    # is quasi-static (cos((i−j)·θ_slow) ≈ 1) over a bounded valid window and
+    # the mean stays uniform.  Q is an exact 1.0 (a LiteralValue) — unscaled,
+    # since validity here is a direct logit contribution, not combined with any
+    # gained score.  K reads only validity.  All valid positions get the same
+    # logit → uniform softmax → mean.
     d_qk = 1
-    d_v = len(value)
 
     query_one = LiteralValue(torch.tensor([1.0]), name="mean_where_query_one")
     query_matrix = torch.zeros((1, d_qk))
@@ -1097,17 +1065,14 @@ def attend_mean_where(
     key_matrix = torch.zeros((len(validity), d_qk))
     key_matrix[0, 0] = _VALIDITY_DIRECT
 
-    value_matrix = torch.eye(d_v)
-    output_matrix = torch.eye(d_v)
-
-    attn = Attn(
-        query_in=query_one,
-        key_in=validity,
-        value_in=value,
-        query_matrix=query_matrix,
-        key_matrix=key_matrix,
-        value_matrix=value_matrix,
-        output_matrix=output_matrix,
+    attn = rotary_content_head(
+        query_one,
+        validity,
+        value,
+        query_matrix,
+        key_matrix,
+        d_head=rope.d_head,
+        base=rope.base,
     )
     # Mean of values in [lo, hi] stays in [lo, hi] (convex combination),
     # but integer-ness / binary-ness / one-hot-ness do not survive the
@@ -1119,6 +1084,7 @@ def attend_mean_where(
 
 
 def attend_argmax_dot(
+    rope: RopeConfig,
     query_vector: Node,
     key_vector: Node,
     value: Node,
@@ -1172,37 +1138,31 @@ def attend_argmax_dot(
         f"(got {len(query_vector)} and {len(key_vector)})"
     )
     W = len(query_vector)
-    d_v = len(value)
 
-    # d_qk layout: cols 0..W-1 are match dimensions (query_vector · key_vector)
-    d_qk = W
-
+    # Content Q/K layout: cols 0..W-1 are match dims (query_vector · key_vector),
+    # relocated onto slow planes by rotary_content_head.
     # --- Query ---
     # Columns 0..W-1: match_gain * query_vector[c]
     query_in = query_vector
-    query_matrix = torch.zeros((W, d_qk))
+    query_matrix = torch.zeros((W, W))
     for c in range(W):
         query_matrix[c, c] = match_gain
 
     # --- Key ---
     # Columns 0..W-1: key_vector[c] (identity)
     key_in = key_vector
-    key_matrix = torch.zeros((W, d_qk))
+    key_matrix = torch.zeros((W, W))
     for c in range(W):
         key_matrix[c, c] = 1.0
 
-    # --- Value / Output: identity pass-through ---
-    value_matrix = torch.eye(d_v)
-    output_matrix = torch.eye(d_v)
-
-    attn = Attn(
-        query_in=query_in,
-        key_in=key_in,
-        value_in=value,
-        query_matrix=query_matrix,
-        key_matrix=key_matrix,
-        value_matrix=value_matrix,
-        output_matrix=output_matrix,
+    attn = rotary_content_head(
+        query_in,
+        key_in,
+        value,
+        query_matrix,
+        key_matrix,
+        d_head=rope.d_head,
+        base=rope.base,
     )
     return _wrap_hard_selection_output(
         attn, value, assert_hardness_gt=assert_hardness_gt
@@ -1210,6 +1170,7 @@ def attend_argmax_dot(
 
 
 def _build_dot_where_attn(
+    rope: RopeConfig,
     query_vector: Node,
     key_vector: Node,
     validity: Node,
@@ -1220,7 +1181,9 @@ def _build_dot_where_attn(
 ) -> Attn:
     """Shared construction for dot-product selection with validity.
 
-    ``score_sign`` is ``+1`` for argmax and ``-1`` for argmin.
+    ``score_sign`` is ``+1`` for argmax and ``-1`` for argmin.  Content is
+    relocated onto slow planes by :func:`rotary_content_head`; ``rope`` carries
+    the ``d_head`` / ``base``.
     """
     assert len(query_vector) == len(key_vector), (
         "query_vector and key_vector must have the same width "
@@ -1230,14 +1193,13 @@ def _build_dot_where_attn(
     assert match_gain > 0, "attend_*_dot_where expects positive match_gain"
 
     W = len(query_vector)
-    d_v = len(value)
-    # d_qk layout:
+    # Content Q/K layout:
     #   cols 0..W-1: dot-product score
     #   col W:       direct validity bonus
     d_qk = W + 1
 
     # The validity term needs a query-side constant.  A LiteralValue keeps
-    # this op independent of PosEncoding while preserving the same direct
+    # this op independent of position while preserving the same direct
     # validity-logit pattern used by the scalar _where variants.
     query_one = LiteralValue(torch.tensor([1.0]), name="dot_where_query_one")
     query_in = Concatenate([query_vector, query_one])
@@ -1253,21 +1215,19 @@ def _build_dot_where_attn(
         key_matrix[c, c] = 1.0
     key_matrix[W, W] = _VALIDITY_DIRECT
 
-    value_matrix = torch.eye(d_v)
-    output_matrix = torch.eye(d_v)
-
-    return Attn(
-        query_in=query_in,
-        key_in=key_in,
-        value_in=value,
-        query_matrix=query_matrix,
-        key_matrix=key_matrix,
-        value_matrix=value_matrix,
-        output_matrix=output_matrix,
+    return rotary_content_head(
+        query_in,
+        key_in,
+        value,
+        query_matrix,
+        key_matrix,
+        d_head=rope.d_head,
+        base=rope.base,
     )
 
 
 def attend_argmax_dot_where(
+    rope: RopeConfig,
     query_vector: Node,
     key_vector: Node,
     validity: Node,
@@ -1319,6 +1279,7 @@ def attend_argmax_dot_where(
         :func:`attend_argmax_dot` — original unmasked dot-product variant.
     """
     attn = _build_dot_where_attn(
+        rope,
         query_vector,
         key_vector,
         validity,
@@ -1332,6 +1293,7 @@ def attend_argmax_dot_where(
 
 
 def attend_argmin_dot_where(
+    rope: RopeConfig,
     query_vector: Node,
     key_vector: Node,
     validity: Node,
@@ -1368,6 +1330,7 @@ def attend_argmin_dot_where(
         Attn node of width ``len(value)``.
     """
     attn = _build_dot_where_attn(
+        rope,
         query_vector,
         key_vector,
         validity,
@@ -1380,209 +1343,85 @@ def attend_argmin_dot_where(
     )
 
 
-def attend_most_recent_matching(
-    pos_encoding: PosEncoding,
-    query_vector: Node,
-    key_vector: Node,
+def attend_to_offset(rope: RopeConfig, value: Node, delta_pos: int = -1) -> Node:
+    """Read ``value`` from the position ``delta_pos`` away — a rotary offset head.
+
+    The RoPE-native replacement for the old ``PosEncoding.attend_to_offset``:
+    a pure-rotary "attend to position ``j + delta_pos``" head that carries **no**
+    positional input (position enters only through the runtime rotation).  At
+    each query position ``j`` it returns ``value`` at key ``j + delta_pos``;
+    ``delta_pos = -1`` is the previous position.  Out-of-range targets (before
+    BOS) are a causal don't-care — do not consume them.
+
+    ``delta_pos = 0`` is a no-op (returns ``value``).  Full-width rotary on the
+    ``rope.d_head`` grid (the §6 LLaMA3 end state), so it works on all three
+    runtime surfaces.
+    """
+    return rotary_offset_head(value, delta_pos, d_qk=rope.d_head, base=rope.base)
+
+
+def get_prev_value(
+    rope: RopeConfig,
     value: Node,
+    cond: Node,
+    recency_rank: Node,
     *,
-    match_gain: float = 200.0,
-    exclude_self: bool = False,
-    assert_hardness_gt: Optional[float] = None,
+    rank_gain: float = 2.0e5,
 ) -> Node:
-    """Attend to the **most recent** key position whose ``key_vector``
-    matches ``query_vector``.
+    """Most-recent previous ``value`` at a position where ``cond`` is true.
 
-    At each query position, the attention returns ``value`` at the
-    causal-window position whose dot-product score
-    ``match_gain · (query_vector_j · key_vector_i)`` is largest, with
-    ties broken by position: among positions sharing the maximum dot
-    product, the one with the highest ``position_idx`` wins.  (The
-    position_idx is the raw integer counter stored in the PE
-    ``counter_col`` — the last column.)
+    The RoPE-native replacement for the old ``PosEncoding.get_prev_value``:
+    recency is ranked by the graph-derived octant ramp
+    (:func:`~torchwright.ops.recency_heads.recency_rank`) instead of a host
+    position counter.  For each query position it selects ``value`` at the most
+    recent causal position where ``cond`` is true.  ``cond`` follows the usual
+    torchwright boolean convention (true ``= +1``; false ``<= 0``).
 
-    Combining content match with a recency tiebreak gives the building
-    block thinking tokens use to find data in the KV cache — "most
-    recent token of type X" is exactly this op with ``query`` as the
-    target type vector and ``key`` as each token's own type vector.
+    The logit at key ``i`` is ``gate · cond_i + rank_gain · recency_rank_i``
+    with ``gate = 4 · rank_gain`` so the condition dominates the recency swing
+    (``rank_range ≈ 2.06 < 4``): any true key beats any false key, and among
+    true keys the most recent (largest ramp) wins.  Content and rank ride slow
+    planes (full-width rotary).
 
-    ``attend_argmax_dot`` does the pure-content-match case but
-    soft-averages across tied keys; this primitive adds the recency
-    tiebreak so a query with multiple matching keys (e.g. all SORTED
-    markers in a rendering loop) still concentrates on exactly one.
-
-    Compile cost: one attention head (auto-split across multiple
-    physical heads when ``d_v > d_head``).
-    ``d_qk = W + 1``, ``d_v = len(value)``.
-
-    **Required invariant on ``match_gain``.**  Callers must set
-    ``match_gain`` such that
-
-        match_gain · (min_match_dot − max_no_match_dot)
-            > _QUERY_GAIN · max_n_pos
-
-    where ``max_n_pos`` is the maximum causal-window length the caller
-    expects to run at.  Without this, a very recent **unmatched**
-    position can outscore a less-recent **matched** one and the op
-    returns the wrong value.
-
-    Quick sizing guide:
-
-    - Unit dot products (one-hot match, ``match_dot=1`` on match,
-      ``0`` off): the safe span is roughly
-      ``match_gain / _QUERY_GAIN``.  At ``match_gain = 300_000`` this
-      covers spans below ``37,500`` positions, including the DOOM
-      renderer's measured ~8,500-position rollout and the 32,768-position
-      regression test, but not a 65,536-position hard cap.
-    - 10×-scaled E8 codes (``match_dot=1600``, worst off-diagonal
-      ``~800``) at ``max_n_pos ≈ 2000``: the ``800``-unit dot gap gives
-      plenty of headroom even at the default ``match_gain = 200``
-      (``200 · 800 = 160000`` vs ``_QUERY_GAIN · 2000 = 16000``).
-
-    **Softmax concentration within the matched tier.**  The recency
-    term contributes ``_QUERY_GAIN · position_idx`` to the logit.
-    Consecutive matched positions a single position_idx apart produce
-    a logit gap of ``_QUERY_GAIN = 8`` — enough for
-    ``exp(8) ≈ 3000×`` weight concentration on the most recent — so
-    even dense matches resolve cleanly.  Set ``assert_hardness_gt`` if
-    you need runtime enforcement.
-
-    **Precision policy.**  Torchwright's current oracle path uses fp32
-    ``torch.matmul`` / ``torch.softmax`` and the compiled path routes
-    SDPA through the MATH backend with fp32 tensors.  PyTorch's default
-    CUDA TF32 matmul flag is also off in the supported environment.
-    Under that policy, ``match_gain = 300_000`` leaves ample precision
-    headroom for the 8-logit adjacent-position recency gap at the spans
-    above.  If a future global precision setting enables TF32, re-run
-    the long-span regression before relying on this gain; TF32's
-    coarser mantissa can erase the 8-logit tiebreak when the total logit
-    is in the hundreds of thousands.
-
-    **When no position matches.**  If no causal-window position has
-    ``query_vector · key_vector`` above the unmatched baseline, the
-    attention degrades to pure recency — returning a soft-weighted
-    mean biased toward recent positions.  Callers must ensure at least
-    one matching position exists within the causal window at every
-    query position whose output is consumed, or wrap the result in a
-    ``select`` against a sentinel.
+    **All-false window.**  If no causal position has ``cond`` true, the gate is
+    uniform and the head degrades to pure recency (the most recent position's
+    value) — callers must ensure at least one true key exists in every consumed
+    window, or gate the result.
 
     Args:
-        pos_encoding: The graph's positional encoding node.  Used for
-            the K-side position counter (raw integer at ``counter_col``,
-            the last column).  The stable Q-side ≈1 signal is an exact
-            ``LiteralValue([1.0])``, not the encoding.
-        query_vector: Width-``W`` node — what we're looking for at
-            each query position.
-        key_vector: Width-``W`` node — the key-side identity at each
-            position.  Same width as ``query_vector``.
-        value: Node to read at the selected key position.  No width
-            constraint — the compiler splits wide V/O across multiple
-            physical heads.
-        match_gain: Coefficient on the dot-product term.  See the
-            invariant above.
-        exclude_self: If ``True``, the current query position is
-            excluded from selection — the head returns ``value`` at the
-            most recent matching position **strictly before** self.
-            Implemented by pre-shifting ``key_vector`` and ``value`` by
-            one position via :meth:`PosEncoding.attend_to_offset`, so
-            that at slot ``i`` the head sees the predecessor's key and
-            value.  Costs two extra attention heads for the key and
-            value shifts (wide key/value auto-split across more heads;
-            no width cap).  At query position 0 the result is degenerate
-            (no prior position exists) — the caller must not consume it
-            there.
-        assert_hardness_gt: If set, wraps the output in a softmax
-            hardness assertion verifying the max attention weight per
-            query exceeds this threshold during ``debug=True`` forward
-            passes.
-
-    Returns:
-        Attn node of width ``len(value)`` equal to ``value`` at the
-        most-recent best-match key position within the causal window.
-
-    See also:
-        :func:`attend_argmax_dot` — same content match without the
-        recency tiebreak (soft-averages across ties).
-        :meth:`PosEncoding.get_prev_value` — the single-bit-condition
-        analogue; superseded by this primitive for multi-dimensional
-        match vectors.
+        rope: the RoPE config (``d_head`` / ``base``).
+        value: node to read at the selected position.
+        cond: length-1 boolean (true = +1).
+        recency_rank: length-1 monotone recency ramp (built once per graph via
+            :func:`~torchwright.ops.recency_heads.recency_rank`).
+        rank_gain: ``G`` — coefficient on the recency ramp.
     """
-    assert len(query_vector) == len(key_vector), (
-        "query_vector and key_vector must have the same width "
-        f"(got {len(query_vector)} and {len(key_vector)})"
-    )
-    d_pos = pos_encoding.d_pos
-    if exclude_self:
-        # The shift uses attend_to_offset, whose Q/K width is trig_width and
-        # whose V/O auto-splits across heads, so key_vector / value may be any
-        # width (the only binding constraint, d_head >= W + 1 for this head's
-        # Q/K, is enforced by the compiler).
-        # Shift key and value back by one position so that at slot i the
-        # head sees key_vector[i-1] / value[i-1].  The causal mask still
-        # admits i in [0, j], but the rightmost slot i = j now carries
-        # the predecessor's data — self can no longer contribute its own
-        # match.
-        key_vector = pos_encoding.attend_to_offset(key_vector, delta_pos=-1)
-        value = pos_encoding.attend_to_offset(value, delta_pos=-1)
-    W = len(query_vector)
-    d_v = len(value)
+    assert len(cond) == 1, "get_prev_value expects a 1-D boolean cond"
+    assert len(recency_rank) == 1, "recency_rank must be a length-1 node"
+    gate = 4.0 * rank_gain  # cond dominates the ramp's ~2.06 swing
 
-    # d_qk layout:
-    #   cols 0..W-1   content match:   Q = match_gain · query_vector[c],
-    #                                  K = key_vector[c].
-    #                                  Σ = match_gain · (query · key).
-    #   col  W        recency tiebreak: Q = _QUERY_GAIN (from a 1.0 literal),
-    #                                  K = position_idx (from PE counter).
-    #                                  Σ = _QUERY_GAIN · position_idx.
-    # Value passes through V/O matrices independently of d_qk layout.
-    d_qk = W + 1
+    # Content cols: [cond gate, recency rank], relocated onto slow planes.
+    query_one = LiteralValue(torch.tensor([1.0]), name="prev_value_query_one")
+    query_matrix = torch.tensor([[gate, rank_gain]])  # (1, 2)
 
-    # The recency tiebreak needs a stable ≈1 on the Q side and the raw
-    # position counter on the K side.  The Q-side constant is an exact 1.0
-    # (a LiteralValue); only the K side needs the positional encoding (for
-    # its counter column).
-    query_one = LiteralValue(torch.tensor([1.0]), name="recency_query_one")
-    query_in = Concatenate([query_vector, query_one])
-    key_in = Concatenate([key_vector, pos_encoding])
+    key_in = Concatenate([cond, recency_rank])
+    key_matrix = torch.zeros((len(key_in), 2))
+    key_matrix[0, 0] = 1.0  # cond -> gate column
+    key_matrix[1, 1] = 1.0  # recency_rank -> recency column
 
-    # --- Query matrix, shape (W + 1, d_qk) ---
-    query_matrix = torch.zeros((W + 1, d_qk))
-    # Cols 0..W-1: match_gain · query_vector[c].
-    for c in range(W):
-        query_matrix[c, c] = match_gain
-    # Col W: the exact 1.0 literal (row W), scaled by _QUERY_GAIN so unit
-    # position gaps produce _QUERY_GAIN-sized logit gaps — the codebase
-    # convention for integer-score signals.
-    query_matrix[W, W] = _QUERY_GAIN
-
-    # --- Key matrix, shape (W + d_pos, d_qk) ---
-    key_matrix = torch.zeros((W + d_pos, d_qk))
-    # Cols 0..W-1: identity on key_vector[c].
-    for c in range(W):
-        key_matrix[c, c] = 1.0
-    # Col W: raw position counter from the PE counter column (unit
-    # coefficient on the K side; the gain lives on the Q side).
-    key_matrix[W + pos_encoding.counter_col, W] = 1.0
-
-    # --- Value / Output: identity pass-through on value. ---
-    value_matrix = torch.eye(d_v)
-    output_matrix = torch.eye(d_v)
-
-    attn = Attn(
-        query_in=query_in,
-        key_in=key_in,
-        value_in=value,
-        query_matrix=query_matrix,
-        key_matrix=key_matrix,
-        value_matrix=value_matrix,
-        output_matrix=output_matrix,
-    )
-    return _wrap_hard_selection_output(
-        attn, value, assert_hardness_gt=assert_hardness_gt
+    return rotary_content_head(
+        query_one,
+        key_in,
+        value,
+        query_matrix,
+        key_matrix,
+        d_head=rope.d_head,
+        base=rope.base,
     )
 
 
-def attend_most_recent_matching_via_ramp(
+def attend_most_recent_matching(
+    rope: RopeConfig,
     query_vector: Node,
     key_vector: Node,
     value: Node,
@@ -1590,16 +1429,19 @@ def attend_most_recent_matching_via_ramp(
     *,
     match_gain: float = 200.0,
     rank_gain: float = 2.0e5,
+    exclude_self: bool = False,
     assert_hardness_gt: Optional[float] = None,
 ) -> Node:
-    """RoPE-native twin of :func:`attend_most_recent_matching`.
+    """Attend to the **most recent** key whose ``key_vector`` matches
+    ``query_vector`` — RoPE-native (the recency tiebreak is the octant ramp).
 
-    Identical content-match-plus-recency-tiebreak selection, but the recency
-    rank is a graph-derived ``recency_rank`` node (the bucket-2 octant ramp,
-    :func:`torchwright.ops.recency_heads.recency_rank`) instead of the raw
-    integer counter in the positional encoding.  ``pos_encoding`` drops out of
-    the signature entirely — this is the form DOOM rewires onto at Phase 5
-    (``docs/rope_port_plan.md`` §7).
+    The content match rides slow planes and the recency tiebreak is a
+    graph-derived ``recency_rank`` node (the bucket-2 octant ramp,
+    :func:`torchwright.ops.recency_heads.recency_rank`) instead of a host
+    position counter — ``docs/rope_port_plan.md`` §7.  (Before the RoPE port
+    this was two functions: a counter-based ``attend_most_recent_matching`` and
+    a ``_via_ramp`` twin; the counter version is gone and this is the single
+    RoPE-native form.)
 
     At each query position the logit at key ``i`` is
 
@@ -1638,12 +1480,20 @@ def attend_most_recent_matching_via_ramp(
     mismatched reference token from winning on its outlier rank, so honor it.
 
     Args:
+        rope: the RoPE config (``d_head`` / ``base`` for the slow-plane
+            placement; every head is full-width rotary in the end state).
         query_vector: Width-``W`` node — what we're looking for.
         key_vector: Width-``W`` node — each key's identity.
         value: Node to read at the selected key position.
         recency_rank: length-1 node, the per-position recency ramp.
         match_gain: Coefficient on the dot-product term (see the invariant).
         rank_gain: ``G`` — coefficient on the recency ramp.
+        exclude_self: If ``True``, the current query position is excluded —
+            the head returns ``value`` at the most recent matching position
+            strictly before self.  Implemented by pre-shifting ``key_vector``
+            and ``value`` back one position via the rotary
+            :func:`attend_to_offset`.  At query position 0 the result is
+            degenerate; the caller must not consume it there.
         assert_hardness_gt: If set, wraps the output in a softmax hardness
             assertion checked during ``debug=True`` passes.
 
@@ -1655,11 +1505,16 @@ def attend_most_recent_matching_via_ramp(
         f"(got {len(query_vector)} and {len(key_vector)})"
     )
     assert len(recency_rank) == 1, "recency_rank must be a length-1 node"
+    if exclude_self:
+        # Shift key and value back one position so slot i carries the
+        # predecessor's data — self can no longer contribute its own match.
+        key_vector = attend_to_offset(rope, key_vector, delta_pos=-1)
+        value = attend_to_offset(rope, value, delta_pos=-1)
     W = len(query_vector)
-    d_v = len(value)
     d_qk = W + 1
 
-    # Q side: match_gain on the query vector, rank_gain on an exact 1.0 literal.
+    # Content Q/K (relocated onto slow planes by rotary_content_head):
+    #   Q side: match_gain on the query vector, rank_gain on an exact 1.0 literal.
     query_one = LiteralValue(torch.tensor([1.0]), name="recency_ramp_query_one")
     query_in = Concatenate([query_vector, query_one])
     query_matrix = torch.zeros((W + 1, d_qk))
@@ -1667,21 +1522,21 @@ def attend_most_recent_matching_via_ramp(
         query_matrix[c, c] = match_gain
     query_matrix[W, W] = rank_gain
 
-    # K side: identity on the key vector, unit on the recency ramp.
+    #   K side: identity on the key vector, unit on the recency ramp.
     key_in = Concatenate([key_vector, recency_rank])
     key_matrix = torch.zeros((W + 1, d_qk))
     for c in range(W):
         key_matrix[c, c] = 1.0
     key_matrix[W, W] = 1.0  # recency_rank row -> recency column
 
-    attn = Attn(
-        query_in=query_in,
-        key_in=key_in,
-        value_in=value,
-        query_matrix=query_matrix,
-        key_matrix=key_matrix,
-        value_matrix=torch.eye(d_v),
-        output_matrix=torch.eye(d_v),
+    attn = rotary_content_head(
+        query_in,
+        key_in,
+        value,
+        query_matrix,
+        key_matrix,
+        d_head=rope.d_head,
+        base=rope.base,
     )
     return _wrap_hard_selection_output(
         attn, value, assert_hardness_gt=assert_hardness_gt

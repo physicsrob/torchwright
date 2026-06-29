@@ -20,7 +20,7 @@ from typing import Tuple, List
 
 import torch
 
-from torchwright.graph import Node, Embedding, PosEncoding
+from torchwright.graph import Node, Embedding, RopeConfig
 from torchwright.graph.embedding import Unembedding
 from torchwright.ops.arithmetic_ops import (
     add,
@@ -30,12 +30,14 @@ from torchwright.ops.arithmetic_ops import (
     relu_add,
     multiply_integers,
 )
+from torchwright.ops.attention_ops import get_prev_value
 from torchwright.ops.inout_nodes import (
     create_literal_value,
     create_embedding,
-    create_pos_encoding,
+    create_rope_config,
     create_unembedding,
 )
+from torchwright.ops.recency_heads import recency_rank_from_tokens
 from torchwright.ops.logic_ops import (
     equals_vector,
     bool_any_true,
@@ -55,12 +57,17 @@ from torchwright.ops.sequence_ops import (
 )
 
 D_MODEL = 1024
+# Rotary width the graph is built against; must match the d_head it is
+# compiled at (the token-example harness and HF parity both compile at
+# d_head=16, the default for compile_to_onnx).
+D_HEAD = 16
+MAX_POSITIONS = 512
 
 
 def create_network_parts(
     max_digits: int = 3,
-) -> Tuple[Node, PosEncoding, Embedding]:
-    """Build the calculator graph and return (output_node, pos_encoding, embedding).
+) -> Tuple[Node, Embedding]:
+    """Build the calculator graph and return (output_node, embedding).
 
     Parses "A op B\\n" where op is +, -, or *, then outputs result digits
     autoregressively. Subtraction can produce negative results (prefixed with "-").
@@ -72,12 +79,16 @@ def create_network_parts(
     """
     vocab = list(
         " 0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ!@#$%^&*()-+="
-    ) + ["\n", "<bos>", "<eos>", "default"]
+    ) + ["\n", "<bos>", "<ref>", "<eos>", "default"]
     embedding = create_embedding(vocab=vocab)
-    pos_encoding = create_pos_encoding()
+    rope = create_rope_config(d_head=D_HEAD, max_positions=MAX_POSITIONS)
+
+    # Bucket-2 recency rank from the <bos>/<ref> markers — replaces the old
+    # position counter that drove "most recent" selection.
+    recency_rank = recency_rank_from_tokens(rope, embedding)
 
     # --- Phase 1: Parse operands and operator ---
-    num_seq = NumericSequence(pos_encoding, embedding, max_digits)
+    num_seq = NumericSequence(rope, embedding, max_digits, recency_rank)
 
     # Detect which operator token appears
     is_plus = equals_vector(embedding, embedding.get_embedding("+"))
@@ -88,15 +99,15 @@ def create_network_parts(
 
     # Guard: only detect operators before "=" — output tokens like "-" must
     # not re-trigger operator signals during autoregressive decoding.
-    has_seen_equals = pos_encoding.get_prev_value(is_equals, is_equals)
+    has_seen_equals = get_prev_value(rope, is_equals, is_equals, recency_rank)
     before_equals = bool_not(has_seen_equals)
     is_operator_input = bool_all_true([is_operator, before_equals])
 
     # Latch which operator was seen (captured at the operator position,
     # carried forward to all later positions via attention).
-    which_plus = pos_encoding.get_prev_value(is_plus, is_operator_input)
-    which_minus = pos_encoding.get_prev_value(is_minus, is_operator_input)
-    which_times = pos_encoding.get_prev_value(is_times, is_operator_input)
+    which_plus = get_prev_value(rope, is_plus, is_operator_input, recency_rank)
+    which_minus = get_prev_value(rope, is_minus, is_operator_input, recency_rank)
+    which_times = get_prev_value(rope, is_times, is_operator_input, recency_rank)
 
     # Extract operand digits (MSB first)
     first_num_digits = num_seq.get_digits_at_event(is_operator_input)
@@ -174,15 +185,16 @@ def create_network_parts(
         )
 
     output_node = output_sequence(
-        pos_encoding,
+        rope,
         is_equals,
         result_digits,
         embedding.get_embedding(" "),
+        recency_rank,
     )
-    return output_node, pos_encoding, embedding
+    return output_node, embedding
 
 
 def create_network(max_digits: int = 3) -> Unembedding:
     """Create a calculator network: parses "A op B\\n", outputs result autoregressively."""
-    output_node, pos_encoding, embedding = create_network_parts(max_digits)
+    output_node, embedding = create_network_parts(max_digits)
     return create_unembedding(output_node, embedding)

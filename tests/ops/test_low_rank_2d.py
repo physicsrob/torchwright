@@ -177,7 +177,6 @@ def test_low_rank_2d_compiled_product():
 
     report = probe_graph(
         node,
-        pos_encoding=None,
         input_values=inputs,
         n_pos=n_pos,
         d=512,

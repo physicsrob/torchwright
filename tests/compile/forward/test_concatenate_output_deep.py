@@ -12,14 +12,12 @@ import torch
 from torchwright.compiler.export import compile_headless
 from torchwright.graph import Concatenate
 from torchwright.ops.arithmetic_ops import compare, signed_multiply, reciprocal
-from torchwright.ops.inout_nodes import create_input, create_pos_encoding
+from torchwright.ops.inout_nodes import create_input
 from torchwright.ops.map_select import select
 
 
 def test_concatenate_output_mixed_depth():
     """Concatenate of a shallow and a deep subgraph should compile."""
-    pos_encoding = create_pos_encoding()
-
     # Shallow subgraph (~3 layers)
     a = create_input("a", 1, value_range=(-10.0, 10.0))
     b = create_input("b", 1, value_range=(-10.0, 10.0))
@@ -36,7 +34,6 @@ def test_concatenate_output_mixed_depth():
 
     module = compile_headless(
         output,
-        pos_encoding,
         d=1024,
         d_head=16,
         verbose=False,

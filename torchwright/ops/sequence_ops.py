@@ -19,8 +19,9 @@ from typing import List
 
 import torch
 
-from torchwright.graph import Node, Embedding, PosEncoding
+from torchwright.graph import Node, Embedding, RopeConfig
 from torchwright.ops.arithmetic_ops import sum_nodes
+from torchwright.ops.attention_ops import attend_to_offset, get_prev_value
 from torchwright.ops.inout_nodes import create_literal_value
 from torchwright.ops.logic_ops import (
     equals_vector,
@@ -62,20 +63,31 @@ class NumericSequence:
         At position "=": window = [embed("4"), embed("5"), embed("6")]
 
     Args:
-        pos_encoding: Positional encoding for attention operations.
+        rope: RoPE config for the rotary offset / recency attention ops.
         embedding: Embedding table (must contain "0"-"9").
         digits: Number of digits to track in the sliding window.
+        recency_rank: length-1 monotone recency ramp (built once per graph via
+            :func:`~torchwright.ops.recency_heads.recency_rank` from the graph's
+            BOS / REF markers) — drives :func:`get_prev_value`'s most-recent
+            selection in :meth:`get_digits_at_event`.
     """
 
-    def __init__(self, pos_encoding: PosEncoding, embedding: Embedding, digits: int):
-        self.pos_encoding = pos_encoding
+    def __init__(
+        self,
+        rope: RopeConfig,
+        embedding: Embedding,
+        digits: int,
+        recency_rank: Node,
+    ):
+        self.rope = rope
+        self.recency_rank = recency_rank
         zero_constant = create_literal_value(embedding.get_embedding("0"))
         is_digit = check_is_digit(embedding)
 
         # Detect the start of a new number: current token is a digit,
         # but the previous token was not.
         is_num_start = bool_all_true(
-            [is_digit, bool_not(pos_encoding.attend_to_offset(is_digit))]
+            [is_digit, bool_not(attend_to_offset(rope, is_digit))]
         )
 
         # Build the sliding window: current_digits[0] = current token,
@@ -87,15 +99,13 @@ class NumericSequence:
                 select(
                     cond=is_num_start,
                     true_node=zero_constant,
-                    false_node=pos_encoding.attend_to_offset(current_digits[-1]),
+                    false_node=attend_to_offset(rope, current_digits[-1]),
                 )
             )
 
         # Shift by one position so digit values are available at the
         # delimiter token (one step after the last digit).
-        self.digit_values = [
-            pos_encoding.attend_to_offset(digit) for digit in current_digits
-        ]
+        self.digit_values = [attend_to_offset(rope, digit) for digit in current_digits]
 
     def get_digits_at_event(self, termination_event: Node) -> List[Node]:
         """Capture the digit window at the position where termination_event fires.
@@ -110,16 +120,17 @@ class NumericSequence:
             List of embedding-valued digit nodes, MSB-first.
         """
         return [
-            self.pos_encoding.get_prev_value(digit, termination_event)
+            get_prev_value(self.rope, digit, termination_event, self.recency_rank)
             for digit in reversed(self.digit_values)
         ]
 
 
 def output_sequence(
-    pos_encoding: PosEncoding,
+    rope: RopeConfig,
     trigger_condition: Node,
     seq: List[Node],
     default_output: torch.Tensor,
+    recency_rank: Node,
 ):
     """Gate a sequence of values for left-to-right autoregressive emission.
 
@@ -130,19 +141,23 @@ def output_sequence(
     at a time during autoregressive decoding.
 
     Args:
-        pos_encoding: Positional encoding for attention.
+        rope: RoPE config for the rotary offset / recency attention ops.
         trigger_condition: Boolean node — emission starts when this is true.
         seq: List of embedding-valued nodes to emit in order.
         default_output: Tensor to output before the trigger fires.
+        recency_rank: length-1 monotone recency ramp (see :class:`NumericSequence`)
+            driving the "has the trigger fired yet" latch.
     """
     # has_triggered is true at all positions from the trigger onward.
-    has_triggered = pos_encoding.get_prev_value(trigger_condition, trigger_condition)
+    has_triggered = get_prev_value(
+        rope, trigger_condition, trigger_condition, recency_rank
+    )
 
     out_values = []
     for i, value in enumerate(seq):
         delta = -i
         # At position (trigger + i), this fires and gates seq[i] through.
-        trigger = pos_encoding.attend_to_offset(trigger_condition, delta_pos=delta)
+        trigger = attend_to_offset(rope, trigger_condition, delta_pos=delta)
         out_values.append(cond_gate(trigger, value))
 
     return select(

@@ -28,7 +28,7 @@ from torchwright.compiler.export import (
 from torchwright.compiler.forward.compile import forward_compile
 from torchwright.compiler.graph_identity import canonical_ids, unwrap_debug
 from torchwright.ops.arithmetic_ops import add, signed_multiply
-from torchwright.ops.inout_nodes import create_input, create_pos_encoding
+from torchwright.ops.inout_nodes import create_input
 
 D = 256
 D_HEAD = 16
@@ -42,14 +42,14 @@ def _build_graph():
     c = create_input("c", 1)
     prod = signed_multiply(a, b, max_abs1=10, max_abs2=10)
     out = add(prod, c)
-    return out, create_pos_encoding()
+    return out
 
 
 def _compile():
-    out, pos = _build_graph()
-    net = forward_compile(D, D_HEAD, out, pos, verbose=False, device="cpu")
+    out = _build_graph()
+    net = forward_compile(D, D_HEAD, out, verbose=False, device="cpu")
     canon = canonical_ids(unwrap_debug(out))
-    return net, canon, out, pos
+    return net, canon, out
 
 
 # ---------------------------------------------------------------------------
@@ -113,7 +113,7 @@ def test_diag_rects_break_when_only_one_axis_advances():
 
 
 def test_matrices_table_shapes_and_axes():
-    net, canon, _, _ = _compile()
+    net, canon, _ = _compile()
     matrices, placements, n_heads, d_hidden = _build_matrix_occupancy(
         net, canon, D, D_HEAD
     )
@@ -166,10 +166,8 @@ def _flatten_weight(net, layer_i, kind):
 def test_placements_cover_all_nonzero_weights():
     # trim_heads=False keeps the full (n_heads, d, d_head) tensors so the flat
     # layout matches the sidecar's full-matrix description.
-    out, pos = _build_graph()
-    net = forward_compile(
-        D, D_HEAD, out, pos, verbose=False, device="cpu", trim_heads=False
-    )
+    out = _build_graph()
+    net = forward_compile(D, D_HEAD, out, verbose=False, device="cpu", trim_heads=False)
     canon = canonical_ids(unwrap_debug(out))
     matrices, placements, _, _ = _build_matrix_occupancy(net, canon, D, D_HEAD)
 
@@ -209,7 +207,7 @@ def test_placements_cover_all_nonzero_weights():
 
 
 def test_placement_keys_are_canonical_or_bucket():
-    net, canon, _, _ = _compile()
+    net, canon, _ = _compile()
     _, placements, _, _ = _build_matrix_occupancy(net, canon, D, D_HEAD)
 
     valid_ids = set(canon.values())
@@ -248,11 +246,16 @@ def _compile_sidecar(parts, tmpdir, name="model.onnx"):
     token exporter; a real token graph just gives compile_to_onnx an embedding
     to unembed against.
     """
-    output_node, pos, embedding = parts
+    output_node, embedding = parts
     onnx_path = os.path.join(tmpdir, name)
     compile_to_onnx(
-        output_node, pos, embedding, onnx_path,
-        d=1024, d_head=D_HEAD, max_seq_len=32, verbose=False,
+        output_node,
+        embedding,
+        onnx_path,
+        d=1024,
+        d_head=D_HEAD,
+        max_seq_len=32,
+        verbose=False,
     )
     with open(debug_meta_path_for(onnx_path)) as f:
         return json.load(f)

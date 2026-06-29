@@ -15,13 +15,10 @@ Example: items with ranges [2,5), [7,9), [0,3)
          output sequence:   2, 3, 4, 7, 8, 0, 1, 2
 """
 
-from typing import Tuple
-
 import torch
 
 from torchwright.graph import Concatenate, Linear, Node
 from torchwright.graph.asserts import assert_01, assert_integer, assert_onehot
-from torchwright.graph.pos_encoding import PosEncoding
 from torchwright.graph.spherical_codes import index_to_vector
 from torchwright.ops.arithmetic_ops import (
     add,
@@ -34,7 +31,7 @@ from torchwright.ops.attention_ops import attend_argmin_unmasked
 from torchwright.ops.inout_nodes import (
     create_input,
     create_literal_value,
-    create_pos_encoding,
+    create_rope_config,
 )
 from torchwright.ops.logic_ops import bool_all_true, bool_not, equals_vector
 from torchwright.ops.map_select import in_range, select
@@ -50,6 +47,14 @@ E8_PRINT = index_to_vector(TOKEN_PRINT)
 D_TOKEN_TYPE = 8
 MAX_ITEMS = 8
 _SENTINEL_SCORE = 99.0
+
+# RoPE substrate. The item-selection head is a content head whose match width
+# is W = 1 + max_items (score col + one mask/position-onehot column per item),
+# and RoPE places those W columns on the slowest d_head/2 planes, so it needs
+# d_head >= 2*W. At the default MAX_ITEMS=8 that is d_head >= 18; D_HEAD=32
+# clears it and matches the d_head the tests compile at.
+D_HEAD = 32
+MAX_POSITIONS = 512
 
 
 # ---------------------------------------------------------------------------
@@ -78,12 +83,12 @@ def _extract_from(
 
 def build_range_printer_graph(
     max_items: int = MAX_ITEMS,
-) -> Tuple[Node, PosEncoding]:
+) -> Node:
     """Build the range_printer computation graph.
 
-    Returns ``(output_node, pos_encoding)``.
+    Returns ``output_node``.
     """
-    pos_encoding = create_pos_encoding()
+    rope = create_rope_config(d_head=D_HEAD, max_positions=MAX_POSITIONS)
 
     # --- Inputs --------------------------------------------------------
     token_type = create_input("token_type", D_TOKEN_TYPE, value_range=(-1.0, 1.0))
@@ -116,7 +121,7 @@ def build_range_printer_graph(
 
     # --- Attention: select first unmasked item -------------------------
     selected = attend_argmin_unmasked(
-        pos_encoding=pos_encoding,
+        rope,
         score=score,
         mask_vector=assert_01(print_mask),
         position_onehot=position_onehot,
@@ -165,7 +170,7 @@ def build_range_printer_graph(
             next_is_new_item,  # 3+N: next is_new_item flag
         ]
     )
-    return output, pos_encoding
+    return output
 
 
 # --- Output index helpers (for host-side parsing) ----------------------

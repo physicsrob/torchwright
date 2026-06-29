@@ -12,7 +12,7 @@ import torch
 
 from torchwright.compiler.export import compile_headless
 from torchwright.ops.arithmetic_ops import signed_multiply
-from torchwright.ops.inout_nodes import create_input, create_pos_encoding
+from torchwright.ops.inout_nodes import create_input
 
 D = 256
 D_HEAD = 16
@@ -22,13 +22,13 @@ def _build_sample_graph():
     a = create_input("a", 1)
     b = create_input("b", 1)
     out = signed_multiply(a, b, max_abs1=10, max_abs2=10)
-    return out, create_pos_encoding()
+    return out
 
 
 def test_compiled_headless_step_matches_call():
     """step(inputs, empty_past) on a full sequence == module(inputs)."""
-    out, pos = _build_sample_graph()
-    module = compile_headless(out, pos, d=D, d_head=D_HEAD, verbose=False)
+    out = _build_sample_graph()
+    module = compile_headless(out, d=D, d_head=D_HEAD, verbose=False)
 
     a_vals = torch.tensor([[3.0], [5.0], [-2.0], [0.0], [4.0]])
     b_vals = torch.tensor([[4.0], [-1.0], [3.0], [7.0], [2.0]])
@@ -45,8 +45,8 @@ def test_compiled_headless_step_matches_call():
 
 def test_compiled_headless_step_prefill_decode_matches_full():
     """Prefill 4 + decode 1 matches a single full-sequence forward."""
-    out, pos = _build_sample_graph()
-    module = compile_headless(out, pos, d=D, d_head=D_HEAD, verbose=False)
+    out = _build_sample_graph()
+    module = compile_headless(out, d=D, d_head=D_HEAD, verbose=False)
 
     a_vals = torch.tensor([[3.0], [5.0], [-2.0], [0.0], [4.0]])
     b_vals = torch.tensor([[4.0], [-1.0], [3.0], [7.0], [2.0]])

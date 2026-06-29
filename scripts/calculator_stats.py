@@ -52,14 +52,11 @@ def _peak_residual_occupancy(sidecar: dict) -> int:
 
 def whole_calculator_stats() -> None:
     print("== whole calculator (max_digits=%d) ==" % MAX_DIGITS)
-    output_node, pos_encoding, embedding = calc.create_network_parts(
-        max_digits=MAX_DIGITS
-    )
+    output_node, embedding = calc.create_network_parts(max_digits=MAX_DIGITS)
     with tempfile.TemporaryDirectory() as tmp:
         path = os.path.join(tmp, "calculator.onnx")
         artifact = compile_to_onnx(
             output_node,
-            pos_encoding,
             embedding,
             path,
             d=D,
@@ -84,7 +81,6 @@ def whole_calculator_stats() -> None:
 def per_operation_layers() -> None:
     print("\n== per-operation depth (each algorithm compiled alone) ==")
     embedding = create_onehot_embedding(calc.CALC_VOCAB)
-    _, pos_encoding, _ = calc.create_network_parts(max_digits=MAX_DIGITS)
     d_embed = embedding.d_embed
 
     def operand(prefix: str, n: int):
@@ -103,7 +99,7 @@ def per_operation_layers() -> None:
         "multiply": Concatenate(multiply_digit_seqs(embedding, a, b)),
     }
     for name, out in ops.items():
-        compiled = compile_headless(out, pos_encoding, d=D, d_head=D_HEAD)
+        compiled = compile_headless(out, d=D, d_head=D_HEAD)
         print(f"  {name:10s}: {compiled._n_layers} layers")
 
 

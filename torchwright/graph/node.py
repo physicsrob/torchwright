@@ -11,6 +11,33 @@ from torchwright.graph.value_type import NodeValueType
 global_node_id = 0
 
 
+def reserve_node_id_above(nodes) -> None:
+    """Advance ``global_node_id`` past every id in ``nodes``.
+
+    ``Node.__eq__``/``__hash__`` key on ``node_id`` (see below), so two distinct
+    nodes that happen to share an id compare equal and collide in any id-keyed
+    dict/set — including the compiler's
+    ``ResidualStreamMap._node_to_indices``.  In production the counter is
+    monotonic and never reset, so a node minted *during* compile (e.g. the RoPE
+    self-match constant-1 column in ``forward_compile``) is always born with an
+    id strictly greater than every graph node and can never collide.  Tests
+    reset the counter to 0 before each test for deterministic column assignment
+    (see ``tests/conftest.py``); re-compiling a long-lived (module-scoped) graph
+    then mints a helper node whose freshly-reset id collides with a graph node,
+    silently overwriting that node's residual-map entry and orphaning its
+    column (invariant I1 fires).  Calling this with the graph's full node set
+    before minting any compile-internal node restores the monotonic invariant
+    locally.  It only ever advances the counter, so it is a no-op whenever the
+    counter is already ahead — which is every non-reset case, production
+    included; it never touches the ids of the graph nodes themselves, so it
+    cannot perturb their column assignment.
+    """
+    global global_node_id
+    highest = max((n.node_id for n in nodes), default=-1)
+    if global_node_id <= highest:
+        global_node_id = highest + 1
+
+
 def _verify_tensor_against_value_type(node: "Node", tensor: torch.Tensor) -> None:
     """Assert the actual tensor conforms to the node's declared value_type.
 

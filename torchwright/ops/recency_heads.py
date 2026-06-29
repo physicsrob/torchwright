@@ -38,9 +38,17 @@ import math
 
 import torch
 
-from torchwright.graph import Attn, Concatenate, LiteralValue, Node
+from torchwright.graph import (
+    Attn,
+    Concatenate,
+    Embedding,
+    LiteralValue,
+    Node,
+    RopeConfig,
+)
 from torchwright.graph.rope import ROPE_BASE, recency_plane_index
-from torchwright.ops.arithmetic_ops import add_const
+from torchwright.ops.arithmetic_ops import add_const, bool_to_01
+from torchwright.ops.logic_ops import equals_vector
 from torchwright.ops.recency_ramp import octant_recency_ramp
 
 # Leakage DC.  The {BOS, REF} pair must dominate the N−2 unmarked background
@@ -130,7 +138,6 @@ def recency_phase_heads(
             key_matrix=km,
             value_matrix=torch.eye(1),
             output_matrix=torch.eye(1),
-            rotary=True,
             rope_base=base,
         )
         return add_const(head, -0.5)  # center the weight -> u / v
@@ -174,3 +181,57 @@ def recency_rank(
         dc_gain=dc_gain,
     )
     return octant_recency_ramp(u, v, gain=gain, sharpness=ramp_sharpness)
+
+
+def recency_rank_from_tokens(
+    rope: RopeConfig,
+    embedding: Embedding,
+    *,
+    bos_token: str = "<bos>",
+    ref_token: str = "<ref>",
+    gain: float = 2.0,
+    seam_frac: float = 0.05,
+    dc_gain: float = _DC_GAIN,
+    ramp_sharpness: float | None = None,
+) -> Node:
+    """Build the recency rank from two marked tokens in the stream.
+
+    Convenience constructor over :func:`recency_rank` for token-stream graphs:
+    it derives the BOS / REF 0/1 indicator markers from ``embedding`` — the
+    token ``bos_token`` at position 0 and ``ref_token`` at position 1, the two
+    always-causally-visible marked tokens the bucket-2 readout needs
+    (``docs/rope_port_plan.md`` §3 bucket 2 / Phase 4) — and feeds them to
+    :func:`recency_rank` on ``rope``'s grid.
+
+    A marker is ``bool_to_01(equals_vector(embedding, e_token))``: ``1`` exactly
+    where the stream token equals the marked token, ``0`` elsewhere — the 0/1
+    form ``recency_phase_heads`` consumes (a ±1 marker would inject ``−1`` into
+    the value and break the readout).
+
+    **Caller contract.**  The prompt must place ``bos_token`` at position 0 and
+    ``ref_token`` at position 1; the shared example harness does this via
+    ``run(..., ref_token="<ref>")`` (``tests/compile/forward/_example_onnx.py``).
+    ``embedding``'s vocab must contain both tokens.
+
+    Returns a length-1 node — the monotone recency ramp — to thread into
+    :func:`~torchwright.ops.attention_ops.get_prev_value`,
+    :func:`~torchwright.ops.attention_ops.attend_most_recent_matching`, and the
+    :mod:`~torchwright.ops.sequence_ops` parsers.
+    """
+    bos_marker = bool_to_01(
+        equals_vector(embedding, embedding.get_embedding(bos_token))
+    )
+    ref_marker = bool_to_01(
+        equals_vector(embedding, embedding.get_embedding(ref_token))
+    )
+    return recency_rank(
+        bos_marker,
+        ref_marker,
+        d_head=rope.d_head,
+        max_positions=rope.max_positions,
+        base=rope.base,
+        gain=gain,
+        seam_frac=seam_frac,
+        dc_gain=dc_gain,
+        ramp_sharpness=ramp_sharpness,
+    )

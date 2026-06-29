@@ -1,15 +1,25 @@
 # RoPE port — plan
 
-Status: **Phases 0, 1, 1b, 2, 3, 4 done** (branch `worktree-rope`). Phase 0 (rotary `Attn`,
-in-process/ONNX/HF), Phase 1 (bucket-1 near-marker count), Phase 1b (recency ramp: `soft_blend` +
-octant ramp, confirm-compile green), Phase 2 Part 1 (relative-offset all-Δ + sign lock), Phase 2
-Part 2 (compiler self-match → rotary, all three surfaces), Phase 3 (content-selection capability on
-slow planes — proven; builder rewrite deferred to Phase 5), Phase 4 (recency end-to-end: the two
-graded `{BOS, REF}` rotary heads → octant ramp → ramp-based selection, proven; in-place builder
-rewrite deferred to Phase 5). Remaining: **Phase 5** (torchwright only — rewire the production
-builders onto the proven capabilities, delete PosEncoding, drop the scaffolding/constraints, validate
-on ONNX/HF; `torchwright_doom` untouched) and **Phase 6** (`torchwright_doom` — rewire the DOOM call
-sites + the BOS/REF tokens, full render parity, and the 42k real-log recency replay). **`main` merged in (`f281ee8`)**: ONNX/HF now
+Status: **Phases 0–5 done; Phase 6 (`torchwright_doom`) remaining** (branch `worktree-rope`). Phase 0
+(rotary `Attn`, in-process/ONNX/HF), Phase 1 (bucket-1 near-marker count), Phase 1b (recency ramp:
+`soft_blend` + octant ramp, confirm-compile green), Phase 2 Part 1 (relative-offset all-Δ + sign
+lock), Phase 2 Part 2 (compiler self-match → rotary, all three surfaces), Phase 3 (content-selection
+capability on slow planes — proven; builder rewrite landed in Phase 5), Phase 4 (recency end-to-end:
+the two graded `{BOS, REF}` rotary heads → octant ramp → ramp-based selection, proven; in-place
+builder rewrite landed in Phase 5).
+
+**Phase 5 done (2026-06-28, uncommitted on `worktree-rope`).** All strands complete and the full
+`make test` suite is **green** on Modal: Strand A (RoPE-native library) + B1 (PosEncoding deletion),
+Strand C (tests/examples migrated, `prefix_*` retired), Strand D (ONNX/HF gate validated end-to-end —
+a save→load NaN bug found and fixed), and Strand B2 (**universal full-width rotary, no escape hatch** —
+the `Attn.rotary` flag removed, `d_qk == d_head` enforced, wall attention migrated to a slow-plane
+rotary content head to keep the DOOM-port derisk valid). Two real bugs were found and fixed with D6
+repros along the way: an I1 `const_one` node-id collision and the HF save→load NaN. See the Phase-5
+status block in §8. `torchwright_doom` is untouched (Phase 6).
+
+Remaining: finish **Phase 5** (torchwright only — Strands C/D/B2 above; `torchwright_doom` untouched)
+and **Phase 6** (`torchwright_doom` — rewire the DOOM call sites + the BOS/REF tokens, full render
+parity, and the 42k real-log recency replay). **`main` merged in (`f281ee8`)**: ONNX/HF now
 run in CI (the Modal image carries `onnxruntime`/`transformers` — the runtime-parity gap is closed),
 the float-I/O headless ONNX export and the delta-transfer compile mode were removed, and the token
 export uses a vanilla untied embedding.
@@ -260,8 +270,11 @@ calibrated to real DOOM difficulty). `torchwright_doom` is only *read* (the cons
 edited, from a torchwright worktree. Through Phases 1–4 each helper's signature stays stable and the
 mechanism swaps *internally* (no call-site churn); **Phase 5 makes the `pos_encoding`-drops-from-
 signatures change** — still entirely within torchwright (its own tests and `examples/` migrate in the
-same phase). **DOOM consumer edits + render parity are Phase 6** — a separate `torchwright_doom`
-branch, coordinated with the Phase-5 torchwright branch via the umbrella pointer bump.
+same phase). *(Phase-5 status: the signature change — `pos_encoding` → `RopeConfig` — and the
+`PosEncoding` deletion are ✅ done on `worktree-rope`; the tests/`examples/` migration is in progress.
+See §8 Phase-5 status.)* **DOOM consumer edits + render parity are Phase 6** — a separate
+`torchwright_doom` branch, coordinated with the Phase-5 torchwright branch via the umbrella pointer
+bump.
 
 ## 8. Implementation phases (ordered, each independently testable)
 
@@ -342,13 +355,15 @@ in-stream marker and value `= pos − marker_pos` recovered via the count, vs or
 >   span_v0.pos − 1` — i.e. *exactly* the bucket-1 marker-relative count (marker = the span's vertex-0
 >   publish), which `count_since_marker` serves directly. So the port-relevant bucket-1 deliverable is
 >   **done**.
-> - **`prefix_*` is out-of-scope for the port (examples-only).** It gates on an *absolute* `pos ≥ 2^k`
->   threshold (k up to ~16), which is **not** a bounded near-marker difference and would need its own
->   RoPE-native OOB detector. Since no DOOM consumer uses it, that detector is **not** built; the
->   `prefix_*` demos will need migration (or retirement) only if Phase 5's PosEncoding deletion is made
->   to keep them working — tracked, not on the render path. (A count-to-BOS boolean `compare(1/(pos+1),
->   1/(2^k+1))` resolves small k but hits the `1/m²` collapse for large k — confirming this needs a
->   different mechanism, deferred.)
+> - **`prefix_*` is out-of-scope for the port (examples-only) — ✅ RETIRED in Phase 5.** It gates on
+>   an *absolute* `pos ≥ 2^k` threshold (k up to ~16), which is **not** a bounded near-marker
+>   difference and would need its own RoPE-native OOB detector. Since no DOOM consumer uses it, that
+>   detector is **not** built and the demos are **retired** rather than migrated. Phase 5 deletes
+>   `ops/prefix_ops.py` and the four `prefix_sum` users — `balanced_parens`, `token_balance`,
+>   **`sort_digits_v2`, `sort_digits_v4`** (the actual call sites; wider than this note originally
+>   implied) — plus their tests. (A count-to-BOS boolean `compare(1/(pos+1), 1/(2^k+1))` resolves
+>   small k but hits the `1/m²` collapse for large k — confirming this needs a different mechanism,
+>   deferred had we kept them.)
 > - **DOOM consumer rewiring is Phase 6.** The one DOOM `get_position_scalar` site rewires to
 >   `count_since_marker(span_v0_marker, …)`; per §7 (DOOM untouched through Phase 5) that lands at
 >   Phase 6, where gate (a) — the marker is graph-recognizable + the post-marker window is
@@ -519,11 +534,12 @@ and validity bounds** (e.g. `_QUERY_GAIN=8`, the `attend_argmin_above_in_bucket`
 slow planes add distance-dependent cosine attenuation and possible cross-plane mixing that must
 stay inside each head's gap.
 
-> **Status (2026-06-27): capability proven; builder rewrite deferred to Phase 5, DOOM wiring to
-> Phase 6.** Like Phases 1 and 1b, this builds and proves the *capability* with a torchwright helper +
-> confidence tests; the in-place rewrite of the 12 production `attend_*` builders waits for Phase 5 (it needs
-> `d_head` at graph-construction time — see "the architectural finding" below — which arrives with the
-> §7 signature change).
+> **Status (2026-06-27): capability proven; builder rewrite ✅ landed in Phase 5 (this branch, see §8
+> status), DOOM wiring to Phase 6.** Like Phases 1 and 1b, this builds and proves the *capability* with
+> a torchwright helper + confidence tests; the in-place rewrite of the production `attend_*` builders
+> (it needs `d_head` at graph-construction time — see "the architectural finding" below — which arrives
+> with the §7 `RopeConfig` signature change) is **done** as of Phase 5: every builder takes `RopeConfig`
+> and routes through `rotary_content_head`.
 > - **Mechanism.** A content head's logit `Σ_c q_c·k_c` becomes, under the global rotation,
 >   `Σ_c q_c·k_c·cos((i−j)·θ_{p_c})`. Placing each content column on a **slow** plane (tiny θ) keeps
 >   `cos((i−j)θ)≈1` over the rollout, so the match is effectively position-free — standard RoPE on the
@@ -602,13 +618,99 @@ octant stays ~180×).
 >   ~42k `torchwright_doom` instrumentation log; the committed log is the ~11.6k frame, and DOOM is
 >   untouched through Phase 5 (§7), so this lands on the Phase-6 `torchwright_doom` branch. The ramp's
 >   monotonicity/resolvability *at cap φ-density* is already proven (`test_recency_ramp_compiled.py` +
->   the analytic gap-1 band test here). (2, **Phase 5**) The **in-place rewrite** of `attend_most_recent_matching` /
->   `get_prev_value` onto `recency_rank` is torchwright — like the Phase-3 content heads it needs `d_head`
->   at construction (the heads are full-width rotary), which arrives with the §7 signature change.
+>   the analytic gap-1 band test here). (2, **Phase 5 — ✅ DONE on this branch, see §8 status**) The
+>   **in-place rewrite** of `attend_most_recent_matching` / `get_prev_value` onto `recency_rank` landed
+>   (oracle-validated); `get_prev_value(rope, value, cond, recency_rank)` and the unified
+>   `attend_most_recent_matching(rope, …, recency_rank)` are the shipped forms.
 
 **Phase 5 — Reach the global end state (torchwright only; `torchwright_doom` untouched).** All
 changes land in torchwright and are validated by the §9 confidence suite + the ONNX/HF export path
 — **no DOOM render in this phase.** Three strands:
+
+> **Status (2026-06-28, uncommitted on `worktree-rope`): ✅ ALL STRANDS DONE — full `make test` green
+> on Modal.** Library + PosEncoding-deletion, tests/examples migration, ONNX/HF end-to-end validation,
+> and the universal-rotary flag removal are all complete. Tracked as four working strands (A/B map onto
+> the plan's strand 1+2; C/D onto strand 3 + the test/example migration):
+>
+> - **Strand A — RoPE-native library. ✅ DONE, oracle-validated.** New
+>   `RopeConfig(d_head, max_positions, base=ROPE_BASE)` in `graph/rope.py` (exported; the concrete
+>   form of the §7 "RoPE config carrying d_head/base") replaces the `pos_encoding` parameter.
+>   Every `attend_*` builder in `ops/attention_ops.py` now takes `rope` and builds a **full-width
+>   rotary-on-slow-planes** head via `rotary_content_head` (the three packed-V/O builders —
+>   `_above_integer`/`_unmasked`/`_valid_unmasked` — were decoupled to identity V/O). The
+>   counter-based `attend_most_recent_matching` is **deleted**; the `_via_ramp` form is now the single
+>   `attend_most_recent_matching(rope, …, recency_rank, exclude_self=…)`. New module-level
+>   `attend_to_offset` (wraps `rotary_offset_head`) and `get_prev_value(rope, value, cond,
+>   recency_rank)`. `ops/marker_count.py` (`count_since_marker`) and `ops/sequence_ops.py`
+>   (`NumericSequence`/`output_sequence`) migrated to `rope` + a threaded `recency_rank`.
+>   `ops/prefix_ops.py` **retired**; `create_pos_encoding` → `create_rope_config`. Validated at the
+>   oracle level (`reference_eval`): argmax / argmin_where / count_since_marker (gap exact to ±0.02) /
+>   recency_rank (strictly monotone) / get_prev_value (multi-fire latch) / most_recent_matching.
+> - **Strand B1 — delete `PosEncoding`. ✅ DONE, validated in-process.** Removed across
+>   `compile.py`, `transformer.py` (host position table), `weight_writer.py` (the rotary self-match is
+>   now the only path — `_current_pos_attn_matrices` and the trig branch deleted; the reserved const-1
+>   column is **unconditional**), `components/attn.py` + the two layer groups, `scheduler.py`,
+>   `cpsat_scheduler.py`, `graph_analysis.py` (input-node class), `graph_identity.py` (`pos_width`
+>   fingerprint term dropped), `affine_rules.py` (`_pos_encoding_rule` + the `[0,100000]` counter
+>   bound deleted), `probe.py`, `onnx_debug.py`, `export.py` (the `pos_encoding_full` initializer +
+>   `Gather` + `_compute_pos_encoding` + the additive `pos` residual term deleted; const-1 rides the
+>   existing `constant_values` seed), `hf/modeling_torchwright.py` + `convert.py` (the
+>   `pos_encoding_full` buffer removed). `graph/pos_encoding.py` and the `d_head ≥ trig_width`
+>   constraint are **gone**. The whole compiler imports clean and a `compile_headless` +
+>   `probe_compiled` run shows **oracle parity** on a compiled rotary content head.
+> - **ONNX/HF emission — ✅ VALIDATED.** The `export.py` / `modeling_torchwright.py` / `convert.py`
+>   changes are exercised end-to-end on Modal (token model through `compile_to_onnx` → HF; prefill ==
+>   cached decode; save→load round trip). A real save→load **NaN bug** was found and fixed: the rotary
+>   `rope_freq`/`rope_enable` buffers were `persistent=False` and computed in `__init__`, so
+>   `from_pretrained`'s meta-device (`low_cpu_mem_usage`) load left them as uninitialised memory (NaN on
+>   the A100 fp32 path). They are now recomputed in `forward` from the serialized config — no buffers to
+>   mis-materialise. Pinned by `tests/hf/test_hf_save_load_rope.py` (D6).
+> - **Strand C — migrate tests + examples. ✅ DONE.** Tests + `examples/` migrated off `pos_encoding`
+>   to `RopeConfig`; the four `prefix_sum` examples (`balanced_parens`, `token_balance`,
+>   `sort_digits_v2`, `sort_digits_v4`) and their tests are retired; obsolete `test_pos_encoding.py` /
+>   `test_position_scalar.py` deleted. Tail fixes landed: `test_baib_adjacent` d_head 20→32 (must divide
+>   d); `test_attn_compute_multiposition` dropped a vestigial PosEncoding `pos` key leaf; the
+>   ONNX-meta key set now includes `rope_base`. Also fixed an **I1 regression** the unconditional
+>   `const_one` exposed under pytest's node-id-reset + module-scoped re-compile: the compile-minted
+>   `const_one` could collide with a graph node id; `forward_compile` now advances the global node-id
+>   counter past the graph before minting (`reserve_node_id_above`), pinned by
+>   `test_recompile_node_id_collision.py` (D6).
+> - **Strand D — validate. ✅ DONE.** Full `make test` **green** on Modal (all shards). ONNX/HF gate
+>   green (above). `make measure-noise` not needed — no PL op implementation or breakpoint grid changed,
+>   and the committed-noise drift test passes. **I1–I4 held** throughout (no D1 stop).
+> - **Strand B2 — universal full-width rotary (no escape hatch). ✅ DONE.** The per-head `rotary` flag
+>   is removed from `Attn` (every head rotates) and the in-process path now asserts `d_qk == d_head`
+>   (matching the existing ONNX/HF contract), so a NoPE head **and** partial-width rotary are both
+>   structurally impossible — universal LLaMA3 rotation, no exceptions. The lone partial-width survivor
+>   (`rotary_offset_head`'s `d_qk=8` default) and the V/O-split tests' small/odd `d_qk` fixtures moved to
+>   full-width. **Wall attention migrated, not deleted** (`tests/graph/test_wall_attention.py`): the raw
+>   geometric content head (was `d_head=3`, content on fast planes — incompatible with rotation) is now a
+>   full-width `rotary_content_head` at `d_head=256` with its angular/distance/role content on the three
+>   slowest planes (rotation ≈ identity over the small token offsets, so the analytical reference holds
+>   unchanged). This **derisks the Phase-6 `torchwright_doom` port**; the prototype's docstring records
+>   the open production-difficulty questions (distance normalisation, real angular resolution, Δ-regime,
+>   interval-containment vs midpoint-cos) that need the not-yet-existing walls-as-tokens spec.
+> - **Strand B2 tail — emission dead-code cleanup + cross-backend parity. ✅ DONE.** With the
+>   `Attn.rotary` flag gone, the ONNX/HF emission's now-dead non-rotary plumbing was deleted: the
+>   always-1 per-head `rope_enable_q/k` inits + their blend nodes (`export.py`), `rotary_enable_per_layer`
+>   (config/convert), the `rotary_width` list (component/weight-writer self-match), and the additive
+>   `pos_encoding_full` table — every head rotates unconditionally over `d_head`. This surfaced a parity
+>   subtlety: **ONNX-oracle (onnxruntime) ≡ native-HF (torch) bit-exactness is not algebraic.** It holds
+>   for every normal-magnitude logit, but rows where the cancel-heads cancel to denormal magnitude
+>   (~1e-40) differ by one denormal ULP (~1e-43) — a sub-ULP rounding difference (one backend contracts a
+>   multiply-add into an FMA, the other doesn't) that the topology change made onnxruntime's optimizer
+>   apply. **Not a compiler bug** (no I1–I4 invariant governs onnxruntime≡torch; meaningful logits and all
+>   tokens are bit-identical). The parity tests now compare **teacher-forced** (identical inputs to both
+>   backends) and tolerate the denormal floor (`tests/hf/test_convert.py`, mirroring the already-robust
+>   `test_calculator_parity`). The earlier "the always-1 enable `Mul` blocked the FMA fusion" story was
+>   **wrong** — multiply-by-1.0 is the IEEE identity (`fma(x,1,y)==add(x,y)`); the cause is onnxruntime's
+>   topology-sensitive fusion, not the enable node.
+> - **Finding — gain calibration is load-bearing for recency selection.** `match_gain` must be large
+>   enough to exclude the BOS/REF **degenerate outlier rank** (≈0.5 vs the ~0.15 interior — a
+>   content-mismatched reference token will otherwise win on its rank) *and* `rank_gain` must be large
+>   enough to concentrate the tiebreak softmax. The two pull opposite ways; each consumer (examples and
+>   DOOM) must size them per-graph, not trust defaults. Smallest-layer repro lives in the Strand-C
+>   recency tests to be written.
 
 - **Rewire the production builders onto the proven capabilities** (each needs `d_head` at
   construction — the §7 signature change). The ~12 `attend_*` content builders → full-width rotary on
@@ -706,6 +808,12 @@ step on a separate `torchwright_doom` branch**, not a per-phase gate in this rep
 
 ## 10. Code change sites
 
+> **Phase-5 status (this branch): all torchwright-side sites below are ✅ done** (the deletions and the
+> `pos_encoding` → `RopeConfig` signature change landed and import clean; in-process validated). Line
+> numbers predate the edits. The ONNX/HF emission edits among them are written but **not yet validated
+> end-to-end** (Strand D), and the per-head rotary-flag removal (Strand B2) is **not yet done**. See
+> §8 Phase-5 status and §11.
+
 - **Delete the host position table (three sites).** `transformer.py:103-106` (writes
   `get_pos_encoding(...)` rows into reserved residual columns each forward); the `pos_encoding_full`
   ONNX initializer + `Gather(pos_encoding_full, cache_position)` in `export.py`; and the HF model
@@ -732,9 +840,9 @@ step on a separate `torchwright_doom` branch**, not a per-phase gate in this rep
 - **Content plane budget.** ✅ DONE (Phase 3). The slowest-plane attenuation at 42k (~0.9965) is set
   by `base` (5e5), not `d_head`; `d_head = 256` (128 planes) covers the widest content head with
   margin. Per-head selection-at-distance gates green (dot 198, bucket 253, worst-case fine-score 3.8 →
-  47× concentration). **The builder rewrite (the 12 `attend_*` funcs → full-width rotary on slow
-  planes) is Phase 5** (torchwright) — it needs `d_head` at construction, which arrives with the §7
-  signature change; **DOOM call-site wiring is Phase 6**.
+  47× concentration). **The builder rewrite (the `attend_*` funcs → full-width rotary on slow planes)
+  ✅ DONE (Phase 5, this branch)** — every builder takes `RopeConfig` and routes through
+  `rotary_content_head`; oracle-validated. **DOOM call-site wiring is Phase 6**.
 - **Re-grep per-class call sites.** Replace the sub-agent census with committed greps before
   per-site work (a direct grep found fewer literal `attend_most_recent_matching` sites than the
   census implied). Confirmed 2026-06-27: `pick_most_recent` does **not** exist in current code —
@@ -744,7 +852,9 @@ step on a separate `torchwright_doom` branch**, not a per-phase gate in this rep
   and the host-position-table sites are in `transformer.py`, `export.py`, `modeling_torchwright.py`.
   **All line numbers here predate the `main` merge — re-grep before per-site work** (the merge
   refactored `export.py`/`modeling_torchwright.py`, e.g. the untied embedding and removed headless
-  export shifted those line numbers).
+  export shifted those line numbers). ✅ **Executed in Phase 5 (this branch):** the per-class rewrite
+  and the host-table deletion landed; `get_prev_value` is now a module function in `attention_ops.py`,
+  and `_current_pos_attn_matrices` / `graph/pos_encoding.py` no longer exist.
 - **RoPE convention (LLaMA3-aligned).** ✅ DONE (Phase 0). `rotate_half` layout (dropped the legacy
   interleaved `(2i,2i+1)` pairing), both Q and K rotated by absolute position (cache holds rotated K,
   matching HF), base = `5e5`, no long-context frequency scaling. Still open: the global grid must
@@ -756,8 +866,11 @@ step on a separate `torchwright_doom` branch**, not a per-phase gate in this rep
   recompiles through rotary self-match behind the opt-in `rotary_self_match` flag; the reserved
   constant-1 residual feature is a `LiteralValue([1.0])` that rides the existing all-surface
   `constant_values` seed (no new ONNX/HF emission), and the rotation propagates via per-head
-  `rotary_width`. Full suite green, **I1–I4 held** (no D1 stop). The trig self-match stays the default
-  until Phase 5 makes rotary the only path. Part 1 (relative-offset, all Δ) ✅ `feffb20`.
+  `rotary_width`. Full suite green, **I1–I4 held** (no D1 stop). Part 1 (relative-offset, all Δ) ✅
+  `feffb20`. ✅ **Phase 5 (this branch) made the rotary self-match the only path** — the
+  `rotary_self_match` flag, the trig self-match, and `_current_pos_attn_matrices` are removed; the
+  reserved const-1 column is allocated unconditionally. (B2, below, still has to make the *rotation
+  itself* unconditional — drop the per-head `rotary_width` flag.)
 - **Runtime rotation parity.** ✅ DONE (Phase 0) **and now CI-tested** — `main` (`f281ee8` merge) added
   `onnxruntime`/`transformers` to the Modal image, so the ONNX/HF rotation tests run in CI; the full
   suite is green (`test_rope_token.py` passes the token-ONNX/HF RoPE path through the untied
@@ -786,3 +899,18 @@ step on a separate `torchwright_doom` branch**, not a per-phase gate in this rep
   Phase-6 `torchwright_doom` branch (DOOM untouched through Phase 5, §7).
 - **Bucket-1 marker gates.** Per consumer, confirm the marker is graph-recognizable and the gap
   bound holds at production config (the marker check is the Phase-6 DOOM call-site rewire).
+- **ONNX/HF emission validation (Phase 5, Strand D).** ✅ **DONE.** Exercised end-to-end on Modal
+  (`compile_to_onnx` → HF; prefill == cached decode; save→load round trip). A real save→load NaN bug
+  (non-persistent rotary buffers not materialised under `from_pretrained`'s meta-device load) was found
+  and fixed by recomputing the rotary constants in `forward`; pinned by `test_hf_save_load_rope.py`.
+- **tests + examples migration (Phase 5, Strand C).** ✅ **DONE.** Tests + `examples/` migrated to
+  `RopeConfig`; the four `prefix_sum` examples and their tests retired; `test_pos_encoding.py` /
+  `test_position_scalar.py` and the `_current_pos_attn_matrices` tests deleted. Tail green-up fixes
+  landed (baib d_head, multiposition dead-leaf, ONNX-meta `rope_base`) plus an I1 `const_one` node-id
+  collision fix (`reserve_node_id_above`, `test_recompile_node_id_collision.py`). Full `make test` green.
+- **Per-head rotary flag removal (Phase 5, Strand B2).** ✅ **DONE.** The `Attn.rotary` flag is gone
+  (every head rotates) and the in-process path asserts `d_qk == d_head`, so NoPE **and** partial-width
+  rotary are both structurally impossible — universal full-width LLaMA3 rotation, no escape hatch. Wall
+  attention was migrated (not deleted) to a slow-plane `rotary_content_head` to keep the Phase-6
+  DOOM-port derisk valid (`test_wall_attention.py`); its docstring records the production-difficulty
+  open questions for Phase 6.

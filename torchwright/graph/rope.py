@@ -22,12 +22,47 @@ recovering the single global grid; this same formula covers that case.
 """
 
 import math
+from dataclasses import dataclass
 
 import torch
 
 # LLaMA3-family base.  See docs/rope_port_plan.md §6 — reconcile downstream
 # analyses (measured at 1e6) if this changes.
 ROPE_BASE = 500000.0
+
+
+@dataclass(frozen=True)
+class RopeConfig:
+    """The RoPE substrate a graph is built against — replaces ``PosEncoding``.
+
+    Under the Phase-5 end state position is *not* a residual feature; it is a
+    rotation applied inside attention (``docs/rope_port_plan.md`` §1, §3).  The
+    ``attend_*`` builders that used to take a ``PosEncoding`` node now take this
+    config because they must lay their content out on the **slow planes** of the
+    full ``d_head`` ``rotate_half`` grid at construction time (the §7 finding:
+    a content head is a full-width rotary ``Attn``, so it needs ``d_head`` and
+    ``base`` before compile — see :func:`place_on_slow_planes`).
+
+    Fields:
+        d_head: the rotary width (= the compiled ``d_head``).  Every head is
+            full-width rotary on this grid; the compile entry points assert the
+            ``d_head`` passed to them matches this.  Must be even.
+        max_positions: the rollout length the recency plane is sized never to
+            wrap over (the cache cap, not the typical frame — past the wrap the
+            recency order silently inverts).  Used only by the recency rank.
+        base: the rotary base (LLaMA3-family ``5e5`` by default).
+    """
+
+    d_head: int
+    max_positions: int
+    base: float = ROPE_BASE
+
+    def __post_init__(self) -> None:
+        if self.d_head % 2 != 0:
+            raise ValueError(
+                f"RopeConfig.d_head must be even (rotate_half pairs dim p with "
+                f"p+d_head/2); got {self.d_head}."
+            )
 
 
 def rope_inv_freq(width: int, base: float) -> torch.Tensor:
@@ -133,7 +168,8 @@ def place_on_slow_planes(mat: torch.Tensor, d_head: int) -> torch.Tensor:
     left zero, so each plane carries exactly one content scalar and the planes do
     not mix under rotation.  Requires ``W ≤ d_head/2``.
 
-    Returns a ``(rows, d_head)`` matrix; pass it to a ``rotary=True`` ``Attn``.
+    Returns a ``(rows, d_head)`` matrix; pass it as the Q/K projection of an
+    ``Attn`` (every ``Attn`` is full-width rotary on the global grid).
     """
     rows, w = mat.shape
     half = d_head // 2
@@ -180,7 +216,6 @@ def rotary_content_head(
         key_matrix=place_on_slow_planes(key_matrix, d_head),
         value_matrix=torch.eye(d_v),
         output_matrix=torch.eye(d_v),
-        rotary=True,
         rope_base=base,
     )
 
@@ -189,7 +224,7 @@ def rotary_offset_head(
     value,
     delta_pos: int = -1,
     *,
-    d_qk: int = 8,
+    d_qk: int,
     base: float = ROPE_BASE,
     hardness: float = 100.0,
 ):
@@ -210,6 +245,11 @@ def rotary_offset_head(
     uniquely maximal at ``i - j - delta_pos = 0`` (every plane at ``cos 0 = 1``),
     i.e. key ``i = j + delta_pos``.  ``delta_pos = -1`` ⇒ the previous position.
     V/O transport the payload unchanged.
+
+    ``d_qk`` is the rotary width and **must equal the compile ``d_head``** — the
+    head is full-width rotary on the global grid (no partial-width rotary; the
+    compiler asserts ``d_qk == d_head``).  Production callers pass
+    ``d_qk=rope.d_head``.
     """
     from torchwright.graph import Attn, LiteralValue
 
@@ -233,6 +273,5 @@ def rotary_offset_head(
         key_matrix=key_matrix,
         value_matrix=torch.eye(d_v),
         output_matrix=torch.eye(d_v),
-        rotary=True,
         rope_base=base,
     )

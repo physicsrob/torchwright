@@ -92,7 +92,6 @@ class Attn(Node):
         key_matrix: torch.Tensor,
         value_matrix: torch.Tensor,
         output_matrix: torch.Tensor,
-        rotary: bool = False,
         rope_base: float = ROPE_BASE,
     ):
         self.d_qk = query_matrix.shape[1]
@@ -113,17 +112,19 @@ class Attn(Node):
             value_matrix,
         )
 
-        if rotary and self.d_qk % 2 != 0:
+        # Every head is rotary on the one global grid (LLaMA3 end state); there
+        # is no non-rotary (NoPE) head, so rotate_half over d_qk requires an even
+        # d_qk unconditionally.
+        if self.d_qk % 2 != 0:
             raise ValueError(
-                f"rotary Attn requires an even d_qk (got {self.d_qk}); "
-                f"rotate_half pairs dim p with dim p+d_qk/2."
+                f"Attn requires an even d_qk (got {self.d_qk}); rotation is "
+                f"full-width rotate_half, pairing dim p with dim p+d_qk/2."
             )
 
         self.query_matrix = query_matrix
         self.key_matrix = key_matrix
         self.value_matrix = value_matrix
         self.output_matrix = output_matrix
-        self.rotary = rotary
         self.rope_base = rope_base
         super().__init__(output_matrix.shape[1], inputs=[query_in, key_in, value_in])
 
@@ -149,14 +150,14 @@ class Attn(Node):
 
         # RoPE: rotate Q and K by absolute position (row index) before the
         # dot product, so the logit depends on the relative offset (i - j).
-        # rotate_half over d_qk; same grid the compiled component applies.
-        if self.rotary:
-            positions = torch.arange(n_pos, device=query_values.device)
-            cos, sin = rope_cos_sin(positions, self.d_qk, self.rope_base)
-            cos = cos.to(query_values.dtype)
-            sin = sin.to(query_values.dtype)
-            query_values = apply_rope(query_values, cos, sin)
-            key_values = apply_rope(key_values, cos, sin)
+        # Full-width rotate_half over d_qk (= d_head) on the one global grid the
+        # compiled component and the ONNX/HF runtimes also apply.
+        positions = torch.arange(n_pos, device=query_values.device)
+        cos, sin = rope_cos_sin(positions, self.d_qk, self.rope_base)
+        cos = cos.to(query_values.dtype)
+        sin = sin.to(query_values.dtype)
+        query_values = apply_rope(query_values, cos, sin)
+        key_values = apply_rope(key_values, cos, sin)
 
         attn_logits = query_values.matmul(key_values.t())
         # attn_logits shape is (query pos, key pos)

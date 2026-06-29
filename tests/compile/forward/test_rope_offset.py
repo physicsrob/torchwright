@@ -18,7 +18,8 @@ import torch
 from torchwright.compiler.export import compile_headless
 from torchwright.debug.probe import probe_compiled
 from torchwright.graph.rope import rotary_offset_head
-from torchwright.ops.inout_nodes import create_input, create_pos_encoding
+from torchwright.ops.attention_ops import attend_to_offset
+from torchwright.ops.inout_nodes import create_input, create_rope_config
 
 N_POS = 12
 D = 256
@@ -40,12 +41,12 @@ def _expected_prev(payload: torch.Tensor) -> torch.Tensor:
 def test_rotary_offset_oracle_selects_prev_position():
     """The rotary head's oracle selects the previous position, token-identical
     to the existing trig-shift ``attend_to_offset(-1)``."""
-    pos = create_pos_encoding()
+    rope = create_rope_config(d_head=D_HEAD, max_positions=512)
     payload = create_input("payload", 1)
     vals = _payload(N_POS)
 
-    rotary = rotary_offset_head(payload, delta_pos=-1)
-    trig = pos.attend_to_offset(payload, delta_pos=-1)
+    rotary = rotary_offset_head(payload, delta_pos=-1, d_qk=D_HEAD)
+    trig = attend_to_offset(rope, payload, delta_pos=-1)
 
     rotary_out = rotary.compute(N_POS, {"payload": vals}).squeeze(1)
     trig_out = trig.compute(N_POS, {"payload": vals}).squeeze(1)
@@ -59,12 +60,11 @@ def test_rotary_offset_oracle_selects_prev_position():
 def test_rotary_offset_compiled_matches_oracle():
     """probe_compiled: the compiled rotary head matches its oracle everywhere
     (no divergent node) — the oracle-first / R15 contract."""
-    pos = create_pos_encoding()
     payload = create_input("payload", 1)
     vals = _payload(N_POS)
-    rotary = rotary_offset_head(payload, delta_pos=-1)
+    rotary = rotary_offset_head(payload, delta_pos=-1, d_qk=D_HEAD)
 
-    compiled = compile_headless(rotary, pos, d=D, d_head=D_HEAD, verbose=False)
+    compiled = compile_headless(rotary, d=D, d_head=D_HEAD, verbose=False)
     report = probe_compiled(compiled, rotary, {"payload": vals}, N_POS, atol=1e-2)
     assert report.first_divergent is None, report.format_short()
 
@@ -76,12 +76,11 @@ def test_rotary_offset_prefill_decode_identical():
     """Prefill and token-by-token cached decode produce identical offset-head
     output — the cache-rotation invariant (K stored rotated, Q rotated by
     absolute position)."""
-    pos = create_pos_encoding()
     payload = create_input("payload", 1)
     vals = _payload(N_POS)
-    rotary = rotary_offset_head(payload, delta_pos=-1)
+    rotary = rotary_offset_head(payload, delta_pos=-1, d_qk=D_HEAD)
 
-    compiled = compile_headless(rotary, pos, d=D, d_head=D_HEAD, verbose=False)
+    compiled = compile_headless(rotary, d=D, d_head=D_HEAD, verbose=False)
     device = compiled._net.device
 
     full = compiled(vals.to(device)).squeeze(1).cpu()

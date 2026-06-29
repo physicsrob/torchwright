@@ -11,7 +11,6 @@ import torch
 from torchwright.compiler.export import compile_headless
 from torchwright.compiler.forward.compile import forward_compile
 from torchwright.compiler.groups.mlp_sublayer import MLPSubLayer
-from torchwright.graph import PosEncoding
 from torchwright.ops.inout_nodes import create_input
 from torchwright.ops.linear_relu_linear import linear_relu_linear
 
@@ -19,8 +18,6 @@ from torchwright.ops.linear_relu_linear import linear_relu_linear
 def _build_relu_chain_graph(d_input: int, d_hidden_chain: int, d_output: int):
     """Build a tiny graph: input -> Linear -> ReLU -> Linear with random weights."""
     inp = create_input("x", d_input)
-    # These tests compile at d_head=8, so the encoding's trig_width must be 8.
-    pos = PosEncoding(9)
     torch.manual_seed(0)
     input_proj = torch.randn(d_hidden_chain, d_input)
     input_bias = torch.randn(d_hidden_chain)
@@ -29,7 +26,7 @@ def _build_relu_chain_graph(d_input: int, d_hidden_chain: int, d_output: int):
     out = linear_relu_linear(
         inp, input_proj, input_bias, output_proj, output_bias, name="chain"
     )
-    return out, pos, inp
+    return out, inp
 
 
 # ---------------------------------------------------------------------------
@@ -57,13 +54,10 @@ def test_mlp_sublayer_rectangular_shapes():
 
 
 def test_compile_with_small_d_hidden():
-    out_node, pos, inp = _build_relu_chain_graph(
-        d_input=4, d_hidden_chain=4, d_output=2
-    )
+    out_node, inp = _build_relu_chain_graph(d_input=4, d_hidden_chain=4, d_output=2)
 
     module = compile_headless(
         out_node,
-        pos,
         d=32,
         d_head=8,
         d_hidden=8,
@@ -104,15 +98,12 @@ def test_compile_with_d_hidden_larger_than_d():
     """A chain whose hidden width exceeds ``d``.  Before the decoupling
     the scheduler would reject the chain because ``next_slot + d_hidden
     > self.d`` (the per-layer pool was the residual stream itself)."""
-    out_node, pos, inp = _build_relu_chain_graph(
-        d_input=4, d_hidden_chain=48, d_output=2
-    )
+    out_node, inp = _build_relu_chain_graph(d_input=4, d_hidden_chain=48, d_output=2)
 
     # d=32 is smaller than the chain's hidden width (48) — impossible
     # before the decoupling (the scheduler's pool was ``self.d``).
     module = compile_headless(
         out_node,
-        pos,
         d=32,
         d_head=8,
         d_hidden=64,
@@ -151,13 +142,12 @@ def test_compile_with_d_hidden_larger_than_d():
 
 
 def test_compile_default_d_hidden_equals_d():
-    out_node, pos, _ = _build_relu_chain_graph(d_input=4, d_hidden_chain=4, d_output=2)
+    out_node, _ = _build_relu_chain_graph(d_input=4, d_hidden_chain=4, d_output=2)
 
     net_default = forward_compile(
         d=32,
         d_head=8,
         output_node=out_node,
-        pos_encoding=pos,
         device="cpu",
         verbose=False,
     )
@@ -166,7 +156,6 @@ def test_compile_default_d_hidden_equals_d():
         d_head=8,
         d_hidden=32,
         output_node=out_node,
-        pos_encoding=pos,
         device="cpu",
         verbose=False,
     )

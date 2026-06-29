@@ -223,7 +223,6 @@ def test_piecewise_linear_2d_probe():
     # Compiled check
     report = probe_graph(
         node,
-        pos_encoding=None,
         input_values=inputs,
         n_pos=n_pos,
         d=512,

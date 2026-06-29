@@ -12,7 +12,7 @@ import torch
 from torchwright.compiler.export import compile_headless
 from torchwright.compiler.transformer import HeadlessTransformer
 from torchwright.ops.arithmetic_ops import add, add_const, multiply_const, relu_add
-from torchwright.ops.inout_nodes import create_input, create_pos_encoding
+from torchwright.ops.inout_nodes import create_input
 
 
 def _patch_noisy_init(
@@ -69,11 +69,10 @@ def test_nonzero_init_intermediate_col(monkeypatch):
     """multiply_const compiles through an attention write to an
     intermediate residual column.  If that column isn't zero at input,
     the additive write produces noise + value, not value."""
-    pos = create_pos_encoding()
     x = create_input(4)
     y = multiply_const(x, 2.0)
 
-    module = compile_headless(y, pos, d=64, verbose=False)
+    module = compile_headless(y, d=64, verbose=False)
     inp = torch.tensor([[1.0, 2.0, 3.0, 4.0]])
     expected = torch.tensor([[2.0, 4.0, 6.0, 8.0]])
 
@@ -93,11 +92,10 @@ def test_nonzero_init_mlp_path(monkeypatch):
     """relu_add compiles to a Linear→ReLU→Linear chain (an MLP op).
     MLP linear2 writes additively to its output column, which the
     compiler assumes starts at zero."""
-    pos = create_pos_encoding()
     x = create_input(4)
     y = relu_add(x, multiply_const(x, -1.0))  # ReLU(x) + ReLU(-x) = |x|
 
-    module = compile_headless(y, pos, d=128, verbose=False)
+    module = compile_headless(y, d=128, verbose=False)
     inp = torch.tensor([[1.0, -2.0, 3.0, -4.0]])
     expected = torch.tensor([[1.0, 2.0, 3.0, 4.0]])
 

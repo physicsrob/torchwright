@@ -13,7 +13,7 @@ from torchwright.compiler.forward.compile import forward_compile
 from torchwright.graph import Add, Linear
 from torchwright.graph.misc import LiteralValue
 from torchwright.graph.relu import ReLU
-from torchwright.ops.inout_nodes import create_input, create_pos_encoding
+from torchwright.ops.inout_nodes import create_input
 from torchwright.ops.map_select import in_range
 
 
@@ -23,7 +23,6 @@ def test_standalone_relu_after_biased_linear():
     Bug: the standalone ReLU reads via mlp.linear1 before compute_bias
     writes to mlp.linear2.output_bias, so it sees W@x without the bias.
     """
-    pos = create_pos_encoding()
     x = create_input("x", 1)
 
     # biased Linear: y = -x + 5
@@ -38,7 +37,6 @@ def test_standalone_relu_after_biased_linear():
         d=64,
         d_head=16,
         output_node=output,
-        pos_encoding=pos,
         verbose=False,
     )
 
@@ -69,7 +67,6 @@ def test_chain_with_two_biased_linear_inputs():
 
     Both biases must be folded into L1's intermediate bias.
     """
-    pos = create_pos_encoding()
     a = create_input("a", 1)
     b = create_input("b", 1)
 
@@ -84,7 +81,6 @@ def test_chain_with_two_biased_linear_inputs():
         d=64,
         d_head=16,
         output_node=masks,
-        pos_encoding=pos,
         verbose=False,
     )
 
@@ -118,7 +114,6 @@ def test_biased_linear_fanout_chain_and_add():
     - -2  → compute_bias missing (Add sees y=0 instead of y=5)
     - -7  → bias doubled in fold (chain sees y=10 instead of y=5)
     """
-    pos = create_pos_encoding()
     x = create_input("x", 1)
 
     # biased Linear: y = x + 5 (consumed by both chain and Add)
@@ -137,7 +132,6 @@ def test_biased_linear_fanout_chain_and_add():
         d=64,
         d_head=16,
         output_node=output,
-        pos_encoding=pos,
         verbose=False,
     )
 

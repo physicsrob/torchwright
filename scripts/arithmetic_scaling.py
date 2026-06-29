@@ -62,8 +62,9 @@ from examples import calculator_advanced, calculator_scratchpad, calculator_simp
 from torchwright.ops.inout_nodes import (
     create_literal_value,
     create_onehot_embedding,
-    create_pos_encoding,
+    create_rope_config,
 )
+from torchwright.ops.recency_heads import recency_rank_from_tokens
 
 # Registered implementations, in figure order: the legible serial folds vs the
 # depth-optimized carry-lookahead / carry-save versions.  Each calculator module
@@ -200,10 +201,17 @@ def measure_scratchpad_op(op_fn, n):
     Depth is flat in ``n`` (the streaming moves the serial recurrence onto the
     decode-step axis); only the neuron count grows."""
     embedding = create_onehot_embedding(calculator_scratchpad.scratch_vocab(n))
-    pos_encoding = create_pos_encoding()
+    rope = create_rope_config(
+        d_head=calculator_scratchpad.D_HEAD,
+        max_positions=calculator_scratchpad.MAX_POSITIONS,
+    )
+    recency_rank = recency_rank_from_tokens(rope, embedding)
+    steps_since = calculator_scratchpad._steps_since_newline(
+        rope, embedding, recency_rank, max_gap=calculator_scratchpad.decode_steps(n) + 2
+    )
     a = _operand(embedding, n)
     b = _operand(embedding, n)
-    thinking, answer = op_fn(pos_encoding, embedding, a, b, n)
+    thinking, answer = op_fn(rope, embedding, a, b, n, recency_rank, steps_since)
     outputs = thinking + answer
     return critical_path_depth(outputs), total_neurons(outputs)
 
@@ -256,7 +264,7 @@ def run(digit_sweep, multiply_cap=DEFAULT_MULTIPLY_CAP):
 def measure_model(impl, n):
     """Build the whole model ``create_network_parts(n)``; return its end-to-end
     (depth, neurons) — parse + arithmetic + dispatch + emit, not one op."""
-    output_node, _, _ = impl.create_network_parts(max_digits=n)
+    output_node, _ = impl.create_network_parts(max_digits=n)
     return critical_path_depth([output_node]), total_neurons([output_node])
 
 
@@ -272,7 +280,9 @@ def run_models(digit_sweep):
             if name == "scratchpad":
                 record["decode_steps"] = impl.decode_steps(n)
             records.append(record)
-            steps = f", steps={record['decode_steps']}" if "decode_steps" in record else ""
+            steps = (
+                f", steps={record['decode_steps']}" if "decode_steps" in record else ""
+            )
             log(f"model {name} n={n}: depth={depth}, neurons={neurons:,}{steps}")
         results[name] = records
     return results

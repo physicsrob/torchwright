@@ -10,11 +10,10 @@ import torch
 from torchwright.compiler.forward.compile import forward_compile
 from torchwright.graph import Linear, ReLU, Add, Concatenate
 from torchwright.graph.misc import InputNode, LiteralValue
-from torchwright.graph.pos_encoding import PosEncoding
 from torchwright.ops.inout_nodes import (
     create_input,
     create_literal_value,
-    create_pos_encoding,
+    create_rope_config,
 )
 from torchwright.ops.arithmetic_ops import (
     add,
@@ -32,14 +31,44 @@ from torchwright.ops.attention_ops import (
     attend_argmax,
     attend_argmin_where,
     attend_argmax_where,
+    attend_to_offset,
+    get_prev_value,
 )
+from torchwright.ops.recency_heads import recency_rank
 
 D = 256
 D_HEAD = 16
+MAX_POSITIONS = 512
+
+
+def _rope():
+    return create_rope_config(d_head=D_HEAD, max_positions=MAX_POSITIONS)
+
+
+def _rope_and_rank():
+    """A rope config plus a recency rank built from synthetic <bos>/<ref> marker
+    channels (the bucket-2 substrate that replaces the old position counter)."""
+    rope = _rope()
+    bos = create_input("bos_marker", 1)
+    ref = create_input("ref_marker", 1)
+    rank = recency_rank(bos, ref, d_head=D_HEAD, max_positions=MAX_POSITIONS)
+    return rope, rank
+
+
+def _markers(n_pos):
+    """Marker input channels: <bos> at position 0, <ref> at position 1."""
+    bos = torch.zeros(n_pos, 1)
+    ref = torch.zeros(n_pos, 1)
+    bos[0, 0] = 1.0
+    ref[1, 0] = 1.0
+    return {"bos_marker": bos, "ref_marker": ref}
 
 
 def _verify(
-    output_node, n_pos, input_values, pos_encoding=None, max_layers=100,
+    output_node,
+    n_pos,
+    input_values,
+    max_layers=100,
 ):
     """Compile and verify output matches node.compute().
 
@@ -50,7 +79,6 @@ def _verify(
         d=D,
         d_head=D_HEAD,
         output_node=output_node,
-        pos_encoding=pos_encoding,
         verbose=False,
         max_layers=max_layers,
     )
@@ -135,10 +163,10 @@ def test_compile_select():
 
 
 def test_compile_attend_to_offset():
-    """pos_encoding.attend_to_offset() — attention-based position lookup."""
-    pos = create_pos_encoding()
+    """attend_to_offset() — rotary attention-based position lookup."""
+    rope = _rope()
     v = create_input("v", 4)
-    out = pos.attend_to_offset(v, delta_pos=-1)
+    out = attend_to_offset(rope, v, delta_pos=-1)
 
     n_pos = 5
     _verify(
@@ -147,15 +175,14 @@ def test_compile_attend_to_offset():
         input_values={
             "v": torch.randn(n_pos, 4),
         },
-        pos_encoding=pos,
     )
 
 
 def test_compile_attend_to_offset_wide_value():
-    """attend_to_offset supports values wider than the position encoding."""
-    pos = create_pos_encoding()
+    """attend_to_offset supports values wider than the rotary width."""
+    rope = _rope()
     v = create_input("v", 20)
-    out = pos.attend_to_offset(v, delta_pos=-1)
+    out = attend_to_offset(rope, v, delta_pos=-1)
 
     n_pos = 5
     _verify(
@@ -164,7 +191,6 @@ def test_compile_attend_to_offset_wide_value():
         input_values={
             "v": torch.randn(n_pos, 20),
         },
-        pos_encoding=pos,
     )
 
 
@@ -219,7 +245,6 @@ def test_compile_cond_gate():
     This is the key pattern from the adder that uses standalone ReLU.
     cond_gate(cond, inp) = cond_add_vector(cond, relu(cond_add_vector(cond, inp, ...)), ...)
     """
-    pos = create_pos_encoding()
     cond = create_input("cond", 1, value_range=(-1.0, 1.0))
     inp = create_input("inp", 4, value_range=(-4.0, 4.0))
     out = cond_gate(cond, inp)
@@ -232,20 +257,16 @@ def test_compile_cond_gate():
             "cond": torch.tensor([[1.0], [-1.0], [1.0], [-1.0]]),
             "inp": torch.randn(n_pos, 4),
         },
-        pos_encoding=pos,
     )
 
 
 def test_compile_get_prev_value():
-    """pos_encoding.get_prev_value() — cross-position attention with Concatenate key_in.
-
-    get_prev_value returns the most recent value where cond was true.
-    Exercises Attn node with Concatenate([pos, cond]) as key_in.
-    """
-    pos = create_pos_encoding()
+    """get_prev_value() — most recent value where cond was true, ranked by the
+    RoPE recency ramp (compiled == oracle; both use the same rotary rank)."""
+    rope, rank = _rope_and_rank()
     v = create_input("v", 4)
     cond = create_input("cond", 1)
-    out = pos.get_prev_value(v, cond)
+    out = get_prev_value(rope, v, cond, rank)
 
     n_pos = 5
     _verify(
@@ -262,8 +283,8 @@ def test_compile_get_prev_value():
                 ]
             ),
             "cond": torch.tensor([[1.0], [0.0], [0.0], [1.0], [0.0]]),
+            **_markers(n_pos),
         },
-        pos_encoding=pos,
     )
 
 
@@ -413,13 +434,13 @@ def test_compile_multi_switch_shared_constants():
     from torchwright.ops.map_select import switch
     from torchwright.ops.logic_ops import cond_gate
 
-    pos = create_pos_encoding()
+    rope, rank = _rope_and_rank()
     flag = create_input("flag", 1)
 
     # Three conditions via attention (like which_plus, which_minus, which_times)
-    c1 = pos.get_prev_value(flag, flag)
-    c2 = pos.get_prev_value(flag, flag)
-    c3 = pos.get_prev_value(flag, flag)
+    c1 = get_prev_value(rope, flag, flag, rank)
+    c2 = get_prev_value(rope, flag, flag, rank)
+    c3 = get_prev_value(rope, flag, flag, rank)
 
     # Real values for c1, placeholder zeros for c2/c3
     zero = create_literal_value(torch.zeros(4))
@@ -438,8 +459,8 @@ def test_compile_multi_switch_shared_constants():
         n_pos=n_pos,
         input_values={
             "flag": torch.tensor([[1.0], [-1.0], [1.0]]),
+            **_markers(n_pos),
         },
-        pos_encoding=pos,
     )
 
 
@@ -454,7 +475,7 @@ def test_compile_switch_with_attention_conditions():
     from torchwright.ops.map_select import switch
     from torchwright.ops.logic_ops import equals_vector
 
-    pos = create_pos_encoding()
+    rope, rank = _rope_and_rank()
     embedding_dim = 8
     v1 = create_literal_value(torch.randn(embedding_dim))
     v2 = create_literal_value(torch.randn(embedding_dim))
@@ -462,9 +483,9 @@ def test_compile_switch_with_attention_conditions():
 
     # Conditions via attention — like equals_vector + get_prev_value
     flag = create_input("flag", 1)
-    c1 = pos.get_prev_value(flag, flag)
-    c2 = pos.get_prev_value(flag, flag)
-    c3 = pos.get_prev_value(flag, flag)
+    c1 = get_prev_value(rope, flag, flag, rank)
+    c2 = get_prev_value(rope, flag, flag, rank)
+    c3 = get_prev_value(rope, flag, flag, rank)
 
     out = switch([c1, c2, c3], [v1, v2, v3])
 
@@ -474,8 +495,8 @@ def test_compile_switch_with_attention_conditions():
         n_pos=n_pos,
         input_values={
             "flag": torch.tensor([[1.0], [-1.0], [1.0]]),
+            **_markers(n_pos),
         },
-        pos_encoding=pos,
     )
 
 
@@ -576,7 +597,6 @@ def test_compile_rejects_d_qk_too_large():
     Q/K cannot be split across heads (softmax nonlinearity), so
     d_head must be >= d_qk.
     """
-    pos = create_pos_encoding()
     x = create_input("x", 4)
     out = _build_attn(x, x, x, d_qk=32, d_v=4, d_out=4)
 
@@ -585,39 +605,33 @@ def test_compile_rejects_d_qk_too_large():
             d=256,
             d_head=16,
             output_node=out,
-            pos_encoding=pos,
             verbose=False,
         )
 
 
 @pytest.mark.parametrize(
-    "d_qk,d_v",
-    [
-        (4, 32),  # d_head=16 default — 2 heads exact
-        (4, 48),  # 3 heads, last chunk padded
-        (1, 32),  # scalar attention logit, 2 V/O heads
-    ],
-    ids=["exact_divisible", "with_remainder", "single_dim_qk"],
+    "d_v",
+    [32, 48],
+    ids=["exact_divisible", "with_remainder"],
 )
-def test_compile_split_vo(d_qk, d_v):
-    """V/O split across heads at default d_head=16."""
+def test_compile_split_vo(d_v):
+    """V/O split across heads.  Q/K are full-width d_qk == d_head (16): every
+    head is rotary on the global grid, so the V/O split is the only thing that
+    varies here (d_v=32 -> 2 heads exact; d_v=48 -> 3 heads, last chunk padded)."""
     x = create_input("x", 8)
-    out = _build_attn(x, x, x, d_qk=d_qk, d_v=d_v, d_out=8)
+    out = _build_attn(x, x, x, d_qk=D_HEAD, d_v=d_v, d_out=8)
     _verify(out, n_pos=4, input_values={"x": torch.randn(4, 8)}, max_layers=10)
 
 
 def test_compile_split_vo_large_ratio():
-    """d_v=64, d_head=8 — 8 V/O heads with tiny d_qk=2."""
-    # d_head=8 requires trig_width <= 8, i.e. PosEncoding(9).
-    pos = PosEncoding(9)
+    """d_v=64, d_head=8 — 8 V/O heads; Q/K full-width d_qk == d_head=8."""
     x = create_input("x", 8)
-    out = _build_attn(x, x, x, d_qk=2, d_v=64, d_out=8)
+    out = _build_attn(x, x, x, d_qk=8, d_v=64, d_out=8)
 
     net = forward_compile(
         d=256,
         d_head=8,
         output_node=out,
-        pos_encoding=pos,
         verbose=False,
         max_layers=10,
     )
@@ -632,7 +646,7 @@ def test_compile_split_vo_large_ratio():
 def test_compile_selection_primitives():
     """Compiled path for the simple selection primitives, whose d_qk shrank
     to 1-2 and whose query is now a bare LiteralValue([1.0])."""
-    pos = create_pos_encoding()  # PosEncoding(17), trig_width 16 == D_HEAD
+    rope = _rope()
     score = create_input("score", 1)
     validity = create_input("valid", 1)
     value = create_input("value", 3)
@@ -646,18 +660,18 @@ def test_compile_selection_primitives():
     }
 
     for out in (
-        attend_argmin(pos, score, value),
-        attend_argmax(pos, score, value),
-        attend_argmin_where(pos, score, validity, value),
-        attend_argmax_where(pos, score, validity, value),
+        attend_argmin(rope, score, value),
+        attend_argmax(rope, score, value),
+        attend_argmin_where(rope, score, validity, value),
+        attend_argmax_where(rope, score, validity, value),
     ):
-        _verify(out, n_pos=n_pos, input_values=inputs, pos_encoding=pos)
+        _verify(out, n_pos=n_pos, input_values=inputs)
 
 
 def test_compile_selection_wide_value():
     """Selection value wider than d_head must auto-split across heads (the
     len(value) <= d_pos cap was removed)."""
-    pos = create_pos_encoding()
+    rope = _rope()
     score = create_input("score", 1)
     value = create_input("value", 40)  # > D_HEAD = 16
     n_pos = 5
@@ -666,41 +680,23 @@ def test_compile_selection_wide_value():
         "value": torch.arange(n_pos * 40, dtype=torch.float32).reshape(n_pos, 40),
     }
     _verify(
-        attend_argmin(pos, score, value),
+        attend_argmin(rope, score, value),
         n_pos=n_pos,
         input_values=inputs,
-        pos_encoding=pos,
     )
 
 
-def test_compile_rejects_d_head_below_trig_width():
-    """forward_compile rejects d_head < pos_encoding.trig_width early, before
-    the copy heads would silently match on only part of the trig grid."""
-    pos = PosEncoding(17)  # trig_width = 16
-    x = create_input("x", 4)
-    out = pos.attend_to_offset(x, delta_pos=-1)
-    with pytest.raises(ValueError, match="trig_width"):
-        forward_compile(
-            d=256,
-            d_head=8,
-            output_node=out,
-            pos_encoding=pos,
-            verbose=False,
-            max_layers=10,
-        )
-
-
 def test_compile_dqk_equals_dv_unchanged():
-    """d_qk == d_v == 8 — backward compat, single head, padded to d_head=16."""
+    """d_qk == d_v == d_head=16 — a single full head, no padding."""
     x = create_input("x", 8)
-    out = _build_attn(x, x, x, d_qk=8, d_v=8, d_out=8)
+    out = _build_attn(x, x, x, d_qk=D_HEAD, d_v=D_HEAD, d_out=8)
     _verify(out, n_pos=4, input_values={"x": torch.randn(4, 8)}, max_layers=10)
 
 
 def test_compile_dv_smaller_than_dhead():
-    """d_qk=4, d_v=8 — both smaller than d_head=16, V padded differently than Q/K."""
+    """d_v=8 < d_head=16 — V/O padded up to d_head; Q/K are full-width d_qk=16."""
     x = create_input("x", 8)
-    out = _build_attn(x, x, x, d_qk=4, d_v=8, d_out=8)
+    out = _build_attn(x, x, x, d_qk=D_HEAD, d_v=8, d_out=8)
     _verify(out, n_pos=4, input_values={"x": torch.randn(4, 8)}, max_layers=10)
 
 
@@ -708,7 +704,7 @@ def test_compile_split_vo_different_inputs():
     """Q/K and V come from different input nodes — tests index resolution with split."""
     qk_in = create_input("qk", 6)
     v_in = create_input("v", 8)
-    out = _build_attn(qk_in, qk_in, v_in, d_qk=4, d_v=32, d_out=6)
+    out = _build_attn(qk_in, qk_in, v_in, d_qk=D_HEAD, d_v=32, d_out=6)
 
     _verify(
         out,
@@ -722,10 +718,10 @@ def test_compile_attend_mean_where():
     """attend_mean_where — uniform mean over valid positions."""
     from torchwright.ops.attention_ops import attend_mean_where
 
-    pos = create_pos_encoding()
+    rope = _rope()
     validity = create_input("validity", 1)
     value = create_input("value", 3)
-    out = attend_mean_where(pos, validity, value)
+    out = attend_mean_where(rope, validity, value)
 
     n_pos = 5
     _verify(
@@ -735,7 +731,6 @@ def test_compile_attend_mean_where():
             "validity": torch.tensor([[1.0], [1.0], [-1.0], [1.0], [-1.0]]),
             "value": torch.randn(n_pos, 3),
         },
-        pos_encoding=pos,
     )
 
 
@@ -744,11 +739,11 @@ def test_compile_attend_argmax_dot():
     from torchwright.ops.attention_ops import attend_argmax_dot
     from torchwright.ops.logic_ops import cond_gate
 
-    pos = create_pos_encoding()
+    rope = _rope()
     qv = create_input("qv", 4)
     kv = create_input("kv", 4)
     value = create_input("value", 3)
-    out = attend_argmax_dot(qv, kv, value, match_gain=200.0)
+    out = attend_argmax_dot(rope, qv, kv, value, match_gain=200.0)
 
     n_pos = 5
     _verify(
@@ -759,7 +754,6 @@ def test_compile_attend_argmax_dot():
             "kv": torch.randn(n_pos, 4),
             "value": torch.randn(n_pos, 3),
         },
-        pos_encoding=pos,
     )
 
 
@@ -767,11 +761,11 @@ def test_compile_attend_most_recent_matching():
     """attend_most_recent_matching — content match + recency tiebreak."""
     from torchwright.ops.attention_ops import attend_most_recent_matching
 
-    pos = create_pos_encoding()
+    rope, rank = _rope_and_rank()
     qv = create_input("qv", 4)
     kv = create_input("kv", 4)
     value = create_input("value", 3)
-    out = attend_most_recent_matching(pos, qv, kv, value)
+    out = attend_most_recent_matching(rope, qv, kv, value, rank)
 
     # Construct a small sequence where position 2 and position 4 both
     # match the query's type; the op must pick position 4 at every
@@ -784,6 +778,10 @@ def test_compile_attend_most_recent_matching():
     _verify(
         out,
         n_pos=n_pos,
-        input_values={"qv": query_in, "kv": key_in, "value": value_in},
-        pos_encoding=pos,
+        input_values={
+            "qv": query_in,
+            "kv": key_in,
+            "value": value_in,
+            **_markers(n_pos),
+        },
     )

@@ -26,7 +26,7 @@ import pytest
 import torch
 
 from torchwright.compiler.export import compile_headless
-from torchwright.ops.inout_nodes import create_input, create_pos_encoding
+from torchwright.ops.inout_nodes import create_input
 from torchwright.ops.recency_ramp import octant_recency_ramp
 
 GAIN = 2.0
@@ -44,11 +44,10 @@ def _sig(x):
 
 @pytest.fixture(scope="module")
 def ramp_module():
-    pos = create_pos_encoding()
     u = create_input("u", 1)
     v = create_input("v", 1)
     out = octant_recency_ramp(u, v, gain=GAIN)
-    return compile_headless(out, pos, d=256, verbose=False)
+    return compile_headless(out, d=256, verbose=False)
 
 
 def _eval(module, phis):

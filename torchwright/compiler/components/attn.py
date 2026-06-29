@@ -5,7 +5,6 @@ import torch.nn.functional as F
 from torch.nn.attention import SDPBackend, sdpa_kernel
 
 from torchwright.compiler.components.component import Component
-from torchwright.graph import PosEncoding
 from torchwright.graph.attn import CAUSAL_MASK_SENTINEL  # kept for compat
 from torchwright.graph.rope import ROPE_BASE, apply_rope, rope_cos_sin
 
@@ -34,26 +33,22 @@ class AttnLayerComponent(Component):
         output_matrix: (n_heads, d_head, d)
     """
 
-    def __init__(
-        self, d: int, d_head: int, pos_encoding: Optional[PosEncoding], name: str = ""
-    ):
+    def __init__(self, d: int, d_head: int, name: str = ""):
         super().__init__(d, name)
         assert (d % d_head) == 0, "Invalid combination of d and d_head"
         self.d_head = d_head
         self.n_heads = d // d_head
         self.used_heads = 0
-        self.pos_encoding = pos_encoding
 
         self.query_matrix = torch.zeros(self.n_heads, d, d_head)
         self.key_matrix = torch.zeros(self.n_heads, d, d_head)
         self.value_matrix = torch.zeros(self.n_heads, d, d_head)
         self.output_matrix = torch.zeros(self.n_heads, d_head, d)
 
-        # Per-head rotary width: 0 = non-rotary; w > 0 rotates the head's
-        # first w (active d_qk) dims by absolute position before the QK dot
-        # product (rotate_half, see torchwright/graph/rope.py).  Set by the
-        # weight writer when it scatters a rotary Attn node.
-        self.rotary_width = [0] * self.n_heads
+        # Every head is full-width rotary on the one global grid (LLaMA3 end
+        # state): Q/K are rotated by absolute position (rotate_half over the whole
+        # d_head, see torchwright/graph/rope.py) before the QK dot product.  There
+        # is no non-rotary (NoPE) head and no partial width; the base is uniform.
         self.rope_base = ROPE_BASE
 
     def __repr__(self):
@@ -62,27 +57,14 @@ class AttnLayerComponent(Component):
     def _apply_rope(
         self, Q: torch.Tensor, K: torch.Tensor, positions: torch.Tensor
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Rotate Q/K of rotary heads by ``positions`` (rotate_half over the
-        head's active d_qk dims).  Q/K are ``(n_heads, P, d_head)``; ``positions``
-        is ``(P,)`` of absolute positions.  Non-rotary heads pass through.
-
-        Each rotary plane lives entirely in the active ``[0:w]`` columns, so the
-        zero padding in ``[w:d_head]`` is untouched and the QK dot product over
-        ``d_head`` equals the dot over the rotated ``[0:w]`` — matching the
-        oracle, which rotates the same ``d_qk`` block (see graph/rope.py)."""
-        if all(w == 0 for w in self.rotary_width):
-            return Q, K
-        Q = Q.clone()
-        K = K.clone()
-        for h, w in enumerate(self.rotary_width):
-            if w == 0:
-                continue
-            cos, sin = rope_cos_sin(positions, w, self.rope_base)  # (P, w)
-            cos = cos.to(Q.dtype)
-            sin = sin.to(Q.dtype)
-            Q[h, :, :w] = apply_rope(Q[h, :, :w], cos, sin)
-            K[h, :, :w] = apply_rope(K[h, :, :w], cos, sin)
-        return Q, K
+        """Rotate Q/K of every head by ``positions`` (rotate_half over the full
+        ``d_head``).  Q/K are ``(n_heads, P, d_head)``; ``positions`` is ``(P,)``
+        of absolute positions.  Every head is rotary on the global grid; unused
+        (all-zero) heads rotate harmlessly (zeros stay zero)."""
+        cos, sin = rope_cos_sin(positions, self.d_head, self.rope_base)  # (P, d_head)
+        cos = cos.to(Q.dtype)
+        sin = sin.to(Q.dtype)
+        return apply_rope(Q, cos, sin), apply_rope(K, cos, sin)
 
     def forward(self, inp: torch.Tensor):
         # inp shape (n_pos, d)
@@ -210,7 +192,6 @@ class AttnLayerComponent(Component):
             self.key_matrix = self.key_matrix[:n].contiguous()
             self.value_matrix = self.value_matrix[:n].contiguous()
             self.output_matrix = self.output_matrix[:n].contiguous()
-            self.rotary_width = self.rotary_width[:n]
             self.n_heads = n
 
     def num_params(self) -> int:

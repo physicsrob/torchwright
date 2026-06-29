@@ -15,9 +15,12 @@ from torchwright.compiler.forward.residual_map import ResidualStreamMap
 from torchwright.compiler.groups.transformer_layer import TransformerLayer
 from torchwright.graph import Node, Linear, Attn, Add, Concatenate
 from torchwright.graph.misc import LiteralValue
-from torchwright.graph.pos_encoding import PosEncoding, attention_hardness
 from torchwright.graph.relu import ReLU
 from torchwright.graph.rope import ROPE_BASE
+
+# Self-match attention hardness: scales the constant-1 self-match logit so the
+# diagonal softmax weight is 1.0 to fp32 (Δ=0 transport is bit-identical).
+_SELF_MATCH_HARDNESS = 100.0
 
 
 @dataclass
@@ -126,38 +129,33 @@ def write_attn_sublayer(
     layer: TransformerLayer,
     ops: List[AttnHeadOp],
     residual_map: ResidualStreamMap,
-    pos_encoding: Optional[PosEncoding],
+    pos_encoding=None,
     recorder: Optional[PlacementRecorder] = None,
     const_one: Optional[Node] = None,
 ):
     """Write attention head operations into a layer's AttnLayerComponent.
 
-    ``const_one`` selects the self-match substrate for the four
-    arithmetic-transport ops (``compute_linear``/``compute_add``/``cancel``/
-    ``add_into``).  When ``None`` (the default), each builds a trig
-    current-position head over ``pos_encoding`` (the legacy path).  When set to
-    the reserved constant-1 :class:`LiteralValue` node, each builds a **rotary**
-    Δ=0 self-match head that reads that column and lets the runtime rotation
-    place the softmax on the diagonal — the Phase-2-part-2 migration that frees
-    the self-match from the trig block (``docs/rope_port_plan.md``).
+    The four arithmetic-transport ops (``compute_linear``/``compute_add``/
+    ``cancel``/``add_into``) build a **rotary** Δ=0 self-match head that reads
+    the reserved constant-1 :class:`LiteralValue` column (``const_one``) and
+    lets the runtime rotation place the softmax on the diagonal — the RoPE
+    end-state self-match (``docs/rope_port_plan.md`` §3, Phase 5).  ``pos_encoding``
+    is accepted for signature stability but is always ``None`` (position is no
+    longer a residual substrate).
     """
     attn = layer.attn.attn
-    assert pos_encoding is not None, "pos_encoding required for attention ops"
+    assert const_one is not None, "const_one required for the rotary self-match"
     for op in ops:
         if op.op_type == "compute_attn":
             _write_compute_attn(attn, op, residual_map, recorder)
         elif op.op_type == "compute_linear":
-            _write_compute_linear(
-                attn, op, residual_map, pos_encoding, recorder, const_one
-            )
+            _write_compute_linear(attn, op, residual_map, recorder, const_one)
         elif op.op_type == "cancel":
-            _write_cancel(attn, op, residual_map, pos_encoding, recorder, const_one)
+            _write_cancel(attn, op, residual_map, recorder, const_one)
         elif op.op_type == "compute_add":
-            _write_compute_add(
-                attn, op, residual_map, pos_encoding, recorder, const_one
-            )
+            _write_compute_add(attn, op, residual_map, recorder, const_one)
         elif op.op_type == "add_into":
-            _write_add_into(attn, op, residual_map, pos_encoding, recorder, const_one)
+            _write_add_into(attn, op, residual_map, recorder, const_one)
         else:
             raise ValueError(f"Unknown attn op_type: {op.op_type}")
 
@@ -302,10 +300,15 @@ def _write_compute_attn(
 
     layer_d_head = attn.d_head
 
-    assert layer_d_head >= node.d_qk, (
-        f"d_head={layer_d_head} is too small for Attn node "
-        f"'{node.name}' which needs d_qk={node.d_qk} for Q/K. "
-        f"Pass d_head>={node.d_qk} to compile_headless()."
+    # RoPE is full-width on the global grid (LLaMA3): every head is rotary and
+    # rotates the entire d_head, so its Q/K projection must fill d_head exactly —
+    # there is no partial-width and no non-rotary (NoPE) head.  This matches the
+    # ONNX/HF contract enforced in export.py (rotary_width == d_head), so the
+    # in-process and exported runtimes rotate identical dims.
+    assert node.d_qk == layer_d_head, (
+        f"Attn '{node.name}' requires d_qk == d_head; got "
+        f"d_qk={node.d_qk}, d_head={layer_d_head}.  Build the head full-width "
+        f"(d_qk={layer_d_head}); partial-width rotary is not supported."
     )
 
     # Q/K are shared across all V/O chunk heads, padded to layer d_head
@@ -327,11 +330,9 @@ def _write_compute_attn(
         )
 
         head = _allocate_head(attn)
-        if node.rotary:
-            # Rotary planes live in the active [0:d_qk] columns of the head;
-            # all V/O chunk heads share the same Q/K and so are equally rotary.
-            attn.rotary_width[head] = node.d_qk
-            attn.rope_base = node.rope_base
+        # Every head is rotary, full-width over d_head (rotate_half) on the one
+        # global grid; just record the base (the component rotates every head).
+        attn.rope_base = node.rope_base
         _scatter_attn_head(
             attn,
             head,
@@ -350,69 +351,29 @@ def _write_compute_attn(
         )
 
 
-def _current_pos_attn_matrices(pos_encoding, d_head):
-    """Build Q/K matrices for current-position (diagonal) attention.
+def _self_match_source(d_head, rmap, const_one):
+    """Q/K source columns + matrices for a Δ=0 self-match head.
 
-    Matches on the trig block only.  The raw position counter is redundant
-    for self-matching — the sin/cos grid alone keeps the diagonal softmax
-    weight at 1.0 far past any realistic sequence length — and is excluded
-    so the logit magnitude stays bounded (the counter would contribute a
-    ``~position^2`` diagonal term).  When ``d_head <= counter_col`` the
-    ``eye`` truncation already drops the counter row; we also zero it
-    explicitly so the behavior does not depend on that, e.g. if ``d_head``
-    exceeds ``d_pos``.
+    Reads the single reserved constant-1 column and projects it to
+    ``hardness · ones`` (query) / ``ones`` (key) across all ``d_head`` dims.
+    Every head is full-width rotary on the one global grid, so the runtime
+    rotates this head by absolute position (rotate_half) and the logit
+    ``∝ Σ_p cos((i − j)·θ_p)`` peaks at ``i == j`` — a bit-identical Δ=0
+    transport (the §6 LLaMA3 end state).
+
+    Returns ``(qk_idx, q_mat, k_mat)`` where ``qk_idx`` is used for both the query
+    and key source (Δ=0 self-match reads one source on both sides).
     """
-    d_pos = len(pos_encoding)
-    q_mat = attention_hardness * torch.eye(d_pos, d_head)
-    k_mat = torch.eye(d_pos, d_head)
-    counter_col = pos_encoding.counter_col
-    if counter_col < d_head:
-        q_mat[counter_col, :] = 0.0
-        k_mat[counter_col, :] = 0.0
-    return q_mat, k_mat
-
-
-def _self_match_source(pos_encoding, d_head, rmap, const_one):
-    """Q/K source columns + matrices + rotary width for a Δ=0 self-match head.
-
-    ``const_one is None`` → the trig path: read the ``pos_encoding`` grid with
-    :func:`_current_pos_attn_matrices`; the head is non-rotary (width 0).
-
-    ``const_one`` set → the rotary path: read the single reserved constant-1
-    column and project it to ``hardness · ones`` (query) / ``ones`` (key) across
-    all ``d_head`` dims, marking the head rotary over the full ``d_head`` (the
-    runtime rotates it by absolute position, rotate_half, so the logit
-    ``∝ Σ_p cos((i − j)·θ_p)`` peaks at ``i == j``).  Full-width ``d_head`` is
-    required — it is the ONNX/HF rotary contract (``rotary_width == d_head``) and
-    matches the §6 LLaMA3 end state.
-
-    Returns ``(qk_idx, q_mat, k_mat, rotary_width)`` where ``qk_idx`` is used for
-    both the query and key source (Δ=0 self-match reads one source on both
-    sides).
-    """
-    if const_one is None:
-        pe_idx = rmap.get_indices(pos_encoding)
-        q_mat, k_mat = _current_pos_attn_matrices(pos_encoding, d_head)
-        return pe_idx, q_mat, k_mat, 0
-
     const_idx = rmap.get_indices(const_one)  # width 1
-    q_mat = attention_hardness * torch.ones(1, d_head)
+    q_mat = _SELF_MATCH_HARDNESS * torch.ones(1, d_head)
     k_mat = torch.ones(1, d_head)
-    return const_idx, q_mat, k_mat, d_head
-
-
-def _mark_rotary(attn, head, rotary_width):
-    """Mark one self-match head rotary (no-op for the trig path, width 0)."""
-    if rotary_width:
-        attn.rotary_width[head] = rotary_width
-        attn.rope_base = ROPE_BASE
+    return const_idx, q_mat, k_mat
 
 
 def _write_compute_linear(
     attn,
     op: AttnHeadOp,
     rmap: ResidualStreamMap,
-    pos_encoding: PosEncoding,
     recorder: Optional[PlacementRecorder] = None,
     const_one: Optional[Node] = None,
 ):
@@ -436,9 +397,7 @@ def _write_compute_linear(
     d_input = len(input_node)
 
     assert op.source_cols is not None, "compute_linear requires source_cols"
-    qk_idx, q_mat, k_mat, rotary_width = _self_match_source(
-        pos_encoding, d_head, rmap, const_one
-    )
+    qk_idx, q_mat, k_mat = _self_match_source(d_head, rmap, const_one)
     v_idx = op.source_cols
     o_idx = op.target_cols
 
@@ -455,7 +414,7 @@ def _write_compute_linear(
         o_mat = F.pad(weight_slice, (0, 0, 0, d_head - chunk_size))
 
         head = _allocate_head(attn)
-        _mark_rotary(attn, head, rotary_width)
+        attn.rope_base = ROPE_BASE
         _scatter_attn_head(
             attn,
             head,
@@ -478,7 +437,6 @@ def _write_compute_add(
     attn,
     op: AttnHeadOp,
     rmap: ResidualStreamMap,
-    pos_encoding: PosEncoding,
     recorder: Optional[PlacementRecorder] = None,
     const_one: Optional[Node] = None,
 ):
@@ -503,9 +461,7 @@ def _write_compute_add(
     d_head = attn.d_head
     d_output = len(node)
     o_idx = op.target_cols
-    qk_idx, q_mat, k_mat, rotary_width = _self_match_source(
-        pos_encoding, d_head, rmap, const_one
-    )
+    qk_idx, q_mat, k_mat = _self_match_source(d_head, rmap, const_one)
 
     v_idx_a = op.source_cols
     v_idx_b = op.source_cols_b
@@ -525,7 +481,7 @@ def _write_compute_add(
             o_mat[:chunk_size, :chunk_size] = torch.eye(chunk_size)
             o_mat[chunk_size : 2 * chunk_size, :chunk_size] = torch.eye(chunk_size)
             head = _allocate_head(attn)
-            _mark_rotary(attn, head, rotary_width)
+            attn.rope_base = ROPE_BASE
             _scatter_attn_head(
                 attn,
                 head,
@@ -549,7 +505,7 @@ def _write_compute_add(
                 v_mat = torch.eye(chunk_size, d_head)
                 o_mat = torch.eye(d_head, chunk_size)
                 head = _allocate_head(attn)
-                _mark_rotary(attn, head, rotary_width)
+                attn.rope_base = ROPE_BASE
                 _scatter_attn_head(
                     attn,
                     head,
@@ -572,7 +528,6 @@ def _write_cancel(
     attn,
     op: AttnHeadOp,
     rmap: ResidualStreamMap,
-    pos_encoding: PosEncoding,
     recorder: Optional[PlacementRecorder] = None,
     const_one: Optional[Node] = None,
 ):
@@ -588,9 +543,7 @@ def _write_cancel(
     d_width = len(op.target_cols)
 
     node_idx = op.target_cols
-    qk_idx, q_mat, k_mat, rotary_width = _self_match_source(
-        pos_encoding, d_head, rmap, const_one
-    )
+    qk_idx, q_mat, k_mat = _self_match_source(d_head, rmap, const_one)
 
     for start in range(0, d_width, d_head):
         end = min(start + d_head, d_width)
@@ -601,7 +554,7 @@ def _write_cancel(
         o_mat = -torch.eye(d_head, chunk_size)
 
         head = _allocate_head(attn)
-        _mark_rotary(attn, head, rotary_width)
+        attn.rope_base = ROPE_BASE
         _scatter_attn_head(
             attn,
             head,
@@ -624,7 +577,6 @@ def _write_add_into(
     attn,
     op: AttnHeadOp,
     rmap: ResidualStreamMap,
-    pos_encoding: PosEncoding,
     recorder: Optional[PlacementRecorder] = None,
     const_one: Optional[Node] = None,
 ):
@@ -647,9 +599,7 @@ def _write_add_into(
     d_live = len(v_idx)
 
     o_idx = op.target_cols  # dead addend's columns
-    qk_idx, q_mat, k_mat, rotary_width = _self_match_source(
-        pos_encoding, d_head, rmap, const_one
-    )
+    qk_idx, q_mat, k_mat = _self_match_source(d_head, rmap, const_one)
 
     for start in range(0, d_live, d_head):
         end = min(start + d_head, d_live)
@@ -662,7 +612,7 @@ def _write_add_into(
         o_mat = torch.eye(d_head, chunk_size)
 
         head = _allocate_head(attn)
-        _mark_rotary(attn, head, rotary_width)
+        attn.rope_base = ROPE_BASE
         _scatter_attn_head(
             attn,
             head,

@@ -34,7 +34,6 @@ from torchwright.compiler.forward.scheduler import LayerScheduler
 from torchwright.compiler.forward.graph_analysis import GraphAnalyzer
 from torchwright.graph import Linear
 from torchwright.graph.optimize import fuse_consecutive_linears
-from torchwright.graph.pos_encoding import PosEncoding
 from torchwright.graph.relu import ReLU
 from torchwright.ops.inout_nodes import create_input
 
@@ -65,12 +64,10 @@ def test_chain_detector_no_overlap_after_fusion():
     assert n_fused == 1, f"expected 1 fusion, got {n_fused}"
     # Sanity: post-fusion, L_b's input is now R (not L_a).
     assert L_b.inputs[0] is R, (
-        f"expected L_b.inputs[0] to be R after fusion, got "
-        f"{L_b.inputs[0]!r}"
+        f"expected L_b.inputs[0] to be R after fusion, got " f"{L_b.inputs[0]!r}"
     )
 
-    pos = PosEncoding(9)
-    gm = build_graph_model(L_c, pos)
+    gm = build_graph_model(L_c)
 
     # The structural assertion in build_graph_model would have raised
     # if a node showed up in two chains.  Spot-check it ourselves so
@@ -98,8 +95,7 @@ def test_chain_detector_picks_upstream_chain():
     x, L_pre, R, L_a, L_b, R_prime, L_c = _build_post_fusion_repro()
     fuse_consecutive_linears({L_c})
 
-    pos = PosEncoding(9)
-    gm = build_graph_model(L_c, pos)
+    gm = build_graph_model(L_c)
 
     # Exactly one chain — the upstream one.  The downstream chain
     # would have been (L_b, R', L_c); since L_b is locked as L2 of
@@ -119,10 +115,11 @@ def test_cpsat_solves_post_fusion_repro():
     x, L_pre, R, L_a, L_b, R_prime, L_c = _build_post_fusion_repro()
     fuse_consecutive_linears({L_c})
 
-    pos = PosEncoding(9)
     assignment, stats = solve_schedule(
-        L_c, pos,
-        d=64, d_head=8, d_hidden=128,
+        L_c,
+        d=64,
+        d_head=8,
+        d_hidden=128,
         time_budget_s=10.0,
         max_layers=20,
     )
@@ -148,9 +145,8 @@ def test_heuristic_chain_detector_no_overlap_after_fusion():
     x, L_pre, R, L_a, L_b, R_prime, L_c = _build_post_fusion_repro()
     fuse_consecutive_linears({L_c})
 
-    pos = PosEncoding(9)
     graph = GraphAnalyzer(L_c)
-    scheduler = LayerScheduler(graph, d=64, d_head=8, pos_encoding=pos)
+    scheduler = LayerScheduler(graph, d=64, d_head=8)
     # Build a ready set that includes both L_pre and L_b — the case
     # where the bug would fire if the de-dup were missing.
     ready = {L_pre, L_b, L_c}

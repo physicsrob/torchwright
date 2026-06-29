@@ -93,10 +93,8 @@ def ensure_artifact() -> str:
     from torchwright.compiler.export import compile_to_onnx
 
     module = importlib.import_module("examples.calculator_v2")
-    output_node, pos_encoding, embedding = module.create_network_parts()
-    compile_to_onnx(
-        output_node, pos_encoding, embedding, ONNX_PATH, d=module.D_MODEL
-    )
+    output_node, embedding = module.create_network_parts()
+    compile_to_onnx(output_node, embedding, ONNX_PATH, d=module.D_MODEL)
     return ONNX_PATH
 
 
@@ -115,9 +113,7 @@ def demo(out_dir: str) -> None:
     import torch
     from transformers import AutoModelForCausalLM, AutoTokenizer
 
-    model = AutoModelForCausalLM.from_pretrained(
-        out_dir, trust_remote_code=True
-    ).eval()
+    model = AutoModelForCausalLM.from_pretrained(out_dir, trust_remote_code=True).eval()
     tok = AutoTokenizer.from_pretrained(out_dir, trust_remote_code=True)
 
     print("\n=== clean-room trust_remote_code demo ===")
@@ -132,9 +128,7 @@ def demo(out_dir: str) -> None:
                 eos_token_id=tok.eos_token_id,
                 pad_token_id=tok.eos_token_id,
             )
-        out = tok.decode(
-            g[0, enc["input_ids"].shape[1]:], skip_special_tokens=True
-        )
+        out = tok.decode(g[0, enc["input_ids"].shape[1] :], skip_special_tokens=True)
         print(f"  {expr.strip():10s} -> {out}")
 
 

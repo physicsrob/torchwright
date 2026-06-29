@@ -13,11 +13,20 @@ a chaining offset that makes the ramp continuous.  The analytic reference is
 ``scripts/rope_octant_assembly.py`` (proven monotone, min step
 ~2.275e-5/token at ``gain=2.0``).
 
-Why ``soft_blend`` and not ``select``: a token's ``phi`` can land arbitrarily
-close to a ``k*pi/4`` octant boundary, where the selecting ``compare`` cannot
-saturate.  ``select``'s ``(M+v)-M`` core then dips to ``~-M`` (non-monotone);
-``soft_blend`` clamps into the ``[min,max]`` box of its two (equal-at-boundary)
-operands instead.  See ``soft_blend`` in ``map_select.py``.
+Why a **convex blend** and not ``select`` or ``soft_blend``: a token's ``phi``
+can land arbitrarily close to a ``k*pi/4`` octant boundary, where the selecting
+soft step cannot saturate.  ``select``'s ``(M+v)-M`` core then dips to ``~-M``
+(non-monotone).  The adjacent octant branches are *equal* at each boundary by
+construction (``_assert_branches_meet_at_boundaries``), so a straight convex
+interpolation ``out = f + g*(t-f)`` (``g`` a saturating soft step in ``[0,1]``)
+is exactly ``t == f`` there — in-box and continuous — and collapses to an exact
+branch value in every octant interior (``g`` saturates to 0/1), preserving the
+gap-1 resolution.  Phase 1b originally rejected this multiply on a "no
+guaranteed-smoother slope" argument and used a deep median-of-three
+``soft_blend`` instead; the gate-b sweep run directly on the convex form shows
+it is strictly monotone with the *same* min step at **half the depth** (one
+``multiply_2d`` per blend vs. an 11-layer median clamp), so the ramp now uses
+it (``docs/rope_port_plan.md`` Phase-5 depth-reduction note).
 
 **Seam constraint (caller's responsibility).** The ramp has one discontinuity,
 the wrap between octant 7 (``phi -> 2*pi``) and octant 0 (``phi -> 0``), which
@@ -36,13 +45,14 @@ from torchwright.graph.asserts import assert_matches_value_type
 from torchwright.graph.value_type import NodeValueType, Range
 from torchwright.ops.arithmetic_ops import (
     abs as abs_op,
+    add,
     add_const,
-    compare,
+    clamp,
+    multiply_2d,
     multiply_const,
     subtract,
 )
 from torchwright.ops.const import step_sharpness
-from torchwright.ops.map_select import soft_blend
 
 # Per octant (increasing phi): (which centered weight is steep, sign that makes
 # the term increase with phi).  u tracks cos, v tracks sin.  Mirrors
@@ -138,7 +148,7 @@ def octant_recency_ramp(
     _assert_branches_meet_at_boundaries(gain, offset)
 
     # Centered sigmoid weights live strictly in (-0.5, 0.5); pin that so the
-    # branch values (and soft_blend's M) carry finite bounds.
+    # branch values carry finite bounds.
     box = NodeValueType(value_range=Range(-0.5, 0.5))
     u = assert_matches_value_type(u, box, atol=1e-3)
     v = assert_matches_value_type(v, box, atol=1e-3)
@@ -152,35 +162,44 @@ def octant_recency_ramp(
 
     b = [branch(o) for o in range(8)]
 
-    # Three octant tests (torchwright booleans: +1 = true).  compare's ramp is
-    # one-sided: cond=0 lands at inp = thresh + 1/(2s), and cond=-1 (crisp) at
-    # inp = thresh.  With thresh=0 the whole soft zone sits on the true side of
-    # the boundary, so soft_blend would be soft where the branches already
-    # differ — its precondition (soft only where t==f) holds only approximately.
-    # Shift each threshold by -1/(2s) so cond=0 lands exactly on the boundary
-    # (inp=0) and the soft zone straddles it symmetrically: now soft_blend is
-    # fully soft precisely where the adjacent branches are equal.
-    s = step_sharpness if sharpness is None else sharpness
-    half = 1.0 / (2.0 * s)
-    cond_u = compare(u, -half, sharpness=s)  # +1 iff u >~ 0 (soft zone centered on 0)
-    cond_v = compare(v, -half, sharpness=s)  # +1 iff v >~ 0
-    cond_c = compare(
-        subtract(abs_op(u), abs_op(v)), -half, sharpness=s
-    )  # +1 iff |u| >~ |v|
+    # Max |t - f| across the whole tree: every branch value lies in
+    # [min(offset) - 0.5, max(offset) + 0.5] (the +-0.5 is the centered-weight
+    # swing) and every blend output stays in that box, so the difference of any
+    # two operands is bounded by the box width.  This sizes the multiply grid.
+    diff_bound = (max(offset) - min(offset)) + 1.0
 
-    # Binary tree on (sign v, sign u, |u|>|v|).  With the centered thresholds
-    # above, each node's two operands are equal exactly on its cond=0 surface
-    # (the matching in-range boundary), so every select is a soft_blend.
-    # Octant assignments (sign_v, sign_u, |u|>|v|):
+    # Saturating soft octant indicators in [0, 1]: = 1 where the test is true,
+    # = 0 where false, with a soft zone of width 1/s centered exactly on the
+    # boundary (inp = 0).  Outside that zone they saturate to 0/1, so in every
+    # octant interior the convex blends below collapse to an exact branch value
+    # (full gap-1 resolution); they are soft only at a boundary, where the two
+    # branches are equal by construction.
+    s = step_sharpness if sharpness is None else sharpness
+
+    def soft01(x: Node) -> Node:
+        return clamp(add_const(multiply_const(x, s), 0.5), 0.0, 1.0)
+
+    g_u = soft01(u)  # 1 iff u >~ 0
+    g_v = soft01(v)  # 1 iff v >~ 0
+    g_c = soft01(subtract(abs_op(u), abs_op(v)))  # 1 iff |u| >~ |v|
+
+    # Convex blend: t when g = 1, f when g = 0, straight interpolation between.
+    # At a boundary t == f (branch-equality precondition), so out == t == f
+    # exactly regardless of g — in-box and continuous, no median clamp needed.
+    def blend(g: Node, t: Node, f: Node) -> Node:
+        return add(f, multiply_2d(g, subtract(t, f), 1.0, diff_bound))
+
+    # Binary tree on (sign v, sign u, |u|>|v|).  Octant assignments
+    # (sign_v, sign_u, |u|>|v|):
     #   o0:(+,+,T) o1:(+,+,F) o2:(+,-,F) o3:(+,-,T)
     #   o4:(-,-,T) o5:(-,-,F) o6:(-,+,F) o7:(-,+,T)
-    # cond_c soft at |u|=|v|:
-    n_pp = soft_blend(cond_c, b[0], b[1])  # v>=0, u>=0  (phi=pi/4: o0|o1)
-    n_pn = soft_blend(cond_c, b[3], b[2])  # v>=0, u<0   (phi=3pi/4: o2|o3)
-    n_np = soft_blend(cond_c, b[7], b[6])  # v<0,  u>=0  (phi=7pi/4: o6|o7)
-    n_nn = soft_blend(cond_c, b[4], b[5])  # v<0,  u<0   (phi=5pi/4: o4|o5)
-    # cond_u soft at u=0:
-    n_p = soft_blend(cond_u, n_pp, n_pn)  # v>=0 (phi=pi/2: o1|o2)
-    n_n = soft_blend(cond_u, n_np, n_nn)  # v<0  (phi=3pi/2: o5|o6)
-    # cond_v soft at v=0 (phi=pi interior continuous; phi=0 seam out of range):
-    return soft_blend(cond_v, n_p, n_n)
+    # g_c soft at |u|=|v|:
+    n_pp = blend(g_c, b[0], b[1])  # v>=0, u>=0  (phi=pi/4: o0|o1)
+    n_pn = blend(g_c, b[3], b[2])  # v>=0, u<0   (phi=3pi/4: o2|o3)
+    n_np = blend(g_c, b[7], b[6])  # v<0,  u>=0  (phi=7pi/4: o6|o7)
+    n_nn = blend(g_c, b[4], b[5])  # v<0,  u<0   (phi=5pi/4: o4|o5)
+    # g_u soft at u=0:
+    n_p = blend(g_u, n_pp, n_pn)  # v>=0 (phi=pi/2: o1|o2)
+    n_n = blend(g_u, n_np, n_nn)  # v<0  (phi=3pi/2: o5|o6)
+    # g_v soft at v=0 (phi=pi interior continuous; phi=0 seam out of range):
+    return blend(g_v, n_p, n_n)

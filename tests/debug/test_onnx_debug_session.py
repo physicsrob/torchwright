@@ -41,7 +41,7 @@ from torchwright.debug.probe import (
 from torchwright.graph.asserts import assert_in_range
 from torchwright.graph.attn import Attn
 from torchwright.ops.arithmetic_ops import add, multiply_const, signed_multiply
-from torchwright.ops.inout_nodes import create_input, create_pos_encoding
+from torchwright.ops.inout_nodes import create_input
 
 onnxruntime = pytest.importorskip("onnxruntime")
 
@@ -77,10 +77,9 @@ def token_artifact(tmp_path_factory):
     """A compiled token-I/O artifact (1-digit adder) with debug sidecar."""
     tmpdir = tmp_path_factory.mktemp("onnx_debug")
     onnx_path = str(tmpdir / "adder.onnx")
-    output_node, pos_encoding, embedding = _build_adder()
+    output_node, embedding = _build_adder()
     compile_to_onnx(
         output_node,
-        pos_encoding,
         embedding,
         onnx_path,
         d=D,
@@ -117,9 +116,7 @@ def test_sidecar_written_with_expected_schema(token_artifact):
     n_layers = sidecar["n_layers"]
     keys = [e["key"] for e in sidecar["states"]]
     assert keys[0] == "input"
-    assert keys[1:] == [
-        f"L{i}.{s}" for i in range(n_layers) for s in ("attn", "mlp")
-    ]
+    assert keys[1:] == [f"L{i}.{s}" for i in range(n_layers) for s in ("attn", "mlp")]
     # The adder graph carries internal asserts; coverage must see them.
     assert sidecar["assert_coverage"]["n_asserts"] > 0
 
@@ -137,7 +134,6 @@ def _build_annotated_graph():
 
     vocab = list("0123456789+") + ["\n", "<bos>", "<eos>", "default"]
     embedding = create_embedding(vocab=vocab)
-    pos = create_pos_encoding()
     with annotate("scene"):
         cond = equals_vector(inp=embedding, vector=embedding.get_embedding("+"))
         with annotate("scene/sum"):
@@ -146,16 +142,21 @@ def _build_annotated_graph():
                 create_literal_value(embedding.get_embedding("1")),
                 create_literal_value(embedding.get_embedding("0")),
             )
-    return out, pos, embedding, cond, out
+    return out, embedding, cond, out
 
 
 def test_sidecar_carries_annotations(tmp_path):
     """The ``annotate()`` label path round-trips through the debug sidecar
     and onto OnnxDebugSession.annotation() against a fresh rebuild."""
-    out, pos, embedding, prod, top = _build_annotated_graph()
+    out, embedding, prod, top = _build_annotated_graph()
     onnx_path = str(tmp_path / "annotated.onnx")
     compile_to_onnx(
-        out, pos, embedding, onnx_path, d=D, d_head=D_HEAD, max_seq_len=16,
+        out,
+        embedding,
+        onnx_path,
+        d=D,
+        d_head=D_HEAD,
+        max_seq_len=16,
         verbose=False,
     )
 
@@ -172,8 +173,8 @@ def test_sidecar_carries_annotations(tmp_path):
     assert "scene/sum" in labels
 
     # Round-trip onto a fresh rebuild (new node ids) via the session.
-    out2, pos2, _emb2, prod2, top2 = _build_annotated_graph()
-    sess = OnnxDebugSession(onnx_path, out2, pos2)
+    out2, _emb2, prod2, top2 = _build_annotated_graph()
+    sess = OnnxDebugSession(onnx_path, out2)
     assert sess.annotation(prod2) == "scene"
     assert sess.annotation(top2) == "scene/sum"
 
@@ -181,11 +182,17 @@ def test_sidecar_carries_annotations(tmp_path):
 def test_sidecar_nodes_table_schema(tmp_path):
     """The per-node table keys by canonical id (same space as placements /
     states) and carries op/width/weights/inputs/layer/sublayer per node."""
-    out, pos, embedding, prod, top = _build_annotated_graph()
+    out, embedding, prod, top = _build_annotated_graph()
     onnx_path = str(tmp_path / "nodes.onnx")
     compile_to_onnx(
-        out, pos, embedding, onnx_path, d=D, d_head=D_HEAD, max_seq_len=16,
-        verbose=False, optimize=1,
+        out,
+        embedding,
+        onnx_path,
+        d=D,
+        d_head=D_HEAD,
+        max_seq_len=16,
+        verbose=False,
+        optimize=1,
         extra_metadata={"screen": {"width": 80, "height": 50}, "scale": 4},
     )
     with open(debug_meta_path_for(onnx_path)) as f:
@@ -235,16 +242,16 @@ def test_sidecar_nodes_table_schema(tmp_path):
 
 def test_probe_and_debug_value_parity_with_headless(token_artifact):
     # ONNX backend over a fresh rebuild.
-    out_onnx, pos_onnx, emb_onnx = _build_adder()
-    session = OnnxDebugSession(token_artifact, out_onnx, pos_onnx)
+    out_onnx, emb_onnx = _build_adder()
+    session = OnnxDebugSession(token_artifact, out_onnx)
     ids = _token_ids(emb_onnx)
     iv = {"embedding_input": ids}
     report_onnx = probe_compiled(session, out_onnx, iv, n_pos=len(TOKENS), atol=1e-3)
     assert report_onnx.first_divergent is None, report_onnx.format_short()
 
     # In-process backend over another fresh rebuild.
-    out_h, pos_h, emb_h = _build_adder()
-    headless = compile_headless(out_h, pos_h, d=D, d_head=D_HEAD, verbose=False)
+    out_h, emb_h = _build_adder()
+    headless = compile_headless(out_h, d=D, d_head=D_HEAD, verbose=False)
     report_h = probe_compiled(headless, out_h, iv, n_pos=len(TOKENS), atol=1e-3)
     assert report_h.first_divergent is None, report_h.format_short()
 
@@ -261,8 +268,8 @@ def test_probe_and_debug_value_parity_with_headless(token_artifact):
 
 
 def test_decode_with_past_matches_prefill_and_debug_passes(token_artifact):
-    out, pos, emb = _build_adder()
-    session = OnnxDebugSession(token_artifact, out, pos)
+    out, emb = _build_adder()
+    session = OnnxDebugSession(token_artifact, out)
     ids = _token_ids(emb)
 
     full = session(ids, debug=True)
@@ -275,8 +282,8 @@ def test_decode_with_past_matches_prefill_and_debug_passes(token_artifact):
 
 
 def test_probe_attention_fetches_artifact_weights(token_artifact):
-    out, pos, emb = _build_adder()
-    session = OnnxDebugSession(token_artifact, out, pos)
+    out, emb = _build_adder()
+    session = OnnxDebugSession(token_artifact, out)
     ids = _token_ids(emb)
 
     stack, seen, attn_node = [out], set(), None
@@ -304,10 +311,10 @@ def test_probe_attention_fetches_artifact_weights(token_artifact):
 
 
 def test_assert_wrappers_are_fingerprint_transparent_and_fire(token_artifact):
-    out, pos, emb = _build_adder()
+    out, emb = _build_adder()
     wrapped = assert_in_range(out, lo=1e6, hi=2e6)  # impossible claim
     # Wrapping must NOT change the fingerprint — the session loads fine...
-    session = OnnxDebugSession(token_artifact, wrapped, pos)
+    session = OnnxDebugSession(token_artifact, wrapped)
     # ...and the rebuilt graph's assert fires on the artifact's values.
     with pytest.raises(AssertionError):
         session(_token_ids(emb), debug=True)
@@ -321,27 +328,26 @@ def test_fingerprint_mismatch_raises(token_artifact):
         adder_module.max_digits = 2
         from examples.adder import create_network_parts
 
-        out_big, pos_big, _ = create_network_parts()
+        out_big, _ = create_network_parts()
     finally:
         adder_module.max_digits = original
     with pytest.raises(ValueError, match="fingerprint mismatch"):
-        OnnxDebugSession(token_artifact, out_big, pos_big)
+        OnnxDebugSession(token_artifact, out_big)
 
 
 def test_assert_coverage_warning_on_weaker_rebuild(tmp_path, capsys):
     onnx_path = str(tmp_path / "adder_asserted.onnx")
-    out, pos, emb = _build_adder()
+    out, emb = _build_adder()
     compile_to_onnx(
         assert_in_range(out, lo=-1e9, hi=1e9),
-        pos,
         emb,
         onnx_path,
         d=D,
         d_head=D_HEAD,
         verbose=False,
     )
-    out2, pos2, _ = _build_adder()  # rebuilt WITHOUT the extra assert
-    OnnxDebugSession(onnx_path, out2, pos2)
+    out2, _ = _build_adder()  # rebuilt WITHOUT the extra assert
+    OnnxDebugSession(onnx_path, out2)
     assert "checking fewer invariants" in capsys.readouterr().out
 
 
@@ -370,8 +376,8 @@ def test_corrupted_initializer_is_detected(token_artifact, tmp_path):
     for ext in (".meta.json", ".debug.json"):
         shutil.copy(token_artifact[:-5] + ext, corrupt[:-5] + ext)
 
-    out, pos, emb = _build_adder()
-    session = OnnxDebugSession(corrupt, out, pos)
+    out, emb = _build_adder()
+    session = OnnxDebugSession(corrupt, out)
     report = probe_compiled(
         session,
         out,
@@ -390,7 +396,7 @@ def test_corrupted_initializer_is_detected(token_artifact, tmp_path):
 def _tiny_graph():
     a = create_input("a", 1)
     b = create_input("b", 1)
-    return add(multiply_const(a, 2.0), b), create_pos_encoding()
+    return add(multiply_const(a, 2.0), b)
 
 
 def test_fingerprints_are_pinned():
@@ -403,15 +409,14 @@ def test_fingerprints_are_pinned():
     update the pins (existing schedule caches will re-solve and existing
     debug sidecars will need re-export).
     """
-    out, pos = _tiny_graph()
+    out = _tiny_graph()
     assert (
-        debug_fingerprint(out, pos, d=256, d_head=16)
-        == "8164b45dfdb3cc78093c6dba7e57e3158aa1b7d275707e6bd32534e1350e03d0"
+        debug_fingerprint(out, d=256, d_head=16)
+        == "50bcb97a0852df4782908a8418bb1a34d2674af2555f1c4f3183b1e65d0e0e29"
     )
     assert (
         graph_fingerprint(
             out,
-            pos,
             d=256,
             d_head=16,
             d_hidden=256,
@@ -420,18 +425,18 @@ def test_fingerprints_are_pinned():
             cancel_slack=2,
             policy=None,
         )
-        == "9aa233367f7f4889d5e105439ee14a95b90216b251f9c913f9da1cb2280a254c"
+        == "7385d143353a723b9ae8d01c9e357992f157c5542cbc606fc5368f6ea255bff6"
     )
 
 
 def test_fingerprint_stable_across_rebuilds_and_wrappers():
-    out1, pos1 = _tiny_graph()
-    out2, pos2 = _tiny_graph()  # fresh node ids
-    fp1 = debug_fingerprint(out1, pos1, d=256, d_head=16)
-    assert fp1 == debug_fingerprint(out2, pos2, d=256, d_head=16)
+    out1 = _tiny_graph()
+    out2 = _tiny_graph()  # fresh node ids
+    fp1 = debug_fingerprint(out1, d=256, d_head=16)
+    assert fp1 == debug_fingerprint(out2, d=256, d_head=16)
     # Assert wrappers are transparent — including at the root.
     wrapped = assert_in_range(out2, lo=-1e9, hi=1e9)
-    assert fp1 == debug_fingerprint(wrapped, pos2, d=256, d_head=16)
+    assert fp1 == debug_fingerprint(wrapped, d=256, d_head=16)
 
 
 # ---------------------------------------------------------------------------
@@ -441,21 +446,19 @@ def test_fingerprint_stable_across_rebuilds_and_wrappers():
 
 def test_artifact_debug_session_matches_direct(tmp_path):
     onnx_path = str(tmp_path / "model.onnx")
-    out1, pos1, emb1 = _build_adder()
-    artifact = compile_to_onnx(
-        out1, pos1, emb1, onnx_path, d=D, d_head=D_HEAD, verbose=False
-    )
+    out1, emb1 = _build_adder()
+    artifact = compile_to_onnx(out1, emb1, onnx_path, d=D, d_head=D_HEAD, verbose=False)
     ids = _token_ids(emb1)
     iv = {"embedding_input": ids}
 
-    out2, pos2, _ = _build_adder()
-    sess_handle = artifact.debug_session(out2, pos2)
+    out2, _ = _build_adder()
+    sess_handle = artifact.debug_session(out2)
     assert isinstance(sess_handle, OnnxDebugSession)
     report = probe_compiled(sess_handle, out2, iv, n_pos=len(TOKENS), atol=1e-3)
     assert report.first_divergent is None, report.format_short()
 
-    out3, pos3, _ = _build_adder()
-    sess_direct = OnnxDebugSession(onnx_path, out3, pos3)
+    out3, _ = _build_adder()
+    sess_direct = OnnxDebugSession(onnx_path, out3)
     a = sess_handle(ids)
     b = sess_direct(ids)
     assert torch.allclose(a, b, atol=0)

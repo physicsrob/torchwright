@@ -125,7 +125,9 @@ def build_config(
     assert (
         len(vocab) <= vocab_size
     ), f"meta vocab len {len(vocab)} exceeds embed_table rows {vocab_size}"
-    max_seq = inits["pos_encoding_full"].shape[0]
+    # No additive PE table under RoPE; the rollout bound is the baked slot
+    # count arange_S (= cache_stride).  config.max_seq is otherwise vestigial.
+    max_seq = inits["arange_S"].shape[0]
 
     n_layers = sum(1 for k in inits if re.fullmatch(r"l\d+_WQ", k))
     assert n_layers > 0, "no l{i}_WQ initializers — not a token transformer?"
@@ -145,19 +147,10 @@ def build_config(
         n_heads_per_layer.append(nh)
         d_hidden_per_layer.append(int(inits[f"l{i}_W1"].shape[1]))
 
-    # RoPE: the exporter records `rope_base` in the sidecar meta and bakes, for
-    # each layer with a rotary head, an `l{i}_rope_enable_q` (nh, 1, 1) per-head
-    # enable.  Absent = the sinusoidal (non-rotary) model.
-    rope_base = float(meta.get("rope_base", 0.0))
-    rotary_enable_per_layer: List[List[int]] = []
-    for i in range(n_layers):
-        key = f"l{i}_rope_enable_q"
-        if key in inits:
-            rotary_enable_per_layer.append(
-                [int(round(float(x))) for x in inits[key].reshape(-1)]
-            )
-        else:
-            rotary_enable_per_layer.append([0] * n_heads_per_layer[i])
+    # RoPE: every head is full-width rotary on one global grid; the exporter
+    # records the single shared `rope_base` in the sidecar meta and the converter
+    # rebuilds the rotation from it (no per-head enable).
+    rope_base = float(meta.get("rope_base", 500000.0))
 
     # Resolve bos/eos ids. A token of None means "this model has no bos/eos";
     # a non-None token that isn't in the vocab is a caller error (e.g. wrong
@@ -187,7 +180,6 @@ def build_config(
         head_kind="token",
         cache_stride=meta.get("cache_stride"),
         rope_base=rope_base,
-        rotary_enable_per_layer=rotary_enable_per_layer,
         bos_token_id=bos_id,
         eos_token_id=eos_id,
         tie_word_embeddings=False,
@@ -218,7 +210,6 @@ def build_state_dict(config, inits: Dict[str, np.ndarray]) -> Tuple[dict, set]:
     sd: dict = {
         "model.embed_tokens.weight": _t(embed_table),
         "lm_head.weight": _t(take("lm_head")),  # untied (vocab, d)
-        "model.pos_encoding_full": _t(take("pos_encoding_full")),  # (max_seq, d)
         "model.constant_values": _t(take("constant_values")),  # (d,)
     }
 
@@ -233,17 +224,12 @@ def build_state_dict(config, inits: Dict[str, np.ndarray]) -> Tuple[dict, set]:
         sd[f"{p}.mlp.linear2.weight"] = _t(take(f"l{i}_W2").T)  # (d, d_h)
         sd[f"{p}.mlp.linear2.bias"] = _t(take(f"l{i}_b2"))
 
-    # RoPE constants are config-derived (rebuilt in the model from rope_base +
-    # the per-head enable), not state-dict weights — mark them consumed so the
-    # all-mapped check passes.
+    # RoPE constants are config-derived (the model rebuilds the rotation from
+    # rope_base; every head is full-width rotary), not state-dict weights — mark
+    # them consumed so the all-mapped check passes.
     for name in ("rope_freq", "rope_base", "rope_split"):
         if name in inits:
             consumed.add(name)
-    for i in range(config.n_layers):
-        for suffix in ("rope_enable_q", "rope_enable_k"):
-            key = f"l{i}_{suffix}"
-            if key in inits:
-                consumed.add(key)
 
     return sd, consumed
 

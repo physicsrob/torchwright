@@ -14,9 +14,11 @@ so the mean is exactly ``1/(gap+1)``.  Inverting (``reciprocal``) gives the
 window size ``gap+1``; subtract 1 for the gap.
 
 This is RoPE-clean: ``attend_mean_where`` uses a literal query and
-validity-driven keys with **no position term**.  Position enters only through
-the ``window_validity`` / ``marker_onehot`` features, which the consumer
-derives from in-context marker tokens — never from an absolute counter.
+validity-driven keys, and under the end-state global rotation it rides the
+**slowest plane** (``cos((i-j)·θ_slow) ≈ 1`` over the bounded window), so the
+mean stays uniform to ~fp32.  Position enters only through the
+``window_validity`` / ``marker_onehot`` features, which the consumer derives
+from in-context marker tokens — never from an absolute counter.
 
 **Resolution (gate b).** The mean values ``{1, 1/2, ..., 1/(N+1)}`` bunch near
 0 for large gaps: ``1/350`` vs ``1/351`` differ by ~8e-6.  The softmax weight
@@ -28,7 +30,7 @@ i.e. ``gap+1`` lands within ±0.5 of the integer out to the ``max_gap`` bound.
 
 import math
 
-from torchwright.graph import Node, PosEncoding
+from torchwright.graph import Node, RopeConfig
 from torchwright.ops.arithmetic_ops import add_const, reciprocal
 from torchwright.ops.attention_ops import attend_mean_where
 
@@ -40,7 +42,7 @@ _RECIP_REL_SAFETY = 16.0
 
 
 def count_since_marker(
-    pos_encoding: PosEncoding,
+    rope: RopeConfig,
     window_validity: Node,
     marker_onehot: Node,
     *,
@@ -49,9 +51,10 @@ def count_since_marker(
     """Integer gap ``pos - marker_pos`` via a uniform-attention count.
 
     Args:
-        pos_encoding: the graph's positional encoding (vestigial here —
-            ``attend_mean_where`` reads no position; kept for signature
-            stability until Phase 5 drops it).
+        rope: the RoPE config.  ``attend_mean_where`` places the validity on the
+            slowest plane, so the rotation is quasi-static
+            (``cos((i-j)·θ_slow) ≈ 1``) over the bounded window and the mean
+            stays uniform; ``rope.d_head`` / ``base`` size that plane.
         window_validity: length-1 boolean (+1 / -1).  +1 for keys in the window
             ``[marker, now]``, -1 outside.  The caller derives this from the
             marker token (e.g. "at or after the most recent marker").
@@ -77,7 +80,7 @@ def count_since_marker(
     # result to ~max_gap rather than crashing, but the gap is meaningless
     # there.  The caller must only consume the gap at positions whose window
     # holds the marker (e.g. at/after a span start) -- see docstring.
-    mean = attend_mean_where(pos_encoding, window_validity, marker_onehot)
+    mean = attend_mean_where(rope, window_validity, marker_onehot)
 
     # reciprocal over a padded range; size breakpoints for the per-gap
     # resolution at the bound (see module docstring / _RECIP_REL_SAFETY).

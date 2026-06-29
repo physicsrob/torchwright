@@ -15,14 +15,21 @@ import torch
 from torchwright.graph import Node, Embedding
 from torchwright.graph.embedding import Unembedding
 from torchwright.ops.arithmetic_ops import concat
+from torchwright.ops.attention_ops import attend_to_offset, get_prev_value
 from torchwright.ops.inout_nodes import (
     create_literal_value,
     create_embedding,
-    create_pos_encoding,
+    create_rope_config,
     create_unembedding,
 )
 from torchwright.ops.logic_ops import equals_vector
 from torchwright.ops.map_select import map_to_table, select
+from torchwright.ops.recency_heads import recency_rank_from_tokens
+
+# Rotary width the graph is built against; must match the d_head it is
+# compiled at (the token-example harness compiles at d_head=16).
+D_HEAD = 16
+MAX_POSITIONS = 512
 
 
 def check_is_num(embedding_value: Node, embedding: Embedding) -> Node:
@@ -66,9 +73,13 @@ def create_network() -> Unembedding:
     # --- Phase 1: Vocabulary and parsing ---
     vocab = list(
         "0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ!@#$%^&*()-+="
-    ) + ["\n", "<eos>", "default"]
+    ) + ["\n", "<bos>", "<ref>", "<eos>", "default"]
     embedding = create_embedding(vocab=vocab)
-    pos_encoding = create_pos_encoding()
+    rope = create_rope_config(d_head=D_HEAD, max_positions=MAX_POSITIONS)
+
+    # Bucket-2 recency rank from the <bos>/<ref> markers — drives the
+    # "most recent" latches (get_prev_value) that capture each operand.
+    recency_rank = recency_rank_from_tokens(rope, embedding)
 
     # Determine the current digit (default to "0" for non-digit tokens).
     zero_constant = create_literal_value(embedding.get_embedding("0"))
@@ -81,11 +92,11 @@ def create_network() -> Unembedding:
 
     # --- Phase 2: Capture operands and compute ---
     # Look one position back to get the digit that just completed.
-    just_completed_num = pos_encoding.attend_to_offset(current_num, delta_pos=-1)
+    just_completed_num = attend_to_offset(rope, current_num, delta_pos=-1)
     # Latch: remember the digit at "+", carry it forward to all later positions.
-    first_num = pos_encoding.get_prev_value(just_completed_num, is_first_num)
+    first_num = get_prev_value(rope, just_completed_num, is_first_num, recency_rank)
     # Latch: remember the digit at "=".
-    second_num = pos_encoding.get_prev_value(just_completed_num, is_second_num)
+    second_num = get_prev_value(rope, just_completed_num, is_second_num, recency_rank)
 
     summed, carry = sum_numbers(embedding, first_num, second_num)
 

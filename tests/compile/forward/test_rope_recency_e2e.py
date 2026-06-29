@@ -18,7 +18,7 @@ Gates proved here (the §8 Phase-1b gate letters):
   unbounded cached decode (``test_recency_rank_prefill_decode_identical``).
 - **plane sizing** — the chosen recency plane never wraps over the full cache cap
   (``test_recency_plane_seam_safe_to_cap``).
-- **selection** — ``attend_most_recent_matching_via_ramp`` returns the
+- **selection** — ``attend_most_recent_matching`` returns the
   most-recent content match, resolving adjacent (gap-1) matches
   (``test_selection_picks_most_recent``,
   ``test_selection_gap1_resolves_at_cap_density``).
@@ -36,8 +36,8 @@ import torch
 from torchwright.compiler.export import compile_headless
 from torchwright.debug.probe import probe_compiled
 from torchwright.graph.rope import ROPE_BASE, recency_plane_index
-from torchwright.ops.attention_ops import attend_most_recent_matching_via_ramp
-from torchwright.ops.inout_nodes import create_input, create_pos_encoding
+from torchwright.ops.attention_ops import attend_most_recent_matching
+from torchwright.ops.inout_nodes import create_input, create_rope_config
 from torchwright.ops.recency_heads import recency_phase_heads, recency_rank
 
 CAP = 61440  # ONNX cache cap / e1m1 max_positions — size the plane to THIS.
@@ -103,7 +103,6 @@ def test_recency_plane_seam_safe_to_cap():
 # --------------------------------------------------------------------------- #
 @pytest.fixture(scope="module")
 def heads_module():
-    pos = create_pos_encoding()
     bos = create_input("bos_marker", 1)
     ref = create_input("ref_marker", 1)
     u, v = recency_phase_heads(bos, ref, d_head=D_HEAD, max_positions=CAP)
@@ -111,7 +110,7 @@ def heads_module():
     from torchwright.graph import Concatenate
 
     out = Concatenate([u, v])
-    return compile_headless(out, pos, d=1024, d_head=D_HEAD, verbose=False), out
+    return compile_headless(out, d=1024, d_head=D_HEAD, verbose=False), out
 
 
 def _eval_heads(module, n):
@@ -172,11 +171,10 @@ def test_phase_heads_leakage_does_not_grow_with_N(heads_module):
 # --------------------------------------------------------------------------- #
 @pytest.fixture(scope="module")
 def rank_module():
-    pos = create_pos_encoding()
     bos = create_input("bos_marker", 1)
     ref = create_input("ref_marker", 1)
     rank = recency_rank(bos, ref, d_head=D_HEAD, max_positions=CAP)
-    return compile_headless(rank, pos, d=1024, d_head=D_HEAD, verbose=False), rank
+    return compile_headless(rank, d=1024, d_head=D_HEAD, verbose=False), rank
 
 
 def test_recency_rank_monotone_compiled(rank_module):
@@ -218,9 +216,8 @@ def test_recency_rank_probe_compiled(rank_module):
     """probe_compiled: the compiled chain matches its graph oracle everywhere
     (the ramp's PL ops included) — no divergent node."""
     _, rank = rank_module
-    pos = create_pos_encoding()
     n = 512
-    compiled = compile_headless(rank, pos, d=1024, d_head=D_HEAD, verbose=False)
+    compiled = compile_headless(rank, d=1024, d_head=D_HEAD, verbose=False)
     report = probe_compiled(compiled, rank, _markers(n), n, atol=1e-2)
     assert report.first_divergent is None, report.format_short()
 
@@ -229,19 +226,21 @@ def test_recency_rank_probe_compiled(rank_module):
 # Selection logic (synthetic monotone rank — cheap, small d_head)             #
 # --------------------------------------------------------------------------- #
 def _selection_module(W, d_v, match_gain, rank_gain):
-    pos = create_pos_encoding()
+    # rope.d_head must match the compile d_head (default 16); content width
+    # here is W+1=3 <= 16/2, so the slow-plane placement fits.
+    rope = create_rope_config(d_head=16, max_positions=CAP)
     qv = create_input("qv", W)
     kv = create_input("kv", W)
     val = create_input("val", d_v)
     rank = create_input("rank", 1)
-    sel = attend_most_recent_matching_via_ramp(
-        qv, kv, val, rank, match_gain=match_gain, rank_gain=rank_gain
+    sel = attend_most_recent_matching(
+        rope, qv, kv, val, rank, match_gain=match_gain, rank_gain=rank_gain
     )
-    return compile_headless(sel, pos, d=256, verbose=False), sel
+    return compile_headless(sel, d=256, d_head=16, verbose=False), sel
 
 
 def test_selection_picks_most_recent():
-    """attend_most_recent_matching_via_ramp selects the most-recent content
+    """attend_most_recent_matching selects the most-recent content
     match.  Well-separated matches concentrate hard; an adjacent (gap-1) pair at
     the worst-case (cap-min) ramp step is still picked correctly — but only
     ~0.98-hard, the octant-boundary concentration dip that ``G=2e5`` accepts
@@ -311,7 +310,7 @@ def test_selection_end_to_end_with_real_rank():
     """Integration: heads -> ramp -> selection, all compiled together, picks the
     most-recent match.  Small N (the recency machinery is full-width rotary)."""
     W, d_v, n = 2, 1, 16
-    pos = create_pos_encoding()
+    rope = create_rope_config(d_head=D_HEAD, max_positions=CAP)
     bos = create_input("bos_marker", 1)
     ref = create_input("ref_marker", 1)
     qv = create_input("qv", W)
@@ -323,10 +322,10 @@ def test_selection_end_to_end_with_real_rank():
     # 0.5, a high outlier vs the ~0.15 interior) make the real rank range ~0.35
     # here, so match_gain must clear rank_gain·0.35 = 7e4 — this is exactly the
     # bound that keeps a content-mismatched BOS from winning on its outlier rank.
-    sel = attend_most_recent_matching_via_ramp(
-        qv, kv, val, rank, match_gain=1.0e6, rank_gain=2.0e5
+    sel = attend_most_recent_matching(
+        rope, qv, kv, val, rank, match_gain=1.0e6, rank_gain=2.0e5
     )
-    m = compile_headless(sel, pos, d=1024, d_head=D_HEAD, verbose=False)
+    m = compile_headless(sel, d=1024, d_head=D_HEAD, verbose=False)
     device = m._net.device
 
     named = _markers(n)

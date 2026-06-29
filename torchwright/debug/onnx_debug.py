@@ -68,7 +68,6 @@ from torchwright.compiler.residual_assignment import (
 )
 from torchwright.graph import Node
 from torchwright.graph.embedding import Embedding
-from torchwright.graph.pos_encoding import PosEncoding
 
 #: Appended to the self-consistency failure preamble on this backend —
 #: unlike the in-process backend, a violation here has three candidate
@@ -119,8 +118,6 @@ class OnnxDebugSession:
             ``<stem>.meta.json``) must sit alongside it.
         output_node: the rebuilt graph's output node.  May be
             Assert-wrapped; wrappers are handled transparently.
-        pos_encoding: the rebuilt graph's positional encoding (its
-            width participates in the fingerprint).
         providers: onnxruntime execution providers (default CPU).
     """
 
@@ -128,7 +125,6 @@ class OnnxDebugSession:
         self,
         onnx_path: str,
         output_node: Node,
-        pos_encoding: PosEncoding,
         providers=None,
     ) -> None:
         import onnx
@@ -147,9 +143,7 @@ class OnnxDebugSession:
 
         # --- Fingerprint: the rebuilt graph must be the compiled graph.
         out = unwrap_debug(output_node)
-        fp = debug_fingerprint(
-            out, pos_encoding, d=self._d, d_head=int(sidecar["d_head"])
-        )
+        fp = debug_fingerprint(out, d=self._d, d_head=int(sidecar["d_head"]))
         if fp != sidecar["fingerprint"]:
             raise ValueError(
                 f"{debug_meta_path_for(onnx_path)}: graph fingerprint mismatch — "
@@ -214,8 +208,7 @@ class OnnxDebugSession:
         # Post-MLP triples — the ordered states every check/probe scans,
         # mirroring the in-process backend.
         self._ordered: List[tuple] = [
-            (i, f"L{i}.mlp", key_to_state[f"L{i}.mlp"])
-            for i in range(self._n_layers)
+            (i, f"L{i}.mlp", key_to_state[f"L{i}.mlp"]) for i in range(self._n_layers)
         ]
         # state -> ONNX tensor name, every capturable state.
         self._state_fetch: List[Tuple[ResidualStreamState, str, str]] = []
@@ -282,9 +275,7 @@ class OnnxDebugSession:
         # Symbolic slot dim => prefix bindings allowed (stride
         # bucketing); a static dim (old export) forces full-width feeds.
         self._static_slot_dim: Optional[int] = _dim(graph_inputs["past_K_0"], 0)
-        self._cache_stride: int = int(
-            self._static_slot_dim or sidecar["cache_stride"]
-        )
+        self._cache_stride: int = int(self._static_slot_dim or sidecar["cache_stride"])
 
         from onnx import TensorProto, helper
 
@@ -321,12 +312,8 @@ class OnnxDebugSession:
         """Zero-length sequence-major KV tuples, mirroring
         ``CompiledHeadless.empty_past``'s grow-per-step representation
         (each entry ``(n_committed, n_heads_i, d_head)``)."""
-        k = tuple(
-            torch.zeros(0, nh, self._d_head) for nh in self._per_layer_n_heads
-        )
-        v = tuple(
-            torch.zeros(0, nh, self._d_head) for nh in self._per_layer_n_heads
-        )
+        k = tuple(torch.zeros(0, nh, self._d_head) for nh in self._per_layer_n_heads)
+        v = tuple(torch.zeros(0, nh, self._d_head) for nh in self._per_layer_n_heads)
         return (k, v)
 
     def _feeds(self, prefill: torch.Tensor, base: int, past: Optional[tuple]) -> dict:
@@ -344,9 +331,7 @@ class OnnxDebugSession:
                 f"static cache overrun: base {base} + n_new {n_new} exceeds "
                 f"cache_stride {self._cache_stride}"
             )
-        feeds: dict = {
-            "cache_position": np.arange(base, base + n_new, dtype=np.int64)
-        }
+        feeds: dict = {"cache_position": np.arange(base, base + n_new, dtype=np.int64)}
         if self._kind == "token":
             ids = prefill.reshape(-1).detach().cpu()
             feeds["token_ids"] = ids.numpy().astype(np.int64, copy=False)
@@ -479,9 +464,7 @@ class OnnxDebugSession:
     def debug_value(self, node: Node) -> Optional[torch.Tensor]:
         """Compiled value of ``node`` from the last debug=True run, or None."""
         if self._debug_state is None:
-            raise RuntimeError(
-                "debug_value() requires a prior debug=True run"
-            )
+            raise RuntimeError("debug_value() requires a prior debug=True run")
         from torchwright.debug.extraction import (
             extract_compiled_value,
             first_state_with,
@@ -557,8 +540,7 @@ class OnnxDebugSession:
                 ids = raw.reshape(-1)
             else:
                 assert self._embedding is not None, (
-                    "token-string inputs need an Embedding node in the "
-                    "rebuilt graph"
+                    "token-string inputs need an Embedding node in the " "rebuilt graph"
                 )
                 ids = torch.tensor(
                     [self._embedding.tokenizer.get_token_id(t) for t in raw]

@@ -18,12 +18,15 @@ weight writer enforces).
 import torch
 
 from torchwright.debug.probe import probe_graph, reference_eval
-from torchwright.graph import InputNode, PosEncoding
+from torchwright.graph import InputNode
 from torchwright.ops.attention_ops import attend_argmin_above_in_bucket
+from torchwright.ops.inout_nodes import create_rope_config
 
 
-def _pe():
-    return PosEncoding(17)
+def _rope(d_head):
+    # The op places its content (d_qk = 2 + nb + nt cols) on the slowest
+    # d_head/2 rotary planes, so rope.d_head must match the compile d_head.
+    return create_rope_config(d_head=d_head, max_positions=512)
 
 
 def _onehot_rows(indices, width):
@@ -41,7 +44,7 @@ def _above_table(scores, thresholds):
     return out
 
 
-def _build(nb, nt, value_width, *, prefix):
+def _build(nb, nt, value_width, *, prefix, d_head):
     """Build the op plus its input nodes, with per-test-unique input names."""
     score = InputNode(f"{prefix}_score", 1, value_range=(-100.0, 100.0))
     validity = InputNode(f"{prefix}_validity", 1, value_range=(-2.0, 2.0))
@@ -51,7 +54,7 @@ def _build(nb, nt, value_width, *, prefix):
     th = InputNode(f"{prefix}_th", nt, value_range=(-2.0, 2.0))
     value = InputNode(f"{prefix}_value", value_width, value_range=(-100.0, 100.0))
     out = attend_argmin_above_in_bucket(
-        _pe(), score, validity, kb, above, qb, th, value
+        _rope(d_head), score, validity, kb, above, qb, th, value
     )
     return out
 
@@ -60,8 +63,12 @@ def test_baib_adjacent_score_recovered_compiled():
     """Two matching rows whose scores differ by 1, at the full predicate-bonus
     stack: the compiled fp32 head recovers the lower-score row, matching exact
     math everywhere."""
-    nb, nt, vw = 3, 5, 4  # d_qk = 2 + 3 + 5 = 10 <= d_head = 16
-    out = _build(nb, nt, vw, prefix="adj")
+    # d_qk = 2 + 3 + 5 = 10; under RoPE the content rides the slowest d_head/2
+    # planes, so d_head >= 2*10 = 20, AND d_head must divide d (512) for an
+    # integer head count — so the smallest valid even d_head is 32 (was d_head=16
+    # pre-RoPE, when the content fit in fewer planes).
+    nb, nt, vw = 3, 5, 4
+    out = _build(nb, nt, vw, prefix="adj", d_head=32)
     n_pos = 2
     scores = [6, 5]  # adjacent; row 1 is the lower score
     thresholds = [0, 1, 2, 3, 4]
@@ -80,11 +87,10 @@ def test_baib_adjacent_score_recovered_compiled():
     # Compiled must reproduce the oracle at every node.
     report = probe_graph(
         out,
-        pos_encoding=_pe(),
         input_values=inputs,
         n_pos=n_pos,
         d=512,
-        d_head=16,
+        d_head=32,
         atol=1e-3,
     )
     assert report.first_divergent is None, report.format_short()
@@ -93,8 +99,8 @@ def test_baib_adjacent_score_recovered_compiled():
 def test_baib_wide_value_splits_over_heads_compiled():
     """A value wider than d_head forces the V/O split across physical heads;
     the compiled output still matches exact math."""
-    nb, nt, vw = 2, 3, 20  # d_qk = 7 <= 16; d_v = 20 > 16 -> 2 V/O heads
-    out = _build(nb, nt, vw, prefix="wide")
+    nb, nt, vw = 2, 3, 20  # d_qk = 7 <= 16/2; d_v = 20 > 16 -> 2 V/O heads
+    out = _build(nb, nt, vw, prefix="wide", d_head=16)
     n_pos = 2
     scores = [5, 6]
     thresholds = [0, 1, 2]
@@ -118,7 +124,6 @@ def test_baib_wide_value_splits_over_heads_compiled():
     assert torch.allclose(oracle[1], value_in[0], atol=1e-2), oracle[1]
     report = probe_graph(
         out,
-        pos_encoding=_pe(),
         input_values=inputs,
         n_pos=n_pos,
         d=512,
@@ -132,7 +137,7 @@ def test_baib_all_invalid_compiled_is_finite():
     """All rows invalid (no match): the compiled head returns a finite,
     defined blend — never NaN, never raises — and matches the oracle blend."""
     nb, nt, vw = 2, 3, 4
-    out = _build(nb, nt, vw, prefix="inv")
+    out = _build(nb, nt, vw, prefix="inv", d_head=16)
     n_pos = 3
     scores = [2, 3, 4]
     thresholds = [0, 1, 2]
@@ -149,7 +154,6 @@ def test_baib_all_invalid_compiled_is_finite():
     assert torch.isfinite(oracle).all(), oracle
     report = probe_graph(
         out,
-        pos_encoding=_pe(),
         input_values=inputs,
         n_pos=n_pos,
         d=512,
@@ -163,7 +167,7 @@ def test_baib_self_row_only_compiled_is_finite():
     """Minimal causal window (n_pos=1, only the self row visible): the compiled
     head returns a finite value and matches the oracle."""
     nb, nt, vw = 2, 3, 4
-    out = _build(nb, nt, vw, prefix="self")
+    out = _build(nb, nt, vw, prefix="self", d_head=16)
     n_pos = 1
     scores = [3]
     thresholds = [0, 1, 2]
@@ -180,7 +184,6 @@ def test_baib_self_row_only_compiled_is_finite():
     assert torch.isfinite(oracle).all(), oracle
     report = probe_graph(
         out,
-        pos_encoding=_pe(),
         input_values=inputs,
         n_pos=n_pos,
         d=512,

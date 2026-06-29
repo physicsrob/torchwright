@@ -13,16 +13,17 @@ from typing import Tuple
 
 import torch
 
-from torchwright.graph import Node, Embedding, PosEncoding
+from torchwright.graph import Node, Embedding, RopeConfig
 from torchwright.graph.embedding import Unembedding
 from torchwright.ops.inout_nodes import (
     create_literal_value,
     create_embedding,
-    create_pos_encoding,
+    create_rope_config,
     create_unembedding,
 )
 from torchwright.ops.logic_ops import equals_vector
 from torchwright.ops.embedding_arithmetic import sum_digit_seqs
+from torchwright.ops.recency_heads import recency_rank_from_tokens
 from torchwright.ops.sequence_ops import (
     NumericSequence,
     output_sequence,
@@ -31,20 +32,28 @@ from torchwright.ops.sequence_ops import (
 
 max_digits = 3
 D_MODEL = 256
+# Rotary width the graph is built against; must match the d_head it is
+# compiled at (the token-example harness compiles at d_head=16).
+D_HEAD = 16
+MAX_POSITIONS = 512
 
 
-def create_network_parts() -> Tuple[Node, PosEncoding, Embedding]:
-    """Build the 3-digit adder graph and return (output_node, pos_encoding, embedding)."""
+def create_network_parts() -> Tuple[Node, Embedding]:
+    """Build the 3-digit adder graph and return (output_node, embedding)."""
     vocab = list(
         " 0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ!@#$%^&*()-+="
-    ) + ["\n", "<bos>", "<eos>", "default"]
+    ) + ["\n", "<bos>", "<ref>", "<eos>", "default"]
     embedding = create_embedding(vocab=vocab)
-    pos_encoding = create_pos_encoding()
+    rope = create_rope_config(d_head=D_HEAD, max_positions=MAX_POSITIONS)
+
+    # Bucket-2 recency rank from the <bos>/<ref> markers — replaces the old
+    # position counter that drove "most recent" selection.
+    recency_rank = recency_rank_from_tokens(rope, embedding)
 
     # --- Phase 1: Parse operand digits from the token stream ---
     # NumericSequence tracks a sliding window of digits as tokens arrive.
     # get_digits_at_event captures the window when the trigger token appears.
-    num_seq = NumericSequence(pos_encoding, embedding, max_digits)
+    num_seq = NumericSequence(rope, embedding, max_digits, recency_rank)
 
     is_end_of_first_num = equals_vector(
         inp=embedding, vector=embedding.get_embedding("+")
@@ -64,14 +73,15 @@ def create_network_parts() -> Tuple[Node, PosEncoding, Embedding]:
 
     # --- Phase 3: Output result autoregressively ---
     output_node = output_sequence(
-        pos_encoding,
+        rope,
         is_end_of_second_num,
         sum_digits,
         embedding.get_embedding(" "),
+        recency_rank,
     )
-    return output_node, pos_encoding, embedding
+    return output_node, embedding
 
 
 def create_network() -> Unembedding:
-    output_node, pos_encoding, embedding = create_network_parts()
+    output_node, embedding = create_network_parts()
     return create_unembedding(output_node, embedding)

@@ -38,7 +38,7 @@ from torchwright.graph.rope import (
     rope_cos_sin,
     rotary_content_head,
 )
-from torchwright.ops.inout_nodes import create_input, create_pos_encoding
+from torchwright.ops.inout_nodes import create_input
 
 D = 512
 D_HEAD = 256
@@ -186,11 +186,10 @@ def test_rotary_content_head_compiled_matches_oracle():
     head = rotary_content_head(
         one, score, score, query_matrix, key_matrix, d_head=D_HEAD
     )
-    pos = create_pos_encoding()
 
     n_pos = 16
     svals = torch.tensor([[float(v)] for v in range(n_pos)])  # strictly increasing
-    compiled = compile_headless(head, pos, d=D, d_head=D_HEAD, verbose=False)
+    compiled = compile_headless(head, d=D, d_head=D_HEAD, verbose=False)
     report = probe_compiled(compiled, head, {"score": svals}, n_pos, atol=1e-2)
     assert report.first_divergent is None, report.format_short()
 

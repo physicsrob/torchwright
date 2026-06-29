@@ -27,13 +27,14 @@ from typing import Dict, List, Tuple
 
 import torch
 
-from torchwright.graph import Embedding, Linear, Node, PosEncoding
+from torchwright.graph import Embedding, Linear, Node, RopeConfig
 from torchwright.graph.embedding import bos_token
 from torchwright.ops.arithmetic_ops import compare as _compare_scalar, concat
+from torchwright.ops.attention_ops import get_prev_value
 from torchwright.ops.inout_nodes import (
     create_literal_value,
     create_onehot_embedding,
-    create_pos_encoding,
+    create_rope_config,
 )
 from torchwright.ops.logic_ops import (
     bool_all_true,
@@ -43,6 +44,7 @@ from torchwright.ops.logic_ops import (
 )
 from torchwright.ops.map_select import select, switch
 from torchwright.ops.onehot_table import onehot_lookup
+from torchwright.ops.recency_heads import recency_rank_from_tokens
 from torchwright.ops.sequence_ops import (
     NumericSequence,
     output_sequence,
@@ -50,10 +52,20 @@ from torchwright.ops.sequence_ops import (
 )
 
 D_MODEL = 1024
+# Rotary width the calculator graph is built against; must equal the d_head the
+# token-example harness compiles at (whose default is 16).  32 leaves 16 slow
+# planes — the widest content head in the family is the scratchpad multiply's
+# pointer gather, whose width is 2n+1 (the answer-column one-hot plus the
+# recency tiebreak); the scratchpad depth test builds up to max_digits=6, where
+# that is 13, so the family needs d_head >= 26 (place_on_slow_planes runs at
+# build time).  32 is the next clean even width with margin.
+D_HEAD = 32
+MAX_POSITIONS = 512
 
 # Compact, calculator-only vocabulary: 10 digits, 3 operators, the newline that
-# ends the input, a space (the pre-result placeholder), a BOS, and an EOS that
-# pads / terminates the result.  17 tokens -> d_embed = 17 one-hot columns.
+# ends the input, a space (the pre-result placeholder), a BOS, a REF (the second
+# always-visible marker the RoPE recency rank reads), and an EOS that
+# pads / terminates the result.  18 tokens -> d_embed = 18 one-hot columns.
 CALC_VOCAB = [str(d) for d in range(10)] + [
     "+",
     "-",
@@ -61,6 +73,7 @@ CALC_VOCAB = [str(d) for d in range(10)] + [
     "\n",
     " ",
     bos_token,
+    "<ref>",
     "<eos>",
 ]
 
@@ -159,7 +172,10 @@ def compare_digit_seqs(
 
 
 def parse_expression(
-    pos_encoding: PosEncoding, embedding: Embedding, max_digits: int
+    rope: RopeConfig,
+    embedding: Embedding,
+    max_digits: int,
+    recency_rank: Node,
 ) -> Tuple[List[Node], List[Node], Node, Node, Node, Node]:
     """Parse ``"A op B\\n"`` from the token stream.
 
@@ -168,7 +184,7 @@ def parse_expression(
     operator appeared, and the ±1 newline trigger that ends the input and
     starts result emission.
     """
-    num_seq = NumericSequence(pos_encoding, embedding, max_digits)
+    num_seq = NumericSequence(rope, embedding, max_digits, recency_rank)
 
     is_plus = equals_vector(embedding, embedding.get_embedding("+"))
     is_minus = equals_vector(embedding, embedding.get_embedding("-"))
@@ -178,14 +194,14 @@ def parse_expression(
 
     # Only treat an operator as such *before* the newline, so a "-" emitted as
     # a negative sign during decoding does not re-trigger operator parsing.
-    seen_newline = pos_encoding.get_prev_value(saw_newline, saw_newline)
+    seen_newline = get_prev_value(rope, saw_newline, saw_newline, recency_rank)
     is_input_operator = bool_all_true([is_operator, bool_not(seen_newline)])
 
     # Latch which operator was used (captured at the operator position, held
     # forward to every later position by attention).
-    which_plus = pos_encoding.get_prev_value(is_plus, is_input_operator)
-    which_minus = pos_encoding.get_prev_value(is_minus, is_input_operator)
-    which_times = pos_encoding.get_prev_value(is_times, is_input_operator)
+    which_plus = get_prev_value(rope, is_plus, is_input_operator, recency_rank)
+    which_minus = get_prev_value(rope, is_minus, is_input_operator, recency_rank)
+    which_times = get_prev_value(rope, is_times, is_input_operator, recency_rank)
 
     # First operand's window is complete at the operator; second's at newline.
     first = num_seq.get_digits_at_event(is_input_operator)
@@ -204,15 +220,16 @@ def _format_result(
 
 
 def emit_result(
-    pos_encoding: PosEncoding,
+    rope: RopeConfig,
     embedding: Embedding,
     saw_newline: Node,
     result_digits: List[Node],
+    recency_rank: Node,
 ) -> Node:
     """Emit ``result_digits`` autoregressively once the newline fires, printing
     a space at every position before then."""
     return output_sequence(
-        pos_encoding, saw_newline, result_digits, embedding.get_embedding(" ")
+        rope, saw_newline, result_digits, embedding.get_embedding(" "), recency_rank
     )
 
 
@@ -222,7 +239,7 @@ def build_calculator(
     add_digit_seqs,
     subtract_digit_seqs,
     multiply_digit_seqs,
-) -> Tuple[Node, PosEncoding, Embedding]:
+) -> Tuple[Node, Embedding]:
     """Assemble the calculator graph from one variant's arithmetic.
 
     The three depth-differentiating algorithms — ``add_digit_seqs``,
@@ -230,13 +247,18 @@ def build_calculator(
     calculator (the legible ``calculator_simple`` or the depth-optimized
     ``calculator_advanced``).  Comparison is identical across variants, so this
     wires up the shared :func:`compare_digit_seqs` directly.  Returns
-    ``(output_node, pos_encoding, embedding)``.
+    ``(output_node, embedding)``.
     """
     embedding = create_onehot_embedding(CALC_VOCAB)
-    pos_encoding = create_pos_encoding()
+    rope = create_rope_config(d_head=D_HEAD, max_positions=MAX_POSITIONS)
+
+    # Bucket-2 recency rank from the <bos>/<ref> markers — replaces the old
+    # position counter that drove "most recent" selection in get_prev_value /
+    # NumericSequence / output_sequence.
+    recency_rank = recency_rank_from_tokens(rope, embedding)
 
     first, second, is_plus, is_minus, is_times, saw_newline = parse_expression(
-        pos_encoding, embedding, max_digits
+        rope, embedding, max_digits, recency_rank
     )
 
     # Multiplication is the widest result (2*max_digits digits); the others are
@@ -269,5 +291,5 @@ def build_calculator(
         switch([is_plus, is_minus, is_times], [add_seq[i], sub_seq[i], mul_seq[i]])
         for i in range(seq_len)
     ]
-    output_node = emit_result(pos_encoding, embedding, saw_newline, result_digits)
-    return output_node, pos_encoding, embedding
+    output_node = emit_result(rope, embedding, saw_newline, result_digits, recency_rank)
+    return output_node, embedding

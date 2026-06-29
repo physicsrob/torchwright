@@ -11,7 +11,6 @@ from torchwright.graph import (
     Assert,
     LiteralValue,
     InputNode,
-    PosEncoding,
     Concatenate,
     Embedding,
 )
@@ -28,7 +27,6 @@ class HeadlessTransformer:
     d: int
     d_hidden: int
     d_head: int
-    pos_encoding: Optional[PosEncoding]
     residual_assignment: Optional[ResidualAssignment]
     assert_aliases: Optional[Dict[Assert, Node]]
     # 2-D weight-matrix occupancy recorded during weight writing (see
@@ -39,13 +37,11 @@ class HeadlessTransformer:
         self,
         d: int,
         d_head: int,
-        pos_encoding: Optional[PosEncoding] = None,
         d_hidden: Optional[int] = None,
     ):
         self.d = d
         self.d_hidden = d if d_hidden is None else d_hidden
         self.d_head = d_head
-        self.pos_encoding = pos_encoding
         self.layers = []
         self.residual_assignment = None
         self.assert_aliases = None
@@ -63,9 +59,7 @@ class HeadlessTransformer:
         return self
 
     def add_layer(self, append: bool = False) -> TransformerLayer:
-        layer = TransformerLayer(
-            self.d, self.d_head, self.pos_encoding, d_hidden=self.d_hidden
-        )
+        layer = TransformerLayer(self.d, self.d_head, d_hidden=self.d_hidden)
         if append:
             self.layers.append(layer)
         else:
@@ -100,10 +94,6 @@ class HeadlessTransformer:
                 value = input_values[node.name]
                 for i, idx in enumerate(indices):
                     res_stream[:, idx] = value[:, i]
-            elif isinstance(node, PosEncoding):
-                encoding = node.get_pos_encoding(past_len + n_pos)[past_len:]
-                for i, idx in enumerate(indices):
-                    res_stream[:, idx] = encoding[:, i]
             elif isinstance(node, Concatenate):
                 # Noop — children are guaranteed to be in the state individually.
                 pass

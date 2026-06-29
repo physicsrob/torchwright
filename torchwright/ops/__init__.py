@@ -63,7 +63,7 @@ from torchwright.ops.inout_nodes import (
     create_embedding,
     create_input,
     create_literal_value,
-    create_pos_encoding,
+    create_rope_config,
     create_unembedding,
 )
 
@@ -95,10 +95,11 @@ from torchwright.ops.sequence_ops import (
     remove_leading_0s,
 )
 
-# Prefix
-from torchwright.ops.prefix_ops import (
-    prefix_and,
-    prefix_sum,
+# Recency (bucket-2 RoPE position rank)
+from torchwright.ops.recency_heads import (
+    recency_phase_heads,
+    recency_rank,
+    recency_rank_from_tokens,
 )
 
 # Loop

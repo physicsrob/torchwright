@@ -29,7 +29,7 @@ from transformers.cache_utils import DynamicCache
 from torchwright.compiler.export import compile_to_onnx
 from torchwright.compiler.hf.convert import convert_onnx_to_hf
 from torchwright.graph.rope import ROPE_BASE, rotary_offset_head
-from torchwright.ops.inout_nodes import create_onehot_embedding, create_pos_encoding
+from torchwright.ops.inout_nodes import create_onehot_embedding
 
 _VOCAB = ["<bos>", "<eos>", "a", "b", "c", "d", "e"]
 D = 256
@@ -39,21 +39,19 @@ D_HEAD = 16
 def _build_and_convert(tmpdir):
     emb = create_onehot_embedding(_VOCAB)
     prev = rotary_offset_head(emb, delta_pos=-1, d_qk=D_HEAD)  # full-width rotary
-    pos = create_pos_encoding()
     path = os.path.join(tmpdir, "prev_token.onnx")
-    compile_to_onnx(
-        prev, pos, emb, path, d=D, d_head=D_HEAD, max_seq_len=64, verbose=False
-    )
+    compile_to_onnx(prev, emb, path, d=D, d_head=D_HEAD, max_seq_len=64, verbose=False)
     return convert_onnx_to_hf(path, bos_token="<bos>", eos_token="<eos>")
 
 
 def test_hf_rope_config_carried():
     with tempfile.TemporaryDirectory() as tmp:
         hf = _build_and_convert(tmp)
+    # Every head is full-width rotary on the one global grid (no per-head enable
+    # to check); the single shared base carried through the converter.  The
+    # predict-previous + prefill==cached-decode assertions below prove the
+    # rotation actually fires correctly.
     assert hf.config.rope_base == ROPE_BASE
-    # Exactly one rotary head exists across the layers.
-    total_rotary = sum(sum(row) for row in hf.config.rotary_enable_per_layer)
-    assert total_rotary == 1, hf.config.rotary_enable_per_layer
 
 
 def test_hf_rope_predicts_previous_token():

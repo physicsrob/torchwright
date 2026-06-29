@@ -279,17 +279,25 @@ class OnnxTokenModule:
         max_new_tokens: int = 10,
         bos_token: str = "<bos>",
         eos_token: str = "<eos>",
+        ref_token: Optional[str] = None,
     ) -> Iterator[str]:
         """Autoregressive argmax generation over the cached protocol.
 
-        Prefills ``[bos_token] + list(input_text)``, then decodes one
-        token per :meth:`step`, yielding each generated token string as
-        it is produced.  Stops at ``eos_token`` or ``max_new_tokens``.
+        Prefills ``[bos_token] (+ [ref_token]) + list(input_text)``, then
+        decodes one token per :meth:`step`, yielding each generated token
+        string as it is produced.  Stops at ``eos_token`` or
+        ``max_new_tokens``.
+
+        ``ref_token`` is the bucket-2 recency reference marker (``docs/
+        rope_port_plan.md`` §3 / Phase 4): a RoPE graph that ranks recency
+        via :func:`~torchwright.ops.recency_heads.recency_rank_from_tokens`
+        needs a second always-visible marked token at position 1, so such a
+        model is generated with ``ref_token="<ref>"``.  Models that do not
+        use recency leave it ``None`` (prefix is ``[bos] + input`` as before).
         """
-        tokens = [bos_token] + list(input_text)
-        ids = torch.tensor(
-            [self.token_to_id(t) for t in tokens], dtype=torch.int64
-        )
+        prefix = [bos_token] + ([ref_token] if ref_token is not None else [])
+        tokens = prefix + list(input_text)
+        ids = torch.tensor([self.token_to_id(t) for t in tokens], dtype=torch.int64)
 
         logits, past = self.step(ids, self.empty_past())
         for _ in range(max_new_tokens):
@@ -298,9 +306,7 @@ class OnnxTokenModule:
             if next_token == eos_token:
                 break
             yield next_token
-            logits, past = self.step(
-                torch.tensor([next_id], dtype=torch.int64), past
-            )
+            logits, past = self.step(torch.tensor([next_id], dtype=torch.int64), past)
 
     def eval(self) -> "OnnxTokenModule":
         return self

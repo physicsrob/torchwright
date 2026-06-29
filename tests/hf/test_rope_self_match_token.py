@@ -4,18 +4,19 @@ The Δ=0 self-match heads behind ``Linear``/``Add``/``Cancel``/``add_into`` are
 compiler-internal — they never appear as a graph ``Attn`` node — so the only way
 to exercise them through the real ONNX emission and the native HF runtime is a
 token model whose lowering emits them.  The "predict the previous token" model
-of ``test_rope_token.py`` does: with ``rotary_self_match=True`` it compiles to
-three rotary heads (the one offset head plus two self-match transport heads),
-versus one with the flag off.
+of ``test_rope_token.py`` does: under RoPE the self-match transport heads are
+*unconditionally* rotary (the old ``rotary_self_match`` flag is gone), so this
+model compiles to more than one rotary head — the offset head plus the self-match
+transport head(s) the schedule emits.
 
 This pins that the migration survives export + convert on both non-in-process
 surfaces:
 
 * the reserved constant-1 column rides the ONNX/HF ``constant_values`` seed
   (no new emission code) and reaches the HF model as a literal 1.0 column,
-* the self-match rotation propagates via per-head ``rotary_width`` → the HF
-  per-head enable mask, so transport stays correct and the model still predicts
-  the previous token,
+* the self-match heads are full-width rotary like every other head (one global
+  grid, no per-head enable), so transport stays correct and the model still
+  predicts the previous token,
 * prefill == token-by-token cached decode (the self-match K is stored rotated
   at absolute position, same as the offset head).
 
@@ -43,7 +44,7 @@ from transformers.cache_utils import DynamicCache
 from torchwright.compiler.export import compile_to_onnx
 from torchwright.compiler.hf.convert import convert_onnx_to_hf
 from torchwright.graph.rope import ROPE_BASE, rotary_offset_head
-from torchwright.ops.inout_nodes import create_onehot_embedding, create_pos_encoding
+from torchwright.ops.inout_nodes import create_onehot_embedding
 
 _VOCAB = ["<bos>", "<eos>", "a", "b", "c", "d", "e"]
 D = 256
@@ -53,18 +54,15 @@ D_HEAD = 16
 def _build_and_convert(tmpdir):
     emb = create_onehot_embedding(_VOCAB)
     prev = rotary_offset_head(emb, delta_pos=-1, d_qk=D_HEAD)  # full-width rotary
-    pos = create_pos_encoding()
     path = os.path.join(tmpdir, "prev_token_self_match.onnx")
     compile_to_onnx(
         prev,
-        pos,
         emb,
         path,
         d=D,
         d_head=D_HEAD,
         max_seq_len=64,
         verbose=False,
-        rotary_self_match=True,
     )
     return convert_onnx_to_hf(path, bos_token="<bos>", eos_token="<eos>")
 
@@ -74,14 +72,10 @@ def test_hf_self_match_rotary_heads_and_const_column():
     constant-1 column reached the HF model as a literal 1.0 column."""
     with tempfile.TemporaryDirectory() as tmp:
         hf = _build_and_convert(tmp)
+    # Every head (offset + the unconditionally-rotary self-match transport heads)
+    # is full-width rotary on the one global grid; the single shared base carried
+    # through the converter (there is no per-head enable).
     assert hf.config.rope_base == ROPE_BASE
-    # With the flag off this model has exactly one rotary head (the offset
-    # head); turning self-match rotary on adds the transport heads, so the
-    # count is strictly greater.  The exact number depends on how many
-    # BIRTH-layer cancels the schedule emits — compile_to_onnx defaults to
-    # assume_zero_init=True, which elides some — so assert "> 1", not a literal.
-    total_rotary = sum(sum(row) for row in hf.config.rotary_enable_per_layer)
-    assert total_rotary > 1, hf.config.rotary_enable_per_layer
     # The const-1 column rode the constant_values seed: at least one residual
     # column is a literal 1.0.
     assert bool(

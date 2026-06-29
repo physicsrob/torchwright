@@ -12,13 +12,12 @@ import torch
 from torchwright.compiler.forward.compile import forward_compile
 from torchwright.graph.linear import Linear
 from torchwright.graph.misc import LiteralValue
-from torchwright.ops.inout_nodes import create_input, create_pos_encoding
+from torchwright.ops.inout_nodes import create_input
 from torchwright.ops.map_select import in_range
 
 
 def test_linear_into_in_range():
     """Linear with bias feeding into in_range should preserve the bias."""
-    pos = create_pos_encoding()
     hh = create_input("hh", 1)
 
     H = 8
@@ -33,7 +32,6 @@ def test_linear_into_in_range():
         d=64,
         d_head=16,
         output_node=masks,
-        pos_encoding=pos,
         verbose=False,
     )
 

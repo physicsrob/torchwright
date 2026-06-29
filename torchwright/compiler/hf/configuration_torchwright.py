@@ -21,7 +21,8 @@ compiler never varies them:
 * No normalization anywhere (no LayerNorm / RMSNorm, no final norm).
 * Attention is causal with ``scale=1.0`` (no ``1/sqrt(d_head)``), no bias.
 * MLP is ``linear2(relu(linear1(x)))``, both linears biased.
-* Positional encoding is plain additive absolute PE.
+* Position is a rotation applied inside attention (RoPE, ``rotate_half`` over
+  ``d_head`` by absolute position); there is no additive PE table.
 * The unembedding is an untied ``lm_head`` Linear over the full residual
   stream; no output bias.
 * fp32 throughout — a downcast to fp16/bf16 breaks correctness (the
@@ -39,8 +40,8 @@ class TorchwrightConfig(PretrainedConfig):
     The residual stream is a uniform width ``d`` across all layers (per-layer
     head trimming keeps it uniform; only the internal head count and MLP hidden
     width vary per layer). The token head looks up a ``(vocab_size, d)``
-    embedding table straight into the residual stream, adds a ``(max_seq, d)``
-    absolute positional encoding and a constant vector, runs ``n_layers``
+    embedding table straight into the residual stream, adds a constant vector,
+    rotates Q/K inside attention by absolute position (RoPE), runs ``n_layers``
     attention+MLP blocks, and unembeds with an untied ``(vocab_size, d)``
     ``lm_head`` over the full residual.
 
@@ -74,8 +75,7 @@ class TorchwrightConfig(PretrainedConfig):
         max_seq: int = 0,
         head_kind: str = "token",
         cache_stride: int | None = None,
-        rope_base: float = 0.0,
-        rotary_enable_per_layer: list | None = None,
+        rope_base: float = 500000.0,
         **kwargs,
     ):
         self.d = int(d)
@@ -87,14 +87,11 @@ class TorchwrightConfig(PretrainedConfig):
         self.max_seq = int(max_seq)
         self.head_kind = head_kind
         self.cache_stride = None if cache_stride is None else int(cache_stride)
-        # RoPE: rope_base 0.0 means "no rotary" (back-compat for the sinusoidal
-        # models).  rotary_enable_per_layer[i] is a per-head 0/1 list (length
-        # n_heads_per_layer[i]) marking which heads of layer i rotate full-width
-        # (rotate_half over d_head).  See docs/rope_port_plan.md §6.
+        # RoPE: every head is full-width rotary on one global grid (rotate_half
+        # over d_head by absolute position) — there is no non-rotary head and no
+        # per-head enable.  ``rope_base`` is the single shared grid base (LLaMA3
+        # value; default 5e5).  See docs/rope_port_plan.md §6.
         self.rope_base = float(rope_base)
-        self.rotary_enable_per_layer = [
-            [int(x) for x in row] for row in (rotary_enable_per_layer or [])
-        ]
         # Aliases so generic transformers utilities that reach for the canonical
         # field names (cache sizing, repr, sharding heuristics) find them. We own
         # them here and recompute from our own fields, so drop any (possibly

@@ -51,7 +51,6 @@ from torchwright.debug.extraction import (
 from torchwright.graph import Concatenate, Node
 from torchwright.graph.attn import Attn, CAUSAL_MASK_SENTINEL
 from torchwright.graph.misc import Assert, InputNode, LiteralValue, Placeholder
-from torchwright.graph.pos_encoding import PosEncoding
 
 # Backward-compatible aliases — the implementations moved to
 # torchwright.debug.extraction so the ONNX debug backend can share them.
@@ -93,6 +92,7 @@ class DebugRuntime(Protocol):
         past_len: int = 0,
         past_kvs: Any = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]: ...
+
 
 # ---------------------------------------------------------------------------
 # Oracle: memoised recursive evaluator
@@ -337,8 +337,8 @@ def probe_compiled(
     report = ProbeReport(atol=atol)
 
     for node in graph.get_topological_order():
-        if isinstance(node, (InputNode, LiteralValue, PosEncoding, Placeholder)):
-            report.skipped[node] = "input/literal/pos_encoding/placeholder"
+        if isinstance(node, (InputNode, LiteralValue, Placeholder)):
+            report.skipped[node] = "input/literal/placeholder"
             continue
         if isinstance(node, Concatenate):
             report.skipped[node] = "concat grouping — leaves are checked individually"
@@ -410,7 +410,6 @@ def _inputs_from_dict(
 
 def probe_graph(
     output_node: Node,
-    pos_encoding: PosEncoding,
     input_values: Dict[str, torch.Tensor],
     n_pos: int,
     d: int = 1024,
@@ -429,7 +428,6 @@ def probe_graph(
     """
     compiled = compile_headless(
         output_node,
-        pos_encoding,
         d=d,
         d_head=d_head,
         max_layers=max_layers,

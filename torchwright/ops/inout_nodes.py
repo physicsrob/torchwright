@@ -1,6 +1,6 @@
 from typing import List, Optional, Tuple
 
-from torchwright.graph import Node, InputNode, LiteralValue, Embedding, PosEncoding
+from torchwright.graph import Node, InputNode, LiteralValue, Embedding, RopeConfig
 import torch
 
 from torchwright.graph.embedding import Unembedding
@@ -103,14 +103,24 @@ def create_unembedding(inp: Node, embedding: Embedding) -> Unembedding:
     return Unembedding(inp, embedding)
 
 
-def create_pos_encoding() -> PosEncoding:
-    """
-    Create a position encoding.
+def create_rope_config(d_head: int = 64, max_positions: int = 4096) -> RopeConfig:
+    """Create the RoPE substrate a graph is built against.
 
-    16 trig columns plus one raw position counter (``d_pos = 17``).  The
-    16-wide trig grid matches a default ``d_head = 16`` exactly.
+    Replaces the old ``create_pos_encoding`` (``docs/rope_port_plan.md`` §7):
+    position is a rotation applied inside attention, not a residual node, so a
+    graph carries a :class:`~torchwright.graph.RopeConfig` (the ``d_head`` /
+    ``base`` / ``max_positions`` the rotary builders need) instead of a
+    ``PosEncoding`` node.  The ``d_head`` here **must** match the ``d_head``
+    passed to the compile entry points (they assert it).
+
+    Args:
+        d_head: rotary width (= compiled ``d_head``).  Must be even and large
+            enough that the widest content head's columns fit on the slow planes
+            (``W <= d_head/2``) and the recency plane exists.
+        max_positions: rollout length the recency plane is sized never to wrap
+            over (the cache cap).
 
     Returns:
-    - Node: PosEncoding node.
+        RopeConfig.
     """
-    return PosEncoding(d_pos=17)
+    return RopeConfig(d_head=d_head, max_positions=max_positions)

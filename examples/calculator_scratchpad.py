@@ -70,11 +70,10 @@ from typing import Callable, Dict, List, Tuple
 
 import torch
 
-from torchwright.graph import Embedding, Node, PosEncoding
+from torchwright.graph import Embedding, Node, RopeConfig
 from torchwright.ops.arithmetic_ops import (
     add,
     add_const,
-    add_scaled_nodes,
     bool_to_01,
     compare,
     concat,
@@ -86,7 +85,7 @@ from torchwright.ops.arithmetic_ops import min as min_node
 from torchwright.ops.inout_nodes import (
     create_literal_value,
     create_onehot_embedding,
-    create_pos_encoding,
+    create_rope_config,
 )
 from torchwright.ops.logic_ops import (
     bool_all_true,
@@ -97,10 +96,18 @@ from torchwright.ops.logic_ops import (
 )
 from torchwright.ops.map_select import in_range, select, switch
 from torchwright.ops.onehot_table import onehot_lookup
-from torchwright.ops.attention_ops import attend_most_recent_matching
+from torchwright.ops.attention_ops import (
+    attend_most_recent_matching,
+    attend_to_offset,
+    get_prev_value,
+)
+from torchwright.ops.marker_count import count_since_marker
+from torchwright.ops.recency_heads import recency_rank_from_tokens
 
 from examples._calculator_common import (
     CALC_VOCAB,
+    D_HEAD,
+    MAX_POSITIONS,
     _CMP_W,
     _EQUAL,
     _GREATER,
@@ -322,6 +329,35 @@ def _read_offset(target_idx: int, here_idx: int) -> int:
     return target_idx - here_idx + 1
 
 
+def _steps_since_newline(
+    rope: RopeConfig,
+    embedding: Embedding,
+    recency_rank: Node,
+    *,
+    max_gap: int,
+) -> Node:
+    """``pos - newline_pos`` (the decode-step index), via the bucket-1
+    near-marker count.
+
+    The RoPE-native replacement for the old
+    ``pos.get_position_scalar() - pos.get_prev_value(pos_scalar, saw_newline)``:
+    there is no absolute position counter under RoPE, but ``count_since_marker``
+    recovers the bounded gap to a recent marker token directly.  The newline is
+    the marker (exactly one per transcript): ``marker_onehot`` is 1 at the
+    newline and 0 elsewhere, and ``window_validity`` is +1 at and after the
+    newline (the "has the newline fired yet" latch).  The result is meaningful
+    only at and after the newline; earlier positions return bounded garbage,
+    which every consumer here gates away (``has_triggered`` / an out-of-range
+    column one-hot).  ``max_gap`` bounds the largest step index read — the full
+    padded transcript length.
+    """
+    embed = embedding.get_embedding
+    saw_newline = equals_vector(embedding, embed("\n"))
+    marker_onehot = bool_to_01(saw_newline)  # 1 at the newline, 0 elsewhere
+    window_validity = get_prev_value(rope, saw_newline, saw_newline, recency_rank)
+    return count_since_marker(rope, window_validity, marker_onehot, max_gap=max_gap)
+
+
 # ---------------------------------------------------------------------------
 # The shared streaming skeleton: a per-column total, then a single-state carry
 # sweep emitting one thinking token per column that reads the previous column's
@@ -354,9 +390,7 @@ def _emit_from_total(
     return onehot_lookup(onehot, table, default)
 
 
-def _carry_sweep(
-    embedding: Embedding, T: List[Node], W: int, n: int
-) -> List[Node]:
+def _carry_sweep(embedding: Embedding, T: List[Node], W: int, n: int) -> List[Node]:
     """Carry sweep over LSB-first column totals ``T`` → one thinking glyph per
     column (each carrying that column's carry-out).
 
@@ -384,7 +418,7 @@ def _carry_sweep(
 
 
 def _carry_digit_fn(
-    pos_encoding: PosEncoding,
+    rope: RopeConfig,
     embedding: Embedding,
     layout: _SeqLayout,
     T: List[Node],
@@ -408,17 +442,19 @@ def _carry_digit_fn(
             cin = _scalar(0.0)
         else:
             target = layout.carry_start + (kc - 1)  # carry-out of column kc-1
-            token = pos_encoding.attend_to_offset(
-                embedding, delta_pos=_read_offset(target, here)
+            token = attend_to_offset(
+                rope, embedding, delta_pos=_read_offset(target, here)
             )
             cin = _thinking_value(embedding, token, n_state)
-        return _emit_from_total(embedding, add(T[kc], cin), digit_table, digit_default, W)
+        return _emit_from_total(
+            embedding, add(T[kc], cin), digit_table, digit_default, W
+        )
 
     return digit
 
 
 def _stream_normalize(
-    pos_encoding: PosEncoding,
+    rope: RopeConfig,
     embedding: Embedding,
     layout: _SeqLayout,
     N: int,
@@ -447,8 +483,8 @@ def _stream_normalize(
     for m in range(N):
         here = layout.norm_start + m
         prev = _scalar(0.0) if m == 0 else _count_value(embedding, embedding, n_state)
-        scratch_token = pos_encoding.attend_to_offset(
-            embedding, delta_pos=_read_offset(layout.scratch_start + m, here)
+        scratch_token = attend_to_offset(
+            rope, embedding, delta_pos=_read_offset(layout.scratch_start + m, here)
         )
         is_zero = equals_vector(inp=scratch_token, vector=embed("0"))
         in_run = compare(prev, thresh=m - 0.5)  # prev == m (count never exceeds m)
@@ -461,57 +497,56 @@ def _stream_normalize(
 
 
 def _read_count(
-    pos_encoding: PosEncoding, embedding: Embedding, layout: _SeqLayout, here: int
+    rope: RopeConfig, embedding: Embedding, layout: _SeqLayout, here: int
 ) -> Node:
     """The total leading-zero count ``L`` carried by the last normalization
     glyph (``layout.norm_last``), read from the token emitted at list-index
     ``here``."""
-    token = pos_encoding.attend_to_offset(
-        embedding, delta_pos=_read_offset(layout.norm_last, here)
+    token = attend_to_offset(
+        rope, embedding, delta_pos=_read_offset(layout.norm_last, here)
     )
     return _count_value(embedding, token, layout.n_state)
 
 
-# The pointer-gather attention's content-match coefficient.  Correctness needs
-# ``match_gain · (min_match_dot − max_no_match_dot) > 8 · max_n_pos``; with
-# one-hot keys/query the match dot is 1 and the no-match dot 0, so the bound is
-# ``match_gain > 8 · max_n_pos``.  The transcript is ``~8n+3`` plus a ``~2n+3``
-# prompt, so even large ``max_digits`` stay well under a few hundred positions;
-# 10000 leaves orders of magnitude of headroom while staying far below the
-# hundreds-of-thousands regime where fp32 precision on the recency tiebreak
-# would matter (see ``attend_most_recent_matching``).
-_MATCH_GAIN = 10_000.0
+# The pointer-gather attention's content-match coefficient.  Under RoPE the
+# recency tiebreak is the bucket-2 octant ramp (range ~2.06) scaled by
+# ``attend_most_recent_matching``'s default ``rank_gain = 2e5`` — NOT the old
+# ``8 · counter``.  Correctness needs the content match to dominate the recency
+# swing: ``match_gain · (min_match_dot − max_no_match_dot) > rank_gain ·
+# rank_range``.  With one-hot keys/query the match dot is 1 and the no-match dot
+# 0, so the bound is ``match_gain > rank_gain · rank_range ≈ 2e5 · 2.06 ≈
+# 4.1e5``.  This is load-bearing precisely because the BOS/REF reference tokens
+# carry a *degenerate outlier* rank (≈0.5, they attend only to themselves): a
+# content-mismatched BOS would otherwise win the gather on its outlier rank and
+# emit ``<bos>`` (docs/rope_port_plan.md §8 Phase-5 gain-calibration finding).
+# 2e6 clears the bound ~5×; the match dot is exactly 1 so there is no fp32
+# precision concern at this magnitude.
+_MATCH_GAIN = 2_000_000.0
 
 
-def _col_onehot(
-    pos_encoding: PosEncoding, embedding: Embedding, layout: _SeqLayout, N: int
-) -> Node:
+def _col_onehot(steps_since: Node, layout: _SeqLayout, N: int) -> Node:
     """Width-``N`` one-hot of *this position's* scratch-digit column index.
 
     At the input position holding scratch digit for column ``i`` the one-hot is
     ``e_i``; everywhere else the column scalar lands outside ``[0, N)`` so the
     one-hot is all-zero (a key that matches no answer-slot query).  The column
-    index is the position counter measured from the scratch region's start: the
-    newline's absolute position is latched (``get_prev_value``), and scratch
-    digit ``i`` is the input at ``newline_pos + scratch_start + i + 1`` (list
-    element ``k`` is emitted at ``newline_pos + k`` and re-read one position
-    later), so ``col = pos − newline_pos − (scratch_start + 1)``.
+    index is the decode-step index measured from the scratch region's start:
+    ``steps_since`` is ``pos − newline_pos`` (the bucket-1 near-marker count),
+    and scratch digit ``i`` is the input at ``newline_pos + scratch_start + i +
+    1`` (list element ``k`` is emitted at ``newline_pos + k`` and re-read one
+    position later), so ``col = steps_since − (scratch_start + 1)``.
     """
-    embed = embedding.get_embedding
-    saw_newline = equals_vector(embedding, embed("\n"))
-    pos_scalar = pos_encoding.get_position_scalar()
-    newline_pos = pos_encoding.get_prev_value(pos_scalar, saw_newline)
-    steps_since = add_scaled_nodes(1.0, pos_scalar, -1.0, newline_pos)
     col_scalar = add_const(steps_since, -float(layout.scratch_start + 1))
     return bool_to_01(in_range(col_scalar, add_const(col_scalar, 1.0), N))
 
 
 def _emit_gathered_answer(
-    pos_encoding: PosEncoding,
+    rope: RopeConfig,
     embedding: Embedding,
     layout: _SeqLayout,
     col_onehot: Node,
     N: int,
+    recency_rank: Node,
     *,
     sign_at: Callable[[int], Node] = None,
 ) -> List[Node]:
@@ -540,7 +575,7 @@ def _emit_gathered_answer(
     for t in range(layout.n_answer):
         here = layout.answer_start + t
         L_capped = min_node(
-            _read_count(pos_encoding, embedding, layout, here), _scalar(float(N - 1))
+            _read_count(rope, embedding, layout, here), _scalar(float(N - 1))
         )
         idx = add_const(L_capped, float(t))
         ge = None
@@ -549,10 +584,11 @@ def _emit_gathered_answer(
             idx = subtract(idx, bool_to_01(bool_not(ge)))  # -1 slot when negative
         query = bool_to_01(in_range(idx, add_const(idx, 1.0), N))
         picked = attend_most_recent_matching(
-            pos_encoding,
+            rope,
             query_vector=query,
             key_vector=col_onehot,
             value=embedding,
+            recency_rank=recency_rank,
             match_gain=_MATCH_GAIN,
         )
         if t == 0 and sign_at is not None:
@@ -563,7 +599,13 @@ def _emit_gathered_answer(
 
 
 def _build_carry_op(
-    pos_encoding: PosEncoding, embedding: Embedding, T: List[Node], W: int, n: int
+    rope: RopeConfig,
+    embedding: Embedding,
+    T: List[Node],
+    W: int,
+    n: int,
+    recency_rank: Node,
+    steps_since: Node,
 ) -> Tuple[List[Node], List[Node]]:
     """Carry-based op (addition / multiplication): carry sweep, scratch digits,
     normalization sweep, pointer-gathered answer.  Returns ``(thinking, answer)``
@@ -573,11 +615,11 @@ def _build_carry_op(
     layout = _SeqLayout(
         n_carry=len(carry), n_scratch=N, n_norm=N, n_answer=N, n_state=_n_thinking(n)
     )
-    digit = _carry_digit_fn(pos_encoding, embedding, layout, T, W, n)
+    digit = _carry_digit_fn(rope, embedding, layout, T, W, n)
     scratch = [digit(layout.scratch_start + m, m) for m in range(N)]
-    norm = _stream_normalize(pos_encoding, embedding, layout, N)
-    col_onehot = _col_onehot(pos_encoding, embedding, layout, N)
-    answer = _emit_gathered_answer(pos_encoding, embedding, layout, col_onehot, N)
+    norm = _stream_normalize(rope, embedding, layout, N)
+    col_onehot = _col_onehot(steps_since, layout, N)
+    answer = _emit_gathered_answer(rope, embedding, layout, col_onehot, N, recency_rank)
     return carry + scratch + norm, answer
 
 
@@ -587,7 +629,13 @@ def _build_carry_op(
 
 
 def _add_op(
-    pos_encoding: PosEncoding, embedding: Embedding, A: List[Node], B: List[Node], n: int
+    rope: RopeConfig,
+    embedding: Embedding,
+    A: List[Node],
+    B: List[Node],
+    n: int,
+    recency_rank: Node,
+    steps_since: Node,
 ) -> Tuple[List[Node], List[Node]]:
     """Streamed addition.  ``num_cols = n + 1`` columns give the top carry a home;
     the column total is just ``a_k + b_k``."""
@@ -595,9 +643,11 @@ def _add_op(
     b_scalar = [_digit_scalar(embedding, d) for d in B]
 
     # Place value k (LSB-first) → MSB-first index n-1-k; column n is the pad.
-    T = [add(a_scalar[n - 1 - k], b_scalar[n - 1 - k]) for k in range(n)] + [_scalar(0.0)]
+    T = [add(a_scalar[n - 1 - k], b_scalar[n - 1 - k]) for k in range(n)] + [
+        _scalar(0.0)
+    ]
     W = 20  # a + b + carry_in ≤ 9 + 9 + 1 = 19
-    return _build_carry_op(pos_encoding, embedding, T, W, n)
+    return _build_carry_op(rope, embedding, T, W, n, recency_rank, steps_since)
 
 
 # ---------------------------------------------------------------------------
@@ -606,7 +656,13 @@ def _add_op(
 
 
 def _mul_op(
-    pos_encoding: PosEncoding, embedding: Embedding, A: List[Node], B: List[Node], n: int
+    rope: RopeConfig,
+    embedding: Embedding,
+    A: List[Node],
+    B: List[Node],
+    n: int,
+    recency_rank: Node,
+    steps_since: Node,
 ) -> Tuple[List[Node], List[Node]]:
     """Streamed multiplication.  The ``n²`` digit products and the per-column
     number sums are ``calculator_simple``'s multiply steps 1–2 verbatim (all
@@ -639,7 +695,7 @@ def _mul_op(
 
     T = [sum_nodes(col) if col else _scalar(0.0) for col in columns]
     W = 20 * n + 1
-    return _build_carry_op(pos_encoding, embedding, T, W, n)
+    return _build_carry_op(rope, embedding, T, W, n, recency_rank, steps_since)
 
 
 # ---------------------------------------------------------------------------
@@ -648,7 +704,13 @@ def _mul_op(
 
 
 def _sub_op(
-    pos_encoding: PosEncoding, embedding: Embedding, A: List[Node], B: List[Node], n: int
+    rope: RopeConfig,
+    embedding: Embedding,
+    A: List[Node],
+    B: List[Node],
+    n: int,
+    recency_rank: Node,
+    steps_since: Node,
 ) -> Tuple[List[Node], List[Node]]:
     """Streamed subtraction.  Three streamed thinking phases precede the answer:
 
@@ -697,7 +759,9 @@ def _sub_op(
     prev_verdict = onehot_lookup(embedding, token_to_verdict, cmp_default)  # offset 0
     verdict_tok = []
     for k in range(n):
-        nxt = onehot_lookup(concat([prev_verdict, A[k], B[k]]), combine_table, cmp_default)
+        nxt = onehot_lookup(
+            concat([prev_verdict, A[k], B[k]]), combine_table, cmp_default
+        )
         verdict_tok.append(
             onehot_lookup(nxt, verdict_to_token, embed(_thinking_text(_EQUAL)))
         )
@@ -714,8 +778,8 @@ def _sub_op(
     # Read the final verdict (at ``verdict_last``) from list-index ``here``,
     # sharpened to a clean ±1 A≥B boolean (less → −1, equal/greater → +1).
     def a_ge_b_at(here: int) -> Node:
-        token = pos_encoding.attend_to_offset(
-            embedding, delta_pos=_read_offset(verdict_last, here)
+        token = attend_to_offset(
+            rope, embedding, delta_pos=_read_offset(verdict_last, here)
         )
         score = onehot_lookup(
             token,
@@ -769,8 +833,8 @@ def _sub_op(
             bin_ = _scalar(0.0)
         else:
             target = borrow_start + (kc - 1)
-            token = pos_encoding.attend_to_offset(
-                embedding, delta_pos=_read_offset(target, here)
+            token = attend_to_offset(
+                rope, embedding, delta_pos=_read_offset(target, here)
             )
             bin_ = _thinking_value(embedding, token, n_state)
         return _emit_from_total(
@@ -778,10 +842,10 @@ def _sub_op(
         )
 
     scratch = [digit(layout.scratch_start + m, m) for m in range(n)]
-    norm = _stream_normalize(pos_encoding, embedding, layout, n)
-    col_onehot = _col_onehot(pos_encoding, embedding, layout, n)
+    norm = _stream_normalize(rope, embedding, layout, n)
+    col_onehot = _col_onehot(steps_since, layout, n)
     answer = _emit_gathered_answer(
-        pos_encoding, embedding, layout, col_onehot, n, sign_at=a_ge_b_at
+        rope, embedding, layout, col_onehot, n, recency_rank, sign_at=a_ge_b_at
     )
     return verdict_tok + borrow_tok + scratch + norm, answer
 
@@ -791,7 +855,9 @@ def _sub_op(
 # ---------------------------------------------------------------------------
 
 
-def _assemble(embedding: Embedding, thinking: List[Node], answer: List[Node]) -> List[Node]:
+def _assemble(
+    embedding: Embedding, thinking: List[Node], answer: List[Node]
+) -> List[Node]:
     """Wrap a (thinking, answer) pair into the full emitted token list:
     ``[THINKING_START] + thinking + [RESULT] + answer + [<eos>]``.
 
@@ -811,7 +877,9 @@ def _assemble(embedding: Embedding, thinking: List[Node], answer: List[Node]) ->
 
 
 def _emit_by_slot_index(
-    pos_encoding: PosEncoding,
+    rope: RopeConfig,
+    recency_rank: Node,
+    steps_since: Node,
     is_trigger: Node,
     seq: List[Node],
     default_output: torch.Tensor,
@@ -833,22 +901,21 @@ def _emit_by_slot_index(
     newline-to-start distance, so it trips this where the pre-trim ``4n+3`` did
     not.
 
-    Instead the step index is computed arithmetically:
-    ``steps_since = pos_scalar - trigger_pos_scalar`` (the raw integer position
-    counter, latched at the trigger), and ``compare`` tests ``steps_since == k``
-    exactly for each compile-time ``k``.  Costs one ``compare`` pair per slot
-    instead of one ``attend_to_offset``, but the gating is exact and immune to
-    aliasing.  (The ops' own back-references — answer digit reading the carry
-    glyph, etc. — keep using ``attend_to_offset``: those target *real, in-range*
-    tokens, where the exact-match key always exists and outscores any near-match,
-    so they are reliable at any distance.)
+    Instead the step index is the bucket-1 near-marker count ``steps_since =
+    pos - newline_pos`` (the trigger is the newline; ``count_since_marker``
+    recovers the bounded gap with no absolute position counter, accurate to well
+    under ±0.5 over the short transcript), and ``compare`` tests ``steps_since ==
+    k`` exactly for each compile-time ``k`` (the ±0.5 band absorbs the count's
+    sub-integer error).  Costs one ``compare`` pair per slot instead of one
+    ``attend_to_offset``, but the gating is immune to aliasing.  (The ops' own
+    back-references — answer digit reading the carry glyph, etc. — keep using
+    ``attend_to_offset``: those target *real, in-range* tokens, where the
+    exact-match key always exists and outscores any near-match, so they are
+    reliable at any distance.)  ``steps_since`` is built once in
+    :func:`create_network_parts` and threaded in (the trigger ``is_trigger`` is
+    the same newline that defines the count).
     """
-    has_triggered = pos_encoding.get_prev_value(is_trigger, is_trigger)
-    pos_scalar = pos_encoding.get_position_scalar()
-    # Latch the trigger's position scalar at the trigger, held forward for every
-    # later position; ``steps_since`` is 0 at the trigger, 1 at the next, etc.
-    trigger_pos_scalar = pos_encoding.get_prev_value(pos_scalar, is_trigger)
-    steps_since = add_scaled_nodes(1.0, pos_scalar, -1.0, trigger_pos_scalar)
+    has_triggered = get_prev_value(rope, is_trigger, is_trigger, recency_rank)
 
     gated = []
     for k in range(len(seq)):
@@ -870,7 +937,7 @@ def _emit_by_slot_index(
 
 def create_network_parts(
     max_digits: int = 3,
-) -> Tuple[Node, PosEncoding, Embedding]:
+) -> Tuple[Node, Embedding]:
     """Build the scratchpad calculator graph: parse, three streamed ops, dispatch.
 
     Each op builds its own full token list; the lists are padded to a common
@@ -887,17 +954,33 @@ def create_network_parts(
     """
     n = max_digits
     embedding = create_onehot_embedding(scratch_vocab(n))
-    pos_encoding = create_pos_encoding()
+    rope = create_rope_config(d_head=D_HEAD, max_positions=MAX_POSITIONS)
 
-    A, B, is_plus, is_minus, is_times, saw_newline = _parse(pos_encoding, embedding, n)
+    # Bucket-2 recency rank from the <bos>/<ref> markers — drives get_prev_value
+    # / attend_most_recent_matching's "most recent" selection (replaces the old
+    # position counter).
+    recency_rank = recency_rank_from_tokens(rope, embedding)
+
+    # Bucket-1 decode-step index pos - newline_pos, built once and threaded into
+    # the per-column reads and the slot-gated emission (replaces the old
+    # pos.get_position_scalar()).  max_gap is the longest padded transcript.
+    steps_since = _steps_since_newline(
+        rope, embedding, recency_rank, max_gap=decode_steps(n) + 2
+    )
+
+    A, B, is_plus, is_minus, is_times, saw_newline = _parse(
+        rope, embedding, n, recency_rank
+    )
 
     seqs = [
-        _assemble(embedding, *op(pos_encoding, embedding, A, B, n))
+        _assemble(embedding, *op(rope, embedding, A, B, n, recency_rank, steps_since))
         for op in (_add_op, _sub_op, _mul_op)
     ]
     length = max(len(s) for s in seqs)
     eos = embedding.get_embedding("<eos>")
-    seqs = [s + [create_literal_value(eos) for _ in range(length - len(s))] for s in seqs]
+    seqs = [
+        s + [create_literal_value(eos) for _ in range(length - len(s))] for s in seqs
+    ]
     add_seq, sub_seq, mul_seq = seqs
 
     result = [
@@ -905,9 +988,14 @@ def create_network_parts(
         for i in range(length)
     ]
     output_node = _emit_by_slot_index(
-        pos_encoding, saw_newline, result, embedding.get_embedding(" ")
+        rope,
+        recency_rank,
+        steps_since,
+        saw_newline,
+        result,
+        embedding.get_embedding(" "),
     )
-    return output_node, pos_encoding, embedding
+    return output_node, embedding
 
 
 # ---------------------------------------------------------------------------
@@ -916,7 +1004,7 @@ def create_network_parts(
 
 
 def _parse(
-    pos_encoding: PosEncoding, embedding: Embedding, n: int
+    rope: RopeConfig, embedding: Embedding, n: int, recency_rank: Node
 ) -> Tuple[List[Node], List[Node], Node, Node, Node, Node]:
     """Parse a fixed-width ``"A op B\\n"`` prompt.
 
@@ -924,9 +1012,10 @@ def _parse(
     digit windows (one-hot embeddings, MSB-first, length ``n``, latched and held
     forward), three latched ±1 operator flags, and the newline trigger.
 
-    Input layout (``<bos>`` at position 0): ``A`` digits at ``1..n``, operator at
-    ``n+1``, ``B`` digits at ``n+2..2n+1``, newline at ``2n+2``.  Every operand
-    digit therefore sits at a fixed offset from the newline, read directly
+    Input layout (``<bos>`` at position 0, ``<ref>`` at position 1): ``A`` digits
+    follow, then the operator, then ``B`` digits, then the newline.  Every
+    operand digit sits at a fixed offset *from the newline* (``attend_to_offset``
+    is relative, so the BOS/REF prefix does not shift the offsets), read directly
     instead of through an ``O(n)`` sliding window.
     """
     embed = embedding.get_embedding
@@ -935,16 +1024,20 @@ def _parse(
     # Operand digits, read at their fixed offset from the newline and latched at
     # the newline so they persist through the whole decode.
     A = [
-        pos_encoding.get_prev_value(
-            pos_encoding.attend_to_offset(embedding, delta_pos=-(2 * n + 1) + i),
+        get_prev_value(
+            rope,
+            attend_to_offset(rope, embedding, delta_pos=-(2 * n + 1) + i),
             saw_newline,
+            recency_rank,
         )
         for i in range(n)
     ]
     B = [
-        pos_encoding.get_prev_value(
-            pos_encoding.attend_to_offset(embedding, delta_pos=-n + j),
+        get_prev_value(
+            rope,
+            attend_to_offset(rope, embedding, delta_pos=-n + j),
             saw_newline,
+            recency_rank,
         )
         for j in range(n)
     ]
@@ -957,9 +1050,9 @@ def _parse(
     is_minus = equals_vector(embedding, embed("-"))
     is_times = equals_vector(embedding, embed("*"))
     is_operator = bool_any_true([is_plus, is_minus, is_times])
-    seen_newline = pos_encoding.get_prev_value(saw_newline, saw_newline)
+    seen_newline = get_prev_value(rope, saw_newline, saw_newline, recency_rank)
     is_input_operator = bool_all_true([is_operator, bool_not(seen_newline)])
-    which_plus = pos_encoding.get_prev_value(is_plus, is_input_operator)
-    which_minus = pos_encoding.get_prev_value(is_minus, is_input_operator)
-    which_times = pos_encoding.get_prev_value(is_times, is_input_operator)
+    which_plus = get_prev_value(rope, is_plus, is_input_operator, recency_rank)
+    which_minus = get_prev_value(rope, is_minus, is_input_operator, recency_rank)
+    which_times = get_prev_value(rope, is_times, is_input_operator, recency_rank)
     return A, B, which_plus, which_minus, which_times, saw_newline

@@ -17,6 +17,7 @@ from torchwright.compiler.export import compile_headless
 from torchwright.debug.probe import probe_graph, reference_eval
 
 from examples.range_printer import (
+    D_HEAD,
     D_TOKEN_TYPE,
     E8_ITEM,
     E8_PRINT,
@@ -144,7 +145,7 @@ _CASES = [
 @pytest.mark.parametrize("items", _CASES)
 def test_oracle(items):
     max_items = len(items)
-    output_node, pos_encoding = build_range_printer_graph(max_items)
+    output_node = build_range_printer_graph(max_items)
     inputs, n_pos, expected_cols = _build_full_batch(items, max_items)
 
     cache = reference_eval(output_node, inputs, n_pos)
@@ -175,13 +176,12 @@ def test_oracle(items):
 @pytest.mark.parametrize("items", _CASES)
 def test_autoregressive(items):
     max_items = len(items)
-    output_node, pos_encoding = build_range_printer_graph(max_items)
+    output_node = build_range_printer_graph(max_items)
 
     compiled = compile_headless(
         output_node,
-        pos_encoding,
         d=256,
-        d_head=32,
+        d_head=D_HEAD,
         max_layers=200,
         verbose=False,
     )
@@ -254,16 +254,15 @@ def test_autoregressive(items):
 def test_probe_parity():
     items = [(2, 4), (7, 9)]
     max_items = len(items)
-    output_node, pos_encoding = build_range_printer_graph(max_items)
+    output_node = build_range_printer_graph(max_items)
     inputs, n_pos, _ = _build_full_batch(items, max_items)
 
     report = probe_graph(
         output_node,
-        pos_encoding=pos_encoding,
         input_values=inputs,
         n_pos=n_pos,
         d=256,
-        d_head=32,
+        d_head=D_HEAD,
         max_layers=200,
         verbose=False,
         atol=1.0,

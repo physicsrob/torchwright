@@ -6,6 +6,8 @@ import importlib
 
 import pytest
 
+from examples._calculator_common import D_HEAD
+
 from ._example_onnx import load_example, run
 
 # One entry per calculator implementation; every test below runs once per module
@@ -23,22 +25,33 @@ def _build(calc_module, digits):
     return calc_module.create_network_parts(max_digits=digits)
 
 
+# d_head=D_HEAD (32): the family's rope is built at this width, and the compile
+# d_head must match it (the scratchpad multiply's pointer gather is the widest
+# content head — see examples._calculator_common.D_HEAD).
 @pytest.fixture(scope="module")
 def calc_1digit(calc_module, tmp_path_factory):
     return load_example(
-        lambda: _build(calc_module, 1), tmp_path_factory.mktemp("calc1"), name="calc1"
+        lambda: _build(calc_module, 1),
+        tmp_path_factory.mktemp("calc1"),
+        name="calc1",
+        d_head=D_HEAD,
     )
 
 
 @pytest.fixture(scope="module")
 def calc_3digit(calc_module, tmp_path_factory):
     return load_example(
-        lambda: _build(calc_module, 3), tmp_path_factory.mktemp("calc3"), name="calc3"
+        lambda: _build(calc_module, 3),
+        tmp_path_factory.mktemp("calc3"),
+        name="calc3",
+        d_head=D_HEAD,
     )
 
 
 def _check(model, input_str, expected):
-    result = run(model, input_str)
+    # Recency calculator: <ref> must land at position 1 for the RoPE recency
+    # rank's second always-visible marker.
+    result = run(model, input_str, ref_token="<ref>")
     assert (
         result == expected
     ), f"For {input_str!r}: expected {expected!r} but got {result!r}"

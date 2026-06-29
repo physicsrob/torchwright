@@ -11,12 +11,11 @@ import torch
 from torchwright.compiler.export import compile_headless
 from torchwright.graph import Concatenate
 from torchwright.ops.arithmetic_ops import compare
-from torchwright.ops.inout_nodes import create_input, create_pos_encoding
+from torchwright.ops.inout_nodes import create_input
 
 
 def test_concatenate_output_node():
     """Compilation should succeed when the output node is a Concatenate."""
-    pos_encoding = create_pos_encoding()
     a = create_input("a", 1)
     b = create_input("b", 1)
 
@@ -26,7 +25,6 @@ def test_concatenate_output_node():
 
     module = compile_headless(
         output,
-        pos_encoding,
         d=512,
         d_head=16,
         verbose=False,

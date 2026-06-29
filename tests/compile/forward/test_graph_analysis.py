@@ -91,7 +91,7 @@ def test_concatenate_transparency():
 
 def test_adder_graph():
     """Load the 3-digit adder graph, verify topo order valid and all nodes reachable."""
-    output_node, pos_encoding, embedding = create_network_parts()
+    output_node, embedding = create_network_parts()
     graph = GraphAnalyzer(output_node)
 
     all_nodes = graph.get_all_nodes()

@@ -18,19 +18,27 @@ from torchwright.compiler.export import compile_headless
 from torchwright.debug.probe import reference_eval
 from torchwright.graph.asserts import assert_in_range
 from torchwright.graph.value_type import NodeValueType, Range
-from torchwright.ops.inout_nodes import create_input, create_pos_encoding
+from torchwright.ops.inout_nodes import create_input, create_rope_config
 from torchwright.ops.marker_count import count_since_marker
 
 MAX_GAP = 350
 
+# count_since_marker rides the slowest rotary plane.  Over a gap-350 window the
+# residual window non-uniformity goes as ~333·theta_slow^2·gap^3, and theta_slow
+# = base^(-(d_head-2)/d_head) shrinks toward base^-1 as d_head grows.  d_head=16
+# leaves the slowest plane too fast (worst gap error ~1.5); d_head=64 pushes it
+# to ~0.19, comfortably under the +/-0.5 round-to-integer budget with margin for
+# the compiled fp32 path.
+D_HEAD = 64
+
 
 def _build(max_gap=MAX_GAP):
-    pos = create_pos_encoding()
+    rope = create_rope_config(d_head=D_HEAD, max_positions=512)
     marker_onehot = create_input("marker_onehot", 1)
     window_validity = create_input("window_validity", 1)
     marker = assert_in_range(marker_onehot, 0.0, 1.0)
-    gap = count_since_marker(pos, window_validity, marker, max_gap=max_gap)
-    return pos, marker_onehot, window_validity, gap
+    gap = count_since_marker(rope, window_validity, marker, max_gap=max_gap)
+    return rope, marker_onehot, window_validity, gap
 
 
 def _inputs(n_pos, marker_pos):
@@ -80,8 +88,8 @@ def test_oracle_marker_not_at_zero():
 
 def test_compiled_recovers_gap_to_bound():
     """Compiled transformer: gap[n] rounds to n out to the ~350 bound."""
-    pos, _marker_in, _valid_in, gap = _build()
-    module = compile_headless(gap, pos, d=512, verbose=False)
+    _rope, _marker_in, _valid_in, gap = _build()
+    module = compile_headless(gap, d=512, d_head=D_HEAD, verbose=False)
 
     n_pos = MAX_GAP + 1
     marker, valid = _inputs(n_pos, marker_pos=0)
