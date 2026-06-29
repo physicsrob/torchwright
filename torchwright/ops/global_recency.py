@@ -158,6 +158,20 @@ def global_position_from_bos(
 
     max_len = rope.max_positions
     theta = _theta_slow(rope)
+
+    # Guard: the BOS-weight w(m) is monotone only when the slowest plane rotates
+    # less than π/2 over the full rollout.  Past π/2, cos(m·θ) goes negative,
+    # w(m) eventually starts increasing, and the PWL inversion silently maps
+    # large positions to near-zero — wrong output, no crash.
+    product = max_len * theta
+    if product >= math.pi / 2:
+        raise ValueError(
+            f"global_position_from_bos requires max_positions × theta_slow < π/2 "
+            f"for the BOS weight to be monotone, but got "
+            f"max_positions={max_len} × theta_slow={theta:.3e} = {product:.3f} ≥ {math.pi/2:.3f}.  "
+            f"Increase d_head or base, or reduce max_positions."
+        )
+
     A = math.sqrt(math.log(max_len))  # sqrt(ln(MAX_LEN)) so Q·K = ln(MAX_LEN)
 
     # --- BOS-weight attention head ---
