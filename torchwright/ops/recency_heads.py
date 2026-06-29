@@ -52,9 +52,13 @@ from torchwright.ops.logic_ops import equals_vector
 from torchwright.ops.recency_ramp import octant_recency_ramp
 
 # Leakage DC.  The {BOS, REF} pair must dominate the N−2 unmarked background
-# keys: residual drift is ~N·exp(−L), so L must clear ln(N/resolution).  At the
-# 61440 cache cap and the octant gap-1 weight signal (~3e-5) this is ≈25 logits
-# (docs/rope_port_plan.md §8 gate d, "≈22+").  25 leaves ~150× margin.
+# keys: residual drift is ~N·exp(−L), so L must clear ln(N/resolution).  The
+# "resolution" is the octant ramp's worst-case per-token (gap-1) step: ~2e-5 at
+# the 61440 cache cap's φ-density (1.98e-5 on the real plane-91 grid; the
+# idealized one-turn plane in scripts/rope_octant_assembly.py is ~2.275e-5).
+# L=25 ⇒ cap leakage 61440·exp(−25) ≈ 8.5e-7, ~23× below that gap-1 step (and
+# ~350× below it at N=4096) — docs/rope_port_plan.md §8 gate d ("≈22+").  Pinned
+# by test_leakage_below_gap1_signal_at_cap in test_rope_recency_e2e.py.
 _DC_GAIN = 25.0
 
 

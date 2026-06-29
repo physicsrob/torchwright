@@ -38,7 +38,11 @@ from torchwright.debug.probe import probe_compiled
 from torchwright.graph.rope import ROPE_BASE, recency_plane_index
 from torchwright.ops.attention_ops import attend_most_recent_matching
 from torchwright.ops.inout_nodes import create_input, create_rope_config
-from torchwright.ops.recency_heads import recency_phase_heads, recency_rank
+from torchwright.ops.recency_heads import (
+    _DC_GAIN,
+    recency_phase_heads,
+    recency_rank,
+)
 
 CAP = 61440  # ONNX cache cap / e1m1 max_positions — size the plane to THIS.
 D_HEAD = 256
@@ -144,8 +148,11 @@ def test_phase_heads_leakage_does_not_grow_with_N(heads_module):
     deviation from the ideal does NOT grow as the background key count grows.
 
     Leakage drift is ~N·exp(−L); with the default L≈25 it is far below the
-    gap-1 weight signal (~3e-5) even at the cap, so the max deviation at N=4096
-    is the same fp32 floor as at N=256.
+    gap-1 weight signal (~2e-5, the octant ramp's worst-case per-token step at
+    the cap) even at the cap — ~23× margin there, ~350× at N=4096 — so the max
+    deviation at N=4096 is the same fp32 floor as at N=256.  (The 1e-5 bound
+    below is a conservative ceiling under that gap-1 step, not the step itself;
+    the cap-level bound is test_leakage_below_gap1_signal_at_cap.)
     """
     plane = recency_plane_index(D_HEAD, ROPE_BASE, CAP, seam_frac=SEAM_FRAC)
     theta = ROPE_BASE ** (-2.0 * plane / D_HEAD)
@@ -164,6 +171,39 @@ def test_phase_heads_leakage_does_not_grow_with_N(heads_module):
     assert (
         large < small * 10 + 1e-6
     ), f"leakage grew with N: {small:.2e} (N=256) -> {large:.2e} (N=4096)"
+
+
+def test_leakage_below_gap1_signal_at_cap():
+    """Gate (d) at the cap: the {BOS, REF} leakage stays below the octant ramp's
+    gap-1 step at the full 61440 cache cap — the cap-level bound the N=4096
+    leakage test above cannot reach (its background key count maxes at 4096).
+
+    Leakage at query ``j`` is ~``j·exp(−L)`` (``j`` unmarked causal keys, each
+    leaking ``exp(−L)`` relative to the references); the worst case is ``j=CAP``.
+    The gap-1 signal is the ramp's smallest per-token step at the cap's φ-density
+    (the same analytic ramp the selection test uses).  ``L`` must keep the former
+    below the latter, else a content-mismatched background key can outrank an
+    adjacent match.  This pins ``_DC_GAIN`` against the true cap margin (~23×) —
+    NOT the ~150× the docs once claimed (that holds only at ~4k typical lengths).
+    """
+    from scripts.rope_octant_assembly import ramp as analytic_ramp
+
+    plane = recency_plane_index(D_HEAD, ROPE_BASE, CAP, seam_frac=SEAM_FRAC)
+    theta = ROPE_BASE ** (-2.0 * plane / D_HEAD)
+    js = torch.arange(0, CAP + 1)
+    phis = (js.double() * theta + SEAM_FRAC * 2 * math.pi).numpy()
+    r = torch.from_numpy(analytic_ramp(phis))
+    gap1_step = (r[1:] - r[:-1]).min().item()
+
+    cap_leakage = CAP * math.exp(-_DC_GAIN)  # worst-case background leakage at j=CAP
+    assert cap_leakage < gap1_step, (
+        f"cap leakage {cap_leakage:.2e} (CAP·exp(−{_DC_GAIN:.0f})) is not below "
+        f"the gap-1 ramp step {gap1_step:.2e} — raise _DC_GAIN"
+    )
+    # Comfortable but not huge — the honest cap margin is ~23×.
+    assert (
+        gap1_step / cap_leakage > 10.0
+    ), f"cap margin {gap1_step / cap_leakage:.1f}× thinner than expected"
 
 
 # --------------------------------------------------------------------------- #

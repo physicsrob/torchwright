@@ -468,7 +468,8 @@ head** — confirm a mid-sigmoid 2-key `{BOS, REF}` head is expressible (`Attn` 
 Q/K/V, no saturation constraint) and `M` keeps both heads graded. (d) **Leakage budget** — the
 readout must be an *effectively 2-key* `{BOS, REF}` softmax, so all other causal keys are suppressed
 below the gap-1 signal. With `N` other keys each leaking weight `ε`, total leakage `N·ε` must stay
-well below the ~1e-5 gap-1 weight difference; at `N ~ 42k` that forces an exclusion score gap of
+well below the ~2e-5 gap-1 weight difference (the octant ramp's worst-case per-token step at the
+cache cap — 1.98e-5 on the real plane-91 grid); at `N ~ 42k` that forces an exclusion score gap of
 ≈ `log(N / resolution)` ≈ 22+ logit units (×scale). Pin that number against the fp32 score dynamic
 range, and confirm the leakage — *and* its growth with key count (a position-dependent drift riding
 on the ramp) — stays below the gap-1 signal. *(Phase 4: the DC gap is `L=25`; REF is the constant
@@ -603,7 +604,8 @@ octant stays ~180×).
 >   cap `61440` that is **plane 91** (`θ ≈ 8.88e-5`, one turn ≈ 70761 positions, rollout phase ≈0.87
 >   turns). Sizing to the ~42k frame instead (plane 87) **wraps past ~47k** and silently inverts the
 >   order — so the cap is the sizing target. DC marker on the slowest plane (127), quasi-static; leakage
->   `L=25` (gate d's "≈22+"), ~150× margin over the gap-1 weight signal.
+>   `L=25` (gate d's "≈22+"), ~23× margin over the gap-1 weight signal **at the 61440 cap** (`61440·exp(−25)
+>   ≈ 8.5e-7` vs the ~2e-5 ramp step; ~350× at the ~4k typical length — the cap is the worst case).
 > - **Gates.** (a) BOS attendability ✅ — recency rank bit-identical prefill vs unbounded cached decode.
 >   (c) graded head ✅ (above). (d) leakage ✅ — head output matches the 2-key ideal to fp32 and does
 >   **not** grow with the background key count (`N=256 → 4096`). Chain (`heads → octant ramp`) strictly
@@ -902,8 +904,9 @@ step on a separate `torchwright_doom` branch**, not a per-phase gate in this rep
 - **Recency leakage budget.** ✅ DONE (Phase 4, gate d). The reference is **REF**, not `self` (a
   `{BOS, self}` softmax shifts the weight by a constant `−M·cos ψ` — see Phase 4 status). The DC
   exclusion gap is `L=25` (≈ `log(N/resolution)` at the cap); the compiled head output matches the
-  2-key ideal to fp32 and does **not** grow with key count (`N=256 → 4096`), ~150× under the gap-1
-  weight signal.
+  2-key ideal to fp32 and does **not** grow with key count (`N=256 → 4096`), ~23× under the gap-1
+  weight signal at the 61440 cap (~350× at N=4096; cap bound pinned by
+  `test_leakage_below_gap1_signal_at_cap`).
 - **Recency at production length.** ⏳ Phase 6 (cross-repo). The ramp's resolvability *at the
   cap φ-density* is proven (`test_recency_ramp_compiled.py` + the analytic gap-1 band in
   `test_rope_recency_e2e.py`); the **0-flips replay against real selections at ~42k** needs a ~42k
