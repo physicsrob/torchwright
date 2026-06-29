@@ -33,8 +33,13 @@ onnxruntime-vs-headless, batched-vs-sequential) were relaxed to bounded fp floor
 from the graph reshape, generation token-identical, independently reviewed (Claude + Codex); see the Phase-6
 status block in §8 and `docs/numerical_noise_findings.md`.
 
-Remaining: **Phase 7** (design + demo the unbounded global most-recent without
-`<ref>`, possibly outside the compiler — torchwright), and **Phase 8** (`torchwright_doom` — rewire the
+**Phase 7 complete** (commit `d583133`): `global_position_from_bos` + `attend_most_recent_globally`
+in `torchwright/ops/global_recency.py`; 7 oracle tests + 3 compiled tests; full suite green.
+Candidate (d) — boosted-BOS weight inversion — validated: monotone over [0, 61440], min gap 4.1e-6
+(69× fp32 floor), PWL error ≤ 0.09 in float32 (well below the 0.5 rounding threshold),
+recency_scale=1.0 gives 26× float32 representability margin at E8 content score scale.
+
+Remaining: **Phase 8** (`torchwright_doom` — rewire the
 DOOM call sites, full render parity, and the 42k real-log recency replay). **`main` merged in
 (`f281ee8`)**: ONNX/HF now
 run in CI (the Modal image carries `onnxruntime`/`transformers` — the runtime-parity gap is closed),
@@ -849,10 +854,10 @@ farther one — no BOS-relative phase, no two-token `{BOS, REF}` readout, no oct
   parity; I1–I4 hold; D6 repro at the op layer.
 - DOOM's *bounded* reads use this (Phase 8); DOOM's clip-memory (look-back `> W`) needs Phase 7.
 
-**Phase 7 — Global most-recent: design + targeted demo, possibly outside the compiler (torchwright).**
-Solve **unbounded** "most recent matching key" — the one place the local lobe is insufficient (DOOM
-clip look-backs exceed `W`) — **without an injected `<ref>` token.** This is a design phase: find a
-constant phase reference that is not a scaffold token. Candidates, roughly in order of how clean they
+**Phase 7 — Global most-recent: DONE (commit `d583133`).**
+Solved **unbounded** "most recent matching key" — the one place the local lobe is insufficient (DOOM
+clip look-backs exceed `W`) — **without an injected `<ref>` token.** Candidate (d) won: boosted-BOS
+weight inversion with a 1024-breakpoint PWL inverse and a direct per-position logit tiebreak. Candidates, roughly in order of how clean they
 are if they hold:
 
 - **(a) `self` carrying DC-only.** `{BOS, self}` was rejected in Phase 4 because `self` carried
