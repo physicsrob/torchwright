@@ -845,8 +845,9 @@ def _emit_cached_preamble(nodes: list) -> None:
     the baked GPU-resident ``arange_S`` instead.
 
     Produces:
-      - ``_rope_cos`` / ``_rope_sin``: (n_new, d_head) — the RoPE rotation
+      - ``_rope_cos`` / ``_rope_sin``: (n_new, d_rot) — the RoPE rotation
         factors at ``cache_position`` (``cos``/``sin`` of ``pos · rope_freq``),
+        width d_rot (the rotary front; == d_head for full rotary),
         broadcast per layer onto Q and the new K rows.
       - ``mask_bool_3d``: (1, n_new, S_eff) bool, True where blocked: slot
         ``j`` is hidden from the query at position ``p`` iff ``j > p``.

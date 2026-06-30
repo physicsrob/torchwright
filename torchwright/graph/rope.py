@@ -183,7 +183,9 @@ def place_on_slow_planes(mat: torch.Tensor, d_head: int) -> torch.Tensor:
     not mix under rotation.  Requires ``W ≤ d_head/2``.
 
     Returns a ``(rows, d_head)`` matrix; pass it as the Q/K projection of an
-    ``Attn`` (every ``Attn`` is full-width rotary on the global grid).
+    ``Attn``.  Content heads ride the slow planes of the full ``d_head`` grid, so
+    they are full-rotary only (:func:`require_full_rotary`); partial rotary would
+    move slow planes into the unrotated tail and break the slow-plane assumption.
     """
     rows, w = mat.shape
     half = d_head // 2

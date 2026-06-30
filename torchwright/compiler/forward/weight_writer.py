@@ -334,10 +334,22 @@ def _write_compute_attn(
         head = _allocate_head(attn)
         # Record the rotary base and partial-rotary width (the component rotates
         # every head's front d_rot planes on the one global grid).  Like
-        # rope_base, this is one value per layer-component (last write wins across
-        # the layer's heads); the ONNX exporter's single-d_rot assertion is what
-        # keeps a model from mixing widths.
+        # rope_base, this is one value per layer-component.  d_rot must be the same
+        # for every head packed into a layer: the component applies one cos/sin to
+        # all heads, so two heads with different rope_d_rot here would make the
+        # compiled layer diverge from the per-node oracle.  This cannot happen when
+        # all heads come from one RopeConfig.d_rot (the global knob); the guard
+        # below catches hand-built graphs that mix widths in a layer.  (The same
+        # ResidualStreamMap chunk-loop writes one node across its V/O chunks, so
+        # re-setting the *same* value is fine — only a different value raises.)
         attn.rope_base = node.rope_base
+        if attn.rope_d_rot is not None and attn.rope_d_rot != node.rope_d_rot:
+            raise AssertionError(
+                f"Attn '{node.name}': two heads with different rope_d_rot "
+                f"({attn.rope_d_rot} vs {node.rope_d_rot}) packed into one layer; "
+                f"d_rot is one global value per model — build every head from one "
+                f"RopeConfig.d_rot."
+            )
         attn.rope_d_rot = node.rope_d_rot
         _scatter_attn_head(
             attn,

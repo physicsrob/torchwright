@@ -96,6 +96,13 @@ class TorchwrightConfig(PretrainedConfig):
         # docs/rope_port_plan.md §6.
         self.rope_base = float(rope_base)
         self.d_rot = int(d_rot) if d_rot is not None else self.d_head
+        # Validate only for a real model (d_head > 0); HF instantiates configs with
+        # all-zero defaults, which must not raise.
+        if self.d_head and (self.d_rot % 2 != 0 or not (0 < self.d_rot <= self.d_head)):
+            raise ValueError(
+                f"TorchwrightConfig.d_rot must be even and in (0, "
+                f"d_head={self.d_head}]; got {self.d_rot}."
+            )
         # Aliases so generic transformers utilities that reach for the canonical
         # field names (cache sizing, repr, sharding heuristics) find them. We own
         # them here and recompute from our own fields, so drop any (possibly

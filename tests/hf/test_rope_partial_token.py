@@ -44,6 +44,20 @@ def _build_and_convert(tmpdir):
     return convert_onnx_to_hf(path, bos_token="<bos>", eos_token="<eos>")
 
 
+def test_torchwright_config_validates_d_rot():
+    from torchwright.compiler.hf.configuration_torchwright import TorchwrightConfig
+
+    # All-zero defaults (HF instantiates configs this way) must not raise.
+    TorchwrightConfig()
+    # A real model rejects an odd or out-of-range d_rot.
+    with pytest.raises(ValueError, match="d_rot"):
+        TorchwrightConfig(d=256, d_head=16, d_rot=3)
+    with pytest.raises(ValueError, match="d_rot"):
+        TorchwrightConfig(d=256, d_head=16, d_rot=18)
+    # Valid partial width is accepted and stored.
+    assert TorchwrightConfig(d=256, d_head=16, d_rot=8).d_rot == 8
+
+
 def test_hf_partial_rope_config_carried():
     with tempfile.TemporaryDirectory() as tmp:
         hf = _build_and_convert(tmp)
