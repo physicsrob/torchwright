@@ -44,18 +44,24 @@ class RopeConfig:
     ``base`` before compile — see :func:`place_on_slow_planes`).
 
     Fields:
-        d_head: the rotary width (= the compiled ``d_head``).  Every head is
-            full-width rotary on this grid; the compile entry points assert the
-            ``d_head`` passed to them matches this.  Must be even.
+        d_head: the head width (= the compiled ``d_head``).  The compile entry
+            points assert the ``d_head`` passed to them matches this.  Must be even.
         max_positions: the rollout length (the cache cap, not the typical
             frame).  Used by :func:`rope_lobe_band` to set the local-recency
             band's near-DC floor (``θ > π/max_positions``).
         base: the rotary base (LLaMA3-family ``5e5`` by default).
+        d_rot: the partial-rotary width (vanilla HF ``partial_rotary_factor``).
+            The first ``d_rot`` dims of every head rotate; the last
+            ``d_head - d_rot`` are the unrotated NoPE tail.  ``None`` (default)
+            resolves to ``d_head`` (full rotary, identical to the LLaMA3 end
+            state).  Must be even and in ``(0, d_head]``.  Global: the ONNX
+            exporter asserts a single ``d_rot`` across all heads.
     """
 
     d_head: int
     max_positions: int
     base: float = ROPE_BASE
+    d_rot: int | None = None
 
     def __post_init__(self) -> None:
         if self.d_head % 2 != 0:
@@ -63,6 +69,36 @@ class RopeConfig:
                 f"RopeConfig.d_head must be even (rotate_half pairs dim p with "
                 f"p+d_head/2); got {self.d_head}."
             )
+        # Resolve d_rot (None → full rotary) to a concrete even width in
+        # (0, d_head]; frozen dataclass, so commit it via object.__setattr__.
+        d_rot = self.d_head if self.d_rot is None else self.d_rot
+        if d_rot % 2 != 0 or not (0 < d_rot <= self.d_head):
+            raise ValueError(
+                f"RopeConfig.d_rot must be even and in (0, d_head={self.d_head}]; "
+                f"got {self.d_rot}."
+            )
+        object.__setattr__(self, "d_rot", d_rot)
+
+
+def require_full_rotary(d_rot: int, d_head: int, feature: str) -> None:
+    """Raise unless the head is full rotary (``d_rot == d_head``).
+
+    The content / recency / global-recency / marker heads lay their signal on
+    specific **planes** of the full ``d_head`` ``rotate_half`` grid
+    (:func:`place_on_slow_planes`, :func:`rope_lobe_band`).  Under partial rotary
+    a plane's ``rotate_half`` partner can fall in the unrotated NoPE tail, which
+    silently breaks the pairing — so these builders reject a partial ``d_rot``
+    loudly rather than miscompute.  Only :func:`rotary_offset_head` (whose tail is
+    a uniform constant, not plane-indexed content) supports partial rotary.
+    Callers pass ``rope.d_rot`` / ``rope.d_head``.  Migrating the plane-based
+    heads to the NoPE tail is future work."""
+    if d_rot != d_head:
+        raise NotImplementedError(
+            f"{feature} assumes full rotary (d_rot == d_head) but got "
+            f"d_rot={d_rot}, d_head={d_head}.  Partial rotary is supported only "
+            f"by the rotary offset head; the plane-based content/recency heads "
+            f"are full-rotary only."
+        )
 
 
 def rope_inv_freq(width: int, base: float) -> torch.Tensor:
@@ -104,9 +140,26 @@ def rotate_half(x: torch.Tensor) -> torch.Tensor:
 
 
 def apply_rope(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.Tensor:
-    """Apply ``rotate_half`` RoPE.  ``x`` is ``(..., P, width)``; ``cos``/``sin``
-    are ``(P, width)`` and broadcast over the leading dims."""
-    return x * cos + rotate_half(x) * sin
+    """Apply ``rotate_half`` RoPE, vanilla partial-rotary (HF ``partial_rotary_factor``).
+
+    ``x`` is ``(..., P, d_head)``; ``cos``/``sin`` are ``(P, d_rot)`` and broadcast
+    over the leading dims.  The rotary width ``d_rot`` is read from ``cos.shape[-1]``:
+    the first ``d_rot`` dims of ``x`` are rotated (``rotate_half`` over ``d_rot``,
+    pairing dim ``i`` with ``i + d_rot/2``) and the last ``d_head - d_rot`` dims pass
+    through unrotated (the NoPE tail).  When ``d_rot == d_head`` (``cos`` as wide as
+    ``x``) this is full rotary and takes the exact pre-partial expression, so existing
+    full-width callers are byte-identical."""
+    d_rot = cos.shape[-1]
+    assert d_rot <= x.shape[-1], (
+        f"RoPE cos width {d_rot} exceeds x width {x.shape[-1]}; cos/sin must be the "
+        f"rotary width d_rot ≤ d_head."
+    )
+    if d_rot == x.shape[-1]:
+        return x * cos + rotate_half(x) * sin
+    x_front = x[..., :d_rot]
+    x_pass = x[..., d_rot:]
+    rotated = x_front * cos + rotate_half(x_front) * sin
+    return torch.cat([rotated, x_pass], dim=-1)
 
 
 def place_on_slow_planes(mat: torch.Tensor, d_head: int) -> torch.Tensor:
@@ -154,6 +207,7 @@ def rotary_content_head(
     *,
     d_head: int,
     base: float = ROPE_BASE,
+    d_rot: int | None = None,
 ):
     """A content-selection ``Attn`` made **rotary on slow planes**.
 
@@ -165,9 +219,15 @@ def rotary_content_head(
     unchanged.  This is the Phase-3 content capability (``docs/rope_port_plan.md``
     §3, §8): selection by content survives the global rotation because the match
     rides quasi-static planes.
+
+    Full-rotary only: the content rides specific planes of the full ``d_head``
+    grid, so a partial ``d_rot`` is rejected (see :func:`require_full_rotary`).
     """
     from torchwright.graph import Attn
 
+    require_full_rotary(
+        d_head if d_rot is None else d_rot, d_head, "rotary_content_head"
+    )
     d_v = len(value)
     return Attn(
         query_in=query_in,
@@ -257,6 +317,7 @@ def rotary_recency_head(
     base: float = ROPE_BASE,
     recency_gain: float,
     theta_max: float = LOBE_THETA_MAX,
+    d_rot: int | None = None,
 ):
     """A "most recent matching" content head with **intrinsic rotary recency**.
 
@@ -287,6 +348,9 @@ def rotary_recency_head(
     """
     from torchwright.graph import Attn, Concatenate, LiteralValue
 
+    require_full_rotary(
+        d_head if d_rot is None else d_rot, d_head, "rotary_recency_head"
+    )
     half = d_head // 2
     w_content = max(query_matrix.shape[1], key_matrix.shape[1])
     planes, amps = rope_lobe_band(d_head, base, max_positions, theta_max=theta_max)
@@ -337,6 +401,7 @@ def rotary_offset_head(
     d_qk: int,
     base: float = ROPE_BASE,
     hardness: float = 100.0,
+    d_rot: int | None = None,
 ):
     """A pure-rotary "attend to position ``j + delta_pos``" head.
 
@@ -358,23 +423,33 @@ def rotary_offset_head(
     i.e. key ``i = j + delta_pos``.  ``delta_pos = -1`` ⇒ the previous position.
     V/O transport the payload unchanged.
 
-    ``d_qk`` is the rotary width and **must equal the compile ``d_head``** — the
-    head is full-width rotary on the global grid (no partial-width rotary; the
-    compiler asserts ``d_qk == d_head``).  Production callers pass
-    ``d_qk=rope.d_head``.
+    ``d_qk`` **must equal the compile ``d_head``** (the head fills the grid; the
+    compiler asserts ``d_qk == d_head``).  ``d_rot`` (default ``d_qk``) is the
+    rotary width: the first ``d_rot`` dims rotate and the rest are the unrotated
+    NoPE tail (vanilla partial rotary).  Production callers pass
+    ``d_qk=rope.d_head, d_rot=rope.d_rot``.
+
+    Partial rotary is harmless here: the query tail is ``hardness·1`` and the key
+    tail is ``1`` (both unrotated), so they contribute a position-independent
+    constant ``hardness·(d_qk - d_rot)`` to every logit, which the softmax's
+    row-max subtraction cancels; the rotated front still peaks uniquely at
+    ``i - j - delta_pos = 0``.
     """
     from torchwright.graph import Attn, LiteralValue
 
     if delta_pos == 0:
         return value
 
+    d_rot = d_qk if d_rot is None else d_rot
     d_v = len(value)
     one = LiteralValue(torch.tensor([1.0]), name="rotary_offset_query_one")
 
     query_matrix = hardness * torch.ones((1, d_qk))  # W_Q · 1 = hardness · 1
 
-    # W_K · 1 = R_{-delta_pos} (1-vector): the static key pre-rotation.
-    cos, sin = rope_cos_sin(torch.tensor([-delta_pos]), d_qk, base)
+    # W_K · 1 = R_{-delta_pos} (1-vector) over the rotary front d_rot: the static
+    # key pre-rotation.  apply_rope rotates only the first d_rot dims, so the tail
+    # [d_rot:d_qk] stays 1 (the NoPE constant the softmax cancels — see docstring).
+    cos, sin = rope_cos_sin(torch.tensor([-delta_pos]), d_rot, base)
     key_matrix = apply_rope(torch.ones((1, d_qk)), cos, sin)  # (1, d_qk)
 
     return Attn(
@@ -386,4 +461,5 @@ def rotary_offset_head(
         value_matrix=torch.eye(d_v),
         output_matrix=torch.eye(d_v),
         rope_base=base,
+        rope_d_rot=d_rot,
     )

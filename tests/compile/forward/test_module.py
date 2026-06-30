@@ -388,9 +388,10 @@ def test_token_onnx_meta_has_no_extra_key_when_omitted():
         with open(meta_path_for(onnx_path)) as f:
             meta = json.load(f)
         assert "extra" not in meta
-        # rope_base is present for every rotary model (every model post-RoPE-port);
-        # "extra" (asserted absent above) is the optional key this guards against.
-        assert set(meta) == {"format", "vocab", "cache_stride", "rope_base"}
+        # rope_base and d_rot are present for every rotary model (every model
+        # post-RoPE-port); d_rot == d_head here (full rotary).  "extra" (asserted
+        # absent above) is the optional key this guards against.
+        assert set(meta) == {"format", "vocab", "cache_stride", "rope_base", "d_rot"}
 
 
 # ===========================================================================

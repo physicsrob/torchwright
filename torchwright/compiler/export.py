@@ -607,30 +607,48 @@ def _add_scalar_inits(dense_inits: list) -> None:
 # ---------------------------------------------------------------------------
 
 
-def _rope_freq_row(d_head: int, base: float) -> np.ndarray:
-    """``(1, d_head)`` per-dim RoPE angular frequencies in the half-split layout.
+def _rope_freq_row(d_rot: int, base: float) -> np.ndarray:
+    """``(1, d_rot)`` per-plane RoPE angular frequencies in the half-split layout.
 
-    Matches :func:`torchwright.graph.rope.rope_inv_freq` (``base^(-2k/d_head)``)
-    with each plane's frequency repeated across both halves, so the runtime
-    ``angle = pos · freq`` reproduces the in-process / oracle rotation.
+    Matches :func:`torchwright.graph.rope.rope_inv_freq` (``base^(-2k/d_rot)``,
+    normalized by the rotary width ``d_rot``) with each plane's frequency repeated
+    across both halves of the rotary front, so the runtime ``angle = pos · freq``
+    reproduces the in-process / oracle rotation.  ``d_rot == d_head`` is full
+    rotary (identical to the LLaMA3 end state).
     """
-    p = np.arange(0, d_head, 2, dtype=np.float64)
-    inv = base ** (-p / d_head)  # (d_head/2,)
-    return np.concatenate([inv, inv]).astype(np.float32).reshape(1, d_head)
+    p = np.arange(0, d_rot, 2, dtype=np.float64)
+    inv = base ** (-p / d_rot)  # (d_rot/2,)
+    return np.concatenate([inv, inv]).astype(np.float32).reshape(1, d_rot)
 
 
-def _add_rope_inits(per_layer_rotary: list, d_head: int, dense_inits: list) -> float:
-    """Add the global RoPE initializers (``rope_freq``, ``rope_split``).  Every
-    head is full-width rotary on the one global grid (LLaMA3 end state), so these
-    are always emitted.  Returns the shared base for the sidecar meta.  All
-    layers must share one base."""
+def _add_rope_inits(
+    per_layer_rotary: list, d_head: int, dense_inits: list
+) -> tuple[float, int]:
+    """Add the global RoPE initializers (``rope_freq``, ``rope_split``, and — for
+    partial rotary — ``rope_partial_split``).  Returns ``(base, d_rot)`` for the
+    sidecar meta.  All layers must share one ``base`` AND one ``d_rot``."""
     bases = {r["base"] for r in per_layer_rotary if r.get("base") is not None}
     if len(bases) > 1:
         raise NotImplementedError(
             f"ONNX RoPE export requires one global base; got {sorted(bases)}."
         )
     base = bases.pop() if bases else ROPE_BASE
-    freq = _rope_freq_row(d_head, base)  # (1, d_head), guaranteed dense
+
+    # Partial-rotary width must also be global (one rotate_half front for the
+    # whole model).  The plane-based content/recency/global-recency heads are
+    # full-rotary (d_rot == d_head); only the rotary offset head may set a
+    # partial d_rot, and all heads must agree.
+    d_rots = {r["d_rot"] for r in per_layer_rotary if r.get("d_rot") is not None}
+    if len(d_rots) > 1:
+        raise NotImplementedError(
+            f"ONNX RoPE export requires one global d_rot (partial-rotary width); "
+            f"got {sorted(d_rots)}.  The plane-based content/recency/global-recency "
+            f"heads are full-rotary; only the rotary offset head sets a partial "
+            f"d_rot, and every head must use the same value."
+        )
+    d_rot = d_rots.pop() if d_rots else d_head
+
+    freq = _rope_freq_row(d_rot, base)  # (1, d_rot), guaranteed dense
     dense_inits.append(
         helper.make_tensor(
             name="rope_freq",
@@ -640,12 +658,23 @@ def _add_rope_inits(per_layer_rotary: list, d_head: int, dense_inits: list) -> f
             raw=True,
         )
     )
+    # rotate_half over the rotary front d_rot (== d_head for full rotary, so this
+    # init is byte-identical to the pre-partial export when d_rot == d_head).
     _add_int64_init(
         "rope_split",
-        np.array([d_head // 2, d_head // 2], dtype=np.int64),
+        np.array([d_rot // 2, d_rot // 2], dtype=np.int64),
         dense_inits,
     )
-    return float(base)
+    # Partial rotary only: split each head into the rotary front (d_rot) and the
+    # unrotated NoPE tail (d_head - d_rot).  Omitted for full rotary so the
+    # full-width init set is unchanged.
+    if d_rot != d_head:
+        _add_int64_init(
+            "rope_partial_split",
+            np.array([d_rot, d_head - d_rot], dtype=np.int64),
+            dense_inits,
+        )
+    return float(base), int(d_rot)
 
 
 def _make_stream_layer_weights_cb(
@@ -699,12 +728,18 @@ def _make_stream_layer_weights_cb(
         hd = nh * d_head
         per_layer_n_heads.append(nh)
 
-        # RoPE: every head is full-width rotary on the one global grid
-        # (rotate_half over d_head, rotation by absolute position).  Record the
-        # shared base; the rotation is emitted unconditionally below — there is
-        # no per-head enable and no non-rotary head.
+        # RoPE on the one global grid (rotate_half over the rotary front d_rot,
+        # rotation by absolute position).  Record the shared base and the
+        # partial-rotary width; the rotation is emitted unconditionally below
+        # (there is no per-head enable).  base/d_rot are asserted global in
+        # _add_rope_inits.
         if per_layer_rotary is not None:
-            per_layer_rotary.append({"base": getattr(attn, "rope_base", None)})
+            per_layer_rotary.append(
+                {
+                    "base": getattr(attn, "rope_base", None),
+                    "d_rot": getattr(attn, "rope_d_rot", None),
+                }
+            )
 
         def emit(name: str, arr: np.ndarray) -> None:
             dense_tp, sparse_tp = _tensor_to_proto(name, arr)
@@ -787,8 +822,9 @@ def _emit_cached_preamble(nodes: list) -> None:
       - initializer ``arange_S``: int64 ``(S,)`` baked ``[0 .. S)``, where
         ``S = cache_stride`` is the FULL static slot count (the maximum
         any binding may use).
-      - initializer ``rope_freq``: (d_head,) — the half-split per-dim RoPE
-        frequencies (every head is full-width rotary on the one global grid).
+      - initializer ``rope_freq``: (d_rot,) — the half-split per-plane RoPE
+        frequencies over the rotary front (d_rot == d_head for full rotary);
+        rope_rotate applies them to the front and passes the NoPE tail through.
       - helper initializers from :func:`_add_scalar_inits`
 
     Memcpy invariant (the CUDA-graph capture requirement): a single
@@ -847,13 +883,14 @@ def _emit_cached_preamble(nodes: list) -> None:
     add("Greater", ["_slots_row", "_cache_pos_col"], ["_mask_bool"])  # (n_new, S_eff)
     add("Unsqueeze", ["_mask_bool", "_axes0_1d"], ["mask_bool_3d"])  # (1, n_new, S_eff)
 
-    # RoPE cos/sin from absolute positions, shared across layers (every head is
-    # full-width rotary on the one global grid, so this is always emitted).
-    # angle(pos, dim) = pos * rope_freq[dim]; rope_freq is the half-split
-    # per-dim frequency baked by the exporter.
+    # RoPE cos/sin from absolute positions, shared across layers (always emitted).
+    # angle(pos, plane) = pos * rope_freq[plane]; rope_freq is the half-split
+    # per-plane frequency baked by the exporter, width d_rot (the rotary front;
+    # == d_head for full rotary).  rope_rotate applies these to the front d_rot
+    # dims and passes the NoPE tail through.
     add("Cast", ["cache_position"], ["_rope_pos_f"], to=TensorProto.FLOAT)
     add("Unsqueeze", ["_rope_pos_f", "_axes1_1d"], ["_rope_pos_col"])  # (n_new,1)
-    add("Mul", ["_rope_pos_col", "rope_freq"], ["_rope_ang"])  # (n_new, d_head)
+    add("Mul", ["_rope_pos_col", "rope_freq"], ["_rope_ang"])  # (n_new, d_rot)
     add("Cos", ["_rope_ang"], ["_rope_cos"])
     add("Sin", ["_rope_ang"], ["_rope_sin"])
     # Broadcast forms: head-major Q is (nh, n_new, d_head) -> (1,n_new,d_head);
@@ -871,6 +908,7 @@ def _emit_cached_layer_nodes(
     d: int,
     d_head: int,
     n_heads: int,
+    d_rot: int,
     scatter_idx_col: str = "_cache_pos_col",
 ) -> str:
     """Emit cached attention + FFN nodes for one layer.
@@ -910,11 +948,15 @@ def _emit_cached_layer_nodes(
         nodes.append(helper.make_node(op, ins, outs, **attrs))
 
     def rope_rotate(src: str, dst: str, cos: str, sin: str) -> None:
-        """rotate_half RoPE: ``dst = src*cos + rotate_half(src)*sin`` over the
-        last (d_head) axis, emitted directly as ``rot``.  Every head is
-        full-width rotary on the one global grid (no per-head enable).  Matches
-        graph/rope.py (rotate_half, half-split); modeling_torchwright.py mirrors
-        this op sequence.
+        """rotate_half RoPE over the rotary front ``d_rot``: rotate the first
+        ``d_rot`` dims (``front*cos + rotate_half(front)*sin``) and pass the last
+        ``d_head - d_rot`` dims (the NoPE tail) through unchanged.  Matches
+        graph/rope.py (vanilla partial rotary, half-split over d_rot);
+        modeling_torchwright.py mirrors this op sequence.
+
+        ``d_rot == d_head`` (full rotary) emits the exact pre-partial 6-node
+        sequence — byte-for-byte the same graph, so the cancel-head denormal-ULP
+        note below still holds and existing exports are unchanged.
 
         No ``src + (rot - src)`` reconstruction: cross-backend onnxruntime/torch
         agreement is not algebraic — the cancel-head rows that cancel to denormal
@@ -923,12 +965,33 @@ def _emit_cached_layer_nodes(
         moves), and the full suite is bit-exact with the direct form, so the
         extra Sub/Add bought nothing.
         """
-        node("Split", [src, "rope_split"], [f"{dst}_h1", f"{dst}_h2"], axis=-1)
+        if d_rot == d_head:
+            # Full rotary: rotate_half over the whole head.
+            node("Split", [src, "rope_split"], [f"{dst}_h1", f"{dst}_h2"], axis=-1)
+            node("Neg", [f"{dst}_h2"], [f"{dst}_h2n"])
+            node("Concat", [f"{dst}_h2n", f"{dst}_h1"], [f"{dst}_rh"], axis=-1)
+            node("Mul", [src, cos], [f"{dst}_c"])
+            node("Mul", [f"{dst}_rh", sin], [f"{dst}_s"])
+            node("Add", [f"{dst}_c", f"{dst}_s"], [dst])
+            return
+        # Partial rotary: split off the rotary front (d_rot) and the NoPE tail,
+        # rotate_half the front, then re-concat the untouched tail.  cos/sin are
+        # width d_rot and broadcast over the front.
+        node(
+            "Split",
+            [src, "rope_partial_split"],
+            [f"{dst}_front", f"{dst}_tail"],
+            axis=-1,
+        )
+        node(
+            "Split", [f"{dst}_front", "rope_split"], [f"{dst}_h1", f"{dst}_h2"], axis=-1
+        )
         node("Neg", [f"{dst}_h2"], [f"{dst}_h2n"])
         node("Concat", [f"{dst}_h2n", f"{dst}_h1"], [f"{dst}_rh"], axis=-1)
-        node("Mul", [src, cos], [f"{dst}_c"])
+        node("Mul", [f"{dst}_front", cos], [f"{dst}_c"])
         node("Mul", [f"{dst}_rh", sin], [f"{dst}_s"])
-        node("Add", [f"{dst}_c", f"{dst}_s"], [dst])
+        node("Add", [f"{dst}_c", f"{dst}_s"], [f"{dst}_rotfront"])
+        node("Concat", [f"{dst}_rotfront", f"{dst}_tail"], [dst], axis=-1)
 
     # Project Q, K_new, V_new from the new rows in sequence-major
     # (n_new, n_heads, d_head).  The deltas (new rows only) are the graph
@@ -1313,7 +1376,9 @@ def compile_to_onnx(
 
     # RoPE: bake the global rope inits when any layer is rotary; the preamble
     # emits cos/sin from cache_position when active (no-op otherwise).
-    rope_base_val = _add_rope_inits(per_layer_rotary, d_head, dense_inits)
+    rope_base_val, rope_d_rot_val = _add_rope_inits(
+        per_layer_rotary, d_head, dense_inits
+    )
     _emit_cached_preamble(nodes)
     # Vanilla token embedding: the (vocab, d) table is gathered straight into
     # the residual seed (no projection).  Position is a rotation applied inside
@@ -1332,6 +1397,7 @@ def compile_to_onnx(
             d,
             d_head,
             per_layer_n_heads[i],
+            rope_d_rot_val,
             scatter_idx_col="_cache_pos_col",
         )
 
@@ -1380,9 +1446,10 @@ def compile_to_onnx(
         # The full static slot count S: with the symbolic cache_slots
         # first dim on past_K_i, loaders read S from here.
         "cache_stride": cache_stride_resolved,
-        # Every head is full-width rotary on the one global grid; the converter
-        # rebuilds the rotation from this base.
+        # RoPE on the one global grid; the converter rebuilds the rotation from
+        # the base and the partial-rotary width d_rot (== d_head for full rotary).
         "rope_base": rope_base_val,
+        "d_rot": rope_d_rot_val,
     }
     if extra_metadata:
         token_meta["extra"] = dict(extra_metadata)

@@ -45,11 +45,17 @@ class AttnLayerComponent(Component):
         self.value_matrix = torch.zeros(self.n_heads, d, d_head)
         self.output_matrix = torch.zeros(self.n_heads, d_head, d)
 
-        # Every head is full-width rotary on the one global grid (LLaMA3 end
-        # state): Q/K are rotated by absolute position (rotate_half over the whole
-        # d_head, see torchwright/graph/rope.py) before the QK dot product.  There
-        # is no non-rotary (NoPE) head and no partial width; the base is uniform.
+        # RoPE on the one global grid: Q/K are rotated by absolute position
+        # (rotate_half, see torchwright/graph/rope.py) before the QK dot product.
+        # rope_d_rot is the rotary front width — the first rope_d_rot dims of every
+        # head rotate; the rest are the unrotated NoPE tail (vanilla partial
+        # rotary).  None means "unset" (no user Attn set a width for this layer —
+        # e.g. compiler-inserted copy/cancel heads, which attend at offset 0 and
+        # so are rotation-invariant); _apply_rope resolves it to full rotary, and
+        # the exporter treats None layers as don't-care when picking the single
+        # global d_rot.  The base is uniform.
         self.rope_base = ROPE_BASE
+        self.rope_d_rot: int | None = None
 
     def __repr__(self):
         return f"AttnLayerComponent(name='{self.name}')"
@@ -57,11 +63,14 @@ class AttnLayerComponent(Component):
     def _apply_rope(
         self, Q: torch.Tensor, K: torch.Tensor, positions: torch.Tensor
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Rotate Q/K of every head by ``positions`` (rotate_half over the full
-        ``d_head``).  Q/K are ``(n_heads, P, d_head)``; ``positions`` is ``(P,)``
-        of absolute positions.  Every head is rotary on the global grid; unused
-        (all-zero) heads rotate harmlessly (zeros stay zero)."""
-        cos, sin = rope_cos_sin(positions, self.d_head, self.rope_base)  # (P, d_head)
+        """Rotate Q/K of every head by ``positions`` (rotate_half over the rotary
+        front ``rope_d_rot``; the last ``d_head - rope_d_rot`` dims pass through
+        unrotated — the NoPE tail).  Q/K are ``(n_heads, P, d_head)``;
+        ``positions`` is ``(P,)`` of absolute positions.  ``apply_rope`` reads the
+        rotary width from ``cos`` and slices; unused (all-zero) heads rotate
+        harmlessly (zeros stay zero)."""
+        d_rot = self.d_head if self.rope_d_rot is None else self.rope_d_rot
+        cos, sin = rope_cos_sin(positions, d_rot, self.rope_base)  # (P, d_rot)
         cos = cos.to(Q.dtype)
         sin = sin.to(Q.dtype)
         return apply_rope(Q, cos, sin), apply_rope(K, cos, sin)

@@ -1,5 +1,21 @@
 # RoPE port — plan
 
+> **Addendum — partial rotary (`d_rot`).** `RopeConfig` now carries an optional
+> `d_rot` (vanilla HF `partial_rotary_factor`): the first `d_rot` dims of every
+> head rotate (`rotate_half` over `d_rot`, frequencies normalized by `d_rot`) and
+> the last `d_head − d_rot` are an unrotated NoPE tail. `d_rot` defaults to
+> `d_head` (full rotary — the LLaMA3 end state below — byte-identical to the
+> pre-`d_rot` export). It is **global**: the ONNX exporter asserts a single
+> `d_rot` across all heads. This intentionally relaxes the §1 "NoPE is the
+> forbidden middle ground" stance for the `d_rot` knob. Only the rotary offset
+> head supports partial rotary (its NoPE tail is a uniform constant the softmax
+> cancels); the plane-based content/recency/global-recency heads stay full-rotary
+> and reject a partial config (`require_full_rotary`). Plumbed through
+> `graph/rope.py`, `graph/attn.py`, the compiler component + weight-writer, the
+> ONNX exporter, and the HF config/convert/modeling; covered by
+> `tests/compile/forward/test_rope_partial.py` and
+> `tests/hf/test_rope_partial_token.py`.
+
 Status: **Phases 0–7 done; Phase 8 remaining** (branch `worktree-rope`). Phase 0
 (rotary `Attn`, in-process/ONNX/HF), Phase 1 (bucket-1 near-marker count), Phase 1b (recency ramp:
 `soft_blend` + octant ramp, confirm-compile green), Phase 2 Part 1 (relative-offset all-Δ + sign

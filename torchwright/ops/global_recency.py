@@ -192,6 +192,7 @@ def global_position_from_bos(
         query_matrix,
         key_matrix,
         d_head=rope.d_head,
+        d_rot=rope.d_rot,
         base=rope.base,
     )
 
@@ -347,6 +348,7 @@ def attend_most_recent_globally(
         query_matrix,
         key_matrix,
         d_head=rope.d_head,
+        d_rot=rope.d_rot,
         base=rope.base,
     )
 

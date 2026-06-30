@@ -103,7 +103,9 @@ def create_unembedding(inp: Node, embedding: Embedding) -> Unembedding:
     return Unembedding(inp, embedding)
 
 
-def create_rope_config(d_head: int = 64, max_positions: int = 4096) -> RopeConfig:
+def create_rope_config(
+    d_head: int = 64, max_positions: int = 4096, d_rot: int | None = None
+) -> RopeConfig:
     """Create the RoPE substrate a graph is built against.
 
     Replaces the old ``create_pos_encoding`` (``docs/rope_port_plan.md`` §7):
@@ -114,13 +116,18 @@ def create_rope_config(d_head: int = 64, max_positions: int = 4096) -> RopeConfi
     passed to the compile entry points (they assert it).
 
     Args:
-        d_head: rotary width (= compiled ``d_head``).  Must be even and large
+        d_head: head width (= compiled ``d_head``).  Must be even and large
             enough that the widest content head's columns fit on the slow planes
             (``W <= d_head/2``) and the recency plane exists.
         max_positions: rollout length the recency plane is sized never to wrap
             over (the cache cap).
+        d_rot: partial-rotary width (vanilla HF ``partial_rotary_factor``).  The
+            first ``d_rot`` dims rotate; the rest are the unrotated NoPE tail.
+            ``None`` (default) is full rotary (``d_rot = d_head``).  The
+            content/recency/global-recency heads assume the full grid and reject
+            a partial ``d_rot``; the rotary offset head supports it.
 
     Returns:
         RopeConfig.
     """
-    return RopeConfig(d_head=d_head, max_positions=max_positions)
+    return RopeConfig(d_head=d_head, max_positions=max_positions, d_rot=d_rot)
