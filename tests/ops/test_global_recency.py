@@ -259,6 +259,74 @@ def test_exclude_self_does_not_pick_self():
 # ---------------------------------------------------------------------------
 
 
+def test_position_recovery_at_n500():
+    """Oracle position recovery at n=500 — mid-range beyond the n=80 basic test.
+
+    The full-cap validation (n=61440) lives in
+    ``scripts/rope_global_recency_validate.py`` (analytic path).  This test
+    confirms integer recovery at an intermediate scale reachable in the oracle
+    (exact math) path without a compilation step.
+    """
+    rope = _rope()
+    n = 500
+
+    bos_indicator = InputNode("bos", 1, value_range=(0.0, 1.0))
+    pos = global_position_from_bos(rope, bos_indicator)
+
+    bos_in = torch.zeros(n, 1)
+    bos_in[0, 0] = 1.0
+
+    result = pos.compute(n_pos=n, input_values={"bos": bos_in}).reshape(-1)
+    for m in range(n):
+        err = abs(result[m].item() - float(m))
+        assert err < 0.5, (
+            f"pos {m}: recovered {result[m].item():.3f}, expected {m}, "
+            f"error {err:.3f} ≥ 0.5"
+        )
+
+
+def test_wider_content_W16():
+    """attend_most_recent_globally works with W=16 content vectors.
+
+    Confirms that the extra planes used by wider content (position tiebreak
+    moves to the 17th-slowest plane) do not break recency ordering.
+    """
+    rope = _rope()
+    W = 16
+
+    bos_indicator = InputNode("bos", 1, value_range=(0.0, 1.0))
+    q = InputNode("q", W, value_range=(-20.0, 20.0))
+    k = InputNode("k", W, value_range=(-20.0, 20.0))
+    v = InputNode("v", 1, value_range=(-1.0e4, 1.0e4))
+
+    global_pos = global_position_from_bos(rope, bos_indicator)
+    out = attend_most_recent_globally(rope, q, k, global_pos, v)
+
+    n, stride = 80, 10
+    matches = set(range(0, n, stride))
+
+    match_vec = torch.zeros(W)
+    match_vec[0] = 10.0  # match_gain(200) × dot(100) = 20000 >> max_position tiebreak
+    other_vec = torch.zeros(W)
+
+    bos_in = torch.zeros(n, 1)
+    bos_in[0, 0] = 1.0
+    key_in = torch.stack([match_vec if p in matches else other_vec for p in range(n)])
+    query_in = match_vec.unsqueeze(0).expand(n, -1).contiguous()
+    value_in = torch.tensor([float(p) for p in range(n)]).reshape(n, 1)
+
+    result = out.compute(
+        n_pos=n,
+        input_values={"bos": bos_in, "q": query_in, "k": key_in, "v": value_in},
+    ).reshape(-1)
+
+    for p in range(1, n):
+        most_recent = max(m for m in matches if m <= p)
+        assert (
+            abs(result[p].item() - float(most_recent)) < 0.5
+        ), f"pos {p}: expected most-recent {most_recent}, got {result[p].item():.2f}"
+
+
 def test_w_of_m_uses_exponential_formula():
     """_w_of_m must compute MAX_LEN^cos(m·θ), not MAX_LEN*cos(m·θ).
 

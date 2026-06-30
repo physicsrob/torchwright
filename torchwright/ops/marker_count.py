@@ -31,6 +31,7 @@ i.e. ``gap+1`` lands within ±0.5 of the integer out to the ``max_gap`` bound.
 import math
 
 from torchwright.graph import Node, RopeConfig
+from torchwright.graph.rope import rope_inv_freq
 from torchwright.ops.arithmetic_ops import add_const, reciprocal
 from torchwright.ops.attention_ops import attend_mean_where
 
@@ -73,6 +74,22 @@ def count_since_marker(
     assert len(window_validity) == 1, "window_validity must be 1-D"
     assert len(marker_onehot) == 1, "marker_onehot must be 1-D"
     assert max_gap >= 1, "max_gap must be >= 1"
+
+    # Guard: the quasi-static approximation holds only when the slowest-plane
+    # frequency is small enough.  The analytic bound on window non-uniformity
+    # is ~333 × θ_slow² × max_gap³; exceeding 0.45 pushes the total gap error
+    # past the ±0.5 rounding threshold.  At base=5e5 this requires d_head ≥ 64
+    # for max_gap=350.
+    theta_slow = float(rope_inv_freq(rope.d_head, rope.base)[-1])
+    approx_err = 333.0 * theta_slow**2 * max_gap**3
+    if approx_err > 0.45:
+        raise ValueError(
+            f"count_since_marker: estimated gap error {approx_err:.2f} > 0.45 "
+            f"(theta_slow={theta_slow:.2e}, max_gap={max_gap}, "
+            f"d_head={rope.d_head}).  "
+            f"Increase d_head/base or reduce max_gap — at base=5e5, d_head≥64 "
+            f"is safe for max_gap=350."
+        )
 
     # mean over the window = (1 + 0*gap) / (gap+1) = 1/(gap+1).  At a query
     # whose window is empty (no valid key), attend_mean_where degrades to

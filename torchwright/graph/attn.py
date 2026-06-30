@@ -93,6 +93,7 @@ class Attn(Node):
         value_matrix: torch.Tensor,
         output_matrix: torch.Tensor,
         rope_base: float = ROPE_BASE,
+        rope_d_rot: int | None = None,
     ):
         self.d_qk = query_matrix.shape[1]
         self.d_v = value_matrix.shape[1]
@@ -112,13 +113,15 @@ class Attn(Node):
             value_matrix,
         )
 
-        # Every head is rotary on the one global grid (LLaMA3 end state); there
-        # is no non-rotary (NoPE) head, so rotate_half over d_qk requires an even
-        # d_qk unconditionally.
-        if self.d_qk % 2 != 0:
+        # The rotary front d_rot is paired by rotate_half (dim p with p+d_rot/2),
+        # so d_rot must be even.  d_rot defaults to d_qk (full rotary); the last
+        # d_qk - d_rot dims are the unrotated NoPE tail (vanilla partial rotary).
+        rope_d_rot = self.d_qk if rope_d_rot is None else rope_d_rot
+        if rope_d_rot % 2 != 0 or not (0 < rope_d_rot <= self.d_qk):
             raise ValueError(
-                f"Attn requires an even d_qk (got {self.d_qk}); rotation is "
-                f"full-width rotate_half, pairing dim p with dim p+d_qk/2."
+                f"Attn rope_d_rot must be even and in (0, d_qk={self.d_qk}]; got "
+                f"{rope_d_rot}.  The rotary front is rotate_half over d_rot, pairing "
+                f"dim p with dim p+d_rot/2."
             )
 
         self.query_matrix = query_matrix
@@ -126,6 +129,7 @@ class Attn(Node):
         self.value_matrix = value_matrix
         self.output_matrix = output_matrix
         self.rope_base = rope_base
+        self.rope_d_rot = rope_d_rot
         super().__init__(output_matrix.shape[1], inputs=[query_in, key_in, value_in])
 
     def compute_value_type(self):
@@ -150,10 +154,11 @@ class Attn(Node):
 
         # RoPE: rotate Q and K by absolute position (row index) before the
         # dot product, so the logit depends on the relative offset (i - j).
-        # Full-width rotate_half over d_qk (= d_head) on the one global grid the
-        # compiled component and the ONNX/HF runtimes also apply.
+        # rotate_half over the rotary front d_rot (= d_qk for full rotary) on the
+        # one global grid the compiled component and the ONNX/HF runtimes also
+        # apply; the last d_qk - d_rot dims are the unrotated NoPE tail.
         positions = torch.arange(n_pos, device=query_values.device)
-        cos, sin = rope_cos_sin(positions, self.d_qk, self.rope_base)
+        cos, sin = rope_cos_sin(positions, self.rope_d_rot, self.rope_base)
         cos = cos.to(query_values.dtype)
         sin = sin.to(query_values.dtype)
         query_values = apply_rope(query_values, cos, sin)

@@ -106,10 +106,11 @@ class TorchwrightAttention(nn.Module):
         self.v_proj = nn.Linear(self.d, hd, bias=False)
         self.o_proj = nn.Linear(hd, self.d, bias=False)
 
-        # RoPE (LLaMA3 rotate_half, half-split, scale baked into base). EVERY head
-        # is full-width rotary on the one global grid — rotation is full-width over
-        # d_head, by ABSOLUTE position (cache_position). There is no non-rotary
-        # (NoPE) head and no per-head enable.
+        # RoPE (LLaMA3 rotate_half, half-split, scale baked into base), rotation by
+        # ABSOLUTE position (cache_position) on the one global grid.  Vanilla
+        # partial rotary: the first ``d_rot`` dims of every head rotate and the last
+        # ``d_head - d_rot`` are the unrotated NoPE tail.  ``d_rot == d_head`` is
+        # full rotary (the LLaMA3 end state); there is no per-head enable.
         #
         # The rotary frequency grid is derived purely from the serialized config
         # and is cheap, so it is recomputed in ``forward`` on the input's device
@@ -117,9 +118,10 @@ class TorchwrightAttention(nn.Module):
         # ``from_pretrained``'s meta-device (low_cpu_mem_usage) load path does NOT
         # materialize a non-persistent buffer — it is absent from the checkpoint
         # and never re-run — so it would reload full of uninitialized garbage and
-        # the rotary multiply would propagate NaN to every logit. A plain Python
-        # scalar is immune to that path.
+        # the rotary multiply would propagate NaN to every logit. Plain Python
+        # scalars are immune to that path.
         self.rope_base = float(config.rope_base)
+        self.d_rot = int(getattr(config, "d_rot", self.d_head))
 
     @staticmethod
     def _rotate_half(x: torch.Tensor) -> torch.Tensor:
@@ -132,16 +134,24 @@ class TorchwrightAttention(nn.Module):
         cos: torch.Tensor,
         sin: torch.Tensor,
     ) -> torch.Tensor:
-        # x: (B, n_heads, T, d_head); cos/sin: (T, d_head) -> (1, 1, T, d_head).
-        # Every head rotates full-width (no per-head enable). Emitted directly,
-        # matching export.py: cross-backend ONNX/torch agreement is not algebraic
-        # (the cancel-head rows that cancel to denormal magnitude differ by one
-        # denormal ULP regardless of the form, which the test_convert parity bound
-        # tolerates — no token or meaningful logit moves), so the `x + (rot - x)`
-        # reconstruction bought nothing and is gone.
+        # x: (B, n_heads, T, d_head); cos/sin: (T, d_rot) -> (1, 1, T, d_rot).
+        # Rotate the first d_rot dims (rotate_half over d_rot) and pass the last
+        # d_head - d_rot dims (the NoPE tail) through unchanged.  d_rot == d_head
+        # (cos as wide as x) is full rotary and takes the exact pre-partial path,
+        # byte-identical to before.  Emitted directly, matching export.py:
+        # cross-backend ONNX/torch agreement is not algebraic (the cancel-head rows
+        # that cancel to denormal magnitude differ by one denormal ULP regardless
+        # of the form, which the test_convert parity bound tolerates — no token or
+        # meaningful logit moves), so the `x + (rot - x)` reconstruction is gone.
         cos = cos[None, None]
         sin = sin[None, None]
-        return x * cos + self._rotate_half(x) * sin
+        d_rot = cos.shape[-1]
+        if d_rot == x.shape[-1]:
+            return x * cos + self._rotate_half(x) * sin
+        x_front = x[..., :d_rot]
+        x_pass = x[..., d_rot:]
+        rotated = x_front * cos + self._rotate_half(x_front) * sin
+        return torch.cat([rotated, x_pass], dim=-1)
 
     def forward(
         self,
@@ -157,14 +167,15 @@ class TorchwrightAttention(nn.Module):
         v = self.v_proj(hidden_states).view(shape).transpose(1, 2)
 
         # RoPE rotates Q and the NEW K by absolute position, before the cache
-        # update, so the cache stores already-rotated K (slot == position).  Every
-        # head is full-width rotary on the one global grid.
+        # update, so the cache stores already-rotated K (slot == position).  The
+        # frequency grid spans the rotary front d_rot (normalized by d_rot); the
+        # NoPE tail is handled by _apply_rope.
         device = hidden_states.device
-        p = torch.arange(0, self.d_head, 2, dtype=torch.float64, device=device)
-        inv = (self.rope_base ** (-p / self.d_head)).to(torch.float32)
-        rope_freq = torch.cat([inv, inv])  # (d_head,)
+        p = torch.arange(0, self.d_rot, 2, dtype=torch.float64, device=device)
+        inv = (self.rope_base ** (-p / self.d_rot)).to(torch.float32)
+        rope_freq = torch.cat([inv, inv])  # (d_rot,)
         ang = cache_position.to(torch.float32)[:, None] * rope_freq[None, :]
-        cos = torch.cos(ang)  # (T, d_head)
+        cos = torch.cos(ang)  # (T, d_rot)
         sin = torch.sin(ang)
         q = self._apply_rope(q, cos, sin)
         k = self._apply_rope(k, cos, sin)

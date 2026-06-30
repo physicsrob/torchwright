@@ -86,6 +86,22 @@ def test_oracle_marker_not_at_zero():
         ), f"pos {n}: expected gap {n - marker_pos}, got {got[n].item():.3f}"
 
 
+def test_unsafe_dhead_raises():
+    """count_since_marker raises ValueError for d_head too small to give <0.5
+    gap error at the given max_gap (the quasi-static approximation breaks down).
+    d_head=16 with max_gap=350 gives analytic error ~1.5 >> 0.45 threshold."""
+    import pytest
+
+    rope = create_rope_config(d_head=16, max_positions=512)
+    with pytest.raises(ValueError, match="estimated gap error"):
+        count_since_marker(
+            rope,
+            create_input("w", 1),
+            create_input("m", 1),
+            max_gap=350,
+        )
+
+
 def test_compiled_recovers_gap_to_bound():
     """Compiled transformer: gap[n] rounds to n out to the ~350 bound."""
     _rope, _marker_in, _valid_in, gap = _build()

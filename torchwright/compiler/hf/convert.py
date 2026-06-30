@@ -153,10 +153,12 @@ def build_config(
         n_heads_per_layer.append(nh)
         d_hidden_per_layer.append(int(inits[f"l{i}_W1"].shape[1]))
 
-    # RoPE: every head is full-width rotary on one global grid; the exporter
-    # records the single shared `rope_base` in the sidecar meta and the converter
-    # rebuilds the rotation from it (no per-head enable).
+    # RoPE on one global grid; the exporter records the single shared `rope_base`
+    # and the partial-rotary width `d_rot` in the sidecar meta, and the converter
+    # rebuilds the rotation from them.  `d_rot` defaults to `d_head` (full rotary)
+    # for artifacts exported before partial rotary existed.
     rope_base = float(meta.get("rope_base", 500000.0))
+    rope_d_rot = int(meta.get("d_rot", d_head))
 
     # Resolve bos/eos ids. A token of None means "this model has no bos/eos";
     # a non-None token that isn't in the vocab is a caller error (e.g. wrong
@@ -201,6 +203,7 @@ def build_config(
         head_kind="token",
         cache_stride=meta.get("cache_stride"),
         rope_base=rope_base,
+        d_rot=rope_d_rot,
         bos_token_id=bos_id,
         eos_token_id=eos_id,
         tie_word_embeddings=False,
@@ -257,9 +260,10 @@ def build_state_dict(config, inits: Dict[str, np.ndarray]) -> Tuple[dict, set]:
         sd["model.norm.weight"] = _t(take("final_norm"))
 
     # RoPE constants are config-derived (the model rebuilds the rotation from
-    # rope_base; every head is full-width rotary), not state-dict weights — mark
-    # them consumed so the all-mapped check passes.
-    for name in ("rope_freq", "rope_base", "rope_split"):
+    # rope_base and d_rot), not state-dict weights — mark them consumed so the
+    # all-mapped check passes.  rope_partial_split is emitted only for partial
+    # rotary; the `in inits` guard skips it on full-rotary artifacts.
+    for name in ("rope_freq", "rope_base", "rope_split", "rope_partial_split"):
         if name in inits:
             consumed.add(name)
 

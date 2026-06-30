@@ -269,13 +269,22 @@ def test_probe_and_debug_value_parity_with_headless(token_artifact):
     # Same probe coverage on both backends.
     assert len(report_onnx.nodes_checked) == len(report_h.nodes_checked)
 
-    # debug_value parity at the output node.
+    # Cross-backend debug_value parity at the output node (onnxruntime artifact
+    # vs in-process headless).  Bounded by the same onnxruntime execution-provider
+    # floor as the oracle probes above (``_ONNX_PROBE_ATOL``): the headless
+    # backend tracks the oracle to fp32 round-off (~2e-6), so the ONNX EP rounding
+    # on the RoPE rotary attention is the dominant term.  Since the partial-rotary
+    # (``d_rot``) direct-form rotation landed, that rounding reaches ~2^-10
+    # (~9.8e-4) on this adder's large-magnitude heads — within the floor, and
+    # measured norm-independent (identical with rms_norm on/off, so it is the
+    # rotary EP gap, not the identity norm).  A tighter bound here would be
+    # inconsistent with ``_ONNX_PROBE_ATOL``.
     session(ids, debug=True)
     headless(headless.build_prefill(iv, len(TOKENS)), debug=True)
     v_onnx = session.debug_value(out_onnx)
     v_h = headless.debug_value(out_h)
     assert v_onnx is not None and v_h is not None
-    assert float((v_onnx - v_h).abs().max()) < 1e-4
+    assert float((v_onnx - v_h).abs().max()) < _ONNX_PROBE_ATOL
 
 
 def test_decode_with_past_matches_prefill_and_debug_passes(token_artifact):

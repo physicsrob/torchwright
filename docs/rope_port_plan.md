@@ -1,5 +1,21 @@
 # RoPE port — plan
 
+> **Addendum — partial rotary (`d_rot`).** `RopeConfig` now carries an optional
+> `d_rot` (vanilla HF `partial_rotary_factor`): the first `d_rot` dims of every
+> head rotate (`rotate_half` over `d_rot`, frequencies normalized by `d_rot`) and
+> the last `d_head − d_rot` are an unrotated NoPE tail. `d_rot` defaults to
+> `d_head` (full rotary — the LLaMA3 end state below — byte-identical to the
+> pre-`d_rot` export). It is **global**: the ONNX exporter asserts a single
+> `d_rot` across all heads. This intentionally relaxes the §1 "NoPE is the
+> forbidden middle ground" stance for the `d_rot` knob. Only the rotary offset
+> head supports partial rotary (its NoPE tail is a uniform constant the softmax
+> cancels); the plane-based content/recency/global-recency heads stay full-rotary
+> and reject a partial config (`require_full_rotary`). Plumbed through
+> `graph/rope.py`, `graph/attn.py`, the compiler component + weight-writer, the
+> ONNX exporter, and the HF config/convert/modeling; covered by
+> `tests/compile/forward/test_rope_partial.py` and
+> `tests/hf/test_rope_partial_token.py`.
+
 Status: **Phases 0–7 done; Phase 8 remaining** (branch `worktree-rope`). Phase 0
 (rotary `Attn`, in-process/ONNX/HF), Phase 1 (bucket-1 near-marker count), Phase 1b (recency ramp:
 `soft_blend` + octant ramp, confirm-compile green), Phase 2 Part 1 (relative-offset all-Δ + sign
@@ -875,17 +891,17 @@ are if they hold:
 - **(d) Boosted-BOS weight inversion.** Place a one-hot feature on the slowest RoPE plane at BOS with
   value `sqrt(ln(MAX_LEN))` and use a matching constant query. All other keys carry zero on this
   dimension. The Q·K score to BOS is then `ln(MAX_LEN)·cos(m·θ_slow)` and all other keys score 0,
-  giving softmax weight `w = MAX_LEN·cos(m·θ_slow) / (MAX_LEN·cos(m·θ_slow) + m)`. The minimum
-  gap between adjacent-m weights is `≥ 1/(4·MAX_LEN) ≈ 3.9e-6` — about 65× the fp32 weight floor
+  giving softmax weight `w = MAX_LEN^cos(m·θ_slow) / (MAX_LEN^cos(m·θ_slow) + m)`. The minimum
+  gap between adjacent-m weights is `≥ 4.9e-6` — about 81× the fp32 weight floor
   (~6e-8). The function is strictly monotone over [0, MAX_LEN] because `θ·m·sin(m·θ)+cos(m·θ) > 0`
   holds whenever `m·θ_slow < π/2`; at the slowest natural plane (θ_slow ≈ 2.22e-6) the maximum
   `m·θ_slow ≈ 0.142`, well inside that bound. The inverse `m = g(w)` is a smooth monotone function
   on [1/2, 1] that can be precomputed and fit as a PWL table. The cosine attenuation factor bakes
-  into the PWL — there is no separate correction step. With ~1800 log-uniform breakpoints the PWL
-  error is ≈ 0.005; the fp32 softmax floor contributes ≈ 0.008; combined ≈ 0.013, well within the
-  0.5 rounding threshold for integer recovery. *(Prototype to validate: measure the actual weight
-  gaps and PWL fit quality; confirm monotonicity test at MAX_LEN; 1800 BPs is compile-time cost
-  only.)*
+  into the PWL — there is no separate correction step. **Shipped:** 1024 log-uniform breakpoints
+  (PWL error ~0.009); fp32 softmax noise ~0.006; fp32 ReLU accumulation in the PWL sum dominates
+  at ~0.09 at small positions; empirical ceiling ~0.15 — 3.3× below the 0.5 rounding threshold.
+  Full-cap monotonicity validated analytically via `scripts/rope_global_recency_validate.py`;
+  compiled tests exercise shorter contexts (n ≤ 117).
 
 - **It may live outside the compiler.** It is plausible the global recency index is a host-side /
   post-processing mechanism (clip-memory served by an external index) rather than a compiled per-token

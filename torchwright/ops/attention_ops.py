@@ -263,6 +263,7 @@ def _build_selection_attn(
         query_matrix,
         key_matrix,
         d_head=rope.d_head,
+        d_rot=rope.d_rot,
         base=rope.base,
     )
 
@@ -308,6 +309,7 @@ def _build_where_attn(
         query_matrix,
         key_matrix,
         d_head=rope.d_head,
+        d_rot=rope.d_rot,
         base=rope.base,
     )
 
@@ -600,6 +602,7 @@ def attend_argmin_above_integer(
         query_matrix,
         key_matrix,
         d_head=rope.d_head,
+        d_rot=rope.d_rot,
         base=rope.base,
     )
     return _wrap_hard_selection_output(
@@ -780,6 +783,7 @@ def attend_argmin_above_in_bucket(
         query_matrix,
         key_matrix,
         d_head=rope.d_head,
+        d_rot=rope.d_rot,
         base=rope.base,
     )
     return _wrap_hard_selection_output(
@@ -906,6 +910,7 @@ def attend_argmin_unmasked(
         query_matrix,
         key_matrix,
         d_head=rope.d_head,
+        d_rot=rope.d_rot,
         base=rope.base,
     )
     return _wrap_hard_selection_output(
@@ -1018,6 +1023,7 @@ def attend_argmin_valid_unmasked(
         query_matrix,
         key_matrix,
         d_head=rope.d_head,
+        d_rot=rope.d_rot,
         base=rope.base,
     )
     return _wrap_hard_selection_output(
@@ -1083,7 +1089,7 @@ def attend_mean_where(
     query_matrix = torch.zeros((1, d_qk))
     query_matrix[0, 0] = 1.0
 
-    # pos_encoding doesn't appear in key_in — only validity drives K.
+    # Only validity drives K — no additional position feature in key_in.
     key_matrix = torch.zeros((len(validity), d_qk))
     key_matrix[0, 0] = _VALIDITY_DIRECT
 
@@ -1094,6 +1100,7 @@ def attend_mean_where(
         query_matrix,
         key_matrix,
         d_head=rope.d_head,
+        d_rot=rope.d_rot,
         base=rope.base,
     )
     # Mean of values in [lo, hi] stays in [lo, hi] (convex combination),
@@ -1184,6 +1191,7 @@ def attend_argmax_dot(
         query_matrix,
         key_matrix,
         d_head=rope.d_head,
+        d_rot=rope.d_rot,
         base=rope.base,
     )
     return _wrap_hard_selection_output(
@@ -1244,6 +1252,7 @@ def _build_dot_where_attn(
         query_matrix,
         key_matrix,
         d_head=rope.d_head,
+        d_rot=rope.d_rot,
         base=rope.base,
     )
 
@@ -1375,11 +1384,15 @@ def attend_to_offset(rope: RopeConfig, value: Node, delta_pos: int = -1) -> Node
     ``delta_pos = -1`` is the previous position.  Out-of-range targets (before
     BOS) are a causal don't-care — do not consume them.
 
-    ``delta_pos = 0`` is a no-op (returns ``value``).  Full-width rotary on the
-    ``rope.d_head`` grid (the §6 LLaMA3 end state), so it works on all three
-    runtime surfaces.
+    ``delta_pos = 0`` is a no-op (returns ``value``).  Rotary on the
+    ``rope.d_head`` grid with the config's ``rope.d_rot`` rotary front (full
+    rotary by default; partial rotary is fine here — the unrotated NoPE tail
+    contributes a position-independent constant the softmax cancels), so it works
+    on all three runtime surfaces.
     """
-    return rotary_offset_head(value, delta_pos, d_qk=rope.d_head, base=rope.base)
+    return rotary_offset_head(
+        value, delta_pos, d_qk=rope.d_head, base=rope.base, d_rot=rope.d_rot
+    )
 
 
 def get_prev_value(
@@ -1441,6 +1454,7 @@ def get_prev_value(
         query_matrix,
         key_matrix,
         d_head=rope.d_head,
+        d_rot=rope.d_rot,
         max_positions=rope.max_positions,
         base=rope.base,
         recency_gain=recency_gain,
@@ -1545,6 +1559,7 @@ def attend_most_recent_matching(
         query_matrix,
         key_matrix,
         d_head=rope.d_head,
+        d_rot=rope.d_rot,
         max_positions=rope.max_positions,
         base=rope.base,
         recency_gain=recency_gain,

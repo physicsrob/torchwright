@@ -89,6 +89,7 @@ class TorchwrightConfig(PretrainedConfig):
         head_kind: str = "token",
         cache_stride: int | None = None,
         rope_base: float = 500000.0,
+        d_rot: int | None = None,
         rms_norm: bool = False,
         rms_norm_eps: float = 1e-5,
         **kwargs,
@@ -102,11 +103,21 @@ class TorchwrightConfig(PretrainedConfig):
         self.max_seq = int(max_seq)
         self.head_kind = head_kind
         self.cache_stride = None if cache_stride is None else int(cache_stride)
-        # RoPE: every head is full-width rotary on one global grid (rotate_half
-        # over d_head by absolute position) — there is no non-rotary head and no
-        # per-head enable.  ``rope_base`` is the single shared grid base (LLaMA3
-        # value; default 5e5).  See docs/rope_port_plan.md §6.
+        # RoPE on one global grid (rotate_half by absolute position).
+        # ``rope_base`` is the single shared grid base (LLaMA3 value; default 5e5).
+        # ``d_rot`` is the partial-rotary width (vanilla HF partial_rotary_factor):
+        # the first ``d_rot`` dims of every head rotate, the rest are the unrotated
+        # NoPE tail.  ``None`` resolves to full rotary (``d_rot == d_head``).  See
+        # docs/rope_port_plan.md §6.
         self.rope_base = float(rope_base)
+        self.d_rot = int(d_rot) if d_rot is not None else self.d_head
+        # Validate only for a real model (d_head > 0); HF instantiates configs with
+        # all-zero defaults, which must not raise.
+        if self.d_head and (self.d_rot % 2 != 0 or not (0 < self.d_rot <= self.d_head)):
+            raise ValueError(
+                f"TorchwrightConfig.d_rot must be even and in (0, "
+                f"d_head={self.d_head}]; got {self.d_rot}."
+            )
         self.rms_norm = bool(rms_norm)
         self.rms_norm_eps = float(rms_norm_eps)
         # Aliases so generic transformers utilities that reach for the canonical

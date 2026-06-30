@@ -694,6 +694,23 @@ def forward_compile(
             f"dim p+d_head/2 and every head is rotary on the global grid."
         )
 
+    # d_rot (vanilla partial rotary) is one global value per model: the runtime
+    # rotates every head's front rope_d_rot planes on one shared cos/sin grid (a
+    # single rope_freq init in ONNX), so a graph mixing rotary widths cannot
+    # compile to one consistent transformer.  Assert it here — before compiling,
+    # for both backends — so a mixed graph fails fast and identically instead of
+    # diverging in-process (the per-layer component holds one width) or only
+    # raising at ONNX export.  Build every head from one RopeConfig.d_rot.
+    from torchwright.graph.attn import Attn as _Attn
+
+    d_rots = {n.rope_d_rot for n in graph.get_all_nodes() if isinstance(n, _Attn)}
+    if len(d_rots) > 1:
+        raise ValueError(
+            f"rope_d_rot must be one global value per model, but the graph's Attn "
+            f"nodes use {sorted(d_rots)}.  Partial rotary (RopeConfig.d_rot) is "
+            f"global — build every head from one RopeConfig."
+        )
+
     if d_hidden is None:
         d_hidden = d
 

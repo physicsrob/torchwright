@@ -300,17 +300,16 @@ def _write_compute_attn(
 
     layer_d_head = attn.d_head
 
-    # RoPE is full-width on the global grid (LLaMA3): every head is rotary and
-    # rotates the entire d_head, so its Q/K projection must fill d_head exactly —
-    # there is no partial-width and no non-rotary (NoPE) head.  export.py always
-    # rotates the full d_head (it has no separate width guard of its own), so this
-    # assert is the only thing keeping the in-process and exported runtimes
-    # rotating identical dims.  Negative test (both directions) lives in
-    # tests/compile/forward/test_compiler_assertions.py.
+    # The head must FILL the grid: its Q/K projection occupies the whole d_head
+    # (the rotary front + the unrotated NoPE tail both live in real columns).
+    # d_rot (how many of those planes rotate) is orthogonal and threaded
+    # separately below; this assert only guards the Q/K *width*.  Negative test
+    # (both directions) lives in tests/compile/forward/test_compiler_assertions.py.
     assert node.d_qk == layer_d_head, (
         f"Attn '{node.name}' requires d_qk == d_head; got "
         f"d_qk={node.d_qk}, d_head={layer_d_head}.  Build the head full-width "
-        f"(d_qk={layer_d_head}); partial-width rotary is not supported."
+        f"(d_qk={layer_d_head}); a narrower Q/K width is not supported "
+        f"(partial rotary is set via rope_d_rot, not by shrinking d_qk)."
     )
 
     # Q/K fill the rotary grid exactly (d_qk == d_head, asserted above), so they
@@ -333,9 +332,14 @@ def _write_compute_attn(
         )
 
         head = _allocate_head(attn)
-        # Every head is rotary, full-width over d_head (rotate_half) on the one
-        # global grid; just record the base (the component rotates every head).
+        # Record the rotary base and partial-rotary width (the component rotates
+        # every head's front d_rot planes on the one global grid).  Like
+        # rope_base, this is one value per layer-component.  d_rot is one global
+        # value per model — forward_compile asserts every graph Attn node shares
+        # it before compiling, so all heads packed into this layer agree and the
+        # last write here is always the same value.
         attn.rope_base = node.rope_base
+        attn.rope_d_rot = node.rope_d_rot
         _scatter_attn_head(
             attn,
             head,
@@ -359,10 +363,12 @@ def _self_match_source(d_head, rmap, const_one):
 
     Reads the single reserved constant-1 column and projects it to
     ``hardness · ones`` (query) / ``ones`` (key) across all ``d_head`` dims.
-    Every head is full-width rotary on the one global grid, so the runtime
-    rotates this head by absolute position (rotate_half) and the logit
-    ``∝ Σ_p cos((i − j)·θ_p)`` peaks at ``i == j`` — a bit-identical Δ=0
-    transport (the §6 LLaMA3 end state).
+    The runtime rotates this head by absolute position (rotate_half over the
+    rotary front), and the logit ``∝ Σ_p cos((i − j)·θ_p)`` (plus a constant from
+    any unrotated NoPE tail) peaks at ``i == j`` — a Δ=0 transport that is
+    rotation-invariant, so it holds for full or partial rotary alike.  This is a
+    compiler-inserted head; it leaves rope_d_rot unset, so it never constrains the
+    model's global d_rot.
 
     Returns ``(qk_idx, q_mat, k_mat)`` where ``qk_idx`` is used for both the query
     and key source (Δ=0 self-match reads one source on both sides).

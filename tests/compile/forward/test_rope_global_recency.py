@@ -116,3 +116,26 @@ def test_prefill_equals_cached_decode():
         full[:8],
         torch.tensor(decoded)[:8],
     )
+
+
+def test_compiled_picks_most_recent_globally_larger_n():
+    """Compiled path at n=500 — extends coverage beyond the n=60 basic test.
+
+    Full-cap validation (n=61440) is analytic-only
+    (``scripts/rope_global_recency_validate.py``).  This test exercises the
+    compiled transformer over a longer prefill so the BOS-weight PWL inversion
+    is exercised at positions where fp32 accumulation error is non-trivial.
+    """
+    sel = _global_recency_graph()
+    stride = 50
+    n = 500
+    matches = set(range(0, n, stride))
+    named = _e8_inputs(n, matches)
+    m = compile_headless(sel, d=2048, d_head=D_HEAD, verbose=False)
+    out = m(_pack(m, named, n).to(m._net.device)).reshape(-1).cpu()
+
+    for p in range(1, n):
+        most_recent = max(mp for mp in matches if mp <= p)
+        assert (
+            abs(out[p].item() - float(most_recent)) < 0.5
+        ), f"pos {p}: expected {most_recent}, got {out[p].item():.2f}"
