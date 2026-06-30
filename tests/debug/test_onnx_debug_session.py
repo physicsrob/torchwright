@@ -275,7 +275,16 @@ def test_probe_and_debug_value_parity_with_headless(token_artifact):
     v_onnx = session.debug_value(out_onnx)
     v_h = headless.debug_value(out_h)
     assert v_onnx is not None and v_h is not None
-    assert float((v_onnx - v_h).abs().max()) < 1e-4
+    # v_onnx carries the onnxruntime fp32 execution floor (the same one this
+    # test budgets _ONNX_PROBE_ATOL=2.5e-3 against above), while v_h is
+    # oracle-tight; so their cross-backend difference must allow that floor, not
+    # the 1e-4 that assumed both sides were oracle-tight. The old 1e-4 sat below
+    # the onnxruntime floor and flipped on the EP's rounding (a single 2^-10 ULP
+    # at the adder's value magnitude tripped it deterministically on some
+    # workers). probe_compiled(session, atol=2.5e-3) above already proves the
+    # ONNX backend matches the oracle at every node, so this is purely the
+    # cross-backend round-off budget.
+    assert float((v_onnx - v_h).abs().max()) < _ONNX_PROBE_ATOL
 
 
 def test_decode_with_past_matches_prefill_and_debug_passes(token_artifact):
