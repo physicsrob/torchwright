@@ -8,7 +8,9 @@ normalized by ``d_rot``.  Coverage:
 * the primitive ``apply_rope`` leaves the NoPE tail exactly position-invariant
   and reduces to the full-rotary expression at ``d_rot == d_head``;
 * ``RopeConfig`` validates ``d_rot``;
-* the plane-based content heads reject a partial ``d_rot`` (full-rotary only);
+* the content heads route onto the NoPE tail under partial ``d_rot`` — they build,
+  select by content, and the selection is EXACT across distance (no slow-plane
+  attenuation), oracle == compiled (``probe_compiled``);
 * the rotary offset head still selects the previous position at ``d_rot < d_head``
   — oracle == compiled (``probe_compiled``) and prefill == cached decode.
 """
@@ -43,6 +45,16 @@ def _expected_prev(payload: torch.Tensor) -> torch.Tensor:
     shifted = payload.squeeze(1).roll(1)
     shifted[0] = payload[0, 0]
     return shifted
+
+
+def _pack(module, named, n):
+    """Pack named per-input tensors into the compiled module's flat input row."""
+    total = sum(w for _, _, w in module._input_specs)
+    out = torch.zeros(n, total)
+    for name, start, w in module._input_specs:
+        if name in named:
+            out[:, start : start + w] = named[name]
+    return out
 
 
 def test_apply_rope_tail_is_position_invariant():
@@ -81,15 +93,55 @@ def test_rope_config_default_d_rot_is_full():
     assert RopeConfig(d_head=D_HEAD, max_positions=512, d_rot=D_ROT).d_rot == D_ROT
 
 
-def test_content_head_rejects_partial_rotary():
-    """The plane-based content heads ride specific planes of the full grid, so a
-    partial ``d_rot`` config is rejected loudly (full-rotary only)."""
+def _argmin_where_graph():
     rope = create_rope_config(d_head=D_HEAD, max_positions=512, d_rot=D_ROT)
     score = create_input("score", 1)
     validity = create_input("validity", 1)
     value = create_input("value", 1)
-    with pytest.raises(NotImplementedError, match="full rotary"):
-        attend_argmin_where(rope, score, validity, value)
+    return attend_argmin_where(rope, score, validity, value)
+
+
+def test_content_head_builds_on_nope_tail_partial_rotary():
+    """A content head now *builds* under partial rotary (no longer rejected): the
+    content rides the NoPE tail, so the Attn carries ``rope_d_rot == D_ROT`` and the
+    rotary front of its Q/K projection is all zero (the logit is pure content
+    dot)."""
+    from torchwright.compiler.forward.graph_analysis import GraphAnalyzer
+    from torchwright.graph.attn import Attn
+
+    sel = _argmin_where_graph()
+    attns = [n for n in GraphAnalyzer(sel).get_all_nodes() if isinstance(n, Attn)]
+    assert attns, "expected a content Attn head"
+    head = attns[0]
+    assert head.rope_d_rot == D_ROT
+    assert head.query_matrix.shape[1] == D_HEAD  # head fills the grid (d_qk==d_head)
+    # The content lives in the unrotated tail; the rotary front is zero.
+    assert head.query_matrix[:, :D_ROT].abs().sum() == 0.0
+    assert head.key_matrix[:, :D_ROT].abs().sum() == 0.0
+    assert head.query_matrix[:, D_ROT:].abs().sum() > 0.0
+
+
+def test_partial_content_compiled_matches_oracle_and_selects():
+    """Compiled partial-rotary argmin-where == oracle, and selects the min-score
+    valid key EXACTLY across distance (tail content has no slow-plane attenuation):
+    a unique min planted at position 1 is selected by every later query, near and
+    far alike."""
+    sel = _argmin_where_graph()
+    n = 24
+    sc = torch.full((n, 1), 50.0)
+    sc[1, 0] = 1.0  # unique minimum at a near position
+    va = torch.ones(n, 1)  # all valid
+    val = (torch.arange(n, dtype=torch.float32) * 10.0).unsqueeze(1)
+    named = {"score": sc, "validity": va, "value": val}
+
+    compiled = compile_headless(sel, d=D, d_head=D_HEAD, verbose=False)
+    report = probe_compiled(compiled, sel, named, n, atol=1e-2)
+    assert report.first_divergent is None, report.format_short()
+
+    out = compiled(_pack(compiled, named, n).to(compiled._net.device)).reshape(-1).cpu()
+    # Every query q >= 1 selects position 1 (value 10), Δ from 0 (q=1) to 22 (q=23).
+    for q in range(1, n):
+        assert abs(out[q].item() - 10.0) < 1e-2, f"pos {q}: got {out[q].item():.4f}"
 
 
 def test_compile_rejects_mixed_d_rot():
