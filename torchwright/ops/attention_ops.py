@@ -14,14 +14,16 @@ All primitives here follow this template:
   per-query signal that rendezvous with a key-side vector).
   ``query_matrix`` scales that ``1.0`` by ``_QUERY_GAIN`` into column 0 of
   the logit, giving a stable positive per-query gain.
-- Every head is **full-width rotary on slow planes**: the content columns are
-  relocated onto the slowest planes of the ``rope.d_head`` ``rotate_half`` grid
-  (:func:`~torchwright.graph.rope.rotary_content_head`), so the match survives
-  the end-state global rotation (``docs/rope_port_plan.md`` §3).  The builders
-  therefore take a :class:`~torchwright.graph.RopeConfig` (carrying
-  ``d_head`` / ``base``) where they used to take a ``PosEncoding`` node —
-  position is a rotation applied inside attention, no longer a residual
-  feature.
+- Every head's content is placed by
+  :func:`~torchwright.graph.rope.rotary_content_head` so the match survives the
+  global rotation, with the placement **routed by the config's ``d_rot``**: under
+  full rotary the content rides the slowest planes of the ``rope.d_head``
+  ``rotate_half`` grid (quasi-static, ``cos((i−j)·θ_slow) ≈ 1``); under partial
+  rotary (``d_rot < d_head``) it rides the unrotated NoPE tail ``[d_rot:d_head]``,
+  an *exact* position-free match (``docs/rope_port_plan.md`` §3).  The builders
+  therefore take a :class:`~torchwright.graph.RopeConfig` (carrying ``d_head`` /
+  ``d_rot`` / ``base``) where they used to take a ``PosEncoding`` node — position
+  is a rotation applied inside attention, no longer a residual feature.
 - ``key_in`` contains **only** what ``key_matrix`` reads from: the
   content nodes that drive selection (score, validity, indicators,
   onehot, etc.).  Never concat a node into ``key_in`` without wiring up

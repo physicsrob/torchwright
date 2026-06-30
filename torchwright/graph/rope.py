@@ -83,15 +83,19 @@ class RopeConfig:
 def require_full_rotary(d_rot: int, d_head: int, feature: str) -> None:
     """Raise unless the head is full rotary (``d_rot == d_head``).
 
-    The content / recency / global-recency / marker heads lay their signal on
-    specific **planes** of the full ``d_head`` ``rotate_half`` grid
-    (:func:`place_on_slow_planes`, :func:`rope_lobe_band`).  Under partial rotary
-    a plane's ``rotate_half`` partner can fall in the unrotated NoPE tail, which
-    silently breaks the pairing — so these builders reject a partial ``d_rot``
-    loudly rather than miscompute.  Only :func:`rotary_offset_head` (whose tail is
-    a uniform constant, not plane-indexed content) supports partial rotary.
-    Callers pass ``rope.d_rot`` / ``rope.d_head``.  Migrating the plane-based
-    heads to the NoPE tail is future work."""
+    The **local-recency lobe** (:func:`rotary_recency_head` /
+    :func:`~torchwright.ops.attention_ops.attend_most_recent_matching`) lays a
+    constant feature across a *band* of planes of the full ``d_head``
+    ``rotate_half`` grid (:func:`rope_lobe_band`).  Under partial rotary a band
+    plane's ``rotate_half`` partner (paired by ``d_rot/2`` once the rotation runs
+    over the front, not by ``d_head/2``) can fall in the unrotated NoPE tail, which
+    silently breaks the pairing — so this builder rejects a partial ``d_rot``
+    loudly rather than miscompute.  Callers pass ``rope.d_rot`` / ``rope.d_head``.
+
+    The content heads (:func:`rotary_content_head`) and the offset head
+    (:func:`rotary_offset_head`) now *support* partial rotary — content rides the
+    NoPE tail (:func:`place_on_nope_tail`); the local lobe is left full-rotary only
+    because DOOM uses the global recency mechanism past the lobe window."""
     if d_rot != d_head:
         raise NotImplementedError(
             f"{feature} assumes full rotary (d_rot == d_head) but got "
@@ -183,9 +187,10 @@ def place_on_slow_planes(mat: torch.Tensor, d_head: int) -> torch.Tensor:
     not mix under rotation.  Requires ``W ≤ d_head/2``.
 
     Returns a ``(rows, d_head)`` matrix; pass it as the Q/K projection of an
-    ``Attn``.  Content heads ride the slow planes of the full ``d_head`` grid, so
-    they are full-rotary only (:func:`require_full_rotary`); partial rotary would
-    move slow planes into the unrotated tail and break the slow-plane assumption.
+    ``Attn``.  This is the **full-rotary** content placement; under partial rotary
+    :func:`rotary_content_head` routes content to the NoPE tail
+    (:func:`place_on_nope_tail`) instead, because partial rotary would move the
+    slow planes into the unrotated tail and break the slow-plane assumption.
     """
     rows, w = mat.shape
     half = d_head // 2
@@ -200,6 +205,44 @@ def place_on_slow_planes(mat: torch.Tensor, d_head: int) -> torch.Tensor:
     return full
 
 
+def place_on_nope_tail(mat: torch.Tensor, d_head: int, d_rot: int) -> torch.Tensor:
+    """Relocate a content head's ``(rows, W)`` Q/K projection onto the **unrotated
+    NoPE tail** ``[d_rot:d_head]`` of the partial-rotary grid.
+
+    The partial-rotary dual of :func:`place_on_slow_planes`.  Under vanilla partial
+    rotary (``d_rot < d_head``) :func:`apply_rope` rotates only the first ``d_rot``
+    dims and passes the last ``d_head - d_rot`` (the tail) through *exactly*
+    unmodified at every position (proven by
+    ``test_apply_rope_tail_is_position_invariant``).  A content scalar placed on a
+    tail dim is therefore read by the Q·K dot product with **no** position
+    dependence at all — exactly position-free at any distance, with none of the
+    slow-plane cosine attenuation :func:`place_on_slow_planes` leaves behind.  This
+    is what dissolves the full-rotary ``d_head`` budget: content rides the tail,
+    position/recency rides the disjoint rotary front.
+
+    Layout: content column ``c`` goes to tail dim ``d_rot + c`` (the ``W`` content
+    columns fill the front of the tail; the rotary front ``[0:d_rot]`` stays all
+    zero, so this head's logit is the bare content dot product, no rotation).
+    Requires ``W <= d_head - d_rot``.
+
+    Returns a ``(rows, d_head)`` matrix; pass it as the Q/K projection of an
+    ``Attn`` built with ``rope_d_rot=d_rot`` so the runtime leaves the tail dims
+    unrotated.
+    """
+    rows, w = mat.shape
+    tail = d_head - d_rot
+    if w > tail:
+        raise ValueError(
+            f"content width {w} exceeds the {tail}-wide NoPE tail at "
+            f"d_head={d_head}, d_rot={d_rot}; raise d_head, lower d_rot, or "
+            f"narrow the content."
+        )
+    full = mat.new_zeros((rows, d_head))
+    for c in range(w):
+        full[:, d_rot + c] = mat[:, c]
+    return full
+
+
 def rotary_content_head(
     query_in,
     key_in,
@@ -211,35 +254,61 @@ def rotary_content_head(
     base: float = ROPE_BASE,
     d_rot: int | None = None,
 ):
-    """A content-selection ``Attn`` made **rotary on slow planes**.
+    """A content-selection ``Attn`` made rotary, with the content placed so the
+    match survives the global rotation — **routed by ``d_rot``**.
 
     Takes a content head's compact ``(·, W)`` ``query_matrix`` / ``key_matrix``
     (the same layout the ``attend_*`` builders construct — score in col 0,
     validity / bucket / dot dims in later cols) and rebuilds it as a full-width
-    ``d_head`` rotary head with the content relocated onto the slowest ``W``
-    planes via :func:`place_on_slow_planes`.  V/O pass the payload through
-    unchanged.  This is the Phase-3 content capability (``docs/rope_port_plan.md``
-    §3, §8): selection by content survives the global rotation because the match
-    rides quasi-static planes.
+    ``d_head`` head.  Two placements, picked by the config's ``d_rot``:
 
-    Full-rotary only: the content rides specific planes of the full ``d_head``
-    grid, so a partial ``d_rot`` is rejected (see :func:`require_full_rotary`).
+    - **Full rotary** (``d_rot is None`` or ``== d_head``): content relocated onto
+      the slowest ``W`` planes of the ``d_head`` ``rotate_half`` grid via
+      :func:`place_on_slow_planes`.  The slow planes are quasi-static under the
+      global rotation (``cos((i−j)·θ_slow) ≈ 1``), so the match is *approximately*
+      position-free (``docs/rope_port_plan.md`` §3).
+
+    - **Partial rotary** (``d_rot < d_head``): content relocated onto the unrotated
+      NoPE tail ``[d_rot:d_head]`` via :func:`place_on_nope_tail`, and the head is
+      built with ``rope_d_rot=d_rot`` so the runtime leaves the tail dims
+      unrotated.  The match is then *exactly* position-free at any distance (no
+      slow-plane attenuation, no slow-plane budget).  This is the deliberate
+      relaxation of §1's "NoPE is the forbidden middle ground" stance for the
+      ``d_rot`` knob — content on disjoint dims from the rotated position/recency
+      planes.
+
+    V/O pass the payload through unchanged in both cases.  The selection-only
+    ``attend_*`` builders need no per-builder change: passing ``rope.d_rot`` here
+    routes them automatically.
+
+    Note this routes only the *content* placement.  Heads that also need a
+    position/recency signal on a *rotated* plane (the BOS-weight head and
+    :func:`~torchwright.ops.global_recency.attend_most_recent_globally`) cannot
+    delegate here under partial rotary — they place the rotated column explicitly.
+    The local-recency lobe (:func:`rotary_recency_head`) stays full-rotary only.
     """
     from torchwright.graph import Attn
 
-    require_full_rotary(
-        d_head if d_rot is None else d_rot, d_head, "rotary_content_head"
-    )
+    d_rot = d_head if d_rot is None else d_rot
     d_v = len(value)
+    if d_rot < d_head:
+        q_full = place_on_nope_tail(query_matrix, d_head, d_rot)
+        k_full = place_on_nope_tail(key_matrix, d_head, d_rot)
+        rope_d_rot = d_rot
+    else:
+        q_full = place_on_slow_planes(query_matrix, d_head)
+        k_full = place_on_slow_planes(key_matrix, d_head)
+        rope_d_rot = None  # full rotary — byte-identical to the pre-partial head
     return Attn(
         query_in=query_in,
         key_in=key_in,
         value_in=value,
-        query_matrix=place_on_slow_planes(query_matrix, d_head),
-        key_matrix=place_on_slow_planes(key_matrix, d_head),
+        query_matrix=q_full,
+        key_matrix=k_full,
         value_matrix=torch.eye(d_v),
         output_matrix=torch.eye(d_v),
         rope_base=base,
+        rope_d_rot=rope_d_rot,
     )
 
 

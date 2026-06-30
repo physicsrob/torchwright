@@ -51,7 +51,7 @@ import math
 
 import torch
 
-from torchwright.graph import Concatenate, LiteralValue, Node, RopeConfig
+from torchwright.graph import Attn, Concatenate, LiteralValue, Node, RopeConfig
 from torchwright.graph.asserts import assert_in_range
 from torchwright.graph.rope import (
     rope_inv_freq,
@@ -84,8 +84,16 @@ _RECENCY_SCALE = 1.0
 
 
 def _theta_slow(rope: RopeConfig) -> float:
-    """Frequency of the slowest rotary plane for this rope config."""
-    return float(rope_inv_freq(rope.d_head, rope.base)[-1])
+    """Frequency of the slowest **rotated** plane for this rope config.
+
+    The runtime rotation runs over the rotary front ``d_rot`` (``apply_rope`` uses
+    width ``d_rot``, so per-plane frequencies are ``base^(-2p/d_rot)``), so the
+    slowest rotated plane is index ``d_rot/2 − 1`` with frequency
+    ``rope_inv_freq(d_rot, base)[-1]``.  Under full rotary ``d_rot == d_head`` and
+    this is the slowest plane of the ``d_head`` grid — byte-identical to the
+    pre-partial form.  This is the plane the BOS-weight feature must ride so its
+    ``cos(m·θ_slow)`` attenuation matches the PWL inversion table."""
+    return float(rope_inv_freq(rope.d_rot, rope.base)[-1])
 
 
 def _w_of_m(m: float, max_len: int, theta: float) -> float:
@@ -178,22 +186,35 @@ def global_position_from_bos(
     A = math.sqrt(math.log(max_len))  # sqrt(ln(MAX_LEN)) so Q·K = ln(MAX_LEN)
 
     # --- BOS-weight attention head ---
-    # Q: constant 1.0 → projected to A on the slowest plane
-    # K: bos_indicator (1 at BOS, 0 elsewhere) → projected to A on slowest plane
-    # V: bos_indicator (so output = w_BOS · 1 + sum_others w_i · 0 = w_BOS)
+    # The BOS feature must ride a ROTATED plane: the mechanism is the
+    # cos(m·θ_slow) attenuation of the BOS score, and the "+m" in w(m)'s
+    # denominator is the count of the m non-BOS keys (each scoring 0).  Placing it
+    # on the unrotated NoPE tail would strip the cosine and mismatch the PWL table
+    # (_w_of_m bakes in cos(m·θ)), so this head cannot delegate to
+    # rotary_content_head under partial rotary (that routes the (1,1) matrix to the
+    # tail).  Place A explicitly on the slowest rotated plane d_rot/2-1
+    # (rotate_half partner d_rot-1 left zero); under full rotary that is d_head/2-1,
+    # byte-identical to the old place_on_slow_planes((1,1)) layout.
+    #   Q: constant 1.0 → A on the slowest rotated plane
+    #   K: bos_indicator (1 at BOS, 0 elsewhere) → A·bos_ind on that plane
+    #   V: bos_indicator (so output = w_BOS · 1 + Σ_others w_i · 0 = w_BOS)
     query_one = LiteralValue(torch.tensor([1.0]), name="bos_weight_query_one")
-    query_matrix = torch.tensor([[A]])  # (1, 1): 1.0 → A on slowest plane
-    key_matrix = torch.tensor([[A]])  # (1, 1): bos_ind → A·bos_ind on slowest plane
+    plane = rope.d_rot // 2 - 1
+    query_matrix = torch.zeros((1, rope.d_head))
+    query_matrix[0, plane] = A
+    key_matrix = torch.zeros((1, rope.d_head))
+    key_matrix[0, plane] = A
 
-    bos_weight = rotary_content_head(
-        query_one,
-        bos_indicator,
-        bos_indicator,  # value: 1 at BOS, 0 elsewhere → output = w_BOS
-        query_matrix,
-        key_matrix,
-        d_head=rope.d_head,
-        d_rot=rope.d_rot,
-        base=rope.base,
+    bos_weight = Attn(
+        query_in=query_one,
+        key_in=bos_indicator,
+        value_in=bos_indicator,  # value: 1 at BOS, 0 elsewhere → output = w_BOS
+        query_matrix=query_matrix,
+        key_matrix=key_matrix,
+        value_matrix=torch.eye(1),
+        output_matrix=torch.eye(1),
+        rope_base=rope.base,
+        rope_d_rot=rope.d_rot,
     )
 
     # --- PWL inverse: w → m ---
@@ -264,6 +285,16 @@ def attend_most_recent_globally(
     additional attention head vs Phase 6 (plus the upstream
     :func:`global_position_from_bos` MLP sublayer, shared across all callers).
 
+    **Placement (full vs partial rotary).**  Under full rotary the content match
+    and the position tiebreak both ride slow planes of the ``d_head`` grid (the
+    content on the slowest ``W``, the tiebreak on the next).  Under partial rotary
+    (``rope.d_rot < rope.d_head``) the content rides the unrotated NoPE tail — an
+    *exact* position-free match, dissolving the slow-plane ``d_head`` budget — and
+    only the position tiebreak rides a rotated plane (the slowest, ``d_rot/2−1``).
+    The two signals are on disjoint dims either way, so they never interact; the
+    partial path is what lets the wide unbounded clip read coexist with the global
+    position tiebreak in one feasible-``d_head`` head.
+
     Args:
         rope: RoPE config.
         query_vector: width-W content query.
@@ -297,20 +328,6 @@ def attend_most_recent_globally(
         value = attend_to_offset(rope, value, delta_pos=-1)
 
     W = len(query_vector)
-    # Guard: the position column occupies the (W+1)-th slowest plane.  That
-    # plane's frequency θ_pos must satisfy max_positions × θ_pos < π/2 so the
-    # RoPE attenuation cos((i−j)·θ_pos) remains positive for all key offsets;
-    # a negative cosine would reverse the tiebreak ordering.
-    theta_pos = float(rope_inv_freq(rope.d_head, rope.base)[rope.d_head // 2 - 1 - W])
-    if rope.max_positions * theta_pos >= math.pi / 2:
-        raise ValueError(
-            f"attend_most_recent_globally: content width W={W} places the "
-            f"position tiebreak on plane {rope.d_head // 2 - 1 - W} "
-            f"(θ={theta_pos:.3e}); max_positions={rope.max_positions} × θ = "
-            f"{rope.max_positions * theta_pos:.3f} ≥ π/2 ({math.pi/2:.3f}).  "
-            f"Narrow the content vector, increase d_head/base, or reduce "
-            f"max_positions."
-        )
 
     # Per-position logit gain: each unit of absolute position contributes
     # recency_scale to the logit.  NOT divided by max_positions — the raw
@@ -319,38 +336,100 @@ def attend_most_recent_globally(
     # recency_scale=1.0 gives adjacent diff = 1.0 >> 0.038 (26× margin).
     alpha = recency_scale
 
-    # d_qk layout (W+1 columns placed on slowest W+1 planes):
-    #   cols 0..W-1: content match (match_gain · Q · K)
-    #   col W:       position tiebreak (recency_scale · 1_query · global_position_key)
-    d_qk = W + 1
-
-    # Query: content vector + constant 1.0 for the position column
+    # Shared inputs: content vector + a constant 1.0 (query side) / global_position
+    # (key side, ≈ absolute position i ∈ [0, max_positions]) for the tiebreak.
     query_one = LiteralValue(torch.tensor([1.0]), name="global_recency_query_one")
     query_in = Concatenate([query_vector, query_one])
-
-    # Key: content vector + global position (≈ absolute position i, range [0, max_positions])
     key_in = Concatenate([key_vector, global_position])
 
-    query_matrix = torch.zeros((W + 1, d_qk))
-    for c in range(W):
-        query_matrix[c, c] = match_gain
-    query_matrix[W, W] = alpha  # constant 1.0 × recency_scale for the position column
-
-    key_matrix = torch.zeros((W + 1, d_qk))
-    for c in range(W):
-        key_matrix[c, c] = 1.0
-    key_matrix[W, W] = 1.0  # global_position passes through identity
-
-    attn = rotary_content_head(
-        query_in,
-        key_in,
-        value,
-        query_matrix,
-        key_matrix,
-        d_head=rope.d_head,
-        d_rot=rope.d_rot,
-        base=rope.base,
-    )
+    d_head = rope.d_head
+    if rope.d_rot < d_head:
+        # --- Partial rotary ---
+        # Content (W match dims) rides the unrotated NoPE tail [d_rot:d_rot+W]: an
+        # EXACT, position-free content dot product at any distance.  The position
+        # tiebreak rides the slowest rotated plane d_rot/2-1, where the RoPE
+        # attenuation cos((i−j)·θ_slow) stays positive (the guard below), so among
+        # content-matching keys the largest global_position (most recent) wins.
+        # The two signals live on disjoint dims, so they do not interact.  This
+        # cannot delegate to rotary_content_head, which would route ALL columns
+        # uniformly (content to the tail AND the position column to the tail, where
+        # there is no rotation to order keys at distance — wrong).
+        tail = d_head - rope.d_rot
+        if W > tail:
+            raise ValueError(
+                f"attend_most_recent_globally: content width W={W} exceeds the "
+                f"{tail}-wide NoPE tail (d_head={d_head}, d_rot={rope.d_rot}); "
+                f"raise d_head or lower d_rot."
+            )
+        pos_plane = rope.d_rot // 2 - 1
+        theta_pos = _theta_slow(rope)
+        if rope.max_positions * theta_pos >= math.pi / 2:
+            raise ValueError(
+                f"attend_most_recent_globally: the position tiebreak on the "
+                f"slowest rotated plane {pos_plane} (θ={theta_pos:.3e}) has "
+                f"max_positions={rope.max_positions} × θ = "
+                f"{rope.max_positions * theta_pos:.3f} ≥ π/2 ({math.pi/2:.3f}); a "
+                f"negative cosine would reverse the tiebreak ordering.  Increase "
+                f"d_rot/base or reduce max_positions."
+            )
+        query_matrix = torch.zeros((W + 1, d_head))
+        key_matrix = torch.zeros((W + 1, d_head))
+        for c in range(W):
+            query_matrix[c, rope.d_rot + c] = match_gain  # content on the tail
+            key_matrix[c, rope.d_rot + c] = 1.0
+        query_matrix[W, pos_plane] = alpha  # position tiebreak on a rotated plane
+        key_matrix[W, pos_plane] = 1.0  # global_position passes through identity
+        d_v = len(value)
+        attn = Attn(
+            query_in=query_in,
+            key_in=key_in,
+            value_in=value,
+            query_matrix=query_matrix,
+            key_matrix=key_matrix,
+            value_matrix=torch.eye(d_v),
+            output_matrix=torch.eye(d_v),
+            rope_base=rope.base,
+            rope_d_rot=rope.d_rot,
+        )
+    else:
+        # --- Full rotary ---
+        # Content + position both on slow planes of the d_head grid; the position
+        # column occupies the (W+1)-th slowest plane (after the W content planes).
+        # Guard: that plane's frequency θ_pos must satisfy max_positions × θ_pos <
+        # π/2 so cos((i−j)·θ_pos) stays positive for all key offsets; a negative
+        # cosine would reverse the tiebreak ordering.
+        theta_pos = float(rope_inv_freq(d_head, rope.base)[d_head // 2 - 1 - W])
+        if rope.max_positions * theta_pos >= math.pi / 2:
+            raise ValueError(
+                f"attend_most_recent_globally: content width W={W} places the "
+                f"position tiebreak on plane {d_head // 2 - 1 - W} "
+                f"(θ={theta_pos:.3e}); max_positions={rope.max_positions} × θ = "
+                f"{rope.max_positions * theta_pos:.3f} ≥ π/2 ({math.pi/2:.3f}).  "
+                f"Narrow the content vector, increase d_head/base, or reduce "
+                f"max_positions."
+            )
+        # d_qk layout (W+1 columns placed on slowest W+1 planes):
+        #   cols 0..W-1: content match (match_gain · Q · K)
+        #   col W:       position tiebreak (recency_scale · 1_query · gp_key)
+        d_qk = W + 1
+        query_matrix = torch.zeros((W + 1, d_qk))
+        for c in range(W):
+            query_matrix[c, c] = match_gain
+        query_matrix[W, W] = alpha  # constant 1.0 × recency_scale for position col
+        key_matrix = torch.zeros((W + 1, d_qk))
+        for c in range(W):
+            key_matrix[c, c] = 1.0
+        key_matrix[W, W] = 1.0  # global_position passes through identity
+        attn = rotary_content_head(
+            query_in,
+            key_in,
+            value,
+            query_matrix,
+            key_matrix,
+            d_head=d_head,
+            d_rot=rope.d_rot,
+            base=rope.base,
+        )
 
     if assert_hardness_gt is not None:
         from torchwright.graph.asserts import assert_softmax_hardness

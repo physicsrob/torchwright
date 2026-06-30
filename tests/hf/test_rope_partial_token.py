@@ -7,7 +7,11 @@ converts to ``TorchwrightForCausalLM``, and checks the HF runtime:
 * carries ``d_rot`` (and ``rope_base``) through the converter,
 * still predicts the previous token (the partial rotation survives export +
   convert — the NoPE tail is a position-independent constant the softmax ignores),
-* prefill == token-by-token cached decode (cache stores rotated K).
+* prefill == token-by-token cached decode (cache stores rotated K),
+* a **content head** (``attend_argmax``) whose content rides the NoPE tail
+  survives export + convert and still selects by content (predicts the
+  highest-vocab-index token seen so far) — the partial-rotary content placement
+  this phase added, exercised on the real ONNX + HF surfaces.
 
 CPU-only; skips where onnxruntime / transformers are unavailable.
 """
@@ -27,7 +31,7 @@ from transformers.cache_utils import DynamicCache
 
 from torchwright.compiler.export import compile_to_onnx
 from torchwright.compiler.hf.convert import convert_onnx_to_hf
-from torchwright.graph.rope import ROPE_BASE, rotary_offset_head
+from torchwright.graph.rope import ROPE_BASE, RopeConfig, rotary_offset_head
 from torchwright.ops.inout_nodes import create_onehot_embedding
 
 _VOCAB = ["<bos>", "<eos>", "a", "b", "c", "d", "e"]
@@ -82,6 +86,62 @@ def test_hf_partial_rope_prefill_equals_cached_decode():
     ids = torch.tensor([[_VOCAB.index(t) for t in seq]])
     with tempfile.TemporaryDirectory() as tmp:
         hf = _build_and_convert(tmp)
+        with torch.no_grad():
+            full = hf(ids).logits[0]
+            cache = DynamicCache()
+            rows = []
+            for t in range(ids.shape[1]):
+                out = hf(
+                    ids[:, t : t + 1],
+                    past_key_values=cache,
+                    use_cache=True,
+                    cache_position=torch.arange(t, t + 1),
+                )
+                cache = out.past_key_values
+                rows.append(out.logits[0, -1])
+            decode = torch.stack(rows)
+    assert torch.allclose(full, decode, atol=1e-4), (full - decode).abs().max()
+
+
+def _build_content_model(tmpdir):
+    """Predict the highest-vocab-index token seen so far via a content head whose
+    content (a width-1 score) rides the NoPE tail under partial rotary."""
+    from torchwright.graph.linear import Linear
+    from torchwright.ops.attention_ops import attend_argmax
+
+    emb = create_onehot_embedding(_VOCAB)
+    # Per-position scalar score = the token's vocab index (one-hot · arange).
+    idx = torch.arange(len(_VOCAB), dtype=torch.float32).reshape(len(_VOCAB), 1)
+    score = Linear(emb, idx, name="vocab_index_score")
+    rope = RopeConfig(d_head=D_HEAD, max_positions=64, d_rot=D_ROT)
+    out = attend_argmax(rope, score, emb)  # embedding of the max-index token so far
+    path = os.path.join(tmpdir, "max_index_token.onnx")
+    compile_to_onnx(out, emb, path, d=D, d_head=D_HEAD, max_seq_len=64, verbose=False)
+    return convert_onnx_to_hf(path, bos_token="<bos>", eos_token="<eos>")
+
+
+def test_hf_partial_content_head_selects_by_content():
+    """A content head on the NoPE tail survives ONNX export + HF convert and still
+    selects by content: each position predicts the highest-vocab-index token in its
+    causal window."""
+    seq = ["<bos>", "a", "c", "b", "e", "d"]  # indices 0,2,4,3,6,5
+    ids = torch.tensor([[_VOCAB.index(t) for t in seq]])
+    with tempfile.TemporaryDirectory() as tmp:
+        hf = _build_content_model(tmp)
+        assert hf.config.d_rot == D_ROT
+        with torch.no_grad():
+            logits = hf(ids).logits[0]
+    pred = [_VOCAB[i] for i in logits.argmax(-1).tolist()]
+    # running-max vocab index → token: <bos>,a,c,c,e,e
+    assert pred == ["<bos>", "a", "c", "c", "e", "e"], pred
+
+
+def test_hf_partial_content_head_prefill_equals_cached_decode():
+    """The partial-rotary content head caches cleanly: prefill == cached decode."""
+    seq = ["<bos>", "a", "c", "b", "e", "d"]
+    ids = torch.tensor([[_VOCAB.index(t) for t in seq]])
+    with tempfile.TemporaryDirectory() as tmp:
+        hf = _build_content_model(tmp)
         with torch.no_grad():
             full = hf(ids).logits[0]
             cache = DynamicCache()

@@ -269,21 +269,21 @@ def test_probe_and_debug_value_parity_with_headless(token_artifact):
     # Same probe coverage on both backends.
     assert len(report_onnx.nodes_checked) == len(report_h.nodes_checked)
 
-    # Cross-backend debug_value parity at the output node (onnxruntime artifact
-    # vs in-process headless).  Bounded by the same onnxruntime execution-provider
-    # floor as the oracle probes above (``_ONNX_PROBE_ATOL``): the headless
-    # backend tracks the oracle to fp32 round-off (~2e-6), so the ONNX EP rounding
-    # on the RoPE rotary attention is the dominant term.  Since the partial-rotary
-    # (``d_rot``) direct-form rotation landed, that rounding reaches ~2^-10
-    # (~9.8e-4) on this adder's large-magnitude heads — within the floor, and
-    # measured norm-independent (identical with rms_norm on/off, so it is the
-    # rotary EP gap, not the identity norm).  A tighter bound here would be
-    # inconsistent with ``_ONNX_PROBE_ATOL``.
+    # debug_value parity at the output node.
     session(ids, debug=True)
     headless(headless.build_prefill(iv, len(TOKENS)), debug=True)
     v_onnx = session.debug_value(out_onnx)
     v_h = headless.debug_value(out_h)
     assert v_onnx is not None and v_h is not None
+    # v_onnx carries the onnxruntime fp32 execution floor (the same one this
+    # test budgets _ONNX_PROBE_ATOL=2.5e-3 against above), while v_h is
+    # oracle-tight; so their cross-backend difference must allow that floor, not
+    # the 1e-4 that assumed both sides were oracle-tight. The old 1e-4 sat below
+    # the onnxruntime floor and flipped on the EP's rounding (a single 2^-10 ULP
+    # at the adder's value magnitude tripped it deterministically on some
+    # workers). probe_compiled(session, atol=2.5e-3) above already proves the
+    # ONNX backend matches the oracle at every node, so this is purely the
+    # cross-backend round-off budget.
     assert float((v_onnx - v_h).abs().max()) < _ONNX_PROBE_ATOL
 
 
