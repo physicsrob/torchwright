@@ -92,6 +92,19 @@ def test_content_head_rejects_partial_rotary():
         attend_argmin_where(rope, score, validity, value)
 
 
+def test_compile_rejects_mixed_d_rot():
+    """d_rot is global: a graph mixing two rotary widths fails fast at
+    forward_compile (one shared cos/sin grid can't honor both)."""
+    from torchwright.graph import Concatenate
+
+    payload = create_input("payload", 1)
+    h_full = rotary_offset_head(payload, delta_pos=-1, d_qk=D_HEAD)  # d_rot=d_head
+    h_part = rotary_offset_head(payload, delta_pos=-1, d_qk=D_HEAD, d_rot=D_ROT)
+    out = Concatenate([h_full, h_part])
+    with pytest.raises(ValueError, match="one global value"):
+        compile_headless(out, d=D, d_head=D_HEAD, verbose=False)
+
+
 def test_partial_offset_oracle_selects_prev_position():
     payload = create_input("payload", 1)
     vals = _payload(N_POS)
