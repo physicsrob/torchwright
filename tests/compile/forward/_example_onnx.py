@@ -22,7 +22,9 @@ D = 1024
 D_HEAD = 16
 
 
-def load_example(build_fn, out_dir, *, d=D, d_head=D_HEAD, name="example"):
+def load_example(
+    build_fn, out_dir, *, d=D, d_head=D_HEAD, name="example", rms_norm=None
+):
     """Compile a token example to ONNX; return ``(model, artifact)``.
 
     ``build_fn()`` returns ``(output_node, embedding)`` — the RoPE-era
@@ -30,6 +32,12 @@ def load_example(build_fn, out_dir, *, d=D, d_head=D_HEAD, name="example"):
     a rotation inside attention now, so there is no ``pos_encoding`` to pass).
     ``out_dir`` is a directory the model + sidecars may be written to (a
     ``tmp_path_factory.mktemp(...)`` result works).
+
+    ``rms_norm`` threads to :func:`compile_to_onnx` (default ``None`` = on, the
+    production default).  Pass ``rms_norm=False`` for an example whose ``d`` is
+    not a power of two — the pinned-constant identity RMSNorm requires a
+    power-of-two ``d`` and these examples use an odd width for residual reasons,
+    not to exercise the norm.
     """
     output_node, embedding = build_fn()
     onnx_path = os.path.join(str(out_dir), f"{name}.onnx")
@@ -40,6 +48,7 @@ def load_example(build_fn, out_dir, *, d=D, d_head=D_HEAD, name="example"):
         d=d,
         d_head=d_head,
         verbose=False,
+        rms_norm=rms_norm,
     )
     return load_onnx(onnx_path), artifact
 

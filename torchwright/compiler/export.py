@@ -1308,10 +1308,11 @@ def compile_to_onnx(
     gain cancels it.  This makes the artifact a stock Llama-style decoder (a
     skeptic can't say "no normalization"); it adds the gain weights as
     initializers (mapped by ``convert.py``) and folds the constant into
-    ``embed_table`` (no new buffer).  The construction requires a power-of-two
-    ``d``, so the default (``None``) emits the norm exactly when ``d`` is a
-    power of two and is otherwise a no-op; ``True`` forces it (and raises on a
-    non-power-of-two ``d``); ``False`` disables it.  ``rms_norm_eps`` (Llama
+    ``embed_table`` (no new buffer).  The norm is **on by default**: ``None``
+    enables it.  The pinned-constant RMS is exact only at a power-of-two ``d``,
+    so the default (and an explicit ``True``) **raises** on a non-power-of-two
+    ``d`` rather than silently shipping an un-normalized artifact — pass
+    ``rms_norm=False`` to opt out deliberately.  ``rms_norm_eps`` (Llama
     default ``1e-5``) is recorded in the meta; it sits below the forced RMS's
     LSB, so it does not affect bit-exactness.  ``rms_norm_const_exp`` (``q``)
     overrides the pinned-constant exponent for a graph whose deepest-layer
@@ -1321,14 +1322,21 @@ def compile_to_onnx(
     # (potentially very long) streaming compile would waste the whole run.
     cache_stride_resolved = _resolve_cache_stride(cache_stride, max_seq_len)
 
-    # Resolve the norm policy.  The pinned-constant RMS is exact only at a
-    # power-of-two ``d``; the default (None) therefore emits the norm exactly
-    # when ``d`` is a power of two (every shipped artifact — calculator 1024,
-    # DOOM 8192 — is), and otherwise behaves as before (no norm).  An explicit
-    # ``rms_norm=True`` at a non-power-of-two ``d`` is a contradiction
-    # forward_compile raises on; ``rms_norm=False`` is always off.
+    # Resolve the norm policy.  RMSNorm is on by default (None -> True): every
+    # shipped artifact should carry the real norm.  The pinned-constant RMS is
+    # exact only at a power-of-two ``d``, so refuse a non-power-of-two ``d``
+    # with the norm on — fail fast and loudly here (before the long streaming
+    # compile) rather than silently dropping it.  ``rms_norm=False`` is the
+    # explicit opt-out.
+    rms_norm_on = True if rms_norm is None else bool(rms_norm)
     d_is_pow2 = d > 0 and (d & (d - 1)) == 0
-    rms_norm_on = d_is_pow2 if rms_norm is None else bool(rms_norm)
+    if rms_norm_on and not d_is_pow2:
+        raise ValueError(
+            f"rms_norm is on (the default) but d={d} is not a power of two; the "
+            f"pinned-constant RMS is an exact identity only when E/d is a power "
+            f"of two. Use a power-of-two d, or pass rms_norm=False to export "
+            f"without the norm."
+        )
 
     # Assert/DebugWatch coverage must be collected BEFORE forward_compile
     # strips both wrapper kinds from the graph in-place.

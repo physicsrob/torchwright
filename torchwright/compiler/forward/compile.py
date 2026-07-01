@@ -113,7 +113,8 @@ def _reserve_rms_norm_columns(
     if (1 << b) != d:
         raise ValueError(
             f"rms_norm requires a power-of-two residual width; got d={d}. "
-            f"The pinned-constant RMS is exact only when E/d is a power of two."
+            f"The pinned-constant RMS is exact only when E/d is a power of two. "
+            f"Use a power-of-two d, or pass rms_norm=False to disable the norm."
         )
     # One column's energy 2^(2q) is an even power of two: rms = 2^(q-b/2) is a
     # power of two only when b is even.  For odd b, two equal columns give

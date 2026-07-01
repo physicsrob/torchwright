@@ -6,7 +6,7 @@ from typing import List, Dict, Optional, Set
 
 import torch
 
-from torchwright.graph.value_type import NodeValueType
+from torchwright.graph.value_type import NodeValueType, Range
 
 global_node_id = 0
 
@@ -191,7 +191,31 @@ class Node:
         r = self._affine_bound.to_scalar_range()
         sr = self._structural_type.value_range
         if sr.lo > r.lo or sr.hi < r.hi:
-            r = r.intersect(sr)
+            # The structural type is tighter on at least one side; take the
+            # intersection.  But the affine bound is float64 interval
+            # arithmetic whose rounding can push a bound a few ULPs past the
+            # structural range — e.g. a value structurally in [0, 1] whose
+            # affine bound collapses to the point 1+2^-26.  That makes the two
+            # *fp-disjoint* even though both soundly bound the same scalar, so
+            # `Range.intersect` (which treats any crossing as a bug) would
+            # raise.  Clamp the affine bound into the structural range instead,
+            # guarded by a magnitude-scaled tolerance so a *gross* disjointness
+            # (a genuinely unsound bound, not rounding) still raises.
+            lo = max(r.lo, sr.lo)
+            hi = min(r.hi, sr.hi)
+            if lo > hi:
+                scale = max(1.0, abs(sr.lo), abs(sr.hi), abs(r.lo), abs(r.hi))
+                if lo - hi > 1e-6 * scale:
+                    raise ValueError(
+                        f"Affine bound {r} is disjoint from structural type "
+                        f"{sr} by {lo - hi:.3e}, beyond fp-rounding noise; the "
+                        f"affine analysis and the per-op value-type rule "
+                        f"disagree, which indicates a real soundness bug."
+                    )
+                # fp-noise crossing: collapse onto the structural boundary
+                # (the exact, authoritative bound) the affine bound rounded past.
+                lo = hi = min(max(hi, sr.lo), sr.hi)
+            r = Range(lo, hi)
         return NodeValueType(value_range=r)
 
     @property

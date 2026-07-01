@@ -53,6 +53,9 @@ def sort_v1(tmp_path_factory):
         d=D_MODEL,
         d_head=D_HEAD,
         name="sortv1",
+        # D_MODEL is not a power of two; the identity RMSNorm (on by default)
+        # needs a power-of-two d and isn't what this example exercises.
+        rms_norm=False,
     )
 
 

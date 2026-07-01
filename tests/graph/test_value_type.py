@@ -92,3 +92,54 @@ def test_tightened_with_both_same_range():
     b = NodeValueType.bounded(0.0, 9.0)
     m = tightened_with(a, b)
     assert m.value_range == Range(0.0, 9.0)
+
+
+# --- Node.value_type: affine-vs-structural reconciliation -------------
+#
+# The affine bound is float64 interval arithmetic; its rounding can push a
+# bound a few ULPs past the structural type (e.g. a clamp gadget whose output
+# is structurally in [0, 1] but whose affine bound collapses to the point
+# 1+2^-26).  `value_type` must reconcile that fp-noise crossing by clamping
+# onto the exact structural boundary rather than raising on the empty
+# intersection — but a *gross* (non-rounding) disjointness must still raise.
+# Regression for the DOOM `compile_to_onnx` failure exposed by the RMSNorm
+# energy certification reading every residual node's `value_type`.
+
+
+def _node_with_bounds(point_value, structural):
+    import torch
+
+    from torchwright.graph import LiteralValue
+    from torchwright.graph.affine_bound import AffineBound
+
+    node = LiteralValue(torch.tensor([1.0], dtype=torch.float32))
+    # Pin a float64 affine point at `point_value` (the real clamp gadget's
+    # affine bound is float64 and carries sub-float32-ULP slop that a float32
+    # literal would round away) and the tighter, exact structural range.
+    node._affine_bound = AffineBound.constant(
+        torch.tensor([point_value], dtype=torch.float64)
+    )
+    node._structural_type = NodeValueType.bounded(*structural)
+    return node
+
+
+def test_value_type_clamps_fp_noise_affine_overshoot():
+    # Affine point 1+2^-26 sits 1.5e-8 above the structural hi of 1.0.
+    node = _node_with_bounds(1.0 + 2.0**-26, (0.0, 1.0))
+    assert node._affine_bound.to_scalar_range().lo > 1.0  # genuinely overshoots
+    vt = node.value_type
+    assert vt.value_range == Range(1.0, 1.0)
+
+
+def test_value_type_clamps_fp_noise_affine_undershoot():
+    # Symmetric: an affine point a hair below the structural lo.
+    node = _node_with_bounds(-(2.0**-26), (0.0, 1.0))
+    assert node._affine_bound.to_scalar_range().hi < 0.0
+    assert node.value_type.value_range == Range(0.0, 0.0)
+
+
+def test_value_type_raises_on_gross_disjointness():
+    # 5.0 vs [0, 1] is far beyond fp-rounding noise: a real soundness bug.
+    node = _node_with_bounds(5.0, (0.0, 1.0))
+    with pytest.raises(ValueError, match="disjoint from structural type"):
+        _ = node.value_type
