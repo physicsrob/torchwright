@@ -249,15 +249,11 @@ def _block_rule(node) -> AffineBound:
     The three sub-steps are exactly the rules the mined ``Linear -> ReLU ->
     Linear`` chain applies across its three nodes today, run here over one
     node's projections.  Step 1 is ReLU-only; a swish envelope is step 2's
-    problem, so a gated/swish block is rejected here (the compiler path is
-    ReLU-degenerate this phase anyway)."""
+    problem, so a gated/swish block gets a fail-closed unbounded bound (sound,
+    just not tight) — the compiler never lowers one this phase (the writer
+    asserts ReLU-degenerate), so no tight bound is needed yet."""
     if node.activation != "relu" or node.up_proj is not None:
-        raise NotImplementedError(
-            "Block affine rule supports only degenerate ReLU lanes in step 1 "
-            f"(got activation={node.activation!r}, "
-            f"gated={node.up_proj is not None}); a swish/gated envelope is "
-            "step 2's affine rule."
-        )
+        return AffineBound.degenerate(node.d_output)
     inp_ab = node.inputs[0]._affine_bound
     # Gate projection: y = x @ gate_proj.T + gate_bias.  gate_proj is
     # (n_lanes, d_input) in math orientation, so W = gate_proj.T.
