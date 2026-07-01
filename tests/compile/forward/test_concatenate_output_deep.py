@@ -11,7 +11,7 @@ import torch
 
 from torchwright.compiler.export import compile_headless
 from torchwright.graph import Concatenate
-from torchwright.ops.arithmetic_ops import compare, signed_multiply, reciprocal
+from torchwright.ops.arithmetic_ops import compare, multiply_2d, reciprocal
 from torchwright.ops.inout_nodes import create_input
 from torchwright.ops.map_select import select
 
@@ -23,11 +23,11 @@ def test_concatenate_output_mixed_depth():
     b = create_input("b", 1, value_range=(-10.0, 10.0))
     shallow = select(compare(a, 0.5), a, b)
 
-    # Deep subgraph (~15 layers): two signed_multiplies + reciprocal
+    # Deep subgraph (~15 layers): two multiply_2ds + reciprocal
     c = create_input("c", 1, value_range=(-10.0, 10.0))
     d = create_input("d", 1, value_range=(-10.0, 10.0))
-    p = signed_multiply(c, d, max_abs1=10, max_abs2=10, step=0.5)
-    p2 = signed_multiply(p, c, max_abs1=100, max_abs2=10, step=1.0)
+    p = multiply_2d(c, d, max_abs1=10, max_abs2=10, step1=0.5, step2=0.5)
+    p2 = multiply_2d(p, c, max_abs1=100, max_abs2=10, step1=1.0, step2=1.0)
     deep = reciprocal(p2, min_value=0.5, max_value=100, step=1.0)
 
     output = Concatenate([shallow, deep])

@@ -204,19 +204,6 @@ def concat(inp_list: List[Node]) -> Node:
 # ---------------------------------------------------------------------------
 
 
-def relu(inp: Node) -> Node:
-    """
-    Applies the Rectified Linear Unit (ReLU) function to the input node.
-
-    Args:
-        inp (Node): Node to apply ReLU.
-
-    Returns:
-        Node: Node with ReLU applied.
-    """
-    return ReLU(inp)
-
-
 def relu_add(inp1: Node, inp2: Node) -> Node:
     """
     Applies the ReLU function to both input nodes and then adds them together.
@@ -378,30 +365,6 @@ def min(inp1: Node, inp2: Node) -> Node:
     abs_diff = abs(diff)
     sum_ab = add(inp1, inp2)
     return add_scaled_nodes(0.5, sum_ab, -0.5, abs_diff)
-
-
-def max(inp1: Node, inp2: Node) -> Node:
-    """Element-wise maximum of two nodes.
-
-    Computed as ``(a + b + |a - b|) / 2``.
-
-    Args:
-        inp1: First node.
-        inp2: Second node (same width as *inp1*).
-
-    Returns:
-        Node of the same width containing ``max(inp1, inp2)`` element-wise.
-
-    .. noise-footer::
-
-       Max error: 3.815e-06 abs, 1.953e-06 rel over 4096 samples;
-       measured at commit aafc5f3. See docs/numerical_noise.md.
-    """
-    assert len(inp1) == len(inp2)
-    diff = subtract(inp1, inp2)
-    abs_diff = abs(diff)
-    sum_ab = add(inp1, inp2)
-    return add_scaled_nodes(0.5, sum_ab, 0.5, abs_diff)
 
 
 # ---------------------------------------------------------------------------
@@ -570,321 +533,6 @@ def piecewise_linear(
 # ---------------------------------------------------------------------------
 
 
-def piecewise_linear_2d(
-    inp1: Node,
-    inp2: Node,
-    breakpoints1: List[float],
-    breakpoints2: List[float],
-    fn,
-    d_max: int = 1024,
-    name: str = "piecewise_linear_2d",
-) -> Node:
-    """Evaluate a piecewise-linear function of two scalar inputs.
-
-    The callable *fn(x, y)* is evaluated at every grid vertex in
-    *breakpoints1* × *breakpoints2* to obtain target values.  The
-    result is a piecewise-linear interpolant on a triangulated
-    rectangular grid (**1 MLP sublayer**).
-
-    Outside the grid the output is clamped to the nearest edge/corner
-    value (constant extrapolation).
-
-    **Cost:** 1 MLP sublayer.  The number of neurons (hidden units) is
-    approximately 2·n1·n2 for an n1 × n2 grid.  For a 30×10 grid this
-    is ~600 neurons, well within typical ``d`` values.
-
-    Args:
-        inp1: 1D scalar node (first input variable).
-        inp2: 1D scalar node (second input variable).
-        breakpoints1: Strictly ascending x-coordinates (length n1 ≥ 2).
-        breakpoints2: Strictly ascending y-coordinates (length n2 ≥ 2).
-        fn: ``fn(x, y) -> float`` evaluated at each grid vertex.
-        d_max: Maximum neurons per MLP sublayer.
-        name: Debug label prefix.
-
-    Returns:
-        1D scalar node containing the interpolated value.
-
-    .. noise-footer::
-
-       Max error: 7.778 abs, 0.6017 rel over 8192 samples;
-       measured at commit aafc5f3. See docs/numerical_noise.md.
-    """
-    assert len(inp1) == 1, "inp1 must be a 1D scalar node"
-    assert len(inp2) == 1, "inp2 must be a 1D scalar node"
-    n1 = len(breakpoints1)
-    n2 = len(breakpoints2)
-    assert n1 >= 2 and n2 >= 2, "Need >= 2 breakpoints per axis"
-    values = [
-        [fn(breakpoints1[i], breakpoints2[j]) for j in range(n2)] for i in range(n1)
-    ]
-    assert all(
-        breakpoints1[i] < breakpoints1[i + 1] for i in range(n1 - 1)
-    ), "breakpoints1 must be strictly ascending"
-    assert all(
-        breakpoints2[i] < breakpoints2[i + 1] for i in range(n2 - 1)
-    ), "breakpoints2 must be strictly ascending"
-
-    inp = Concatenate([inp1, inp2])
-
-    # ---------------------------------------------------------------
-    # Strategy: solve for ReLU output weights via constrained
-    # least-squares.
-    #
-    # Hyperplane family (4 directions through every grid vertex):
-    #   1. Vertical:   x = x_i
-    #   2. Horizontal: y = y_j
-    #   3. Sum:        x + y = x_i + y_j
-    #   4. Difference: x - y = x_i - y_j
-    #
-    # On non-uniform grids the sum/diff families expand to O(n1·n2)
-    # distinct lines, making the system heavily underdetermined (more
-    # hyperplanes than vertex constraints).  pinv's min-L2-norm
-    # solution then packs large cancelling ReLU weights that agree at
-    # vertices but oscillate across cell interiors.
-    #
-    # Fix: constrained least-squares.  Vertex values are enforced as
-    # hard equality constraints (preserving exact interpolation at
-    # grid points).  Interior sample points — fn evaluated at several
-    # points per cell — provide a soft objective that pins down the
-    # free DOF in the nullspace of the vertex system, eliminating the
-    # oscillation.
-    # ---------------------------------------------------------------
-
-    seen: set = set()
-    hyperplanes: list = []  # (a, b, c) tuples
-
-    def _add(a: float, b: float, c: float) -> None:
-        key = (round(a, 10), round(b, 10), round(c, 10))
-        if key not in seen:
-            seen.add(key)
-            hyperplanes.append((a, b, c))
-
-    for i in range(n1):
-        _add(1.0, 0.0, -breakpoints1[i])
-    for j in range(n2):
-        _add(0.0, 1.0, -breakpoints2[j])
-
-    for i in range(n1):
-        for j in range(n2):
-            _add(1.0, 1.0, -(breakpoints1[i] + breakpoints2[j]))
-            _add(1.0, -1.0, -(breakpoints1[i] - breakpoints2[j]))
-
-    K = len(hyperplanes)
-
-    # -- Vectorized design-matrix builder (float64) --
-    a_arr = torch.tensor([h[0] for h in hyperplanes], dtype=torch.float64)
-    b_arr = torch.tensor([h[1] for h in hyperplanes], dtype=torch.float64)
-    c_arr = torch.tensor([h[2] for h in hyperplanes], dtype=torch.float64)
-
-    def _design(xs: list, ys: list) -> torch.Tensor:
-        xt = torch.tensor(xs, dtype=torch.float64)
-        yt = torch.tensor(ys, dtype=torch.float64)
-        M = torch.zeros(len(xs), 3 + K, dtype=torch.float64)
-        M[:, 0] = 1.0
-        M[:, 1] = xt
-        M[:, 2] = yt
-        M[:, 3:] = torch.clamp(
-            a_arr.unsqueeze(0) * xt.unsqueeze(1)
-            + b_arr.unsqueeze(0) * yt.unsqueeze(1)
-            + c_arr.unsqueeze(0),
-            min=0.0,
-        )
-        return M
-
-    # Vertex constraints (hard equality).
-    xs_v = [breakpoints1[i] for i in range(n1) for _ in range(n2)]
-    ys_v = [breakpoints2[j] for _ in range(n1) for j in range(n2)]
-    bv = torch.tensor(
-        [values[i][j] for i in range(n1) for j in range(n2)],
-        dtype=torch.float64,
-    )
-    A_v = _design(xs_v, ys_v)
-
-    # Interior sample constraints (soft, resolved in nullspace).
-    # 4 points per cell, spread to cover both triangles of the SW-NE
-    # triangulation.  fn is evaluated at these points to get the true
-    # target — this is what pins down the nullspace DOF.
-    _OFFSETS = [(0.25, 0.25), (0.75, 0.25), (0.25, 0.75), (0.75, 0.75)]
-    xs_int: list = []
-    ys_int: list = []
-    vals_int: list = []
-    for i in range(n1 - 1):
-        for j in range(n2 - 1):
-            xi, xi1 = breakpoints1[i], breakpoints1[i + 1]
-            yj, yj1 = breakpoints2[j], breakpoints2[j + 1]
-            for u, v in _OFFSETS:
-                x = xi + u * (xi1 - xi)
-                y = yj + v * (yj1 - yj)
-                xs_int.append(x)
-                ys_int.append(y)
-                vals_int.append(float(fn(x, y)))
-
-    # Constrained least-squares via nullspace parameterization:
-    #   x_part = vertex-exact particular solution (min-norm)
-    #   N_basis = nullspace of A_v
-    #   z = argmin ||A_int · (x_part + N_basis · z) - b_int||²
-    #   solution = x_part + N_basis · z
-    x_part = torch.linalg.pinv(A_v) @ bv
-
-    if xs_int:
-        # We need Vh's rows up to the column dimension (3+K) to span the
-        # nullspace basis N_basis = Vh[rank:].T below.
-        #
-        # When A_v is TALL (rows n1*n2 >= cols 3+K — uniform / collapsed
-        # grids, e.g. the unit grid multiply_2d used to feed here), the
-        # reduced SVD already returns all 3+K right-singular vectors, so
-        # full_matrices=False yields a bit-identical Vh while avoiding the
-        # (n1*n2, n1*n2) left-singular matrix U that full_matrices=True
-        # materializes and we discard — that U is ~35 GB of float64 at
-        # n1*n2 ~ 66049 and is the build-time OOM this guard removes.
-        #
-        # When A_v is WIDE (rows < cols — non-uniform grids, where the
-        # sum/diff hyperplane families do not collapse), the reduced SVD
-        # returns only the first `rows` right-singular vectors and the
-        # nullspace rows rank..(3+K) would be missing.  There we must keep
-        # full_matrices=True so N_basis spans the full nullspace; the U it
-        # builds is only (rows, rows) and the grids that hit this path are
-        # small.
-        tall = A_v.shape[0] >= A_v.shape[1]
-        _U, S, Vh = torch.linalg.svd(A_v, full_matrices=not tall)
-        tol = S.max().item() * 1e-10 if S.numel() else 0.0
-        rank = int((S > tol).sum().item())
-        N_basis = Vh[rank:].T  # (3+K, nulldim)
-
-        if N_basis.shape[1] > 0:
-            A_int = _design(xs_int, ys_int)
-            b_int = torch.tensor(vals_int, dtype=torch.float64)
-            A_red = A_int @ N_basis
-            b_red = b_int - A_int @ x_part
-            # Tikhonov-regularized solve: penalize large z to prevent
-            # the nullspace solve from exploding when A_red is
-            # ill-conditioned (some nullspace directions are nearly
-            # invisible to the interior samples).
-            AtA = A_red.T @ A_red
-            lam = AtA.diag().max().item() * 1e-6
-            z = torch.linalg.solve(
-                AtA + lam * torch.eye(AtA.shape[0], dtype=torch.float64),
-                A_red.T @ b_red,
-            )
-            solution = (x_part + N_basis @ z).float()
-        else:
-            solution = x_part.float()
-    else:
-        solution = x_part.float()
-
-    bias_val = solution[0].item()
-    base_sx = solution[1].item()
-    base_sy = solution[2].item()
-    weights = solution[3:]
-
-    # Filter out near-zero neurons
-    active = []
-    for k in range(K):
-        if _builtin_abs(weights[k].item()) > 1e-10:
-            active.append((hyperplanes[k], weights[k].item()))
-
-    if (
-        len(active) == 0
-        and _builtin_abs(base_sx) < 1e-10
-        and _builtin_abs(base_sy) < 1e-10
-    ):
-        from torchwright.ops.inout_nodes import create_literal_value
-
-        return create_literal_value(torch.tensor([bias_val]))
-
-    # Build L -> ReLU -> L weight matrices, chunking across sublayers if
-    # the active neuron count exceeds d_max.  Each chunk is an independent
-    # linear_relu_linear that contributes a partial sum of ReLU terms; the
-    # constant bias_val is carried by the first chunk only.
-    if not active:
-        # Degenerate placeholder: bias_val needs a carrier, but all ReLU
-        # weights are zero.  One dead neuron keeps the shape valid.
-        input_proj = torch.zeros(1, 2)
-        input_bias = torch.zeros(1)
-        output_proj = torch.zeros(1, 1)
-        result = linear_relu_linear(
-            input_node=inp,
-            input_proj=input_proj,
-            input_bias=input_bias,
-            output_proj=output_proj,
-            output_bias=torch.tensor([bias_val]),
-            name=name,
-        )
-    else:
-        chunks = []
-        multi = len(active) > d_max
-        for chunk_start in range(0, len(active), d_max):
-            chunk = active[chunk_start : chunk_start + d_max]
-            d = len(chunk)
-            input_proj = torch.zeros(d, 2)
-            input_bias = torch.zeros(d)
-            output_proj = torch.zeros(d, 1)
-            for k, ((a, b, c), w) in enumerate(chunk):
-                input_proj[k, 0] = a
-                input_proj[k, 1] = b
-                input_bias[k] = c
-                output_proj[k, 0] = w
-            ob = torch.tensor([bias_val]) if chunk_start == 0 else torch.zeros(1)
-            chunk_name = f"{name}_{chunk_start}_{chunk_start + d}" if multi else name
-            chunks.append(
-                linear_relu_linear(
-                    input_node=inp,
-                    input_proj=input_proj,
-                    input_bias=input_bias,
-                    output_proj=output_proj,
-                    output_bias=ob,
-                    name=chunk_name,
-                )
-            )
-        result = chunks[0] if len(chunks) == 1 else sum_nodes(chunks)
-
-    # Add base linear term (sx*x + sy*y) — free (Linear node).
-    if _builtin_abs(base_sx) > 1e-10 or _builtin_abs(base_sy) > 1e-10:
-        base_weight = torch.tensor([[base_sx], [base_sy]])
-        base_linear = Linear(inp, base_weight, name=f"{name}_base")
-        result = Add(base_linear, result)
-
-    # Declare the tight output range.  Inside the grid the piecewise-
-    # linear interpolation is bounded by the function's vertex min/max.
-    # A non-zero base linear term (base_sx*x + base_sy*y) extrapolates
-    # linearly outside the grid — but grid_lo/grid_hi already include
-    # the base linear contribution at grid vertices, so only the input
-    # range that extends BEYOND the grid boundaries adds extra range.
-    grid_vals = [v for row in values for v in row]
-    grid_lo = builtins.min(grid_vals)
-    grid_hi = builtins.max(grid_vals)
-    base_lo = 0.0
-    base_hi = 0.0
-    can_tighten = True
-    if _builtin_abs(base_sx) > 1e-10:
-        r1 = inp1.value_type.value_range
-        if not r1.is_finite():
-            can_tighten = False
-        else:
-            ext_below = builtins.min(r1.lo - breakpoints1[0], 0.0)
-            ext_above = builtins.max(r1.hi - breakpoints1[-1], 0.0)
-            cand = (base_sx * ext_below, base_sx * ext_above)
-            base_lo += builtins.min(cand)
-            base_hi += builtins.max(cand)
-    if can_tighten and _builtin_abs(base_sy) > 1e-10:
-        r2 = inp2.value_type.value_range
-        if not r2.is_finite():
-            can_tighten = False
-        else:
-            ext_below = builtins.min(r2.lo - breakpoints2[0], 0.0)
-            ext_above = builtins.max(r2.hi - breakpoints2[-1], 0.0)
-            cand = (base_sy * ext_below, base_sy * ext_above)
-            base_lo += builtins.min(cand)
-            base_hi += builtins.max(cand)
-    if can_tighten:
-        result = assert_matches_value_type(
-            result,
-            NodeValueType(value_range=Range(grid_lo + base_lo, grid_hi + base_hi)),
-        )
-    return result
-
-
 def _product_2d_quarter_square(
     u_node: Node,
     v_node: Node,
@@ -1008,19 +656,15 @@ def multiply_2d(
     step2: float = 1.0,
     breakpoints1: Optional[List[float]] = None,
     breakpoints2: Optional[List[float]] = None,
-    min1: Optional[float] = None,
-    min2: Optional[float] = None,
-    max_abs_output: Optional[float] = None,
     d_max: int = 1024,
     name: str = "multiply_2d",
 ) -> Node:
     """Multiply two signed scalars via a 2D piecewise-linear lookup.
 
-    Computes ``inp1 * inp2`` in a **single MLP sublayer** by tabulating
-    the product on a 2D grid and delegating to :func:`piecewise_linear_2d`.
-    This trades MLP width for depth: ``signed_multiply`` uses ~3 MLP
-    sublayers but few neurons; ``multiply_2d`` uses 1 sublayer but
-    ~2*n1*n2 neurons (non-uniform grids) or ~3*(n1+n2) neurons (uniform).
+    Computes ``inp1 * inp2`` in a **single MLP sublayer** via an analytic
+    quarter-square construction: both axes are normalized to a common unit
+    grid and the bilinear product is built from ``((u+v)² − (u−v)²)/4`` as
+    one ReLU bank of ~``2*(2n−2)`` neurons (O(n) in the breakpoint count).
 
     **When to prefer over** ``signed_multiply``:
 
@@ -1031,12 +675,10 @@ def multiply_2d(
     * You need one multiplication per layer rather than a 3-layer chain.
 
     **Breakpoint generation.** When ``breakpoints1`` / ``breakpoints2`` are
-    not provided, uniform spacing from ``min1`` to ``max_abs1`` (and
-    similarly for axis 2) at ``step`` intervals is used.  ``min1`` defaults
-    to ``-max_abs1``; setting ``min1=0`` halves the breakpoints for
-    inputs known to be non-negative (e.g. ``inv_range``).  Custom
-    breakpoints (like the non-uniform ``_DIFF_BP`` used elsewhere in the
-    renderer) can be passed directly.
+    not provided, uniform spacing from ``-max_abs1`` to ``max_abs1`` (and
+    similarly for axis 2) at ``step`` intervals is used.  Custom breakpoints
+    (like the non-uniform ``_DIFF_BP`` used elsewhere in the renderer) can be
+    passed directly.
 
     Args:
         inp1: 1D scalar node.
@@ -1046,21 +688,14 @@ def multiply_2d(
         step1: Grid spacing for auto-generated breakpoints on axis 1.
         step2: Grid spacing for auto-generated breakpoints on axis 2.
         breakpoints1: Explicit breakpoints for axis 1.  Overrides
-            ``max_abs1`` / ``step1`` / ``min1``.
+            ``max_abs1`` / ``step1``.
         breakpoints2: Explicit breakpoints for axis 2.  Overrides
-            ``max_abs2`` / ``step2`` / ``min2``.
-        min1: Lower bound for auto-generated axis-1 breakpoints.
-            Defaults to ``-max_abs1``.
-        min2: Lower bound for auto-generated axis-2 breakpoints.
-            Defaults to ``-max_abs2``.
-        max_abs_output: If set, clamp the product to
-            ``[-max_abs_output, max_abs_output]`` via an extra
-            :func:`clamp` node (1 additional MLP sublayer).
+            ``max_abs2`` / ``step2``.
         d_max: Maximum neurons in the underlying MLP sublayer.
         name: Node name for debugging.
 
     Returns:
-        1D scalar node containing ``inp1 * inp2`` (optionally clamped).
+        1D scalar node containing ``inp1 * inp2``.
 
     .. noise-footer::
 
@@ -1072,29 +707,27 @@ def multiply_2d(
 
     # --- Build breakpoints ---
     if breakpoints1 is None:
-        lo1 = -max_abs1 if min1 is None else min1
+        lo1 = -max_abs1
         n1 = builtins.max(int(round((max_abs1 - lo1) / step1)) + 1, 2)
         breakpoints1 = [lo1 + i * step1 for i in range(n1)]
         breakpoints1[-1] = max_abs1  # pin endpoint
     if breakpoints2 is None:
-        lo2 = -max_abs2 if min2 is None else min2
+        lo2 = -max_abs2
         n2 = builtins.max(int(round((max_abs2 - lo2) / step2)) + 1, 2)
         breakpoints2 = [lo2 + i * step2 for i in range(n2)]
         breakpoints2[-1] = max_abs2  # pin endpoint
 
     # --- Normalize both axes to [0, 1] with a common step ---
     #
-    # piecewise_linear_2d places ReLU hyperplanes at x+y=const and
-    # x−y=const through every grid vertex.  On a square grid (equal step
-    # on both axes), these collapse to O(n) distinct lines.  When the
-    # steps differ the sums/differences are all distinct → O(n²)
-    # hyperplanes, which can exceed the MLP width budget.
-    #
-    # Affine-mapping both axes to [0, 1] with a common breakpoint count
-    # guarantees equal step → diagonal collapse → O(n) hyperplanes.
-    # The mapping is done by two free Linear nodes; the product
-    # fn(u, v) = (lo₁ + range₁·u)·(lo₂ + range₂·v) is passed to
-    # piecewise_linear_2d so the output is mathematically identical.
+    # The quarter-square construction places ReLU staircases along the
+    # normalized sum axis u+v and difference axis u−v.  On a square grid
+    # (equal step on both axes) these are uniform with a single spacing;
+    # differing steps would make the sums/differences all distinct → O(n²)
+    # neurons.  Affine-mapping both axes to [0, 1] with a common breakpoint
+    # count guarantees equal step → O(n) neurons.  The mapping is done by two
+    # free Linear nodes; the product fn(u, v) = (lo₁ + range₁·u)·(lo₂ +
+    # range₂·v) is reconstructed below so the output is mathematically
+    # identical.
     lo1_f = float(breakpoints1[0])
     hi1_f = float(breakpoints1[-1])
     lo2_f = float(breakpoints2[0])
@@ -1103,14 +736,10 @@ def multiply_2d(
     range2 = hi2_f - lo2_f
 
     if range1 < 1e-12 or range2 < 1e-12:
-        result = piecewise_linear_2d(
-            inp1,
-            inp2,
-            breakpoints1,
-            breakpoints2,
-            lambda a, b: a * b,
-            d_max=d_max,
-            name=name,
+        raise ValueError(
+            f"{name}: degenerate zero-width input axis "
+            f"(range1={range1}, range2={range2}); multiply_2d requires each "
+            "axis to span a positive range."
         )
     else:
         n = builtins.max(len(breakpoints1), len(breakpoints2))
@@ -1190,184 +819,10 @@ def multiply_2d(
                 ),
             )
 
-    if max_abs_output is not None:
-        result = clamp(result, -max_abs_output, max_abs_output)
-
     return result
 
 
-def low_rank_2d(
-    inp1: Node,
-    inp2: Node,
-    breakpoints1: List[float],
-    breakpoints2: List[float],
-    fn,
-    rank: int,
-    multiply_steps_per_axis: int = 20,
-    max_abs_output: Optional[float] = None,
-    d_max: int = 1024,
-    name: str = "low_rank_2d",
-) -> Node:
-    """Evaluate a 2D function via rank-K separable approximation.
-
-    Samples ``fn`` at every grid vertex, SVD-truncates the value matrix
-    to rank *K*, and emits the approximation as a sum of ``K`` separable
-    rank-1 terms::
-
-        f(x, y) ≈ Σ_{k=1..K} U_k(x) · V_k(y)
-
-    where ``U_k`` and ``V_k`` are 1-D piecewise-linear interpolants of
-    the scaled left/right singular vectors.  The output is the
-    SVD-optimal rank-K fit in Frobenius norm — in particular, the
-    worst-cell error is bounded above by ``σ_{K+1}`` (the first
-    truncated singular value), which is deterministic and computable at
-    compile time.
-
-    **When to prefer over** :func:`piecewise_linear_2d`:
-
-    * The grid is non-uniform (``piecewise_linear_2d``'s least-squares
-      solve oscillates in cell interiors on non-uniform grids).
-    * The function has low effective rank.  Products ``x·y`` are rank-1
-      exactly, so K=1 is lossless.  Smooth functions like ``atan(x/y)``
-      typically need K=2–3 for ~1% precision.
-    * You want a compile-time error bound that isn't dependent on the
-      pinv condition number.
-
-    **Cost:** 2 MLP sublayers:
-
-    * Sublayer 1: two 1D piecewise-linear lookups (one per axis), each
-      with vector-valued output of width *K*.  ``~(n1 + n2)`` neurons
-      total, independent of *K* (channels share ReLUs).
-    * Sublayer 2: *K* scalar multiplications via :func:`multiply_2d` on
-      uniform bounded grids (where the pinv issue doesn't bite).
-
-    Args:
-        inp1: 1-D scalar node.
-        inp2: 1-D scalar node.
-        breakpoints1: Strictly ascending x-coordinates (length n1 ≥ 2).
-        breakpoints2: Strictly ascending y-coordinates (length n2 ≥ 2).
-        fn: ``fn(x, y) -> float`` evaluated at each grid vertex.
-        rank: Number of separable terms *K* in the decomposition.
-            Clamped to ``min(n1, n2)``.  Compile time scales linearly
-            with *K*; pick the smallest *K* that meets your tolerance.
-        multiply_steps_per_axis: Grid resolution of each inner
-            :func:`multiply_2d` call (uniform breakpoints).  20 gives
-            typical ~1% multiply precision.
-        max_abs_output: If set, clamp the sum to
-            ``[−max_abs_output, max_abs_output]`` (one extra sublayer).
-        d_max: Maximum neurons per MLP sublayer.
-        name: Debug label prefix.
-
-    Returns:
-        1-D scalar node containing the rank-K approximation.
-
-    .. noise-footer::
-
-       Max error: 0.0651 abs, 0.3313 rel over 4096 samples;
-       measured at commit aafc5f3. See docs/numerical_noise.md.
-    """
-    assert len(inp1) == 1, "inp1 must be a 1D scalar node"
-    assert len(inp2) == 1, "inp2 must be a 1D scalar node"
-    n1 = len(breakpoints1)
-    n2 = len(breakpoints2)
-    assert n1 >= 2 and n2 >= 2, "Need >= 2 breakpoints per axis"
-    assert rank >= 1, "rank must be >= 1"
-    assert all(
-        breakpoints1[i] < breakpoints1[i + 1] for i in range(n1 - 1)
-    ), "breakpoints1 must be strictly ascending"
-    assert all(
-        breakpoints2[i] < breakpoints2[i + 1] for i in range(n2 - 1)
-    ), "breakpoints2 must be strictly ascending"
-
-    K = builtins.min(rank, builtins.min(n1, n2))
-
-    V = torch.zeros(n1, n2, dtype=torch.float64)
-    for i, xi in enumerate(breakpoints1):
-        for j, yj in enumerate(breakpoints2):
-            V[i, j] = float(fn(xi, yj))
-
-    U_full, S_full, Vh_full = torch.linalg.svd(V, full_matrices=False)
-
-    U_k = U_full[:, :K]  # (n1, K)
-    S_k = S_full[:K]
-    Vh_k = Vh_full[:K, :]  # (K, n2)
-
-    # Absorb √σ into each factor so both U_scaled and V_scaled have
-    # comparable magnitudes — makes the downstream multiply grid easy
-    # to bound.
-    sqrt_S = torch.sqrt(S_k)
-    U_scaled = (U_k * sqrt_S.unsqueeze(0)).tolist()  # (n1, K)
-    V_scaled = (Vh_k * sqrt_S.unsqueeze(1)).tolist()  # (K, n2)
-
-    # Map breakpoint → vector of K component values for piecewise_linear's
-    # vector-fn interface.  Float-equality dict lookup works because
-    # piecewise_linear iterates the exact same breakpoint floats.
-    u_by_bp = {breakpoints1[i]: U_scaled[i] for i in range(n1)}
-    v_by_bp = {breakpoints2[j]: [V_scaled[k][j] for k in range(K)] for j in range(n2)}
-
-    u_vec = piecewise_linear(
-        inp1,
-        breakpoints1,
-        lambda x: u_by_bp[x],
-        d_max=d_max,
-        name=f"{name}_u_vec",
-    )
-    v_vec = piecewise_linear(
-        inp2,
-        breakpoints2,
-        lambda y: v_by_bp[y],
-        d_max=d_max,
-        name=f"{name}_v_vec",
-    )
-
-    # Per-component amplitude bounds (used to size the multiply grid).
-    u_abs_max = [
-        builtins.max(_builtin_abs(U_scaled[i][k]) for i in range(n1)) for k in range(K)
-    ]
-    v_abs_max = [
-        builtins.max(_builtin_abs(V_scaled[k][j]) for j in range(n2)) for k in range(K)
-    ]
-
-    products: list = []
-    for k in range(K):
-        proj_u = torch.zeros(K, 1)
-        proj_u[k, 0] = 1.0
-        u_k = Linear(u_vec, proj_u, name=f"{name}_u{k}")
-
-        proj_v = torch.zeros(K, 1)
-        proj_v[k, 0] = 1.0
-        v_k = Linear(v_vec, proj_v, name=f"{name}_v{k}")
-
-        # Pad 5% around the empirical max so the input lands strictly
-        # inside the multiply's interpolation grid.  Floor at 1e-6 so
-        # a degenerate all-zero component doesn't produce step=0.
-        u_bound = builtins.max(u_abs_max[k] * 1.05, 1e-6)
-        v_bound = builtins.max(v_abs_max[k] * 1.05, 1e-6)
-        step_u = u_bound / builtins.max(multiply_steps_per_axis // 2, 1)
-        step_v = v_bound / builtins.max(multiply_steps_per_axis // 2, 1)
-
-        products.append(
-            multiply_2d(
-                u_k,
-                v_k,
-                max_abs1=u_bound,
-                max_abs2=v_bound,
-                step1=step_u,
-                step2=step_v,
-                d_max=d_max,
-                name=f"{name}_prod{k}",
-            )
-        )
-
-    result = products[0] if len(products) == 1 else sum_nodes(products)
-
-    if max_abs_output is not None:
-        result = clamp(result, -max_abs_output, max_abs_output)
-
-    return result
-
-
-def square(inp: Node, max_value: float, step: float = 1.0, d_max: int = 1024) -> Node:
+def square(inp: Node, max_value: float, step: float = 1.0) -> Node:
     """Compute x² via piecewise-linear interpolation.
 
     Exact when x is a multiple of ``step``. Between grid points the
@@ -1383,8 +838,6 @@ def square(inp: Node, max_value: float, step: float = 1.0, d_max: int = 1024) ->
         step: Grid spacing. Exact for multiples of step. Smaller values
             give better accuracy for non-grid inputs at the cost of more
             breakpoints.
-        d_max: Maximum neurons per MLP sublayer. When more breakpoints
-            are needed, they are split into chunks of this size.
 
     Returns:
         1D scalar node containing x² (exact at grid points).
@@ -1403,49 +856,7 @@ def square(inp: Node, max_value: float, step: float = 1.0, d_max: int = 1024) ->
         breakpoints.append(x)
         x += step
 
-    return piecewise_linear(
-        inp, breakpoints, lambda x: x * x, d_max=d_max, name="square"
-    )
-
-
-def square_signed(
-    inp: Node,
-    max_abs: float,
-    step: float = 1.0,
-    d_max: int = 1024,
-) -> Node:
-    """Compute x² for signed inputs via piecewise-linear interpolation.
-
-    Unlike :func:`square` (which only handles non-negative inputs),
-    this handles x in [-max_abs, max_abs] directly — no ``abs`` needed.
-    This saves one MLP sublayer when used inside :func:`signed_multiply`.
-
-    Args:
-        inp: 1D scalar node with value in [-max_abs, max_abs].
-        max_abs: Maximum absolute value of input.
-        step: Grid spacing.
-        d_max: Maximum neurons per MLP sublayer.
-
-    Returns:
-        1D scalar node containing x².
-
-    .. noise-footer::
-
-       Max error: 0.25 abs, 276.7 rel over 4096 samples;
-       measured at commit aafc5f3. See docs/numerical_noise.md.
-    """
-    assert len(inp) == 1, "Input must be a 1D scalar node"
-    assert max_abs > 0, "max_abs must be positive"
-
-    breakpoints = []
-    x = -max_abs
-    while x <= max_abs + step / 2.0:
-        breakpoints.append(x)
-        x += step
-
-    return piecewise_linear(
-        inp, breakpoints, lambda x: x * x, d_max=d_max, name="square_signed"
-    )
+    return piecewise_linear(inp, breakpoints, lambda x: x * x, name="square")
 
 
 def thermometer_floor_div(inp: Node, divisor: int, max_value: int) -> Node:
@@ -1542,193 +953,6 @@ def mod_const(inp: Node, divisor: int, max_value: int) -> Node:
     return subtract(inp, multiply_const(q, float(divisor)))
 
 
-def linear_bin_index(
-    x: Node,
-    x_min: Node,
-    x_max: Node,
-    n_bins: int,
-    min_range: float = 0.5,
-    max_range: float = 200.0,
-    n_reciprocal_breakpoints: int = 32,
-    mul_step: float = 0.5,
-    name: str = "linear_bin_index",
-    inv_range: Optional[Node] = None,
-) -> Node:
-    """Map a continuous coordinate onto an integer bin index.
-
-    Computes ::
-
-        bin = clamp(floor((x - x_min) * n_bins / (x_max - x_min)),
-                    0, n_bins - 1)
-
-    for runtime scalars ``x``, ``x_min``, ``x_max`` and a compile-time
-    ``n_bins``.  This is the "continuous → discrete bin" side of
-    resampling: paired with :func:`dynamic_extract` it gives texture
-    sampling, histogram bucketing, dispatch tables, and every other
-    "which of ``n_bins`` things am I looking at right now" query.
-
-    Decomposition (and why each piece exists):
-
-    1. ``range_ = x_max - x_min`` — free Linear.
-    2. ``clamp(range_, min_range, max_range)`` — a runtime range that
-       drops to zero would blow up the reciprocal.  Clamping bounds the
-       reciprocal at ``1/min_range`` instead.  Costs 1 MLP sublayer.
-    3. ``inv_range = 1/clamped_range`` — **geometric** breakpoints, not
-       linear, because ``1/x`` has steep gradient near small ``x`` and
-       geometric spacing gives constant *relative* error across the
-       whole range.  Costs 1 MLP sublayer with ~``n_reciprocal_breakpoints``
-       neurons.
-    4. ``delta = x - x_min`` — free Linear.
-    5. ``clamped_delta = clamp(delta, -max_range, max_range)`` — keeps
-       the multiplication within its declared input bounds even when
-       the caller sends an ``x`` far outside ``[x_min, x_max]``.
-    6. ``normalized = signed_multiply(clamped_delta, inv_range,
-       max_abs_output=max_range/min_range)`` — the one non-trivial cost,
-       ~3 MLP sublayers.  Bounded via ``max_abs_output`` so downstream
-       ops see a defined output range.
-    7. ``bin_f = multiply_const(normalized, float(n_bins))`` — free.
-    8. ``clamp(bin_f, 0, n_bins - 0.5)`` — clamp to the valid floor
-       domain.  Callers who pass out-of-range ``x`` land on the nearest
-       endpoint bin instead of wandering off into the staircase's
-       extrapolation zone.
-    9. ``thermometer_floor_div(..., divisor=1, max_value=n_bins-1)`` —
-       the actual floor-to-integer step.
-
-    Total cost: ~6 MLP sublayers at step sharpness ~1.  Depth is
-    dominated by the ``signed_multiply``.  The primitive is designed
-    for "call once per query"; if a caller needs many bin indices over
-    the same ``(x_min, x_max)`` with different ``x`` values, the cheap
-    path is to hoist ``inv_range`` out and pass it via the ``inv_range``
-    parameter, saving 2 MLP sublayers per call::
-
-        # Hoist the shared computation:
-        range_ = subtract(x_max, x_min)
-        clamped = clamp(range_, min_range, max_range)
-        inv = reciprocal(clamped, min_value=min_range, max_value=max_range)
-
-        for y_idx in range(rows_per_patch):
-            idx = linear_bin_index(y, x_min, x_max, n_bins,
-                                   min_range=min_range, max_range=max_range,
-                                   inv_range=inv)
-
-    Args:
-        x: Scalar node — continuous coordinate to bin.
-        x_min: Scalar node — lower edge of the value range.
-        x_max: Scalar node — upper edge.  Must satisfy
-            ``x_max - x_min >= min_range`` for correct output; smaller
-            ranges are clamped to ``min_range`` before the reciprocal.
-            Ignored (but still required for API stability) when
-            ``inv_range`` is provided.
-        n_bins: Number of discrete bins (compile-time).  Output is an
-            integer in ``[0, n_bins - 1]``.
-        min_range: Smallest representable value of ``x_max - x_min``.
-            Smaller values need more reciprocal breakpoints to stay
-            accurate.  Also sets the ``signed_multiply`` bound
-            ``max_abs2 = 1/min_range``, so it is required even when
-            ``inv_range`` is provided.
-        max_range: Largest representable value of ``x_max - x_min``.
-            Also sets the ``signed_multiply`` bound ``max_abs1 = max_range``
-            and the delta clamp, so it is required even when ``inv_range``
-            is provided.
-        n_reciprocal_breakpoints: Number of geometrically-spaced
-            breakpoints used by the internal ``1/range`` lookup.  More
-            breakpoints → tighter relative error on the reciprocal;
-            typically ``log(max_range/min_range) / log(1 + tolerance)``.
-            Default 32 gives ≲1% relative error over a 400× range.
-            Ignored when ``inv_range`` is provided.
-        mul_step: Grid spacing passed to the internal ``signed_multiply``
-            for the ``delta × inv_range`` product.
-        inv_range: Pre-computed ``1 / clamp(x_max - x_min, min_range,
-            max_range)`` node.  When provided, steps 1-3 above are
-            skipped and this node is used directly in the multiplication.
-            The caller is responsible for computing this with adequate
-            precision (see the hoisting example above).
-
-    Returns:
-        Scalar node carrying an integer in ``[0, n_bins - 1]``.
-
-    .. noise-footer::
-
-       Max error: 1 abs, 1 rel over 4096 samples;
-       measured at commit aafc5f3. See docs/numerical_noise.md.
-    """
-    assert len(x) == 1, "x must be a 1D scalar node"
-    assert len(x_min) == 1, "x_min must be a 1D scalar node"
-    assert len(x_max) == 1, "x_max must be a 1D scalar node"
-    assert n_bins >= 1, "n_bins must be at least 1"
-    assert (
-        0 < min_range < max_range
-    ), "need 0 < min_range < max_range for the reciprocal lookup"
-
-    if inv_range is not None:
-        # Caller pre-computed 1/clamped_range — skip steps 1-3.
-        assert len(inv_range) == 1, "inv_range must be a 1D scalar node"
-    else:
-        assert (
-            n_reciprocal_breakpoints >= 2
-        ), "need at least 2 breakpoints for the geometric reciprocal lookup"
-
-        # 1. range and its clamp.
-        range_ = subtract(x_max, x_min)
-        clamped_range = clamp(range_, min_range, max_range)
-
-        # 2. 1/range via a geometric breakpoint lookup.  Geometric spacing
-        #    gives constant relative error per segment: error_rel ≈ (r-1)²/4
-        #    where r is the per-step ratio.  For 32 breakpoints over a
-        #    400× range, r ≈ 1.22 and error_rel ≈ 1.2%.
-        ratio = (max_range / min_range) ** (1.0 / (n_reciprocal_breakpoints - 1))
-        bps: List[float] = [
-            min_range * (ratio**k) for k in range(n_reciprocal_breakpoints)
-        ]
-        # Pin the endpoints so float rounding can't drift them.
-        bps[0] = min_range
-        bps[-1] = max_range
-        # The breakpoints must be strictly ascending — trivially true for
-        # geometric spacing but assert in case min_range == max_range sneaks
-        # through numerically.
-        assert all(
-            bps[i] < bps[i + 1] for i in range(len(bps) - 1)
-        ), "geometric breakpoints collapsed — check min_range/max_range"
-        inv_range = piecewise_linear(
-            clamped_range,
-            bps,
-            lambda r: 1.0 / r,
-            name=f"{name}_inv_range",
-        )
-
-    # 3. delta and its clamp.  Pre-clamping keeps the multiplication
-    #    inputs inside the declared bounds even under adversarial
-    #    caller behaviour.
-    delta = subtract(x, x_min)
-    clamped_delta = clamp(delta, -max_range, max_range)
-
-    # 4. normalized = delta × (1/range).  Signed because delta may be
-    #    negative when x < x_min.
-    max_abs_normalized = max_range / min_range
-    normalized = signed_multiply(
-        clamped_delta,
-        inv_range,
-        max_abs1=max_range,
-        max_abs2=1.0 / min_range,
-        max_abs_output=max_abs_normalized,
-        step=mul_step,
-    )
-
-    # 5. Scale by n_bins (free Linear), clamp to the valid floor domain,
-    #    then staircase-floor.  The (n_bins - 0.5) upper clamp ensures
-    #    that an x at or past x_max lands on bin (n_bins - 1) rather
-    #    than the non-existent bin n_bins.  We use ``floor_int`` rather
-    #    than ``thermometer_floor_div`` because ``bin_f`` is a continuous
-    #    float that rarely lands on an integer — ``floor_int`` places
-    #    its staircase ramps AT integer boundaries (leaving the flat
-    #    between-integer region clean), whereas ``thermometer_floor_div``
-    #    places them at ``k - 0.5`` which is designed for integer
-    #    inputs and produces interpolated junk on non-integer floats.
-    bin_f = multiply_const(normalized, float(n_bins))
-    clamped_bin_f = clamp(bin_f, 0.0, float(n_bins) - 0.5)
-    return floor_int(clamped_bin_f, min_value=0, max_value=n_bins - 1)
-
-
 def clamp(inp: Node, lo: float, hi: float) -> Node:
     """Clamp a scalar to [lo, hi] in a single MLP sublayer.
 
@@ -1769,7 +993,6 @@ def reciprocal(
     min_value: float,
     max_value: float,
     step: float = 1.0,
-    d_max: int = 1024,
 ) -> Node:
     """Compute 1/x via piecewise-linear interpolation.
 
@@ -1785,7 +1008,6 @@ def reciprocal(
         max_value: Upper bound on input.
         step: Controls breakpoint density.  Smaller step = more
             breakpoints = higher accuracy.
-        d_max: Maximum neurons per MLP sublayer.
 
     Returns:
         1D scalar node containing 1/x.
@@ -1805,430 +1027,7 @@ def reciprocal(
     breakpoints[0] = min_value
     breakpoints[-1] = max_value
 
-    return piecewise_linear(
-        inp, breakpoints, lambda x: 1.0 / x, d_max=d_max, name="reciprocal"
-    )
-
-
-def _log_single(
-    inp: Node,
-    min_value: float,
-    max_value: float,
-    n_breakpoints: int,
-    d_max: int,
-    name: str = "log_section",
-) -> Node:
-    """Single-section piecewise-linear log over ``[min_value, max_value]``.
-
-    Geometric breakpoint spacing. Used both as the fallback path of
-    :func:`log` (for ranges that fit in one section) and as each
-    section's interior approximation in the sectioned path.
-    """
-    import math as _math
-
-    ratio = (max_value / min_value) ** (1.0 / (n_breakpoints - 1))
-    breakpoints = [min_value * (ratio**k) for k in range(n_breakpoints)]
-    breakpoints[0] = min_value
-    breakpoints[-1] = max_value
-    return piecewise_linear(
-        inp, breakpoints, lambda x: _math.log(x), d_max=d_max, name=name
-    )
-
-
-_LOG_BOUNDARY_SHARPNESS = 10.0
-"""Step-sharpness for :func:`log`'s section-routing compares.
-
-Trade-off here is between **ramp width** (``1/sharpness`` in input
-units, drives the section-overlap requirement) and **compare-output
-cancellation noise** (``sharpness · x_max · 2⁻²³``, since the compare
-realises a 0→1 step as ``ReLU(s·(x-t)) - ReLU(s·(x-t) - 1)`` whose
-two terms grow with ``s·x_max``).
-
-At ``sharpness=10`` and ``x_max≈3·10⁴``, cancellation magnitude is
-``3·10⁵`` so output noise is ``~0.04`` absolute — manageable with
-the widened ``_LOG_COMPARE_ATOL`` below. Higher sharpness narrows
-the ramp but explodes cancellation noise; lower sharpness widens
-the ramp past where multiply_2d blending stays accurate.
-"""
-
-_LOG_COMPARE_ATOL = 0.1
-"""Tolerance on ``_log_compare_01``'s value-range assertion.
-
-Float32 cancellation in ``ReLU(s·(x-t)) - ReLU(s·(x-t) - 1)`` at
-extreme ``x`` can push the output as far as ``±0.07`` outside the
-nominal ``[0, 1]`` range. ``0.1`` gives a safety margin without
-masking real bugs.
-"""
-
-
-def _log_compare_01(inp: Node, thresh: float) -> Node:
-    """0/1 thermometer compare for :func:`log`'s section routing.
-
-    Inline ``linear_relu_linear`` (rather than calling :func:`compare`)
-    so we can attach a widened value-range assertion that accommodates
-    the float32 cancellation noise at extreme ``x``. Same structure
-    as ``compare``: two ReLUs realise a 0→1 ramp of width
-    ``1/_LOG_BOUNDARY_SHARPNESS`` starting at ``thresh``.
-    """
-    s = _LOG_BOUNDARY_SHARPNESS
-    input_proj = torch.tensor([[s], [s]])
-    input_bias = torch.tensor([-s * float(thresh), -s * float(thresh) - 1.0])
-    output_proj = torch.tensor([[1.0], [-1.0]])
-    output_bias = torch.tensor([0.0])
-    result = linear_relu_linear(
-        input_node=inp,
-        input_proj=input_proj,
-        input_bias=input_bias,
-        output_proj=output_proj,
-        output_bias=output_bias,
-        name="log_cmp",
-    )
-    return assert_matches_value_type(
-        result,
-        NodeValueType(value_range=Range(0.0, 1.0)),
-        atol=_LOG_COMPARE_ATOL,
-    )
-
-
-def log(
-    inp: Node,
-    min_value: float,
-    max_value: float,
-    n_breakpoints: int = 256,
-    section_factor: float = 10.0,
-    d_max: int = 1024,
-) -> Node:
-    """Natural log of a positive scalar via per-section piecewise-linear.
-
-    The naïve single-section piecewise-linear log accumulates
-    ``slope[0] · x_max ≈ x_max / x_min`` in pre-cancellation magnitude
-    at the right end of its range, hitting a float32 cancellation
-    floor of ``(x_max/x_min) · 2⁻²³``. For ``x_max/x_min > ~10⁴`` this
-    exceeds typical noise budgets — and adding more breakpoints makes
-    it *worse* by lengthening the cancellation chain.
-
-    This implementation sections the input range geometrically by
-    ``section_factor`` (default decades), computes one piecewise-
-    linear log per section in parallel, and routes via thermometer
-    compare plus :func:`multiply_2d` blending. Each section's pre-
-    cancellation magnitude is bounded by its own ``B_{i+1}/B_i =
-    section_factor``, so the per-section precision floor is
-    ``section_factor · 2⁻²³`` — independent of the overall range.
-
-    **Routing detail.** Section ``i``'s piecewise-linear is extended
-    by ``1/_LOG_BOUNDARY_SHARPNESS`` past its right boundary so that
-    when an input lands in the ramp zone of the boundary compare,
-    both adjacent sections compute ``log(x)`` correctly (not clamped).
-    The 0/1 thermometer indicators (telescoping differences) sum to 1
-    by construction, so :func:`multiply_2d` blending gives the linear
-    interpolation between two correct values at boundaries — i.e.,
-    still the correct value.
-
-    For ranges that fit in one section
-    (``x_max/x_min <= section_factor``), falls through to a single
-    :func:`piecewise_linear` with no routing overhead.
-
-    Args:
-        inp: 1D scalar node with value in ``[min_value, max_value]``.
-        min_value: Lower bound on input (must be > 0).
-        max_value: Upper bound on input (must exceed ``min_value``).
-        n_breakpoints: Approximate total breakpoint budget. Distributed
-            across sections in the sectioned path; sets BP density in
-            the single-section path. Default 256.
-        section_factor: Geometric width of each section (default 10).
-            Smaller factor means more sections — tighter precision per
-            section, more total neurons.
-        d_max: Maximum neurons per MLP sublayer.
-
-    Returns:
-        1D scalar node containing ``log(x)``.
-
-    .. noise-footer::
-
-       Max error: 0.003152 abs, 0.003719 rel over 8192 samples;
-       measured at commit aafc5f3. See docs/numerical_noise.md.
-    """
-    import math as _math
-
-    assert len(inp) == 1, "Input must be a 1D scalar node"
-    assert min_value > 0, "min_value must be positive"
-    assert max_value > min_value, "max_value must exceed min_value"
-    assert n_breakpoints >= 2, "need >= 2 breakpoints"
-    assert section_factor > 1.0, "section_factor must be > 1"
-
-    log_ratio = _math.log(max_value / min_value)
-    log_factor = _math.log(section_factor)
-    n_sections = builtins.max(int(_math.ceil(log_ratio / log_factor)), 1)
-
-    if n_sections == 1:
-        return _log_single(
-            inp, min_value, max_value, n_breakpoints, d_max, name="log"
-        )
-
-    # Geometric section endpoints.
-    section_ratio = (max_value / min_value) ** (1.0 / n_sections)
-    endpoints = [min_value * (section_ratio**i) for i in range(n_sections + 1)]
-    endpoints[0] = min_value
-    endpoints[-1] = max_value
-
-    # Per-section breakpoint count: distribute the budget but keep a
-    # floor so each section is well-resolved with many sections.
-    n_bp_per_section = builtins.max(n_breakpoints // n_sections, 16)
-
-    # Section overlap on the right side: extend each section's PWL
-    # past its boundary by the ramp width of the routing compare. At
-    # an input in the ramp zone, both adjacent sections then produce
-    # log(x) correctly rather than the clamped boundary value.
-    ramp_width = 1.0 / _LOG_BOUNDARY_SHARPNESS
-
-    # Parallel section logs. We unwrap each section's value-range
-    # Assert: its declared range (e.g. ``[log(B_i), log(B_{i+1})]``)
-    # is exceeded by ~1e-3 absolute when the PWL is evaluated far
-    # outside its section (float32 cancellation in the slope-delta
-    # sum at large ``x``), but those out-of-section values are routed
-    # to weight≈0 via the indicator gating below. The global value
-    # range is re-asserted on the final sum.
-    section_logs = []
-    for i in range(n_sections):
-        bp_lo = endpoints[i]
-        bp_hi = endpoints[i + 1] + (
-            ramp_width if i < n_sections - 1 else 0.0
-        )
-        sec = _log_single(
-            inp, bp_lo, bp_hi, n_bp_per_section, d_max, name=f"log_sec_{i}"
-        )
-        # piecewise_linear with clamp=True wraps in assert_matches_value_type;
-        # the wrapped node is `sec.inputs[0]`.
-        section_logs.append(sec.inputs[0])
-
-    # Thermometer compares against interior boundaries (0/1 outputs).
-    is_above = [
-        _log_compare_01(inp, endpoints[k + 1])
-        for k in range(n_sections - 1)
-    ]
-
-    # 0/1 indicators via thermometer differences. Sum to 1 by
-    # telescoping (including in ramp zones where adjacent indicators
-    # are non-{0,1} but sum to 1).
-    from torchwright.ops.inout_nodes import create_literal_value
-
-    one_lit = create_literal_value(torch.tensor([1.0]), name="log_one_lit")
-    indicators = []
-    indicators.append(subtract(one_lit, is_above[0]))
-    for i in range(1, n_sections - 1):
-        indicators.append(subtract(is_above[i - 1], is_above[i]))
-    indicators.append(is_above[-1])
-
-    # multiply_2d blending: indicator (∈[0,1]) × section_log. At a
-    # fuzzy boundary, sum = 0.5·log(B) + 0.5·log(B) = log(B).
-    log_min = _math.log(min_value)
-    log_max = _math.log(max_value)
-    max_abs_log = builtins.max(builtins.abs(log_min), builtins.abs(log_max))
-
-    # Indicator nominal range is [0, 1] but noisy in compare-cancellation
-    # zones (extreme x). Widen multiply_2d's first-axis range so the
-    # blending op still sees its inputs as valid.
-    weight_lo = -_LOG_COMPARE_ATOL * 2
-    weight_hi = 1.0 + _LOG_COMPARE_ATOL * 2
-    weighted = []
-    for i in range(n_sections):
-        weighted.append(
-            multiply_2d(
-                indicators[i],
-                section_logs[i],
-                max_abs1=weight_hi,
-                max_abs2=max_abs_log,
-                min1=weight_lo,
-                step1=0.05,
-                step2=0.5,
-                d_max=d_max,
-                name=f"log_sec_blend_{i}",
-            )
-        )
-
-    result = sum_nodes(weighted)
-    return assert_matches_value_type(
-        result, NodeValueType(value_range=Range(log_min, log_max))
-    )
-
-
-def exp(
-    inp: Node,
-    min_value: float,
-    max_value: float,
-    n_breakpoints: int = 256,
-    d_max: int = 1024,
-) -> Node:
-    """Natural exponential via piecewise-linear interpolation.
-
-    Uses **uniform** breakpoint spacing.  The second derivative of
-    ``exp(x)`` is ``exp(x)`` itself, so the linear-interpolation error
-    between two breakpoints ``[x_i, x_{i+1}]`` is approximately
-    ``(Δx)² · exp(x_mid) / 8``.  Uniform spacing (constant ``Δx``)
-    therefore gives constant *relative* error of ``(Δx)² / 8`` in the
-    output across the whole range — the natural pairing for the
-    geometric-spaced :func:`log`.
-
-    With ``n_breakpoints = 256`` over a range of width 10
-    (``Δx ≈ 0.0392``), the worst-case relative error is
-    ``Δx² / 8 ≈ 1.9·10⁻⁴``.
-
-    Args:
-        inp: 1D scalar node with value in ``[min_value, max_value]``.
-        min_value: Lower bound on input.
-        max_value: Upper bound on input (must exceed ``min_value``).
-        n_breakpoints: Number of breakpoints (default 256).  Must be
-            >= 2.
-        d_max: Maximum neurons per MLP sublayer.
-
-    Returns:
-        1D scalar node containing ``exp(x)``.
-
-    .. noise-footer::
-
-       Max error: 0.02797 abs, 0.0001924 rel over 4096 samples;
-       measured at commit aafc5f3. See docs/numerical_noise.md.
-    """
-    import math as _math
-
-    assert len(inp) == 1, "Input must be a 1D scalar node"
-    assert max_value > min_value, "max_value must exceed min_value"
-    assert n_breakpoints >= 2, "need >= 2 breakpoints"
-
-    step = (max_value - min_value) / (n_breakpoints - 1)
-    breakpoints = [min_value + k * step for k in range(n_breakpoints)]
-    breakpoints[-1] = max_value
-
-    return piecewise_linear(
-        inp, breakpoints, lambda x: _math.exp(x), d_max=d_max, name="exp"
-    )
-
-
-_LOG_ABS_SINGLE_RATIO_THRESHOLD = 1e4
-"""Above this ``max_abs/min_abs`` ratio, single-piecewise :func:`log_abs`'s
-float32 cancellation floor exceeds ~1.2e-3 absolute. Use the abs+sectioned
-log fallback above this threshold (3 sublayers but precision bounded by
-section width)."""
-
-
-def _log_abs_single(
-    inp: Node,
-    min_abs: float,
-    max_abs: float,
-    n_breakpoints: int,
-    d_max: int,
-) -> Node:
-    """Single-sublayer V-shape ``log|·|`` via :func:`piecewise_linear` over
-    signed ``x``.
-
-    Breakpoints are placed at ``[-max_abs, ..., -min_abs, min_abs, ...,
-    max_abs]`` with geometric spacing on each arm. The flat V-bottom is
-    represented implicitly: between the consecutive breakpoints
-    ``-min_abs`` and ``+min_abs`` (no BP between), :func:`piecewise_linear`
-    interpolates linearly — and both endpoints have value ``log(min_abs)``,
-    so the interpolation is constant. Outside ``±max_abs``, :func:`piecewise_linear`'s
-    default ``clamp=True`` holds the value at ``log(max_abs)``.
-    """
-    import math as _math
-
-    n_arm = builtins.max(n_breakpoints // 2, 8)
-
-    # Right arm: geometric BPs from min_abs to max_abs.
-    ratio = (max_abs / min_abs) ** (1.0 / (n_arm - 1))
-    right_arm = [min_abs * (ratio**k) for k in range(n_arm)]
-    right_arm[0] = min_abs
-    right_arm[-1] = max_abs
-
-    # Left arm: mirror around 0 (so breakpoints stay strictly ascending
-    # when concatenated).
-    left_arm = [-v for v in reversed(right_arm)]
-
-    breakpoints = left_arm + right_arm  # length 2 * n_arm
-
-    def _fn(v: float) -> float:
-        a = _builtin_abs(v)
-        clamped = builtins.max(min_abs, builtins.min(max_abs, a))
-        return _math.log(clamped)
-
-    return piecewise_linear(
-        inp, breakpoints, _fn, d_max=d_max, name="log_abs"
-    )
-
-
-def log_abs(
-    inp: Node,
-    min_abs: float = 0.1,
-    max_abs: float = 100.0,
-    n_breakpoints: int = 256,
-    section_factor: float = 10.0,
-    d_max: int = 1024,
-) -> Node:
-    """``log(clamp(|x|, min_abs, max_abs))`` for signed ``x``.
-
-    Even-symmetric, V-shaped with a flat bottom at ``log(min_abs)`` over
-    ``[-min_abs, +min_abs]``, and clamped to ``log(max_abs)`` outside
-    ``[-max_abs, +max_abs]``. Pairs with :func:`exp` and Linear addition
-    for log-domain multiplication of a signed by a positive value (e.g.
-    ``signed_coord · positive_scale``). Saves the explicit
-    ``abs`` + ``log`` layering by treating the V-shaped ``log|x|`` as a
-    single piecewise op.
-
-    **Implementation paths.**
-
-    * For ratios ``max_abs/min_abs ≤ 10⁴`` (the typical case, including
-      the default 3-decade ``[0.1, 100]``): a single piecewise_linear
-      over signed ``x`` with V-shape breakpoints. Cost: **1 MLP
-      sublayer.** The V-spikes at ``±min_abs`` (where the log slope
-      transitions to/from the flat zone) each contribute roughly
-      ``(max_abs/min_abs) · log_slope_jump`` magnitude to the matmul
-      partial sum at extreme ``x`` — but with the threshold at 10⁴ that
-      magnitude stays under ~10³, giving float32 ULP ~1.2e-4 absolute.
-    * For wider ratios: compose ``log(abs(x), ..., section_factor=...)``
-      with the sectioned :func:`log` op. Cost: **3 MLP sublayers** (1 for
-      ``abs``, 2 for sectioned ``log``) — at parity with the explicit
-      ``abs`` + ``log`` composition this op fuses below the threshold.
-
-    Args:
-        inp: 1D scalar node (signed).
-        min_abs: Lower clamp on ``|x|`` (must be > 0). Below ``|x| = min_abs``
-            the output is constant ``log(min_abs)``.
-        max_abs: Upper clamp on ``|x|`` (must exceed ``min_abs``). Above
-            ``|x| = max_abs`` the output is constant ``log(max_abs)``.
-        n_breakpoints: Approximate total breakpoint budget (default 256).
-            Distributed roughly evenly across the two arms in the single-
-            piecewise path; passed through to :func:`log` in the fallback.
-        section_factor: Geometric section width used by the wide-range
-            fallback's :func:`log` (default 10). Mirrors :func:`log`'s knob
-            for API consistency; unused on the single-piecewise path.
-        d_max: Maximum neurons per MLP sublayer.
-
-    Returns:
-        1D scalar node containing ``log(clamp(|x|, min_abs, max_abs))``.
-
-    .. noise-footer::
-
-       Max error: 0.0006061 abs, 0.1426 rel over 4096 samples;
-       measured at commit aafc5f3. See docs/numerical_noise.md.
-    """
-    assert len(inp) == 1, "Input must be a 1D scalar node"
-    assert min_abs > 0, "min_abs must be positive"
-    assert max_abs > min_abs, "max_abs must exceed min_abs"
-    assert n_breakpoints >= 4, "need >= 4 breakpoints (>= 2 per arm)"
-    assert section_factor > 1.0, "section_factor must be > 1"
-
-    if max_abs / min_abs <= _LOG_ABS_SINGLE_RATIO_THRESHOLD:
-        return _log_abs_single(inp, min_abs, max_abs, n_breakpoints, d_max)
-
-    # Wide-range fallback: abs + sectioned log = 3 sublayers.
-    abs_x = abs(inp)
-    return log(
-        abs_x,
-        min_value=min_abs,
-        max_value=max_abs,
-        n_breakpoints=n_breakpoints,
-        section_factor=section_factor,
-        d_max=d_max,
-    )
+    return piecewise_linear(inp, breakpoints, lambda x: 1.0 / x, name="reciprocal")
 
 
 def floor_int(
@@ -2389,9 +1188,7 @@ def ceil_int(
        measured at commit aafc5f3. See docs/numerical_noise.md.
     """
     assert len(inp) == 1, "Input must be a 1D scalar node"
-    return negate(
-        floor_int(negate(inp), -max_value, -min_value, sharpness=sharpness)
-    )
+    return negate(floor_int(negate(inp), -max_value, -min_value, sharpness=sharpness))
 
 
 # ---------------------------------------------------------------------------
@@ -2403,7 +1200,6 @@ def multiply_integers(
     inp1: Node,
     inp2: Node,
     max_value: int,
-    strategy: str = "deep",
 ) -> Node:
     """Multiply two non-negative integer scalars using the polarization identity.
 
@@ -2417,21 +1213,15 @@ def multiply_integers(
         s = a + b                          range [0, 2*max_value], Linear (free)
         d = a - b                          range [-max_value, max_value], Linear (free)
         s² = square(s)                     1+ MLP sublayers
-        d²:
-          deep    → |d| = abs(d), |d|² = square(|d|)        2 MLP sublayers
-          shallow → square_signed(d)                         1 MLP sublayer (~2× width)
-        result = (s² - d²) / 4              Linear (free)
+        d² = square(abs(d))                2 MLP sublayers (|d| = abs(d), then square)
+        result = (s² - d²) / 4             Linear (free)
 
-    Total cost: 3 MLP sublayers (deep, default) or 2 MLP sublayers (shallow).
+    Total cost: 3 MLP sublayers.
 
     Args:
         inp1: 1D scalar node, integer value in [0, max_value].
         inp2: 1D scalar node, integer value in [0, max_value].
         max_value: Upper bound on each input.
-        strategy: ``"deep"`` (default, abs+square, narrower) or ``"shallow"``
-            (square_signed, saves 1 MLP sublayer at ~2× the width on the
-            d branch).  Use ``"shallow"`` only when the target ``d`` can
-            fit ``2*max_value + 1`` neurons in a single MLP sublayer.
 
     Returns:
         1D scalar node containing inp1 * inp2.
@@ -2441,7 +1231,6 @@ def multiply_integers(
        Max error: 0 abs, 0 rel over 4096 samples;
        measured at commit aafc5f3. See docs/numerical_noise.md.
     """
-    assert strategy in ("deep", "shallow"), f"unknown strategy: {strategy}"
     assert len(inp1) == 1, "Input must be a 1D scalar node"
     assert len(inp2) == 1, "Input must be a 1D scalar node"
 
@@ -2449,205 +1238,7 @@ def multiply_integers(
     d = subtract(inp1, inp2)  # a-b (may be negative)
 
     sq_sum = square(s, 2 * max_value)  # (a+b)²
-    if strategy == "shallow":
-        sq_diff = square_signed(d, max_abs=max_value)  # (a-b)²
-    else:
-        sq_diff = square(abs(d), max_value)  # (a-b)²
+    sq_diff = square(abs(d), max_value)  # (a-b)²
 
     # a*b = ((a+b)² - (a-b)²) / 4
     return add_scaled_nodes(0.25, sq_sum, -0.25, sq_diff)
-
-
-def signed_multiply(
-    inp1: Node,
-    inp2: Node,
-    max_abs1: float,
-    max_abs2: float,
-    step: float = 1.0,
-    max_abs_output: float | None = None,
-    d_max: int = 1024,
-    strategy: str = "deep",
-) -> Node:
-    """Multiply two signed scalars using the polarization identity.
-
-    ``a * b = (|a+b|² - |a-b|²) / 4``
-
-    Exact when both inputs are multiples of ``step``.  Piecewise-linear
-    between grid points.
-
-    Two implementations of the squarings are available:
-
-    - ``"deep"`` (default): ``abs(s)`` then ``square(abs_s)`` per branch.
-      Depth 2 per branch (1 abs layer + 1 square layer), narrower MLP
-      hidden width (~``2*ceil(max_sum/step)`` neurons total).
-    - ``"shallow"``: ``square_signed(s)`` per branch.  Depth 1 per branch,
-      roughly 2× the MLP hidden width (~``2*ceil(2*max_sum/step)`` neurons).
-      Saves 1 MLP sublayer.
-
-    **Precision vs. bounds (read this if the caller cares about small
-    relative errors).** The absolute error in the output scales with
-    ``step × max_sum`` where ``max_sum = max_abs1 + max_abs2``, not
-    with ``|inp1 * inp2|``.  Loose bounds are quietly expensive: a
-    caller declaring ``max_abs1 = 200`` when its actual data never
-    exceeds ``10`` pays the full ``200``-scale error budget on every
-    output.  The relative error on a product whose magnitude is
-    ``|a*b|`` is roughly ``(step × max_sum) / (4 * |a*b|)`` — so
-    halving ``max_sum`` doubles effective precision at zero neuron
-    cost.  Hidden width scales linearly with ``max_sum / step``, so
-    tightening the bounds also *reduces* neuron count.
-
-    If tuning bounds isn't possible but finer precision is needed,
-    shrink ``step`` — precision improves linearly, hidden width grows
-    linearly.  ``step = 0.25`` with ``max_sum = 20`` gives ``~80``
-    neurons per square op; ``step = 0.1`` gives ``~200``.
-
-    Pathological inputs: when one of the factors is near zero
-    (e.g. ``a = 1e-3``) and the other is near its bound (``|b| =
-    max_abs2``), the polarization identity subtracts two nearly-equal
-    squares, magnifying interpolation error.  Callers computing small
-    products at the tail of a wide input distribution should either
-    clamp upstream or drop ``step`` further.
-
-    Args:
-        inp1: 1D scalar node with value in [-max_abs1, max_abs1].
-        inp2: 1D scalar node with value in [-max_abs2, max_abs2].
-        max_abs1: Maximum absolute value of *inp1*.  Tighter bounds
-            → better precision AND fewer neurons; see the precision
-            note above.
-        max_abs2: Maximum absolute value of *inp2*.  Same story.
-        step: Grid spacing for accuracy.  Smaller → more neurons,
-            more precision.
-        max_abs_output: Optional tighter bound on the result magnitude.
-            When provided, the output is clamped to [-max_abs_output,
-            max_abs_output].
-        d_max: Maximum neurons per MLP sublayer.
-        strategy: ``"deep"`` (default) or ``"shallow"``.  Use
-            ``"shallow"`` only when the target ``d`` can fit
-            ``2 * (2*max_sum/step + 1)`` neurons in a single MLP sublayer.
-
-    Returns:
-        1D scalar node containing inp1 * inp2.
-
-    .. noise-footer::
-
-       Max error: 0.06248 abs, 2.15 rel over 4096 samples;
-       measured at commit aafc5f3. See docs/numerical_noise.md.
-    """
-    assert strategy in ("deep", "shallow"), f"unknown strategy: {strategy}"
-    assert len(inp1) == 1, "Input must be a 1D scalar node"
-    assert len(inp2) == 1, "Input must be a 1D scalar node"
-
-    s = add(inp1, inp2)  # a+b
-    d = subtract(inp1, inp2)  # a-b
-    max_sum = max_abs1 + max_abs2
-
-    if strategy == "shallow":
-        sq_sum = square_signed(s, max_abs=max_sum, step=step, d_max=d_max)
-        sq_diff = square_signed(d, max_abs=max_sum, step=step, d_max=d_max)
-    else:  # "deep"
-        abs_s = abs(s)  # |a+b|
-        abs_d = abs(d)  # |a-b|
-        sq_sum = square(abs_s, max_value=max_sum, step=step, d_max=d_max)
-        sq_diff = square(abs_d, max_value=max_sum, step=step, d_max=d_max)
-
-    result = add_scaled_nodes(0.25, sq_sum, -0.25, sq_diff)
-
-    if max_abs_output is not None:
-        result = piecewise_linear(
-            result,
-            [-max_abs_output, max_abs_output],
-            lambda x: x,
-            clamp=True,
-            name="signed_multiply_clamp",
-        )
-
-    return result
-
-
-# ---------------------------------------------------------------------------
-# Reductions
-# ---------------------------------------------------------------------------
-
-
-def reduce_min(keys: List[Node], values: List[Node]) -> Tuple[Node, Node]:
-    """Find the (key, value) pair with the minimum key.
-
-    Uses a binary tree reduction with ``ceil(log2(N))`` stages.
-
-    Args:
-        keys: N scalar nodes (each ``d_output=1``).
-        values: N nodes (all same width).
-
-    Returns:
-        ``(winning_key, winning_value)`` tuple.
-    """
-    from torchwright.ops.map_select import select
-
-    assert len(keys) == len(values) and len(keys) >= 1
-    assert all(len(k) == 1 for k in keys)
-    if len(values) > 1:
-        d_val = len(values[0])
-        assert all(len(v) == d_val for v in values)
-
-    cur_keys = list(keys)
-    cur_vals = list(values)
-
-    while len(cur_keys) > 1:
-        nxt_keys: List[Node] = []
-        nxt_vals: List[Node] = []
-        for i in range(0, len(cur_keys), 2):
-            if i + 1 >= len(cur_keys):
-                nxt_keys.append(cur_keys[i])
-                nxt_vals.append(cur_vals[i])
-            else:
-                diff = subtract(cur_keys[i], cur_keys[i + 1])
-                # cond = 1.0 when diff > 0 (k1 > k2) → pick k2
-                cond = compare(diff, 0.0)
-                nxt_keys.append(select(cond, cur_keys[i + 1], cur_keys[i]))
-                nxt_vals.append(select(cond, cur_vals[i + 1], cur_vals[i]))
-        cur_keys = nxt_keys
-        cur_vals = nxt_vals
-
-    return cur_keys[0], cur_vals[0]
-
-
-def reduce_max(keys: List[Node], values: List[Node]) -> Tuple[Node, Node]:
-    """Find the (key, value) pair with the maximum key.
-
-    Uses a binary tree reduction with ``ceil(log2(N))`` stages.
-
-    Args:
-        keys: N scalar nodes (each ``d_output=1``).
-        values: N nodes (all same width).
-
-    Returns:
-        ``(winning_key, winning_value)`` tuple.
-    """
-    from torchwright.ops.map_select import select
-
-    assert len(keys) == len(values) and len(keys) >= 1
-    assert all(len(k) == 1 for k in keys)
-    if len(values) > 1:
-        d_val = len(values[0])
-        assert all(len(v) == d_val for v in values)
-
-    cur_keys = list(keys)
-    cur_vals = list(values)
-
-    while len(cur_keys) > 1:
-        nxt_keys: List[Node] = []
-        nxt_vals: List[Node] = []
-        for i in range(0, len(cur_keys), 2):
-            if i + 1 >= len(cur_keys):
-                nxt_keys.append(cur_keys[i])
-                nxt_vals.append(cur_vals[i])
-            else:
-                diff = subtract(cur_keys[i], cur_keys[i + 1])
-                # cond = 1.0 when diff > 0 (k1 > k2) → pick k1
-                cond = compare(diff, 0.0)
-                nxt_keys.append(select(cond, cur_keys[i], cur_keys[i + 1]))
-                nxt_vals.append(select(cond, cur_vals[i], cur_vals[i + 1]))
-        cur_keys = nxt_keys
-        cur_vals = nxt_vals
-
-    return cur_keys[0], cur_vals[0]

@@ -8,12 +8,6 @@ from torchwright.ops.arithmetic_ops import (
     ceil_int,
     compare,
     concat,
-    exp,
-    linear_bin_index,
-    log,
-    log_abs,
-    low_rank_2d,
-    max,
     min,
     floor_int,
     mod_const,
@@ -22,13 +16,8 @@ from torchwright.ops.arithmetic_ops import (
     multiply_integers,
     negate,
     piecewise_linear,
-    piecewise_linear_2d,
     reciprocal,
-    reduce_max,
-    reduce_min,
-    relu,
     relu_add,
-    signed_multiply,
     square,
     subtract,
     sum_nodes,
@@ -40,7 +29,6 @@ from torchwright.ops.logic_ops import (
     bool_all_true,
     bool_any_true,
     bool_not,
-    cond_add_vector,
     cond_gate,
     equals_vector,
 )
@@ -54,7 +42,6 @@ from torchwright.ops.map_select import (
     select,
     switch,
     table_lookup_2d,
-    table_lookup_3d,
 )
 
 # I/O nodes
@@ -76,12 +63,6 @@ from torchwright.ops.scalar_encoding import (
 
 # Embedding-space arithmetic
 from torchwright.ops.embedding_arithmetic import (
-    compare_digit_pair,
-    compare_digit_seqs,
-    multiply_digit_pair,
-    multiply_digit_seqs,
-    subtract_digit_seqs,
-    subtract_digits,
     sum_digit_seqs,
     sum_digits,
 )
@@ -93,9 +74,6 @@ from torchwright.ops.sequence_ops import (
     output_sequence,
     remove_leading_0s,
 )
-
-# Loop
-from torchwright.ops.loop_ops import unrolled_loop
 
 # Building block
 from torchwright.ops.linear_relu_linear import linear_relu_linear

@@ -45,23 +45,14 @@ from torchwright.ops.arithmetic_ops import (
     ceil_int,
     clamp,
     compare,
-    exp,
     floor_int,
-    linear_bin_index,
-    log,
-    log_abs,
-    low_rank_2d,
-    max as max_op,
     min as min_op,
     mod_const,
     multiply_2d,
     multiply_integers,
     piecewise_linear,
-    piecewise_linear_2d,
     reciprocal,
-    signed_multiply,
     square,
-    square_signed,
     thermometer_floor_div,
 )
 from torchwright.ops.logic_ops import (
@@ -680,76 +671,6 @@ def _target_ops() -> List[TargetOp]:
             ),
         ),
         TargetOp(
-            name="log",
-            module=_ARITH,
-            source_file=_ARITH_FILE,
-            input_specs={"x": 1},
-            build_graph=lambda nodes: log(
-                nodes["x"], min_value=0.01, max_value=100.0, n_breakpoints=256
-            ),
-            reference_fn=lambda inputs: torch.log(inputs["x"]),
-            distribution_names=(
-                "log_4decades_001_100",
-                "log_6decades_wide",
-            ),
-            build_graphs_per_distribution={
-                "log_6decades_wide": lambda nodes: log(
-                    nodes["x"],
-                    min_value=0.01,
-                    max_value=30000.0,
-                    n_breakpoints=256,
-                ),
-            },
-            notes=(
-                "Natural log via per-section piecewise-linear "
-                "interpolation. The op auto-sections the input range "
-                "geometrically by `section_factor=10` (default decades) "
-                "and routes via thermometer compare + multiply_2d "
-                "blending, so float32 cancellation is bounded by "
-                "section width regardless of overall input range. Pairs "
-                "with `exp` for log-space arithmetic chains."
-            ),
-        ),
-        TargetOp(
-            name="log_abs",
-            module=_ARITH,
-            source_file=_ARITH_FILE,
-            input_specs={"x": 1},
-            build_graph=lambda nodes: log_abs(
-                nodes["x"], min_abs=0.1, max_abs=100.0, n_breakpoints=256
-            ),
-            reference_fn=lambda inputs: torch.log(
-                torch.clamp(inputs["x"].abs(), min=0.1, max=100.0)
-            ),
-            distribution_names=("log_abs_3decades_pm100",),
-            notes=(
-                "Fused `log(clamp(|x|, min_abs, max_abs))` for signed "
-                "input. Single-piecewise V-shape over signed `x` for "
-                "`max_abs/min_abs ≤ 10⁴` (1 sublayer); falls back to "
-                "`abs + sectioned log` for wider ratios (3 sublayers). "
-                "Pairs with `exp` and Linear addition for log-domain "
-                "multiplication of a signed by a positive value."
-            ),
-        ),
-        TargetOp(
-            name="exp",
-            module=_ARITH,
-            source_file=_ARITH_FILE,
-            input_specs={"x": 1},
-            build_graph=lambda nodes: exp(
-                nodes["x"], min_value=-5.0, max_value=5.0, n_breakpoints=256
-            ),
-            reference_fn=lambda inputs: torch.exp(inputs["x"]),
-            distribution_names=("exp_pm5",),
-            notes=(
-                "Natural exponential via piecewise-linear interpolation "
-                "with uniform breakpoint spacing. Constant relative output "
-                "error per cell `(Δx)²/8` because `d²exp/dx² = exp`. "
-                "Pairs with `log` to implement `A·B = exp(log A + log B)` "
-                "and `A/B = exp(log A − log B)` in log-space chains."
-            ),
-        ),
-        TargetOp(
             name="piecewise_linear",
             module=_ARITH,
             source_file=_ARITH_FILE,
@@ -782,20 +703,6 @@ def _target_ops() -> List[TargetOp]:
             ),
         ),
         TargetOp(
-            name="square_signed",
-            module=_ARITH,
-            source_file=_ARITH_FILE,
-            input_specs={"x": 1},
-            build_graph=lambda nodes: square_signed(nodes["x"], max_abs=10.0, step=1.0),
-            reference_fn=lambda inputs: inputs["x"] ** 2,
-            distribution_names=("square_signed_pm10",),
-            notes=(
-                "Same interpolation profile as `square` but spans [-max_abs, "
-                "max_abs]; saves one MLP sublayer vs. abs+square in "
-                "`multiply_integers` / `signed_multiply` deep strategies."
-            ),
-        ),
-        TargetOp(
             name="multiply_2d",
             module=_ARITH,
             source_file=_ARITH_FILE,
@@ -815,70 +722,6 @@ def _target_ops() -> List[TargetOp]:
                 "quarter-square identity `a*b = ((a+b)^2 - (a-b)^2)/4` "
                 "(O(n) neurons, no least-squares solve). Worst-cell absolute "
                 "bound is `step1*step2/4 = 0.25` for this configuration."
-            ),
-        ),
-        TargetOp(
-            name="signed_multiply",
-            module=_ARITH,
-            source_file=_ARITH_FILE,
-            input_specs={"a": 1, "b": 1},
-            build_graph=lambda nodes: signed_multiply(
-                nodes["a"],
-                nodes["b"],
-                max_abs1=10.0,
-                max_abs2=10.0,
-                step=1.0,
-            ),
-            reference_fn=lambda inputs: inputs["a"] * inputs["b"],
-            distribution_names=("signed_multiply_pm10",),
-            notes=(
-                "Polarization identity `a·b = (|a+b|² - |a-b|²)/4`. Absolute "
-                "error scales with `step × (max_abs1 + max_abs2)`, not with "
-                "`|a·b|`; pathological near-zero × large-magnitude inputs "
-                "exhibit high relative error."
-            ),
-        ),
-        TargetOp(
-            name="low_rank_2d",
-            module=_ARITH,
-            source_file=_ARITH_FILE,
-            input_specs={"a": 1, "b": 1},
-            build_graph=lambda nodes: low_rank_2d(
-                nodes["a"],
-                nodes["b"],
-                breakpoints1=_ATAN_BP_CROSS,
-                breakpoints2=_ATAN_BP_DOT,
-                fn=lambda x, y: float(torch.atan(torch.tensor(x / y)).item()),
-                rank=3,
-            ),
-            reference_fn=lambda inputs: torch.atan(inputs["a"] / inputs["b"]),
-            distribution_names=("atan_cross_dot_nonuniform",),
-            notes=(
-                "Rank-3 SVD of `atan(cross/dot)` on a non-uniform grid. "
-                "Worst-cell error is bounded by σ_{K+1}, the first truncated "
-                "singular value — verify against the SVD computed in "
-                "`tests/ops/test_low_rank_2d.py:100`."
-            ),
-        ),
-        TargetOp(
-            name="piecewise_linear_2d",
-            module=_ARITH,
-            source_file=_ARITH_FILE,
-            input_specs={"a": 1, "b": 1},
-            build_graph=lambda nodes: piecewise_linear_2d(
-                nodes["a"],
-                nodes["b"],
-                breakpoints1=_DIFF_BP,
-                breakpoints2=_TRIG_BP,
-                fn=lambda x, y: x * y,
-            ),
-            reference_fn=lambda inputs: inputs["a"] * inputs["b"],
-            distribution_names=("diff_trig_nonuniform", "diff_vel_nonuniform"),
-            notes=(
-                "Triangulated-grid lookup with non-uniform breakpoints. On "
-                "non-uniform grids `piecewise_linear_2d` uses a constrained "
-                "least-squares fit that can oscillate in cell interiors — "
-                "`low_rank_2d` is preferred there."
             ),
         ),
         TargetOp(
@@ -954,32 +797,6 @@ def _target_ops() -> List[TargetOp]:
                 "identity is exact; `square` is exact at integer grid points)."
             ),
         ),
-        TargetOp(
-            name="linear_bin_index",
-            module=_ARITH,
-            source_file=_ARITH_FILE,
-            input_specs={"x": 1, "x_min": 1, "x_max": 1},
-            build_graph=lambda nodes: linear_bin_index(
-                nodes["x"],
-                nodes["x_min"],
-                nodes["x_max"],
-                n_bins=16,
-                min_range=0.5,
-                max_range=200.0,
-            ),
-            reference_fn=lambda inputs: _bin_index_ref(
-                inputs["x"], inputs["x_min"], inputs["x_max"], n_bins=16
-            ),
-            distribution_names=("linear_bin_index_tex_col_16",),
-            notes=(
-                "End-to-end composite (~6 MLP sublayers). Error compounds "
-                "across `reciprocal`, `signed_multiply`, `clamp`, and the "
-                "terminal `thermometer_floor_div`. Inputs close to integer "
-                "bin boundaries land in the staircase's ramp zone; `_bin_index_ref` "
-                "uses `torch.floor` on the exact linear mapping, so tight "
-                "bin edges reveal ramp-zone slippage."
-            ),
-        ),
         # -------------------------------------------------------------------
         # Priority B — exact-op negative controls. Expected error ≲ 1e-6.
         # -------------------------------------------------------------------
@@ -1005,16 +822,6 @@ def _target_ops() -> List[TargetOp]:
             reference_fn=lambda inputs: torch.minimum(inputs["a"], inputs["b"]),
             distribution_names=("minmax_uniform_pm50",),
             notes="Exact via `(a + b - |a - b|) / 2`.",
-        ),
-        TargetOp(
-            name="max",
-            module=_ARITH,
-            source_file=_ARITH_FILE,
-            input_specs={"a": 1, "b": 1},
-            build_graph=lambda nodes: max_op(nodes["a"], nodes["b"]),
-            reference_fn=lambda inputs: torch.maximum(inputs["a"], inputs["b"]),
-            distribution_names=("minmax_uniform_pm50",),
-            notes="Exact via `(a + b + |a - b|) / 2`.",
         ),
         TargetOp(
             name="ceil_int",

@@ -8,7 +8,7 @@ converts to ``TorchwrightForCausalLM``, and checks the HF runtime:
 * still predicts the previous token (the partial rotation survives export +
   convert — the NoPE tail is a position-independent constant the softmax ignores),
 * prefill == token-by-token cached decode (cache stores rotated K),
-* a **content head** (``attend_argmax``) whose content rides the NoPE tail
+* a **content head** (``attend_argmax_dot``) whose content rides the NoPE tail
   survives export + convert and still selects by content (predicts the
   highest-vocab-index token seen so far) — the partial-rotary content placement
   this phase added, exercised on the real ONNX + HF surfaces.
@@ -107,14 +107,18 @@ def _build_content_model(tmpdir):
     """Predict the highest-vocab-index token seen so far via a content head whose
     content (a width-1 score) rides the NoPE tail under partial rotary."""
     from torchwright.graph.linear import Linear
-    from torchwright.ops.attention_ops import attend_argmax
+    from torchwright.ops.attention_ops import attend_argmax_dot
+    from torchwright.ops.inout_nodes import create_literal_value
 
     emb = create_onehot_embedding(_VOCAB)
     # Per-position scalar score = the token's vocab index (one-hot · arange).
     idx = torch.arange(len(_VOCAB), dtype=torch.float32).reshape(len(_VOCAB), 1)
     score = Linear(emb, idx, name="vocab_index_score")
     rope = RopeConfig(d_head=D_HEAD, max_positions=64, d_rot=D_ROT)
-    out = attend_argmax(rope, score, emb)  # embedding of the max-index token so far
+    # A constant-1 query dotted with the score key ranks causal keys by score, so
+    # the dot-content head selects the max-score (highest vocab index) token so far.
+    query_one = create_literal_value(torch.tensor([1.0]), name="content_query_one")
+    out = attend_argmax_dot(rope, query_one, score, emb)
     path = os.path.join(tmpdir, "max_index_token.onnx")
     compile_to_onnx(out, emb, path, d=D, d_head=D_HEAD, max_seq_len=64, verbose=False)
     return convert_onnx_to_hf(path, bos_token="<bos>", eos_token="<eos>")

@@ -27,7 +27,7 @@ from torchwright.graph.rope import (
     rotary_offset_head,
     rotate_half,
 )
-from torchwright.ops.attention_ops import attend_argmin_where
+from torchwright.ops.attention_ops import attend_argmax_dot
 from torchwright.ops.inout_nodes import create_input, create_rope_config
 
 N_POS = 12
@@ -93,23 +93,26 @@ def test_rope_config_default_d_rot_is_full():
     assert RopeConfig(d_head=D_HEAD, max_positions=512, d_rot=D_ROT).d_rot == D_ROT
 
 
-def _argmin_where_graph():
+def _content_dot_graph():
+    """A content (dot-match) head under partial rotary. ``attend_argmax_dot``
+    picks the causal key with the largest ``query·key`` — a pure content head,
+    so under ``d_rot < d_head`` its content must ride the NoPE tail."""
     rope = create_rope_config(d_head=D_HEAD, max_positions=512, d_rot=D_ROT)
-    score = create_input("score", 1)
-    validity = create_input("validity", 1)
+    query = create_input("query", 1)
+    key = create_input("key", 1)
     value = create_input("value", 1)
-    return attend_argmin_where(rope, score, validity, value)
+    return attend_argmax_dot(rope, query, key, value)
 
 
 def test_content_head_builds_on_nope_tail_partial_rotary():
-    """A content head now *builds* under partial rotary (no longer rejected): the
+    """A content head *builds* under partial rotary (no longer rejected): the
     content rides the NoPE tail, so the Attn carries ``rope_d_rot == D_ROT`` and the
     rotary front of its Q/K projection is all zero (the logit is pure content
     dot)."""
     from torchwright.compiler.forward.graph_analysis import GraphAnalyzer
     from torchwright.graph.attn import Attn
 
-    sel = _argmin_where_graph()
+    sel = _content_dot_graph()
     attns = [n for n in GraphAnalyzer(sel).get_all_nodes() if isinstance(n, Attn)]
     assert attns, "expected a content Attn head"
     head = attns[0]
@@ -122,26 +125,26 @@ def test_content_head_builds_on_nope_tail_partial_rotary():
 
 
 def test_partial_content_compiled_matches_oracle_and_selects():
-    """Compiled partial-rotary argmin-where == oracle, and selects the min-score
-    valid key EXACTLY across distance (tail content has no slow-plane attenuation):
-    a unique min planted at position 1 is selected by every later query, near and
-    far alike."""
-    sel = _argmin_where_graph()
+    """Compiled partial-rotary content-dot head == oracle, and selects the
+    highest-dot valid key EXACTLY across distance (tail content has no slow-plane
+    attenuation): a unique max planted at position 1 is selected by every later
+    query, near and far alike."""
+    sel = _content_dot_graph()
     n = 24
-    sc = torch.full((n, 1), 50.0)
-    sc[1, 0] = 1.0  # unique minimum at a near position
-    va = torch.ones(n, 1)  # all valid
+    q = torch.ones(n, 1)  # constant query
+    k = torch.ones(n, 1)
+    k[1, 0] = 50.0  # unique max-dot key at a near position
     val = (torch.arange(n, dtype=torch.float32) * 10.0).unsqueeze(1)
-    named = {"score": sc, "validity": va, "value": val}
+    named = {"query": q, "key": k, "value": val}
 
     compiled = compile_headless(sel, d=D, d_head=D_HEAD, verbose=False)
     report = probe_compiled(compiled, sel, named, n, atol=1e-2)
     assert report.first_divergent is None, report.format_short()
 
     out = compiled(_pack(compiled, named, n).to(compiled._net.device)).reshape(-1).cpu()
-    # Every query q >= 1 selects position 1 (value 10), Δ from 0 (q=1) to 22 (q=23).
-    for q in range(1, n):
-        assert abs(out[q].item() - 10.0) < 1e-2, f"pos {q}: got {out[q].item():.4f}"
+    # Every query qq >= 1 selects position 1 (value 10), Δ from 0 (qq=1) to 22.
+    for qq in range(1, n):
+        assert abs(out[qq].item() - 10.0) < 1e-2, f"pos {qq}: got {out[qq].item():.4f}"
 
 
 def test_compile_rejects_mixed_d_rot():

@@ -133,8 +133,6 @@ def _bisect_m(w_target: float, max_len: int, theta: float) -> float:
 def global_position_from_bos(
     rope: RopeConfig,
     bos_indicator: Node,
-    *,
-    n_breakpoints: int = _N_BPS,
 ) -> Node:
     """Approximate absolute position (0-indexed) via boosted-BOS attention.
 
@@ -144,7 +142,7 @@ def global_position_from_bos(
 
         w(m) = MAX_LEN^cos(m·θ) / (MAX_LEN^cos(m·θ) + m)
 
-    A log-uniform PWL table (``n_breakpoints`` entries) inverts w → m.
+    A log-uniform PWL table (``_N_BPS`` entries) inverts w → m.
 
     Precision: max error ~0.15 positions (PWL fitting ~0.009; fp32 softmax
     ~0.006; fp32 ReLU accumulation in the PWL sum up to ~0.09 at small
@@ -158,8 +156,6 @@ def global_position_from_bos(
         bos_indicator: length-1 node; 1.0 at position 0 (BOS), 0.0 elsewhere.
             Derive from the BOS token's embedding one-hot or a graph-level
             indicator.
-        n_breakpoints: breakpoints for the PWL inverse table.  1024 (default)
-            fits in one MLP sublayer; 512 gives max error ~0.05 — still fine.
 
     Returns:
         length-1 node whose value at position m approximates m (float,
@@ -220,8 +216,8 @@ def global_position_from_bos(
     # --- PWL inverse: w → m ---
     # Build log-uniform breakpoints in w ∈ [w_min, 1] (ascending).
     w_min = _w_of_m(max_len, max_len, theta)
-    ratio = (1.0 / w_min) ** (1.0 / (n_breakpoints - 1))
-    w_bps = [w_min * (ratio**k) for k in range(n_breakpoints)]
+    ratio = (1.0 / w_min) ** (1.0 / (_N_BPS - 1))
+    w_bps = [w_min * (ratio**k) for k in range(_N_BPS)]
     w_bps[-1] = 1.0  # exact endpoint
 
     # clamp=False: suppress piecewise_linear's auto tight-range assertion

@@ -1,7 +1,7 @@
 import math
 from typing import List
 
-from torchwright.graph import Node, Add, Concatenate
+from torchwright.graph import Node, Concatenate
 from torchwright.graph.asserts import assert_matches_value_type
 from torchwright.graph.value_type import NodeValueType, Range
 from torchwright.ops.linear_relu_linear import linear_relu_linear
@@ -9,10 +9,7 @@ from torchwright.ops.linear_relu_linear import linear_relu_linear
 import torch
 
 from torchwright.ops.arithmetic_ops import sum_nodes, compare
-from torchwright.ops.const import (
-    step_sharpness,
-    embedding_step_sharpness,
-)
+from torchwright.ops.const import embedding_step_sharpness
 
 _GATE_OFFSET_SAFETY_FACTOR = 2.0
 """Headroom over the declared ``max|value|`` so that activation noise
@@ -23,6 +20,12 @@ win (M ≈ 2·max_abs rather than 1000) while tolerating modest drift."""
 
 
 _MAX_REASONABLE_OFFSET = 1e6
+
+_COND_GATE_C_TOL = 0.005
+"""Maximum acceptable deviation of ``|cond|`` from 1 in ``cond_gate``. An
+Assert checks ``||cond| - 1| <= _COND_GATE_C_TOL`` and the output's semantic
+bound is widened by ``M * _COND_GATE_C_TOL`` to account for amplified condition
+noise. 0.005 matches typical far-field compare noise."""
 
 
 def _max_abs_or_raise(vt: NodeValueType, caller: str) -> float:
@@ -196,54 +199,6 @@ def equals_vector(inp: Node, vector: torch.Tensor) -> Node:
     )
 
 
-def cond_add_vector(
-    cond: Node, inp: Node, true_vector: torch.Tensor, false_vector: torch.Tensor
-) -> Node:
-    """
-    Conditionally adds a vector to the input node based on the value of the condition node.
-
-    If the value from the `cond` node is true, this function adds the `true_vector` to the `input_node`.
-    If the value from the `cond` node is false, it adds the `false_vector` to the `input_node`.
-
-    Args:
-        cond (Node): A boolean input node that determines which vector gets added.
-        inp (Node): The node whose values are to be modified based on the condition.
-        true_vector (torch.Tensor): The vector to add if the condition is true.
-        false_vector (torch.Tensor): The vector to add if the condition is false.
-
-    Returns:
-        Node: A new node with the modified values based on the condition and input vectors.
-    """
-    assert len(cond) == 1
-    assert len(true_vector) == len(false_vector) == len(inp)
-
-    # We need 2 MLP entries, we'll use the equation:
-    # y= c * [max(step_sharpness*x, 0) - max(step_sharpness*x - 1, 0)]
-    # And rely on the residual connection
-
-    d_input = len(inp)
-
-    input_proj = torch.tensor([[step_sharpness], [step_sharpness]])
-    input_bias = torch.tensor([0.0, -1.0])
-    output_proj = torch.zeros((2, d_input))
-    output_bias = false_vector
-
-    for d in range(d_input):
-        output_proj[0, d] = true_vector[d] - false_vector[d]
-        output_proj[1, d] = -(true_vector[d] - false_vector[d])
-
-    return Add(
-        inp,
-        linear_relu_linear(
-            input_node=cond,
-            input_proj=input_proj,
-            input_bias=input_bias,
-            output_proj=output_proj,
-            output_bias=output_bias,
-        ),
-    )
-
-
 def _cond_gate_output_type(cond: Node, inp: Node) -> NodeValueType:
     vt = inp.value_type
     r = vt.value_range
@@ -252,34 +207,21 @@ def _cond_gate_output_type(cond: Node, inp: Node) -> NodeValueType:
     return NodeValueType(value_range=Range(min(0.0, r.lo), max(0.0, r.hi)))
 
 
-def cond_gate(
-    cond: Node,
-    inp: Node,
-    *,
-    approximate: bool = True,
-    c_tol: float = 0.005,
-) -> Node:
+def cond_gate(cond: Node, inp: Node) -> Node:
     """
     Gates the value of a node based on a condition. If the condition is true,
     outputs the value. If false, outputs a zero tensor of the same shape as value.
 
+    Uses a single L→ReLU→L sublayer with an additive cancellation trick: the
+    on-path computes ``(M + v) − M`` where ``M`` is derived from
+    ``inp.value_type``. This loses precision for ``|v| ≪ ULP(M)`` and amplifies
+    approximate-cond error as ``M·ε``. An Assert checks ``||cond| - 1|`` stays
+    within ``_COND_GATE_C_TOL`` and the output's semantic bound is widened by
+    ``M * _COND_GATE_C_TOL`` accordingly.
+
     Args:
         cond (Node): Condition node.
         inp (Node): The node whose value is to be gated.
-        approximate: When ``True`` (default), uses a single L→ReLU→L sublayer
-            with an additive cancellation trick. The on-path computes
-            ``(M + v) − M`` where ``M`` is derived from ``inp.value_type``; this
-            loses precision for ``|v| ≪ ULP(M)`` and amplifies approximate-cond
-            error as ``M·ε``. When ``False``, uses two sublayers: the first
-            maps ``cond`` to ``c_off = ReLU(−cond) ∈ {0, 1}`` (clipping cond
-            noise on the on-side); the second gates ``inp`` via
-            ``ReLU(±inp − M·c_off)``. The on-path is float-exact and immune to
-            cond noise; costs one extra MLP sublayer.
-        c_tol: Maximum acceptable deviation of ``|cond|`` from 1. When
-            ``approximate=True``, an Assert checks ``||cond| - 1| <= c_tol``
-            and the output's semantic bound is widened by ``M * c_tol`` to
-            account for the amplified condition noise. Default 0.005
-            matches typical far-field compare noise.
 
     Returns:
         Node: Output node after applying the gate based on condition.
@@ -293,93 +235,65 @@ def cond_gate(
     d = len(inp)
     M = _max_abs_or_raise(inp.value_type, "cond_gate")
 
-    if approximate:
-        from torchwright.graph.misc import Assert
+    from torchwright.graph.misc import Assert
 
-        def _cond_check(x: torch.Tensor) -> tuple:
-            deviation = (x.abs() - 1.0).abs()
-            bad = deviation > c_tol
-            if not bad.any():
-                return True, ""
-            from torchwright.graph.asserts import _format_bad
+    def _cond_check(x: torch.Tensor) -> tuple:
+        deviation = (x.abs() - 1.0).abs()
+        bad = deviation > _COND_GATE_C_TOL
+        if not bad.any():
+            return True, ""
+        from torchwright.graph.asserts import _format_bad
 
-            return False, (f"expected ||cond| - 1| <= {c_tol}; {_format_bad(x, bad)}")
-
-        cond = Assert(
-            cond,
-            _cond_check,
-            message=f"cond near ±1 (c_tol={c_tol})",
-            claimed_type=NodeValueType(value_range=Range(-1.0 - c_tol, 1.0 + c_tol)),
+        return False, (
+            f"expected ||cond| - 1| <= {_COND_GATE_C_TOL}; {_format_bad(x, bad)}"
         )
-        # Per-column offsets: the gate bakes M into `(M + v) - M`, so size M
-        # per column from the per-column affine interval (a narrow column is
-        # not forced to a wide sibling's M). Falls back to the scalar M.
-        intervals = _intersect_intervals(inp)
-        M_cols = per_column_offsets(intervals, M) if intervals is not None \
-            else torch.full((d,), M)
 
-        d_hidden = 2 * d
-        input_proj = torch.zeros(d_hidden, 1 + d)
-        input_bias = torch.zeros(d_hidden)
-        output_proj = torch.zeros(d_hidden, d)
-        output_bias = -M_cols.clone()
+    cond = Assert(
+        cond,
+        _cond_check,
+        message=f"cond near ±1 (c_tol={_COND_GATE_C_TOL})",
+        claimed_type=NodeValueType(
+            value_range=Range(-1.0 - _COND_GATE_C_TOL, 1.0 + _COND_GATE_C_TOL)
+        ),
+    )
+    # Per-column offsets: the gate bakes M into `(M + v) - M`, so size M
+    # per column from the per-column affine interval (a narrow column is
+    # not forced to a wide sibling's M). Falls back to the scalar M.
+    intervals = _intersect_intervals(inp)
+    M_cols = (
+        per_column_offsets(intervals, M)
+        if intervals is not None
+        else torch.full((d,), M)
+    )
 
-        for j in range(d):
-            a = j
-            b = d + j
-            input_proj[a, 0] = M_cols[j]
-            input_proj[a, 1 + j] = 1.0
-            input_proj[b, 0] = -M_cols[j]
-            output_proj[a, j] = 1.0
-            output_proj[b, j] = 1.0
+    d_hidden = 2 * d
+    input_proj = torch.zeros(d_hidden, 1 + d)
+    input_bias = torch.zeros(d_hidden)
+    output_proj = torch.zeros(d_hidden, d)
+    output_bias = -M_cols.clone()
 
-        x = Concatenate([cond, inp])
-        result = linear_relu_linear(
-            input_node=x,
-            input_proj=input_proj,
-            input_bias=input_bias,
-            output_proj=output_proj,
-            output_bias=output_bias,
-            name="cond_gate",
-        )
-    else:
-        c_off = linear_relu_linear(
-            input_node=cond,
-            input_proj=torch.tensor([[-1.0]]),
-            input_bias=torch.tensor([0.0]),
-            output_proj=torch.tensor([[1.0]]),
-            output_bias=torch.tensor([0.0]),
-            name="cond_gate_c_off",
-        )
-        d_hidden = 2 * d
-        input_proj = torch.zeros(d_hidden, 1 + d)
-        input_bias = torch.zeros(d_hidden)
-        output_proj = torch.zeros(d_hidden, d)
-        output_bias = torch.zeros(d)
+    for j in range(d):
+        a = j
+        b = d + j
+        input_proj[a, 0] = M_cols[j]
+        input_proj[a, 1 + j] = 1.0
+        input_proj[b, 0] = -M_cols[j]
+        output_proj[a, j] = 1.0
+        output_proj[b, j] = 1.0
 
-        for j in range(d):
-            a = j
-            b = d + j
-            input_proj[a, 0] = -M
-            input_proj[a, 1 + j] = 1.0
-            input_proj[b, 0] = -M
-            input_proj[b, 1 + j] = -1.0
-            output_proj[a, j] = 1.0
-            output_proj[b, j] = -1.0
-
-        x = Concatenate([c_off, inp])
-        result = linear_relu_linear(
-            input_node=x,
-            input_proj=input_proj,
-            input_bias=input_bias,
-            output_proj=output_proj,
-            output_bias=output_bias,
-            name="cond_gate",
-        )
+    x = Concatenate([cond, inp])
+    result = linear_relu_linear(
+        input_node=x,
+        input_proj=input_proj,
+        input_bias=input_bias,
+        output_proj=output_proj,
+        output_bias=output_bias,
+        name="cond_gate",
+    )
 
     vt = _cond_gate_output_type(cond, inp)
     if vt != NodeValueType.unknown():
-        gate_atol = M * c_tol if approximate else 1e-3
+        gate_atol = M * _COND_GATE_C_TOL
         result = assert_matches_value_type(result, vt, atol=gate_atol)
     from torchwright.graph.affine_rules import (
         _apply_semantic_override,
@@ -388,8 +302,6 @@ def cond_gate(
 
     _apply_semantic_override(
         result,
-        _cond_gate_semantic_bound(
-            inp._affine_bound, inp, c_tol=c_tol if approximate else 0.0, M=M
-        ),
+        _cond_gate_semantic_bound(inp._affine_bound, inp, c_tol=_COND_GATE_C_TOL, M=M),
     )
     return result

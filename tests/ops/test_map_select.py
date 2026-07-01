@@ -32,49 +32,6 @@ def test_select():
         assert output.tolist() == [[expected_value]]
 
 
-def test_select_exact_branch_passes_clean_cond():
-    """Two-sublayer select matches approximate=True under clean ±1 cond."""
-    cond_input = create_input("cond", 1)
-    true_node = create_literal_value(torch.tensor([2.0]))
-    false_node = create_literal_value(torch.tensor([-3.0]))
-    out = select(cond_input, true_node, false_node, approximate=False)
-    for cond in [1.0, -1.0]:
-        output = out.compute(n_pos=1, input_values={"cond": torch.tensor([[cond]])})
-        expected = 2.0 if cond > 0 else -3.0
-        assert output.item() == expected
-
-
-def test_select_exact_branch_preserves_small_inputs():
-    """Bounded small inputs pass through bit-for-bit on the cancellation-free branch."""
-    cond_input = create_input("cond", 1)
-    t = create_input("t", 1)
-    f = create_input("f", 1)
-    t_bounded = assert_matches_value_type(
-        t, NodeValueType(value_range=Range(-1.0, 1.0))
-    )
-    f_bounded = assert_matches_value_type(
-        f, NodeValueType(value_range=Range(-1.0, 1.0))
-    )
-    out = select(cond_input, t_bounded, f_bounded, approximate=False)
-
-    t_val = torch.tensor([[1.0e-5]])
-    f_val = torch.tensor([[-1.0e-5]])
-
-    # cond=+1 should pick t exactly
-    output = out.compute(
-        n_pos=1,
-        input_values={"cond": torch.tensor([[1.0]]), "t": t_val, "f": f_val},
-    )
-    assert torch.equal(output, t_val)
-
-    # cond=-1 should pick f exactly
-    output = out.compute(
-        n_pos=1,
-        input_values={"cond": torch.tensor([[-1.0]]), "t": t_val, "f": f_val},
-    )
-    assert torch.equal(output, f_val)
-
-
 def test_select_builds_eagerly():
     """select with bounded inputs builds eagerly (no placeholder)."""
     cond_input = create_input("cond", 1)

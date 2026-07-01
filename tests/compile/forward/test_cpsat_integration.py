@@ -21,7 +21,6 @@ from torchwright.ops.arithmetic_ops import (
     add,
     add_scaled_nodes,
     concat,
-    relu,
     sum_nodes,
 )
 from torchwright.ops.inout_nodes import create_input, create_literal_value

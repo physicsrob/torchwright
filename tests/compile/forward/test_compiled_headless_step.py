@@ -11,7 +11,7 @@ the float graph is incidental — ``CompiledHeadless`` runs any graph.)
 import torch
 
 from torchwright.compiler.export import compile_headless
-from torchwright.ops.arithmetic_ops import signed_multiply
+from torchwright.ops.arithmetic_ops import multiply_2d
 from torchwright.ops.inout_nodes import create_input
 
 D = 256
@@ -21,7 +21,7 @@ D_HEAD = 16
 def _build_sample_graph():
     a = create_input("a", 1)
     b = create_input("b", 1)
-    out = signed_multiply(a, b, max_abs1=10, max_abs2=10)
+    out = multiply_2d(a, b, max_abs1=10, max_abs2=10)
     return out
 
 

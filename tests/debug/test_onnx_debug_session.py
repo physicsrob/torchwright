@@ -40,7 +40,7 @@ from torchwright.debug.probe import (
 )
 from torchwright.graph.asserts import assert_in_range
 from torchwright.graph.attn import Attn
-from torchwright.ops.arithmetic_ops import add, multiply_const, signed_multiply
+from torchwright.ops.arithmetic_ops import add, multiply_const
 from torchwright.ops.inout_nodes import create_input
 
 onnxruntime = pytest.importorskip("onnxruntime")

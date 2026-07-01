@@ -9,12 +9,19 @@ from torchwright.graph.asserts import assert_integer, assert_matches_value_type
 from torchwright.graph.value_type import NodeValueType, Range
 from torchwright.ops.const import step_sharpness, embedding_step_sharpness
 from torchwright.ops.logic_ops import (
-    cond_add_vector,
     cond_gate,
     _max_abs_or_raise,
     _intersect_intervals,
     per_column_offsets,
 )
+
+_GATE_C_TOL = 0.005
+"""Maximum acceptable deviation of ``|cond|`` from 1 for the additive-
+cancellation gate in ``select`` / ``broadcast_select``. Matches typical
+far-field compare noise."""
+
+_LOOKUP_D_MAX = 1024
+"""Neurons-per-MLP-sublayer cap for the table-lookup column-gate chunking."""
 
 
 def _select_per_column_offsets(true_node, false_node, scalar_M):
@@ -345,7 +352,6 @@ def table_lookup_2d(
     *,
     index_scale=1.0,
     sharpness: float = 100.0,
-    d_max: int = 1024,
     name: str = "table_lookup_2d",
 ) -> Node:
     """Lookup a scalar from a compile-time constant 2D table.
@@ -367,8 +373,7 @@ def table_lookup_2d(
     s = float(sharpness)
     if not math.isfinite(s) or s <= 1.0:
         raise ValueError(f"sharpness must be finite and > 1, got {s}")
-    if d_max < 2:
-        raise ValueError(f"d_max must be >= 2, got {d_max}")
+    d_max = _LOOKUP_D_MAX
 
     table_t = torch.as_tensor(table, dtype=torch.float32)
     if table_t.ndim != 2:
@@ -449,151 +454,6 @@ def table_lookup_2d(
     )
 
 
-def _table_lookup_index_staircase(
-    index: Node,
-    n: int,
-    *,
-    sharpness: float,
-    d_max: int,
-    name: str,
-) -> Node:
-    """Scalar centered integer-index staircase: scaled ``index`` -> clamped
-    nearest-integer index, flat in stable bins with narrow ramps at the
-    half-integer boundaries.  The scalar analogue of the row-vector lookup;
-    width-1 output."""
-    if n == 1:
-        return _constant_vector(torch.tensor([0.0]), name=f"{name}_zero_index")
-
-    # value[k] = k; deltas[k-1] = 1; top = n-1.
-    result = _saturating_step_select(
-        index,
-        n=n,
-        top_value=torch.tensor([float(n - 1)]),
-        deltas=torch.ones((n - 1, 1)),
-        sharpness=sharpness,
-        d_max=d_max,
-        name=f"{name}_staircase",
-    )
-    return assert_matches_value_type(
-        result,
-        NodeValueType(value_range=Range(0.0, float(n - 1))),
-        atol=_lookup_numeric_slack(float(n - 1), sharpness, n),
-    )
-
-
-def table_lookup_3d(
-    i: Node,
-    j: Node,
-    k: Node,
-    table,
-    *,
-    index_scale=1.0,
-    sharpness: float = 100.0,
-    outer_axis=None,
-    d_max: int = 1024,
-    name: str = "table_lookup_3d",
-) -> Node:
-    """Lookup a scalar from a compile-time constant 3D table.
-
-    A ``table_lookup_2d`` whose row index is a flattened, pre-rounded
-    ``(A, B)`` index: the two flattened axes are rounded to integer indices
-    ``idx_a, idx_b`` and combined as ``q = B * idx_a + idx_b`` into the row
-    axis of ``table.reshape(A * B, C)``; the C axis is the 2D column gate.
-
-    Semantics match ``table_lookup_2d`` per axis at integer inputs.  Off the
-    integer grid the three axes differ: the vector axis ``C`` is the
-    saturating-gate handoff, the inner flattened axis ``B`` is a two-neighbor
-    linear blend, and the outer flattened axis ``A`` is degenerate (its
-    transition sweeps a whole block of ``B`` rows).  ``A`` is therefore
-    asserted integer-valued.
-
-    Internal axis order is fixed by a heuristic: ``A`` = ``outer_axis``
-    (defaults to the smallest axis, asserted integer), ``C`` = the larger of
-    the remaining two (the contiguous vector axis), ``B`` = the smaller
-    remaining axis.  ``index_scale`` may be a scalar or length-3 tuple mapping
-    to ``(i, j, k)``.
-    """
-    inputs = [i, j, k]
-    for axis, inp in enumerate(inputs):
-        if len(inp) != 1:
-            raise ValueError(f"input for axis {axis} must be a 1D scalar node")
-    s = float(sharpness)
-    if not math.isfinite(s) or s <= 1.0:
-        raise ValueError(f"sharpness must be finite and > 1, got {s}")
-    if d_max < 2:
-        raise ValueError(f"d_max must be >= 2, got {d_max}")
-
-    table_t = torch.as_tensor(table, dtype=torch.float32)
-    if table_t.ndim != 3:
-        raise ValueError(f"table must be 3D, got shape {tuple(table_t.shape)}")
-    if any(d < 1 for d in table_t.shape):
-        raise ValueError(f"table must be non-empty, got shape {tuple(table_t.shape)}")
-    if not torch.isfinite(table_t).all():
-        raise ValueError("table must contain only finite values")
-
-    sizes = list(table_t.shape)
-    if outer_axis is None:
-        a_axis = int(min(range(3), key=lambda ax: sizes[ax]))
-    else:
-        a_axis = int(outer_axis)
-        if a_axis not in (0, 1, 2):
-            raise ValueError(f"outer_axis must be 0, 1, or 2, got {outer_axis!r}")
-    # C is the larger of the two remaining axes (kept contiguous as the
-    # vector axis); B is the smaller, so A*B stays small.
-    remaining = sorted(
-        (ax for ax in range(3) if ax != a_axis), key=lambda ax: sizes[ax]
-    )
-    b_axis, c_axis = remaining[0], remaining[1]
-
-    a_size, b_size, c_size = sizes[a_axis], sizes[b_axis], sizes[c_axis]
-
-    a_scaled = _scale_lookup_index(
-        inputs[a_axis],
-        _lookup_axis_scale(index_scale, a_axis, n_axes=3),
-        name=f"{name}_scale_a",
-    )
-    b_scaled = _scale_lookup_index(
-        inputs[b_axis],
-        _lookup_axis_scale(index_scale, b_axis, n_axes=3),
-        name=f"{name}_scale_b",
-    )
-    c_scaled = _scale_lookup_index(
-        inputs[c_axis],
-        _lookup_axis_scale(index_scale, c_axis, n_axes=3),
-        name=f"{name}_scale_c",
-    )
-
-    # The outer axis has no graceful off-grid handoff, so require it integer.
-    a_scaled = assert_integer(a_scaled)
-
-    idx_a = _table_lookup_index_staircase(
-        a_scaled, a_size, sharpness=s, d_max=d_max, name=f"{name}_a"
-    )
-    idx_b = _table_lookup_index_staircase(
-        b_scaled, b_size, sharpness=s, d_max=d_max, name=f"{name}_b"
-    )
-    q = Linear(
-        Concatenate([idx_a, idx_b]),
-        torch.tensor([[float(b_size)], [1.0]]),
-        name=f"{name}_flatten",
-    )
-
-    table_2d = (
-        table_t.permute(a_axis, b_axis, c_axis)
-        .contiguous()
-        .reshape(a_size * b_size, c_size)
-    )
-    return table_lookup_2d(
-        q,
-        c_scaled,
-        table_2d,
-        index_scale=1.0,
-        sharpness=s,
-        d_max=d_max,
-        name=f"{name}_2d",
-    )
-
-
 def switch(conditions: List[Node], values: List[Node]) -> Node:
     """
     Select one of N values based on which condition is true.
@@ -631,144 +491,86 @@ def _select_offset(true_node: Node, false_node: Node, caller: str) -> float:
     return _max_abs_or_raise(union_vt, caller)
 
 
-def select(
-    cond: Node,
-    true_node: Node,
-    false_node: Node,
-    *,
-    approximate: bool = True,
-    c_tol: float = 0.005,
-) -> Node:
+def select(cond: Node, true_node: Node, false_node: Node) -> Node:
     """
     Outputs one of two nodes based on a boolean condition.
+
+    Uses a single L→ReLU→L sublayer with an additive cancellation trick: both
+    branches compute ``(M + v) − M`` where ``M`` is derived from the union of
+    ``true_node`` / ``false_node`` ranges; this loses precision for
+    ``|v| ≪ ULP(M)``. An Assert checks ``||cond| - 1|`` stays within
+    ``_GATE_C_TOL`` and the output's semantic bound is widened by
+    ``_GATE_C_TOL * M`` accordingly.
 
     Args:
         cond (Node): Condition node that outputs either true or false.
         true_node (Node): Node to be outputted if the condition is true.
         false_node (Node): Node to be outputted if the condition is false.
-        approximate: When ``True`` (default), uses a single L→ReLU→L sublayer
-            with an additive cancellation trick. Both branches compute
-            ``(M + v) − M`` where ``M`` is derived from the union of
-            ``true_node`` / ``false_node`` ranges; this loses precision for
-            ``|v| ≪ ULP(M)``. When ``False``, uses two sublayers: the first
-            maps ``cond`` to ``c_on = ReLU(cond)`` and ``c_off = ReLU(−cond)``;
-            the second gates each branch with ReLU clipping (no cancellation).
-            The winning branch is float-exact and immune to cond noise; costs
-            one extra MLP sublayer.
-        c_tol: Maximum acceptable deviation of ``|cond|`` from 1. When
-            ``approximate=True``, an Assert checks ``||cond| - 1| <= c_tol``
-            and the output's semantic bound is widened by ``c_tol * M`` to
-            account for the amplified condition noise. Default 0.005
-            matches typical far-field compare noise.
 
     Returns:
         Node: Either true_node or false_node based on the condition.
     """
-    from torchwright.ops.const import step_sharpness
-
     assert len(cond) == 1
     assert len(true_node) == len(false_node)
 
     d = len(true_node)
     M = _select_offset(true_node, false_node, "select")
 
-    if approximate:
-        from torchwright.graph.misc import Assert
+    from torchwright.graph.misc import Assert
 
-        def _cond_check(x: torch.Tensor) -> tuple:
-            deviation = (x.abs() - 1.0).abs()
-            bad = deviation > c_tol
-            if not bad.any():
-                return True, ""
-            from torchwright.graph.asserts import _format_bad
+    def _cond_check(x: torch.Tensor) -> tuple:
+        deviation = (x.abs() - 1.0).abs()
+        bad = deviation > _GATE_C_TOL
+        if not bad.any():
+            return True, ""
+        from torchwright.graph.asserts import _format_bad
 
-            return False, (f"expected ||cond| - 1| <= {c_tol}; {_format_bad(x, bad)}")
+        return False, (f"expected ||cond| - 1| <= {_GATE_C_TOL}; {_format_bad(x, bad)}")
 
-        cond = Assert(
-            cond,
-            _cond_check,
-            message=f"cond near ±1 (c_tol={c_tol})",
-            claimed_type=NodeValueType(value_range=Range(-1.0 - c_tol, 1.0 + c_tol)),
-        )
-        # Per-column offsets sized from the union of the two operands' columns
-        # (see per_column_offsets) so a narrow column is not forced to a wide
-        # sibling's M in the `(M + v) - M` cancellation.
-        M_cols = _select_per_column_offsets(true_node, false_node, M)
+    cond = Assert(
+        cond,
+        _cond_check,
+        message=f"cond near ±1 (c_tol={_GATE_C_TOL})",
+        claimed_type=NodeValueType(
+            value_range=Range(-1.0 - _GATE_C_TOL, 1.0 + _GATE_C_TOL)
+        ),
+    )
+    # Per-column offsets sized from the union of the two operands' columns
+    # (see per_column_offsets) so a narrow column is not forced to a wide
+    # sibling's M in the `(M + v) - M` cancellation.
+    M_cols = _select_per_column_offsets(true_node, false_node, M)
 
-        d_hidden = 2 * d
-        input_proj = torch.zeros(d_hidden, 1 + 2 * d)
-        input_bias = torch.zeros(d_hidden)
-        output_proj = torch.zeros(d_hidden, d)
-        output_bias = -M_cols.clone()
+    d_hidden = 2 * d
+    input_proj = torch.zeros(d_hidden, 1 + 2 * d)
+    input_bias = torch.zeros(d_hidden)
+    output_proj = torch.zeros(d_hidden, d)
+    output_bias = -M_cols.clone()
 
-        for j in range(d):
-            a = j
-            b = d + j
-            input_proj[a, 0] = M_cols[j]
-            input_proj[a, 1 + j] = 1.0
-            input_proj[b, 0] = -M_cols[j]
-            input_proj[b, 1 + d + j] = 1.0
-            output_proj[a, j] = 1.0
-            output_proj[b, j] = 1.0
+    for j in range(d):
+        a = j
+        b = d + j
+        input_proj[a, 0] = M_cols[j]
+        input_proj[a, 1 + j] = 1.0
+        input_proj[b, 0] = -M_cols[j]
+        input_proj[b, 1 + d + j] = 1.0
+        output_proj[a, j] = 1.0
+        output_proj[b, j] = 1.0
 
-        x = Concatenate([cond, true_node, false_node])
-        result = linear_relu_linear(
-            input_node=x,
-            input_proj=input_proj,
-            input_bias=input_bias,
-            output_proj=output_proj,
-            output_bias=output_bias,
-            name="select",
-        )
-    else:
-        cond_gates = linear_relu_linear(
-            input_node=cond,
-            input_proj=torch.tensor([[-1.0], [1.0]]),
-            input_bias=torch.tensor([0.0, 0.0]),
-            output_proj=torch.tensor([[1.0, 0.0], [0.0, 1.0]]),
-            output_bias=torch.tensor([0.0, 0.0]),
-            name="select_cond_gates",
-        )
-        d_hidden = 4 * d
-        d_input = 2 + 2 * d
-        input_proj = torch.zeros(d_hidden, d_input)
-        input_bias = torch.zeros(d_hidden)
-        output_proj = torch.zeros(d_hidden, d)
-        output_bias = torch.zeros(d)
-
-        for j in range(d):
-            t_pos = j
-            t_neg = d + j
-            f_pos = 2 * d + j
-            f_neg = 3 * d + j
-            input_proj[t_pos, 0] = -M
-            input_proj[t_pos, 2 + j] = 1.0
-            input_proj[t_neg, 0] = -M
-            input_proj[t_neg, 2 + j] = -1.0
-            input_proj[f_pos, 1] = -M
-            input_proj[f_pos, 2 + d + j] = 1.0
-            input_proj[f_neg, 1] = -M
-            input_proj[f_neg, 2 + d + j] = -1.0
-            output_proj[t_pos, j] = 1.0
-            output_proj[t_neg, j] = -1.0
-            output_proj[f_pos, j] = 1.0
-            output_proj[f_neg, j] = -1.0
-
-        x = Concatenate([cond_gates, true_node, false_node])
-        result = linear_relu_linear(
-            input_node=x,
-            input_proj=input_proj,
-            input_bias=input_bias,
-            output_proj=output_proj,
-            output_bias=output_bias,
-            name="select",
-        )
+    x = Concatenate([cond, true_node, false_node])
+    result = linear_relu_linear(
+        input_node=x,
+        input_proj=input_proj,
+        input_bias=input_bias,
+        output_proj=output_proj,
+        output_bias=output_bias,
+        name="select",
+    )
 
     vt = _select_output_type(cond, true_node, false_node)
     if vt != NodeValueType.unknown():
-        gate_atol = M * c_tol if approximate else 1e-3
+        gate_atol = M * _GATE_C_TOL
         result = assert_matches_value_type(result, vt, atol=gate_atol)
-    tolerance = c_tol * M if approximate else 0.0
+    tolerance = _GATE_C_TOL * M
     from torchwright.graph.affine_rules import (
         _apply_semantic_override,
         _select_semantic_bound,
@@ -968,7 +770,6 @@ def broadcast_select(
     d_fill: int,
     *,
     approximate: bool = True,
-    c_tol: float = 0.005,
 ) -> Node:
     """Select between two values at each of N slots, based on per-slot masks.
 
@@ -994,11 +795,9 @@ def broadcast_select(
             ``c_off[i] = ReLU(-mask_i)`` and ``c_on[i] = ReLU(mask_i)``;
             sublayer 2 gates each branch by ReLU clipping against
             ``M·c_on`` / ``M·c_off`` — no cancellation, winning branch
-            is float-exact at mask=±1.
-        c_tol: Maximum acceptable deviation of ``|masks[i]|`` from 1.
-            When ``approximate=True``, an Assert checks
-            ``||masks| - 1| <= c_tol`` per element and the output's
-            semantic bound is widened by ``c_tol * M``. Default 0.005.
+            is float-exact at mask=±1. When ``approximate=True``, an Assert
+            checks ``||masks| - 1|`` stays within ``_GATE_C_TOL`` per element
+            and the output's semantic bound is widened by ``_GATE_C_TOL * M``.
 
     Returns:
         Node of width n_slots * d_fill.
@@ -1087,7 +886,7 @@ def broadcast_select(
         fv = false_value.value_type
         r = tv.value_range.union(fv.value_range)
         if r.is_finite():
-            gate_atol = M * c_tol
+            gate_atol = M * _GATE_C_TOL
             result = assert_matches_value_type(
                 result, NodeValueType(value_range=r), atol=gate_atol
             )
@@ -1105,7 +904,7 @@ def broadcast_select(
                 d_fill,
                 true_is_broadcast,
                 false_is_broadcast,
-                tolerance=c_tol * M,
+                tolerance=_GATE_C_TOL * M,
             ),
         )
         return result
@@ -1178,4 +977,3 @@ def broadcast_select(
         output_bias=output_bias,
         name="broadcast_select",
     )
-

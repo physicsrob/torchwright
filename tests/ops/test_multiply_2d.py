@@ -13,7 +13,7 @@ import pytest
 import torch
 
 from torchwright.debug.probe import probe_graph, reference_eval
-from torchwright.ops.arithmetic_ops import multiply_2d, signed_multiply
+from torchwright.ops.arithmetic_ops import multiply_2d
 from torchwright.ops.inout_nodes import create_input
 
 # ---------------------------------------------------------------------------
@@ -136,18 +136,17 @@ def test_multiply_2d_custom_breakpoints():
 
 
 # ---------------------------------------------------------------------------
-# Unsigned ranges (min1/min2)
+# Positive-input ranges
 # ---------------------------------------------------------------------------
 
 
 def test_multiply_2d_unsigned():
-    """min2=0 for positive-only second input (e.g., inv_range)."""
+    """Positive-only second input (e.g., inv_range)."""
     node = _build_multiply_2d(
         max_abs1=10.0,
         max_abs2=2.0,
         step1=1.0,
         step2=0.25,
-        min2=0.0,
     )
 
     # Positive second input
@@ -165,8 +164,6 @@ def test_multiply_2d_both_unsigned():
         max_abs2=5.0,
         step1=1.0,
         step2=1.0,
-        min1=0.0,
-        min2=0.0,
     )
 
     for a in [0.0, 1.0, 3.0, 5.0]:
@@ -174,69 +171,6 @@ def test_multiply_2d_both_unsigned():
             expected = a * b
             result = _eval_mul(node, a, b)
             assert abs(result - expected) < 0.01, f"{a}*{b} = {expected}, got {result}"
-
-
-# ---------------------------------------------------------------------------
-# Output clamping
-# ---------------------------------------------------------------------------
-
-
-def test_multiply_2d_output_clamp():
-    """max_abs_output caps the product."""
-    node = _build_multiply_2d(
-        max_abs1=10.0,
-        max_abs2=10.0,
-        step1=1.0,
-        step2=1.0,
-        max_abs_output=20.0,
-    )
-
-    # Within clamp range
-    assert abs(_eval_mul(node, 3.0, 4.0) - 12.0) < 0.5
-
-    # At clamp boundary — 5*5 = 25, clamped to 20
-    result = _eval_mul(node, 5.0, 5.0)
-    assert abs(result - 20.0) < 0.5, f"5*5 clamped to 20, got {result}"
-
-    # Negative clamp — -5*5 = -25, clamped to -20
-    result = _eval_mul(node, -5.0, 5.0)
-    assert abs(result - (-20.0)) < 0.5, f"-5*5 clamped to -20, got {result}"
-
-    # Well within range
-    assert abs(_eval_mul(node, 2.0, 3.0) - 6.0) < 0.5
-
-
-# ---------------------------------------------------------------------------
-# Comparison with signed_multiply
-# ---------------------------------------------------------------------------
-
-
-def test_multiply_2d_vs_signed_multiply():
-    """multiply_2d and signed_multiply agree on a sweep of inputs."""
-    a_inp = create_input("a", 1)
-    b_inp = create_input("b", 1)
-
-    node_2d = multiply_2d(
-        a_inp, b_inp, max_abs1=10.0, max_abs2=10.0, step1=1.0, step2=1.0
-    )
-    node_sm = signed_multiply(a_inp, b_inp, max_abs1=10.0, max_abs2=10.0, step=1.0)
-
-    for a in [-7.0, -3.0, 0.0, 4.0, 8.0]:
-        for b in [-6.0, -1.0, 0.0, 2.0, 9.0]:
-            inputs = {
-                "a": torch.tensor([[a]]),
-                "b": torch.tensor([[b]]),
-            }
-            r_2d = node_2d.compute(n_pos=1, input_values=inputs).item()
-            r_sm = node_sm.compute(n_pos=1, input_values=inputs).item()
-            expected = a * b
-            # Both should be close to the true product
-            assert (
-                abs(r_2d - expected) < 0.5
-            ), f"multiply_2d({a}, {b}) = {r_2d}, expected {expected}"
-            assert (
-                abs(r_sm - expected) < 0.5
-            ), f"signed_multiply({a}, {b}) = {r_sm}, expected {expected}"
 
 
 # ---------------------------------------------------------------------------

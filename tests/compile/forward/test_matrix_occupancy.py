@@ -27,7 +27,7 @@ from torchwright.compiler.export import (
 )
 from torchwright.compiler.forward.compile import forward_compile
 from torchwright.compiler.graph_identity import canonical_ids, unwrap_debug
-from torchwright.ops.arithmetic_ops import add, signed_multiply
+from torchwright.ops.arithmetic_ops import add, multiply_2d
 from torchwright.ops.inout_nodes import create_input
 
 D = 256
@@ -40,7 +40,7 @@ def _build_graph():
     a = create_input("a", 1)
     b = create_input("b", 1)
     c = create_input("c", 1)
-    prod = signed_multiply(a, b, max_abs1=10, max_abs2=10)
+    prod = multiply_2d(a, b, max_abs1=10, max_abs2=10)
     out = add(prod, c)
     return out
 

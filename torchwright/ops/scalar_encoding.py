@@ -31,7 +31,6 @@ from torchwright.ops.arithmetic_ops import (
 )
 from torchwright.ops.const import step_sharpness
 from torchwright.ops.linear_relu_linear import linear_relu_linear
-from torchwright.ops.inout_nodes import create_literal_value
 from torchwright.ops.map_select import map_to_table
 
 

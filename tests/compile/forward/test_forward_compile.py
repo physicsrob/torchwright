@@ -15,22 +15,18 @@ from torchwright.ops.inout_nodes import (
     create_literal_value,
     create_rope_config,
 )
+from torchwright.graph.relu import ReLU
 from torchwright.ops.arithmetic_ops import (
     add,
     add_const,
     add_scaled_nodes,
-    relu,
     relu_add,
     concat,
     sum_nodes,
 )
-from torchwright.ops.logic_ops import cond_gate, cond_add_vector
+from torchwright.ops.logic_ops import cond_gate
 from torchwright.ops.map_select import select, map_to_table
 from torchwright.ops.attention_ops import (
-    attend_argmin,
-    attend_argmax,
-    attend_argmin_where,
-    attend_argmax_where,
     attend_to_offset,
     get_prev_value,
 )
@@ -291,8 +287,8 @@ def test_compile_add_relu():
     v2 = create_input("v2", 4)
     n_pos = 2
     a = add(v1, v2)
-    r1 = relu(a)
-    out = relu(r1)
+    r1 = ReLU(a)
+    out = ReLU(r1)
     _verify(
         out,
         n_pos=n_pos,
@@ -310,16 +306,18 @@ def test_compile_add_const():
     _verify(out, n_pos=1, input_values={"v": torch.tensor([[1.0]])})
 
 
-def test_compile_cond_add_vector():
-    """cond_add_vector — MLP multiplexer + Add."""
-    cond = create_input("cond", 1)
+def test_compile_select_into_add():
+    """MLP multiplexer (select) feeding an Add into a live literal.
+
+    Preserves the compiler pattern the cut ``cond_add_vector`` exercised:
+    a select's L->ReLU->L multiplexer output added onto another live node
+    (here ``add(x, select(cond, true_vec, false_vec))``).  cond=+1 -> x+true_vec,
+    cond=-1 -> x+false_vec."""
+    cond = create_input("cond", 1, value_range=(-1.0, 1.0))
     x = create_literal_value(torch.tensor([15.0, 25.0]))
-    out = cond_add_vector(
-        cond,
-        x,
-        true_vector=torch.tensor([100.0, 0.0]),
-        false_vector=torch.tensor([0.0, 100.0]),
-    )
+    true_vec = create_literal_value(torch.tensor([100.0, 0.0]))
+    false_vec = create_literal_value(torch.tensor([0.0, 100.0]))
+    out = add(x, select(cond, true_vec, false_vec))
     for cond_val in [-1.0, 1.0]:
         _verify(
             out,
@@ -621,49 +619,6 @@ def test_compile_split_vo_large_ratio():
     ), f"Max diff: {(actual.cpu() - expected).abs().max().item():.6f}"
 
 
-def test_compile_selection_primitives():
-    """Compiled path for the simple selection primitives, whose d_qk shrank
-    to 1-2 and whose query is now a bare LiteralValue([1.0])."""
-    rope = _rope()
-    score = create_input("score", 1)
-    validity = create_input("valid", 1)
-    value = create_input("value", 3)
-
-    n_pos = 6
-    inputs = {
-        "score": torch.tensor([[3.0], [1.0], [4.0], [0.0], [2.0], [5.0]]),
-        # position 0 is always valid, so every causal window has a valid key
-        "valid": torch.tensor([[1.0], [-1.0], [1.0], [-1.0], [1.0], [-1.0]]),
-        "value": torch.arange(n_pos * 3, dtype=torch.float32).reshape(n_pos, 3),
-    }
-
-    for out in (
-        attend_argmin(rope, score, value),
-        attend_argmax(rope, score, value),
-        attend_argmin_where(rope, score, validity, value),
-        attend_argmax_where(rope, score, validity, value),
-    ):
-        _verify(out, n_pos=n_pos, input_values=inputs)
-
-
-def test_compile_selection_wide_value():
-    """Selection value wider than d_head must auto-split across heads (the
-    len(value) <= d_pos cap was removed)."""
-    rope = _rope()
-    score = create_input("score", 1)
-    value = create_input("value", 40)  # > D_HEAD = 16
-    n_pos = 5
-    inputs = {
-        "score": torch.tensor([[3.0], [1.0], [2.0], [0.0], [4.0]]),
-        "value": torch.arange(n_pos * 40, dtype=torch.float32).reshape(n_pos, 40),
-    }
-    _verify(
-        attend_argmin(rope, score, value),
-        n_pos=n_pos,
-        input_values=inputs,
-    )
-
-
 def test_compile_dqk_equals_dv_unchanged():
     """d_qk == d_v == d_head=16 — a single full head, no padding."""
     x = create_input("x", 8)
@@ -731,38 +686,5 @@ def test_compile_attend_argmax_dot():
             "qv": torch.randn(n_pos, 4),
             "kv": torch.randn(n_pos, 4),
             "value": torch.randn(n_pos, 3),
-        },
-    )
-
-
-def test_compile_attend_most_recent_matching():
-    """attend_most_recent_matching — content match + local recency tiebreak.
-
-    One-hot content (dot gap 1) against the d_head=16 lobe peak (~1.0) needs
-    match_gain > recency_gain·peak ≈ 600 for content to dominate; 2000 clears it
-    so the op picks the most-recent *matching* key (compiled == oracle)."""
-    from torchwright.ops.attention_ops import attend_most_recent_matching
-
-    rope = _rope()
-    qv = create_input("qv", 4)
-    kv = create_input("kv", 4)
-    value = create_input("value", 3)
-    out = attend_most_recent_matching(rope, qv, kv, value, match_gain=2000.0)
-
-    # Construct a small sequence where position 2 and position 4 both
-    # match the query's type; the op must pick position 4 at every
-    # query position ≥ 4 via recency.
-    n_pos = 5
-    key_in = torch.eye(4)[torch.tensor([0, 1, 2, 0, 2])]
-    # Every query asks for type 2.
-    query_in = torch.eye(4)[torch.tensor([2, 2, 2, 2, 2])]
-    value_in = torch.randn(n_pos, 3)
-    _verify(
-        out,
-        n_pos=n_pos,
-        input_values={
-            "qv": query_in,
-            "kv": key_in,
-            "value": value_in,
         },
     )
