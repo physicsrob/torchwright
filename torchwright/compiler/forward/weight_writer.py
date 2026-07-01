@@ -16,6 +16,7 @@ from torchwright.compiler.groups.transformer_layer import TransformerLayer
 from torchwright.graph import Node, Linear, Attn, Add, Concatenate
 from torchwright.graph.misc import LiteralValue
 from torchwright.graph.relu import ReLU
+from torchwright.graph.block import Block
 from torchwright.graph.rope import ROPE_BASE
 
 # Self-match attention hardness: scales the constant-1 self-match logit so the
@@ -112,6 +113,7 @@ class AttnHeadOp:
 class MLPOp:
     op_type: Literal[
         "compute_relu",
+        "compute_block",
         "compute_standalone_relu",
         "compute_literal_value",
         "compute_bias",
@@ -121,7 +123,8 @@ class MLPOp:
     target_cols: List[int]
     mlp_slots: List[int] = field(default_factory=list)
     # Input columns captured at schedule time.  Used by compute_relu
-    # (l1's input) and compute_standalone_relu (relu's input).
+    # (l1's input), compute_block (the Block's input), and
+    # compute_standalone_relu (relu's input).
     source_cols: Optional[List[int]] = None
 
 
@@ -173,6 +176,8 @@ def write_mlp_sublayer(
     for op in ops:
         if op.op_type == "compute_relu":
             _write_compute_relu(layer.mlp, op, residual_map, biased_linears, recorder)
+        elif op.op_type == "compute_block":
+            _write_compute_block(layer.mlp, op, residual_map, biased_linears, recorder)
         elif op.op_type == "compute_literal_value":
             _write_compute_literal_value(layer.mlp, op)
         elif op.op_type == "compute_bias":
@@ -719,6 +724,83 @@ def _write_compute_relu(
         # matrix to the graph node carrying its weights).
         recorder.add("mlp.W_in", l1_node, op.op_type, in_idx, mlp_slots, "dense")
         recorder.add("mlp.W_out", l2_node, op.op_type, mlp_slots, out_idx, "dense")
+
+
+def _write_compute_block(
+    mlp,
+    op: MLPOp,
+    rmap: ResidualStreamMap,
+    biased_linears: Optional[Set[Node]] = None,
+    recorder: Optional[PlacementRecorder] = None,
+):
+    """Compile a degenerate-ReLU :class:`Block` through the MLP sublayer.
+
+    Identical emission to :func:`_write_compute_relu`, but the projections are
+    read from one node instead of three:
+
+    - ``linear1``: input columns -> mlp_slots, weight ``gate_proj.T`` (the
+      Block stores ``gate_proj`` as ``(n_lanes, d_input)``; the MLP linear1
+      matrix is ``(d_input, n_lanes)``), bias ``gate_bias``.
+    - ReLU: applied elementwise (the sublayer's built-in nonlinearity).
+    - ``linear2``: mlp_slots -> target columns, weight ``out_proj``
+      ``(n_lanes, d_output)``, bias ``out_bias``.
+    """
+    block = op.node
+    assert isinstance(block, Block)
+    assert block.activation == "relu" and block.up_proj is None, (
+        f"compute_block supports only degenerate ReLU blocks in step 1, got "
+        f"activation={block.activation!r}, gated={block.up_proj is not None}"
+    )
+
+    assert op.source_cols is not None, "compute_block requires source_cols"
+    input_node = block.inputs[0]
+    in_idx = op.source_cols
+    mlp_slots = op.mlp_slots
+    out_idx = op.target_cols
+
+    in_idx_t = torch.as_tensor(in_idx, dtype=torch.long)
+    slots_t = torch.as_tensor(mlp_slots, dtype=torch.long)
+    out_idx_t = torch.as_tensor(out_idx, dtype=torch.long)
+
+    target_dtype = mlp.linear1.output_matrix.dtype
+
+    # linear1: rows=input columns, cols=mlp slots.  gate matrix is
+    # (d_input, n_lanes) = gate_proj.T; gate bias is (n_lanes,).
+    gate_matrix = block.gate_proj.t()
+    mlp.linear1.output_matrix[in_idx_t.unsqueeze(1), slots_t.unsqueeze(0)] = (
+        gate_matrix.to(target_dtype)
+    )
+    mlp.linear1.output_bias[slots_t] = block.gate_bias.to(target_dtype)
+
+    # Fold deferred biased-Linear inputs into the gate's hidden bias — the same
+    # correction _write_compute_relu applies, because the Block reads those
+    # columns in linear1 before the deferred output_bias is written.
+    if biased_linears:
+        leaves = (
+            flatten_concat_nodes([input_node])
+            if isinstance(input_node, Concatenate)
+            else [input_node]
+        )
+        offset = 0
+        for leaf in leaves:
+            if leaf in biased_linears:
+                assert isinstance(leaf, Linear)
+                contrib = leaf.output_bias @ gate_matrix[offset : offset + len(leaf), :]
+                mlp.linear1.output_bias[slots_t] += contrib.to(target_dtype)
+            offset += len(leaf)
+
+    # linear2: rows=mlp slots, cols=output columns.  out_proj is
+    # (n_lanes, d_output); out_bias is (d_output,).
+    mlp.linear2.output_matrix[slots_t.unsqueeze(1), out_idx_t.unsqueeze(0)] = (
+        block.out_proj.to(target_dtype)
+    )
+    mlp.linear2.output_bias[out_idx_t] = block.out_bias.to(target_dtype)
+
+    if recorder is not None:
+        # Both dense weight blocks attributed to the Block node (it carries all
+        # the weights, unlike a mined chain's split across L1/L2).
+        recorder.add("mlp.W_in", block, op.op_type, in_idx, mlp_slots, "dense")
+        recorder.add("mlp.W_out", block, op.op_type, mlp_slots, out_idx, "dense")
 
 
 def _write_compute_literal_value(mlp, op: MLPOp):

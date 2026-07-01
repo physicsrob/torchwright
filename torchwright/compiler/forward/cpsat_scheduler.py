@@ -52,6 +52,7 @@ from torchwright.graph import (
 )
 from torchwright.graph.misc import LiteralValue
 from torchwright.graph.relu import ReLU
+from torchwright.graph.block import Block
 
 # ---------------------------------------------------------------------------
 # Public dataclasses
@@ -457,6 +458,8 @@ def routing(node: Node, gm: GraphModel, policy: SchedulingPolicy) -> str:
         return ATTN
     if isinstance(node, ReLU):
         return MLP  # standalone or chain-internal — both MLP
+    if isinstance(node, Block):
+        return MLP  # a Block is the L->R->L composite, always MLP-locked
     if isinstance(node, LiteralValue):
         return MLP
     if isinstance(node, Linear):
@@ -544,6 +547,11 @@ def slots_for(node: Node, gm: GraphModel) -> int:
         return 0
     if isinstance(node, ReLU):
         return len(node)
+    if isinstance(node, Block):
+        # A Block carries its own composite slot demand (one hidden slot per
+        # lane) — the analogue of a chain's len(R), but the Block *is* the
+        # composite so there is no separate chain object to hold it.
+        return node.n_lanes
     if isinstance(node, Linear):
         return 2 * node.d_output  # MLP bypass
     if isinstance(node, LiteralValue):

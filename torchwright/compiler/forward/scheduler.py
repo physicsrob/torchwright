@@ -19,6 +19,7 @@ from torchwright.compiler.forward.weight_writer import AttnHeadOp, MLPOp
 from torchwright.graph import Node, Linear, Attn, Add, Concatenate
 from torchwright.graph.misc import LiteralValue
 from torchwright.graph.relu import ReLU
+from torchwright.graph.block import Block
 
 
 class LayerScheduler:
@@ -153,7 +154,7 @@ class LayerScheduler:
                     free_adds.append(node)
                 else:
                     deferred_adds.append(node)
-            elif isinstance(node, (Attn, Linear, ReLU, LiteralValue)):
+            elif isinstance(node, (Attn, Linear, ReLU, LiteralValue, Block)):
                 ready.add(node)
             # else: skip unschedulable source nodes (InputNode, Embedding, etc.)
 
@@ -211,7 +212,7 @@ class LayerScheduler:
                 d1 = self._is_dead_for_add(a1, node, computed_nodes)
                 if not (d0 or d1):
                     continue  # deferred add, skip
-            if isinstance(node, (Linear, ReLU, LiteralValue)):
+            if isinstance(node, (Linear, ReLU, LiteralValue, Block)):
                 ready.add(node)
 
         new_chains = self._detect_chains(ready, claimed_relus)
@@ -681,6 +682,62 @@ class LayerScheduler:
             if exclusive:
                 computed_nodes.add(l1)
                 self._mark_scheduled(l1)
+
+        # 3a½. Declared Blocks (blockify's first-class L->R->L composites).
+        # A Block is the chain step above with the structure named instead of
+        # mined: it allocates its d_output residual cols, claims n_lanes hidden
+        # slots, and reads its input's residual cols inline in linear1.  No
+        # exclusivity/split branches — a Block is always realized whole
+        # (Gate A), and blockify already asserted its input projection is
+        # exclusive.
+        blocks = [n for n in ready if isinstance(n, Block)]
+        if under_pressure:
+            blocks.sort(
+                key=lambda b: (
+                    self._net_column_cost(b, computed_nodes, residual_map),
+                    self._critical_path_key(b),
+                )
+            )
+        else:
+            blocks.sort(key=self._critical_path_key)
+        for block in blocks:
+            n_lanes = block.n_lanes
+            if next_slot + n_lanes > self.d_hidden:
+                continue
+            if not self._is_admissible(block):
+                self._admission_deferred = True
+                continue
+            target_cols = self._try_allocate(block, residual_map)
+            if target_cols is None:
+                continue
+            ok, additions, delta = fits_cancel(target_cols)
+            if not ok:
+                residual_map.free(block)
+                continue
+            mlp_slots = list(range(next_slot, next_slot + n_lanes))
+            next_slot += n_lanes
+            self._require_live(
+                block.inputs[0],
+                residual_map,
+                f"compute_block input for {block!r}",
+            )
+            input_cols = residual_map.resolve_indices(block.inputs[0])
+            mlp_ops.append(
+                MLPOp(
+                    "compute_block",
+                    block,
+                    target_cols,
+                    mlp_slots,
+                    source_cols=input_cols,
+                )
+            )
+            commit_cancel(additions, delta)
+            dirty = residual_map.dirty_subset(target_cols)
+            if dirty:
+                residual_map.mark_clean(dirty)
+            computed_nodes.add(block)
+            ready.discard(block)
+            self._mark_scheduled(block)
 
         # 3b. Standalone ReLU (not part of chain)
         standalone_relus = sorted(
