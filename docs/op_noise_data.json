@@ -1,7 +1,7 @@
 {
   "schema_version": 1,
-  "commit": "aafc5f3",
-  "measured_at": "2026-06-29",
+  "commit": "ac4109c",
+  "measured_at": "2026-07-01",
   "ops": [
     {
       "name": "abs",
@@ -224,28 +224,6 @@
       ]
     },
     {
-      "name": "exp",
-      "module": "torchwright.ops.arithmetic_ops",
-      "notes": "Natural exponential via piecewise-linear interpolation with uniform breakpoint spacing. Constant relative output error per cell `(Δx)²/8` because `d²exp/dx² = exp`. Pairs with `log` to implement `A·B = exp(log A + log B)` and `A/B = exp(log A − log B)` in log-space chains.",
-      "distributions": [
-        {
-          "name": "exp_pm5",
-          "description": "exp(x) over [-5, 5] — output spans [exp(-5), exp(5)] ≈ [0.0067, 148.4], the natural pairing for log over [0.01, 100]. Uniform 256-BP grid (`Δx ≈ 0.0392`); per-cell relative-error bound is `(Δx)²/8 ≈ 1.9e-4`.",
-          "n_samples": 4096,
-          "max_abs_error": 0.0279694,
-          "mean_abs_error": 0.00171608,
-          "p99_abs_error": 0.0209377,
-          "max_rel_error": 0.000192375,
-          "mean_rel_error": 0.000120445,
-          "p99_rel_error": 0.000192209,
-          "rel_valid_samples": 4096,
-          "worst_input": {
-            "x": 4.98001
-          }
-        }
-      ]
-    },
-    {
       "name": "floor_int",
       "module": "torchwright.ops.arithmetic_ops",
       "notes": "Staircase with ramp width `1/step_sharpness` directly below each integer. Inputs near integer boundaries land in the ramp zone and produce interpolated values; callers with integer-ish inputs should use `thermometer_floor_div` instead, whose ramps sit at half-integer thresholds.",
@@ -278,135 +256,6 @@
           "rel_valid_samples": 3828,
           "worst_input": {
             "x": 5.99982
-          }
-        }
-      ]
-    },
-    {
-      "name": "linear_bin_index",
-      "module": "torchwright.ops.arithmetic_ops",
-      "notes": "End-to-end composite (~6 MLP sublayers). Error compounds across `reciprocal`, `signed_multiply`, `clamp`, and the terminal `thermometer_floor_div`. Inputs close to integer bin boundaries land in the staircase's ramp zone; `_bin_index_ref` uses `torch.floor` on the exact linear mapping, so tight bin edges reveal ramp-zone slippage.",
-      "distributions": [
-        {
-          "name": "linear_bin_index_tex_col_16",
-          "description": "16-bin quantisation of x ∈ [0, 64] with x_min=0, x_max=64.",
-          "n_samples": 4096,
-          "max_abs_error": 1.0,
-          "mean_abs_error": 0.0747671,
-          "p99_abs_error": 0.921875,
-          "max_rel_error": 1.0,
-          "mean_rel_error": 0.0152883,
-          "p99_rel_error": 0.246094,
-          "rel_valid_samples": 3715,
-          "worst_input": {
-            "x": 7.99831,
-            "x_min": 0.0,
-            "x_max": 64.0
-          }
-        }
-      ]
-    },
-    {
-      "name": "log",
-      "module": "torchwright.ops.arithmetic_ops",
-      "notes": "Natural log via per-section piecewise-linear interpolation. The op auto-sections the input range geometrically by `section_factor=10` (default decades) and routes via thermometer compare + multiply_2d blending, so float32 cancellation is bounded by section width regardless of overall input range. Pairs with `exp` for log-space arithmetic chains.",
-      "distributions": [
-        {
-          "name": "log_4decades_001_100",
-          "description": "log(x) over [0.01, 100] — 4 decades. With per-decade sectioning (default), each section's pre-cancellation magnitude is bounded by `section_factor=10`, so float32 ULP noise is ~1.2e-6 per section. The dominant residual error comes from the multiply_2d blending grid in routing.",
-          "n_samples": 4096,
-          "max_abs_error": 0.000247955,
-          "mean_abs_error": 0.000111881,
-          "p99_abs_error": 0.000167853,
-          "max_rel_error": 0.00371932,
-          "mean_rel_error": 4.23695e-05,
-          "p99_rel_error": 0.000264197,
-          "rel_valid_samples": 4096,
-          "worst_input": {
-            "x": 0.0179683
-          }
-        },
-        {
-          "name": "log_6decades_wide",
-          "description": "log(x) over [0.01, 30000] — 6 decades. Stresses the sectioning path: a single-section piecewise log over this range fails outright (cancellation floor `(x_max/x_min) · 2⁻²³ ≈ 0.36 absolute, observed worst ~1.0 abs). Sectioning drops the floor to ~5e-3 absolute, dominated by compare-cancellation noise at large `x` propagating through multiply_2d blending.",
-          "n_samples": 4096,
-          "max_abs_error": 0.00315189,
-          "mean_abs_error": 0.00154114,
-          "p99_abs_error": 0.00281918,
-          "max_rel_error": 0.00115095,
-          "mean_rel_error": 0.000171528,
-          "p99_rel_error": 0.000407437,
-          "rel_valid_samples": 4096,
-          "worst_input": {
-            "x": 16817.4
-          }
-        }
-      ]
-    },
-    {
-      "name": "log_abs",
-      "module": "torchwright.ops.arithmetic_ops",
-      "notes": "Fused `log(clamp(|x|, min_abs, max_abs))` for signed input. Single-piecewise V-shape over signed `x` for `max_abs/min_abs ≤ 10⁴` (1 sublayer); falls back to `abs + sectioned log` for wider ratios (3 sublayers). Pairs with `exp` and Linear addition for log-domain multiplication of a signed by a positive value.",
-      "distributions": [
-        {
-          "name": "log_abs_3decades_pm100",
-          "description": "log_abs(x) for x ∈ [-100, 100] with min_abs=0.1, max_abs=100 (3 decades on |x|). Signed log-uniform |x| samples plus a V-bottom grid concentrated in [-0.2, 0.2] to stress the flat-zone transition at ±min_abs. Single-piecewise path (ratio 1000 < single-piecewise threshold).",
-          "n_samples": 4096,
-          "max_abs_error": 0.00060606,
-          "mean_abs_error": 0.000251085,
-          "p99_abs_error": 0.000429201,
-          "max_rel_error": 0.142606,
-          "mean_rel_error": 0.000631695,
-          "p99_rel_error": 0.00773819,
-          "rel_valid_samples": 4096,
-          "worst_input": {
-            "x": 77.7515
-          }
-        }
-      ]
-    },
-    {
-      "name": "low_rank_2d",
-      "module": "torchwright.ops.arithmetic_ops",
-      "notes": "Rank-3 SVD of `atan(cross/dot)` on a non-uniform grid. Worst-cell error is bounded by σ_{K+1}, the first truncated singular value — verify against the SVD computed in `tests/ops/test_low_rank_2d.py:100`.",
-      "distributions": [
-        {
-          "name": "atan_cross_dot_nonuniform",
-          "description": "atan2(cross/dot) over [-2, 2] × [0.5, 10] on a non-uniform grid — rank-3 SVD via `low_rank_2d`.",
-          "n_samples": 4096,
-          "max_abs_error": 0.0651017,
-          "mean_abs_error": 0.0158553,
-          "p99_abs_error": 0.0574395,
-          "max_rel_error": 0.331317,
-          "mean_rel_error": 0.0803216,
-          "p99_rel_error": 0.217159,
-          "rel_valid_samples": 4096,
-          "worst_input": {
-            "a": -2.0,
-            "b": 3.36508
-          }
-        }
-      ]
-    },
-    {
-      "name": "max",
-      "module": "torchwright.ops.arithmetic_ops",
-      "notes": "Exact via `(a + b + |a - b|) / 2`.",
-      "distributions": [
-        {
-          "name": "minmax_uniform_pm50",
-          "description": "Two independent uniform streams on [-50, 50]². `min`/`max` are exact via the abs-trick; residual is float32 round-off only.",
-          "n_samples": 4096,
-          "max_abs_error": 3.8147e-06,
-          "mean_abs_error": 5.31843e-07,
-          "p99_abs_error": 3.8147e-06,
-          "max_rel_error": 1.95265e-06,
-          "mean_rel_error": 6.58503e-08,
-          "p99_rel_error": 1.95265e-06,
-          "rel_valid_samples": 4096,
-          "worst_input": {
-            "a": -50.0,
-            "b": -46.8254
           }
         }
       ]
@@ -525,45 +374,6 @@
       ]
     },
     {
-      "name": "piecewise_linear_2d",
-      "module": "torchwright.ops.arithmetic_ops",
-      "notes": "Triangulated-grid lookup with non-uniform breakpoints. On non-uniform grids `piecewise_linear_2d` uses a constrained least-squares fit that can oscillate in cell interiors — `low_rank_2d` is preferred there.",
-      "distributions": [
-        {
-          "name": "diff_trig_nonuniform",
-          "description": "Two-input product over DIFF_BP × TRIG_BP — DIFF in [-40, 40] (non-uniform), TRIG in [-1, 1] (non-uniform).",
-          "n_samples": 4096,
-          "max_abs_error": 7.77785,
-          "mean_abs_error": 1.30067,
-          "p99_abs_error": 6.54323,
-          "max_rel_error": 0.60163,
-          "mean_rel_error": 0.117967,
-          "p99_rel_error": 0.350006,
-          "rel_valid_samples": 4096,
-          "worst_input": {
-            "a": 22.2222,
-            "b": -1.0
-          }
-        },
-        {
-          "name": "diff_vel_nonuniform",
-          "description": "Two-input product over DIFF_BP × VEL_BP — DIFF in [-40, 40] (non-uniform), VEL in [-0.7, 0.7] (non-uniform).",
-          "n_samples": 4096,
-          "max_abs_error": 5.44453,
-          "mean_abs_error": 0.937458,
-          "p99_abs_error": 4.72484,
-          "max_rel_error": 0.601709,
-          "mean_rel_error": 0.123236,
-          "p99_rel_error": 0.350014,
-          "rel_valid_samples": 4096,
-          "worst_input": {
-            "a": 22.2222,
-            "b": -0.7
-          }
-        }
-      ]
-    },
-    {
       "name": "reciprocal",
       "module": "torchwright.ops.arithmetic_ops",
       "notes": "Geometric breakpoint spacing keeps relative interpolation error roughly constant across the range. Measured against a reciprocal graph with `(min_value, max_value, step) = (0.3, 200.0, 1.0)`.",
@@ -586,29 +396,6 @@
       ]
     },
     {
-      "name": "signed_multiply",
-      "module": "torchwright.ops.arithmetic_ops",
-      "notes": "Polarization identity `a·b = (|a+b|² - |a-b|²)/4`. Absolute error scales with `step × (max_abs1 + max_abs2)`, not with `|a·b|`; pathological near-zero × large-magnitude inputs exhibit high relative error.",
-      "distributions": [
-        {
-          "name": "signed_multiply_pm10",
-          "description": "a·b over [-10, 10]² via polarization identity, step=1.0 — analytical bound `step × (max_abs1 + max_abs2) / 4 = 5.0` absolute, much smaller relative.",
-          "n_samples": 4096,
-          "max_abs_error": 0.062484,
-          "mean_abs_error": 0.0201976,
-          "p99_abs_error": 0.0584545,
-          "max_rel_error": 2.15001,
-          "mean_rel_error": 0.00729324,
-          "p99_rel_error": 0.0661538,
-          "rel_valid_samples": 4096,
-          "worst_input": {
-            "a": -1.74603,
-            "b": -1.74603
-          }
-        }
-      ]
-    },
-    {
       "name": "square",
       "module": "torchwright.ops.arithmetic_ops",
       "notes": "Always an underestimate of x² between grid points. Max segment error is `(step/2)²` at half-integers.",
@@ -626,28 +413,6 @@
           "rel_valid_samples": 4094,
           "worst_input": {
             "x": 6.49947
-          }
-        }
-      ]
-    },
-    {
-      "name": "square_signed",
-      "module": "torchwright.ops.arithmetic_ops",
-      "notes": "Same interpolation profile as `square` but spans [-max_abs, max_abs]; saves one MLP sublayer vs. abs+square in `multiply_integers` / `signed_multiply` deep strategies.",
-      "distributions": [
-        {
-          "name": "square_signed_pm10",
-          "description": "x² over [-10, 10] with step=1.0 — covers the negative half the unsigned variant cannot reach.",
-          "n_samples": 4096,
-          "max_abs_error": 0.250023,
-          "mean_abs_error": 0.163952,
-          "p99_abs_error": 0.249971,
-          "max_rel_error": 276.695,
-          "mean_rel_error": 0.748596,
-          "p99_rel_error": 13.238,
-          "rel_valid_samples": 4096,
-          "worst_input": {
-            "x": 9.49681
           }
         }
       ]

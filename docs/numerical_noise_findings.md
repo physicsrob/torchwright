@@ -38,61 +38,18 @@ their distributions are width-1, where per-column M equals the old scalar M — 
 this carries no noise-number drift. (Motivation: the Plan-K Step-1 edge-key
 precision fix, `/data/torchdoom/k_step1_divergence_characterization.md`.)
 
-### `piecewise_linear_2d` oscillates on non-uniform grids
-
-`diff_trig_nonuniform` hits **7.78 absolute error** on a product whose
-reference value is `-24.3` — a ~32% relative deviation.
-`diff_vel_nonuniform` hits **5.44 absolute error**. The op's own docstring
-already flags this: the constrained least-squares fit used on non-uniform
-breakpoint grids can oscillate inside cell interiors. **Preferred
-replacement:** `low_rank_2d`, which measures 0.065 absolute / 33% relative
-(rank-3 SVD, with a compile-time `σ_{K+1}` bound).
-
-**The SVD's `full_matrices` flag is load-bearing here, and only for *tall*
-design matrices.** `piecewise_linear_2d` reads the nullspace basis
-`N_basis = Vh[rank:].T`, which needs every right-singular vector up to the
-column dimension `3+K`. The shape of `A_v` decides whether the two SVD
-modes agree:
-
-* **Tall** (`vertex rows n1·n2 >= 3+K`): this happens on uniform / collapsed
-  grids — e.g. the unit grid `multiply_2d` used to feed here, where the
-  sum/diff hyperplane families collapse to O(n) distinct lines. The reduced
-  SVD (`full_matrices=False`) already returns all `3+K` right-singular
-  vectors, so `Vh` — and therefore the solution — is identical to the full
-  SVD, while skipping the discarded `(n1·n2, n1·n2)` left-singular matrix U
-  (~35 GB of float64 at n1·n2 ≈ 66049 — a real build-time OOM).
-* **Wide** (`rows < 3+K`): this is the *non-uniform* case — DIFF_BP × TRIG_BP
-  has 117 vertex rows but 219 hyperplane columns. The reduced SVD returns
-  only the first 117 right-singular vectors, so the nullspace rows
-  `rank..(3+K)` are *missing*. `N_basis` then can't span the nullspace the
-  interior-sample regularization needs, the oscillation is no longer pinned,
-  and `diff_trig_nonuniform`'s max abs error jumps from 7.78 to **19.4**.
-
-So the op now guards the flag: `full_matrices=False` only when `A_v` is
-tall, `full_matrices=True` (the U it builds is only `(rows, rows)`, and the
-non-uniform grids that hit this path are small) otherwise. An earlier commit
-that flipped the flag unconditionally was the source of the historical 19.4
-regression; the conditional guard keeps the non-uniform path at its
-original 7.78 while making the tall path buildable at high breakpoint
-counts. The underlying issue — `piecewise_linear_2d` is brittle on highly
-non-uniform grids — is unchanged; callers should prefer `low_rank_2d` or a
-uniform grid.
-
 ### `multiply_2d` builds its product grid analytically (quarter-square)
 
-`multiply_2d` no longer routes the product through `piecewise_linear_2d`'s
-generic least-squares solve. A product is exactly bilinear, so on the
-common unit grid the op now builds the piecewise-linear interpolant in
-closed form via the quarter-square identity
+`multiply_2d` builds the product on the common unit grid in closed form —
+a product is exactly bilinear, so the op constructs the piecewise-linear
+interpolant via the quarter-square identity
 `u·v = ((u+v)² − (u−v)²)/4`: the interpolant of `t²` on a uniform grid of
 spacing `h` has a *constant* slope change of `2h` at every interior
 breakpoint, so each square is an equal-weight ReLU staircase and the whole
-product is one ReLU bank of `~2·(2n−2)` neurons — O(n) build, no SVD, no
-O(n²) design matrix (the old path OOM'd at ~257 breakpoints/axis). This is
-the same single MLP sublayer and the same diagonal-aligned interpolant, so
-`multiply_uniform_pm10` is unchanged at ~0.0625 absolute (it moved by ~1e-5,
-within GPU FP run-to-run jitter). The near-zero high-relative-error
-pathology below is structural to the product and unaffected.
+product is one ReLU bank of `~2·(2n−2)` neurons — O(n) build in a single MLP
+sublayer, no SVD and no O(n²) design matrix (so it stays buildable at high
+breakpoint counts). `multiply_uniform_pm10` measures ~0.0625 absolute. The
+near-zero high-relative-error pathology below is structural to the product.
 
 ### `reciprocal` relative error is load-bearing at the high-x tail
 
@@ -104,17 +61,16 @@ output errors at tail inputs. Callers who drive reciprocal near its
 declared `max_value` should either reduce `step` to tighten the geometric
 grid, or clamp the input before the reciprocal lookup.
 
-### `multiply_2d`, `signed_multiply`, `square*` are brittle near zero
+### `multiply_2d`, `square` are brittle near zero
 
-`signed_multiply_pm10` and `multiply_uniform_pm10` both report ~2.15 max
-relative error. Both land at inputs of the form `(±a, ∓a)` with tiny
-`|a·b|` — the polarization identity subtracts two nearly-equal squares,
-so its absolute error is fixed by `step × max_sum` regardless of output
-magnitude. Similarly, `square`'s 230× relative error near x=0 is a direct
-consequence of the reference going to 0 while the piecewise segment does
-not. **These are expected by design**, not bugs — the numbers exist to keep
-callers honest about where these ops can and cannot substitute for exact
-arithmetic.
+`multiply_uniform_pm10` reports ~2.15 max relative error, landing at inputs
+of the form `(±a, ∓a)` with tiny `|a·b|` — the quarter-square identity
+subtracts two nearly-equal squares, so its absolute error is fixed by
+`step × max_sum` regardless of output magnitude. Similarly, `square`'s 230×
+relative error near x=0 is a direct consequence of the reference going to 0
+while the piecewise segment does not. **These are expected by design**, not
+bugs — the numbers exist to keep callers honest about where these ops can and
+cannot substitute for exact arithmetic.
 
 ### Softmax inside attention is not measured here
 
@@ -216,11 +172,10 @@ subtleties matter:
 - **Bound the step, don't leave it unbounded.** An earlier version output the
   raw `relu(t)` (∈ `[0, ~s·x]`) and relied on `1 − relu(1 − relu(t))` to
   saturate. That is reference-exact but the *intermediate* `relu(t)` carries
-  upstream compiled noise amplified by `s` (≈×10), which broke the
-  `linear_bin_index` compile-fidelity probe (`test_resampling_primitives`) on
-  an internal node even though the output was correct. Clamping the step to
-  `[0, W]` keeps the intermediate small (compiled-precise) with `≥ W−1` slack
-  below the stage-2 threshold of 1.
+  upstream compiled noise amplified by `s` (≈×10) on an internal node even
+  though the output was correct. Clamping the step to `[0, W]` keeps the
+  intermediate small (compiled-precise) with `≥ W−1` slack below the stage-2
+  threshold of 1.
 - **Size `W` to the magnitude.** `relu(t) − relu(t−W)` collapses to 0 once `t`
   and `t−W` round to the same float32 (`ulp(t) ≥ W`), so `W = max(2,
   8·ulp(s·n))` — 2 for the common small-range case, larger only as `s·n`
@@ -228,28 +183,27 @@ subtleties matter:
 
 Cost: one extra MLP sublayer (two chained ReLUs) and a width-`n` intermediate.
 Exact at any magnitude/sharpness AND compiled-precise; pinned by
-`test_floor_int_wide_range_large_magnitude`,
-`test_floor_int_byte_range_exact_high_sharpness`, and the existing
-`linear_bin_index` compile probe. Note `thermometer_floor_div` shares the
-slope-change-sum structure but is correct for its documented **integer-only**
-contract (integer inputs land in flat zones); it is not reworked.
+`test_floor_int_wide_range_large_magnitude` and
+`test_floor_int_byte_range_exact_high_sharpness`. Note `thermometer_floor_div`
+shares the slope-change-sum structure but is correct for its documented
+**integer-only** contract (integer inputs land in flat zones); it is not
+reworked.
 
 ### Resolved: the `map_select` table-lookup staircases had the same 2^24 cancellation
 
 An audit for the `floor_int` cancellation class found one untriggered sibling.
-`_table_lookup_index_staircase` / `_table_lookup_row_vector` /
-`_table_lookup_column_mask` (`torchwright/ops/map_select.py`) built a
-`piecewise_linear` with `2·(n−1)+1` breakpoints and `input_scale=sharpness`
-(default 100), feeding `table_lookup_2d`/`table_lookup_3d`. Same single
-alternating-sign ReLU sum, so the same overflow:
-`_table_lookup_index_staircase(n=256, sharpness=100)` at `x=100000` returned
+`_table_lookup_row_vector` / `_table_lookup_column_mask`
+(`torchwright/ops/map_select.py`) built a `piecewise_linear` with `2·(n−1)+1`
+breakpoints and `input_scale=sharpness` (default 100), feeding
+`table_lookup_2d`. Same single alternating-sign ReLU sum, so the same overflow:
+`_table_lookup_row_vector(n=256, sharpness=100)` at `x=100000` returned
 `0.0` (should clamp to 255 — the index was never clamped before the staircase),
 and `n=20000, sharpness=1000` collapsed an in-range `x=19999` to `0.0`
 (`s·max_breakpoint ≈ 2e7 > 2^24`). Two triggers: **(a)** a scaled index far
 outside `[0, n−1]` pushes `sharpness·x` past `2^24`; **(b)** a tall table's top
 breakpoint position passes `2^24`.
 
-**Fixed** by rebuilding all three on the shared `_saturating_step_select`
+**Fixed** by rebuilding both on the shared `_saturating_step_select`
 helper, the table analogue of `floor_int`'s saturating-step staircase. Two
 parts, one per trigger:
 
@@ -272,22 +226,20 @@ parts, one per trigger:
 
 Cost: one `min` sublayer plus the two chained ReLU sublayers of the staircase,
 versus the old single sublayer. Exact at any magnitude/sharpness and
-compiled-precise; pinned by `test_table_lookup_2d_out_of_range_index_clamps_to_edge`,
-`test_table_lookup_2d_tall_table_stays_exact`,
-`test_table_lookup_index_staircase_clamps_and_rounds_at_any_magnitude`, and
-`test_table_lookup_3d_large_flattened_rows_exact` in
-`tests/ops/test_resampling_primitives.py`. (`table_lookup_2d`/`_3d` are not in
-the measured-op set in `scripts/measure_op_noise.py`; adding them there for a
+compiled-precise; pinned by `test_table_lookup_2d_out_of_range_index_clamps_to_edge`
+and `test_table_lookup_2d_tall_table_stays_exact` in
+`tests/ops/test_resampling_primitives.py`. (`table_lookup_2d` is not in
+the measured-op set in `scripts/measure_op_noise.py`; adding it there for a
 tracked noise number is a reasonable follow-on.)
 
 The same audit flagged `compare` as a milder 2-term variant that fails silently
 for `|x| ≳ 2^24/sharpness` (default-sharpness boundary ~1.68e6; live callers
-stay far under it) and confirmed `square`/`exp`/`multiply_2d`/`low_rank_2d` safe
+stay far under it) and confirmed `square`/`multiply_2d` safe
 (monotone slopes or `input_scale=1`); those are unchanged.
 
 ### Rel-error reporting: ramp-zone artefacts
 
-For `compare`, `floor_int`, `linear_bin_index`, and the boolean ops
+For `compare`, `floor_int`, and the boolean ops
 (`bool_any_true`, `bool_all_true`, `bool_not`, `equals_vector`), the
 reference is a discrete step function — the op is approximating a
 piecewise-constant target through a small continuous ramp. Samples that
@@ -297,93 +249,6 @@ numbers in `numerical_noise.md` at e.g. `compare_near_thresh_0` (abs
 ≈ 2.0, rel ≈ 2.0) are diagnostic of ramp width, not a defect of the
 op. Read ramp-zone distribution rows as "here is how the ramp looks,"
 not as "here is an error budget."
-
-### `log` is per-section to escape the wide-range cancellation floor; `exp` hits its theoretical relative-error bound
-
-The `log`/`exp` ops are paired primitives for log-space arithmetic
-(e.g., `A·B = exp(log A + log B)`, `A/B = exp(log A − log B)`).
-
-**`exp` (uniform 256-BP grid over `[-5, 5]`)** measures
-`max_rel_error = 1.92e-4`, identical to the theoretical per-cell bound
-`(Δx)² / 8`. Uniform breakpoints on `exp` deliver constant relative
-output error by construction (since `d²exp/dx² = exp(x)` cancels
-against the function value), and the measurement confirms float32
-noise is small enough not to blur this.
-
-**`log` is sectioned by default.** A naïve single-piecewise log over
-`[x_min, x_max]` has the first ReLU contribute `slope[0] · x_max ≈
-x_max / x_min` in pre-cancellation magnitude at the right end of the
-range, hitting a float32 floor of `(x_max/x_min) · 2⁻²³` on the
-absolute log output. For wide ranges (`x_max/x_min ≈ 3·10⁶`) this
-floor is ~0.36 absolute log error — which translates to ~30%
-relative error in the underlying `x` and outright fails the value-
-range assertion. **Increasing breakpoint count makes it worse**, not
-better, by lengthening the cancellation chain (verified empirically:
-N=1024 over [0.01, 30000] gave 3.3 absolute error vs 1.0 at N=256).
-
-The op auto-sections the input range geometrically by
-`section_factor=10` (default decades), runs one piecewise-linear log
-per section in parallel, and routes via thermometer compare plus
-`multiply_2d` blending. Each section's pre-cancellation magnitude is
-bounded by its own `B_{i+1}/B_i = section_factor`, so the floor drops
-to `section_factor · 2⁻²³ ≈ 1.2e-6` per section — independent of
-overall range. For ranges that fit in one section
-(`x_max/x_min ≤ section_factor`), the op falls through to a single
-`piecewise_linear` with no routing overhead.
-
-**Measured noise floors:**
-
-* `log_4decades_001_100`: `max_abs = 2.5e-4` (vs 4.8e-3 pre-
-  sectioning — 19× better). `max_rel = 3.7e-3`, dominated by inputs
-  near `x = 1` where `log(x) → 0` (the same near-zero relative-error
-  pathology as `square` and `multiply_2d`).
-* `log_6decades_wide` (`[0.01, 30000]`): `max_abs = 3.0e-3` — usable.
-  Without sectioning the worst-case error is ~1.0 absolute and the
-  value-range assertion fires on most inputs near `x_max`.
-
-**Working rule for callers:**
-
-The dominant residual error in the sectioned path comes from the
-routing's `multiply_2d` blend (worst case ~5e-3 absolute log error
-near section boundaries at extreme `x`). For `x_max/x_min ≤ 10⁵`,
-expect `max_abs_error < 1e-3`; for `x_max/x_min ≤ 10⁷`, expect
-`max_abs_error < 5e-3`. Translate to `x` via
-`rel_err_in_x ≈ abs_err_in_log` (approximate; exact for small errors).
-
-### `log_abs` fuses `abs + log` into one sublayer for typical ranges
-
-`log_abs(x, min_abs, max_abs)` ≈ `log(clamp(|x|, min_abs, max_abs))` for
-signed `x`. Even-symmetric V-shape with a flat bottom at `log(min_abs)`
-over `[-min_abs, +min_abs]`, clamped to `log(max_abs)` outside
-`[-max_abs, +max_abs]`. Pairs with `exp` and Linear addition for
-log-domain multiplication of a signed by a positive value (e.g.
-`signed_coord · positive_scale`).
-
-The implementation has two paths driven by the input dynamic range:
-
-* `max_abs/min_abs ≤ 10⁴` (typical case, including the default
-  `[0.1, 100]`): single piecewise_linear over signed `x` with V-shape
-  breakpoints. **1 MLP sublayer.** Saves 2 sublayers vs the explicit
-  `abs + sectioned_log` composition.
-* Wider ratios: falls back to `abs(x) → log(...)`. **3 sublayers**, at
-  parity with the explicit composition.
-
-The single-path's float32 floor comes from V-spike contributions at
-`±min_abs` (where the slope-delta encoding has a `1/min_abs`-magnitude
-delta turning the log curve on/off). At extreme `x`, those spikes
-contribute `~max_abs/min_abs` magnitude to the matmul partial sum, with
-ULP-level noise scaling proportionally. The 10⁴ ratio threshold caps
-this floor at ~1.2e-3 absolute, comfortably inside the noise budget.
-
-**Measured (`log_abs_3decades_pm100`, default 256 BPs):**
-
-* `max_abs = 7.0e-4` (under 1e-3 target).
-* `mean_abs = 2.5e-4` (over the 1e-4 soft target, under 5e-4 hard
-  ceiling — interpolation-bound; raise `n_breakpoints` to tighten).
-* `max_rel = 0.14` — expected, samples near `|x| = min_abs` produce
-  outputs near `log(min_abs) = -2.3` so a small absolute drift gives
-  a misleading "relative" number. Same near-output-zero pathology as
-  `square` and `multiply_2d`. Score on absolute error, not relative.
 
 ### `compare(x, 0)` is a margin test, not a scale-free sign operator
 
