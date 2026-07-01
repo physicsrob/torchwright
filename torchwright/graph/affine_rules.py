@@ -39,6 +39,7 @@ def compute_affine_bound(node: "Node") -> AffineBound:
     )
     from torchwright.graph.linear import Linear
     from torchwright.graph.relu import ReLU
+    from torchwright.graph.block import Block
     from torchwright.graph.embedding import Embedding
     from torchwright.graph.attn import Attn
 
@@ -67,6 +68,9 @@ def compute_affine_bound(node: "Node") -> AffineBound:
     if isinstance(node, ReLU):
         return _relu_rule(node)
 
+    if isinstance(node, Block):
+        return _block_rule(node)
+
     if isinstance(node, Assert):
         return _assert_rule(node)
 
@@ -88,11 +92,15 @@ def compute_affine_bound(node: "Node") -> AffineBound:
     return AffineBound.degenerate(node.d_output)
 
 
-def _linear_rule(node) -> AffineBound:
-    """y = x @ W + c: sign-split GEMM."""
-    inp_ab = node.inputs[0]._affine_bound
-    W = node.output_matrix.to(torch.float64)
-    c = node.output_bias.to(torch.float64)
+def _linear_affine(
+    inp_ab: AffineBound, W: torch.Tensor, c: torch.Tensor
+) -> AffineBound:
+    """y = x @ W + c through a bound: sign-split GEMM.
+
+    ``W`` is ``(d_input, d_output)`` and ``c`` is ``(d_output,)``, both
+    float64.  Pure function of the input bound and the affine params — shared
+    by :func:`_linear_rule` (the ``Linear`` node) and :func:`_block_rule` (the
+    gate/out projections of a ``Block``)."""
     W_plus = torch.clamp(W, min=0)
     W_minus = torch.clamp(W, max=0)
 
@@ -113,6 +121,14 @@ def _linear_rule(node) -> AffineBound:
         columns=inp_ab.columns,
         input_ranges=inp_ab.input_ranges,
     )
+
+
+def _linear_rule(node) -> AffineBound:
+    """y = x @ W + c: sign-split GEMM."""
+    inp_ab = node.inputs[0]._affine_bound
+    W = node.output_matrix.to(torch.float64)
+    c = node.output_bias.to(torch.float64)
+    return _linear_affine(inp_ab, W, c)
 
 
 def _add_rule(node) -> AffineBound:
@@ -164,11 +180,17 @@ def _concat_rule(node) -> AffineBound:
     )
 
 
-def _relu_rule(node) -> AffineBound:
-    """ReLU per-component case analysis using linear envelope."""
-    inp_ab = node.inputs[0]._affine_bound
+def _relu_affine(
+    inp_ab: AffineBound, warn_node: Optional["Node"] = None
+) -> AffineBound:
+    """ReLU per-component case analysis using the linear envelope.
+
+    Pure function of the input bound.  ``warn_node`` (optional) is only used
+    to emit the "infinite affine interval but finite value_type" warning
+    against a real node; pass ``None`` when there is no single node behind the
+    bound (e.g. a ``Block``'s internal gate values)."""
     intervals = inp_ab.to_interval()
-    d = node.d_output
+    d = inp_ab.d_output
     n = inp_ab.n_cols
 
     A_lo = torch.zeros(d, n, dtype=torch.float64)
@@ -186,16 +208,17 @@ def _relu_rule(node) -> AffineBound:
         elif h <= 0:
             pass
         elif math.isinf(l) or math.isinf(h):
-            vt_range = node.inputs[0].value_type.value_range
-            if math.isfinite(vt_range.lo) and math.isfinite(vt_range.hi):
-                import warnings
+            if warn_node is not None:
+                vt_range = warn_node.value_type.value_range
+                if math.isfinite(vt_range.lo) and math.isfinite(vt_range.hi):
+                    import warnings
 
-                warnings.warn(
-                    f"Node {node.node_id}: ReLU input affine interval is "
-                    f"infinite ({l}, {h}) but value_type is finite "
-                    f"{vt_range}. Upstream affine rule may be missing or "
-                    f"degenerate."
-                )
+                    warnings.warn(
+                        f"Node {warn_node.node_id}: ReLU input affine interval is "
+                        f"infinite ({l}, {h}) but value_type is finite "
+                        f"{vt_range}. Upstream affine rule may be missing or "
+                        f"degenerate."
+                    )
             b_hi[i] = float(h)
         else:
             slope = h / (h - l)
@@ -213,6 +236,41 @@ def _relu_rule(node) -> AffineBound:
         columns=inp_ab.columns,
         input_ranges=inp_ab.input_ranges,
     )
+
+
+def _relu_rule(node) -> AffineBound:
+    """ReLU per-component case analysis using linear envelope."""
+    return _relu_affine(node.inputs[0]._affine_bound, warn_node=node.inputs[0])
+
+
+def _block_rule(node) -> AffineBound:
+    """Block: compose gate projection -> ReLU envelope -> output projection.
+
+    The three sub-steps are exactly the rules the mined ``Linear -> ReLU ->
+    Linear`` chain applies across its three nodes today, run here over one
+    node's projections.  Step 1 is ReLU-only; a swish envelope is step 2's
+    problem, so a gated/swish block is rejected here (the compiler path is
+    ReLU-degenerate this phase anyway)."""
+    if node.activation != "relu" or node.up_proj is not None:
+        raise NotImplementedError(
+            "Block affine rule supports only degenerate ReLU lanes in step 1 "
+            f"(got activation={node.activation!r}, "
+            f"gated={node.up_proj is not None}); a swish/gated envelope is "
+            "step 2's affine rule."
+        )
+    inp_ab = node.inputs[0]._affine_bound
+    # Gate projection: y = x @ gate_proj.T + gate_bias.  gate_proj is
+    # (n_lanes, d_input) in math orientation, so W = gate_proj.T.
+    gate_W = node.gate_proj.to(torch.float64).T
+    gate_c = node.gate_bias.to(torch.float64)
+    gate_ab = _linear_affine(inp_ab, gate_W, gate_c)
+    # ReLU envelope per lane.
+    lane_ab = _relu_affine(gate_ab, warn_node=None)
+    # Output projection: out = lane @ out_proj + out_bias.  out_proj is already
+    # (n_lanes, d_output).
+    out_W = node.out_proj.to(torch.float64)
+    out_c = node.out_bias.to(torch.float64)
+    return _linear_affine(lane_ab, out_W, out_c)
 
 
 def _assert_rule(node) -> AffineBound:
