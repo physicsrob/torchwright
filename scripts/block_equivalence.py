@@ -189,10 +189,8 @@ def schedule_trace(
 
     Each list entry is a dict for one layer: ``hidden`` (total MLP slots used),
     ``composites`` (a list of ``(annotation, width, slots, node_id)`` for every
-    compute_relu / compute_block op that layer), and ``layer`` (index).  The
-    MLP composite of a mined chain is its L2 Linear; of a blockified graph, the
-    Block — both carry the same annotation (blockify copies L2's), so composites
-    are matchable across the two schedules by ``(annotation, width)``.
+    compute_block op that layer), and ``layer`` (index).  The MLP composite is
+    the Block node, matchable across schedules by ``(annotation, width)``.
     """
     d_hidden = d if d_hidden is None else d_hidden
     graph = GraphAnalyzer(output_node)
@@ -210,7 +208,7 @@ def schedule_trace(
         for op in mlp_ops:
             if op.mlp_slots:
                 hidden += len(op.mlp_slots)
-            if op.op_type in ("compute_relu", "compute_block"):
+            if op.op_type == "compute_block":
                 composites.append(
                     (
                         op.node.annotation,

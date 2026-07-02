@@ -30,7 +30,7 @@ from torchwright.compiler.forward.cpsat_scheduler import (
 from torchwright.compiler.forward.residual_map import ResidualStreamMap
 from torchwright.compiler.graph_identity import graph_fingerprint
 from torchwright.graph import Linear
-from torchwright.graph.relu import ReLU
+from torchwright.ops.linear_relu_linear import linear_relu_linear
 from torchwright.graph.value_type import Range
 from torchwright.ops.inout_nodes import create_input
 
@@ -209,12 +209,18 @@ def test_energy_bound_identity_holds_below_and_breaks_above():
 
 
 def _tiny_graph():
-    """x -> Linear -> ReLU -> Linear; small enough to solve sub-second."""
+    """x -> Block (a degenerate-ReLU MLP block); small enough to solve
+    sub-second."""
     torch.manual_seed(0)
     x = create_input("x", 8)
-    l1 = Linear(x, torch.randn(8, 16), torch.zeros(16), name="l1")
-    r = ReLU(l1, name="r")
-    return Linear(r, torch.randn(16, 4), torch.zeros(4), name="l2")
+    return linear_relu_linear(
+        x,
+        torch.randn(16, 8),
+        torch.zeros(16),
+        torch.randn(16, 4),
+        torch.zeros(4),
+        name="block",
+    )
 
 
 _CPSAT_KW = dict(d=64, d_head=8, d_hidden=128)

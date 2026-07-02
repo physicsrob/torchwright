@@ -51,7 +51,6 @@ from torchwright.graph import (
     Node,
 )
 from torchwright.graph.misc import LiteralValue
-from torchwright.graph.relu import ReLU
 from torchwright.graph.block import Block
 
 # ---------------------------------------------------------------------------
@@ -174,7 +173,6 @@ MLP = "mlp"
 # script and any regression test validate names against one source of truth.
 CONSTRAINT_FAMILIES = frozenset(
     {
-        "chain_coupling",  # L1==R==L2 same-layer equalities
         "dependency",  # edge u->v layer ordering
         "cancel_consumer_lb",  # cancel_layer >= consumer_layer + 1
         "cancel_slack",  # cancel_layer <= last_consumer + 1 + K window
@@ -223,26 +221,6 @@ class BuiltModel:
 
 
 @dataclass
-class Chain:
-    """One detected `L1 -> ReLU -> L2` chain.
-
-    `exclusive` = `L1` has no effective consumers other than `R`, so
-    `L1` doesn't need its own residual position (it's simulated inline
-    inside `linear1` from its input's residual columns).
-    """
-
-    chain_id: int
-    l1: Linear
-    relu: ReLU
-    l2: Linear
-    exclusive: bool
-
-    @property
-    def width(self) -> int:
-        return len(self.relu)
-
-
-@dataclass
 class GraphModel:
     """Static analysis of the graph that the CP-SAT model is built over."""
 
@@ -250,8 +228,6 @@ class GraphModel:
     schedulable: List[Node]  # nodes that need a time slot
     edges: List[Tuple[Node, Node]]  # (u, v) Concatenate-transparent
     consumers_eff: Dict[Node, Set[Node]]  # effective consumers (Concat-transparent)
-    chains: List[Chain]
-    node_to_chain: Dict[Node, Chain]  # any of L1/R/L2 -> Chain
     output_node: Node
     pos_encoding: object  # vestigial (always None) — position is rotary, no node
     input_nodes: List[Node]  # pre-allocated inputs (incl. LiteralValue)
@@ -278,69 +254,6 @@ def _effective_consumers(
             result.add(consumer)
     cache[node] = result
     return result
-
-
-def _detect_chains_static(
-    graph: GraphAnalyzer,
-    schedulable: Set[Node],
-    consumers_eff: Dict[Node, Set[Node]],
-) -> List[Chain]:
-    """Mirror `LayerScheduler._detect_chains` over the entire graph.
-
-    Each ReLU matches at most one chain.  Each Linear is also used in
-    at most one chain — `fuse_consecutive_linears` mutates a Linear's
-    input to point at an upstream ReLU, which can leave a single
-    Linear satisfying the structural conditions for both L1 of one
-    chain and L2 of another (`... -> R -> L_shared -> R' -> ...`
-    after fusion of `L_a -> L_b` becomes `L_b = L_shared`).  Without
-    Linear-de-dup the two chains would couple via the shared Linear's
-    `layer_var` equality and the model would be `INFEASIBLE`.
-
-    Iteration is in node-id order for determinism; node-id roughly
-    corresponds to upstream-first graph build order, so when an
-    overlap exists the upstream chain is detected first and wins.
-    """
-    chains: List[Chain] = []
-    seen_relus: Set[Node] = set()
-    seen_linears: Set[Node] = set()
-
-    linears = sorted(
-        (n for n in schedulable if isinstance(n, Linear)),
-        key=lambda n: n.node_id,
-    )
-    for l1 in linears:
-        if l1 in seen_linears:
-            continue
-        for consumer in graph.get_consumers(l1):
-            if not isinstance(consumer, ReLU) or consumer in seen_relus:
-                continue
-            relu = consumer
-            relu_eff = consumers_eff.get(relu, set())
-            l2_candidates = [c for c in relu_eff if isinstance(c, Linear)]
-            if len(relu_eff) != 1 or len(l2_candidates) != 1:
-                continue
-            l2 = l2_candidates[0]
-            if l2.inputs[0] is not relu:
-                continue
-            if l2 in seen_linears:
-                continue
-            l1_eff = consumers_eff.get(l1, set())
-            exclusive = l1_eff == {relu}
-            chains.append(
-                Chain(
-                    chain_id=len(chains),
-                    l1=l1,
-                    relu=relu,
-                    l2=l2,
-                    exclusive=exclusive,
-                )
-            )
-            seen_relus.add(relu)
-            seen_linears.add(l1)
-            seen_linears.add(l2)
-            break
-
-    return chains
 
 
 def build_graph_model(output_node: Node, pos_encoding=None) -> GraphModel:
@@ -392,33 +305,6 @@ def build_graph_model(output_node: Node, pos_encoding=None) -> GraphModel:
                 edges_set.add(key)
                 edges.append((pred, v))
 
-    chains = _detect_chains_static(graph, set(schedulable), consumers_eff)
-    node_to_chain: Dict[Node, Chain] = {}
-    for c in chains:
-        # Structural invariant: a node appears in at most one chain.
-        # `_detect_chains_static` enforces this via `seen_relus` and
-        # `seen_linears`; this assertion catches regressions in the
-        # detector itself and is cheap (linear in chain count).
-        # Without this, a fusion-induced overlap (`L_b` is L2 of one
-        # chain and L1 of another) silently makes the CP-SAT model
-        # `INFEASIBLE` — the chain-coupling equalities force two
-        # ReLUs onto the same layer, contradicting their dependency
-        # ordering — which is then masked by the heuristic-fallback
-        # path.
-        for role, node in (("l1", c.l1), ("relu", c.relu), ("l2", c.l2)):
-            if node in node_to_chain:
-                prior = node_to_chain[node]
-                raise AssertionError(
-                    f"Chain detector produced overlapping chains: "
-                    f"{node!r} appears as {role} of chain "
-                    f"{c.chain_id} and was already registered for "
-                    f"chain {prior.chain_id} "
-                    f"(L1={prior.l1!r}, ReLU={prior.relu!r}, "
-                    f"L2={prior.l2!r}).  This indicates a missing "
-                    f"de-dup in `_detect_chains_static`."
-                )
-            node_to_chain[node] = c
-
     pinned_nodes: Set[Node] = set(input_nodes)
     pinned_nodes.add(output_node)
 
@@ -427,8 +313,6 @@ def build_graph_model(output_node: Node, pos_encoding=None) -> GraphModel:
         schedulable=schedulable,
         edges=edges,
         consumers_eff=consumers_eff,
-        chains=chains,
-        node_to_chain=node_to_chain,
         output_node=output_node,
         pos_encoding=pos_encoding,
         input_nodes=input_nodes,
@@ -456,19 +340,11 @@ def routing(node: Node, gm: GraphModel, policy: SchedulingPolicy) -> str:
         return ATTN
     if isinstance(node, Add):
         return ATTN
-    if isinstance(node, ReLU):
-        return MLP  # standalone or chain-internal — both MLP
     if isinstance(node, Block):
-        return MLP  # a Block is the L->R->L composite, always MLP-locked
+        return MLP  # a Block is the L->ReLU->L composite, always MLP-locked
     if isinstance(node, LiteralValue):
         return MLP
     if isinstance(node, Linear):
-        chain = gm.node_to_chain.get(node)
-        if chain is not None and not (node is chain.l1 and not chain.exclusive):
-            # Chain ReLU/L2 and exclusive L1 are pinned to MLP. Non-
-            # exclusive L1 has a standalone realization that follows
-            # the same policy as a standalone Linear.
-            return MLP
         if policy.local_in_attention == "always":
             return ATTN
         return MLP
@@ -479,32 +355,15 @@ def is_flex(node: Node, gm: GraphModel) -> bool:
     """True iff this node's routing is a CP-SAT decision variable
     when `flex_routing=True`.
 
-    Standalone Linears (not part of any L1->R->L2 chain) can run in
-    attention (`heads = ⌈d_input/d_head⌉`) or in MLP bypass (`slots
-    = 2 · d_output`). The heuristic picks one statically per policy;
-    CP-SAT can pick per-node.
+    Exactly the standalone Linears: a Linear can run in attention
+    (`heads = ⌈d_input/d_head⌉`) or in MLP bypass (`slots = 2 ·
+    d_output`).  The heuristic picks one statically per policy; CP-SAT
+    can pick per-node.
 
-    Non-exclusive chain L1 (a chain L1 with consumers besides the
-    chain's ReLU) is also flex: the heuristic emits a standalone
-    realization of L1 alongside the chain composite (writing L1's
-    value to its own residual columns for the non-chain consumers),
-    and that realization can run in attention or MLP-bypass per
-    policy. Chain composite still always runs in MLP.
-
-    Chain ReLU and L2 stay locked to MLP — splitting a chain into
-    separate ops would need a different model structure. Exclusive
-    L1 has no standalone realization (computed inline inside
-    `linear1`), so its routing is not a decision.
-
-    `Attn` / `Add` / standalone `ReLU` / `LiteralValue` stay locked
-    because they have only one valid sublayer.
+    `Attn` / `Add` / `Block` / `LiteralValue` stay locked because they
+    have only one valid sublayer (a Block is always the MLP composite).
     """
-    if not isinstance(node, Linear):
-        return False
-    chain = gm.node_to_chain.get(node)
-    if chain is None:
-        return True
-    return node is chain.l1 and not chain.exclusive
+    return isinstance(node, Linear)
 
 
 def heads_for(node: Node, d_head: int) -> int:
@@ -532,25 +391,11 @@ def heads_for(node: Node, d_head: int) -> int:
 def slots_for(node: Node, gm: GraphModel) -> int:
     """MLP slots consumed if MLP-routed.
 
-    Chain ReLU and L2 return 0 — the chain composite (modeled
-    separately) carries the `len(R)` slot demand. Exclusive L1
-    similarly returns 0 (no standalone realization).
-
-    Non-exclusive L1 returns `2 · d_output` for the MLP-bypass slot
-    demand of its standalone realization. This is additive on top of
-    the chain composite's `len(R)` demand at the same layer.
+    A Block carries one hidden slot per lane (the composite's slot
+    demand); a standalone Linear routed to MLP bypass needs `2 ·
+    d_output`; everything else costs no hidden slots.
     """
-    chain = gm.node_to_chain.get(node)
-    if chain is not None:
-        if node is chain.l1 and not chain.exclusive:
-            return 2 * node.d_output  # standalone MLP-bypass realization
-        return 0
-    if isinstance(node, ReLU):
-        return len(node)
     if isinstance(node, Block):
-        # A Block carries its own composite slot demand (one hidden slot per
-        # lane) — the analogue of a chain's len(R), but the Block *is* the
-        # composite so there is no separate chain object to hold it.
         return node.n_lanes
     if isinstance(node, Linear):
         return 2 * node.d_output  # MLP bypass
@@ -562,23 +407,13 @@ def slots_for(node: Node, gm: GraphModel) -> int:
 def uses_residual(node: Node, gm: GraphModel) -> bool:
     """True iff this node gets its own residual-stream column allocation.
 
-    Chain `R`: no — its activations live in MLP hidden slots, not residual.
-    Chain `L1` (exclusive): no — computed inline inside `linear1` from
-        its input's residual cols, never written back to the stream.
-    Chain `L1` (non-exclusive): yes — has consumers besides `R`, so
-        needs a residual position alongside the chain.
-    Chain `L2`: yes — chain output writes to residual.
-    All other schedulable nodes (standalone Linear/Add/Attn/ReLU/
-        LiteralValue): yes.
+    Every schedulable node writes its output to the residual stream (a
+    Block's output, a Linear's output, an Add, an Attn, a LiteralValue).
+    The Block's internal ReLU activations live in MLP hidden slots, not
+    the residual stream, but the Block node itself (its output) does use
+    residual columns.
     """
-    chain = gm.node_to_chain.get(node)
-    if chain is None:
-        return True
-    if node is chain.relu:
-        return False
-    if node is chain.l1:
-        return not chain.exclusive
-    return True  # chain.l2
+    return True
 
 
 # ---------------------------------------------------------------------------
@@ -598,9 +433,8 @@ def _compute_layer_bounds(
     same-layer placement only when u *can* run in the attention sublayer and
     v *can* run in MLP (gap 0); otherwise v must come at least one layer
     after u (gap 1).  "Can" means: flexible routing, or pinned to the
-    needed sublayer.  Chain members (L1/ReLU/L2) share one layer, so their
-    bounds are unified.  These are the same bounds CP-SAT presolve derives
-    by propagation; computing them here shrinks the input model instead.
+    needed sublayer.  These are the same bounds CP-SAT presolve derives by
+    propagation; computing them here shrinks the input model instead.
     """
 
     # Per-node allowed sublayers ("modes").  The propagation is mode-aware:
@@ -624,22 +458,14 @@ def _compute_layer_bounds(
     for u, v in gm.edges:
         if u.node_id in input_ids:
             continue
-        if (
-            u in gm.node_to_chain
-            and v in gm.node_to_chain
-            and gm.node_to_chain[u] is gm.node_to_chain[v]
-        ):
-            continue
         edges.append((u.node_id, v.node_id))
 
     ids = [n.node_id for n in gm.schedulable]
     es = {i: {m: 0 for m in node_modes[i]} for i in ids}
     ls = {i: {m: max_layers - 1 for m in node_modes[i]} for i in ids}
-    chain_groups = [(c.l1.node_id, c.relu.node_id, c.l2.node_id) for c in gm.chains]
-    # Fixpoint: edge sweeps interleaved with chain-equality unification.
-    # The DAG alone converges in one forward+backward sweep when edges are
-    # in topological order (gm.schedulable is build-ordered); the chain
-    # equalities can ripple a bound back, hence the loop.
+    # Fixpoint over the dependency edges; converges in one forward+backward
+    # sweep when edges are in topological order (gm.schedulable is
+    # build-ordered), but loop defensively in case they are not.
     for _ in range(200):
         changed = False
         for u, v in edges:
@@ -656,17 +482,6 @@ def _compute_layer_bounds(
                 if hi < ls[u][a]:
                     ls[u][a] = hi
                     changed = True
-        for g in chain_groups:
-            m_es = max(min(es[i].values()) for i in g)
-            m_ls = min(max(ls[i].values()) for i in g)
-            for i in g:
-                for m in node_modes[i]:
-                    if es[i][m] < m_es:
-                        es[i][m] = m_es
-                        changed = True
-                    if ls[i][m] > m_ls:
-                        ls[i][m] = m_ls
-                        changed = True
         if not changed:
             break
     else:
@@ -811,12 +626,6 @@ def build_cpsat_model(
         layer_var_lo[n.node_id] = lo
         layer_var[n.node_id] = model.NewIntVar(lo, hi, f"L_n{n.node_id}")
 
-    # Chain composites: L1, R, L2 share one layer.
-    if "chain_coupling" not in _disabled_families:
-        for c in gm.chains:
-            model.Add(layer_var[c.l1.node_id] == layer_var[c.relu.node_id])
-            model.Add(layer_var[c.relu.node_id] == layer_var[c.l2.node_id])
-
     # ---- Routing: is_attn[n] BoolVar (or fixed literal) per node ----
     # is_attn[n] == 1 means the node runs in the attention sublayer
     # at its layer; is_attn[n] == 0 means it runs in MLP.
@@ -840,12 +649,6 @@ def build_cpsat_model(
     if "dependency" not in _disabled_families:
         for u, v in gm.edges:
             if u.node_id in input_ids:
-                continue
-            if (
-                u in gm.node_to_chain
-                and v in gm.node_to_chain
-                and gm.node_to_chain[u] is gm.node_to_chain[v]
-            ):
                 continue
             u_attn = is_attn[u.node_id]
             v_attn = is_attn[v.node_id]
@@ -1066,11 +869,9 @@ def build_cpsat_model(
         if n in gm.pinned_nodes:
             continue
         if not uses_residual(n, gm):
-            # Chain-internal exclusive L1 and chain-internal ReLU live
-            # in MLP hidden slots, never in the residual stream — no
-            # columns to cancel.  Skipping prevents the cumulative from
-            # over-counting on graphs with wide chain hidden widths
-            # (e.g. d_hidden_chain > n_heads_per_layer * d_head).
+            # A node with no residual-stream column (none today — every
+            # schedulable node writes its output to the stream) has no
+            # columns to cancel.
             continue
         c_end = model.NewIntVar(1, max_layers + 1, f"cend_n{n.node_id}")
         model.Add(c_end == cancel_layer[n.node_id] + 1)
@@ -1139,8 +940,9 @@ def build_cpsat_model(
         )
 
     # ---- MLP slots cumulative ----
-    # For flex nodes, MLP demand is gated by NOT(is_attn). Chain
-    # composites and standalone ReLUs are always MLP-routed.
+    # For flex nodes, MLP demand is gated by NOT(is_attn).  A Block carries
+    # its lane slots and is pinned to MLP (is_attn == 0), so its interval is
+    # always present.
     mlp_intervals: List = []
     mlp_demands: List[int] = []
     for n in gm.schedulable:
@@ -1154,14 +956,6 @@ def build_cpsat_model(
         )
         mlp_intervals.append(iv)
         mlp_demands.append(s)
-    for c in gm.chains:
-        end = model.NewIntVar(1, max_layers, f"mend_c{c.chain_id}")
-        model.Add(end == layer_var[c.relu.node_id] + 1)
-        iv = model.NewIntervalVar(
-            layer_var[c.relu.node_id], 1, end, f"miv_c{c.chain_id}"
-        )
-        mlp_intervals.append(iv)
-        mlp_demands.append(c.width)
     if "mlp_cumulative" not in _disabled_families and mlp_intervals:
         model.AddCumulative(mlp_intervals, mlp_demands, d_hidden)
 

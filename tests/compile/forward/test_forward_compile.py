@@ -8,14 +8,14 @@ import pytest
 import torch
 
 from torchwright.compiler.forward.compile import forward_compile
-from torchwright.graph import Linear, ReLU, Add, Concatenate
+from torchwright.graph import Linear, Add, Concatenate
 from torchwright.graph.misc import InputNode, LiteralValue
 from torchwright.ops.inout_nodes import (
     create_input,
     create_literal_value,
     create_rope_config,
 )
-from torchwright.graph.relu import ReLU
+from torchwright.ops.linear_relu_linear import linear_relu_linear
 from torchwright.ops.arithmetic_ops import (
     add,
     add_const,
@@ -90,13 +90,13 @@ def test_compile_linear():
     _verify(out, n_pos=3, input_values={"x": torch.randn(3, 4)})
 
 
-def test_compile_relu_chain():
-    """Input -> Linear -> ReLU -> Linear (the MLP pattern)."""
+def test_compile_block():
+    """Input -> Block (the L->ReLU->L MLP pattern, one node)."""
     x = create_input("x", 4)
-    l1 = Linear(x, torch.randn(4, 8), torch.randn(8), name="l1")
-    r = ReLU(l1)
-    l2 = Linear(r, torch.randn(8, 3), torch.randn(3), name="l2")
-    _verify(l2, n_pos=3, input_values={"x": torch.randn(3, 4)})
+    block = linear_relu_linear(
+        x, torch.randn(8, 4), torch.randn(8), torch.randn(8, 3), torch.randn(3)
+    )
+    _verify(block, n_pos=3, input_values={"x": torch.randn(3, 4)})
 
 
 def test_compile_add():
@@ -216,10 +216,9 @@ def test_compile_sum_nodes():
 
 
 def test_compile_cond_gate():
-    """cond_gate — exercises standalone ReLU (Add -> ReLU -> Add pattern).
+    """cond_gate — a gating op built on Blocks (linear_relu_linear).
 
-    This is the key pattern from the adder that uses standalone ReLU.
-    cond_gate(cond, inp) = cond_add_vector(cond, relu(cond_add_vector(cond, inp, ...)), ...)
+    cond_gate(cond, inp) = cond_add_vector(cond, block(cond_add_vector(cond, inp, ...)), ...)
     """
     cond = create_input("cond", 1, value_range=(-1.0, 1.0))
     inp = create_input("inp", 4, value_range=(-4.0, 4.0))
@@ -279,24 +278,6 @@ def test_compile_repeated_adds():
     a2 = add(c3, c4)
     out = add(a1, a2)
     _verify(out, n_pos=2, input_values={})
-
-
-def test_compile_add_relu():
-    """Add -> ReLU -> ReLU — chained standalone ReLUs."""
-    v1 = create_input("v1", 4)
-    v2 = create_input("v2", 4)
-    n_pos = 2
-    a = add(v1, v2)
-    r1 = ReLU(a)
-    out = ReLU(r1)
-    _verify(
-        out,
-        n_pos=n_pos,
-        input_values={
-            "v1": torch.randn(n_pos, 4) - 0.5,
-            "v2": torch.randn(n_pos, 4) - 0.5,
-        },
-    )
 
 
 def test_compile_add_const():

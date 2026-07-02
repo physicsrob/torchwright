@@ -18,7 +18,6 @@ from torchwright.compiler.forward.scheduling_policy import SchedulingPolicy
 from torchwright.compiler.forward.weight_writer import AttnHeadOp, MLPOp
 from torchwright.graph import Node, Linear, Attn, Add, Concatenate
 from torchwright.graph.misc import LiteralValue
-from torchwright.graph.relu import ReLU
 from torchwright.graph.block import Block
 
 
@@ -87,8 +86,9 @@ class LayerScheduler:
             1. Classify ready nodes (free adds, deferred adds, compute-ready).
             2. Attention sublayer: free adds, compute ops (Attn/Linear/Add),
                cancellations of dead nodes.
-            3. MLP sublayer: Linear->ReLU->Linear chains, standalone ReLUs,
-               constants, bias writes for biased Linears.
+            3. MLP sublayer: Blocks (the L->ReLU->L composite), standalone
+               Linears via MLP bypass, constants, bias writes for biased
+               Linears.
 
         Mutates ``residual_map`` (allocate/free/reassign) and
         ``computed_nodes`` (add newly computed nodes).
@@ -154,35 +154,20 @@ class LayerScheduler:
                     free_adds.append(node)
                 else:
                     deferred_adds.append(node)
-            elif isinstance(node, (Attn, Linear, ReLU, LiteralValue, Block)):
+            elif isinstance(node, (Attn, Linear, LiteralValue, Block)):
                 ready.add(node)
             # else: skip unschedulable source nodes (InputNode, Embedding, etc.)
 
         dead = self._find_dead_nodes(residual_map, computed_nodes)
-        chains = self._detect_chains(ready)
-        claimed_relus = {relu for _, relu, _, _, _ in chains}
 
-        # Remove chain-internal nodes from ready so they're not double-scheduled.
-        # L1 with fanout stays in ready for standalone attention scheduling.
-        for l1, relu, l2, d_hidden, exclusive in chains:
-            ready.discard(l2)
-            ready.discard(relu)
-            if exclusive:
-                ready.discard(l1)
-
-        had_schedulable = (
-            bool(ready) or bool(free_adds) or bool(deferred_adds) or bool(chains)
-        )
-
-        # Collect nodes that pending MLP chains will read directly from
-        # the residual stream.  The chain's l1 is simulated inside
-        # linear1 using its input's cols, so eager-freeing in the attn
-        # sublayer must not cancel those inputs.
-        chain_protected: Set[Node] = set()
-        for l1, _relu, _l2, _d_hidden, _exclusive in chains:
-            chain_protected.add(l1.inputs[0])
+        had_schedulable = bool(ready) or bool(free_adds) or bool(deferred_adds)
 
         # --- 2. Attention sublayer ---
+        # A Block reads its input's residual columns inline in linear1, but the
+        # Block is a normal ready node and an uncomputed consumer of that input
+        # until it is scheduled in the MLP sublayer, so the input is never
+        # "freshly dead" during the attention sublayer and needs no special
+        # protection (the analogue of the chain's old ``chain_protected`` set).
         (
             attn_ops,
             biased_linears,
@@ -198,7 +183,6 @@ class LayerScheduler:
             deferred_adds,
             residual_map,
             computed_nodes,
-            chain_protected,
         )
 
         # --- 2.5. Re-check readiness after attention ---
@@ -212,16 +196,8 @@ class LayerScheduler:
                 d1 = self._is_dead_for_add(a1, node, computed_nodes)
                 if not (d0 or d1):
                     continue  # deferred add, skip
-            if isinstance(node, (Linear, ReLU, LiteralValue, Block)):
+            if isinstance(node, (Linear, LiteralValue, Block)):
                 ready.add(node)
-
-        new_chains = self._detect_chains(ready, claimed_relus)
-        for l1, relu, l2, d_hidden, exclusive in new_chains:
-            ready.discard(l2)
-            ready.discard(relu)
-            if exclusive:
-                ready.discard(l1)
-        chains.extend(new_chains)
 
         # Newly-ready MLP-routed Linears: extend bypass_linears so the
         # MLP sublayer picks them up this layer.  bypass_linears was
@@ -235,9 +211,6 @@ class LayerScheduler:
         for node in ready:
             if not isinstance(node, Linear) or node in bypass_set:
                 continue
-            inp = node.inputs[0]
-            if isinstance(inp, ReLU) and inp not in computed_nodes:
-                continue  # chain candidate, handled in MLP sublayer 3a
             if not self._route_linear_to_attn(node):
                 bypass_linears.append(node)
                 bypass_set.add(node)
@@ -249,7 +222,6 @@ class LayerScheduler:
         mlp_ops, cancel_cols, cancel_cols_set, cancel_heads, heads_used = (
             self._schedule_mlp_sublayer(
                 ready,
-                chains,
                 bypass_linears,
                 biased_linears,
                 residual_map,
@@ -284,7 +256,6 @@ class LayerScheduler:
         deferred_adds,
         residual_map,
         computed_nodes,
-        chain_protected=frozenset(),
     ):
         attn_ops = []
         biased_linears = []
@@ -381,14 +352,6 @@ class LayerScheduler:
                 n_heads = (node.d_v + self.d_head - 1) // self.d_head
                 compute_candidates.append(("compute_attn", node, n_heads))
             elif isinstance(node, Linear):
-                inp = node.inputs[0]
-                # Skip Linears whose ReLU input isn't yet computed — these will
-                # be scheduled as L->R->L chains in the MLP sublayer.  But if
-                # the ReLU IS computed (e.g., L1 was scheduled earlier due to
-                # fanout, then ReLU scheduled standalone), we can schedule L2
-                # as a standalone Linear reading from the ReLU's residual slot.
-                if isinstance(inp, ReLU) and inp not in computed_nodes:
-                    continue
                 if not self._route_linear_to_attn(node):
                     bypass_linears.append(node)
                     continue
@@ -521,12 +484,6 @@ class LayerScheduler:
             for fresh in self._freshly_dead_inputs(node, computed_nodes, residual_map):
                 if fresh in add_into_live_addends or fresh in already_pending:
                     continue
-                # Pending MLP chains simulate their l1 inside linear1
-                # using the chain-input's residual cols.  Don't cancel
-                # those inputs mid-layer even if the graph-level
-                # consumer was just placed.
-                if fresh in chain_protected:
-                    continue
                 cancel_candidates.append(fresh)
                 already_pending.add(fresh)
             cancel_candidates.sort(key=lambda n: -len(n))
@@ -569,7 +526,6 @@ class LayerScheduler:
     def _schedule_mlp_sublayer(
         self,
         ready,
-        chains,
         bypass_linears,
         biased_linears,
         residual_map,
@@ -615,81 +571,18 @@ class LayerScheduler:
             additions, delta = result
             return True, additions, delta
 
-        # 3a. L->R->L chains
+        # Residual-pressure flag shared by the Block and bypass-Linear passes:
+        # under pressure they sort by net column cost (free columns first) to
+        # relieve the residual stream; otherwise by critical path.
         under_pressure = residual_map.get_free_count() < self.d * (
             1.0 - self.policy.pressure_threshold
         )
-        if under_pressure:
-            chains.sort(
-                key=lambda c: (
-                    self._chain_net_column_cost(c, computed_nodes, residual_map),
-                    -self.graph.get_critical_path_length(c[2]),
-                )
-            )
-        else:
-            chains.sort(key=lambda c: -self.graph.get_critical_path_length(c[2]))
-        # NOTE: ``d_hidden`` here is the per-chain hidden width (``len(relu)``).
-        # ``self.d_hidden`` is the layer-wide MLP hidden pool size.  Same name,
-        # different scopes — chains are packed into the layer pool.
-        for l1, relu, l2, d_hidden, exclusive in chains:
-            if next_slot + d_hidden > self.d_hidden:
-                continue
-            if not self._is_admissible(l2):
-                self._admission_deferred = True
-                continue
-            target_cols = self._try_allocate(l2, residual_map)
-            if target_cols is None:
-                continue
-            ok, additions, delta = fits_cancel(target_cols)
-            if not ok:
-                residual_map.free(l2)
-                continue
-            mlp_slots = list(range(next_slot, next_slot + d_hidden))
-            next_slot += d_hidden
-            self._require_live(
-                l1.inputs[0],
-                residual_map,
-                f"compute_relu (L1 input) for {l2!r}",
-            )
-            input_cols = residual_map.resolve_indices(l1.inputs[0])
-            mlp_ops.append(
-                MLPOp(
-                    "compute_relu",
-                    l2,
-                    target_cols,
-                    mlp_slots,
-                    source_cols=input_cols,
-                )
-            )
-            commit_cancel(additions, delta)
-            dirty = residual_map.dirty_subset(target_cols)
-            if dirty:
-                residual_map.mark_clean(dirty)
-            # The chain composite emits the chain output (L2) and L1's
-            # value lives in MLP hidden slots inline.  For exclusive
-            # chains, L1 has no residual realization (no consumers
-            # besides R), so marking L1 computed here is correct.  For
-            # non-exclusive chains, L1's standalone realization
-            # (writing L1's value to its own residual cols for the
-            # non-chain consumers) is the bypass loop's job — leave
-            # L1 out of computed_nodes so the bypass loop processes
-            # it as a regular Linear, allocating cols and emitting
-            # compute_linear_bypass(L1) in this same MLP sublayer.
-            computed_nodes.add(relu)
-            computed_nodes.add(l2)
-            self._mark_scheduled(relu)
-            self._mark_scheduled(l2)
-            if exclusive:
-                computed_nodes.add(l1)
-                self._mark_scheduled(l1)
 
-        # 3a½. Declared Blocks (blockify's first-class L->R->L composites).
-        # A Block is the chain step above with the structure named instead of
-        # mined: it allocates its d_output residual cols, claims n_lanes hidden
-        # slots, and reads its input's residual cols inline in linear1.  No
-        # exclusivity/split branches — a Block is always realized whole
-        # (Gate A), and blockify already asserted its input projection is
-        # exclusive.
+        # 3a. Blocks (the first-class L->ReLU->L MLP composite).
+        # A Block allocates its d_output residual cols, claims n_lanes hidden
+        # slots, and reads its input's residual cols inline in linear1.  It is
+        # always realized whole (Gate A); its input projection is exclusive by
+        # construction (the gate rows are the Block's own weights).
         blocks = [n for n in ready if isinstance(n, Block)]
         if under_pressure:
             blocks.sort(
@@ -739,59 +632,7 @@ class LayerScheduler:
             ready.discard(block)
             self._mark_scheduled(block)
 
-        # 3b. Standalone ReLU (not part of chain)
-        standalone_relus = sorted(
-            [n for n in ready if isinstance(n, ReLU)],
-            key=(
-                (
-                    lambda n: (
-                        self._net_column_cost(n, computed_nodes, residual_map),
-                        self._critical_path_key(n),
-                    )
-                )
-                if under_pressure
-                else self._critical_path_key
-            ),
-        )
-        for node in standalone_relus:
-            d_relu = len(node)
-            if next_slot + d_relu > self.d_hidden:
-                continue
-            if not self._is_admissible(node):
-                self._admission_deferred = True
-                continue
-            target_cols = self._try_allocate(node, residual_map)
-            if target_cols is None:
-                continue
-            ok, additions, delta = fits_cancel(target_cols)
-            if not ok:
-                residual_map.free(node)
-                continue
-            mlp_slots = list(range(next_slot, next_slot + d_relu))
-            next_slot += d_relu
-            self._require_live(
-                node.inputs[0],
-                residual_map,
-                f"compute_standalone_relu input for {node!r}",
-            )
-            input_cols = residual_map.resolve_indices(node.inputs[0])
-            mlp_ops.append(
-                MLPOp(
-                    "compute_standalone_relu",
-                    node,
-                    target_cols,
-                    mlp_slots,
-                    source_cols=input_cols,
-                )
-            )
-            commit_cancel(additions, delta)
-            dirty = residual_map.dirty_subset(target_cols)
-            if dirty:
-                residual_map.mark_clean(dirty)
-            computed_nodes.add(node)
-            self._mark_scheduled(node)
-
-        # 3b½. Standalone Linears via MLP bypass (ReLU bypass trick).
+        # 3b. Standalone Linears via MLP bypass (ReLU bypass trick).
         # These were skipped in the attention phase because the policy
         # routes them to MLP.  Each output column needs 2 MLP slots.
         if bypass_linears:
@@ -895,64 +736,6 @@ class LayerScheduler:
         return mlp_ops, cancel_cols, cancel_cols_set, cancel_heads, heads_used
 
     # ------------------------------------------------------------------
-    # Chain detection
-    # ------------------------------------------------------------------
-
-    def _detect_chains(self, ready, exclude_relus=None):
-        """Detect L1->ReLU->L2 chains by walking forward from ready Linears.
-
-        Returns list of (l1, relu, l2, d_hidden, exclusive).
-        exclusive means L1 has no effective consumers other than the ReLU.
-
-        Each ReLU and each Linear participates in at most one chain.
-        Linear de-dup matters when ``fuse_consecutive_linears`` has
-        rewired a Linear's input to point at an upstream ReLU — the
-        same Linear can then satisfy both the L2 condition for one
-        chain and the L1 condition for a downstream chain.  Without
-        de-dup the two chains would share that Linear; the heuristic
-        per-layer pruning (``ready.discard(l2)`` after scheduling)
-        usually rescues this, but the static CP-SAT counterpart
-        (``_detect_chains_static``) has no such pruning, so both
-        sides apply the same exclusion for parity.
-        """
-        chains = []
-        seen_relus = set() if exclude_relus is None else set(exclude_relus)
-        seen_linears: Set[Node] = set()
-
-        for node in ready:
-            if not isinstance(node, Linear):
-                continue
-            l1 = node
-            if l1 in seen_linears:
-                continue
-
-            for consumer in self.graph.get_consumers(l1):
-                if not isinstance(consumer, ReLU) or consumer in seen_relus:
-                    continue
-                relu = consumer
-
-                # ReLU must have exactly one effective consumer that's a Linear
-                relu_eff = self._get_effective_consumers(relu)
-                l2_candidates = [c for c in relu_eff if isinstance(c, Linear)]
-                if len(relu_eff) != 1 or len(l2_candidates) != 1:
-                    continue
-                l2 = l2_candidates[0]
-                if l2.inputs[0] is not relu:
-                    continue
-                if l2 in seen_linears:
-                    continue
-
-                l1_eff = self._get_effective_consumers(l1)
-                exclusive = l1_eff == {relu}
-                chains.append((l1, relu, l2, len(relu), exclusive))
-                seen_relus.add(relu)
-                seen_linears.add(l1)
-                seen_linears.add(l2)
-                break  # one chain per L1
-
-        return chains
-
-    # ------------------------------------------------------------------
     # Helpers
     # ------------------------------------------------------------------
 
@@ -976,37 +759,6 @@ class LayerScheduler:
                 remaining = (
                     self._get_effective_consumers(leaf) - computed_nodes - {node}
                 )
-                if not remaining:
-                    cost -= len(leaf)
-        return cost
-
-    def _chain_net_column_cost(
-        self,
-        chain: tuple,
-        computed_nodes: Set[Node],
-        residual_map: ResidualStreamMap,
-    ) -> int:
-        """Net column cost of an L1->ReLU->L2 chain.
-
-        Only L2 is allocated in the residual stream (L1/ReLU use MLP slots).
-        Non-exclusive L1 is also allocated separately.
-        """
-        l1, relu, l2, d_hidden, exclusive = chain
-        cost = len(l2)
-        if not exclusive and not residual_map.is_allocated(l1):
-            cost += len(l1)
-
-        hypothetical = computed_nodes | {l1, relu, l2}
-        for inp in l1.inputs:
-            leaves = (
-                flatten_concat_nodes([inp]) if isinstance(inp, Concatenate) else [inp]
-            )
-            for leaf in leaves:
-                if leaf is self.pos_encoding:
-                    continue
-                if not residual_map.is_allocated(leaf):
-                    continue
-                remaining = self._get_effective_consumers(leaf) - hypothetical
                 if not remaining:
                     cost -= len(leaf)
         return cost

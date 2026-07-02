@@ -16,7 +16,7 @@ import torch
 
 from torchwright.compiler.forward.compile import forward_compile
 from torchwright.compiler.forward.cpsat_scheduler import Costs
-from torchwright.graph import Add, Linear, ReLU
+from torchwright.graph import Add, Linear
 from torchwright.ops.arithmetic_ops import (
     add,
     add_scaled_nodes,
@@ -24,30 +24,46 @@ from torchwright.ops.arithmetic_ops import (
     sum_nodes,
 )
 from torchwright.ops.inout_nodes import create_input, create_literal_value
+from torchwright.ops.linear_relu_linear import linear_relu_linear
 
 D = 256
 D_HEAD = 16
 
 
 def _build_relu_chain():
-    """Input -> Linear -> ReLU -> Linear graph."""
+    """Input -> Block (a degenerate-ReLU MLP block) graph."""
     x = create_input("x", 8)
-    l1 = Linear(x, torch.randn(8, 16), torch.randn(16), name="l1")
-    r = ReLU(l1)
-    l2 = Linear(r, torch.randn(16, 4), torch.randn(4), name="l2")
-    return l2, {"x": torch.randn(3, 8)}
+    block = linear_relu_linear(
+        x,
+        torch.randn(16, 8),
+        torch.randn(16),
+        torch.randn(16, 4),
+        torch.randn(4),
+        name="mlp",
+    )
+    return block, {"x": torch.randn(3, 8)}
 
 
 def _build_branchy():
-    """A non-trivial graph: input -> two parallel chains -> add."""
+    """A non-trivial graph: input -> two parallel Blocks -> add."""
     x = create_input("x", 8)
-    a_l1 = Linear(x, torch.randn(8, 16), torch.zeros(16), name="a_l1")
-    a_r = ReLU(a_l1)
-    a_l2 = Linear(a_r, torch.randn(16, 8), torch.zeros(8), name="a_l2")
-    b_l1 = Linear(x, torch.randn(8, 16), torch.zeros(16), name="b_l1")
-    b_r = ReLU(b_l1)
-    b_l2 = Linear(b_r, torch.randn(16, 8), torch.zeros(8), name="b_l2")
-    out = add(a_l2, b_l2)
+    a = linear_relu_linear(
+        x,
+        torch.randn(16, 8),
+        torch.zeros(16),
+        torch.randn(16, 8),
+        torch.zeros(8),
+        name="a",
+    )
+    b = linear_relu_linear(
+        x,
+        torch.randn(16, 8),
+        torch.zeros(16),
+        torch.randn(16, 8),
+        torch.zeros(8),
+        name="b",
+    )
+    out = add(a, b)
     return out, {"x": torch.randn(2, 8)}
 
 
@@ -262,52 +278,6 @@ def test_cpsat_warm_start_layer_count_no_worse():
         optimize=1,
     )
     assert len(net_cpsat.layers) <= len(net_heur.layers)
-
-
-def test_cpsat_compiles_fanout_chain():
-    """Non-exclusive chain L1 — L1 also feeds another consumer.
-
-    Mirrors ``test_relu_chain_broken_by_fanout`` from
-    ``test_scheduler.py``.  The chain composite emits L1 inline
-    inside ``linear1``; the standalone realization of L1 (writing
-    L1's value to its own residual cols for the non-chain consumer)
-    is emitted by the bypass loop in the same MLP sublayer.  The
-    P1 CP-SAT model fix accounts for both realizations' resource
-    cost.
-
-    Exercises the default (``local_in_attention="never"``) policy
-    so L1 routes through MLP-bypass — the path that previously
-    silently produced wrong values because the chain block marked
-    L1 ``computed`` before the bypass loop could emit
-    ``compute_linear_bypass`` for it.
-    """
-    x = create_input("x", 8)
-    l1 = Linear(x, torch.randn(8, 16), torch.zeros(16), name="l1")
-    r = ReLU(l1)
-    l2 = Linear(r, torch.randn(16, 4), torch.zeros(4), name="l2")
-    other = Linear(l1, torch.randn(16, 4), torch.zeros(4), name="other")
-    out = sum_nodes([l2, other])
-    inputs = {"x": torch.randn(2, 8)}
-
-    net_heur = forward_compile(
-        d=D,
-        d_head=D_HEAD,
-        output_node=out,
-        verbose=False,
-        optimize=0,
-    )
-    net_cpsat = forward_compile(
-        d=D,
-        d_head=D_HEAD,
-        output_node=out,
-        verbose=False,
-        optimize=1,
-    )
-    out_heur = net_heur.compute(2, inputs)[out].cpu()
-    out_cpsat = net_cpsat.compute(2, inputs)[out].cpu()
-    expected = out.compute(2, inputs)
-    torch.testing.assert_close(out_cpsat, expected, atol=1e-4, rtol=1e-4)
-    torch.testing.assert_close(out_heur, expected, atol=1e-4, rtol=1e-4)
 
 
 def test_cpsat_compiles_shared_input_adds():

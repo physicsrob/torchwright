@@ -2,9 +2,8 @@
 (2026-06): domain tightening, solver parameter overrides, incumbent trace
 capture, and lexicographic secondary objectives.
 
-All tests run on the small post-fusion repro graph from
-``test_cpsat_chain_overlap`` — known OPTIMAL at 3 layers — so each solve
-is sub-second.
+All tests run on a small two-Block repro graph — a handful of nodes, so
+each solve is sub-second.
 """
 
 import pytest
@@ -19,22 +18,35 @@ from torchwright.compiler.forward.cpsat_scheduler import (
 from torchwright.compiler.forward.scheduling_policy import SchedulingPolicy
 from torchwright.graph import Linear
 from torchwright.graph.optimize import fuse_consecutive_linears
-from torchwright.graph.relu import ReLU
 from torchwright.ops.inout_nodes import create_input
+from torchwright.ops.linear_relu_linear import linear_relu_linear
 
 
 def _repro_graph():
-    """x -> L_pre -> R -> fused(L_a,L_b) -> R' -> L_c (post-fusion)."""
+    """x -> Block -> L_mid -> Block -> L_out (a small serial block graph,
+    lightly fused)."""
     torch.manual_seed(0)
     x = create_input("x", 8)
-    L_pre = Linear(x, torch.randn(8, 16), torch.zeros(16), name="L_pre")
-    R = ReLU(L_pre, name="R")
-    L_a = Linear(R, torch.randn(16, 12), torch.zeros(12), name="L_a")
-    L_b = Linear(L_a, torch.randn(12, 16), torch.zeros(16), name="L_b")
-    R_prime = ReLU(L_b, name="R_prime")
-    L_c = Linear(R_prime, torch.randn(16, 4), torch.zeros(4), name="L_c")
-    fuse_consecutive_linears({L_c})
-    return L_c
+    block_a = linear_relu_linear(
+        x,
+        torch.randn(16, 8),
+        torch.zeros(16),
+        torch.randn(16, 12),
+        torch.zeros(12),
+        name="a",
+    )
+    L_mid = Linear(block_a, torch.randn(12, 16), torch.zeros(16), name="L_mid")
+    block_c = linear_relu_linear(
+        L_mid,
+        torch.randn(16, 16),
+        torch.zeros(16),
+        torch.randn(16, 8),
+        torch.zeros(8),
+        name="c",
+    )
+    L_out = Linear(block_c, torch.randn(8, 4), torch.zeros(4), name="L_out")
+    fuse_consecutive_linears({L_out})
+    return L_out
 
 
 _SOLVE_KW = dict(d=64, d_head=8, d_hidden=128, time_budget_s=10.0, max_layers=20)

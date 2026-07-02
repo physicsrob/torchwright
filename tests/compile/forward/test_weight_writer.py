@@ -26,7 +26,8 @@ from torchwright.compiler.forward.weight_writer import (
     write_mlp_sublayer,
 )
 from torchwright.compiler.groups.transformer_layer import TransformerLayer
-from torchwright.graph import Linear, ReLU, Attn, Add, Concatenate
+from torchwright.graph import Linear, Attn, Add, Concatenate
+from torchwright.ops.linear_relu_linear import linear_relu_linear
 from torchwright.graph.misc import InputNode, LiteralValue
 
 D = 64
@@ -124,20 +125,15 @@ def _make_mlp_op(
     """Construct an MLPOp with source_cols captured from ``rmap``."""
     if mlp_slots is None:
         mlp_slots = []
-    if op_type == "compute_relu":
-        # node is L2; L1's input is the actual source
-        l2 = node
-        l1 = l2.inputs[0].inputs[0]
-        kwargs.setdefault("source_cols", rmap.resolve_indices(l1.inputs[0]))
-    elif op_type == "compute_standalone_relu":
+    if op_type == "compute_block":
+        # node is the Block; its input is the actual source
         kwargs.setdefault("source_cols", rmap.resolve_indices(node.inputs[0]))
     elif op_type == "compute_linear_bypass":
         kwargs.setdefault("source_cols", rmap.resolve_indices(node.inputs[0]))
     return MLPOp(
         op_type=cast(
             Literal[
-                "compute_relu",
-                "compute_standalone_relu",
+                "compute_block",
                 "compute_literal_value",
                 "compute_bias",
                 "compute_linear_bypass",
@@ -694,29 +690,30 @@ def test_compute_add_wide():
 
 
 # ---------------------------------------------------------------------------
-# MLP — compute_relu
+# MLP — compute_block
 # ---------------------------------------------------------------------------
 
 
-def test_mlp_relu_chain():
-    """Linear -> ReLU -> Linear chain compiled via MLP."""
+def test_mlp_block():
+    """A degenerate-ReLU Block compiled via MLP."""
     x = InputNode("x", 4, value_range=(-100.0, 100.0))
-    W1 = torch.randn(4, 8)
-    b1 = torch.randn(8)
-    W2 = torch.randn(8, 3)
-    b2 = torch.randn(3)
-    l1 = Linear(x, W1, b1, name="l1")
-    r = ReLU(l1, name="r")
-    l2 = Linear(r, W2, b2, name="l2")
+    block = linear_relu_linear(
+        x,
+        torch.randn(8, 4),
+        torch.randn(8),
+        torch.randn(8, 3),
+        torch.randn(3),
+        name="block",
+    )
 
     rmap = ResidualStreamMap(D)
     x_cols = rmap.allocate(x)
-    out_cols = rmap.allocate(l2)
+    out_cols = rmap.allocate(block)
 
-    mlp_slots = list(range(0, 8))  # 8 internal MLP slots for the 8-dim intermediate
+    mlp_slots = list(range(0, 8))  # 8 hidden slots for the 8-lane block
 
     layer = TransformerLayer(D, D_HEAD)
-    op = _make_mlp_op(rmap, "compute_relu", l2, out_cols, mlp_slots=mlp_slots)
+    op = _make_mlp_op(rmap, "compute_block", block, out_cols, mlp_slots=mlp_slots)
     write_mlp_sublayer(layer, [op], rmap)
     layer.to(device_mod.get_device(verbose=False))
 
@@ -727,36 +724,45 @@ def test_mlp_relu_chain():
     out = layer.mlp.forward(res)
     result = out[:, out_cols]
 
-    expected = l2.compute(N_POS, {"x": x_values})
+    expected = block.compute(N_POS, {"x": x_values})
     assert torch.allclose(result.cpu(), expected, atol=1e-4)
 
 
-def test_mlp_relu_chain_multiple():
-    """Two L->R->L chains in same MLP, using different slot ranges."""
+def test_mlp_block_multiple():
+    """Two Blocks in the same MLP, using different slot ranges."""
     x = InputNode("x", 4, value_range=(-100.0, 100.0))
     y = InputNode("y", 3, value_range=(-100.0, 100.0))
 
-    # Chain 1: x -> l1a -> relu -> l1b
-    l1a = Linear(x, torch.randn(4, 6), torch.randn(6), name="l1a")
-    r1 = ReLU(l1a)
-    l1b = Linear(r1, torch.randn(6, 2), torch.randn(2), name="l1b")
-
-    # Chain 2: y -> l2a -> relu -> l2b
-    l2a = Linear(y, torch.randn(3, 5), torch.randn(5), name="l2a")
-    r2 = ReLU(l2a)
-    l2b = Linear(r2, torch.randn(5, 2), torch.randn(2), name="l2b")
+    block1 = linear_relu_linear(
+        x,
+        torch.randn(6, 4),
+        torch.randn(6),
+        torch.randn(6, 2),
+        torch.randn(2),
+        name="block1",
+    )
+    block2 = linear_relu_linear(
+        y,
+        torch.randn(5, 3),
+        torch.randn(5),
+        torch.randn(5, 2),
+        torch.randn(2),
+        name="block2",
+    )
 
     rmap = ResidualStreamMap(D)
     rmap.allocate(x)
     rmap.allocate(y)
-    out1_cols = rmap.allocate(l1b)
-    out2_cols = rmap.allocate(l2b)
+    out1_cols = rmap.allocate(block1)
+    out2_cols = rmap.allocate(block2)
 
     layer = TransformerLayer(D, D_HEAD)
     ops = [
-        _make_mlp_op(rmap, "compute_relu", l1b, out1_cols, mlp_slots=list(range(0, 6))),
         _make_mlp_op(
-            rmap, "compute_relu", l2b, out2_cols, mlp_slots=list(range(6, 11))
+            rmap, "compute_block", block1, out1_cols, mlp_slots=list(range(0, 6))
+        ),
+        _make_mlp_op(
+            rmap, "compute_block", block2, out2_cols, mlp_slots=list(range(6, 11))
         ),
     ]
     write_mlp_sublayer(layer, ops, rmap)
@@ -768,85 +774,10 @@ def test_mlp_relu_chain_multiple():
 
     out = layer.mlp.forward(res)
 
-    expected1 = l1b.compute(N_POS, {"x": x_values})
-    expected2 = l2b.compute(N_POS, {"y": y_values})
+    expected1 = block1.compute(N_POS, {"x": x_values})
+    expected2 = block2.compute(N_POS, {"y": y_values})
     assert torch.allclose(out[:, out1_cols].cpu(), expected1, atol=1e-4)
     assert torch.allclose(out[:, out2_cols].cpu(), expected2, atol=1e-4)
-
-
-# ---------------------------------------------------------------------------
-# MLP — compute_standalone_relu
-# ---------------------------------------------------------------------------
-
-
-def test_mlp_standalone_relu():
-    """Standalone ReLU compiled via MLP with identity linear1/linear2."""
-    x = InputNode("x", 4, value_range=(-100.0, 100.0))
-    relu_node = ReLU(x, name="standalone_relu")
-
-    rmap = ResidualStreamMap(D)
-    x_cols = rmap.allocate(x)
-    out_cols = rmap.allocate(relu_node)
-
-    mlp_slots = list(range(0, 4))  # 4 slots for 4-dim ReLU
-
-    layer = TransformerLayer(D, D_HEAD)
-    op = _make_mlp_op(
-        rmap, "compute_standalone_relu", relu_node, out_cols, mlp_slots=mlp_slots
-    )
-    write_mlp_sublayer(layer, [op], rmap)
-    layer.to(device_mod.get_device(verbose=False))
-
-    # Input with mix of positive and negative values to exercise ReLU
-    x_values = torch.tensor(
-        [
-            [1.0, -2.0, 3.0, -4.0],
-            [-1.0, 2.0, -3.0, 4.0],
-            [0.5, -0.5, 0.0, 1.0],
-            [-0.1, 0.1, -0.2, 0.2],
-        ]
-    )
-    res = _build_residual_stream(rmap, {x: x_values})
-
-    out = layer.mlp.forward(res)
-    result = out[:, out_cols]
-
-    expected = relu_node.compute(N_POS, {"x": x_values})
-    assert torch.allclose(result.cpu(), expected, atol=1e-4)
-
-
-def test_mlp_standalone_relu_preserves_input():
-    """Standalone ReLU doesn't corrupt the input node's columns."""
-    x = InputNode("x", 4, value_range=(-100.0, 100.0))
-    relu_node = ReLU(x, name="standalone_relu")
-
-    rmap = ResidualStreamMap(D)
-    x_cols = rmap.allocate(x)
-    out_cols = rmap.allocate(relu_node)
-
-    mlp_slots = list(range(0, 4))
-
-    layer = TransformerLayer(D, D_HEAD)
-    op = _make_mlp_op(
-        rmap, "compute_standalone_relu", relu_node, out_cols, mlp_slots=mlp_slots
-    )
-    write_mlp_sublayer(layer, [op], rmap)
-    layer.to(device_mod.get_device(verbose=False))
-
-    x_values = torch.tensor(
-        [
-            [1.0, -2.0, 3.0, -4.0],
-            [-1.0, 2.0, -3.0, 4.0],
-            [0.5, -0.5, 0.0, 1.0],
-            [-0.1, 0.1, -0.2, 0.2],
-        ]
-    )
-    res = _build_residual_stream(rmap, {x: x_values})
-
-    out = layer.mlp.forward(res)
-
-    # Input columns should be preserved by the skip connection
-    assert torch.allclose(out[:, x_cols].cpu(), x_values, atol=1e-4)
 
 
 # ---------------------------------------------------------------------------

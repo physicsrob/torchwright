@@ -26,9 +26,8 @@ For each candidate join node J (currently: ``Concatenate`` with
     3. Prune nodes whose direct consumers escape the exclusive set
        (i.e., have any consumer outside ``exclusive ∪ {J}``,
        modulo ``Concatenate`` transparency).
-    4. Skip MLP-chain-internal ReLU nodes when computing peak width —
-       their hidden slots are MLP-sublayer scratch, not residual
-       columns.
+    4. Peak width = the max ``len(n)`` over the surviving branch nodes
+       (a Block's output occupies residual columns like any node).
     5. Accept the cluster iff ≥ ``min_chains`` branches survive and
        the maximum branch peak-width ≥ ``min_peak_width``.
 
@@ -50,9 +49,8 @@ from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Set, Tuple
 
 from torchwright.compiler.forward.graph_analysis import GraphAnalyzer
-from torchwright.graph import Concatenate, Linear, Node
+from torchwright.graph import Concatenate, Node
 from torchwright.graph.misc import LiteralValue
-from torchwright.graph.relu import ReLU
 
 
 @dataclass
@@ -194,8 +192,11 @@ class SiblingClusterAnalyzer:
             if not exclusive:
                 continue
 
-            # Step 4: compute peak width, skipping MLP-chain-internal ReLUs.
-            widths = [len(n) for n in exclusive if not self._is_chain_internal_relu(n)]
+            # Step 4: compute peak residual width.  A Block's output occupies
+            # residual columns like any node (its internal ReLU activations
+            # live in MLP hidden slots, but that is not a graph node here), so
+            # every exclusive node contributes its width.
+            widths = [len(n) for n in exclusive]
             if not widths:
                 continue
             peak = max(widths)
@@ -304,24 +305,6 @@ class SiblingClusterAnalyzer:
                 break
             exclusive -= to_remove
         return exclusive
-
-    def _is_chain_internal_relu(self, node: Node) -> bool:
-        """True if ``node`` is a ReLU that will be absorbed into an MLP chain.
-
-        Mirrors the scheduler's :meth:`LayerScheduler._detect_chains`
-        acceptance criteria so widths are computed consistently.
-        """
-        if not isinstance(node, ReLU):
-            return False
-        if not node.inputs or not isinstance(node.inputs[0], Linear):
-            return False
-        effective = self._effective_consumers(node)
-        if len(effective) != 1:
-            return False
-        (cons,) = effective
-        if not isinstance(cons, Linear):
-            return False
-        return cons.inputs[0] is node
 
     def _effective_consumers(self, node: Node) -> Set[Node]:
         """Consumers of ``node``, walking through ``Concatenate``."""

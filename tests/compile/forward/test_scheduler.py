@@ -25,8 +25,9 @@ from torchwright.compiler.forward.scheduling_policy import (
     SchedulingPolicy,
 )
 from torchwright.compiler.forward.weight_writer import AttnHeadOp, MLPOp
-from torchwright.graph import Linear, ReLU, Attn, Add, Concatenate
+from torchwright.graph import Linear, Attn, Add, Concatenate
 from torchwright.graph.misc import InputNode, LiteralValue
+from torchwright.ops.linear_relu_linear import linear_relu_linear
 
 D = 64
 D_HEAD = 16
@@ -66,14 +67,17 @@ def _make_biased_linear(inp, d_out, name=""):
     return Linear(inp, torch.randn(len(inp), d_out), torch.randn(d_out), name=name)
 
 
-def _make_relu_chain(inp, d_hidden, d_out, name=""):
-    """L1 -> ReLU -> L2 chain. Returns (l2, relu, l1)."""
-    l1 = Linear(
-        inp, torch.randn(len(inp), d_hidden), torch.randn(d_hidden), name=f"{name}_l1"
+def _make_block(inp, d_hidden, d_out, name=""):
+    """A degenerate-ReLU Block (the former L1 -> ReLU -> L2 chain, now one
+    node).  Returns the Block."""
+    return linear_relu_linear(
+        inp,
+        torch.randn(d_hidden, len(inp)),
+        torch.randn(d_hidden),
+        torch.randn(d_hidden, d_out),
+        torch.randn(d_out),
+        name=name,
     )
-    r = ReLU(l1, name=f"{name}_r")
-    l2 = Linear(r, torch.randn(d_hidden, d_out), torch.randn(d_out), name=f"{name}_l2")
-    return l2, r, l1
 
 
 # ---------------------------------------------------------------------------
@@ -102,13 +106,13 @@ def test_schedule_attn_node():
     assert attn_node in computed
 
 
-def test_schedule_relu_chain():
-    """L->R->L chain produces MLPOp('compute_relu'); all 3 nodes marked computed."""
+def test_schedule_block():
+    """A Block produces MLPOp('compute_block'); the Block is marked computed."""
     pos = _make_reserved_block()
     x = InputNode("x", 4, value_range=(-100.0, 100.0))
-    l2, r, l1 = _make_relu_chain(x, 8, 3, "chain")
+    block = _make_block(x, 8, 3, "chain")
 
-    graph = GraphAnalyzer(l2)
+    graph = GraphAnalyzer(block)
     rmap = ResidualStreamMap(D)
     rmap.allocate(pos)
     rmap.allocate(x)
@@ -117,14 +121,12 @@ def test_schedule_relu_chain():
     scheduler = LayerScheduler(graph, D, D_HEAD, pos)
     attn_ops, mlp_ops, _biased = scheduler.schedule_layer(rmap, computed)
 
-    relu_ops = [op for op in mlp_ops if op.op_type == "compute_relu"]
-    assert len(relu_ops) == 1
-    assert relu_ops[0].node is l2
-    assert len(relu_ops[0].mlp_slots) == 8  # intermediate dim
+    block_ops = [op for op in mlp_ops if op.op_type == "compute_block"]
+    assert len(block_ops) == 1
+    assert block_ops[0].node is block
+    assert len(block_ops[0].mlp_slots) == 8  # hidden width (n_lanes)
 
-    assert l1 in computed
-    assert r in computed
-    assert l2 in computed
+    assert block in computed
 
 
 def test_schedule_constant():
@@ -273,11 +275,11 @@ def test_schedule_cancellation():
     pos = _make_reserved_block()
     x = InputNode("x", 4, value_range=(-100.0, 100.0))
     a = _make_linear(x, 4, "a")
-    l2, r, l1 = _make_relu_chain(a, 8, 3, "out")
-    # Graph: x -> a -> l1 -> r -> l2 (output)
+    block = _make_block(a, 8, 3, "out")
+    # Graph: x -> a -> block (output)
     # After computing a: x is dead (x's only consumer is a, which is computed)
 
-    graph = GraphAnalyzer(l2)
+    graph = GraphAnalyzer(block)
     rmap = ResidualStreamMap(D)
     rmap.allocate(pos)
     rmap.allocate(x)
@@ -461,15 +463,14 @@ def test_head_budget_exhaustion():
 
 
 def test_mlp_slot_exhaustion():
-    """More L->R->L chains than MLP slots: respects slot budget."""
+    """More Blocks than MLP slots: respects slot budget."""
     pos = _make_reserved_block()
     x = InputNode("x", 4, value_range=(-100.0, 100.0))
-    # 4 chains × 20 slots each = 80 > D=64
-    chains = []
+    # 4 blocks × 20 slots each = 80 > D=64
+    blocks = []
     for i in range(4):
-        l2, _, _ = _make_relu_chain(x, 20, 2, f"chain{i}")
-        chains.append(l2)
-    out_cat = Concatenate(chains)
+        blocks.append(_make_block(x, 20, 2, f"chain{i}"))
+    out_cat = Concatenate(blocks)
     out = _make_linear(out_cat, 1, "out")
 
     graph = GraphAnalyzer(out)
@@ -482,12 +483,12 @@ def test_mlp_slot_exhaustion():
     attn_ops, mlp_ops, _biased = scheduler.schedule_layer(rmap, computed)
 
     total_slots = sum(
-        len(op.mlp_slots) for op in mlp_ops if op.op_type == "compute_relu"
+        len(op.mlp_slots) for op in mlp_ops if op.op_type == "compute_block"
     )
     assert total_slots <= D
 
-    relu_ops = [op for op in mlp_ops if op.op_type == "compute_relu"]
-    assert 0 < len(relu_ops) < 4
+    block_ops = [op for op in mlp_ops if op.op_type == "compute_block"]
+    assert 0 < len(block_ops) < 4
 
 
 # ---------------------------------------------------------------------------
@@ -508,9 +509,9 @@ def test_schedule_under_column_pressure():
     )  # fills the stream to 0 free alongside pos + x + a
     x = InputNode("x", 4, value_range=(-100.0, 100.0))
     a = _make_linear(x, 4, "a")
-    l2, r, l1 = _make_relu_chain(a, 8, 3, "out")
+    block = _make_block(a, 8, 3, "out")
 
-    graph = GraphAnalyzer(l2)
+    graph = GraphAnalyzer(block)
     rmap = ResidualStreamMap(D)
     rmap.allocate(pos)
     rmap.allocate(filler)
@@ -531,10 +532,10 @@ def test_schedule_under_column_pressure():
         x_cols <= cancel_targets
     ), f"expected x's cols {x_cols} within cancel targets {cancel_targets}"
 
-    # Relu chain should still be scheduled
-    relu_ops = [op for op in mlp_ops if op.op_type == "compute_relu"]
-    assert len(relu_ops) == 1
-    assert l2 in computed
+    # Block should still be scheduled
+    block_ops = [op for op in mlp_ops if op.op_type == "compute_block"]
+    assert len(block_ops) == 1
+    assert block in computed
 
 
 # ---------------------------------------------------------------------------
@@ -549,10 +550,10 @@ def test_multi_layer_progression():
     """
     pos = _make_reserved_block()
     x = InputNode("x", 4, value_range=(-100.0, 100.0))
-    l2a, ra, l1a = _make_relu_chain(x, 8, 4, "a")
-    l2b, rb, l1b = _make_relu_chain(l2a, 6, 3, "b")
+    block_a = _make_block(x, 8, 4, "a")
+    block_b = _make_block(block_a, 6, 3, "b")
 
-    graph = GraphAnalyzer(l2b)
+    graph = GraphAnalyzer(block_b)
     rmap = ResidualStreamMap(D)
     rmap.allocate(pos)
     rmap.allocate(x)
@@ -560,14 +561,14 @@ def test_multi_layer_progression():
 
     scheduler = LayerScheduler(graph, D, D_HEAD, pos)
 
-    # Layer 1: first chain scheduled
+    # Layer 1: first block scheduled
     scheduler.schedule_layer(rmap, computed)
-    assert l2a in computed
-    assert l2b not in computed
+    assert block_a in computed
+    assert block_b not in computed
 
-    # Layer 2: second chain scheduled (depends on first)
+    # Layer 2: second block scheduled (depends on first)
     scheduler.schedule_layer(rmap, computed)
-    assert l2b in computed
+    assert block_b in computed
 
 
 def test_deferred_add_fires_via_compute_add():
@@ -579,8 +580,8 @@ def test_deferred_add_fires_via_compute_add():
     pos = _make_reserved_block()
     a = InputNode("a", 4, value_range=(-100.0, 100.0))
     b = InputNode("b", 4, value_range=(-100.0, 100.0))
-    a_chain, _, _ = _make_relu_chain(a, 8, 2, "ac")
-    b_chain, _, _ = _make_relu_chain(b, 8, 2, "bc")
+    a_chain = _make_block(a, 8, 2, "ac")
+    b_chain = _make_block(b, 8, 2, "bc")
     add_node = Add(a, b)
     out_cat = Concatenate([add_node, a_chain, b_chain])
     out = _make_linear(out_cat, 1, "out")
@@ -615,9 +616,9 @@ def test_scheduling_with_concatenate_input():
     b = InputNode("b", 4, value_range=(-100.0, 100.0))
     c = InputNode("c", 4, value_range=(-100.0, 100.0))
     cat = Concatenate([a, b, c])
-    l2, r, l1 = _make_relu_chain(cat, 8, 3, "out")
+    block = _make_block(cat, 8, 3, "out")
 
-    graph = GraphAnalyzer(l2)
+    graph = GraphAnalyzer(block)
     rmap = ResidualStreamMap(D)
     rmap.allocate(pos)
     rmap.allocate(a)
@@ -628,15 +629,15 @@ def test_scheduling_with_concatenate_input():
     scheduler = LayerScheduler(graph, D, D_HEAD, pos)
     scheduler.schedule_layer(rmap, computed)
 
-    # Chain not ready: c is missing
-    assert l2 not in computed
+    # Block not ready: c is missing
+    assert block not in computed
 
     # Now add c to computed
     computed.add(c)
     scheduler.schedule_layer(rmap, computed)
 
-    # Chain should fire
-    assert l2 in computed
+    # Block should fire
+    assert block in computed
 
 
 # ---------------------------------------------------------------------------
@@ -645,13 +646,13 @@ def test_scheduling_with_concatenate_input():
 
 
 def test_mixed_attn_and_mlp():
-    """Both Attn node and L->R->L chain ready: both scheduled in same layer."""
+    """Both an Attn node and a Block ready: both scheduled in same layer."""
     pos = _make_reserved_block()
     v = InputNode("v", 4, value_range=(-100.0, 100.0))
     x = InputNode("x", 4, value_range=(-100.0, 100.0))
     attn_node = _make_attn(v)
-    l2, r, l1 = _make_relu_chain(x, 8, 3, "chain")
-    out_cat = Concatenate([attn_node, l2])
+    block = _make_block(x, 8, 3, "chain")
+    out_cat = Concatenate([attn_node, block])
     out = _make_linear(out_cat, 1, "out")
 
     graph = GraphAnalyzer(out)
@@ -665,220 +666,9 @@ def test_mixed_attn_and_mlp():
     attn_ops, mlp_ops, _biased = scheduler.schedule_layer(rmap, computed)
 
     assert any(op.op_type == "compute_attn" and op.node is attn_node for op in attn_ops)
-    assert any(op.op_type == "compute_relu" and op.node is l2 for op in mlp_ops)
+    assert any(op.op_type == "compute_block" and op.node is block for op in mlp_ops)
     assert attn_node in computed
-    assert l2 in computed
-
-
-# ---------------------------------------------------------------------------
-# 8. L->R->L chain edge cases and standalone ReLU
-# ---------------------------------------------------------------------------
-
-
-def test_schedule_standalone_relu():
-    """Standalone ReLU (not part of L->R->L chain) produces MLPOp('compute_standalone_relu').
-
-    This pattern occurs in cond_gate: ReLU(Add(...)) where the ReLU's consumer
-    is an Add, not a Linear — so it's not part of any chain.
-    """
-    pos = _make_reserved_block()
-    x = InputNode("x", 4, value_range=(-100.0, 100.0))
-    relu_node = ReLU(x, name="standalone")
-    # ReLU feeds into an Add, not a Linear → not part of a chain
-    other = InputNode("other", 4, value_range=(-100.0, 100.0))
-    add_node = Add(relu_node, other)
-
-    graph = GraphAnalyzer(add_node)
-    rmap = ResidualStreamMap(D)
-    rmap.allocate(pos)
-    rmap.allocate(x)
-    rmap.allocate(other)
-    computed = {pos, x, other}
-
-    scheduler = LayerScheduler(graph, D, D_HEAD, pos)
-    attn_ops, mlp_ops, _biased = scheduler.schedule_layer(rmap, computed)
-
-    relu_ops = [op for op in mlp_ops if op.op_type == "compute_standalone_relu"]
-    assert len(relu_ops) == 1
-    assert relu_ops[0].node is relu_node
-    assert len(relu_ops[0].mlp_slots) == len(relu_node)  # 4 slots for 4-dim
-    assert relu_node in computed
-
-
-def test_relu_chain_broken_by_fanout():
-    """L1 has consumers besides its ReLU — scheduler still makes progress.
-
-    The chain can't be claimed as a unit because L1 also feeds 'other'.
-    The scheduler must handle this (e.g., schedule L1 separately, use alternative
-    strategy, or compute the chain while also placing L1 in the stream).
-    """
-    pos = _make_reserved_block()
-    x = InputNode("x", 4, value_range=(-100.0, 100.0))
-    l1 = Linear(x, torch.randn(4, 8), torch.randn(8), name="l1")
-    r = ReLU(l1, name="r")
-    l2 = Linear(r, torch.randn(8, 3), torch.randn(3), name="l2")
-    # l1 also feeds another node — breaks the exclusive chain pattern
-    other = _make_linear(l1, 2, "other")
-    out_cat = Concatenate([l2, other])
-    out = _make_linear(out_cat, 1, "final")
-
-    graph = GraphAnalyzer(out)
-    rmap = ResidualStreamMap(D)
-    rmap.allocate(pos)
-    rmap.allocate(x)
-    computed = {pos, x}
-
-    # Use legacy policy so L1 goes to attention (non-exclusive chain + attention L1)
-    scheduler = LayerScheduler(graph, D, D_HEAD, pos, policy=LEGACY_POLICY)
-    before = len(computed)
-    scheduler.schedule_layer(rmap, computed)
-
-    # Must make progress — at least one new node computed
-    assert len(computed) > before
-
-
-def test_relu_chain_broken_by_fanout_bypass():
-    """Same as above but with default bypass policy — still makes progress."""
-    pos = _make_reserved_block()
-    x = InputNode("x", 4, value_range=(-100.0, 100.0))
-    l1 = Linear(x, torch.randn(4, 8), torch.randn(8), name="l1")
-    r = ReLU(l1, name="r")
-    l2 = Linear(r, torch.randn(8, 3), torch.randn(3), name="l2")
-    other = _make_linear(l1, 2, "other")
-    out_cat = Concatenate([l2, other])
-    out = _make_linear(out_cat, 1, "final")
-
-    graph = GraphAnalyzer(out)
-    rmap = ResidualStreamMap(D)
-    rmap.allocate(pos)
-    rmap.allocate(x)
-    computed = {pos, x}
-
-    scheduler = LayerScheduler(graph, D, D_HEAD, pos)
-    before = len(computed)
-    scheduler.schedule_layer(rmap, computed)
-
-    assert len(computed) > before
-
-
-def test_relu_chain_broken_by_fanout_bypass_emits_l1_standalone():
-    """Non-exclusive L1 + bypass policy: the bypass loop emits a
-    standalone ``compute_linear_bypass(L1)`` alongside the chain
-    composite's ``compute_relu(L2)``, in the same MLP sublayer.
-
-    Regression test for the smallest reproducing layer of the
-    silent value-corruption bug where the chain block marked L1 as
-    ``computed`` and pre-allocated its residual cols but emitted no
-    op that wrote a value into them — leaving consumers of L1 to
-    read uninitialized data.
-    """
-    pos = _make_reserved_block()
-    x = InputNode("x", 4, value_range=(-100.0, 100.0))
-    l1 = Linear(x, torch.randn(4, 8), torch.randn(8), name="l1")
-    r = ReLU(l1, name="r")
-    l2 = Linear(r, torch.randn(8, 3), torch.randn(3), name="l2")
-    other = _make_linear(l1, 2, "other")
-    out_cat = Concatenate([l2, other])
-    out = _make_linear(out_cat, 1, "final")
-
-    graph = GraphAnalyzer(out)
-    rmap = ResidualStreamMap(D)
-    rmap.allocate(pos)
-    rmap.allocate(x)
-    computed = {pos, x}
-
-    scheduler = LayerScheduler(graph, D, D_HEAD, pos)
-    attn_ops, mlp_ops, biased = scheduler.schedule_layer(rmap, computed)
-
-    # The chain composite must be emitted (writes L2).
-    relu_ops = [op for op in mlp_ops if op.op_type == "compute_relu"]
-    assert len(relu_ops) == 1
-    assert relu_ops[0].node is l2
-
-    # AND a separate compute_linear_bypass for L1 must be emitted in
-    # the same MLP sublayer — without it, L1's residual cols are
-    # allocated but never written and consumers read garbage.
-    bypass_ops = [
-        op for op in mlp_ops if op.op_type == "compute_linear_bypass" and op.node is l1
-    ]
-    assert len(bypass_ops) == 1, (
-        f"Expected a compute_linear_bypass(L1) op in the same MLP "
-        f"sublayer as the chain composite, but mlp_ops were: "
-        f"{[(op.op_type, getattr(op.node, 'name', op.node)) for op in mlp_ops]}. "
-        f"L1 must be written when it has consumers besides the "
-        f"chain's ReLU."
-    )
-
-    # Both the chain composite and the bypass realization should
-    # have actually completed: L1, R, and L2 in computed_nodes.
-    assert l1 in computed
-    assert r in computed
-    assert l2 in computed
-    # L1's residual cols are allocated and were just written by the
-    # bypass op.
-    assert rmap.is_allocated(l1)
-    assert bypass_ops[0].target_cols == rmap.get_indices(l1)
-
-
-def test_linear_with_computed_relu_input():
-    """Linear whose input ReLU is already computed can be scheduled standalone.
-
-    After Linear fusion or certain scheduling patterns, L1 and ReLU may be
-    computed in earlier layers while L2 is deferred. L2's input is a ReLU node
-    that's already in the residual stream, so L2 should be schedulable as a
-    standalone Linear rather than as part of a chain.
-    """
-    pos = _make_reserved_block()
-    x = InputNode("x", 4, value_range=(-100.0, 100.0))
-    l1 = Linear(x, torch.randn(4, 8), torch.randn(8), name="l1")
-    r = ReLU(l1, name="r")
-    l2 = Linear(r, torch.randn(8, 3), torch.randn(3), name="l2")
-
-    graph = GraphAnalyzer(l2)
-    rmap = ResidualStreamMap(D)
-    rmap.allocate(pos)
-    rmap.allocate(x)
-    rmap.allocate(l1)
-    rmap.allocate(r)
-    computed = {pos, x, l1, r}
-
-    # Legacy: scheduled via attention
-    scheduler = LayerScheduler(graph, D, D_HEAD, pos, policy=LEGACY_POLICY)
-    attn_ops, mlp_ops, biased = scheduler.schedule_layer(rmap, computed)
-
-    compute_linears = [op for op in attn_ops if op.op_type == "compute_linear"]
-    assert len(compute_linears) == 1
-    assert compute_linears[0].node is l2
-    assert l2 in computed
-
-
-def test_linear_with_computed_relu_input_bypass():
-    """Same scenario with default policy — scheduled via MLP bypass."""
-    pos = _make_reserved_block()
-    x = InputNode("x", 4, value_range=(-100.0, 100.0))
-    l1 = Linear(x, torch.randn(4, 8), torch.randn(8), name="l1")
-    r = ReLU(l1, name="r")
-    l2 = Linear(r, torch.randn(8, 3), torch.randn(3), name="l2")
-
-    graph = GraphAnalyzer(l2)
-    rmap = ResidualStreamMap(D)
-    rmap.allocate(pos)
-    rmap.allocate(x)
-    rmap.allocate(l1)
-    rmap.allocate(r)
-    computed = {pos, x, l1, r}
-
-    scheduler = LayerScheduler(graph, D, D_HEAD, pos)
-    attn_ops, mlp_ops, biased = scheduler.schedule_layer(rmap, computed)
-
-    bypass_ops = [op for op in mlp_ops if op.op_type == "compute_linear_bypass"]
-    assert len(bypass_ops) == 1
-    assert bypass_ops[0].node is l2
-    assert l2 in computed
-
-    # Should NOT be scheduled via compute_relu (that's for full chains)
-    relu_ops = [op for op in mlp_ops if op.op_type == "compute_relu"]
-    assert len(relu_ops) == 0
+    assert block in computed
 
 
 # ---------------------------------------------------------------------------

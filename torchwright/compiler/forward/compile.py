@@ -50,7 +50,6 @@ from torchwright.compiler.residual_assignment import flatten_concat_nodes
 from torchwright.graph import Node, Linear, Concatenate
 from torchwright.graph.node import reserve_node_id_above
 from torchwright.graph.misc import LiteralValue
-from torchwright.graph.relu import ReLU
 
 # Default constant magnitude exponent q for the pinned-RMS norm: each reserved
 # column holds 2^q.  Bit-exactness of the identity requires the data energy to
@@ -351,8 +350,8 @@ def _run_heuristic_warm_start(
             return {}, {}, {}, 0
         # Routing decisions for standalone Linears: heuristic placed
         # compute_linear in attention or compute_linear_bypass in
-        # MLP.  Chain Linears are non-flex (always MLP) so we don't
-        # hint them.
+        # MLP.  Blocks are non-flex (always the MLP composite) so we
+        # don't hint them.
         for op in attn_ops:
             if op.op_type == "compute_linear" and op.node is not None:
                 hint_routing[op.node.node_id] = "attn"
@@ -463,8 +462,7 @@ def _verify_end_of_layer_writes(
         if isinstance(node, Concatenate):
             continue
         if not residual_map.is_allocated(node):
-            # Exclusive chain L1 and chain ReLU live only in MLP hidden
-            # slots; LiteralValue may be folded into output bias without
+            # A LiteralValue may be folded into an output bias without
             # owning residual cols.  No residual write expected.
             continue
         if node in prev_allocated:

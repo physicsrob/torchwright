@@ -870,7 +870,7 @@ Two enforcement points:
 - **Schedule-time (always on):** every source-column capture in
   `LayerScheduler` — `compute_linear`, `compute_attn` Q/K/V,
   `compute_add` a0/a1, `add_into` dead/live addends,
-  `compute_relu` L1 input, `compute_standalone_relu` input —
+  `compute_block` input, `compute_linear_bypass` input —
   first calls `LayerScheduler._require_live(node, rmap, op_label)`
   which walks through `Concatenate` leaves.
 - **End-of-layer (gated behind `TW_COMPILER_VERIFY=1`):**

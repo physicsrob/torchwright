@@ -12,60 +12,14 @@ import torch
 from torchwright.compiler.forward.compile import forward_compile
 from torchwright.graph import Add, Linear
 from torchwright.graph.misc import LiteralValue
-from torchwright.graph.relu import ReLU
 from torchwright.ops.inout_nodes import create_input
 from torchwright.ops.map_select import in_range
 
 
-def test_standalone_relu_after_biased_linear():
-    """Standalone ReLU should see the biased Linear's full value (W@x + bias).
+def test_block_with_two_biased_linear_inputs():
+    """Block (in_range) whose Concatenate input has two biased Linears.
 
-    Bug: the standalone ReLU reads via mlp.linear1 before compute_bias
-    writes to mlp.linear2.output_bias, so it sees W@x without the bias.
-    """
-    x = create_input("x", 1)
-
-    # biased Linear: y = -x + 5
-    y = Linear(x, torch.tensor([[-1.0]]), torch.tensor([5.0]))
-
-    # Standalone ReLU (consumer is Add, not Linear → no chain detected)
-    z = ReLU(y)
-    offset = LiteralValue(torch.tensor([100.0]))
-    output = Add(z, offset)
-
-    net = forward_compile(
-        d=64,
-        d_head=16,
-        output_node=output,
-        verbose=False,
-    )
-
-    # x=2 → y=3 → z=ReLU(3)=3 → output=103
-    # If bias dropped: y=-2 → z=ReLU(-2)=0 → output=100
-    vals = {"x": torch.tensor([[2.0]])}
-    graph_out = output.compute(1, vals)[0]
-    compiled_out = net.compute(1, vals)[output][0]
-    assert abs(graph_out[0].item() - 103.0) < 0.5
-    assert abs(compiled_out[0].item() - 103.0) < 0.5, (
-        f"Expected 103, got {compiled_out[0].item():.1f}. "
-        f"If 100, standalone ReLU is missing the deferred bias."
-    )
-
-    # x=-3 → y=8 → z=ReLU(8)=8 → output=108
-    # If bias dropped: y=3 → z=ReLU(3)=3 → output=103
-    vals = {"x": torch.tensor([[-3.0]])}
-    graph_out = output.compute(1, vals)[0]
-    compiled_out = net.compute(1, vals)[output][0]
-    assert abs(graph_out[0].item() - 108.0) < 0.5
-    assert (
-        abs(compiled_out[0].item() - 108.0) < 0.5
-    ), f"Expected 108, got {compiled_out[0].item():.1f}."
-
-
-def test_chain_with_two_biased_linear_inputs():
-    """Chain (in_range) whose Concatenate input has two biased Linears.
-
-    Both biases must be folded into L1's intermediate bias.
+    Both biases must be folded into the Block's gate bias.
     """
     a = create_input("a", 1)
     b = create_input("b", 1)
@@ -101,11 +55,11 @@ def test_chain_with_two_biased_linear_inputs():
         ), f"Compiled mismatch at slot {i}: got {compiled_out[i].item():.1f}, expected {expected[i]}"
 
 
-def test_biased_linear_fanout_chain_and_add():
-    """Biased Linear consumed by both a chain and an Add.
+def test_biased_linear_fanout_block_and_add():
+    """Biased Linear consumed by both a Block and an Add.
 
-    Verifies that the chain fold and compute_bias coexist correctly:
-    - Chain must see the bias (via fold into L1 intermediate bias)
+    Verifies that the Block gate-bias fold and compute_bias coexist correctly:
+    - Block must see the bias (via fold into its gate bias)
     - Residual stream must have the bias (via compute_bias for the Add)
     Neither should double-apply the bias.
 

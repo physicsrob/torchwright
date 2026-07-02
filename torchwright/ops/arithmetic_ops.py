@@ -5,7 +5,6 @@ from torchwright.graph import Node, Add, Concatenate, Linear
 import torch
 
 from torchwright.graph.asserts import assert_matches_value_type
-from torchwright.graph.relu import ReLU
 from torchwright.graph.value_type import NodeValueType, Range
 from torchwright.ops.linear_relu_linear import linear_relu_linear
 
