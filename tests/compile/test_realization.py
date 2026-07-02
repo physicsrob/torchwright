@@ -195,6 +195,57 @@ def test_compile_records_resolved_table():
     assert table.resolved_class(out) == MLP_BYPASS
 
 
+def test_cost_summary_static_hand_computed():
+    """d_head=8; a,b: Linear 4->3 (bypass 2*3=6 slots each; transport
+    ceil(4/8)=1 head each); blk: 6 lanes; add width 3: reuse ceil(3/8)=1,
+    copy 2; literal: no slots."""
+    out, a, b, add, blk, lit = _test_graph()
+    lowered = lower(out)
+
+    cs = lowered.cost_summary(d_head=8)  # default policy: bypass
+    assert cs.mlp_bypass_slots == 12
+    assert cs.mlp_lanes == 6
+    assert cs.heads_by_class == {}  # nothing attention-routed
+    assert (cs.add_heads_if_all_reuse, cs.add_heads_if_all_copy) == (1, 2)
+    assert (cs.attn_heads_min, cs.attn_heads_max) == (1, 2)
+
+    cs_attn = lowered.cost_summary(d_head=8, policy=LEGACY_POLICY)
+    assert cs_attn.mlp_bypass_slots == 0
+    assert cs_attn.heads_by_class == {ATTN_TRANSPORT: 2}
+    assert (cs_attn.attn_heads_min, cs_attn.attn_heads_max) == (3, 4)
+    assert "bypass" in cs_attn.format_short()
+
+
+def test_cost_summary_requires_resolved_table():
+    out, a, b, add, blk, lit = _test_graph()
+    lowered = lower(out)
+    with pytest.raises(UnresolvedRealizationError, match="incomplete"):
+        lowered.cost_summary(d_head=8, realization_table=lowered.realization_table)
+
+
+def test_cost_summary_reconciles_with_solver_totals():
+    """Gate B3: the pre-schedule summary's totals agree with the finished
+    solve's accounting (flex pinned so routing is the static table)."""
+    from torchwright.compiler.forward.compile import forward_compile
+
+    out, a, b, add, blk, lit = _test_graph()
+    lowered = lower(out)
+    cs = lowered.cost_summary(d_head=8)
+
+    net = forward_compile(
+        d=64,
+        d_head=8,
+        output_node=out,
+        verbose=False,
+        optimize=1,
+        cpsat_flex_routing=False,
+        require_solver=True,
+    )
+    stats = net.cpsat_solve_stats
+    assert stats.total_mlp_bypass_slots == cs.mlp_bypass_slots
+    assert cs.attn_heads_min <= stats.total_attn_heads <= cs.attn_heads_max
+
+
 def test_eager_and_directed_tables_agree_when_flex_pinned():
     """With cpsat_flex_routing=False the solve uses the shared static
     routing, so the directed path's table must equal the eager path's —

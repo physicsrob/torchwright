@@ -34,9 +34,13 @@ later recompute.
 """
 
 from dataclasses import dataclass
-from typing import Dict, List, Set, Tuple
+from typing import Dict, List, Optional, Set, Tuple
 
-from torchwright.compiler.realization import RealizationTable
+from torchwright.compiler.realization import (
+    CostSummary,
+    RealizationTable,
+    summarize_cost,
+)
 from torchwright.compiler.utils import get_ancestor_nodes
 from torchwright.graph import Node
 from torchwright.graph.affine_rules import refresh_node_caches
@@ -95,6 +99,30 @@ class LoweredGraph:
 
     output_node: Node
     realization_table: RealizationTable
+
+    def cost_summary(
+        self,
+        d_head: int,
+        realization_table: Optional[RealizationTable] = None,
+        policy: Optional["SchedulingPolicy"] = None,
+    ) -> CostSummary:
+        """Hardware demand readable *before* scheduling.
+
+        Aggregates heads by class, MLP bypass slot demand, and Block lane
+        counts from a resolved realization table plus each class's
+        resource signature.  Pass the resolved table you intend to compile
+        with; by default the static policy resolves the free choices (the
+        optimize=0 rule).  ``Add`` demand is reported as its two
+        conditional bounds.
+        """
+        from torchwright.compiler.forward.scheduling_policy import SchedulingPolicy
+
+        if realization_table is None:
+            realization_table = self.realization_table.resolve_static(
+                policy if policy is not None else SchedulingPolicy()
+            )
+        nodes = get_ancestor_nodes({self.output_node})
+        return summarize_cost(nodes, realization_table, d_head)
 
 
 def _unwrap(node: Node) -> Node:

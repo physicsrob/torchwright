@@ -114,6 +114,118 @@ def static_flex_class(candidates: Tuple[str, ...], policy: SchedulingPolicy) -> 
 
 
 # ---------------------------------------------------------------------------
+# Resource signatures: hardware demand per (node, class)
+# ---------------------------------------------------------------------------
+
+
+def class_heads(node: Node, cls: str, d_head: int) -> int:
+    """Attention-head demand of realizing *node* as *cls* (0 for MLP
+    classes).  Mirrors the CP-SAT model's accounting (``heads_for``): an
+    ``attn_copy`` Add is charged 2× the per-chunk unit count — the model-
+    level approximation; the walk's emission can share one head when two
+    chunks of the same Add fit in a single ``d_head``."""
+    if cls == ATTN_HEADS:
+        return (node.d_v + d_head - 1) // d_head
+    if cls == ATTN_TRANSPORT:
+        d_in = len(node.inputs[0])
+        return (d_in + d_head - 1) // d_head
+    if cls == RESIDUAL_REUSE:
+        return (node.d_output + d_head - 1) // d_head
+    if cls == ATTN_COPY:
+        return 2 * ((node.d_output + d_head - 1) // d_head)
+    return 0
+
+
+def class_hidden_slots(node: Node, cls: str) -> int:
+    """MLP hidden-slot demand of realizing *node* as *cls* (0 for
+    attention classes; a literal's constant write costs no hidden slot)."""
+    if cls == MLP_BYPASS:
+        return 2 * node.d_output
+    if cls == MLP_COMPOSITE:
+        return node.n_lanes
+    return 0
+
+
+@dataclass(frozen=True)
+class CostSummary:
+    """Hardware demand read off a lowered graph *before* scheduling.
+
+    Aggregated from the resolved realization table plus each class's
+    resource signature.  ``Add`` entries are conditional, so their head
+    demand is reported as the two bounds (every Add realized as
+    ``residual_reuse`` vs every Add as ``attn_copy``); the schedule lands
+    in between.  These are demand totals, not a layer count — placement
+    (and the cancel heads it emits) is the scheduler's business.
+    """
+
+    nodes_by_class: Dict[str, int]
+    heads_by_class: Dict[str, int]  # resolved attention classes only
+    add_heads_if_all_reuse: int
+    add_heads_if_all_copy: int
+    mlp_bypass_slots: int
+    mlp_lanes: int
+
+    @property
+    def attn_heads_min(self) -> int:
+        return sum(self.heads_by_class.values()) + self.add_heads_if_all_reuse
+
+    @property
+    def attn_heads_max(self) -> int:
+        return sum(self.heads_by_class.values()) + self.add_heads_if_all_copy
+
+    def format_short(self) -> str:
+        by_class = ", ".join(
+            f"{cls}={n}" for cls, n in sorted(self.heads_by_class.items())
+        )
+        return (
+            f"attn heads {self.attn_heads_min}..{self.attn_heads_max} "
+            f"({by_class or 'no fixed-head classes'}, "
+            f"adds {self.add_heads_if_all_reuse}..{self.add_heads_if_all_copy}); "
+            f"mlp: {self.mlp_bypass_slots} bypass slots + {self.mlp_lanes} lanes; "
+            f"nodes {dict(sorted(self.nodes_by_class.items()))}"
+        )
+
+
+def summarize_cost(
+    nodes: Iterable[Node], table: "RealizationTable", d_head: int
+) -> CostSummary:
+    """Aggregate hardware demand over *nodes* under a resolved *table*.
+
+    Raises :class:`UnresolvedRealizationError` if the table is incomplete
+    for the schedulable nodes (resolve first; conditional Adds are fine).
+    """
+    nodes = [n for n in nodes if is_schedulable(n)]
+    table.check_complete(nodes)
+    nodes_by_class: Dict[str, int] = {}
+    heads_by_class: Dict[str, int] = {}
+    add_reuse = add_copy = bypass_slots = lanes = 0
+    for node in nodes:
+        entry = table.entries[node.node_id]
+        if entry.conditional:
+            reuse_cls, copy_cls = entry.candidates
+            add_reuse += class_heads(node, reuse_cls, d_head)
+            add_copy += class_heads(node, copy_cls, d_head)
+            key = "|".join(entry.candidates)
+            nodes_by_class[key] = nodes_by_class.get(key, 0) + 1
+            continue
+        cls = entry.resolved
+        nodes_by_class[cls] = nodes_by_class.get(cls, 0) + 1
+        h = class_heads(node, cls, d_head)
+        if h:
+            heads_by_class[cls] = heads_by_class.get(cls, 0) + h
+        bypass_slots += class_hidden_slots(node, cls) if cls == MLP_BYPASS else 0
+        lanes += class_hidden_slots(node, cls) if cls == MLP_COMPOSITE else 0
+    return CostSummary(
+        nodes_by_class=nodes_by_class,
+        heads_by_class=heads_by_class,
+        add_heads_if_all_reuse=add_reuse,
+        add_heads_if_all_copy=add_copy,
+        mlp_bypass_slots=bypass_slots,
+        mlp_lanes=lanes,
+    )
+
+
+# ---------------------------------------------------------------------------
 # The realization table
 # ---------------------------------------------------------------------------
 
