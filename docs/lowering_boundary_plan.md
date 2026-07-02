@@ -6,6 +6,63 @@ code-verified review of rev 1: it corrects what the review found, scopes the
 design to what the proposed machinery actually fits, and adds sequencing.
 Written against the codebase as of the block refactor (`block-ir-2a`).*
 
+## STATUS: B1–B3 COMPLETE (2026-07-02) — closeout record
+
+All three scheduled steps landed on `block-ir-2a` (B1 `342751e` + follow-up,
+B2 `4849873`, B3 `c23a46c`); item D remains deferred as designed.
+
+**Gates, verified:**
+- Full `make test` green (10 shards) at each step boundary.
+- Flagship schedule metrics (e1m1, hud-off, eager heuristic):
+  **(57, 781, 16384, 8192)** — byte-identical to the step-1 closeout's
+  post-refactor tuple.  10,954 nodes certified at the boundary; build
+  95.9s, schedule 17.0s.
+- No `blockify` symbol remains in either repo (one extra call site was
+  found beyond the plan's two — torchwright's own
+  `scripts/block_equivalence.py` harness, missed because the B1 sweep
+  grepped the package dir, not repo-root `scripts/`).
+- Routing decisions live only in the two resolvers (`resolve_static`;
+  the solve via `resolve_from_assignment`); `_route_linear_to_attn` and
+  the directed override are deleted.
+- `cost_summary()` reconciles with the solve's accounting on suite
+  graphs (bypass slots equal; total heads within the Add bounds); the
+  flagship demand line reads: attn heads 398..464 (attn_heads=332,
+  adds 66..132), 10,176 bypass slots, 185,256 lanes.  Note the metrics
+  tuple's 781 heads also counts schedule-emergent cancel heads — the
+  summary is compute demand, by design.
+
+**One deviation from the B1 text:** `forward_compile` keeps its
+`output_node: Node` signature (57 direct call sites in tests) and calls
+`lower()` unbypassably as step 0, ahead of `GraphAnalyzer`; the
+`LoweredGraph` handoff is internal (its table feeds the resolvers and the
+walk).  The boundary guarantee is by construction rather than by caller
+signature — every compile certifies; nothing reaches the scheduler
+uncertified.
+
+**Implementation notes for future readers:**
+- Semantic affine overrides (`_apply_semantic_override` — cond_gate,
+  compare, select) are persisted on the node and re-applied by
+  `refresh_node_caches`; a recompute that dropped them would silently
+  loosen every downstream bound.  Fusion's Block→Linear fold voids the
+  survivor's override (that fold changes the survivor's value; the other
+  two folds preserve it).
+- `LayerScheduler` constructed without a table resolves statically from
+  its policy through the same resolver code path (standalone/test
+  convenience); compile passes the table explicitly.
+- `ScheduleAssignment.node_to_routing` and its schedule-cache
+  serialization are unchanged; the table is the shared in-memory
+  artifact, resolved fresh per compile.
+
+**Remaining (cleanup/decisions, no open engineering):**
+1. torchwright_doom: `block_equivalence_flagship.py` switched to
+   `lower()` + demand line (committed on `block-ir-2a-r8`); umbrella
+   pointer bumps happen at merge time as usual.
+2. `scripts/block_equivalence.py`'s two-path comparison is vestigial —
+   since Phase 2b/3 both "paths" build the same Block-native graph.
+   Candidate deletion (keep `schedule_metrics`, drop the chain/block
+   compare); left for an explicit decision since the harness is
+   committed Gate-C tooling.
+
 ## What changed from rev 1
 
 1. **Two kinds of realization choice are now distinguished** — a *write-path
