@@ -1,8 +1,7 @@
-from torchwright.graph import Node, Linear
-
 import torch
 
-from torchwright.graph.relu import ReLU
+from torchwright.graph import Node
+from torchwright.graph.block import Block
 
 
 def linear_relu_linear(
@@ -13,22 +12,32 @@ def linear_relu_linear(
     output_bias: torch.Tensor,
     name: str = "",
 ) -> Node:
-    """Build a ``Linear -> ReLU -> Linear`` subgraph.
+    """Build a degenerate-ReLU :class:`~torchwright.graph.block.Block`.
 
-    This is the fundamental building block for piecewise-linear
-    functions in the computation graph. The compiler maps each call
-    to one MLP sublayer in the compiled transformer.
+    This is the fundamental building block for piecewise-linear functions in
+    the computation graph: an input projection, a ReLU, and an output
+    projection.  It returns a single :class:`Block` node (not the three
+    ``Linear -> ReLU -> Linear`` nodes it once built) — the ReLU and the two
+    projections are the Block's gate projection, activation, and output
+    projection.
+
+    A Block is a **packable unit**, not a sublayer: the scheduler bins many
+    blocks' lanes into one MLP sublayer's hidden pool, so several calls can
+    share one compiled MLP sublayer.  (The old "one call = one MLP sublayer"
+    description was never quite true and is easy to over-rely on.)
 
     Args:
-        input_node: Upstream node whose output feeds into the first Linear.
-        input_proj: First-layer weight matrix, shape ``(d_hidden, d_input)``.
-        input_bias: First-layer bias, shape ``(d_hidden,)``.
-        output_proj: Second-layer weight matrix, shape ``(d_hidden, d_output)``.
-        output_bias: Second-layer bias, shape ``(d_output,)``.
-        name: Label prefix for the sub-nodes (for debugging).
+        input_node: Upstream node whose output feeds the gate projection.
+        input_proj: Gate-projection weight matrix, shape ``(d_hidden, d_input)``.
+        input_bias: Gate-projection bias, shape ``(d_hidden,)``.
+        output_proj: Output-projection weight matrix, shape
+            ``(d_hidden, d_output)``.
+        output_bias: Output-projection bias, shape ``(d_output,)``.
+        name: Label for the Block (for debugging).
 
     Returns:
-        The final Linear node (output of the two-layer subgraph).
+        The :class:`Block` node computing
+        ``ReLU(x @ input_proj.T + input_bias) @ output_proj + output_bias``.
     """
     if len(input_proj.shape) == 1:
         input_proj = input_proj.unsqueeze(0)
@@ -47,7 +56,12 @@ def linear_relu_linear(
     assert output_proj.shape == (d_hidden, d_output)
     assert output_bias.shape == (d_output,)
 
-    linear1 = Linear(input_node, input_proj.t(), input_bias, name=f"{name}_linear1")
-    relu_out = ReLU(linear1, name=f"{name}_relu")
-    linear2 = Linear(relu_out, output_proj, output_bias, name=f"{name}_linear2")
-    return linear2
+    return Block(
+        input_node,
+        gate_proj=input_proj,
+        gate_bias=input_bias,
+        out_proj=output_proj,
+        out_bias=output_bias,
+        activation="relu",
+        name=name,
+    )

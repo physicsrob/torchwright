@@ -1,10 +1,10 @@
-"""ONNX debug-surface parity for a blockified graph.
+"""ONNX debug-surface parity for a graph with Block nodes.
 
-Confirms the new :class:`~torchwright.graph.block.Block` node type round-trips
-the debug sidecar / canonical-id remap / rebuild fingerprint: a blockified
-token graph exported with :func:`compile_to_onnx`, then reopened as an
-:class:`OnnxDebugSession` over a *freshly rebuilt* (and re-blockified) graph,
-gives a clean ``probe_compiled`` verdict and a passing ``debug=True`` step.
+Confirms the :class:`~torchwright.graph.block.Block` node type round-trips the
+debug sidecar / canonical-id remap / rebuild fingerprint: a token graph built
+natively with Blocks, exported with :func:`compile_to_onnx`, then reopened as an
+:class:`OnnxDebugSession` over a *freshly rebuilt* graph, gives a clean
+``probe_compiled`` verdict and a passing ``debug=True`` step.
 """
 
 import pytest
@@ -49,20 +49,16 @@ def _token_ids(emb) -> torch.Tensor:
     )
 
 
-def test_onnx_debug_session_roundtrips_blockified_graph(tmp_path):
-    from torchwright.graph.blockify import blockify
-
+def test_onnx_debug_session_roundtrips_block_graph(tmp_path):
     onnx_path = str(tmp_path / "blk.onnx")
-    out, emb = _build()
-    out_block = blockify(out)
+    out_block, emb = _build()
     assert isinstance(out_block, Block)
     compile_to_onnx(
         out_block, emb, onnx_path, d=D, d_head=D_HEAD, max_seq_len=16, verbose=False
     )
 
-    # Fresh rebuild + re-blockify: different node ids, same canonical topology.
-    out2, emb2 = _build()
-    out2_block = blockify(out2)
+    # Fresh rebuild: different node ids, same canonical topology.
+    out2_block, emb2 = _build()
     session = OnnxDebugSession(onnx_path, out2_block)
 
     ids = _token_ids(emb2)

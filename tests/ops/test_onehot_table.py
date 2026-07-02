@@ -9,8 +9,7 @@ matrix").
 
 import torch
 
-from torchwright.graph import Linear
-from torchwright.graph.relu import ReLU
+from torchwright.graph import Block, Linear
 from torchwright.graph.misc import Assert
 from torchwright.ops.arithmetic_ops import concat
 from torchwright.ops.inout_nodes import create_input, create_onehot_embedding
@@ -131,16 +130,16 @@ def test_multi_input_default_when_unmatched():
     assert torch.allclose(got, torch.tensor([[-1.0]]), atol=1e-5)
 
 
-def test_multi_input_uses_relu():
+def test_multi_input_uses_block():
     a = create_input("a", 2)
     b = create_input("b", 2)
     out = onehot_lookup(
         concat([a, b]), _two_block_table(), default=torch.tensor([-1.0])
     )
-    linear2 = _unwrap(out)
-    assert isinstance(linear2, Linear)
-    relu = linear2.inputs[0]
-    assert isinstance(relu, ReLU)
+    # The multi-block path needs the nonlinear ReLU-AND, so it builds a Block
+    # (via linear_relu_linear) rather than the pure-Linear single-block lookup.
+    node = _unwrap(out)
+    assert isinstance(node, Block)
 
 
 # ---------------------------------------------------------------------------

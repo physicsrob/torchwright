@@ -51,7 +51,7 @@ def test_block_compute_matches_hand_computed():
     assert blk.is_degenerate
 
 
-def test_block_compute_matches_linear_relu_linear_subgraph():
+def test_block_compute_matches_linear_relu_linear_builder():
     d_input, n_lanes, d_output, n_pos = 6, 8, 3, 7
     gate_proj, gate_bias, out_proj, out_bias = _rand_block_params(
         d_input, n_lanes, d_output, seed=1
@@ -60,8 +60,9 @@ def test_block_compute_matches_linear_relu_linear_subgraph():
     x = create_input("x", d_input, value_range=(-3.0, 3.0))
     # linear_relu_linear takes input_proj (d_hidden, d_input) = gate_proj and
     # output_proj (d_hidden, d_output) = out_proj — same orientation as the
-    # Block's gate_proj / out_proj rows.
-    chain = linear_relu_linear(x, gate_proj, gate_bias, out_proj, out_bias)
+    # Block's gate_proj / out_proj rows — and now returns a Block directly.
+    built = linear_relu_linear(x, gate_proj, gate_bias, out_proj, out_bias)
+    assert isinstance(built, Block)
     blk = Block(
         x,
         gate_proj=gate_proj,
@@ -71,18 +72,18 @@ def test_block_compute_matches_linear_relu_linear_subgraph():
     )
 
     xv = torch.randn(n_pos, d_input)
-    cv = chain.compute(n_pos, {"x": xv})
+    cv = built.compute(n_pos, {"x": xv})
     bv = blk.compute(n_pos, {"x": xv})
-    assert torch.equal(cv, bv), "Block must be bit-identical to the L/R/L chain"
+    assert torch.equal(cv, bv), "builder Block must match a directly-constructed Block"
 
 
-def test_block_affine_bound_matches_chain():
+def test_block_affine_bound_matches_builder():
     d_input, n_lanes, d_output = 5, 6, 4
     gate_proj, gate_bias, out_proj, out_bias = _rand_block_params(
         d_input, n_lanes, d_output, seed=2
     )
     x = create_input("x", d_input, value_range=(-2.0, 2.0))
-    chain = linear_relu_linear(x, gate_proj, gate_bias, out_proj, out_bias)
+    built = linear_relu_linear(x, gate_proj, gate_bias, out_proj, out_bias)
     blk = Block(
         x,
         gate_proj=gate_proj,
@@ -91,7 +92,7 @@ def test_block_affine_bound_matches_chain():
         out_bias=out_bias,
     )
 
-    cr = chain.value_type.value_range
+    cr = built.value_type.value_range
     br = blk.value_type.value_range
     assert br.lo == pytest.approx(cr.lo)
     assert br.hi == pytest.approx(cr.hi)
