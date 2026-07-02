@@ -3,7 +3,8 @@
 import torch
 import pytest
 
-from torchwright.graph import Linear, InputNode, Concatenate
+from torchwright.compiler.export import compile_headless
+from torchwright.graph import Block, Concatenate, InputNode, Linear
 from torchwright.graph.optimize import fuse_consecutive_linears
 
 
@@ -179,3 +180,131 @@ def test_fuse_param_decrease():
     # matrix operations where floating-point error accumulates)
     out_after = l2.compute(n_pos, {"x": x})
     assert torch.allclose(out_before, out_after, atol=1e-4)
+
+
+# ---------------------------------------------------------------------------
+# Block-aware folds (Phase 2c)
+# ---------------------------------------------------------------------------
+
+
+def _block(inp, d_input, n_lanes, d_output, seed=0):
+    g = torch.Generator().manual_seed(seed)
+    return Block(
+        inp,
+        gate_proj=torch.randn(n_lanes, d_input, generator=g) * 0.3,
+        gate_bias=torch.randn(n_lanes, generator=g) * 0.1,
+        out_proj=torch.randn(n_lanes, d_output, generator=g) * 0.3,
+        out_bias=torch.randn(d_output, generator=g) * 0.1,
+    )
+
+
+def test_fold_upstream_linear_into_block_gate():
+    """A Linear whose sole consumer is a Block folds into the gate projection."""
+    inp = InputNode("x", 10, value_range=(-2.0, 2.0))
+    u = Linear(inp, torch.randn(10, 6) * 0.2, torch.randn(6) * 0.1, name="u")
+    b = _block(u, 6, 8, 4, seed=1)
+
+    n_pos = 5
+    x = torch.randn(n_pos, 10)
+    before = b.compute(n_pos, {"x": x})
+
+    fused = fuse_consecutive_linears({b})
+    assert fused == 1
+    assert isinstance(b, Block)
+    assert b.inputs[0] is inp  # gate now reads x directly
+    assert b.d_input == 10
+    assert b.gate_proj.shape == (8, 10)
+
+    after = b.compute(n_pos, {"x": x})
+    assert torch.allclose(before, after, atol=1e-5)
+
+
+def test_fold_block_out_into_downstream_linear():
+    """A Block whose sole consumer is a Linear folds its out_proj into it."""
+    inp = InputNode("x", 6, value_range=(-2.0, 2.0))
+    b = _block(inp, 6, 8, 4, seed=2)
+    l = Linear(b, torch.randn(4, 3) * 0.2, torch.randn(3) * 0.1, name="l")
+    sink = Concatenate([l])  # keep l off the output boundary
+
+    n_pos = 5
+    x = torch.randn(n_pos, 6)
+    before = sink.compute(n_pos, {"x": x})
+
+    fused = fuse_consecutive_linears({sink})
+    assert fused == 1
+    assert b.d_output == 3
+    assert b.out_proj.shape == (8, 3)
+    assert sink.inputs[0] is b  # downstream Linear orphaned, consumer rewired
+
+    after = sink.compute(n_pos, {"x": x})
+    assert torch.allclose(before, after, atol=1e-5)
+
+
+def test_block_out_fold_declined_at_output_boundary():
+    """The Block-into-Linear fold is declined when the Linear is a caller-held
+    output node, preserving the caller's output identity."""
+    inp = InputNode("x", 6, value_range=(-2.0, 2.0))
+    b = _block(inp, 6, 8, 4, seed=3)
+    l = Linear(b, torch.randn(4, 3) * 0.2, torch.randn(3) * 0.1, name="l")
+
+    fused = fuse_consecutive_linears({l})
+    assert fused == 0
+    assert l.inputs[0] is b  # unchanged
+
+
+def test_fold_linear_block_linear_both_sides():
+    """Linear -> Block -> Linear folds on both sides in one fixpoint call."""
+    inp = InputNode("x", 10, value_range=(-2.0, 2.0))
+    u = Linear(inp, torch.randn(10, 6) * 0.2, torch.randn(6) * 0.1, name="u")
+    b = _block(u, 6, 8, 4, seed=4)
+    l = Linear(b, torch.randn(4, 3) * 0.2, torch.randn(3) * 0.1, name="l")
+    sink = Concatenate([l])
+
+    n_pos = 5
+    x = torch.randn(n_pos, 10)
+    before = sink.compute(n_pos, {"x": x})
+
+    fused = fuse_consecutive_linears({sink})
+    assert fused == 2
+    assert b.inputs[0] is inp
+    assert b.d_input == 10
+    assert b.d_output == 3
+    assert sink.inputs[0] is b
+
+    after = sink.compute(n_pos, {"x": x})
+    assert torch.allclose(before, after, atol=1e-5)
+
+
+def test_block_folds_preserve_compiled_output():
+    """Folding a Linear -> Block -> Linear graph must not change compiled output."""
+
+    def build():
+        g = torch.Generator().manual_seed(700)
+        inp = InputNode("x", 12, value_range=(-1.0, 1.0))
+        u = Linear(
+            inp,
+            torch.randn(12, 8, generator=g) * 0.2,
+            torch.randn(8, generator=g) * 0.1,
+            name="u",
+        )
+        b = _block(u, 8, 10, 6, seed=7)
+        l = Linear(
+            b,
+            torch.randn(6, 5, generator=g) * 0.2,
+            torch.randn(5, generator=g) * 0.1,
+            name="l",
+        )
+        return inp, Concatenate([l])
+
+    n_pos = 4
+    g = torch.Generator().manual_seed(21)
+    xt = torch.randn(n_pos, 12, generator=g)
+
+    _, out_plain = build()
+    c_plain = compile_headless(out_plain, d=64, d_head=8)
+
+    _, out_fused = build()
+    fuse_consecutive_linears({out_fused})
+    c_fused = compile_headless(out_fused, d=64, d_head=8)
+
+    assert torch.allclose(c_plain(xt), c_fused(xt), atol=1e-4)
