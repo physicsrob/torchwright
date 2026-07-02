@@ -86,14 +86,15 @@ def _fold_block_into_linear(b: Block, consumers: Dict[Node, List[Node]]) -> None
         consumer.replace_input(l, b)
 
 
-def _fuse_one_pass(output_nodes: Set[Node], verbose: bool) -> int:
+def _fuse_one_pass(output_nodes: Set[Node], verbose: bool, mutated: Set[Node]) -> int:
     """One fusion round: apply a set of non-overlapping folds, return the count.
 
     Each node participates in at most one fold per pass (a node touched as a
     fold's survivor or orphaned input is skipped for the rest of the pass);
     chains resolve across successive passes.  Candidates are gathered and
     applied in ``node_id`` order for determinism (the schedule cache keys on
-    node structure).
+    node structure).  Every surviving (mutated) node is added to ``mutated`` so
+    the caller can refresh the affine bounds a fold invalidates.
     """
     from torchwright.compiler.utils import get_ancestor_nodes
 
@@ -132,6 +133,7 @@ def _fuse_one_pass(output_nodes: Set[Node], verbose: bool) -> int:
                 _fuse_linear_into_linear(l1, l2)
                 touched.add(l1)
                 touched.add(l2)
+                mutated.add(l2)
                 applied += 1
 
             elif isinstance(inp, Block):
@@ -151,6 +153,7 @@ def _fuse_one_pass(output_nodes: Set[Node], verbose: bool) -> int:
                 _fold_block_into_linear(b, consumers)
                 touched.add(b)
                 touched.add(l)
+                mutated.add(b)
                 applied += 1
 
         elif isinstance(node, Block):
@@ -175,6 +178,7 @@ def _fuse_one_pass(output_nodes: Set[Node], verbose: bool) -> int:
             _fold_linear_into_block_gate(u, b)
             touched.add(u)
             touched.add(b)
+            mutated.add(b)
             applied += 1
 
     if verbose and applied:
@@ -205,6 +209,16 @@ def fuse_consecutive_linears(
     references (a Block-into-output-Linear fold is declined to preserve the
     caller's output identity).
 
+    Because each fold rewrites a surviving node's weights and inputs in place,
+    that node's eagerly-cached ``_affine_bound`` / ``_structural_type`` (and
+    every downstream node's, which was derived from it) go stale.  A stale
+    bound can be unsound once a downstream ``Assert`` later tightens a node's
+    structural type (``GraphAnalyzer`` strip) — the affine and structural
+    ranges then disagree and the RMSNorm certification's soundness check
+    fires.  So after all folds settle, refresh the bounds of every mutated
+    node and everything downstream of one (see
+    :func:`_recompute_bounds_after_fusion`).
+
     Args:
         output_nodes: The graph's output nodes (used to find all ancestors and
             to protect caller-held output identity).
@@ -214,14 +228,43 @@ def fuse_consecutive_linears(
         Total number of folds performed.
     """
     total = 0
+    mutated: Set[Node] = set()
     while True:
-        n = _fuse_one_pass(output_nodes, verbose)
+        n = _fuse_one_pass(output_nodes, verbose, mutated)
         total += n
         if n == 0:
             break
+    if mutated:
+        _recompute_bounds_after_fusion(output_nodes, mutated)
     if verbose and total:
         print(f"Fused {total} pair(s) total")
     return total
+
+
+def _recompute_bounds_after_fusion(output_nodes: Set[Node], mutated: Set[Node]) -> None:
+    """Refresh ``_structural_type`` / ``_affine_bound`` on every node a fold
+    made stale — the mutated survivors and everything downstream of one.
+
+    Both are computed eagerly in ``Node.__init__`` from the node's inputs, so
+    an in-place fold (new weights, new input) leaves them describing the
+    pre-fold graph.  Recomputing only the mutated node is not enough: its own
+    recompute reads its inputs' bounds, which are correct, but a node *further*
+    downstream was derived from the mutated node's pre-fold bound, so it must
+    recompute too — and only after its inputs have.  Walking in ``node_id``
+    order is a valid topological order (a node's inputs always have smaller
+    ids, and every fold rewires inputs to strictly-smaller-id nodes), so one
+    forward sweep recomputes each dirty node after its inputs.
+    """
+    from torchwright.compiler.utils import get_ancestor_nodes
+    from torchwright.graph.affine_rules import compute_affine_bound
+
+    reachable = get_ancestor_nodes(output_nodes)
+    dirty: Set[Node] = set(mutated)
+    for node in sorted(reachable, key=lambda n: n.node_id):
+        if node in mutated or any(inp in dirty for inp in node.inputs):
+            node._structural_type = node.compute_value_type()
+            node._affine_bound = compute_affine_bound(node)
+            dirty.add(node)
 
 
 def optimize_graph(

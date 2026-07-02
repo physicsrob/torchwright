@@ -308,3 +308,38 @@ def test_block_folds_preserve_compiled_output():
     c_fused = compile_headless(out_fused, d=64, d_head=8)
 
     assert torch.allclose(c_plain(xt), c_fused(xt), atol=1e-4)
+
+
+def test_fusion_refreshes_stale_bounds():
+    """Regression (RMSNorm-cert soundness crash): a fold rewrites a surviving
+    node's weights/inputs in place, so its eagerly-cached ``_affine_bound`` /
+    ``_structural_type`` — and every downstream node's — go stale.  A stale
+    bound stays hidden until a downstream ``Assert`` tightens a structural type
+    (GraphAnalyzer strip), at which point the affine and structural ranges
+    disagree and the RMSNorm energy certification's soundness check fires.
+    ``fuse_consecutive_linears`` must refresh every mutated/downstream bound, so
+    the cached bound equals a fresh recompute for every node.
+    """
+    from torchwright.compiler.utils import get_ancestor_nodes
+    from torchwright.graph.affine_rules import compute_affine_bound
+
+    # Linear -> Block -> Linear exercises Fold 1 (Linear into the gate) and
+    # Fold 2 (Block's out_proj into the downstream Linear, which also changes
+    # the Block's d_output 5 -> 4 — the clearest stale-bound signature).
+    inp = InputNode("x", 6, value_range=(-1.0, 1.0))
+    u = Linear(inp, torch.randn(6, 8) * 0.2, torch.randn(8) * 0.1, name="u")
+    b = _block(u, 8, 10, 5, seed=3)
+    l = Linear(b, torch.randn(5, 4) * 0.2, torch.randn(4) * 0.1, name="l")
+    sink = Concatenate([l])
+
+    n = fuse_consecutive_linears({sink})
+    assert n == 2, f"expected both folds to fire, got {n}"
+    assert b.d_output == 4  # Fold 2 rewrote the Block's output width
+
+    for node in get_ancestor_nodes({sink}):
+        cached = node._affine_bound.to_scalar_range()
+        fresh = compute_affine_bound(node).to_scalar_range()
+        assert cached.lo == fresh.lo and cached.hi == fresh.hi, (
+            f"stale bound on {type(node).__name__} id={node.node_id}: "
+            f"cached={cached} fresh={fresh}"
+        )
