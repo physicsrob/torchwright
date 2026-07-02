@@ -202,6 +202,11 @@ def blockify(output_node: Node, *, verbose: bool = False) -> Node:
             activation="relu",
             name=(f"block_{l2.name}" if l2.name else ""),
         )
+        # Inherit the chain output's annotation so a blockified Block still
+        # reports which render stage it came from (debug/trace parity).  The
+        # annotation is metadata only — not part of the canonical fingerprint
+        # or any scheduling decision — so this does not perturb the compile.
+        block.annotation = l2.annotation
 
         # Rewire every direct consumer of L2 onto the Block.  A consumer that
         # is a Concatenate or an external Assert/DebugWatch is rewired in place

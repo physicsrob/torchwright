@@ -176,6 +176,59 @@ def schedule_metrics(
     )
 
 
+def schedule_trace(
+    output_node: Node,
+    *,
+    d: int,
+    d_head: int,
+    d_hidden: Optional[int] = None,
+    assume_zero_init: bool = False,
+    max_layers: int = 800,
+) -> List[dict]:
+    """Schedule-only, but return per-layer detail for tracing occupancy diffs.
+
+    Each list entry is a dict for one layer: ``hidden`` (total MLP slots used),
+    ``composites`` (a list of ``(annotation, width, slots, node_id)`` for every
+    compute_relu / compute_block op that layer), and ``layer`` (index).  The
+    MLP composite of a mined chain is its L2 Linear; of a blockified graph, the
+    Block — both carry the same annotation (blockify copies L2's), so composites
+    are matchable across the two schedules by ``(annotation, width)``.
+    """
+    d_hidden = d if d_hidden is None else d_hidden
+    graph = GraphAnalyzer(output_node)
+    output_node = graph.get_output_node()
+    rmap, computed = _seed_residual_map(graph, d, assume_zero_init)
+    sched = LayerScheduler(graph, d, d_head, pos_encoding=None, d_hidden=d_hidden)
+
+    trace: List[dict] = []
+    for i in range(max_layers):
+        if output_node in computed:
+            break
+        attn_ops, mlp_ops, _biased = sched.schedule_layer(rmap, computed)
+        composites = []
+        hidden = 0
+        for op in mlp_ops:
+            if op.mlp_slots:
+                hidden += len(op.mlp_slots)
+            if op.op_type in ("compute_relu", "compute_block"):
+                composites.append(
+                    (
+                        op.node.annotation,
+                        op.node.d_output,
+                        len(op.mlp_slots),
+                        op.node.node_id,
+                    )
+                )
+        trace.append({"layer": i, "hidden": hidden, "composites": composites})
+        for node in graph.get_all_nodes():
+            if isinstance(node, Concatenate) and node not in computed:
+                if all(leaf in computed for leaf in flatten_concat_nodes([node])):
+                    computed.add(node)
+        if not attn_ops and not mlp_ops:
+            break
+    return trace
+
+
 def equivalence_report(
     build_fn: Callable[[], Node],
     *,
