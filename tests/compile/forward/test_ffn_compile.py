@@ -1,7 +1,7 @@
-"""Compiled-correctness tests for the Block node.
+"""Compiled-correctness tests for the FFN node.
 
 A graph built natively from :func:`linear_relu_linear` (which returns a
-:class:`Block`) compiles cleanly and ``probe_compiled`` agrees with the oracle,
+:class:`FFN`) compiles cleanly and ``probe_compiled`` agrees with the oracle,
 on both the heuristic and CP-SAT schedules.
 """
 
@@ -10,14 +10,14 @@ import torch
 
 from torchwright.compiler.export import compile_headless
 from torchwright.debug.probe import probe_compiled
-from torchwright.graph import Block
+from torchwright.graph import FFN
 from torchwright.graph.asserts import assert_in_range
 from torchwright.ops.inout_nodes import create_input
 from torchwright.ops.linear_relu_linear import linear_relu_linear
 
 
 def _build():
-    """A two-Block graph (block feeding block) — new node ids each call."""
+    """A two-FFN graph (FFN feeding FFN) — new node ids each call."""
     x = create_input("x", 8, value_range=(-1.0, 1.0))
     g = torch.Generator().manual_seed(11)
     h = linear_relu_linear(
@@ -69,12 +69,12 @@ def test_probe_clean_on_block_graph(xt):
 
 def test_debug_value_and_assert_on_block_output(xt):
     _, out_block = _build()
-    assert isinstance(out_block, Block)
+    assert isinstance(out_block, FFN)
     wrapped = assert_in_range(out_block, -1000.0, 1000.0)
     compiled = compile_headless(wrapped, d=D, d_head=D_HEAD)
 
     # debug=True runs the residual self-consistency check and the assert
-    # predicate on the compiled Block value; both must pass.
+    # predicate on the compiled FFN value; both must pass.
     compiled(xt, debug=True)
     val = compiled.debug_value(out_block)
     ref = out_block.compute(N_POS, {"x": xt})
@@ -83,11 +83,11 @@ def test_debug_value_and_assert_on_block_output(xt):
 
 
 def test_swish_block_rejected_by_compiler(xt):
-    """A gated/swish Block has no ReLU-degenerate lowering this phase; the
+    """A gated/swish FFN has no ReLU-degenerate lowering this phase; the
     MLP writer's precondition assert fires rather than silently miscompiling."""
     x = create_input("x", 8, value_range=(-1.0, 1.0))
     g = torch.Generator().manual_seed(5)
-    blk = Block(
+    blk = FFN(
         x,
         gate_proj=torch.randn(6, 8, generator=g) * 0.2,
         gate_bias=torch.randn(6, generator=g) * 0.1,

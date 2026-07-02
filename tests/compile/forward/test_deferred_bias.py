@@ -17,9 +17,9 @@ from torchwright.ops.map_select import in_range
 
 
 def test_block_with_two_biased_linear_inputs():
-    """Block (in_range) whose Concatenate input has two biased Linears.
+    """FFN (in_range) whose Concatenate input has two biased Linears.
 
-    Both biases must be folded into the Block's gate bias.
+    Both biases must be folded into the FFN's gate bias.
     """
     a = create_input("a", 1)
     b = create_input("b", 1)
@@ -56,10 +56,10 @@ def test_block_with_two_biased_linear_inputs():
 
 
 def test_biased_linear_fanout_block_and_add():
-    """Biased Linear consumed by both a Block and an Add.
+    """Biased Linear consumed by both an FFN and an Add.
 
-    Verifies that the Block gate-bias fold and compute_bias coexist correctly:
-    - Block must see the bias (via fold into its gate bias)
+    Verifies that the FFN gate-bias fold and compute_bias coexist correctly:
+    - FFN must see the bias (via fold into its gate bias)
     - Residual stream must have the bias (via compute_bias for the Add)
     Neither should double-apply the bias.
 

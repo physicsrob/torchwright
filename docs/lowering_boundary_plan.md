@@ -1,5 +1,10 @@
 # The lowering boundary and realization choice: design + plan (rev 2)
 
+> **Historical note (2026-07):** the `Block` node described in this document
+> has been renamed `FFN` (`torchwright/graph/ffn.py`), and
+> `scripts/block_equivalence.py` is now `scripts/ffn_equivalence.py`.  Names
+> below reflect the pre-rename vocabulary.
+
 *Companion to `ir_semantic_vs_structural.md` (the diagnosis). Rev 1 of this
 document was an end-state design with no sequencing. This revision follows a
 code-verified review of rev 1: it corrects what the review found, scopes the

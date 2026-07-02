@@ -125,15 +125,15 @@ def _make_mlp_op(
     """Construct an MLPOp with source_cols captured from ``rmap``."""
     if mlp_slots is None:
         mlp_slots = []
-    if op_type == "compute_block":
-        # node is the Block; its input is the actual source
+    if op_type == "compute_ffn":
+        # node is the FFN; its input is the actual source
         kwargs.setdefault("source_cols", rmap.resolve_indices(node.inputs[0]))
     elif op_type == "compute_linear_bypass":
         kwargs.setdefault("source_cols", rmap.resolve_indices(node.inputs[0]))
     return MLPOp(
         op_type=cast(
             Literal[
-                "compute_block",
+                "compute_ffn",
                 "compute_literal_value",
                 "compute_bias",
                 "compute_linear_bypass",
@@ -690,30 +690,30 @@ def test_compute_add_wide():
 
 
 # ---------------------------------------------------------------------------
-# MLP — compute_block
+# MLP — compute_ffn
 # ---------------------------------------------------------------------------
 
 
 def test_mlp_block():
-    """A degenerate-ReLU Block compiled via MLP."""
+    """A degenerate-ReLU FFN compiled via MLP."""
     x = InputNode("x", 4, value_range=(-100.0, 100.0))
-    block = linear_relu_linear(
+    ffn = linear_relu_linear(
         x,
         torch.randn(8, 4),
         torch.randn(8),
         torch.randn(8, 3),
         torch.randn(3),
-        name="block",
+        name="ffn",
     )
 
     rmap = ResidualStreamMap(D)
     x_cols = rmap.allocate(x)
-    out_cols = rmap.allocate(block)
+    out_cols = rmap.allocate(ffn)
 
-    mlp_slots = list(range(0, 8))  # 8 hidden slots for the 8-lane block
+    mlp_slots = list(range(0, 8))  # 8 hidden slots for the 8-lane FFN
 
     layer = TransformerLayer(D, D_HEAD)
-    op = _make_mlp_op(rmap, "compute_block", block, out_cols, mlp_slots=mlp_slots)
+    op = _make_mlp_op(rmap, "compute_ffn", ffn, out_cols, mlp_slots=mlp_slots)
     write_mlp_sublayer(layer, [op], rmap)
     layer.to(device_mod.get_device(verbose=False))
 
@@ -724,45 +724,45 @@ def test_mlp_block():
     out = layer.mlp.forward(res)
     result = out[:, out_cols]
 
-    expected = block.compute(N_POS, {"x": x_values})
+    expected = ffn.compute(N_POS, {"x": x_values})
     assert torch.allclose(result.cpu(), expected, atol=1e-4)
 
 
 def test_mlp_block_multiple():
-    """Two Blocks in the same MLP, using different slot ranges."""
+    """Two FFNs in the same MLP, using different slot ranges."""
     x = InputNode("x", 4, value_range=(-100.0, 100.0))
     y = InputNode("y", 3, value_range=(-100.0, 100.0))
 
-    block1 = linear_relu_linear(
+    ffn1 = linear_relu_linear(
         x,
         torch.randn(6, 4),
         torch.randn(6),
         torch.randn(6, 2),
         torch.randn(2),
-        name="block1",
+        name="ffn1",
     )
-    block2 = linear_relu_linear(
+    ffn2 = linear_relu_linear(
         y,
         torch.randn(5, 3),
         torch.randn(5),
         torch.randn(5, 2),
         torch.randn(2),
-        name="block2",
+        name="ffn2",
     )
 
     rmap = ResidualStreamMap(D)
     rmap.allocate(x)
     rmap.allocate(y)
-    out1_cols = rmap.allocate(block1)
-    out2_cols = rmap.allocate(block2)
+    out1_cols = rmap.allocate(ffn1)
+    out2_cols = rmap.allocate(ffn2)
 
     layer = TransformerLayer(D, D_HEAD)
     ops = [
         _make_mlp_op(
-            rmap, "compute_block", block1, out1_cols, mlp_slots=list(range(0, 6))
+            rmap, "compute_ffn", ffn1, out1_cols, mlp_slots=list(range(0, 6))
         ),
         _make_mlp_op(
-            rmap, "compute_block", block2, out2_cols, mlp_slots=list(range(6, 11))
+            rmap, "compute_ffn", ffn2, out2_cols, mlp_slots=list(range(6, 11))
         ),
     ]
     write_mlp_sublayer(layer, ops, rmap)
@@ -774,8 +774,8 @@ def test_mlp_block_multiple():
 
     out = layer.mlp.forward(res)
 
-    expected1 = block1.compute(N_POS, {"x": x_values})
-    expected2 = block2.compute(N_POS, {"y": y_values})
+    expected1 = ffn1.compute(N_POS, {"x": x_values})
+    expected2 = ffn2.compute(N_POS, {"y": y_values})
     assert torch.allclose(out[:, out1_cols].cpu(), expected1, atol=1e-4)
     assert torch.allclose(out[:, out2_cols].cpu(), expected2, atol=1e-4)
 

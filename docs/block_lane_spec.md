@@ -1,5 +1,10 @@
 # Block node spec (Phase 1 of `block_ir_step1_plan.md` — Gate B draft)
 
+> **Historical note (2026-07):** the `Block` node described in this document
+> has been renamed `FFN` (`torchwright/graph/ffn.py`), and
+> `scripts/block_equivalence.py` is now `scripts/ffn_equivalence.py`.  Names
+> below reflect the pre-rename vocabulary.
+
 *One page. Written against the SwiGLU end-state (`ops_plain_english.md`);
 step 1 instantiates only the degenerate ReLU form. Gate A rulings apply:
 no export-raw-lanes, ReLU is block-internal, and no raw chain survives —

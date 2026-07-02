@@ -1,9 +1,9 @@
-"""Equivalence harness for the block-IR step-1 refactor
+"""Equivalence harness for the FFN-IR (formerly block-IR) step-1 refactor
 (``docs/block_ir_step1_plan.md``, "Equivalence harness").
 
 For a given graph builder it compiles **both** code paths — historically the
 chain-mined path vs the blockified one; since Phase 2b/3 the ops layer builds
-Blocks natively, so both builds are the same graph and the "block path" is
+FFNs natively, so both builds are the same graph and the "FFN path" is
 the build certified at the lowering boundary (``compiler.lower``, blockify's
 successor) — runs identical inputs, and reports the max output divergence
 plus a compile-metrics tuple for each path.
@@ -59,14 +59,14 @@ class ScheduleMetrics:
 @dataclass
 class EquivalenceReport:
     chain_metrics: ScheduleMetrics
-    block_metrics: ScheduleMetrics
+    ffn_metrics: ScheduleMetrics
     max_output_divergence: Optional[float] = None
     notes: List[str] = field(default_factory=list)
 
     def regressions(self) -> List[str]:
-        """Metrics where the block path is worse than the chain path."""
+        """Metrics where the FFN path is worse than the chain path."""
         out = []
-        c, b = self.chain_metrics, self.block_metrics
+        c, b = self.chain_metrics, self.ffn_metrics
         if b.n_layers > c.n_layers:
             out.append(f"n_layers {c.n_layers} -> {b.n_layers}")
         if b.total_heads > c.total_heads:
@@ -78,24 +78,24 @@ class EquivalenceReport:
         return out
 
     def format(self) -> str:
-        lines = ["Block-IR equivalence report", "=" * 40]
-        lines.append(f"  metric          {'chain':>12} {'block':>12}")
+        lines = ["FFN-IR equivalence report", "=" * 40]
+        lines.append(f"  metric          {'chain':>12} {'ffn':>12}")
         for label, cval, bval in (
-            ("n_layers", self.chain_metrics.n_layers, self.block_metrics.n_layers),
+            ("n_layers", self.chain_metrics.n_layers, self.ffn_metrics.n_layers),
             (
                 "total_heads",
                 self.chain_metrics.total_heads,
-                self.block_metrics.total_heads,
+                self.ffn_metrics.total_heads,
             ),
             (
                 "peak_hidden",
                 self.chain_metrics.peak_hidden,
-                self.block_metrics.peak_hidden,
+                self.ffn_metrics.peak_hidden,
             ),
             (
                 "residual_peak",
                 self.chain_metrics.residual_peak,
-                self.block_metrics.residual_peak,
+                self.ffn_metrics.residual_peak,
             ),
         ):
             lines.append(f"  {label:<14} {cval:>12} {bval:>12}")
@@ -114,7 +114,7 @@ class EquivalenceReport:
 def _seed_residual_map(graph: GraphAnalyzer, d: int, assume_zero_init: bool):
     """Replicate forward_compile's residual-stream seed for schedule-only runs:
     the const-1 self-match column and every input node (no RMSNorm reservation
-    — off by default, and irrelevant to the chain-vs-block comparison as long as
+    — off by default, and irrelevant to the chain-vs-FFN comparison as long as
     both paths use the same seed)."""
     input_nodes = [n for n in graph.get_all_nodes() if graph.is_input_node(n)]
     rmap = ResidualStreamMap(d)
@@ -190,8 +190,8 @@ def schedule_trace(
 
     Each list entry is a dict for one layer: ``hidden`` (total MLP slots used),
     ``composites`` (a list of ``(annotation, width, slots, node_id)`` for every
-    compute_block op that layer), and ``layer`` (index).  The MLP composite is
-    the Block node, matchable across schedules by ``(annotation, width)``.
+    compute_ffn op that layer), and ``layer`` (index).  The MLP composite is
+    the FFN node, matchable across schedules by ``(annotation, width)``.
     """
     d_hidden = d if d_hidden is None else d_hidden
     graph = GraphAnalyzer(output_node)
@@ -209,7 +209,7 @@ def schedule_trace(
         for op in mlp_ops:
             if op.mlp_slots:
                 hidden += len(op.mlp_slots)
-            if op.op_type == "compute_block":
+            if op.op_type == "compute_ffn":
                 composites.append(
                     (
                         op.node.annotation,
@@ -255,9 +255,9 @@ def equivalence_report(
         assume_zero_init=assume_zero_init,
     )
 
-    # Block path (certified at the lowering boundary; blockify's successor).
+    # FFN path (certified at the lowering boundary; blockify's successor).
     block_out = lower(build_fn()).output_node
-    block_metrics = schedule_metrics(
+    ffn_metrics = schedule_metrics(
         block_out,
         d=d,
         d_head=d_head,
@@ -265,7 +265,7 @@ def equivalence_report(
         assume_zero_init=assume_zero_init,
     )
 
-    report = EquivalenceReport(chain_metrics=chain_metrics, block_metrics=block_metrics)
+    report = EquivalenceReport(chain_metrics=chain_metrics, ffn_metrics=ffn_metrics)
 
     if run_output:
         from torchwright.compiler.export import compile_headless

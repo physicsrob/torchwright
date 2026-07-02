@@ -15,7 +15,7 @@ from torchwright.compiler.forward.residual_map import ResidualStreamMap
 from torchwright.compiler.groups.transformer_layer import TransformerLayer
 from torchwright.graph import Node, Linear, Attn, Add, Concatenate
 from torchwright.graph.misc import LiteralValue
-from torchwright.graph.block import Block
+from torchwright.graph.ffn import FFN
 from torchwright.graph.rope import ROPE_BASE
 
 # Self-match attention hardness: scales the constant-1 self-match logit so the
@@ -111,7 +111,7 @@ class AttnHeadOp:
 @dataclass
 class MLPOp:
     op_type: Literal[
-        "compute_block",
+        "compute_ffn",
         "compute_literal_value",
         "compute_bias",
         "compute_linear_bypass",
@@ -119,8 +119,8 @@ class MLPOp:
     node: Node
     target_cols: List[int]
     mlp_slots: List[int] = field(default_factory=list)
-    # Input columns captured at schedule time.  Used by compute_block (the
-    # Block's input) and compute_linear_bypass (the Linear's input).
+    # Input columns captured at schedule time.  Used by compute_ffn (the
+    # FFN's input) and compute_linear_bypass (the Linear's input).
     source_cols: Optional[List[int]] = None
 
 
@@ -170,8 +170,8 @@ def write_mlp_sublayer(
     if biased_linears is None:
         biased_linears = set()
     for op in ops:
-        if op.op_type == "compute_block":
-            _write_compute_block(layer.mlp, op, residual_map, biased_linears, recorder)
+        if op.op_type == "compute_ffn":
+            _write_compute_ffn(layer.mlp, op, residual_map, biased_linears, recorder)
         elif op.op_type == "compute_literal_value":
             _write_compute_literal_value(layer.mlp, op)
         elif op.op_type == "compute_bias":
@@ -640,35 +640,35 @@ def _write_add_into(
 # ---------------------------------------------------------------------------
 
 
-def _write_compute_block(
+def _write_compute_ffn(
     mlp,
     op: MLPOp,
     rmap: ResidualStreamMap,
     biased_linears: Optional[Set[Node]] = None,
     recorder: Optional[PlacementRecorder] = None,
 ):
-    """Compile a degenerate-ReLU :class:`Block` through the MLP sublayer.
+    """Compile a degenerate-ReLU :class:`FFN` through the MLP sublayer.
 
-    The Block is the only MLP composite: it maps its input through the gate
+    The FFN is the only MLP composite: it maps its input through the gate
     projection into the hidden slots, applies the sublayer's built-in ReLU, and
     maps back out through the output projection:
 
     - ``linear1``: input columns -> mlp_slots, weight ``gate_proj.T`` (the
-      Block stores ``gate_proj`` as ``(n_lanes, d_input)``; the MLP linear1
+      FFN stores ``gate_proj`` as ``(n_lanes, d_input)``; the MLP linear1
       matrix is ``(d_input, n_lanes)``), bias ``gate_bias``.
     - ReLU: applied elementwise (the sublayer's built-in nonlinearity).
     - ``linear2``: mlp_slots -> target columns, weight ``out_proj``
       ``(n_lanes, d_output)``, bias ``out_bias``.
     """
-    block = op.node
-    assert isinstance(block, Block)
-    assert block.activation == "relu" and block.up_proj is None, (
-        f"compute_block supports only degenerate ReLU blocks in step 1, got "
-        f"activation={block.activation!r}, gated={block.up_proj is not None}"
+    ffn = op.node
+    assert isinstance(ffn, FFN)
+    assert ffn.activation == "relu" and ffn.up_proj is None, (
+        f"compute_ffn supports only degenerate ReLU FFNs in step 1, got "
+        f"activation={ffn.activation!r}, gated={ffn.up_proj is not None}"
     )
 
-    assert op.source_cols is not None, "compute_block requires source_cols"
-    input_node = block.inputs[0]
+    assert op.source_cols is not None, "compute_ffn requires source_cols"
+    input_node = ffn.inputs[0]
     in_idx = op.source_cols
     mlp_slots = op.mlp_slots
     out_idx = op.target_cols
@@ -681,14 +681,14 @@ def _write_compute_block(
 
     # linear1: rows=input columns, cols=mlp slots.  gate matrix is
     # (d_input, n_lanes) = gate_proj.T; gate bias is (n_lanes,).
-    gate_matrix = block.gate_proj.t()
+    gate_matrix = ffn.gate_proj.t()
     mlp.linear1.output_matrix[in_idx_t.unsqueeze(1), slots_t.unsqueeze(0)] = (
         gate_matrix.to(target_dtype)
     )
-    mlp.linear1.output_bias[slots_t] = block.gate_bias.to(target_dtype)
+    mlp.linear1.output_bias[slots_t] = ffn.gate_bias.to(target_dtype)
 
     # Fold deferred biased-Linear inputs into the gate's hidden bias, because
-    # the Block reads those columns in linear1 before the deferred output_bias
+    # the FFN reads those columns in linear1 before the deferred output_bias
     # is written.
     if biased_linears:
         leaves = (
@@ -707,15 +707,15 @@ def _write_compute_block(
     # linear2: rows=mlp slots, cols=output columns.  out_proj is
     # (n_lanes, d_output); out_bias is (d_output,).
     mlp.linear2.output_matrix[slots_t.unsqueeze(1), out_idx_t.unsqueeze(0)] = (
-        block.out_proj.to(target_dtype)
+        ffn.out_proj.to(target_dtype)
     )
-    mlp.linear2.output_bias[out_idx_t] = block.out_bias.to(target_dtype)
+    mlp.linear2.output_bias[out_idx_t] = ffn.out_bias.to(target_dtype)
 
     if recorder is not None:
-        # Both dense weight blocks attributed to the Block node (it carries all
+        # Both dense weight blocks attributed to the FFN node (it carries all
         # the weights, unlike a mined chain's split across L1/L2).
-        recorder.add("mlp.W_in", block, op.op_type, in_idx, mlp_slots, "dense")
-        recorder.add("mlp.W_out", block, op.op_type, mlp_slots, out_idx, "dense")
+        recorder.add("mlp.W_in", ffn, op.op_type, in_idx, mlp_slots, "dense")
+        recorder.add("mlp.W_out", ffn, op.op_type, mlp_slots, out_idx, "dense")
 
 
 def _write_compute_literal_value(mlp, op: MLPOp):

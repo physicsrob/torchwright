@@ -14,6 +14,6 @@ from .misc import (
     ValueLogger,
 )
 from .relu import ReLU
-from .block import Block
+from .ffn import FFN
 from .rope import ROPE_BASE, RopeConfig
 from .session import fresh_graph_session

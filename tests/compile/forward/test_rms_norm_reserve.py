@@ -209,7 +209,7 @@ def test_energy_bound_identity_holds_below_and_breaks_above():
 
 
 def _tiny_graph():
-    """x -> Block (a degenerate-ReLU MLP block); small enough to solve
+    """x -> FFN (a degenerate-ReLU FFN); small enough to solve
     sub-second."""
     torch.manual_seed(0)
     x = create_input("x", 8)
@@ -219,7 +219,7 @@ def _tiny_graph():
         torch.zeros(16),
         torch.randn(16, 4),
         torch.zeros(4),
-        name="block",
+        name="ffn",
     )
 
 

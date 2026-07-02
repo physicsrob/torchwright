@@ -12,7 +12,7 @@ import pytest
 import torch
 
 from torchwright.compiler.lower import LoweredGraph, LoweringError, lower
-from torchwright.graph import Block, Linear, Node, ReLU
+from torchwright.graph import FFN, Linear, Node, ReLU
 from torchwright.graph.affine_rules import compute_affine_bound
 from torchwright.graph.asserts import assert_in_range
 from torchwright.graph.misc import Concatenate
@@ -40,7 +40,7 @@ def _block(x, d_input, n_lanes, d_output, seed=0, name=""):
 def test_linear_relu_linear_builds_block_natively():
     x = create_input("x", 4, value_range=(-2.0, 2.0))
     node = _block(x, 4, 6, 3, name="c")
-    assert isinstance(node, Block)
+    assert isinstance(node, FFN)
 
 
 def test_lower_passes_on_native_block_graph():

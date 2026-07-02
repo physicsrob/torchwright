@@ -1,8 +1,8 @@
-"""ONNX debug-surface parity for a graph with Block nodes.
+"""ONNX debug-surface parity for a graph with FFN nodes.
 
-Confirms the :class:`~torchwright.graph.block.Block` node type round-trips the
+Confirms the :class:`~torchwright.graph.ffn.FFN` node type round-trips the
 debug sidecar / canonical-id remap / rebuild fingerprint: a token graph built
-natively with Blocks, exported with :func:`compile_to_onnx`, then reopened as an
+natively with FFNs, exported with :func:`compile_to_onnx`, then reopened as an
 :class:`OnnxDebugSession` over a *freshly rebuilt* graph, gives a clean
 ``probe_compiled`` verdict and a passing ``debug=True`` step.
 """
@@ -12,7 +12,7 @@ import torch
 
 from torchwright.compiler.export import compile_to_onnx
 from torchwright.debug.probe import probe_compiled
-from torchwright.graph import Block
+from torchwright.graph import FFN
 from torchwright.ops.inout_nodes import create_embedding
 from torchwright.ops.linear_relu_linear import linear_relu_linear
 
@@ -52,7 +52,7 @@ def _token_ids(emb) -> torch.Tensor:
 def test_onnx_debug_session_roundtrips_block_graph(tmp_path):
     onnx_path = str(tmp_path / "blk.onnx")
     out_block, emb = _build()
-    assert isinstance(out_block, Block)
+    assert isinstance(out_block, FFN)
     compile_to_onnx(
         out_block, emb, onnx_path, d=D, d_head=D_HEAD, max_seq_len=16, verbose=False
     )

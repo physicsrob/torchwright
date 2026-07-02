@@ -1,5 +1,10 @@
 # Step 1 plan: block-first ReLU machine (numerics frozen)
 
+> **Historical note (2026-07):** the `Block` node described in this document
+> has been renamed `FFN` (`torchwright/graph/ffn.py`), and
+> `scripts/block_equivalence.py` is now `scripts/ffn_equivalence.py`.  Names
+> below reflect the pre-rename vocabulary.
+
 ## STATUS: COMPLETE (2026-07-01) — closeout record
 
 All phases (0, 1, 2a, 2b, 2c, 3) are done and verified; every gate passed.

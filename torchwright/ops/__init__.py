@@ -75,5 +75,5 @@ from torchwright.ops.sequence_ops import (
     remove_leading_0s,
 )
 
-# Building block
+# FFN builder
 from torchwright.ops.linear_relu_linear import linear_relu_linear

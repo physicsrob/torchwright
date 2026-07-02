@@ -7,7 +7,7 @@ layer count and parameter overhead.
 from typing import Dict, List, Set
 
 from torchwright.graph import Concatenate, Node
-from torchwright.graph.block import Block
+from torchwright.graph.ffn import FFN
 from torchwright.graph.linear import Linear
 
 
@@ -38,8 +38,8 @@ def _fuse_linear_into_linear(l1: Linear, l2: Linear) -> None:
         l2.name = f"fused_{l1.name}_{l2.name}"
 
 
-def _fold_linear_into_block_gate(u: Linear, b: Block) -> None:
-    """Fold an upstream Linear ``u`` into Block ``b``'s gate (and up) projection.
+def _fold_linear_into_ffn_gate(u: Linear, b: FFN) -> None:
+    """Fold an upstream Linear ``u`` into FFN ``b``'s gate (and up) projection.
 
     ``b`` survives (mutated in place); ``u`` is orphaned.  With
     ``gate_in = (x @ M_u + b_u) @ gate_proj.T + gate_bias``::
@@ -47,8 +47,8 @@ def _fold_linear_into_block_gate(u: Linear, b: Block) -> None:
         gate_proj' = gate_proj @ M_u.T
         gate_bias' = b_u @ gate_proj.T + gate_bias
 
-    and the same for ``up_proj`` when the Block is gated.  This is width-safe by
-    construction — the Block is realized whole, so folding into its gate never
+    and the same for ``up_proj`` when the FFN is gated.  This is width-safe by
+    construction — the FFN is realized whole, so folding into its gate never
     ejects the ReLU (the property the deleted ejection gate used to police in
     the chain world).
     """
@@ -64,10 +64,10 @@ def _fold_linear_into_block_gate(u: Linear, b: Block) -> None:
         b.name = f"fused_{u.name}_{b.name}"
 
 
-def _fold_block_into_linear(b: Block, consumers: Dict[Node, List[Node]]) -> None:
-    """Fold Block ``b``'s output projection into its sole downstream Linear.
+def _fold_ffn_into_linear(b: FFN, consumers: Dict[Node, List[Node]]) -> None:
+    """Fold FFN ``b``'s output projection into its sole downstream Linear.
 
-    ``b``'s only consumer is a Linear ``l``.  The fused node is still a Block
+    ``b``'s only consumer is a Linear ``l``.  The fused node is still an FFN
     (lanes + output projection), so ``b`` survives and ``l`` is orphaned; every
     consumer of ``l`` is rewired to ``b``.  With ``z = (lane @ out_proj +
     out_bias) @ M_l + b_l``::
@@ -113,8 +113,8 @@ def _fuse_one_pass(output_nodes: Set[Node], verbose: bool, mutated: Set[Node]) -
         # Skip folds that would grow the parameter count (bottleneck patterns).
         return new_params <= old_params
 
-    # Linear -> Linear, and Block -> Linear (out-proj fold): keyed on the
-    # downstream Linear.  Linear -> Block (gate fold): keyed on the Block.
+    # Linear -> Linear, and FFN -> Linear (out-proj fold): keyed on the
+    # downstream Linear.  Linear -> FFN (gate fold): keyed on the FFN.
     for node in sorted(all_nodes, key=lambda n: n.node_id):
         if node in touched:
             continue
@@ -141,9 +141,9 @@ def _fuse_one_pass(output_nodes: Set[Node], verbose: bool, mutated: Set[Node]) -
                 mutated.add(l2)
                 applied += 1
 
-            elif isinstance(inp, Block):
-                # Fold the Block's out_proj into this downstream Linear.  The
-                # Block becomes the survivor, so the Linear must not be a
+            elif isinstance(inp, FFN):
+                # Fold the FFN's out_proj into this downstream Linear.  The
+                # FFN becomes the survivor, so the Linear must not be a
                 # caller-held output node (its identity would be lost).
                 b, l = inp, node
                 if l in output_nodes:
@@ -155,13 +155,13 @@ def _fuse_one_pass(output_nodes: Set[Node], verbose: bool, mutated: Set[Node]) -
                 new = n_lanes * d_z + d_z
                 if not param_delta_ok(new, old):
                     continue
-                _fold_block_into_linear(b, consumers)
+                _fold_ffn_into_linear(b, consumers)
                 touched.add(b)
                 touched.add(l)
                 mutated.add(b)
                 applied += 1
 
-        elif isinstance(node, Block):
+        elif isinstance(node, FFN):
             inp = node.inputs[0]
             if not isinstance(inp, Linear) or inp in touched:
                 continue
@@ -180,7 +180,7 @@ def _fuse_one_pass(output_nodes: Set[Node], verbose: bool, mutated: Set[Node]) -
             new = n_proj * per_proj_new
             if not param_delta_ok(new, old):
                 continue
-            _fold_linear_into_block_gate(u, b)
+            _fold_linear_into_ffn_gate(u, b)
             touched.add(u)
             touched.add(b)
             mutated.add(b)
@@ -195,23 +195,23 @@ def fuse_consecutive_linears(
     output_nodes: Set[Node],
     verbose: bool = False,
 ) -> int:
-    """Fuse adjacent linear maps, block-aware, until no more folds apply.
+    """Fuse adjacent linear maps, FFN-aware, until no more folds apply.
 
     Three folds, each width-safe and gated so it never grows the parameter
     count:
 
     - **Linear -> Linear** (``l1``'s sole consumer is ``l2``): ``l2`` absorbs
       ``l1`` (``M1 @ M2``, ``b1 @ M2 + b2``).  Saves one compiled layer.
-    - **Linear -> Block** (the Linear's sole consumer is the Block): the Linear
-      folds into the Block's gate (and up) projection.  In the chain world this
+    - **Linear -> FFN** (the Linear's sole consumer is the FFN): the Linear
+      folds into the FFN's gate (and up) projection.  In the chain world this
       was the "eject the ReLU" case the width-safe gate had to decline; with a
-      first-class Block there is nothing to eject, so it is always legal.
-    - **Block -> Linear** (the Block's sole consumer is the Linear, and the
-      Linear is not a caller-held output): the Block's output projection folds
-      into the downstream Linear (``out_proj @ M_l``), the Block absorbing it.
+      first-class FFN there is nothing to eject, so it is always legal.
+    - **FFN -> Linear** (the FFN's sole consumer is the Linear, and the
+      Linear is not a caller-held output): the FFN's output projection folds
+      into the downstream Linear (``out_proj @ M_l``), the FFN absorbing it.
 
     All folds mutate a surviving node in place; ``output_nodes`` stay valid
-    references (a Block-into-output-Linear fold is declined to preserve the
+    references (an FFN-into-output-Linear fold is declined to preserve the
     caller's output identity).
 
     Because each fold rewrites a surviving node's weights and inputs in place,

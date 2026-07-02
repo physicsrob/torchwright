@@ -3,13 +3,13 @@
 These run as reference evaluation (``node.compute``), which executes the same
 Linear/ReLU matmuls the compiler emits — so "exact on every key" here is the
 op's exact arithmetic, and the weight-matrix readback is the literal compiled
-block (D6: the smallest layer that reproduces "a lookup is a selection
+node (D6: the smallest layer that reproduces "a lookup is a selection
 matrix").
 """
 
 import torch
 
-from torchwright.graph import Block, Linear
+from torchwright.graph import FFN, Linear
 from torchwright.graph.misc import Assert
 from torchwright.ops.arithmetic_ops import concat
 from torchwright.ops.inout_nodes import create_input, create_onehot_embedding
@@ -136,10 +136,10 @@ def test_multi_input_uses_block():
     out = onehot_lookup(
         concat([a, b]), _two_block_table(), default=torch.tensor([-1.0])
     )
-    # The multi-block path needs the nonlinear ReLU-AND, so it builds a Block
+    # The multi-block path needs the nonlinear ReLU-AND, so it builds an FFN
     # (via linear_relu_linear) rather than the pure-Linear single-block lookup.
     node = _unwrap(out)
-    assert isinstance(node, Block)
+    assert isinstance(node, FFN)
 
 
 # ---------------------------------------------------------------------------

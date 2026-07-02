@@ -17,8 +17,9 @@ The target hardware — a transformer — has two kinds of compute per layer:
 
 - an **attention sublayer** (query/key/value projections, softmax over
   positions, output projection), and
-- an **MLP sublayer** (also called the **FFN**): a `Linear`, a nonlinearity, a
-  `Linear`.
+- an **MLP sublayer**: a `Linear`, a nonlinearity, a `Linear`.  (An **FFN**
+  here is the *packable unit* — one gate/up/out lane group, now the `FFN`
+  node — many of which the scheduler bins into one MLP sublayer.)
 
 Both write their output by **adding it into the residual stream** — the running
 per-position vector that flows down the layers (`x = x + sublayer(x)`).

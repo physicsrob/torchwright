@@ -91,12 +91,12 @@ def test_compile_linear():
 
 
 def test_compile_block():
-    """Input -> Block (the L->ReLU->L MLP pattern, one node)."""
+    """Input -> FFN (the L->ReLU->L MLP pattern, one node)."""
     x = create_input("x", 4)
-    block = linear_relu_linear(
+    ffn = linear_relu_linear(
         x, torch.randn(8, 4), torch.randn(8), torch.randn(8, 3), torch.randn(3)
     )
-    _verify(block, n_pos=3, input_values={"x": torch.randn(3, 4)})
+    _verify(ffn, n_pos=3, input_values={"x": torch.randn(3, 4)})
 
 
 def test_compile_add():
@@ -216,9 +216,9 @@ def test_compile_sum_nodes():
 
 
 def test_compile_cond_gate():
-    """cond_gate — a gating op built on Blocks (linear_relu_linear).
+    """cond_gate — a gating op built on FFNs (linear_relu_linear).
 
-    cond_gate(cond, inp) = cond_add_vector(cond, block(cond_add_vector(cond, inp, ...)), ...)
+    cond_gate(cond, inp) = cond_add_vector(cond, ffn(cond_add_vector(cond, inp, ...)), ...)
     """
     cond = create_input("cond", 1, value_range=(-1.0, 1.0))
     inp = create_input("inp", 4, value_range=(-4.0, 4.0))

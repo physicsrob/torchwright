@@ -2,7 +2,7 @@
 (2026-06): domain tightening, solver parameter overrides, incumbent trace
 capture, and lexicographic secondary objectives.
 
-All tests run on a small two-Block repro graph — a handful of nodes, so
+All tests run on a small two-FFN repro graph — a handful of nodes, so
 each solve is sub-second.
 """
 
@@ -23,7 +23,7 @@ from torchwright.ops.linear_relu_linear import linear_relu_linear
 
 
 def _repro_graph():
-    """x -> Block -> L_mid -> Block -> L_out (a small serial block graph,
+    """x -> FFN -> L_mid -> FFN -> L_out (a small serial FFN graph,
     lightly fused)."""
     torch.manual_seed(0)
     x = create_input("x", 8)

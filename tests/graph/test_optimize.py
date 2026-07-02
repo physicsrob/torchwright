@@ -4,7 +4,7 @@ import torch
 import pytest
 
 from torchwright.compiler.export import compile_headless
-from torchwright.graph import Block, Concatenate, InputNode, Linear
+from torchwright.graph import FFN, Concatenate, InputNode, Linear
 from torchwright.graph.optimize import fuse_consecutive_linears
 
 
@@ -183,13 +183,13 @@ def test_fuse_param_decrease():
 
 
 # ---------------------------------------------------------------------------
-# Block-aware folds (Phase 2c)
+# FFN-aware folds (Phase 2c)
 # ---------------------------------------------------------------------------
 
 
 def _block(inp, d_input, n_lanes, d_output, seed=0):
     g = torch.Generator().manual_seed(seed)
-    return Block(
+    return FFN(
         inp,
         gate_proj=torch.randn(n_lanes, d_input, generator=g) * 0.3,
         gate_bias=torch.randn(n_lanes, generator=g) * 0.1,
@@ -199,7 +199,7 @@ def _block(inp, d_input, n_lanes, d_output, seed=0):
 
 
 def test_fold_upstream_linear_into_block_gate():
-    """A Linear whose sole consumer is a Block folds into the gate projection."""
+    """A Linear whose sole consumer is an FFN folds into the gate projection."""
     inp = InputNode("x", 10, value_range=(-2.0, 2.0))
     u = Linear(inp, torch.randn(10, 6) * 0.2, torch.randn(6) * 0.1, name="u")
     b = _block(u, 6, 8, 4, seed=1)
@@ -210,7 +210,7 @@ def test_fold_upstream_linear_into_block_gate():
 
     fused = fuse_consecutive_linears({b})
     assert fused == 1
-    assert isinstance(b, Block)
+    assert isinstance(b, FFN)
     assert b.inputs[0] is inp  # gate now reads x directly
     assert b.d_input == 10
     assert b.gate_proj.shape == (8, 10)
@@ -220,7 +220,7 @@ def test_fold_upstream_linear_into_block_gate():
 
 
 def test_fold_block_out_into_downstream_linear():
-    """A Block whose sole consumer is a Linear folds its out_proj into it."""
+    """An FFN whose sole consumer is a Linear folds its out_proj into it."""
     inp = InputNode("x", 6, value_range=(-2.0, 2.0))
     b = _block(inp, 6, 8, 4, seed=2)
     l = Linear(b, torch.randn(4, 3) * 0.2, torch.randn(3) * 0.1, name="l")
@@ -241,7 +241,7 @@ def test_fold_block_out_into_downstream_linear():
 
 
 def test_block_out_fold_declined_at_output_boundary():
-    """The Block-into-Linear fold is declined when the Linear is a caller-held
+    """The FFN-into-Linear fold is declined when the Linear is a caller-held
     output node, preserving the caller's output identity."""
     inp = InputNode("x", 6, value_range=(-2.0, 2.0))
     b = _block(inp, 6, 8, 4, seed=3)
@@ -253,7 +253,7 @@ def test_block_out_fold_declined_at_output_boundary():
 
 
 def test_fold_linear_block_linear_both_sides():
-    """Linear -> Block -> Linear folds on both sides in one fixpoint call."""
+    """Linear -> FFN -> Linear folds on both sides in one fixpoint call."""
     inp = InputNode("x", 10, value_range=(-2.0, 2.0))
     u = Linear(inp, torch.randn(10, 6) * 0.2, torch.randn(6) * 0.1, name="u")
     b = _block(u, 6, 8, 4, seed=4)
@@ -276,7 +276,7 @@ def test_fold_linear_block_linear_both_sides():
 
 
 def test_block_folds_preserve_compiled_output():
-    """Folding a Linear -> Block -> Linear graph must not change compiled output."""
+    """Folding a Linear -> FFN -> Linear graph must not change compiled output."""
 
     def build():
         g = torch.Generator().manual_seed(700)
@@ -323,9 +323,9 @@ def test_fusion_refreshes_stale_bounds():
     from torchwright.compiler.utils import get_ancestor_nodes
     from torchwright.graph.affine_rules import compute_affine_bound
 
-    # Linear -> Block -> Linear exercises Fold 1 (Linear into the gate) and
-    # Fold 2 (Block's out_proj into the downstream Linear, which also changes
-    # the Block's d_output 5 -> 4 — the clearest stale-bound signature).
+    # Linear -> FFN -> Linear exercises Fold 1 (Linear into the gate) and
+    # Fold 2 (FFN's out_proj into the downstream Linear, which also changes
+    # the FFN's d_output 5 -> 4 — the clearest stale-bound signature).
     inp = InputNode("x", 6, value_range=(-1.0, 1.0))
     u = Linear(inp, torch.randn(6, 8) * 0.2, torch.randn(8) * 0.1, name="u")
     b = _block(u, 8, 10, 5, seed=3)
@@ -334,7 +334,7 @@ def test_fusion_refreshes_stale_bounds():
 
     n = fuse_consecutive_linears({sink})
     assert n == 2, f"expected both folds to fire, got {n}"
-    assert b.d_output == 4  # Fold 2 rewrote the Block's output width
+    assert b.d_output == 4  # Fold 2 rewrote the FFN's output width
 
     for node in get_ancestor_nodes({sink}):
         cached = node._affine_bound.to_scalar_range()

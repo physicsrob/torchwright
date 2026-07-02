@@ -27,7 +27,7 @@ from typing import Dict, Iterable, Optional, Tuple
 
 from torchwright.compiler.forward.scheduling_policy import SchedulingPolicy
 from torchwright.graph import Add, Attn, Linear, Node
-from torchwright.graph.block import Block
+from torchwright.graph.ffn import FFN
 from torchwright.graph.misc import LiteralValue
 
 # ---------------------------------------------------------------------------
@@ -41,7 +41,7 @@ ATTN_TRANSPORT = "attn_transport"
 MLP_BYPASS = "mlp_bypass"
 #: An Attn node on attention heads (the only hardware that attends).
 ATTN_HEADS = "attn_heads"
-#: A Block on the MLP sublayer (the L→act→L composite; always MLP-locked).
+#: An FFN on the MLP sublayer (the L→act→L composite; always MLP-locked).
 MLP_COMPOSITE = "mlp_composite"
 #: A LiteralValue written by the MLP constant path.
 MLP_LITERAL = "mlp_literal"
@@ -73,7 +73,7 @@ def candidate_classes(node: Node) -> Tuple[str, ...]:
     """
     if isinstance(node, Attn):
         return (ATTN_HEADS,)
-    if isinstance(node, Block):
+    if isinstance(node, FFN):
         return (MLP_COMPOSITE,)
     if isinstance(node, LiteralValue):
         return (MLP_LITERAL,)
@@ -86,7 +86,7 @@ def candidate_classes(node: Node) -> Tuple[str, ...]:
 
 def is_schedulable(node: Node) -> bool:
     """True for node types that occupy hardware (get a table entry)."""
-    return isinstance(node, (Attn, Block, LiteralValue, Add, Linear))
+    return isinstance(node, (Attn, FFN, LiteralValue, Add, Linear))
 
 
 def is_conditional(node: Node) -> bool:

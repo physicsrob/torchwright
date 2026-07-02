@@ -19,7 +19,7 @@ from torchwright.compiler.forward.scheduling_policy import SchedulingPolicy
 from torchwright.compiler.forward.weight_writer import AttnHeadOp, MLPOp
 from torchwright.graph import Node, Linear, Attn, Add, Concatenate
 from torchwright.graph.misc import LiteralValue
-from torchwright.graph.block import Block
+from torchwright.graph.ffn import FFN
 
 
 class LayerScheduler:
@@ -99,7 +99,7 @@ class LayerScheduler:
             1. Classify ready nodes (free adds, deferred adds, compute-ready).
             2. Attention sublayer: free adds, compute ops (Attn/Linear/Add),
                cancellations of dead nodes.
-            3. MLP sublayer: Blocks (the L->ReLU->L composite), standalone
+            3. MLP sublayer: FFNs (the L->ReLU->L composite), standalone
                Linears via MLP bypass, constants, bias writes for biased
                Linears.
 
@@ -167,7 +167,7 @@ class LayerScheduler:
                     free_adds.append(node)
                 else:
                     deferred_adds.append(node)
-            elif isinstance(node, (Attn, Linear, LiteralValue, Block)):
+            elif isinstance(node, (Attn, Linear, LiteralValue, FFN)):
                 ready.add(node)
             # else: skip unschedulable source nodes (InputNode, Embedding, etc.)
 
@@ -176,8 +176,8 @@ class LayerScheduler:
         had_schedulable = bool(ready) or bool(free_adds) or bool(deferred_adds)
 
         # --- 2. Attention sublayer ---
-        # A Block reads its input's residual columns inline in linear1, but the
-        # Block is a normal ready node and an uncomputed consumer of that input
+        # An FFN reads its input's residual columns inline in linear1, but the
+        # FFN is a normal ready node and an uncomputed consumer of that input
         # until it is scheduled in the MLP sublayer, so the input is never
         # "freshly dead" during the attention sublayer and needs no special
         # protection (the analogue of the chain's old ``chain_protected`` set).
@@ -209,7 +209,7 @@ class LayerScheduler:
                 d1 = self._is_dead_for_add(a1, node, computed_nodes)
                 if not (d0 or d1):
                     continue  # deferred add, skip
-            if isinstance(node, (Linear, LiteralValue, Block)):
+            if isinstance(node, (Linear, LiteralValue, FFN)):
                 ready.add(node)
 
         # Newly-ready MLP-routed Linears: extend bypass_linears so the
@@ -584,54 +584,54 @@ class LayerScheduler:
             additions, delta = result
             return True, additions, delta
 
-        # Residual-pressure flag shared by the Block and bypass-Linear passes:
+        # Residual-pressure flag shared by the FFN and bypass-Linear passes:
         # under pressure they sort by net column cost (free columns first) to
         # relieve the residual stream; otherwise by critical path.
         under_pressure = residual_map.get_free_count() < self.d * (
             1.0 - self.policy.pressure_threshold
         )
 
-        # 3a. Blocks (the first-class L->ReLU->L MLP composite).
-        # A Block allocates its d_output residual cols, claims n_lanes hidden
+        # 3a. FFNs (the first-class L->ReLU->L MLP composite).
+        # An FFN allocates its d_output residual cols, claims n_lanes hidden
         # slots, and reads its input's residual cols inline in linear1.  It is
         # always realized whole (Gate A); its input projection is exclusive by
-        # construction (the gate rows are the Block's own weights).
-        blocks = [n for n in ready if isinstance(n, Block)]
+        # construction (the gate rows are the FFN's own weights).
+        ffns = [n for n in ready if isinstance(n, FFN)]
         if under_pressure:
-            blocks.sort(
+            ffns.sort(
                 key=lambda b: (
                     self._net_column_cost(b, computed_nodes, residual_map),
                     self._critical_path_key(b),
                 )
             )
         else:
-            blocks.sort(key=self._critical_path_key)
-        for block in blocks:
-            n_lanes = block.n_lanes
+            ffns.sort(key=self._critical_path_key)
+        for ffn in ffns:
+            n_lanes = ffn.n_lanes
             if next_slot + n_lanes > self.d_hidden:
                 continue
-            if not self._is_admissible(block):
+            if not self._is_admissible(ffn):
                 self._admission_deferred = True
                 continue
-            target_cols = self._try_allocate(block, residual_map)
+            target_cols = self._try_allocate(ffn, residual_map)
             if target_cols is None:
                 continue
             ok, additions, delta = fits_cancel(target_cols)
             if not ok:
-                residual_map.free(block)
+                residual_map.free(ffn)
                 continue
             mlp_slots = list(range(next_slot, next_slot + n_lanes))
             next_slot += n_lanes
             self._require_live(
-                block.inputs[0],
+                ffn.inputs[0],
                 residual_map,
-                f"compute_block input for {block!r}",
+                f"compute_ffn input for {ffn!r}",
             )
-            input_cols = residual_map.resolve_indices(block.inputs[0])
+            input_cols = residual_map.resolve_indices(ffn.inputs[0])
             mlp_ops.append(
                 MLPOp(
-                    "compute_block",
-                    block,
+                    "compute_ffn",
+                    ffn,
                     target_cols,
                     mlp_slots,
                     source_cols=input_cols,
@@ -641,9 +641,9 @@ class LayerScheduler:
             dirty = residual_map.dirty_subset(target_cols)
             if dirty:
                 residual_map.mark_clean(dirty)
-            computed_nodes.add(block)
-            ready.discard(block)
-            self._mark_scheduled(block)
+            computed_nodes.add(ffn)
+            ready.discard(ffn)
+            self._mark_scheduled(ffn)
 
         # 3b. Standalone Linears via MLP bypass (ReLU bypass trick).
         # These were skipped in the attention phase because the policy

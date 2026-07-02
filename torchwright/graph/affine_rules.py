@@ -39,7 +39,7 @@ def compute_affine_bound(node: "Node") -> AffineBound:
     )
     from torchwright.graph.linear import Linear
     from torchwright.graph.relu import ReLU
-    from torchwright.graph.block import Block
+    from torchwright.graph.ffn import FFN
     from torchwright.graph.embedding import Embedding
     from torchwright.graph.attn import Attn
 
@@ -68,8 +68,8 @@ def compute_affine_bound(node: "Node") -> AffineBound:
     if isinstance(node, ReLU):
         return _relu_rule(node)
 
-    if isinstance(node, Block):
-        return _block_rule(node)
+    if isinstance(node, FFN):
+        return _ffn_rule(node)
 
     if isinstance(node, Assert):
         return _assert_rule(node)
@@ -99,8 +99,8 @@ def _linear_affine(
 
     ``W`` is ``(d_input, d_output)`` and ``c`` is ``(d_output,)``, both
     float64.  Pure function of the input bound and the affine params — shared
-    by :func:`_linear_rule` (the ``Linear`` node) and :func:`_block_rule` (the
-    gate/out projections of a ``Block``)."""
+    by :func:`_linear_rule` (the ``Linear`` node) and :func:`_ffn_rule` (the
+    gate/out projections of an ``FFN``)."""
     W_plus = torch.clamp(W, min=0)
     W_minus = torch.clamp(W, max=0)
 
@@ -188,7 +188,7 @@ def _relu_affine(
     Pure function of the input bound.  ``warn_node`` (optional) is only used
     to emit the "infinite affine interval but finite value_type" warning
     against a real node; pass ``None`` when there is no single node behind the
-    bound (e.g. a ``Block``'s internal gate values)."""
+    bound (e.g. an ``FFN``'s internal gate values)."""
     intervals = inp_ab.to_interval()
     d = inp_ab.d_output
     n = inp_ab.n_cols
@@ -243,13 +243,13 @@ def _relu_rule(node) -> AffineBound:
     return _relu_affine(node.inputs[0]._affine_bound, warn_node=node.inputs[0])
 
 
-def _block_rule(node) -> AffineBound:
-    """Block: compose gate projection -> ReLU envelope -> output projection.
+def _ffn_rule(node) -> AffineBound:
+    """FFN: compose gate projection -> ReLU envelope -> output projection.
 
     The three sub-steps are exactly the rules the mined ``Linear -> ReLU ->
     Linear`` chain applies across its three nodes today, run here over one
     node's projections.  Step 1 is ReLU-only; a swish envelope is step 2's
-    problem, so a gated/swish block gets a fail-closed unbounded bound (sound,
+    problem, so a gated/swish FFN gets a fail-closed unbounded bound (sound,
     just not tight) — the compiler never lowers one this phase (the writer
     asserts ReLU-degenerate), so no tight bound is needed yet."""
     if node.activation != "relu" or node.up_proj is not None:

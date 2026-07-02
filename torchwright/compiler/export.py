@@ -961,7 +961,7 @@ def _emit_cached_layer_nodes(
     rms_norm: bool = False,
     rms_eps_name: Optional[str] = None,
 ) -> str:
-    """Emit cached attention + FFN nodes for one layer.
+    """Emit cached attention + MLP-sublayer nodes for one layer.
 
     Reads graph inputs ``past_K_{i}`` / ``past_V_{i}`` — the FULL static
     cache, sequence-major ``(S, n_heads, d_head)`` with zero-filled slots
@@ -1155,7 +1155,7 @@ def _emit_cached_layer_nodes(
             f"{p}_mlp_norm",
         )
 
-    # FFN + skip
+    # MLP sublayer + skip
     node("MatMul", [mlp_in, f"{p}_W1"], [f"{p}_l1_m"])
     node("Add", [f"{p}_l1_m", f"{p}_b1"], [f"{p}_l1_b"])
     node("Relu", [f"{p}_l1_b"], [f"{p}_l1_r"])

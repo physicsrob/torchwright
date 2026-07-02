@@ -6,10 +6,10 @@ ops layer built" to "certified compilable vocabulary"
 validates two things:
 
 1. **Closed vocabulary** — every reachable node is one of the compilable
-   types (Block, Attn, Linear, Add), bookkeeping (InputNode, LiteralValue,
+   types (FFN, Attn, Linear, Add), bookkeeping (InputNode, LiteralValue,
    Embedding, Concatenate, Placeholder), or a debug wrapper (Assert,
    DebugWatch, ValueLogger).  In particular no raw ``ReLU`` survives: since
-   Phase 2b the ops layer builds Block nodes natively, so a ReLU in a graph
+   Phase 2b the ops layer builds FFN nodes natively, so a ReLU in a graph
    is a construction bug (a hand-built ``Linear -> ReLU -> Linear`` chain,
    or a stray nonlinearity the scheduler has no write path for).  The chain
    miner that used to live in ``graph/blockify.py`` is folded in here as
@@ -45,7 +45,7 @@ from torchwright.compiler.utils import get_ancestor_nodes
 from torchwright.graph import Node
 from torchwright.graph.affine_rules import refresh_node_caches
 from torchwright.graph.attn import Attn
-from torchwright.graph.block import Block
+from torchwright.graph.ffn import FFN
 from torchwright.graph.embedding import Embedding
 from torchwright.graph.linear import Linear
 from torchwright.graph.misc import (
@@ -65,7 +65,7 @@ from torchwright.graph.relu import ReLU
 # rejected at the boundary with a construction-bug error instead of failing
 # deep inside scheduling.
 VOCABULARY: Tuple[type, ...] = (
-    Block,
+    FFN,
     Attn,
     Linear,
     Add,
@@ -108,7 +108,7 @@ class LoweredGraph:
     ) -> CostSummary:
         """Hardware demand readable *before* scheduling.
 
-        Aggregates heads by class, MLP bypass slot demand, and Block lane
+        Aggregates heads by class, MLP bypass slot demand, and FFN lane
         counts from a resolved realization table plus each class's
         resource signature.  Pass the resolved table you intend to compile
         with; by default the static policy resolves the free choices (the
@@ -137,7 +137,7 @@ class _ChainMiner:
 
     Ported from the deleted ``graph/blockify.py``.  Used only to enrich the
     vocabulary error: when raw ReLU nodes are found, chains among them are
-    reported as (L1, ReLU, L2) id triples so the fix ("build a Block") is
+    reported as (L1, ReLU, L2) id triples so the fix ("build an FFN") is
     obvious.  Resolves effective consumers transparently through
     ``Concatenate`` **and** ``Assert``/``DebugWatch`` so a hand-built chain
     is detected even when a wrapper sits on an internal value.
@@ -228,13 +228,13 @@ def _check_vocabulary(all_nodes: Set[Node]) -> None:
             parts.append(
                 f"{len(chain_ids)} hand-built Linear->ReLU->Linear chain(s) "
                 f"(L1,ReLU,L2 node ids) {chain_ids} — since Phase 2b ops "
-                f"build Block nodes natively (linear_relu_linear); build a "
-                f"Block instead"
+                f"build FFN nodes natively (linear_relu_linear); build an "
+                f"FFN instead"
             )
         if lone:
             parts.append(
                 f"raw ReLU node(s) {lone} with no chain shape — the "
-                f"scheduler has no write path for a lone ReLU; use a Block"
+                f"scheduler has no write path for a lone ReLU; use an FFN"
             )
     others = [n for n in strays if not isinstance(n, ReLU)]
     if others:

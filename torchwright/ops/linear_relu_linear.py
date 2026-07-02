@@ -1,7 +1,7 @@
 import torch
 
 from torchwright.graph import Node
-from torchwright.graph.block import Block
+from torchwright.graph.ffn import FFN
 
 
 def linear_relu_linear(
@@ -12,17 +12,17 @@ def linear_relu_linear(
     output_bias: torch.Tensor,
     name: str = "",
 ) -> Node:
-    """Build a degenerate-ReLU :class:`~torchwright.graph.block.Block`.
+    """Build a degenerate-ReLU :class:`~torchwright.graph.ffn.FFN`.
 
     This is the fundamental building block for piecewise-linear functions in
     the computation graph: an input projection, a ReLU, and an output
-    projection.  It returns a single :class:`Block` node (not the three
+    projection.  It returns a single :class:`FFN` node (not the three
     ``Linear -> ReLU -> Linear`` nodes it once built) — the ReLU and the two
-    projections are the Block's gate projection, activation, and output
+    projections are the FFN's gate projection, activation, and output
     projection.
 
-    A Block is a **packable unit**, not a sublayer: the scheduler bins many
-    blocks' lanes into one MLP sublayer's hidden pool, so several calls can
+    An FFN is a **packable unit**, not a sublayer: the scheduler bins many
+    FFNs' lanes into one MLP sublayer's hidden pool, so several calls can
     share one compiled MLP sublayer.  (The old "one call = one MLP sublayer"
     description was never quite true and is easy to over-rely on.)
 
@@ -33,10 +33,10 @@ def linear_relu_linear(
         output_proj: Output-projection weight matrix, shape
             ``(d_hidden, d_output)``.
         output_bias: Output-projection bias, shape ``(d_output,)``.
-        name: Label for the Block (for debugging).
+        name: Label for the FFN (for debugging).
 
     Returns:
-        The :class:`Block` node computing
+        The :class:`FFN` node computing
         ``ReLU(x @ input_proj.T + input_bias) @ output_proj + output_bias``.
     """
     if len(input_proj.shape) == 1:
@@ -56,7 +56,7 @@ def linear_relu_linear(
     assert output_proj.shape == (d_hidden, d_output)
     assert output_bias.shape == (d_output,)
 
-    return Block(
+    return FFN(
         input_node,
         gate_proj=input_proj,
         gate_bias=input_bias,

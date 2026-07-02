@@ -27,7 +27,7 @@ For each candidate join node J (currently: ``Concatenate`` with
        (i.e., have any consumer outside ``exclusive ∪ {J}``,
        modulo ``Concatenate`` transparency).
     4. Peak width = the max ``len(n)`` over the surviving branch nodes
-       (a Block's output occupies residual columns like any node).
+       (an FFN's output occupies residual columns like any node).
     5. Accept the cluster iff ≥ ``min_chains`` branches survive and
        the maximum branch peak-width ≥ ``min_peak_width``.
 
@@ -192,7 +192,7 @@ class SiblingClusterAnalyzer:
             if not exclusive:
                 continue
 
-            # Step 4: compute peak residual width.  A Block's output occupies
+            # Step 4: compute peak residual width.  An FFN's output occupies
             # residual columns like any node (its internal ReLU activations
             # live in MLP hidden slots, but that is not a graph node here), so
             # every exclusive node contributes its width.

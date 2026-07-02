@@ -59,7 +59,7 @@ from torchwright.graph import (
     Node,
 )
 from torchwright.graph.misc import LiteralValue
-from torchwright.graph.block import Block
+from torchwright.graph.ffn import FFN
 
 # ---------------------------------------------------------------------------
 # Public dataclasses
@@ -391,7 +391,7 @@ def is_flex(node: Node, gm: GraphModel) -> bool:
     bypass (`slots = 2 · d_output`).  The heuristic picks one statically
     per policy; CP-SAT can pick per-node.
 
-    `Attn` / `Block` / `LiteralValue` stay locked (single candidate
+    `Attn` / `FFN` / `LiteralValue` stay locked (single candidate
     class); `Add` is conditional, not flex — its class is decided by
     schedule state (addend deadness), not by a free routing variable.
     """
@@ -423,11 +423,11 @@ def heads_for(node: Node, d_head: int) -> int:
 def slots_for(node: Node, gm: GraphModel) -> int:
     """MLP slots consumed if MLP-routed.
 
-    A Block carries one hidden slot per lane (the composite's slot
+    An FFN carries one hidden slot per lane (the composite's slot
     demand); a standalone Linear routed to MLP bypass needs `2 ·
     d_output`; everything else costs no hidden slots.
     """
-    if isinstance(node, Block):
+    if isinstance(node, FFN):
         return node.n_lanes
     if isinstance(node, Linear):
         return 2 * node.d_output  # MLP bypass
@@ -440,9 +440,9 @@ def uses_residual(node: Node, gm: GraphModel) -> bool:
     """True iff this node gets its own residual-stream column allocation.
 
     Every schedulable node writes its output to the residual stream (a
-    Block's output, a Linear's output, an Add, an Attn, a LiteralValue).
-    The Block's internal ReLU activations live in MLP hidden slots, not
-    the residual stream, but the Block node itself (its output) does use
+    FFN's output, a Linear's output, an Add, an Attn, a LiteralValue).
+    The FFN's internal ReLU activations live in MLP hidden slots, not
+    the residual stream, but the FFN node itself (its output) does use
     residual columns.
     """
     return True
@@ -1038,7 +1038,7 @@ def build_cpsat_model(
         )
 
     # ---- MLP slots cumulative ----
-    # For flex nodes, MLP demand is gated by NOT(is_attn).  A Block carries
+    # For flex nodes, MLP demand is gated by NOT(is_attn).  An FFN carries
     # its lane slots and is pinned to MLP (is_attn == 0), so its interval is
     # always present.
     mlp_intervals: List = []

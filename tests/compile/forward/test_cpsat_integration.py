@@ -31,9 +31,9 @@ D_HEAD = 16
 
 
 def _build_relu_chain():
-    """Input -> Block (a degenerate-ReLU MLP block) graph."""
+    """Input -> FFN (a degenerate-ReLU FFN) graph."""
     x = create_input("x", 8)
-    block = linear_relu_linear(
+    ffn = linear_relu_linear(
         x,
         torch.randn(16, 8),
         torch.randn(16),
@@ -41,11 +41,11 @@ def _build_relu_chain():
         torch.randn(4),
         name="mlp",
     )
-    return block, {"x": torch.randn(3, 8)}
+    return ffn, {"x": torch.randn(3, 8)}
 
 
 def _build_branchy():
-    """A non-trivial graph: input -> two parallel Blocks -> add."""
+    """A non-trivial graph: input -> two parallel FFNs -> add."""
     x = create_input("x", 8)
     a = linear_relu_linear(
         x,
@@ -68,7 +68,7 @@ def _build_branchy():
 
 
 def test_relu_chain_compiles_with_cpsat():
-    """Smallest non-trivial graph: chain of one MLP block."""
+    """Smallest non-trivial graph: chain of one FFN."""
     out, inputs = _build_relu_chain()
     net = forward_compile(
         d=D,

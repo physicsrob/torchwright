@@ -67,9 +67,9 @@ def _make_biased_linear(inp, d_out, name=""):
     return Linear(inp, torch.randn(len(inp), d_out), torch.randn(d_out), name=name)
 
 
-def _make_block(inp, d_hidden, d_out, name=""):
-    """A degenerate-ReLU Block (the former L1 -> ReLU -> L2 chain, now one
-    node).  Returns the Block."""
+def _make_ffn(inp, d_hidden, d_out, name=""):
+    """A degenerate-ReLU FFN (the former L1 -> ReLU -> L2 chain, now one
+    node).  Returns the FFN."""
     return linear_relu_linear(
         inp,
         torch.randn(d_hidden, len(inp)),
@@ -107,12 +107,12 @@ def test_schedule_attn_node():
 
 
 def test_schedule_block():
-    """A Block produces MLPOp('compute_block'); the Block is marked computed."""
+    """An FFN produces MLPOp('compute_ffn'); the FFN is marked computed."""
     pos = _make_reserved_block()
     x = InputNode("x", 4, value_range=(-100.0, 100.0))
-    block = _make_block(x, 8, 3, "chain")
+    ffn = _make_ffn(x, 8, 3, "chain")
 
-    graph = GraphAnalyzer(block)
+    graph = GraphAnalyzer(ffn)
     rmap = ResidualStreamMap(D)
     rmap.allocate(pos)
     rmap.allocate(x)
@@ -121,12 +121,12 @@ def test_schedule_block():
     scheduler = LayerScheduler(graph, D, D_HEAD, pos)
     attn_ops, mlp_ops, _biased = scheduler.schedule_layer(rmap, computed)
 
-    block_ops = [op for op in mlp_ops if op.op_type == "compute_block"]
-    assert len(block_ops) == 1
-    assert block_ops[0].node is block
-    assert len(block_ops[0].mlp_slots) == 8  # hidden width (n_lanes)
+    ffn_ops = [op for op in mlp_ops if op.op_type == "compute_ffn"]
+    assert len(ffn_ops) == 1
+    assert ffn_ops[0].node is ffn
+    assert len(ffn_ops[0].mlp_slots) == 8  # hidden width (n_lanes)
 
-    assert block in computed
+    assert ffn in computed
 
 
 def test_schedule_constant():
@@ -275,11 +275,11 @@ def test_schedule_cancellation():
     pos = _make_reserved_block()
     x = InputNode("x", 4, value_range=(-100.0, 100.0))
     a = _make_linear(x, 4, "a")
-    block = _make_block(a, 8, 3, "out")
-    # Graph: x -> a -> block (output)
+    ffn = _make_ffn(a, 8, 3, "out")
+    # Graph: x -> a -> ffn (output)
     # After computing a: x is dead (x's only consumer is a, which is computed)
 
-    graph = GraphAnalyzer(block)
+    graph = GraphAnalyzer(ffn)
     rmap = ResidualStreamMap(D)
     rmap.allocate(pos)
     rmap.allocate(x)
@@ -463,14 +463,14 @@ def test_head_budget_exhaustion():
 
 
 def test_mlp_slot_exhaustion():
-    """More Blocks than MLP slots: respects slot budget."""
+    """More FFNs than MLP slots: respects slot budget."""
     pos = _make_reserved_block()
     x = InputNode("x", 4, value_range=(-100.0, 100.0))
-    # 4 blocks × 20 slots each = 80 > D=64
-    blocks = []
+    # 4 FFNs × 20 slots each = 80 > D=64
+    ffns = []
     for i in range(4):
-        blocks.append(_make_block(x, 20, 2, f"chain{i}"))
-    out_cat = Concatenate(blocks)
+        ffns.append(_make_ffn(x, 20, 2, f"chain{i}"))
+    out_cat = Concatenate(ffns)
     out = _make_linear(out_cat, 1, "out")
 
     graph = GraphAnalyzer(out)
@@ -483,12 +483,12 @@ def test_mlp_slot_exhaustion():
     attn_ops, mlp_ops, _biased = scheduler.schedule_layer(rmap, computed)
 
     total_slots = sum(
-        len(op.mlp_slots) for op in mlp_ops if op.op_type == "compute_block"
+        len(op.mlp_slots) for op in mlp_ops if op.op_type == "compute_ffn"
     )
     assert total_slots <= D
 
-    block_ops = [op for op in mlp_ops if op.op_type == "compute_block"]
-    assert 0 < len(block_ops) < 4
+    ffn_ops = [op for op in mlp_ops if op.op_type == "compute_ffn"]
+    assert 0 < len(ffn_ops) < 4
 
 
 # ---------------------------------------------------------------------------
@@ -509,9 +509,9 @@ def test_schedule_under_column_pressure():
     )  # fills the stream to 0 free alongside pos + x + a
     x = InputNode("x", 4, value_range=(-100.0, 100.0))
     a = _make_linear(x, 4, "a")
-    block = _make_block(a, 8, 3, "out")
+    ffn = _make_ffn(a, 8, 3, "out")
 
-    graph = GraphAnalyzer(block)
+    graph = GraphAnalyzer(ffn)
     rmap = ResidualStreamMap(D)
     rmap.allocate(pos)
     rmap.allocate(filler)
@@ -532,10 +532,10 @@ def test_schedule_under_column_pressure():
         x_cols <= cancel_targets
     ), f"expected x's cols {x_cols} within cancel targets {cancel_targets}"
 
-    # Block should still be scheduled
-    block_ops = [op for op in mlp_ops if op.op_type == "compute_block"]
-    assert len(block_ops) == 1
-    assert block in computed
+    # FFN should still be scheduled
+    ffn_ops = [op for op in mlp_ops if op.op_type == "compute_ffn"]
+    assert len(ffn_ops) == 1
+    assert ffn in computed
 
 
 # ---------------------------------------------------------------------------
@@ -550,8 +550,8 @@ def test_multi_layer_progression():
     """
     pos = _make_reserved_block()
     x = InputNode("x", 4, value_range=(-100.0, 100.0))
-    block_a = _make_block(x, 8, 4, "a")
-    block_b = _make_block(block_a, 6, 3, "b")
+    block_a = _make_ffn(x, 8, 4, "a")
+    block_b = _make_ffn(block_a, 6, 3, "b")
 
     graph = GraphAnalyzer(block_b)
     rmap = ResidualStreamMap(D)
@@ -561,12 +561,12 @@ def test_multi_layer_progression():
 
     scheduler = LayerScheduler(graph, D, D_HEAD, pos)
 
-    # Layer 1: first block scheduled
+    # Layer 1: first FFN scheduled
     scheduler.schedule_layer(rmap, computed)
     assert block_a in computed
     assert block_b not in computed
 
-    # Layer 2: second block scheduled (depends on first)
+    # Layer 2: second FFN scheduled (depends on first)
     scheduler.schedule_layer(rmap, computed)
     assert block_b in computed
 
@@ -580,8 +580,8 @@ def test_deferred_add_fires_via_compute_add():
     pos = _make_reserved_block()
     a = InputNode("a", 4, value_range=(-100.0, 100.0))
     b = InputNode("b", 4, value_range=(-100.0, 100.0))
-    a_chain = _make_block(a, 8, 2, "ac")
-    b_chain = _make_block(b, 8, 2, "bc")
+    a_chain = _make_ffn(a, 8, 2, "ac")
+    b_chain = _make_ffn(b, 8, 2, "bc")
     add_node = Add(a, b)
     out_cat = Concatenate([add_node, a_chain, b_chain])
     out = _make_linear(out_cat, 1, "out")
@@ -616,9 +616,9 @@ def test_scheduling_with_concatenate_input():
     b = InputNode("b", 4, value_range=(-100.0, 100.0))
     c = InputNode("c", 4, value_range=(-100.0, 100.0))
     cat = Concatenate([a, b, c])
-    block = _make_block(cat, 8, 3, "out")
+    ffn = _make_ffn(cat, 8, 3, "out")
 
-    graph = GraphAnalyzer(block)
+    graph = GraphAnalyzer(ffn)
     rmap = ResidualStreamMap(D)
     rmap.allocate(pos)
     rmap.allocate(a)
@@ -629,15 +629,15 @@ def test_scheduling_with_concatenate_input():
     scheduler = LayerScheduler(graph, D, D_HEAD, pos)
     scheduler.schedule_layer(rmap, computed)
 
-    # Block not ready: c is missing
-    assert block not in computed
+    # FFN not ready: c is missing
+    assert ffn not in computed
 
     # Now add c to computed
     computed.add(c)
     scheduler.schedule_layer(rmap, computed)
 
-    # Block should fire
-    assert block in computed
+    # FFN should fire
+    assert ffn in computed
 
 
 # ---------------------------------------------------------------------------
@@ -646,13 +646,13 @@ def test_scheduling_with_concatenate_input():
 
 
 def test_mixed_attn_and_mlp():
-    """Both an Attn node and a Block ready: both scheduled in same layer."""
+    """Both an Attn node and an FFN ready: both scheduled in same layer."""
     pos = _make_reserved_block()
     v = InputNode("v", 4, value_range=(-100.0, 100.0))
     x = InputNode("x", 4, value_range=(-100.0, 100.0))
     attn_node = _make_attn(v)
-    block = _make_block(x, 8, 3, "chain")
-    out_cat = Concatenate([attn_node, block])
+    ffn = _make_ffn(x, 8, 3, "chain")
+    out_cat = Concatenate([attn_node, ffn])
     out = _make_linear(out_cat, 1, "out")
 
     graph = GraphAnalyzer(out)
@@ -666,9 +666,9 @@ def test_mixed_attn_and_mlp():
     attn_ops, mlp_ops, _biased = scheduler.schedule_layer(rmap, computed)
 
     assert any(op.op_type == "compute_attn" and op.node is attn_node for op in attn_ops)
-    assert any(op.op_type == "compute_block" and op.node is block for op in mlp_ops)
+    assert any(op.op_type == "compute_ffn" and op.node is ffn for op in mlp_ops)
     assert attn_node in computed
-    assert block in computed
+    assert ffn in computed
 
 
 # ---------------------------------------------------------------------------

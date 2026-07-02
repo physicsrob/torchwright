@@ -29,7 +29,7 @@ from torchwright.compiler.forward.scheduling_policy import (
     SchedulingPolicy,
 )
 from torchwright.graph import Add, Linear
-from torchwright.graph.block import Block
+from torchwright.graph.ffn import FFN
 from torchwright.graph.misc import Concatenate, LiteralValue
 from torchwright.ops.inout_nodes import create_input
 from torchwright.ops.linear_relu_linear import linear_relu_linear
@@ -47,7 +47,7 @@ def _block(x, d_input, n_lanes, d_output, seed=0):
 
 
 def _test_graph():
-    """x -> {a, b} Linears -> Add; plus a Block and a LiteralValue."""
+    """x -> {a, b} Linears -> Add; plus an FFN and a LiteralValue."""
     x = create_input("x", 4, value_range=(-1.0, 1.0))
     a = Linear(x, torch.randn(4, 3) * 0.2, torch.randn(3) * 0.1, name="a")
     b = Linear(x, torch.randn(4, 3) * 0.2, torch.randn(3) * 0.1, name="b")
@@ -69,7 +69,7 @@ def test_candidate_classes_declaration():
     assert candidate_classes(add) == (RESIDUAL_REUSE, ATTN_COPY)
     assert candidate_classes(blk) == (MLP_COMPOSITE,)
     assert candidate_classes(lit) == (MLP_LITERAL,)
-    assert isinstance(blk, Block)
+    assert isinstance(blk, FFN)
     with pytest.raises(TypeError):
         candidate_classes(out)  # Concatenate is not schedulable
 
@@ -150,7 +150,7 @@ def test_resolve_from_assignment():
 def test_resolve_from_assignment_rejects_contradiction():
     out, a, b, add, blk, lit = _test_graph()
     table = lower(out).realization_table
-    # The solve routing a Block to attention contradicts its only class.
+    # The solve routing an FFN to attention contradicts its only class.
     with pytest.raises(UnresolvedRealizationError, match="only realization"):
         table.resolve_from_assignment({blk.node_id: "attn"})
 

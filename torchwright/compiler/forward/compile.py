@@ -350,7 +350,7 @@ def _run_heuristic_warm_start(
             return {}, {}, {}, 0
         # Routing decisions for standalone Linears: heuristic placed
         # compute_linear in attention or compute_linear_bypass in
-        # MLP.  Blocks are non-flex (always the MLP composite) so we
+        # MLP.  FFNs are non-flex (always the MLP composite) so we
         # don't hint them.
         for op in attn_ops:
             if op.op_type == "compute_linear" and op.node is not None:

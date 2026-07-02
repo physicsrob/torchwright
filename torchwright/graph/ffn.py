@@ -1,23 +1,23 @@
-"""The Block node: a first-class MLP-block (lanes + output projection).
+"""The FFN node: a first-class feed-forward unit (lanes + output projection).
 
-A Block is the *structural* unit the compiled transformer's MLP sublayer
+An FFN is the *structural* unit the compiled transformer's MLP sublayer
 realizes directly, as opposed to the *semantic* ``Linear -> ReLU -> Linear``
 chain the scheduler mines today.  It is the shape the gated (SwiGLU) machine
 needs; step 1 (this phase) instantiates only the degenerate ReLU form (each
-lane's "up" factor is the constant 1), so a Block compiles to exactly the same
+lane's "up" factor is the constant 1), so an FFN compiles to exactly the same
 ``linear1 -> ReLU -> linear2`` MLP module a mined chain does — identical math,
 identical weights.
 
 See ``docs/block_lane_spec.md`` for the full spec.  Two facts worth pinning
 here because they are easy to get wrong:
 
-- **A Block is a packable unit, not a sublayer.**  The scheduler bins many
-  blocks' lanes into one MLP sublayer's hidden pool.  Nothing here promises
+- **An FFN is a packable unit, not a sublayer.**  The scheduler bins many
+  FFNs' lanes into one MLP sublayer's hidden pool.  Nothing here promises
   sublayer ownership — do not rebuild the ``linear_relu_linear`` "one call =
   one MLP sublayer" assumption on top of it.
-- **A Block owns its input projection.**  Blockify asserts the mined first
-  Linear is exclusive (its only consumer is the chain's ReLU); a shared
-  upstream value stays a separate ``Linear`` feeding the Block.
+- **An FFN owns its input projection.**  The gate rows are the FFN's own
+  weights; a shared upstream value stays a separate ``Linear`` feeding the
+  FFN.
 """
 
 from typing import Optional
@@ -28,9 +28,9 @@ from torchwright.graph import Node
 from torchwright.graph.value_type import NodeValueType
 
 
-class Block(Node):
-    """One MLP block: lanes computed from a gate (and optional up) projection,
-    combined by an output projection.
+class FFN(Node):
+    """One feed-forward unit: lanes computed from a gate (and optional up)
+    projection, combined by an output projection.
 
     For an input row ``x`` (width ``d_input``)::
 
@@ -40,7 +40,7 @@ class Block(Node):
     where ``up[j](x)`` is the constant 1 (degenerate lane, ``up_proj is None``
     — step 1's only form) or ``up_proj[j] · x + up_bias[j]`` (gated lane, step
     2).  ``act`` is ``"relu"`` (step 1) or ``"swish"`` (step 2).  Lane kind is
-    uniform per block.
+    uniform per FFN.
 
     Attributes:
         gate_proj: ``(n_lanes, d_input)`` gate projection (row per lane).
@@ -74,12 +74,12 @@ class Block(Node):
     ):
         if activation not in ("relu", "swish"):
             raise ValueError(
-                f"Block activation must be 'relu' or 'swish', got {activation!r}"
+                f"FFN activation must be 'relu' or 'swish', got {activation!r}"
             )
         n_lanes, d_input = gate_proj.shape
         assert (
             len(input_node) == d_input
-        ), f"Block input width {len(input_node)} != gate_proj d_input {d_input}"
+        ), f"FFN input width {len(input_node)} != gate_proj d_input {d_input}"
         assert gate_bias.shape == (
             n_lanes,
         ), f"gate_bias shape {tuple(gate_bias.shape)} != ({n_lanes},)"
@@ -92,7 +92,7 @@ class Block(Node):
         ), f"out_bias shape {tuple(out_bias.shape)} != ({d_output},)"
         if (up_proj is None) != (up_bias is None):
             raise ValueError(
-                "Block up_proj and up_bias must both be set (gated lane) or "
+                "FFN up_proj and up_bias must both be set (gated lane) or "
                 "both None (degenerate lane)."
             )
         if up_proj is not None:
@@ -143,7 +143,7 @@ class Block(Node):
 
     def compute_value_type(self) -> NodeValueType:
         # Default; the real per-component range comes from the affine bound
-        # (_block_rule).  Semantic overrides stay op-level, as for Linear/ReLU.
+        # (_ffn_rule).  Semantic overrides stay op-level, as for Linear/ReLU.
         return NodeValueType()
 
     def num_params(self):
