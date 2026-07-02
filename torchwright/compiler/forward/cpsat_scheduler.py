@@ -37,6 +37,13 @@ from typing import Dict, FrozenSet, List, Optional, Set, Tuple
 from ortools.sat.python import cp_model
 
 from torchwright.compiler.forward.graph_analysis import GraphAnalyzer
+from torchwright.compiler.realization import (
+    CLASS_SUBLAYER,
+    candidate_classes,
+    has_flex_choice,
+    is_conditional,
+    static_flex_class,
+)
 from torchwright.compiler.forward.scheduling_policy import (
     LEGACY_POLICY,
     SchedulingPolicy,
@@ -356,35 +363,39 @@ def routing(node: Node, gm: GraphModel, policy: SchedulingPolicy) -> str:
     Used when `flex_routing=False`: every node has a fixed sublayer.
     With `flex_routing=True`, only `is_flex(n)` nodes' modes become
     CP-SAT decision variables; others still use this routing.
+
+    Derived from the shared option set
+    (`torchwright/compiler/realization.py:candidate_classes`) — the same
+    declaration the eager path's static resolver reads, so the two paths
+    cannot drift apart on what the options are.
     """
-    if isinstance(node, Attn):
+    if is_conditional(node):
+        # Add: residual_reuse vs attn_copy is a schedule-state conditional,
+        # but both classes are attention-sublayer ops.
         return ATTN
-    if isinstance(node, Add):
-        return ATTN
-    if isinstance(node, Block):
-        return MLP  # a Block is the L->ReLU->L composite, always MLP-locked
-    if isinstance(node, LiteralValue):
-        return MLP
-    if isinstance(node, Linear):
-        if policy.local_in_attention == "always":
-            return ATTN
-        return MLP
-    raise TypeError(f"Unknown schedulable node type: {type(node).__name__}")
+    if has_flex_choice(node):
+        # Standalone Linear: the policy pins the sublayer here; with
+        # flex_routing=True the CP-SAT choice variable overrides this.
+        return CLASS_SUBLAYER[static_flex_class(candidate_classes(node), policy)]
+    (single,) = candidate_classes(node)  # raises TypeError on unknown types
+    return CLASS_SUBLAYER[single]
 
 
 def is_flex(node: Node, gm: GraphModel) -> bool:
     """True iff this node's routing is a CP-SAT decision variable
     when `flex_routing=True`.
 
-    Exactly the standalone Linears: a Linear can run in attention
-    (`heads = ⌈d_input/d_head⌉`) or in MLP bypass (`slots = 2 ·
-    d_output`).  The heuristic picks one statically per policy; CP-SAT
-    can pick per-node.
+    Exactly the nodes with a free realization choice
+    (`realization.has_flex_choice`) — today the standalone Linears: a
+    Linear can run in attention (`heads = ⌈d_input/d_head⌉`) or in MLP
+    bypass (`slots = 2 · d_output`).  The heuristic picks one statically
+    per policy; CP-SAT can pick per-node.
 
-    `Attn` / `Add` / `Block` / `LiteralValue` stay locked because they
-    have only one valid sublayer (a Block is always the MLP composite).
+    `Attn` / `Block` / `LiteralValue` stay locked (single candidate
+    class); `Add` is conditional, not flex — its class is decided by
+    schedule state (addend deadness), not by a free routing variable.
     """
-    return isinstance(node, Linear)
+    return has_flex_choice(node)
 
 
 def heads_for(node: Node, d_head: int) -> int:

@@ -1084,6 +1084,8 @@ def forward_compile(
                 clusters=clusters,
                 admission_budget_fraction=admission_budget_fraction,
                 policy=policy,
+                # Fallback resolves statically, same as optimize=0.
+                realization_table=lowered.realization_table.resolve_static(policy),
             )
         else:
             if verbose and net.cpsat_solve_stats.status_name != "CACHED":
@@ -1102,6 +1104,11 @@ def forward_compile(
                 clusters=clusters,
                 admission_budget_fraction=admission_budget_fraction,
                 policy=policy,
+                # The solve is the resolver: its per-node sublayer decisions
+                # resolve the lowered table into the artifact the walk reads.
+                realization_table=lowered.realization_table.resolve_from_assignment(
+                    assignment.node_to_routing
+                ),
             )
     else:
         scheduler = LayerScheduler(
@@ -1113,7 +1120,14 @@ def forward_compile(
             clusters=clusters,
             admission_budget_fraction=admission_budget_fraction,
             policy=policy,
+            # The static policy is the optimize=0 resolver.
+            realization_table=lowered.realization_table.resolve_static(policy),
         )
+
+    # Realization completeness: every schedulable node's entry is resolved
+    # or explicitly conditional before the walk starts (the walk only reads).
+    scheduler.realization_table.check_complete(graph.get_all_nodes())
+    net.realization_table = scheduler.realization_table
 
     # Save input indices before scheduling (scheduling may free/reassign them)
     input_indices: dict[Node, list[int]] = {}

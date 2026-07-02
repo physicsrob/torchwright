@@ -9,6 +9,7 @@ Mutates residual_map (allocate, free, reassign) and computed_nodes (add).
 
 from typing import Dict, List, Optional, Set, Tuple
 
+from torchwright.compiler.realization import RealizationTable
 from torchwright.compiler.residual_assignment import flatten_concat_nodes
 from torchwright.compiler.forward.cpsat_scheduler import ScheduleAssignment
 from torchwright.compiler.forward.graph_analysis import GraphAnalyzer
@@ -48,6 +49,7 @@ class LayerScheduler:
         admission_budget_fraction: float = 0.4,
         policy: Optional[SchedulingPolicy] = None,
         eager_free: bool = True,
+        realization_table: Optional[RealizationTable] = None,
     ):
         self.graph = graph
         self.d = d
@@ -56,6 +58,17 @@ class LayerScheduler:
         self.n_heads = d // d_head
         self.pos_encoding = pos_encoding
         self.policy = policy if policy is not None else SchedulingPolicy()
+        # The resolved realization table the walk reads (one artifact,
+        # written by whichever resolver the optimize level provides — see
+        # torchwright/compiler/realization.py).  When the caller doesn't
+        # pass one (standalone scheduler construction in tests), resolve
+        # statically from the policy through the same code path the
+        # optimize=0 compile uses.
+        if realization_table is None:
+            realization_table = RealizationTable.build(
+                graph.get_all_nodes()
+            ).resolve_static(self.policy)
+        self.realization_table = realization_table
         # Eager (within-layer) freeing: when a node is placed, free any of its
         # inputs that just became dead so their columns can be reused *in the
         # same layer*.  This is what lets the heuristic exploit within-layer
@@ -211,7 +224,7 @@ class LayerScheduler:
         for node in ready:
             if not isinstance(node, Linear) or node in bypass_set:
                 continue
-            if not self._route_linear_to_attn(node):
+            if not self.realization_table.is_attention_routed(node):
                 bypass_linears.append(node)
                 bypass_set.add(node)
 
@@ -352,7 +365,7 @@ class LayerScheduler:
                 n_heads = (node.d_v + self.d_head - 1) // self.d_head
                 compute_candidates.append(("compute_attn", node, n_heads))
             elif isinstance(node, Linear):
-                if not self._route_linear_to_attn(node):
+                if not self.realization_table.is_attention_routed(node):
                     bypass_linears.append(node)
                     continue
                 n_heads = self._heads_for_linear(node)
@@ -927,16 +940,6 @@ class LayerScheduler:
         """
         return self.graph.get_ready_nodes(computed_nodes)
 
-    def _route_linear_to_attn(self, node: Linear) -> bool:
-        """Should a standalone ``Linear`` go to the attention sublayer?
-
-        The default consults ``policy.local_in_attention``: ``"never"`` ->
-        MLP bypass, anything else -> attention.
-        :class:`DirectedLayerScheduler` overrides this to read the
-        per-node routing decision from its ``ScheduleAssignment``.
-        """
-        return self.policy.local_in_attention != "never"
-
     def _heads_for_node(self, node: Node) -> int:
         """Number of attention heads needed to copy a node's output."""
         return (len(node) + self.d_head - 1) // self.d_head
@@ -1116,7 +1119,8 @@ class DirectedLayerScheduler(LayerScheduler):
       schedule this layer.  Other ready nodes stay deferred until their
       assigned layer.
     - **Routing.** Each standalone ``Linear`` is forced into the attention
-      sublayer or the MLP bypass per ``assignment.node_to_routing[n]``.
+      sublayer or the MLP bypass per the realization table resolved from
+      ``assignment.node_to_routing`` (the solve is the resolver).
       ``policy.local_in_attention`` is ignored.
     - **Cancellation.** Dead-node candidates restricted to nodes with
       ``assignment.node_to_cancel_layer[n] == current_layer``.  The
@@ -1146,7 +1150,15 @@ class DirectedLayerScheduler(LayerScheduler):
         clusters: Optional[SiblingClusters] = None,
         admission_budget_fraction: float = 0.4,
         policy: Optional[SchedulingPolicy] = None,
+        realization_table: Optional[RealizationTable] = None,
     ):
+        # The directed path's resolver is the solve itself: its per-node
+        # sublayer decisions (node_to_routing) resolve the table the walk
+        # reads.  policy.local_in_attention plays no part here.
+        if realization_table is None:
+            realization_table = RealizationTable.build(
+                graph.get_all_nodes()
+            ).resolve_from_assignment(assignment.node_to_routing)
         super().__init__(
             graph,
             d,
@@ -1156,6 +1168,7 @@ class DirectedLayerScheduler(LayerScheduler):
             clusters=clusters,
             admission_budget_fraction=admission_budget_fraction,
             policy=policy,
+            realization_table=realization_table,
         )
         self._assignment = assignment
         self._current_layer: int = -1
@@ -1177,9 +1190,6 @@ class DirectedLayerScheduler(LayerScheduler):
         all_ready = self.graph.get_ready_nodes(computed_nodes)
         n2l = self._assignment.node_to_layer
         return {n for n in all_ready if n2l.get(n.node_id) == self._current_layer}
-
-    def _route_linear_to_attn(self, node: Linear) -> bool:
-        return self._assignment.node_to_routing.get(node.node_id) == "attn"
 
     def _literal_needed_now(self, node: Node, computed_nodes: Set[Node]) -> bool:
         # Assignment-driven: the CP-SAT layer assignment already places each

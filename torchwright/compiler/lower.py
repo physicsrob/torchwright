@@ -36,6 +36,7 @@ later recompute.
 from dataclasses import dataclass
 from typing import Dict, List, Set, Tuple
 
+from torchwright.compiler.realization import RealizationTable
 from torchwright.compiler.utils import get_ancestor_nodes
 from torchwright.graph import Node
 from torchwright.graph.affine_rules import refresh_node_caches
@@ -83,12 +84,17 @@ class LoweringError(ValueError):
 class LoweredGraph:
     """Certificate that a graph passed the lowering boundary.
 
-    Holds the certified output node.  Produced only by :func:`lower`;
-    the compile pipeline's scheduling stages consume this type, so an
-    uncertified graph cannot reach the scheduler.
+    Holds the certified output node and the **unresolved realization
+    table** — every schedulable node's candidate realization classes
+    (:mod:`torchwright.compiler.realization`).  Produced only by
+    :func:`lower`; the compile pipeline's scheduling stages consume this
+    type, so an uncertified graph cannot reach the scheduler.  A resolver
+    (the static policy at ``optimize=0``; the CP-SAT solve on the directed
+    path) turns the table into the resolved artifact the layer walk reads.
     """
 
     output_node: Node
+    realization_table: RealizationTable
 
 
 def _unwrap(node: Node) -> Node:
@@ -265,6 +271,7 @@ def lower(output_node: Node, *, verbose: bool = False) -> LoweredGraph:
     _check_vocabulary(all_nodes)
     for node in _topological_order(output_node):
         refresh_node_caches(node)
+    table = RealizationTable.build(all_nodes)
     if verbose:
         print(f"lower(): certified {len(all_nodes)} nodes (vocabulary + fresh caches)")
-    return LoweredGraph(output_node=output_node)
+    return LoweredGraph(output_node=output_node, realization_table=table)
