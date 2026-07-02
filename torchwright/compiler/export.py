@@ -101,6 +101,29 @@ def _write_meta(onnx_path: str, meta: dict) -> str:
     return meta_path
 
 
+def _schedule_provenance(compiled, optimize: int) -> dict:
+    """Solver provenance for the artifact meta.
+
+    ``compiled.cpsat_solve_stats`` carries the CP-SAT outcome (including the
+    synthetic CACHED stats on a schedule-cache hit) but was dropped at export,
+    so a heuristic-fallback artifact was indistinguishable from a real solve.
+    ``status`` values: OPTIMAL / FEASIBLE / CACHED mean the artifact runs a
+    CP-SAT schedule; UNKNOWN / INFEASIBLE with ``optimize > 0`` mean the
+    solver failed and the artifact ships the heuristic fallback; ``null``
+    means the solver never ran (``optimize == 0``).
+    """
+    stats = getattr(compiled, "cpsat_solve_stats", None)
+    if stats is None:
+        return {"optimize": int(optimize), "status": None}
+    return {
+        "optimize": int(optimize),
+        "status": stats.status_name,
+        "objective": stats.objective_value,
+        "best_bound": stats.best_objective_bound,
+        "is_optimal": stats.is_optimal,
+    }
+
+
 def debug_meta_path_for(onnx_path: str) -> str:
     base, _ = os.path.splitext(onnx_path)
     return base + ".debug.json"
@@ -1619,6 +1642,11 @@ def compile_to_onnx(
         # from the initializers, but eps is not a tensor).
         "rms_norm": rms_spec is not None,
         "rms_norm_eps": rms_spec.eps if rms_spec is not None else None,
+        # Solver provenance: distinguishes a real CP-SAT schedule (status
+        # OPTIMAL/FEASIBLE/CACHED) from the heuristic fallback (UNKNOWN/
+        # INFEASIBLE with optimize>0) — a fallback artifact is value-correct
+        # but unoptimized, and nothing else in the artifact records that.
+        "schedule": _schedule_provenance(compiled, optimize),
     }
     if extra_metadata:
         token_meta["extra"] = dict(extra_metadata)

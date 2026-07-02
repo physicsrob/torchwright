@@ -30,8 +30,9 @@ from __future__ import annotations
 
 import os
 import time
+import warnings
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Set, Tuple
+from typing import Dict, FrozenSet, List, Optional, Set, Tuple
 
 from ortools.sat.python import cp_model
 
@@ -213,6 +214,26 @@ class BuiltModel:
     # when Costs has secondary terms (earliness/waste); 1 otherwise.
     # ObjectiveValue() // objective_scale recovers the primary value.
     objective_scale: int = 1
+    # Tightened per-node layer domains `node_id -> (lo, hi)` when the model
+    # was built with `tighten_domains=True`; None otherwise.  Retained so
+    # hint validation can check layer hints against the actual variable
+    # domains without re-deriving them (and without reading IntVar.Proto(),
+    # which returns corrupted memory in the installed ortools build and
+    # segfaults a later Solve()).
+    layer_bounds: Optional[Dict[int, Tuple[int, int]]] = None
+    # Schedulable nodes whose cancel var is pinned to `max_layers` (pinned
+    # nodes and nodes consumed by a terminal Concatenate), and the same for
+    # freeable inputs.  Retained for hint validation.
+    keep_forever_ids: FrozenSet[int] = frozenset()
+    input_keep_ids: FrozenSet[int] = frozenset()
+    # Hint-aware cancel-window widening actually applied: `node_id -> delta`
+    # for every node whose window was widened past the uniform
+    # `last_consumer + 1 + K` (only nonzero deltas appear).  None when the
+    # model was built without hints.
+    cancel_window_delta: Optional[Dict[int, int]] = None
+    # The cancel-window slack K the model actually posted (None when the
+    # window family is disabled or `cancel_slack=None`).
+    eff_cancel_slack: Optional[int] = None
 
 
 # ---------------------------------------------------------------------------
@@ -531,6 +552,8 @@ def build_cpsat_model(
     reserve_residual: int = 0,
     assume_zero_init: bool = False,
     tighten_domains: bool = False,
+    hint_layers: Optional[Dict[int, int]] = None,
+    hint_cancel: Optional[Dict[int, int]] = None,
     _disabled_families: frozenset = frozenset(),
 ) -> BuiltModel:
     """Build (but do not solve) the CP-SAT scheduling model.
@@ -540,6 +563,12 @@ def build_cpsat_model(
     path.  ``solve_schedule`` calls this, then adds the warm-start hint, the
     decision strategy, solves, and reads the variables back out of the
     returned :class:`BuiltModel`.
+
+    ``hint_layers`` / ``hint_cancel`` are used ONLY to size the per-node
+    cancel windows (see the widening comment at the cancel-layer section) —
+    hint *application* (``AddHint``) stays in :func:`solve_schedule`.  With
+    both left as None the model is byte-identical to the hint-less build,
+    so diagnostics, the probe script, and hint-less callers are unchanged.
 
     ``_disabled_families`` is a diagnostic-only escape hatch: each name in
     :data:`CONSTRAINT_FAMILIES` gates one constraint family, and listing it
@@ -610,6 +639,9 @@ def build_cpsat_model(
     layer_var: Dict[int, cp_model.IntVar] = {}
     layer_var_hi_sum = 0
     layer_var_lo: Dict[int, int] = {}
+    layer_bounds: Optional[Dict[int, Tuple[int, int]]] = (
+        {} if bounds is not None else None
+    )
     for n in gm.schedulable:
         lo, hi = (
             (bounds[0][n.node_id], bounds[1][n.node_id])
@@ -624,6 +656,8 @@ def build_cpsat_model(
             )
         layer_var_hi_sum += hi
         layer_var_lo[n.node_id] = lo
+        if layer_bounds is not None:
+            layer_bounds[n.node_id] = (lo, hi)
         layer_var[n.node_id] = model.NewIntVar(lo, hi, f"L_n{n.node_id}")
 
     # ---- Routing: is_attn[n] BoolVar (or fixed literal) per node ----
@@ -673,6 +707,47 @@ def build_cpsat_model(
     # layers of the last consumer, so K=2 cuts the cancel decision
     # space ~30x with negligible loss of optimality.
     eff_cancel_slack = None if "cancel_slack" in _disabled_families else cancel_slack
+
+    # Hint-aware cancel-window widening.  Freeing a node's columns costs
+    # attention-head work charged against the same per-layer head budget as
+    # compute, so the heuristic warm-start *defers* a free when a layer's
+    # heads are full (`try_add_cancel` returns None — the free retries next
+    # layer).  A deferred free lands past the uniform
+    # `last_consumer + 1 + K` window, making the whole warm-start hint
+    # infeasible under this model: CP-SAT silently drops it, cold-searches,
+    # and `forward_compile` falls back to the heuristic (the optimize=2
+    # fallback incident, 2026-07).  For each hinted node, widen its window by
+    # exactly the amount the hint needs:
+    # `delta_n = max(0, hint_cancel[n] - (hint_base + 1 + K))` where
+    # `hint_base` is the hinted last-consumer layer (or the hinted birth
+    # layer when the node has no layer-bound consumers; 0 for freeable
+    # inputs).  `delta_n = 0` whenever the node or any needed consumer lacks
+    # a hint entry.  This is a pure relaxation: the cancel still pays its
+    # attention-head charge at whatever layer it lands and the residual
+    # interval still spans [layer, cancel), so no invalid schedule becomes
+    # expressible — the window just admits the schedules the heuristic
+    # actually emits, preserving the moving near-last-consumer shape.
+    cancel_window_delta: Dict[int, int] = {}
+
+    def _widen_delta(nid: int, hint_base: Optional[int]) -> int:
+        if hint_cancel is None or hint_base is None or eff_cancel_slack is None:
+            return 0
+        hinted = hint_cancel.get(nid)
+        if hinted is None:
+            return 0
+        delta = max(0, hinted - (hint_base + 1 + eff_cancel_slack))
+        if delta:
+            cancel_window_delta[nid] = delta
+        return delta
+
+    def _hinted_last_consumer(consumer_ids: List[int]) -> Optional[int]:
+        if hint_layers is None or not consumer_ids:
+            return None
+        hinted = [hint_layers.get(cid) for cid in consumer_ids]
+        if any(L is None for L in hinted):
+            return None
+        return max(hinted)
+
     cancel_layer: Dict[int, cp_model.IntVar] = {}
     keep_forever_ids: Set[int] = set()
     for n in gm.schedulable:
@@ -685,6 +760,7 @@ def build_cpsat_model(
             continue
         keep_forever = False
         consumer_layer_vars: List[cp_model.IntVar] = []
+        consumer_ids: List[int] = []
         for c in gm.consumers_eff.get(n, set()):
             if isinstance(c, Concatenate):
                 model.Add(cl == max_layers)
@@ -694,17 +770,23 @@ def build_cpsat_model(
                 if "cancel_consumer_lb" not in _disabled_families:
                     model.Add(cl >= layer_var[c.node_id] + 1)
                 consumer_layer_vars.append(layer_var[c.node_id])
+                consumer_ids.append(c.node_id)
         if keep_forever:
             keep_forever_ids.add(n.node_id)
             continue
         if eff_cancel_slack is not None and consumer_layer_vars:
+            delta = _widen_delta(n.node_id, _hinted_last_consumer(consumer_ids))
             last_cons = model.NewIntVar(0, max_layers - 1, f"last_cons_n{n.node_id}")
             model.AddMaxEquality(last_cons, consumer_layer_vars)
-            model.Add(cl <= last_cons + 1 + eff_cancel_slack)
+            model.Add(cl <= last_cons + 1 + eff_cancel_slack + delta)
         elif eff_cancel_slack is not None and not consumer_layer_vars:
             # No layer-bound consumers — cancel can fire right after
             # the node's own birth layer.
-            model.Add(cl <= layer_var[n.node_id] + 1 + eff_cancel_slack)
+            delta = _widen_delta(
+                n.node_id,
+                hint_layers.get(n.node_id) if hint_layers is not None else None,
+            )
+            model.Add(cl <= layer_var[n.node_id] + 1 + eff_cancel_slack + delta)
 
     # ---- Freeable input cancel layers ----
     # Freeable inputs are born at layer 0 (pre-allocated by the compiler
@@ -719,6 +801,7 @@ def build_cpsat_model(
         model.Add(cl >= 1)  # born at layer 0; live through at least layer 0
         keep_forever = False
         consumer_layer_vars = []
+        consumer_ids = []
         for c in gm.consumers_eff.get(n, set()):
             if isinstance(c, Concatenate):
                 model.Add(cl == max_layers)
@@ -728,15 +811,19 @@ def build_cpsat_model(
                 if "cancel_consumer_lb" not in _disabled_families:
                     model.Add(cl >= layer_var[c.node_id] + 1)
                 consumer_layer_vars.append(layer_var[c.node_id])
+                consumer_ids.append(c.node_id)
         if keep_forever:
             input_keep_ids.add(n.node_id)
             continue
         if eff_cancel_slack is not None and consumer_layer_vars:
+            delta = _widen_delta(n.node_id, _hinted_last_consumer(consumer_ids))
             last_cons = model.NewIntVar(0, max_layers - 1, f"last_cons_in{n.node_id}")
             model.AddMaxEquality(last_cons, consumer_layer_vars)
-            model.Add(cl <= last_cons + 1 + eff_cancel_slack)
+            model.Add(cl <= last_cons + 1 + eff_cancel_slack + delta)
         elif eff_cancel_slack is not None and not consumer_layer_vars:
-            model.Add(cl <= 1 + eff_cancel_slack)
+            # Born at layer 0, so the hinted base is the fixed birth layer 0.
+            delta = _widen_delta(n.node_id, 0)
+            model.Add(cl <= 1 + eff_cancel_slack + delta)
 
     # ---- Add free/compute classification ----
     # The heuristic schedules an `Add` via `add_into` (free regime)
@@ -1124,6 +1211,15 @@ def build_cpsat_model(
         n_heads_per_layer=n_heads_per_layer,
         input_cancel_layer=input_cancel_layer,
         objective_scale=objective_scale,
+        layer_bounds=layer_bounds,
+        keep_forever_ids=frozenset(keep_forever_ids),
+        input_keep_ids=frozenset(input_keep_ids),
+        cancel_window_delta=(
+            cancel_window_delta
+            if (hint_layers is not None or hint_cancel is not None)
+            else None
+        ),
+        eff_cancel_slack=eff_cancel_slack,
     )
 
 
@@ -1165,6 +1261,161 @@ class _IncumbentTrace(cp_model.CpSolverSolutionCallback):
         )
 
 
+def _validate_hint(
+    built: BuiltModel,
+    hint_layers: Optional[Dict[int, int]],
+    hint_routing: Optional[Dict[int, str]],
+    hint_cancel: Optional[Dict[int, int]],
+    *,
+    max_layers: int,
+    strict: bool = False,
+) -> List[str]:
+    """Cross-check a warm-start hint against the built model — the tripwire.
+
+    The hint-application loop in :func:`solve_schedule` guards every
+    ``AddHint`` with ``if nid in vars and in-range`` — a hint that fails the
+    guard silently vanishes, and a hint that passes the guard but violates a
+    model constraint is silently discarded by CP-SAT at solve time (it
+    cold-searches instead).  Both failure classes were invisible twice: the
+    June 2026 eager-free infeasible hint and the July 2026 deferred-cancel
+    infeasible hint (the silent optimize=2 fallback).  This validator mirrors
+    every hint-checkable model constraint and reports what the model would
+    reject:
+
+    - layer hints inside the tightened domains (when the model has them);
+    - guard-dropped hints for non-``Concatenate`` nodes (``Concatenate``
+      drops are expected — the warm start records them but the model has no
+      vars for them);
+    - cancel >= hinted birth + 1 and >= each hinted consumer's layer + 1;
+    - keep-forever nodes: cancel hint must be ``max_layers`` or absent;
+    - the (widened) cancel windows.  Post-widening this check should never
+      fire; firing means a NEW class of hint infeasibility has appeared —
+      investigate before trusting optimize>0 results.
+
+    Returns the violation list.  ``strict=True`` raises ``ValueError``
+    naming the first violations; the default emits one ``RuntimeWarning``
+    (production keeps its fall-back-don't-fail contract).
+    """
+    violations: List[str] = []
+    gm = built.gm
+    all_nodes: Dict[int, Node] = {n.node_id: n for n in gm.graph.get_all_nodes()}
+    input_ids = {n.node_id for n in gm.input_nodes}
+
+    def _desc(nid: int) -> str:
+        n = all_nodes.get(nid)
+        if n is None:
+            return f"id={nid} <not in graph>"
+        return f"id={nid} {type(n).__name__} name={getattr(n, 'name', None)!r}"
+
+    def _expected_drop(nid: int) -> bool:
+        n = all_nodes.get(nid)
+        return isinstance(n, Concatenate)
+
+    K = built.eff_cancel_slack
+    deltas = built.cancel_window_delta or {}
+
+    for nid, L in (hint_layers or {}).items():
+        if nid in built.layer_var:
+            if not (0 <= L < max_layers):
+                violations.append(
+                    f"layer hint out of range (guard-dropped): "
+                    f"{_desc(nid)} hint={L}"
+                )
+            elif built.layer_bounds is not None:
+                lo, hi = built.layer_bounds[nid]
+                if not (lo <= L <= hi):
+                    violations.append(
+                        f"layer hint outside tightened domain [{lo},{hi}]: "
+                        f"{_desc(nid)} hint={L}"
+                    )
+        elif not _expected_drop(nid) and nid not in input_ids:
+            violations.append(
+                f"layer hint for node with no layer var (guard-dropped): "
+                f"{_desc(nid)} hint={L}"
+            )
+
+    for nid, route in (hint_routing or {}).items():
+        if route not in (ATTN, MLP):
+            violations.append(
+                f"routing hint with unknown route {route!r}: {_desc(nid)}"
+            )
+        if nid not in built.is_attn and not _expected_drop(nid):
+            violations.append(
+                f"routing hint for node with no routing var (guard-dropped): "
+                f"{_desc(nid)} hint={route}"
+            )
+
+    for nid, L in (hint_cancel or {}).items():
+        in_sched = nid in built.cancel_layer
+        in_input = nid in built.input_cancel_layer
+        if not in_sched and not in_input:
+            if not _expected_drop(nid):
+                violations.append(
+                    f"cancel hint for node with no cancel var (guard-dropped): "
+                    f"{_desc(nid)} hint={L}"
+                )
+            continue
+        if not (0 <= L <= max_layers):
+            violations.append(
+                f"cancel hint out of range (guard-dropped): {_desc(nid)} hint={L}"
+            )
+            continue
+        keep = nid in (built.keep_forever_ids if in_sched else built.input_keep_ids)
+        if keep:
+            if L != max_layers:
+                violations.append(
+                    f"cancel hint below max_layers={max_layers} for "
+                    f"keep-forever node: {_desc(nid)} hint={L}"
+                )
+            continue
+        birth = (hint_layers or {}).get(nid) if in_sched else 0
+        if birth is not None and L < birth + 1:
+            violations.append(
+                f"cancel hint before birth+1: {_desc(nid)} cancel={L} " f"birth={birth}"
+            )
+        node = all_nodes.get(nid)
+        hinted_cons: List[int] = []
+        all_cons_hinted = True
+        for c in gm.consumers_eff.get(node, set()):
+            if c.node_id not in built.layer_var:
+                continue
+            c_hint = (hint_layers or {}).get(c.node_id)
+            if c_hint is None:
+                all_cons_hinted = False
+                continue
+            hinted_cons.append(c_hint)
+            if L < c_hint + 1:
+                violations.append(
+                    f"cancel hint before consumer's layer+1: {_desc(nid)} "
+                    f"cancel={L}, consumer {_desc(c.node_id)} layer={c_hint}"
+                )
+        if K is not None and all_cons_hinted:
+            base = max(hinted_cons) if hinted_cons else birth
+            if base is not None:
+                ub = base + 1 + K + deltas.get(nid, 0)
+                if L > ub:
+                    violations.append(
+                        f"cancel hint outside the (widened) window: "
+                        f"{_desc(nid)} cancel={L} > ub={ub} (base={base}, "
+                        f"K={K}, delta={deltas.get(nid, 0)}) — post-widening "
+                        f"this should be impossible; a new class of hint "
+                        f"infeasibility has appeared"
+                    )
+
+    if violations:
+        shown = "; ".join(violations[:5])
+        more = f" (+{len(violations) - 5} more)" if len(violations) > 5 else ""
+        msg = (
+            f"warm-start hint validation found {len(violations)} "
+            f"violation(s) — CP-SAT will silently drop the affected hints "
+            f"(or the whole incumbent): {shown}{more}"
+        )
+        if strict:
+            raise ValueError(msg)
+        warnings.warn(msg, RuntimeWarning, stacklevel=3)
+    return violations
+
+
 def solve_schedule(
     output_node: Node,
     pos_encoding=None,
@@ -1188,6 +1439,7 @@ def solve_schedule(
     tighten_domains: bool = False,
     solver_params: Optional[Dict[str, object]] = None,
     solution_trace: Optional[List[dict]] = None,
+    strict_hint: bool = False,
 ) -> Tuple[Optional[ScheduleAssignment], SolveStats]:
     """Build and solve the CP-SAT scheduling model.
 
@@ -1224,7 +1476,12 @@ def solve_schedule(
             for the cancel layer.  Captures when the heuristic freed
             each node's columns; combined with ``hint_layers`` this
             gives a complete schedule the solver can verify and
-            improve from.
+            improve from.  ``hint_layers``/``hint_cancel`` are also
+            forwarded to :func:`build_cpsat_model` to widen each hinted
+            node's cancel window just enough to admit the hint (the
+            heuristic defers a free when a layer's heads are full, which
+            otherwise lands past the uniform window and silently
+            invalidates the whole incumbent).
         cancel_slack: when not None, restrict each non-pinned node's
             cancel layer to ``[earliest_dead, earliest_dead + K]``
             where ``earliest_dead = max(layer[c] + 1)`` over consumers
@@ -1256,6 +1513,10 @@ def solve_schedule(
             and CP-SAT model agree.  Defaults to False — the
             conservative model that mirrors the heuristic's defensive
             BIRTH-layer cancellation of fresh allocations.
+        strict_hint: if True, a hint the model would drop or reject
+            raises ``ValueError`` (see :func:`_validate_hint`).  Default
+            False emits one ``RuntimeWarning`` instead — production
+            keeps its fall-back-don't-fail contract; tests use strict.
 
     Raises ``RuntimeError`` only on structural problems (no residual
     columns left after pre-allocated inputs).  Solver-outcome
@@ -1277,7 +1538,14 @@ def solve_schedule(
         reserve_residual=reserve_residual,
         assume_zero_init=assume_zero_init,
         tighten_domains=tighten_domains,
+        hint_layers=hint_layers,
+        hint_cancel=hint_cancel,
     )
+    if log_search_progress and built.cancel_window_delta:
+        print(
+            f"  cancel windows widened for {len(built.cancel_window_delta)} "
+            f"nodes (max +{max(built.cancel_window_delta.values())})"
+        )
     model = built.model
     gm = built.gm
     layer_var = built.layer_var
@@ -1293,7 +1561,18 @@ def solve_schedule(
     # full feasible incumbent it can verify and improve from, which
     # is much faster than reconstructing routing and cancel timing
     # from a layer-only hint.  Hints are soft — CP-SAT is free to
-    # discard them and explore alternatives.
+    # discard them and explore alternatives — which is exactly why a
+    # bad hint is validated loudly here instead of vanishing behind
+    # the `if nid in ...` guards below.
+    if any(h is not None for h in (hint_layers, hint_routing, hint_cancel)):
+        _validate_hint(
+            built,
+            hint_layers,
+            hint_routing,
+            hint_cancel,
+            max_layers=max_layers,
+            strict=strict_hint,
+        )
     if hint_layers is not None:
         for nid, L in hint_layers.items():
             if nid in layer_var and 0 <= L < max_layers:

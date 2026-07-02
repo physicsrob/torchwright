@@ -445,7 +445,9 @@ def test_fingerprints_are_pinned():
             cancel_slack=2,
             policy=None,
         )
-        == "7385d143353a723b9ae8d01c9e357992f157c5542cbc606fc5368f6ea255bff6"
+        # Pin updated 2026-07: deliberate generation bump ("cancel_window":
+        # "hint-aware-v1") so pre-widening schedule-cache entries re-solve.
+        == "1a0cd1db3d17369b525eaa9fdc0b833973899e446dafa10975138a5e2e46532b"
     )
 
 

@@ -390,7 +390,8 @@ def test_token_onnx_meta_has_no_extra_key_when_omitted():
         assert "extra" not in meta
         # rope_base and d_rot are present for every rotary model (every model
         # post-RoPE-port; d_rot == d_head here, full rotary); rms_norm/rms_norm_eps
-        # for every model post-RMSNorm; "extra" (asserted absent above) is the
+        # for every model post-RMSNorm; "schedule" (solver provenance) for
+        # every model post-2026-07; "extra" (asserted absent above) is the
         # optional key this guards against.
         assert set(meta) == {
             "format",
@@ -400,7 +401,11 @@ def test_token_onnx_meta_has_no_extra_key_when_omitted():
             "d_rot",
             "rms_norm",
             "rms_norm_eps",
+            "schedule",
         }
+        # optimize defaults to 0 here, so the solver never ran: provenance
+        # records that as status None.
+        assert meta["schedule"] == {"optimize": 0, "status": None}
 
 
 # ===========================================================================

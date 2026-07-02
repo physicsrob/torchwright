@@ -115,6 +115,15 @@ def graph_fingerprint(
     the schedule, so it MUST participate in the key.  It is added only when
     non-zero so the common case (no reservation) keeps hashing byte-identically
     to the pre-feature layout and existing cache entries still hit.
+
+    ``cancel_window`` is a deliberate generation bump (2026-07): the model
+    gained hint-aware cancel-window widening (``hint-aware-v1``), so every
+    pre-widening cache entry — solved against a model that rejected the
+    warm-start hint and typically fell back — must miss and re-solve once.
+    Unlike ``reserve_residual`` it is unconditional: invalidating the old
+    generation is the point.  Sound as a pure function of the payload
+    because the warm-start hint is a deterministic function of the same
+    topology+geometry this fingerprint already hashes.
     """
     payload = {
         "topology": topology_entries(output_node),
@@ -125,6 +134,7 @@ def graph_fingerprint(
         "assume_zero_init": assume_zero_init,
         "cancel_slack": cancel_slack,
         "policy": asdict(policy) if policy is not None else None,
+        "cancel_window": "hint-aware-v1",
     }
     if reserve_residual:
         payload["reserve_residual"] = reserve_residual

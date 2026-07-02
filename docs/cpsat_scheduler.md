@@ -569,6 +569,38 @@ floor varies run-to-run with CP-SAT's parallel workers).  The heuristic
 **fallback** (used only when CP-SAT finds nothing) keeps the default
 eager behavior, so a timeout never regresses below the eager depth.
 
+**The deferred-cancel infeasibility (2026-07).**  The eager-free fix
+above was the first time a silently-infeasible hint caused the
+optimize=2 fallback; this was the second.  The heuristic defers a
+node's free to the next layer when the current layer's attention
+heads are exhausted (`try_add_cancel` returns `None`), so its
+captured `hint_cancel` can land past the model's uniform
+`last_consumer + 1 + K` cancel window.  Since the block-IR refactor
+this happened for ~385 nodes on the production e1m1 hud-on graph —
+every violation exactly one layer over — so CP-SAT silently dropped
+the hint, cold-searched a model too hard for its 180 s budget,
+returned UNKNOWN, and every cold `optimize=2` compile shipped the
+61-layer heuristic fallback instead of the ~51-layer CP-SAT schedule.
+Diagnosed with `torchwright_doom/scripts/cpsat_hint_audit.py`
+(hard-fix the hint → INFEASIBLE in presolve; family bisect →
+`cancel_slack` is the sole rejector).  Fixed by the hint-aware
+per-node window widening described under *Cancel-domain restriction*.
+
+**The hint-validation tripwire.**  Both incidents were invisible: a
+bad hint either fails the `if nid in vars` guard at the `AddHint`
+site (vanishes) or is silently discarded by CP-SAT at solve time.
+`solve_schedule` now runs `_validate_hint` before applying hints —
+it mirrors every hint-checkable model constraint (guard drops for
+non-`Concatenate` nodes, tightened layer domains, `cancel ≥ birth+1`,
+`cancel ≥ consumer_layer+1`, keep-forever pins, and the *widened*
+cancel windows) and reports violations.  Default behavior is one
+`RuntimeWarning` (production keeps its fall-back-don't-fail
+contract); `strict_hint=True` raises `ValueError` naming the first
+violations (tests use strict).  Post-widening, the cancel-window
+check should never fire — if it does, a third class of hint
+infeasibility has appeared and should be investigated before
+trusting any `optimize>0` result.
+
 **Rollback-cancel correction.**  `LayerScheduler` speculatively
 allocates a node, then rolls the allocation back with `free(node)`
 when the op can't be committed under the dirty-cancel / head budget.
@@ -601,6 +633,33 @@ preserve optimality while cutting the cancel-decision space ~30×.
 The kwarg is on `solve_schedule` for users who want to widen or
 disable it; `forward_compile` doesn't expose it (the default is
 correct for every tested geometry).
+
+**Hint-aware per-node widening (2026-07).**  "Almost always" was the
+bug: freeing a node's columns costs attention-head work charged
+against the same per-layer head budget as compute, and the heuristic
+*defers* a free when a layer's heads are full (`try_add_cancel`
+returns `None` — the free retries next layer).  On the production
+DOOM graph ~385 nodes' frees land exactly one layer past the K=2
+window, making the entire warm-start hint infeasible (see the
+warm-start section below).  When `build_cpsat_model` receives
+`hint_layers`/`hint_cancel`, each hinted node's window is therefore
+widened by exactly the amount its hint needs:
+
+```
+delta_n = max(0, hint_cancel[n] - (hint_last_consumer + 1 + K))
+cancel_layer[n] <= last_consumer + 1 + K + delta_n
+```
+
+where `hint_last_consumer` is the max hinted layer over the same
+consumers the model's `last_consumer` var ranges over (the node's own
+hinted birth layer when it has no layer-bound consumers; layer 0 for
+freeable inputs).  `delta_n = 0` whenever the node or any needed
+consumer lacks a hint entry, so an unhinted build is byte-identical
+to the pre-widening model.  The widening is a pure relaxation — the
+cancel still pays its attention-head charge at whatever layer it
+lands and the residual interval still spans `[birth, cancel)` — so no
+invalid schedule becomes expressible; the window keeps its moving
+near-last-consumer shape instead of being anchored to a constant.
 
 ### Determinism
 
@@ -637,6 +696,18 @@ back to the heuristic schedule.
 feasible but possibly non-optimal.  `forward_compile` accepts it —
 `optimize > 0` semantics treat any feasible schedule as success;
 `stats.is_optimal` reports whether optimality was proven.
+
+**Hint validation failure** (`strict_hint=True` raises
+`ValueError`).  The warm-start hint contains something the model
+would drop or reject — see *The hint-validation tripwire* above.  A
+strict-mode raise means the hint capture and the model have drifted
+apart again (the June eager-free and July deferred-cancel incidents
+are the two known instances): the compile would still *work* via the
+silent-fallback path, but `optimize>0` would silently have no
+effect.  Fix the capture or the model — do not just switch strict
+off.  In default (non-strict) mode the same condition surfaces as a
+`RuntimeWarning` and the solve proceeds, usually ending in the
+heuristic fallback.
 
 ### Geometry sensitivity
 

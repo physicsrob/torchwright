@@ -214,6 +214,187 @@ def test_schedule_cache_disabled_without_env(monkeypatch):
     )
 
 
+# ---------------------------------------------------------------------------
+# Hint-aware cancel-window widening (the silent optimize=2 fallback fix)
+# ---------------------------------------------------------------------------
+
+
+def _deferred_cancel_hint(max_layers, cancel_slack=2):
+    """Solve the repro graph, then craft a warm-start hint whose cancel for
+    one node is pushed to ``last_consumer + 1 + K + 1`` — the shape the
+    heuristic produces when a layer's attention heads are full and it defers
+    the free to the next layer.  Returns ``(out, hints, target_id)``."""
+    from torchwright.compiler.forward.cpsat_scheduler import Concatenate
+
+    out = _repro_graph()
+    assignment, stats = solve_schedule(out, **_SOLVE_KW)
+    assert assignment is not None and stats.status_name == "OPTIMAL"
+
+    gm = build_graph_model(out)
+    pinned_ids = {n.node_id for n in gm.pinned_nodes}
+    target_id = last_cons_layer = None
+    for n in gm.schedulable:
+        if n.node_id in pinned_ids:
+            continue
+        consumers = gm.consumers_eff.get(n, set())
+        if any(isinstance(c, Concatenate) for c in consumers):
+            continue
+        cons_layers = [
+            assignment.node_to_layer[c.node_id]
+            for c in consumers
+            if c.node_id in assignment.node_to_layer
+        ]
+        if not cons_layers:
+            continue
+        if max(cons_layers) + 1 + cancel_slack + 1 <= max_layers:
+            target_id = n.node_id
+            last_cons_layer = max(cons_layers)
+            break
+    assert target_id is not None, "repro graph has no widenable node"
+
+    hint_layers = dict(assignment.node_to_layer)
+    hint_routing = dict(assignment.node_to_routing)
+    hint_cancel = dict(assignment.node_to_cancel_layer)
+    hint_cancel[target_id] = last_cons_layer + 1 + cancel_slack + 1
+    return out, (hint_layers, hint_routing, hint_cancel), target_id
+
+
+def _hard_fix_and_solve(built, hint_layers, hint_routing, hint_cancel):
+    """Add an equality per hinted variable and solve — is the hint a model
+    point?  Mirrors phase 2 of ``torchwright_doom/scripts/cpsat_hint_audit``."""
+    from ortools.sat.python import cp_model
+
+    from torchwright.compiler.forward.cpsat_scheduler import ATTN
+
+    model = built.model
+    for nid, L in hint_layers.items():
+        if nid in built.layer_var:
+            model.Add(built.layer_var[nid] == L)
+    for nid, route in hint_routing.items():
+        if nid in built.is_attn:
+            model.Add(built.is_attn[nid] == (1 if route == ATTN else 0))
+    for nid, L in hint_cancel.items():
+        if nid in built.cancel_layer:
+            model.Add(built.cancel_layer[nid] == L)
+        elif nid in built.input_cancel_layer:
+            model.Add(built.input_cancel_layer[nid] == L)
+    solver = cp_model.CpSolver()
+    solver.parameters.max_time_in_seconds = 10.0
+    solver.parameters.num_search_workers = 1
+    return solver.StatusName(solver.Solve(model))
+
+
+def test_deferred_cancel_hint_rejected_without_widening():
+    """Pins the bug: a heuristic-shaped hint (one cancel deferred one layer
+    past the uniform window) is INFEASIBLE under the hint-blind model — the
+    root cause of the silent optimize=2 fallback — and becomes a model point
+    once ``build_cpsat_model`` sees the hint and widens that node's window."""
+    from torchwright.compiler.forward.cpsat_scheduler import build_cpsat_model
+
+    max_layers = _SOLVE_KW["max_layers"]
+    out, (hint_layers, hint_routing, hint_cancel), target_id = _deferred_cancel_hint(
+        max_layers
+    )
+    build_kw = dict(
+        d=_SOLVE_KW["d"],
+        d_head=_SOLVE_KW["d_head"],
+        d_hidden=_SOLVE_KW["d_hidden"],
+        max_layers=max_layers,
+    )
+
+    blind = build_cpsat_model(out, **build_kw)
+    assert blind.cancel_window_delta is None
+    status = _hard_fix_and_solve(blind, hint_layers, hint_routing, hint_cancel)
+    assert status == "INFEASIBLE", (
+        f"hint-blind model accepted the deferred-cancel hint ({status}) — "
+        f"the reproducer no longer reproduces"
+    )
+
+    aware = build_cpsat_model(
+        out, hint_layers=hint_layers, hint_cancel=hint_cancel, **build_kw
+    )
+    assert aware.cancel_window_delta == {target_id: 1}
+    status = _hard_fix_and_solve(aware, hint_layers, hint_routing, hint_cancel)
+    assert status in (
+        "OPTIMAL",
+        "FEASIBLE",
+    ), f"widened model rejected the deferred-cancel hint ({status})"
+
+
+def test_deferred_cancel_hint_accepted_by_solve_schedule():
+    """End-to-end through ``solve_schedule``: the deferral-shaped hint passes
+    strict validation (the widened window admits it) and solves."""
+    out, (hint_layers, hint_routing, hint_cancel), _ = _deferred_cancel_hint(
+        _SOLVE_KW["max_layers"]
+    )
+    assignment, stats = solve_schedule(
+        out,
+        hint_layers=hint_layers,
+        hint_routing=hint_routing,
+        hint_cancel=hint_cancel,
+        strict_hint=True,
+        **_SOLVE_KW,
+    )
+    assert assignment is not None
+    assert stats.status_name in ("OPTIMAL", "FEASIBLE")
+
+
+def test_strict_hint_validation_raises_on_invalid_hint():
+    """A genuinely invalid hint (cancel before birth+1) raises under
+    ``strict_hint=True`` and warns under the default."""
+    out = _repro_graph()
+    assignment, _ = solve_schedule(out, **_SOLVE_KW)
+    assert assignment is not None
+    hint_layers = dict(assignment.node_to_layer)
+    # Pick any non-keep-forever node and hint its cancel AT its birth layer
+    # (the model requires cancel >= birth + 1).
+    gm = build_graph_model(out)
+    pinned_ids = {n.node_id for n in gm.pinned_nodes}
+    target = next(
+        nid
+        for nid, cl in assignment.node_to_cancel_layer.items()
+        if nid in hint_layers and nid not in pinned_ids and cl < _SOLVE_KW["max_layers"]
+    )
+    bad_cancel = {target: hint_layers[target]}
+
+    with pytest.raises(ValueError, match="before birth"):
+        solve_schedule(
+            out,
+            hint_layers=hint_layers,
+            hint_cancel=bad_cancel,
+            strict_hint=True,
+            **_SOLVE_KW,
+        )
+
+    with pytest.warns(RuntimeWarning, match="hint validation"):
+        assignment2, _ = solve_schedule(
+            out, hint_layers=hint_layers, hint_cancel=bad_cancel, **_SOLVE_KW
+        )
+    # Default mode keeps the fall-back-don't-fail contract: still solves.
+    assert assignment2 is not None
+
+
+def test_strict_hint_validation_raises_on_keep_forever_cancel():
+    """A cancel hint below max_layers for a keep-forever node (pinned or
+    Concatenate-consumed) is a hint the model pins to max_layers — strict
+    mode names it."""
+    out = _repro_graph()
+    assignment, _ = solve_schedule(out, **_SOLVE_KW)
+    assert assignment is not None
+    gm = build_graph_model(out)
+    # The output node is the schedulable pinned node (inputs are modeled as
+    # freeable, so they are not keep-forever despite being pinned).
+    keep = gm.output_node
+    with pytest.raises(ValueError, match="keep-forever"):
+        solve_schedule(
+            out,
+            hint_layers=dict(assignment.node_to_layer),
+            hint_cancel={keep.node_id: 1},
+            strict_hint=True,
+            **_SOLVE_KW,
+        )
+
+
 def test_floor_probe_infeasible_falls_back_to_descent():
     """Width-starved graph: the floor horizon cannot fit (parallel wide
     chains must serialize), so optimize=2 must fall through the probe and
