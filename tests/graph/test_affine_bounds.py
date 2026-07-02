@@ -920,3 +920,215 @@ class TestToIntervalFpCrossing:
         ab = self._point_bound(1.0, 0.5)
         with pytest.raises(ValueError):
             ab.to_interval()
+
+
+# --- Gated / swish FFN rule ------------------------------------------------
+
+
+def _gated_ffn(x, gate_proj, up_proj, out_proj, activation="swish"):
+    from torchwright.graph.ffn import FFN
+
+    n_lanes = gate_proj.shape[0]
+    d_output = out_proj.shape[1]
+    return FFN(
+        x,
+        gate_proj=gate_proj,
+        gate_bias=torch.zeros(n_lanes),
+        out_proj=out_proj,
+        out_bias=torch.zeros(d_output),
+        up_proj=up_proj,
+        up_bias=torch.zeros(n_lanes),
+        activation=activation,
+    )
+
+
+def _ffn_forward_f64(blk, x64):
+    """The FFN lane math evaluated in float64 from the node's own weights."""
+    gate = x64 @ blk.gate_proj.double().t() + blk.gate_bias.double()
+    if blk.activation == "relu":
+        act = torch.clamp(gate, min=0.0)
+    else:
+        act = gate * torch.sigmoid(gate)
+    if blk.up_proj is not None:
+        act = act * (x64 @ blk.up_proj.double().t() + blk.up_bias.double())
+    return act @ blk.out_proj.double() + blk.out_bias.double()
+
+
+def _pointwise_slack(blk, lo, hi, n_samples=20_000, seed=0):
+    """Min over samples of (f - lower) and (upper - f); both must be >= 0."""
+    ab = blk.affine_bound
+    g = torch.Generator().manual_seed(seed)
+    lo64 = torch.as_tensor(lo, dtype=torch.float64)
+    hi64 = torch.as_tensor(hi, dtype=torch.float64)
+    x = lo64 + (hi64 - lo64) * torch.rand(
+        n_samples, ab.n_cols, dtype=torch.float64, generator=g
+    )
+    y = _ffn_forward_f64(blk, x)
+    lower = x @ ab.A_lo.T + ab.b_lo
+    upper = x @ ab.A_hi.T + ab.b_hi
+    return min((y - lower).min().item(), (upper - y).min().item())
+
+
+class TestSwishSandwich:
+    def test_relu_sandwich_holds_on_dense_grid(self):
+        from torchwright.graph.affine_rules import _SWISH_SANDWICH_C
+
+        z = torch.linspace(-80.0, 80.0, 2_000_001, dtype=torch.float64)
+        sw = z * torch.sigmoid(z)
+        relu = torch.clamp(z, min=0.0)
+        assert (sw - relu).max().item() <= 0.0
+        assert ((relu - _SWISH_SANDWICH_C) - sw).max().item() <= 0.0
+
+    def test_swish_interval_exact(self):
+        from torchwright.graph.affine_rules import _swish_interval
+
+        # Interval containing the interior minimum.
+        lo, hi = _swish_interval(-5.0, 5.0)
+        assert lo == pytest.approx(-0.278465, abs=1e-6)
+        assert hi == pytest.approx(5.0 / (1.0 + math.exp(-5.0)))
+        # Entirely left of the argmin: swish is decreasing there.
+        lo, hi = _swish_interval(-10.0, -5.0)
+        assert lo == pytest.approx(-5.0 / (1.0 + math.exp(5.0)))
+        assert hi == pytest.approx(-10.0 / (1.0 + math.exp(10.0)))
+        # Infinite endpoints stay sound and NaN-free.
+        lo, hi = _swish_interval(float("-inf"), float("inf"))
+        assert lo == pytest.approx(-0.278465, abs=1e-6) and math.isinf(hi)
+
+
+class TestGatedFFNRule:
+    def test_random_gated_swish_pointwise_soundness(self):
+        for seed in range(5):
+            with fresh_graph_session():
+                g = torch.Generator().manual_seed(100 + seed)
+                d_in, n_lanes, d_out = 5, 7, 3
+                scale = 1.0 + 4.0 * torch.rand(1, generator=g).item()
+                x = InputNode(d_in, name="x", value_range=(-4.0, 4.0))
+                blk = _gated_ffn(
+                    x,
+                    gate_proj=torch.randn(n_lanes, d_in, generator=g) * scale,
+                    up_proj=torch.randn(n_lanes, d_in, generator=g),
+                    out_proj=torch.randn(n_lanes, d_out, generator=g),
+                )
+                slack = _pointwise_slack(blk, -4.0, 4.0, seed=seed)
+                assert slack >= -1e-9, f"seed {seed}: bound violated by {-slack}"
+
+    def test_gated_relu_pointwise_soundness(self):
+        with fresh_graph_session():
+            g = torch.Generator().manual_seed(7)
+            x = InputNode(4, name="x", value_range=(-3.0, 3.0))
+            blk = _gated_ffn(
+                x,
+                gate_proj=torch.randn(6, 4, generator=g) * 2.0,
+                up_proj=torch.randn(6, 4, generator=g),
+                out_proj=torch.randn(6, 2, generator=g),
+                activation="relu",
+            )
+            assert _pointwise_slack(blk, -3.0, 3.0) >= -1e-9
+
+    def test_degenerate_swish_pointwise_soundness(self):
+        from torchwright.graph.ffn import FFN
+
+        with fresh_graph_session():
+            g = torch.Generator().manual_seed(11)
+            x = InputNode(4, name="x", value_range=(-3.0, 3.0))
+            blk = FFN(
+                x,
+                gate_proj=torch.randn(6, 4, generator=g) * 2.0,
+                gate_bias=torch.randn(6, generator=g),
+                out_proj=torch.randn(6, 2, generator=g),
+                out_bias=torch.randn(2, generator=g),
+                activation="swish",
+            )
+            assert _pointwise_slack(blk, -3.0, 3.0) >= -1e-9
+
+    def test_gated_swish_value_type_finite(self):
+        """The RMSNorm energy certification requirement: a gated swish FFN
+        over bounded inputs must expose a finite value range."""
+        with fresh_graph_session():
+            g = torch.Generator().manual_seed(13)
+            x = InputNode(5, name="x", value_range=(-10.0, 10.0))
+            blk = _gated_ffn(
+                x,
+                gate_proj=torch.randn(8, 5, generator=g),
+                up_proj=torch.randn(8, 5, generator=g),
+                out_proj=torch.randn(8, 3, generator=g),
+            )
+            r = blk.value_type.value_range
+            assert math.isfinite(r.lo) and math.isfinite(r.hi)
+
+    def test_unbounded_input_degenerates_without_crash(self):
+        """An unbounded gated lane must fall back to an unbounded row —
+        constructed and concretized NaN-free (to_interval asserts on NaN),
+        never a crash at graph build."""
+        with fresh_graph_session():
+            g = torch.Generator().manual_seed(17)
+            x = InputNode(3, name="x", value_range=(float("-inf"), float("inf")))
+            blk = _gated_ffn(
+                x,
+                gate_proj=torch.randn(4, 3, generator=g),
+                up_proj=torch.randn(4, 3, generator=g),
+                out_proj=torch.randn(4, 2, generator=g),
+            )
+            intervals = blk.affine_bound.to_interval()
+            assert all(math.isinf(r.lo) and math.isinf(r.hi) for r in intervals)
+
+
+class TestGatedFFNTightness:
+    """The ops_plain_english.md constructions: the rule must stay within a
+    small factor of the true output range (regression-pinned from the spike:
+    multiply 1.06x, select 1.10x, cond_gate 1.05x)."""
+
+    def test_multiply_construction(self):
+        # multiply(a, b) = swish(a)*b + swish(-a)*(-b), a, b in [-10, 10];
+        # exact output a*b in [-100, 100].
+        with fresh_graph_session():
+            x = InputNode(2, name="x", value_range=(-10.0, 10.0))
+            blk = _gated_ffn(
+                x,
+                gate_proj=torch.tensor([[1.0, 0.0], [-1.0, 0.0]]),
+                up_proj=torch.tensor([[0.0, 1.0], [0.0, -1.0]]),
+                out_proj=torch.tensor([[1.0], [1.0]]),
+            )
+            r = blk.affine_bound.to_interval()[0]
+            assert r.lo <= -100.0 <= 100.0 <= r.hi  # contains the true range
+            assert r.lo >= -110.0 and r.hi <= 110.0  # within 1.10x
+            assert _pointwise_slack(blk, -10.0, 10.0) >= -1e-9
+
+    def test_select_construction(self):
+        # select(cond, a, b) = swish(s*cond)/s * a + swish(-s*cond)/s * b,
+        # s = 12; output within ~[-10, 10] and reaches ~±9.99 at cond = ±1.
+        s = 12.0
+        with fresh_graph_session():
+            cond = InputNode(1, name="cond", value_range=(-1.0, 1.0))
+            ab = InputNode(2, name="ab", value_range=(-10.0, 10.0))
+            from torchwright.graph import Concatenate
+
+            inp = Concatenate([cond, ab])
+            blk = _gated_ffn(
+                inp,
+                gate_proj=torch.tensor([[s, 0.0, 0.0], [-s, 0.0, 0.0]]),
+                up_proj=torch.tensor([[0.0, 1.0, 0.0], [0.0, 0.0, 1.0]]),
+                out_proj=torch.tensor([[1.0 / s], [1.0 / s]]),
+            )
+            r = blk.affine_bound.to_interval()[0]
+            assert r.lo <= -9.9 and r.hi >= 9.9
+            assert r.lo >= -11.5 and r.hi <= 11.5
+
+    def test_cond_gate_construction(self):
+        # cond_gate(cond, inp) = swish(s*cond)/s * inp: single gated lane.
+        s = 12.0
+        with fresh_graph_session():
+            cond = InputNode(1, name="cond", value_range=(-1.0, 1.0))
+            val = InputNode(1, name="val", value_range=(-10.0, 10.0))
+            from torchwright.graph import Concatenate
+
+            inp = Concatenate([cond, val])
+            blk = _gated_ffn(
+                inp,
+                gate_proj=torch.tensor([[s, 0.0]]),
+                up_proj=torch.tensor([[0.0, 1.0]]),
+                out_proj=torch.tensor([[1.0 / s]]),
+            )
+            r = blk.affine_bound.to_interval()[0]
+            assert r.lo <= -9.9 and r.hi >= 9.9
+            assert r.lo >= -11.0 and r.hi <= 11.0

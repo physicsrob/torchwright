@@ -243,25 +243,192 @@ def _relu_rule(node) -> AffineBound:
     return _relu_affine(node.inputs[0]._affine_bound, warn_node=node.inputs[0])
 
 
-def _ffn_rule(node) -> AffineBound:
-    """FFN: compose gate projection -> ReLU envelope -> output projection.
+# Swish is sandwiched by ReLU globally: relu(z) - C <= swish(z) <= relu(z)
+# for every z (upper: z*sigmoid(z) <= z for z >= 0 and <= 0 for z <= 0;
+# lower: swish's global minimum is -0.2784645... at z = -1.2784645..., and
+# for z > 0 the gap z - swish(z) = z*sigmoid(-z) has the same maximum by
+# symmetry).  C is the minimum's magnitude rounded UP so the sandwich stays
+# sound in float64.
+_SWISH_SANDWICH_C = 0.278465
+_SWISH_ARGMIN = -1.278464542761074
 
-    The three sub-steps are exactly the rules the mined ``Linear -> ReLU ->
-    Linear`` chain applies across its three nodes today, run here over one
-    node's projections.  Step 1 is ReLU-only; a swish envelope is step 2's
-    problem, so a gated/swish FFN gets a fail-closed unbounded bound (sound,
-    just not tight) — the compiler never lowers one this phase (the writer
-    asserts ReLU-degenerate), so no tight bound is needed yet."""
-    if node.activation != "relu" or node.up_proj is not None:
-        return AffineBound.degenerate(node.d_output)
+
+def _swish_affine(inp_ab: AffineBound) -> AffineBound:
+    """Swish envelope: the ReLU envelope with the lower offset shifted by C.
+
+    Sound pointwise because relu(z) - C <= swish(z) <= relu(z) everywhere,
+    so any linear under-estimator of ReLU minus C under-estimates swish and
+    any linear over-estimator of ReLU over-estimates it.  The slack is the
+    constant C per lane — it does not grow with the value magnitude."""
+    ab = _relu_affine(inp_ab, warn_node=None)
+    return AffineBound(
+        A_lo=ab.A_lo,
+        A_hi=ab.A_hi,
+        b_lo=ab.b_lo - _SWISH_SANDWICH_C,
+        b_hi=ab.b_hi,
+        columns=ab.columns,
+        input_ranges=ab.input_ranges,
+    )
+
+
+def _swish_scalar(v: float) -> float:
+    """swish(v) = v * sigmoid(v), overflow-safe for any float (incl. ±inf)."""
+    if math.isinf(v):
+        return v if v > 0 else 0.0
+    if v >= 0:
+        return v / (1.0 + math.exp(-v))
+    t = math.exp(v)  # underflows to 0 for very negative v; v*t then rounds to -0.0
+    return v * t / (1.0 + t)
+
+
+def _swish_interval(lo: float, hi: float) -> tuple:
+    """Exact range of swish over [lo, hi]: endpoints plus the interior
+    minimum when the interval contains swish's argmin.  (Swish decreases
+    until the argmin and increases after it, so the maximum is always at an
+    endpoint.)  Uses -C for the interior minimum — rounded below the true
+    minimum, keeping the range sound."""
+    f_lo, f_hi = _swish_scalar(lo), _swish_scalar(hi)
+    out_lo, out_hi = min(f_lo, f_hi), max(f_lo, f_hi)
+    if lo <= _SWISH_ARGMIN <= hi:
+        out_lo = min(out_lo, -_SWISH_SANDWICH_C)
+    return out_lo, out_hi
+
+
+def _bilinear_comb(
+    a_s: torch.Tensor,
+    a_u: torch.Tensor,
+    g: torch.Tensor,
+    s_ab: AffineBound,
+    u_ab: AffineBound,
+    lower: bool,
+):
+    """Per-lane affine under-estimator (``lower=True``) or over-estimator of
+    ``a_s*s + a_u*u + g``: route each coefficient to the factor's lower or
+    upper affine expression by sign — the same clamp-and-route logic as the
+    sign-split GEMM in :func:`_linear_affine`, per lane."""
+
+    def pick(coef, ab):
+        take_lo = (coef >= 0) if lower else (coef < 0)
+        A = torch.where(take_lo.unsqueeze(1), ab.A_lo, ab.A_hi)
+        b = torch.where(take_lo, ab.b_lo, ab.b_hi)
+        # 0 * ±inf must contribute 0, matching _safe_matvec semantics.
+        return coef.unsqueeze(1) * A, torch.where(
+            coef == 0, torch.zeros_like(b), coef * b
+        )
+
+    A_s, b_s = pick(a_s, s_ab)
+    A_u, b_u = pick(a_u, u_ab)
+    return A_s + A_u, b_s + b_u + g
+
+
+def _gated_lane_affine(
+    s_ab: AffineBound, u_ab: AffineBound, s_iv: list, u_iv: list
+) -> AffineBound:
+    """Affine bound on the per-lane product ``w = s * u`` (activated gate
+    times up projection).
+
+    A product of two affine-bounded quantities is not affine, but given
+    interval endpoints ``s in [sl, sh]``, ``u in [ul, uh]`` that hold
+    pointwise, the four standard linear product relaxations (the McCormick
+    inequalities) are::
+
+        w >= ul*s + sl*u - sl*ul      w <= ul*s + sh*u - sh*ul
+        w >= uh*s + sh*u - sh*uh      w <= uh*s + sl*u - sl*uh
+
+    Each is affine in (s, u), so substituting the factors' affine bounds
+    keeps the result affine in the graph inputs.  Per side, both candidates
+    are built and the tighter one (by concretized interval over the input
+    box) is kept per lane.  A lane with a non-finite factor interval falls
+    back to an unbounded row — sound, and it degenerates only that lane."""
+    assert s_ab.columns == u_ab.columns, "gate/up bounds must share a basis"
+    sl = torch.tensor([iv[0] for iv in s_iv], dtype=torch.float64)
+    sh = torch.tensor([iv[1] for iv in s_iv], dtype=torch.float64)
+    ul = torch.tensor([iv[0] for iv in u_iv], dtype=torch.float64)
+    uh = torch.tensor([iv[1] for iv in u_iv], dtype=torch.float64)
+    finite = (
+        torch.isfinite(sl)
+        & torch.isfinite(sh)
+        & torch.isfinite(ul)
+        & torch.isfinite(uh)
+    )
+    # Zero non-finite corner coefficients so candidate construction stays
+    # NaN-free; those lanes' rows are overwritten with ±inf offsets below.
+    zero = torch.zeros((), dtype=torch.float64)
+    sl_, sh_ = torch.where(finite, sl, zero), torch.where(finite, sh, zero)
+    ul_, uh_ = torch.where(finite, ul, zero), torch.where(finite, uh, zero)
+
+    A_L1, b_L1 = _bilinear_comb(ul_, sl_, -sl_ * ul_, s_ab, u_ab, lower=True)
+    A_L2, b_L2 = _bilinear_comb(uh_, sh_, -sh_ * uh_, s_ab, u_ab, lower=True)
+    A_U1, b_U1 = _bilinear_comb(ul_, sh_, -sh_ * ul_, s_ab, u_ab, lower=False)
+    A_U2, b_U2 = _bilinear_comb(uh_, sl_, -sl_ * uh_, s_ab, u_ab, lower=False)
+
+    bad = ~finite
+    for A, b, fill in (
+        (A_L1, b_L1, float("-inf")),
+        (A_L2, b_L2, float("-inf")),
+        (A_U1, b_U1, float("inf")),
+        (A_U2, b_U2, float("inf")),
+    ):
+        A[bad] = 0.0
+        b[bad] = fill
+
+    def bound(A_lo, b_lo, A_hi, b_hi):
+        return AffineBound(
+            A_lo=A_lo,
+            A_hi=A_hi,
+            b_lo=b_lo,
+            b_hi=b_hi,
+            columns=s_ab.columns,
+            input_ranges=s_ab.input_ranges,
+        )
+
+    iv1 = bound(A_L1, b_L1, A_U1, b_U1).to_interval()
+    iv2 = bound(A_L2, b_L2, A_U2, b_U2).to_interval()
+    lo2 = torch.tensor([r2.lo > r1.lo for r1, r2 in zip(iv1, iv2)])
+    hi2 = torch.tensor([r2.hi < r1.hi for r1, r2 in zip(iv1, iv2)])
+    return bound(
+        torch.where(lo2.unsqueeze(1), A_L2, A_L1),
+        torch.where(lo2, b_L2, b_L1),
+        torch.where(hi2.unsqueeze(1), A_U2, A_U1),
+        torch.where(hi2, b_U2, b_U1),
+    )
+
+
+def _ffn_rule(node) -> AffineBound:
+    """FFN: gate projection -> activation envelope -> (x up projection) ->
+    output projection.
+
+    The degenerate-ReLU form composes exactly the rules the mined
+    ``Linear -> ReLU -> Linear`` chain applied across three nodes.  The
+    swish envelope is the ReLU envelope shifted by the sandwich constant
+    (see :func:`_swish_affine`); a gated lane adds the product relaxation
+    (see :func:`_gated_lane_affine`), whose pointwise-valid factor
+    intervals come from the exact 1-D activation range over the gate's
+    concretized interval — not from concretizing the activation envelope,
+    which is far looser at wide gate intervals."""
     inp_ab = node.inputs[0]._affine_bound
     # Gate projection: y = x @ gate_proj.T + gate_bias.  gate_proj is
     # (n_lanes, d_input) in math orientation, so W = gate_proj.T.
     gate_W = node.gate_proj.to(torch.float64).T
     gate_c = node.gate_bias.to(torch.float64)
     gate_ab = _linear_affine(inp_ab, gate_W, gate_c)
-    # ReLU envelope per lane.
-    lane_ab = _relu_affine(gate_ab, warn_node=None)
+    if node.activation == "relu":
+        act_ab = _relu_affine(gate_ab, warn_node=None)
+    else:
+        act_ab = _swish_affine(gate_ab)
+    if node.up_proj is None:
+        lane_ab = act_ab
+    else:
+        up_W = node.up_proj.to(torch.float64).T
+        up_c = node.up_bias.to(torch.float64)
+        u_ab = _linear_affine(inp_ab, up_W, up_c)
+        gate_iv = gate_ab.to_interval()
+        if node.activation == "relu":
+            s_iv = [(max(r.lo, 0.0), max(r.hi, 0.0)) for r in gate_iv]
+        else:
+            s_iv = [_swish_interval(r.lo, r.hi) for r in gate_iv]
+        u_iv = [(r.lo, r.hi) for r in u_ab.to_interval()]
+        lane_ab = _gated_lane_affine(act_ab, u_ab, s_iv, u_iv)
     # Output projection: out = lane @ out_proj + out_bias.  out_proj is already
     # (n_lanes, d_output).
     out_W = node.out_proj.to(torch.float64)

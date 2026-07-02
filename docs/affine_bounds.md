@@ -552,11 +552,12 @@ chord computation `h / (h - l)` would produce `inf/inf = NaN`.
 A guard falls back to degenerate `[0, h]` (or `[0, +inf]`) for
 those components.
 
-`ReLU` is the **only** primitive rule that introduces looseness.
+`ReLU` and the `FFN` rule's activation/product relaxations (next
+section) are the only primitive rules that introduce looseness.
 Every other primitive rule is exact; any slack in a downstream
-interval traces back to a straddling-`ReLU` envelope. (Composite
-ops introduce additional looseness via semantic overrides; see
-*Composite ops and semantic overrides*.)
+interval traces back to one of them. (Composite ops introduce
+additional looseness via semantic overrides; see *Composite ops
+and semantic overrides*.)
 
 A tighter choice — learning α per component via gradient descent
 against a specific output bound — is known in the bound-propagation
@@ -569,6 +570,68 @@ through the bound computation and a per-query optimization pass —
 a meaningful architectural addition, not a local rule upgrade. If
 the continuous-chord bounds prove too loose in practice, that work
 is well-understood in the literature; it just isn't small.
+
+### `FFN` — gate projection → activation → (× up projection) → output projection
+
+One node, composed from the rules above (`_ffn_rule`). The
+degenerate-ReLU form (`up_proj is None`, `activation="relu"`) is
+exactly the three rules the mined `Linear → ReLU → Linear` chain
+applied across three nodes: sign-split GEMM through `gate_proj`,
+the ReLU envelope per lane, sign-split GEMM through `out_proj`.
+
+**Swish activation.** Swish is sandwiched by ReLU globally:
+
+```
+relu(z) - C <= swish(z) <= relu(z),   C = 0.278465
+```
+
+(`C` is the magnitude of swish's global minimum at
+`z ≈ -1.2785`, rounded up; for `z > 0` the gap
+`z - swish(z) = z·σ(-z)` has the same maximum by symmetry.) So the
+swish envelope is the ReLU envelope with the lower offsets shifted
+down by `C` (`_swish_affine`). The slack is the *constant* `C` per
+lane — it does not grow with value magnitude, and for
+`Swish(scale·cond)/scale` gates the fold-through divides it by
+`scale`.
+
+**Gated lanes.** A gated lane `w = act(gate(x)) · up(x)` is a
+product of two affine-bounded quantities, which is not affine.
+Given per-lane interval endpoints `s ∈ [sl, sh]`, `u ∈ [ul, uh]`
+that hold pointwise, the four standard linear product relaxations
+(the McCormick inequalities) are affine in `(s, u)`:
+
+```
+w >= ul·s + sl·u - sl·ul      w <= ul·s + sh·u - sh·ul
+w >= uh·s + sh·u - sh·uh      w <= uh·s + sl·u - sl·uh
+```
+
+Substituting each factor's affine bound (routing every coefficient
+to the factor's lower or upper expression by sign, as in the
+sign-split GEMM) keeps the lane bound affine in the graph inputs
+(`_gated_lane_affine`). Per side, both candidates are built and
+the tighter one by concretized interval is kept per lane.
+
+Two details that matter for tightness and soundness:
+
+- The activation's interval endpoints `[sl, sh]` come from the
+  **exact 1-D activation range over the gate's concretized
+  interval** (`_swish_interval`: endpoints plus the interior
+  minimum when the interval contains the argmin) — *not* from
+  concretizing the activation envelope, whose lower line
+  evaluated at a wide gate interval is far below the true
+  minimum and would poison the corner coefficients.
+- A lane with a non-finite factor interval falls back to an
+  unbounded row (zero coefficients, `±inf` offsets) — sound, and
+  it degenerates only that lane.
+
+Measured on the `ops_plain_english.md` constructions
+(regression-pinned in `tests/graph/test_affine_bounds.py`): the
+±-pair `multiply` FFN over `[-10, 10]²` concretizes to within
+1.06× of the true `[-100, 100]`; `select` and `cond_gate` land
+within 1.10× and 1.05×. The remaining slack is the cross-lane
+correlation (the `σ(g) + σ(-g) = 1` cancellation) that no
+per-lane relaxation can see; semantic overrides remain the tool
+when an op needs the exact range.
 
 ### `Concatenate` — row-stacking
 
