@@ -1,5 +1,78 @@
 # Step 1 plan: block-first ReLU machine (numerics frozen)
 
+## STATUS: COMPLETE (2026-07-01) — closeout record
+
+All phases (0, 1, 2a, 2b, 2c, 3) are done and verified; every gate passed.
+This section is the state a fresh session needs; the phase sections below are
+the original plan, kept for reference (Gate A ruling section included).
+
+**Branches (committed, NOT pushed, umbrella pointers untouched):**
+- torchwright `block-ir-2a` @ `0570af1` (2a: 84178ac..77ea7e9; 2b: 726f349;
+  2c: e50eb7a; 3: e5a6481; fix: 0570af1). Net production delta
+  77ea7e9..e5a6481: +343/−1003 in torchwright/.
+- torchwright_doom `block-ir-2a-r8` @ `b2d1973` (branched from rope-phase8
+  because doom main predates torchwright's RoPE Phase 5 and cannot build the
+  flagship against torchwright main — pre-existing pointer skew, fix
+  separately). Five untracked scripts in scripts/ (see cleanup below).
+
+**Verified results:**
+- Full `make test` green (10 shards) at each phase boundary and after the fix.
+- Flagship metrics (e1m1, non-HUD build): (layers, heads, peak_hidden,
+  residual_peak) = **(57, 781, 16384, 8192)** vs pre-refactor
+  (64, 813, 16384, 8157). −7 layers / −32 heads from block-aware fusion
+  firing where the old relu-ejection gate declined (~536 Gate-A candidates).
+  Residual at exactly d is feasible (57 layers even with the 2-column
+  RMSNorm reserve).
+- Forward divergence, original chain-64 model vs final block-57 model, same
+  prefill: max 1.220703e-04, mean 8.06e-05, argmax 9/9 — fp-accumulation
+  floor. (Caveat: 9 fallback tokens; does not exercise HUD emission.)
+- `docs/op_noise_data.json` byte-identical throughout (numerics frozen).
+- Production `make compile` (e1m1, hud=1, 64-CPU Modal): completes, 61
+  layers, artifact in cache volume.
+
+**Bug found & fixed on the way (0570af1 + reproducer
+`test_fusion_refreshes_stale_bounds`):** the 2c Block→Linear fold inverts
+survivorship (the surviving Block absorbs the downstream Linear's transform,
+changing the survivor's VALUE), so its construction-time-cached
+`_affine_bound`/`_structural_type` went stale-unsound; GraphAnalyzer's
+Assert-strip then tightened the structural type from the assert's claimed
+range ([0,255] pixel) and the RMSNorm-certification soundness check fired
+(affine −255 vs structural [0,255], `pspr/R_DrawPlayerSprites/emit`).
+Fix: after folds settle, recompute bounds for every mutated survivor and all
+downstream nodes in node_id (topological) order. Weights were always folded
+correctly — artifacts and the divergence result were never affected.
+
+**Trap for any future flagship verification:** the graph depends on env read
+at import time (`TORCHWRIGHT_DOOM_HUD`, `_DETAIL`, `_RENDER_SCALE`, screen
+dims). e1m1 production = hud=1/detail=low/scale=1/320x200, set via
+`apply_screen_env` BEFORE torchwright_doom imports. Hud-off builds fuse 774
+pairs / 57 layers; hud-on fuses 839 / 61 layers — verifying the wrong one
+looks clean and proves nothing about the other.
+
+**Confirmed out-of-band finding (separate thread):** cold `optimize=2`
+CP-SAT at flagship scale returns UNKNOWN at its 180s budget even on the
+production 64-CPU container and silently falls back to the eager heuristic
+(RuntimeWarning only). Recommend recording solver status in the artifact
+meta and/or failing loudly. Until then, `optimize=2` is only effective via a
+warm schedule cache.
+
+**Remaining work (decisions/cleanup, no open engineering):**
+1. Merge/push both branches; bump umbrella pointers.
+2. Pre-merge cleanup: `git worktree remove` the two `.divergence_baseline`
+   worktrees; revert the TEMPORARY baseline-mount block in doom
+   `modal_image.py` (committed in b2d1973, marked with a revert note); in
+   doom scripts/ keep `find_valuetype_soundness.py` (general graph-soundness
+   scanner) + `count_chain_flexibilities.py` (Phase-0 instrument) as
+   committed tooling, delete `trace_block_bound.py`,
+   `compare_pspr_constant_chain.py`, `baseline_soundness_scan.py` (one-off
+   traces; durable value is the committed reproducer test).
+3. Disposition (decided): KEEP `blockify` (verification tripwire: asserts no
+   raw L→R→L chains return) and the `ReLU` node type (blockify's detector +
+   affine-rule internals); ReLU is no longer op-facing, per Gate A.
+4. Step 2 (SwiGLU) is unblocked: the Block node already carries the
+   up-projection fields and per-block activation the gated machine needs —
+   see `block_lane_spec.md` and `ops_plain_english.md`.
+
 *Companion to `ir_semantic_vs_structural.md` (the diagnosis) and
 `ops_plain_english.md` (the target SwiGLU op formulas). This is the derisking
 step for the ReLU → SwiGLU migration: reshape the current ReLU machine into
