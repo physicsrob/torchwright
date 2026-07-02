@@ -1,11 +1,12 @@
 """Equivalence harness for the block-IR step-1 refactor
 (``docs/block_ir_step1_plan.md``, "Equivalence harness").
 
-For a given graph builder it compiles **both** code paths — the chain-mined
-path (today's ``Linear -> ReLU -> Linear`` scheduler) and the blockified path
-(``blockify`` -> :class:`Block`) — runs identical inputs, and reports the max
-output divergence plus a compile-metrics tuple for each path.  "Both paths in
-one tree" is what makes each commit's equivalence checkable.
+For a given graph builder it compiles **both** code paths — historically the
+chain-mined path vs the blockified one; since Phase 2b/3 the ops layer builds
+Blocks natively, so both builds are the same graph and the "block path" is
+the build certified at the lowering boundary (``compiler.lower``, blockify's
+successor) — runs identical inputs, and reports the max output divergence
+plus a compile-metrics tuple for each path.
 
 Two collection modes, so this scales from a unit-test graph to the d=8192
 flagship:
@@ -37,8 +38,8 @@ from torchwright.compiler.forward.graph_analysis import GraphAnalyzer
 from torchwright.compiler.forward.residual_map import ResidualStreamMap
 from torchwright.compiler.forward.scheduler import LayerScheduler
 from torchwright.compiler.residual_assignment import flatten_concat_nodes
+from torchwright.compiler.lower import lower
 from torchwright.graph import Concatenate, Node
-from torchwright.graph.blockify import blockify
 from torchwright.graph.misc import LiteralValue
 from torchwright.graph.node import reserve_node_id_above
 
@@ -254,8 +255,8 @@ def equivalence_report(
         assume_zero_init=assume_zero_init,
     )
 
-    # Block path.
-    block_out = blockify(build_fn())
+    # Block path (certified at the lowering boundary; blockify's successor).
+    block_out = lower(build_fn()).output_node
     block_metrics = schedule_metrics(
         block_out,
         d=d,
@@ -277,7 +278,7 @@ def equivalence_report(
             assume_zero_init=assume_zero_init,
         )
         c_block = compile_headless(
-            blockify(build_fn()),
+            lower(build_fn()).output_node,
             d=d,
             d_head=d_head,
             d_hidden=d_hidden,

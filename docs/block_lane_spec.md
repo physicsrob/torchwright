@@ -2,8 +2,9 @@
 
 *One page. Written against the SwiGLU end-state (`ops_plain_english.md`);
 step 1 instantiates only the degenerate ReLU form. Gate A rulings apply:
-no export-raw-lanes, ReLU is block-internal, blockify asserts L1
-exclusivity.*
+no export-raw-lanes, ReLU is block-internal, and no raw chain survives —
+originally asserted by the `blockify` pass, now by the lowering boundary
+(`compiler.lower`, which absorbed and deleted it).*
 
 ## Semantics
 
@@ -41,7 +42,7 @@ convention as `Linear`), `gate_proj (n_lanes, d_input)`, `gate_bias
 - Canonical-id / ONNX debug sidecar / rebuild fingerprint: Block
   participates like any node type; fingerprints will change — expected.
 
-## Invariants (stated, enforced at blockify/construction)
+## Invariants (stated, enforced at the lowering boundary/construction)
 
 1. **A Block is a packable unit, not a sublayer.** The scheduler bins many
    blocks' lanes into one MLP sublayer's hidden pool (`d_hidden`). Nothing
