@@ -181,6 +181,12 @@ class Node:
         # ``computed_nodes``.  Empty by default.
         self.scheduling_predecessors: Set["Node"] = set()
         global_node_id += 1
+        # Semantic affine override installed by an op via
+        # ``affine_rules._apply_semantic_override`` (None for most nodes).
+        # Stored persistently so ``refresh_node_caches`` can re-apply it
+        # after recomputing the propagated bound — a recompute that dropped
+        # it would silently loosen every downstream bound.
+        self._semantic_affine_override = None
         self._structural_type = self.compute_value_type()
         from torchwright.graph.affine_rules import compute_affine_bound
 

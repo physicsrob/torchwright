@@ -669,6 +669,16 @@ def forward_compile(
         A HeadlessTransformer whose compute() method reproduces
         output_node.compute() for the same inputs.
     """
+    # 0. Lowering boundary: certify vocabulary and refresh derived caches
+    # (docs/lowering_boundary_plan.md).  Runs BEFORE GraphAnalyzer so the
+    # Assert-strip's structural/bound tightening lands on fresh caches
+    # instead of being wiped by a later recompute.  Every compile passes
+    # through here, so an uncertified graph cannot reach the scheduler.
+    from torchwright.compiler.lower import lower
+
+    lowered = lower(output_node, verbose=verbose)
+    output_node = lowered.output_node
+
     # 1. Analyze graph
     graph = GraphAnalyzer(output_node)
     # GraphAnalyzer may have stripped the output if it was an Assert; use

@@ -388,7 +388,14 @@ def _embedding_rule(node) -> AffineBound:
 
 
 def _apply_semantic_override(node: "Node", semantic_ab: Optional[AffineBound]) -> None:
-    """Replace *node*'s affine bound with a semantic override."""
+    """Replace *node*'s affine bound with a semantic override.
+
+    The override is also recorded on the node
+    (``_semantic_affine_override``) so :func:`refresh_node_caches` can
+    re-apply it after recomputing the propagated bound — otherwise any
+    post-construction recompute would silently drop the semantic
+    tightening and loosen every downstream bound derived from it.
+    """
     if semantic_ab is None:
         return
     propagated = node._affine_bound.to_scalar_range()
@@ -397,7 +404,25 @@ def _apply_semantic_override(node: "Node", semantic_ab: Optional[AffineBound]) -
         f"Semantic override on node {node.node_id} is disjoint from "
         f"propagated bound: semantic={semantic}, propagated={propagated}"
     )
+    node._semantic_affine_override = semantic_ab
     node._affine_bound = semantic_ab
+
+
+def refresh_node_caches(node: "Node") -> None:
+    """Recompute *node*'s eagerly-cached derived data from its inputs.
+
+    Recomputes ``_structural_type`` and ``_affine_bound`` (both computed
+    eagerly in ``Node.__init__`` and therefore stale after any in-place
+    mutation of the node or an ancestor), then re-applies the node's
+    semantic affine override if an op installed one.  Callers must invoke
+    this in an order where a node's inputs are refreshed before the node
+    itself (any topological order works; the fusion pass uses node-id
+    order, which its folds keep topological).
+    """
+    node._structural_type = node.compute_value_type()
+    node._affine_bound = compute_affine_bound(node)
+    if node._semantic_affine_override is not None:
+        _apply_semantic_override(node, node._semantic_affine_override)
 
 
 def _cond_gate_semantic_bound(

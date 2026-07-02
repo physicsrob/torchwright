@@ -80,6 +80,11 @@ def _fold_block_into_linear(b: Block, consumers: Dict[Node, List[Node]]) -> None
     b.out_bias = b.out_bias @ l.output_matrix + l.output_bias
     b.out_proj = b.out_proj @ l.output_matrix
     b.d_output = l.output_matrix.shape[1]
+    # This fold inverts survivorship: b's VALUE becomes what l's was, so a
+    # semantic affine override installed on b describes the pre-fold value
+    # and must not be re-applied by the bounds refresh.  (The other two
+    # folds preserve the survivor's value, so their overrides stay valid.)
+    b._semantic_affine_override = None
     if b.name and l.name:
         b.name = f"fused_{b.name}_{l.name}"
     for consumer in list(consumers.get(l, [])):
@@ -256,14 +261,13 @@ def _recompute_bounds_after_fusion(output_nodes: Set[Node], mutated: Set[Node]) 
     forward sweep recomputes each dirty node after its inputs.
     """
     from torchwright.compiler.utils import get_ancestor_nodes
-    from torchwright.graph.affine_rules import compute_affine_bound
+    from torchwright.graph.affine_rules import refresh_node_caches
 
     reachable = get_ancestor_nodes(output_nodes)
     dirty: Set[Node] = set(mutated)
     for node in sorted(reachable, key=lambda n: n.node_id):
         if node in mutated or any(inp in dirty for inp in node.inputs):
-            node._structural_type = node.compute_value_type()
-            node._affine_bound = compute_affine_bound(node)
+            refresh_node_caches(node)
             dirty.add(node)
 
 
