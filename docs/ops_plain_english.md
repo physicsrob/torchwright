@@ -992,8 +992,11 @@ The first item gates everything else; the rest land with their ops.
    a kernel misses by an ulp, budgets survive (~1e-7-class errors) but
    every "bit-exact" claim in this doc — and any test asserting exact
    equality — must be softened.
-2. **Builder API.** Pin the name and signature of the gated /
-   degenerate-swish FFN builder before the first op ports.
+2. **Builder API — pinned** (see `docs/swiglu_step2_plan.md`):
+   `swiglu_ffn(input_node, gate_proj, gate_bias, output_proj,
+   output_bias, *, up_proj=None, up_bias=None, name="")` in
+   `ops/swiglu`, hardcoding `activation="swish"`; degenerate vs gated
+   is `up_proj` presence.
 3. **piecewise_linear grid audit.** Per call site: minimum breakpoint
    spacing vs `34/K`. Pre-cleared: `scalar_to_embedding` (its pair
    spacing reduces to `scale > 34` in closed form — see the entry).
