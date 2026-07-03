@@ -149,6 +149,32 @@ select's interval hull and a `(1+rel_tol)` scaling of cond_gate's
 pass-through affine envelope. The ±1 cond assert (c_tol = 0.005) is
 unchanged in form; compare's 0.0028 fillet dip fits inside it.
 
+### swiglu abs: the one designed regression, measuring exactly its predicted peak
+
+relu `abs` is a 0-error negative control (`ReLU(x) + ReLU(−x)` is an
+identity); swiglu `abs` is the rare op the migration makes *worse* —
+`|x|` has a corner no smooth lane sum can express. The new
+`abs_near_zero_pm02` distribution pins the designed error dead-on:
+max_abs 0.00556928 at x = 0.0128039, i.e. `2·swish_dip/scale` at
+`|x| = 1.278/scale` to six figures. The error is one-sided (output in
+`[0, |x|]`, never negative, never above), so the ≥ 0 range claim
+carries no slack; the ~1.0 max *relative* error in the near-zero
+distribution is the same one-sidedness read at tiny `|x|` (deep in the
+fillet the output is a near-total underestimate of a near-zero
+reference) — expected, not a pathology. Bit-exact for `|x| ≳ 0.2`, so
+the whole integer grid is clean. Only consumers needing abs to not
+under-read near the origin (dividing by it, thresholding it small)
+budget the 0.0056.
+
+swiglu `min` (`a − hinge(a−b)`) measures 1.1e-5 on `minmax_uniform_pm50`
+— the far-apart-operand fp class (the `a − (a−b)` cancellation at the
+larger operand's ulp, unchanged from the ReLU machine). Its *dip* class
+(one-sided over-estimate ≤ `swish_dip/scale` = 0.0028, only when
+`|a−b| ≲ 0.2`) is essentially unsampled by that distribution — ties are
+~0.2% of it — so the committed number reflects fp rounding, not the
+dip; the dip bound is pinned by the op's unit test sweep instead
+(`tests/ops/swiglu/test_arithmetic_ops.py`).
+
 ### Softmax inside attention is not measured here
 
 The plan originally called for a per-op measurement of the "piecewise

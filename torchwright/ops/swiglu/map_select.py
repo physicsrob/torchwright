@@ -59,7 +59,7 @@ def select(cond: Node, true_node: Node, false_node: Node) -> Node:
     .. noise-footer::
 
        Max error: 4.768e-07 abs, 1.19e-07 rel over 4096 samples;
-       measured at commit e07fc22. See docs/numerical_noise.md.
+       measured at commit 23fee36. See docs/numerical_noise.md.
     """
     assert len(cond) == 1
     assert len(true_node) == len(false_node)

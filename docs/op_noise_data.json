@@ -1,6 +1,6 @@
 {
   "schema_version": 2,
-  "commit": "e07fc22",
+  "commit": "23fee36",
   "measured_at": "2026-07-03",
   "ops": [
     {
@@ -458,6 +458,44 @@
       ]
     },
     {
+      "name": "abs",
+      "machine": "swiglu",
+      "module": "torchwright.ops.swiglu.arithmetic_ops",
+      "notes": "`hinge(x) + hinge(-x)` = x·tanh(scale·x/2) — the rare op that regresses under swish (the relu identity is exact; |x| has a corner no smooth lane sum can express). Error is one-sided and bounded: output in [0, |x|], worst underestimate 2·swish_dip/scale (0.0056) at |x| = 1.278/scale; bit-exact for |x| ≳ 0.2 (the whole integer grid).",
+      "distributions": [
+        {
+          "name": "abs_near_zero_pm02",
+          "description": "|x| ≤ 0.2 — the swish abs fillet zone, where the one-sided underestimate peaks (2·swish_dip/scale at |x| = 1.278/scale); the relu abs is exact here.",
+          "n_samples": 4096,
+          "max_abs_error": 0.00556928,
+          "mean_abs_error": 0.000825454,
+          "p99_abs_error": 0.00555473,
+          "max_rel_error": 0.996398,
+          "mean_rel_error": 0.0729097,
+          "p99_rel_error": 0.929879,
+          "rel_valid_samples": 4096,
+          "worst_input": {
+            "x": 0.0128039
+          }
+        },
+        {
+          "name": "abs_uniform_pm50",
+          "description": "Uniform signed inputs on [-50, 50]. `abs` is exact (ReLU(x) + ReLU(-x)) so any residual is float32 round-off only.",
+          "n_samples": 4096,
+          "max_abs_error": 0.00510581,
+          "mean_abs_error": 5.9226e-06,
+          "p99_abs_error": 3.8147e-06,
+          "max_rel_error": 0.283571,
+          "mean_rel_error": 0.000262228,
+          "p99_rel_error": 1.1274e-07,
+          "rel_valid_samples": 4096,
+          "worst_input": {
+            "x": -0.0180054
+          }
+        }
+      ]
+    },
+    {
       "name": "bool_all_true",
       "machine": "swiglu",
       "module": "torchwright.ops.swiglu.logic_ops",
@@ -613,6 +651,30 @@
             "x[0]": 1.0,
             "x[1]": 2.0,
             "x[2]": 3.0
+          }
+        }
+      ]
+    },
+    {
+      "name": "min",
+      "machine": "swiglu",
+      "module": "torchwright.ops.swiglu.arithmetic_ops",
+      "notes": "`a − hinge(a−b)` plus a's sharpened bypass pair. One-sided over-estimate ≤ swish_dip/scale (0.0028), only when |a−b| ≲ 0.2; ties exact; far-apart operands carry the folded-/scale product-rounding ulp class.",
+      "distributions": [
+        {
+          "name": "minmax_uniform_pm50",
+          "description": "Two independent uniform streams on [-50, 50]². `min`/`max` are exact via the abs-trick; residual is float32 round-off only.",
+          "n_samples": 4096,
+          "max_abs_error": 1.14441e-05,
+          "mean_abs_error": 9.21631e-07,
+          "p99_abs_error": 5.72205e-06,
+          "max_rel_error": 6.75917e-06,
+          "mean_rel_error": 6.64772e-08,
+          "p99_rel_error": 7.20978e-07,
+          "rel_valid_samples": 4096,
+          "worst_input": {
+            "a": 21.4286,
+            "b": -46.8254
           }
         }
       ]

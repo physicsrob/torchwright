@@ -61,7 +61,7 @@ def compare(
     .. noise-footer::
 
        Max error: 1.999 abs, 1.999 rel over 8192 samples;
-       measured at commit e07fc22. See docs/numerical_noise.md.
+       measured at commit 23fee36. See docs/numerical_noise.md.
     """
     assert len(inp) == 1, "Input must be a 1D scalar node"
 
@@ -128,7 +128,7 @@ def multiply(inp1: Node, inp2: Node) -> Node:
     .. noise-footer::
 
        Max error: 0.0009766 abs, 2.241e-07 rel over 8192 samples;
-       measured at commit e07fc22. See docs/numerical_noise.md.
+       measured at commit 23fee36. See docs/numerical_noise.md.
     """
     assert len(inp1) == 1, "Input must be a 1D scalar node"
     assert len(inp2) == 1, "Input must be a 1D scalar node"
@@ -143,6 +143,108 @@ def multiply(inp1: Node, inp2: Node) -> Node:
         up_proj=torch.tensor([[0.0, 1.0], [0.0, -1.0]]),  # up rows +b / -b
         up_bias=torch.zeros(2),
         name="multiply",
+    )
+
+
+def abs(inp: Node) -> Node:
+    """Element-wise absolute value.
+
+        abs(x) = Swish(scale·x)/scale + Swish(-scale·x)/scale  =  x·tanh(scale·x/2)
+
+    The ReLU identity (``|x| = ReLU(x) + ReLU(-x)``, exact) with each
+    ReLU replaced by the sharpened hinge.  Unlike ``multiply``'s ± pair,
+    the two sigmoids here *add* instead of cancelling — an
+    approximation, the rare op that regresses under swish (there is no
+    exact swish form: ``|x|`` has a corner, and every finite sum of
+    Swish lanes is smooth).  The error is one-sided and bounded: the
+    output always lies in ``[0, |x|]`` — never negative, never above the
+    true value.  Worst underestimate is ``2·swish_dip/scale`` (0.0056 at
+    scale=100), hit at ``|x| = 1.278/scale``; for ``|x| ≳ 0.2`` tanh
+    saturates and the op is bit-exact in fp32 — the entire integer
+    grid.  Only consumers that need ``abs`` to *not under-read* near the
+    origin (dividing by it, comparing it against a small threshold)
+    must budget the ``2·swish_dip/scale``.
+
+    Args:
+        inp: Node of any width.
+
+    Returns:
+        Node of the same width containing ``|x|`` element-wise.
+
+    .. noise-footer::
+
+       Max error: 0.005569 abs, 0.9964 rel over 8192 samples;
+       measured at commit 23fee36. See docs/numerical_noise.md.
+    """
+    d = len(inp)
+    eye = torch.eye(d)
+    return swiglu_ffn(
+        inp,
+        torch.cat([scale * eye, -scale * eye]),  # gate rows +scale·x / -scale·x
+        torch.zeros(2 * d),
+        torch.cat([eye, eye]) / scale,
+        torch.zeros(d),
+        name="abs",
+    )
+
+
+def min(inp1: Node, inp2: Node) -> Node:
+    """Element-wise minimum of two nodes.
+
+        min(a, b) = a - Swish(scale·(a-b))/scale        # a - hinge(a-b)
+
+    Replaces the ReLU-era abs route (``(a+b-|a-b|)/2``) — under swish
+    the two forms have identical error, so the choice falls to graph
+    simplicity: the hinge form is self-contained, with no dependency on
+    ``abs``'s budget.  The ``a`` pass-through is a sharpened bypass pair
+    (``Swish(scale·a)/scale - Swish(-scale·a)/scale = a``, exact at any
+    sharpening — the identity the ``mlp_bypass`` realization class
+    relies on).  Error is one-sided: min is *over*-estimated by at most
+    ``swish_dip/scale`` (0.0028 at scale=100), and only when
+    ``|a-b| ≲ 0.2``; ties are exact (``Swish(0) = 0``).  The
+    construction is asymmetric but the error is not: the hinge's gap to
+    ReLU is an even function of ``a-b``.  fp note: min of far-apart
+    magnitudes inherits the larger operand's relative fp error (the
+    ``a - (a-b)`` cancellation), plus the folded ``/scale`` product
+    rounding at the lane-contribution magnitude — both unchanged in
+    class from the ReLU machine.
+
+    Args:
+        inp1: First node.
+        inp2: Second node (same width as *inp1*).
+
+    Returns:
+        Node of the same width containing ``min(inp1, inp2)`` element-wise.
+
+    .. noise-footer::
+
+       Max error: 1.144e-05 abs, 6.759e-06 rel over 4096 samples;
+       measured at commit 23fee36. See docs/numerical_noise.md.
+    """
+    assert len(inp1) == len(inp2)
+    d = len(inp1)
+    eye = torch.eye(d)
+    zero = torch.zeros(d, d)
+
+    # 3 degenerate lanes per component: hinge on (a-b), then a's bypass
+    # pair; the /scale folds into out_proj.
+    gate_proj = scale * torch.cat(
+        [
+            torch.cat([eye, -eye], dim=1),  # hinge rows: +a, -b
+            torch.cat([eye, zero], dim=1),  # bypass +a
+            torch.cat([-eye, zero], dim=1),  # bypass -a
+        ]
+    )
+    output_proj = torch.cat([-eye, eye, -eye]) / scale
+
+    x = Concatenate([inp1, inp2])
+    return swiglu_ffn(
+        x,
+        gate_proj,
+        torch.zeros(3 * d),
+        output_proj,
+        torch.zeros(d),
+        name="min",
     )
 
 
@@ -166,7 +268,7 @@ def square(inp: Node) -> Node:
     .. noise-footer::
 
        Max error: 3.052e-05 abs, 2.266e-07 rel over 8192 samples;
-       measured at commit e07fc22. See docs/numerical_noise.md.
+       measured at commit 23fee36. See docs/numerical_noise.md.
     """
     assert len(inp) == 1, "Input must be a 1D scalar node"
 

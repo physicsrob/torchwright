@@ -609,6 +609,14 @@ def _distributions() -> Dict[str, InputDistribution]:
             -50.0,
             50.0,
         ),
+        "abs_near_zero_pm02": _uniform_1d(
+            "abs_near_zero_pm02",
+            "|x| ≤ 0.2 — the swish abs fillet zone, where the one-sided "
+            "underestimate peaks (2·swish_dip/scale at |x| = 1.278/scale); "
+            "the relu abs is exact here.",
+            -0.2,
+            0.2,
+        ),
         "minmax_uniform_pm50": _uniform_2d(
             "minmax_uniform_pm50",
             "Two independent uniform streams on [-50, 50]². `min`/`max` are "
@@ -1214,6 +1222,41 @@ def _target_ops() -> List[TargetOp]:
                 "relative rounding. (The relu-machine select was never "
                 "measured — its additive-cancellation error class, half an "
                 "ulp of M, is documented in the findings doc instead.)"
+            ),
+        ),
+        TargetOp(
+            name="abs",
+            machine="swiglu",
+            module=_SWIGLU_ARITH,
+            source_file=_SWIGLU_ARITH_FILE,
+            input_specs={"x": 1},
+            build_graph=lambda nodes: swiglu_ops.abs(nodes["x"]),
+            reference_fn=lambda inputs: inputs["x"].abs(),
+            distribution_names=("abs_uniform_pm50", "abs_near_zero_pm02"),
+            notes=(
+                "`hinge(x) + hinge(-x)` = x·tanh(scale·x/2) — the rare op "
+                "that regresses under swish (the relu identity is exact; "
+                "|x| has a corner no smooth lane sum can express). Error is "
+                "one-sided and bounded: output in [0, |x|], worst "
+                "underestimate 2·swish_dip/scale (0.0056) at "
+                "|x| = 1.278/scale; bit-exact for |x| ≳ 0.2 (the whole "
+                "integer grid)."
+            ),
+        ),
+        TargetOp(
+            name="min",
+            machine="swiglu",
+            module=_SWIGLU_ARITH,
+            source_file=_SWIGLU_ARITH_FILE,
+            input_specs={"a": 1, "b": 1},
+            build_graph=lambda nodes: swiglu_ops.min(nodes["a"], nodes["b"]),
+            reference_fn=lambda inputs: torch.minimum(inputs["a"], inputs["b"]),
+            distribution_names=("minmax_uniform_pm50",),
+            notes=(
+                "`a − hinge(a−b)` plus a's sharpened bypass pair. One-sided "
+                "over-estimate ≤ swish_dip/scale (0.0028), only when "
+                "|a−b| ≲ 0.2; ties exact; far-apart operands carry the "
+                "folded-/scale product-rounding ulp class."
             ),
         ),
     ]

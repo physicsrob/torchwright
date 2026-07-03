@@ -13,7 +13,9 @@ weight writer imports it too).
 """
 
 from torchwright.ops.swiglu.arithmetic_ops import (
+    abs,
     compare,
+    min,
     multiply,
     square,
 )
