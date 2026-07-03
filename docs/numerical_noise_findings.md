@@ -222,6 +222,27 @@ split ports unchanged: map_to_table keeps `default ± Σ|Δ|` (overlap
 soundness) and onehot_lookup keeps the tight `[min, max]` (the reason
 it exists), with no new slack on either.
 
+### swiglu piecewise_linear family: relu parity, and the spacing audit caught two real call sites
+
+The five measured entries land at relu parity: `piecewise_linear` 0.25
+(the chord error both machines share — the fillets change nothing on a
+well-spaced grid), `clamp` 2.9e-6 vs 1.9e-6 (one extra fillet's ulp),
+`thermometer_floor_div`/`mod_const` exact 0, and `reciprocal`
+**byte-identical** to the relu number (0.000824451). That last one is
+the payoff of the grid-spacing audit the spec mandates
+(`34/K` per call site): at `input_scale = 1`, reciprocal's geometric
+grid (smallest gap ~0.0098 at min_value) had ~35 overlapping fillets
+whose dips stacked to ~2e-2 — a 20x regression — and
+`global_position_from_bos`'s 1024-entry inversion table (slope
+O(max_len) near w = 1, spacing ~0.01) mis-read position 0 by **~10
+positions**. Both ops now derive `input_scale` from their grid's
+smallest gap (`34/(scale·min_gap)`), separating the fillets; K
+multiplies out of the value path, so the fix costs nothing. The
+recovered-position test passes at the relu op's own 0.15 empirical
+ceiling. Lesson recorded: the audit is not a formality — dense
+smooth-target grids do *not* self-absorb once fillets overlap the
+grid pitch.
+
 ### Softmax inside attention is not measured here
 
 The plan originally called for a per-op measurement of the "piecewise

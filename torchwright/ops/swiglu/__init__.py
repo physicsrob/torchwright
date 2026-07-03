@@ -14,11 +14,17 @@ weight writer imports it too).
 
 from torchwright.ops.swiglu.arithmetic_ops import (
     abs,
+    clamp,
     compare,
     min,
+    mod_const,
     multiply,
+    piecewise_linear,
+    reciprocal,
     square,
+    thermometer_floor_div,
 )
+from torchwright.ops.swiglu.global_recency import global_position_from_bos
 from torchwright.ops.swiglu.logic_ops import (
     bool_all_true,
     bool_any_true,

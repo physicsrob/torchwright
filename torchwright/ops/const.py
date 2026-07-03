@@ -22,6 +22,16 @@ embedding_step_sharpness = 1.0  # For embedding-space ops (map_to_table, equals_
 # by tests/docs/test_swish_constants.py.
 scale = 100.0
 
+# The declared minimum MLP hidden width any compiled graph must provide: an
+# FFN is a packable unit that must fit one MLP sublayer's hidden pool, so the
+# swiglu lookup-family ops derive their chunk caps from this constant
+# (piecewise_linear's d_max, floor_int's per-chunk boundary count,
+# table_lookup_2d's axis chunks).  The flagship compiles at d_hidden = 16384
+# (torchwright_doom configs/e1m1*.yaml) — 16x headroom.  Raising a chunk cap
+# above this value requires raising this constant, which is the signal to
+# re-confirm every consumer's geometry.
+min_d_hidden = 1024
+
 # Swish's global-minimum magnitude: |min_z z·sigmoid(z)| = 0.2784645... at
 # z = -1.2784645...  This is the worst gap between the sharpened hinge
 # ``Swish(scale·z)/scale`` and ``ReLU(z)`` — ``swish_dip/scale`` in value

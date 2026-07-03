@@ -1,6 +1,6 @@
 {
   "schema_version": 2,
-  "commit": "249512e",
+  "commit": "3d08c2e",
   "measured_at": "2026-07-03",
   "ops": [
     {
@@ -603,6 +603,29 @@
       ]
     },
     {
+      "name": "clamp",
+      "machine": "swiglu",
+      "module": "torchwright.ops.swiglu.arithmetic_ops",
+      "notes": "piecewise_linear with 4 breakpoints, input_scale = step_sharpness; corners 0.1 apart clear the 34/K spacing audit 3x, so the only additions over relu are two isolated fillets (≤ swish_dip·|Δm|/K each).",
+      "distributions": [
+        {
+          "name": "clamp_flat_zone_pm20",
+          "description": "Uniform samples on [-8, 8] with clamp bounds [-10, 10] — every sample is inside the flat identity zone. Residual measures float32 round-off only.",
+          "n_samples": 4096,
+          "max_abs_error": 2.86102e-06,
+          "mean_abs_error": 4.60077e-07,
+          "p99_abs_error": 1.90735e-06,
+          "max_rel_error": 0.000331016,
+          "mean_rel_error": 6.65646e-07,
+          "p99_rel_error": 6.85662e-06,
+          "rel_valid_samples": 4096,
+          "worst_input": {
+            "x": 7.65666
+          }
+        }
+      ]
+    },
+    {
       "name": "compare",
       "machine": "swiglu",
       "module": "torchwright.ops.swiglu.arithmetic_ops",
@@ -794,6 +817,29 @@
       ]
     },
     {
+      "name": "mod_const",
+      "machine": "swiglu",
+      "module": "torchwright.ops.swiglu.arithmetic_ops",
+      "notes": "x − d·thermometer_floor_div(x, d) — linear hardware plus the staircase; exact on integer inputs to the folded ulp class, as on relu.",
+      "distributions": [
+        {
+          "name": "mod_integers_0_100_by7",
+          "description": "Integer inputs on [0, 100] with divisor=7. `mod_const` is x − divisor × `thermometer_floor_div(x)`, exact on integers.",
+          "n_samples": 4096,
+          "max_abs_error": 0.0,
+          "mean_abs_error": 0.0,
+          "p99_abs_error": 0.0,
+          "max_rel_error": 0.0,
+          "mean_rel_error": 0.0,
+          "p99_rel_error": 0.0,
+          "rel_valid_samples": 3486,
+          "worst_input": {
+            "x": 64.0
+          }
+        }
+      ]
+    },
+    {
       "name": "multiply",
       "machine": "swiglu",
       "module": "torchwright.ops.swiglu.arithmetic_ops",
@@ -861,6 +907,52 @@
       ]
     },
     {
+      "name": "piecewise_linear",
+      "machine": "swiglu",
+      "module": "torchwright.ops.swiglu.arithmetic_ops",
+      "notes": "The relu construction with sharpened hinges (K = scale·input_scale in the gate rows). Chord error between breakpoints is untouched and dominates, exactly as on relu; each corner adds a radius-17/K fillet whose dip (≤ swish_dip·|Δm|/K) bends toward the curve — grids with spacing under 34/K must raise input_scale (the spacing audit; reciprocal and the BOS inversion table do).",
+      "distributions": [
+        {
+          "name": "parabola_0_10_step1",
+          "description": "f(x)=x² on [0, 10] with integer breakpoints — probes generic `piecewise_linear` precision between grid points.",
+          "n_samples": 4096,
+          "max_abs_error": 0.25,
+          "mean_abs_error": 0.163654,
+          "p99_abs_error": 0.249977,
+          "max_rel_error": 139.677,
+          "mean_rel_error": 0.514982,
+          "p99_rel_error": 11.3921,
+          "rel_valid_samples": 4094,
+          "worst_input": {
+            "x": 8.49967
+          }
+        }
+      ]
+    },
+    {
+      "name": "reciprocal",
+      "machine": "swiglu",
+      "module": "torchwright.ops.swiglu.arithmetic_ops",
+      "notes": "Geometric grid; the smallest gap (at min_value) fails the 34/K spacing audit at input_scale=1 (stacked fillets reached ~2e-2, a 20x regression), so the op derives input_scale from the smallest gap — with the fillets separated, the measured error is the chord class, as on relu.",
+      "distributions": [
+        {
+          "name": "reciprocal_03_200",
+          "description": "1/x over [0.3, 200.0], step=1.0.",
+          "n_samples": 4096,
+          "max_abs_error": 0.000824451,
+          "mean_abs_error": 0.000106724,
+          "p99_abs_error": 0.00044889,
+          "max_rel_error": 0.111707,
+          "mean_rel_error": 0.0133427,
+          "p99_rel_error": 0.075248,
+          "rel_valid_samples": 4096,
+          "worst_input": {
+            "x": 0.315914
+          }
+        }
+      ]
+    },
+    {
       "name": "select",
       "machine": "swiglu",
       "module": "torchwright.ops.swiglu.map_select",
@@ -919,6 +1011,29 @@
           "rel_valid_samples": 4094,
           "worst_input": {
             "x": 8.68994
+          }
+        }
+      ]
+    },
+    {
+      "name": "thermometer_floor_div",
+      "machine": "swiglu",
+      "module": "torchwright.ops.swiglu.arithmetic_ops",
+      "notes": "Integer-input-only staircase via piecewise_linear at input_scale = step_sharpness. Integer inputs sit in flat zones ≥ 4 units from every ramp — saturated, so exact to the folded ulp class.",
+      "distributions": [
+        {
+          "name": "thermometer_integers_0_100_by10",
+          "description": "Integer inputs on [0, 100] with divisor=10 — `thermometer_floor_div` is defined only for integer inputs.",
+          "n_samples": 4096,
+          "max_abs_error": 0.0,
+          "mean_abs_error": 0.0,
+          "p99_abs_error": 0.0,
+          "max_rel_error": 0.0,
+          "mean_rel_error": 0.0,
+          "p99_rel_error": 0.0,
+          "rel_valid_samples": 3699,
+          "worst_input": {
+            "x": 64.0
           }
         }
       ]

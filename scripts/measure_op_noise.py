@@ -1539,6 +1539,101 @@ def _target_ops() -> List[TargetOp]:
                 "never measured.)"
             ),
         ),
+        TargetOp(
+            name="piecewise_linear",
+            machine="swiglu",
+            module=_SWIGLU_ARITH,
+            source_file=_SWIGLU_ARITH_FILE,
+            input_specs={"x": 1},
+            build_graph=lambda nodes: swiglu_ops.piecewise_linear(
+                nodes["x"],
+                breakpoints=[float(i) for i in range(11)],
+                fn=lambda v: v * v,
+            ),
+            reference_fn=lambda inputs: inputs["x"] ** 2,
+            distribution_names=("parabola_0_10_step1",),
+            notes=(
+                "The relu construction with sharpened hinges "
+                "(K = scale·input_scale in the gate rows). Chord error "
+                "between breakpoints is untouched and dominates, exactly "
+                "as on relu; each corner adds a radius-17/K fillet whose "
+                "dip (≤ swish_dip·|Δm|/K) bends toward the curve — grids "
+                "with spacing under 34/K must raise input_scale (the "
+                "spacing audit; reciprocal and the BOS inversion table do)."
+            ),
+        ),
+        TargetOp(
+            name="clamp",
+            machine="swiglu",
+            module=_SWIGLU_ARITH,
+            source_file=_SWIGLU_ARITH_FILE,
+            input_specs={"x": 1},
+            build_graph=lambda nodes: swiglu_ops.clamp(nodes["x"], lo=-10.0, hi=10.0),
+            reference_fn=lambda inputs: torch.clamp(inputs["x"], -10.0, 10.0),
+            distribution_names=("clamp_flat_zone_pm20",),
+            notes=(
+                "piecewise_linear with 4 breakpoints, input_scale = "
+                "step_sharpness; corners 0.1 apart clear the 34/K spacing "
+                "audit 3x, so the only additions over relu are two "
+                "isolated fillets (≤ swish_dip·|Δm|/K each)."
+            ),
+        ),
+        TargetOp(
+            name="reciprocal",
+            machine="swiglu",
+            module=_SWIGLU_ARITH,
+            source_file=_SWIGLU_ARITH_FILE,
+            input_specs={"x": 1},
+            build_graph=lambda nodes: swiglu_ops.reciprocal(
+                nodes["x"], min_value=0.3, max_value=200.0, step=1.0
+            ),
+            reference_fn=lambda inputs: 1.0 / inputs["x"],
+            distribution_names=("reciprocal_03_200",),
+            notes=(
+                "Geometric grid; the smallest gap (at min_value) fails the "
+                "34/K spacing audit at input_scale=1 (stacked fillets "
+                "reached ~2e-2, a 20x regression), so the op derives "
+                "input_scale from the smallest gap — with the fillets "
+                "separated, the measured error is the chord class, as on "
+                "relu."
+            ),
+        ),
+        TargetOp(
+            name="thermometer_floor_div",
+            machine="swiglu",
+            module=_SWIGLU_ARITH,
+            source_file=_SWIGLU_ARITH_FILE,
+            input_specs={"x": 1},
+            build_graph=lambda nodes: swiglu_ops.thermometer_floor_div(
+                nodes["x"], divisor=10, max_value=100
+            ),
+            reference_fn=lambda inputs: torch.floor(inputs["x"] / 10.0),
+            distribution_names=("thermometer_integers_0_100_by10",),
+            notes=(
+                "Integer-input-only staircase via piecewise_linear at "
+                "input_scale = step_sharpness. Integer inputs sit in flat "
+                "zones ≥ 4 units from every ramp — saturated, so exact to "
+                "the folded ulp class."
+            ),
+        ),
+        TargetOp(
+            name="mod_const",
+            machine="swiglu",
+            module=_SWIGLU_ARITH,
+            source_file=_SWIGLU_ARITH_FILE,
+            input_specs={"x": 1},
+            build_graph=lambda nodes: swiglu_ops.mod_const(
+                nodes["x"], divisor=7, max_value=100
+            ),
+            reference_fn=lambda inputs: inputs["x"]
+            - 7.0 * torch.floor(inputs["x"] / 7.0),
+            distribution_names=("mod_integers_0_100_by7",),
+            notes=(
+                "x − d·thermometer_floor_div(x, d) — linear hardware plus "
+                "the staircase; exact on integer inputs to the folded ulp "
+                "class, as on relu."
+            ),
+        ),
     ]
 
 
