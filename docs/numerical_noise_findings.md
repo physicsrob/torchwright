@@ -131,6 +131,24 @@ the aggregate numbers don't show, pinned in
   bit-exact (all lane contributions exactly ±0.0, or the
   `scale·fl((T−F)/scale)` product provably rounding clean).
 
+### swiglu cond_gate/select: the offset-cancellation error class is gone
+
+swiglu `cond_gate` measures 4.8e-7 abs / 1.2e-7 rel on the same
+distribution where relu `cond_gate` measures 9.8e-4 abs / 0.39 rel: the
+relu gate recovers the value through `(M+v)−M`, paying half an ulp *of
+the offset M* even when the value is tiny, while the gated lane passes
+the winner directly with ~1 ulp *relative* rounding and a losing branch
+that is exactly zero (`σ(−scale)` computes as 0.0 in fp32). `select`
+(measured for the first time — the relu select was never in the table;
+it shares relu cond_gate's `(M+v)−M` class) lands at the same 1-ulp
+relative floor. The whole offset apparatus is absent from the swiglu
+ops: no `M`, no finite-range requirement (unbounded branch ranges
+build fine), and the semantic bounds widen *relatively* —
+`δ·|actual value|`, implemented as per-side `rel_tol·|hull side|` for
+select's interval hull and a `(1+rel_tol)` scaling of cond_gate's
+pass-through affine envelope. The ±1 cond assert (c_tol = 0.005) is
+unchanged in form; compare's 0.0028 fillet dip fits inside it.
+
 ### Softmax inside attention is not measured here
 
 The plan originally called for a per-op measurement of the "piecewise

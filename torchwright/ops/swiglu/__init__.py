@@ -21,6 +21,11 @@ from torchwright.ops.swiglu.logic_ops import (
     bool_all_true,
     bool_any_true,
     bool_not,
+    cond_gate,
     equals_vector,
+)
+from torchwright.ops.swiglu.map_select import (
+    select,
+    switch,
 )
 from torchwright.ops.swiglu.swiglu_ffn import swiglu_ffn

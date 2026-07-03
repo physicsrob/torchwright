@@ -120,8 +120,14 @@ def debug_watch(node: Node, predicate: Predicate, message: str = "") -> Node:
 
 
 def _format_bad(x: torch.Tensor, mask: torch.Tensor, *, max_show: int = 3) -> str:
-    """Summarize the first ``max_show`` positions where ``mask`` is True."""
-    bad_indices = mask.nonzero(as_tuple=False).flatten().tolist()
+    """Summarize the first ``max_show`` positions where ``mask`` is True.
+
+    Indices are into the flattened tensor — the mask is flattened
+    *before* ``nonzero`` (a multi-dim ``nonzero`` returns coordinate
+    rows, which flattened would be coordinates misread as flat indices,
+    pairing wrong values with wrong positions).
+    """
+    bad_indices = mask.flatten().nonzero(as_tuple=False).flatten().tolist()
     if not bad_indices:
         return "no bad entries"
     head = bad_indices[:max_show]

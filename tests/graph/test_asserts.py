@@ -711,3 +711,18 @@ def test_range_violation_raises():
     node = assert_matches_value_type(inp, NodeValueType.bounded(0, 9))
     with pytest.raises(AssertionError, match="range"):
         node.compute(1, {})
+
+
+def test_format_bad_multidim_reports_true_positions():
+    """_format_bad on a multi-dim tensor: indices are into the flattened
+    tensor and pair with the actual offending values. (Regression: a
+    multi-dim nonzero returns coordinate rows; flattening those produced
+    coordinates misread as flat indices, pairing wrong values with wrong
+    positions.)"""
+    from torchwright.graph.asserts import _format_bad
+
+    x = torch.tensor([[1.0, 2.0], [-3.0, -4.0], [5.0, 6.0], [-7.0, -8.0]])
+    mask = x < -4.5  # true at flat positions 6 (-7.0) and 7 (-8.0)
+    msg = _format_bad(x, mask)
+    assert "[6]=-7.0000" in msg
+    assert "[7]=-8.0000" in msg

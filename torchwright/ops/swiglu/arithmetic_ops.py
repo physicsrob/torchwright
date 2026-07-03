@@ -61,7 +61,7 @@ def compare(
     .. noise-footer::
 
        Max error: 1.999 abs, 1.999 rel over 8192 samples;
-       measured at commit 95cf02b. See docs/numerical_noise.md.
+       measured at commit e07fc22. See docs/numerical_noise.md.
     """
     assert len(inp) == 1, "Input must be a 1D scalar node"
 
@@ -128,7 +128,7 @@ def multiply(inp1: Node, inp2: Node) -> Node:
     .. noise-footer::
 
        Max error: 0.0009766 abs, 2.241e-07 rel over 8192 samples;
-       measured at commit 95cf02b. See docs/numerical_noise.md.
+       measured at commit e07fc22. See docs/numerical_noise.md.
     """
     assert len(inp1) == 1, "Input must be a 1D scalar node"
     assert len(inp2) == 1, "Input must be a 1D scalar node"
@@ -166,7 +166,7 @@ def square(inp: Node) -> Node:
     .. noise-footer::
 
        Max error: 3.052e-05 abs, 2.266e-07 rel over 8192 samples;
-       measured at commit 95cf02b. See docs/numerical_noise.md.
+       measured at commit e07fc22. See docs/numerical_noise.md.
     """
     assert len(inp) == 1, "Input must be a 1D scalar node"
 

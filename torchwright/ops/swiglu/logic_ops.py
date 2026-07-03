@@ -2,14 +2,15 @@
 
 The bool ops are pure :func:`~torchwright.ops.swiglu.arithmetic_ops.compare`
 compositions — they inherit compare's entry in ``docs/ops_plain_english.md``,
-not their own.  ``equals_vector`` is a one-sided compare on a dot product.
+not their own.  ``equals_vector`` is a one-sided compare on a dot product;
+``cond_gate`` is the one-branch gated select.
 """
 
 from typing import List
 
 import torch
 
-from torchwright.graph import Node
+from torchwright.graph import Concatenate, Node
 from torchwright.graph.asserts import assert_matches_value_type
 from torchwright.graph.value_type import NodeValueType, Range
 from torchwright.ops.const import embedding_step_sharpness, scale, swish_dip
@@ -20,6 +21,35 @@ from torchwright.ops.const import embedding_step_sharpness, scale, swish_dip
 from torchwright.ops.relu.arithmetic_ops import sum_nodes
 from torchwright.ops.swiglu.arithmetic_ops import compare
 from torchwright.ops.swiglu.swiglu_ffn import swiglu_ffn
+
+_GATE_C_TOL = 0.005
+"""Maximum acceptable deviation of ``|cond|`` from 1 in the gated ops
+(``cond_gate``, ``select``, ``switch``).  A saturated swish gate is linear in
+the cond, so a cond off ±1 by δ mis-scales the gated value by exactly
+δ·|actual value| — the semantic bounds widen by that relative amount (no
+range maximum ``M`` anywhere).  0.005 matches typical far-field compare
+noise and clears compare's fillet dip (0.0028) with margin."""
+
+
+def _assert_cond_pm1(cond: Node, c_tol: float = _GATE_C_TOL) -> Node:
+    """Wrap ``cond`` in the gated ops' shared ±1 assert."""
+    from torchwright.graph.misc import Assert
+
+    def _cond_check(x: torch.Tensor) -> tuple:
+        deviation = (x.abs() - 1.0).abs()
+        bad = deviation > c_tol
+        if not bad.any():
+            return True, ""
+        from torchwright.graph.asserts import _format_bad
+
+        return False, (f"expected ||cond| - 1| <= {c_tol}; {_format_bad(x, bad)}")
+
+    return Assert(
+        cond,
+        _cond_check,
+        message=f"cond near ±1 (c_tol={c_tol})",
+        claimed_type=NodeValueType(value_range=Range(-1.0 - c_tol, 1.0 + c_tol)),
+    )
 
 
 def bool_any_true(inp_list: List[Node]) -> Node:
@@ -35,7 +65,7 @@ def bool_any_true(inp_list: List[Node]) -> Node:
     .. noise-footer::
 
        Max error: 0 abs, 0 rel over 4096 samples;
-       measured at commit 95cf02b. See docs/numerical_noise.md.
+       measured at commit e07fc22. See docs/numerical_noise.md.
     """
     # Convert all the values to 1.0 if they're > 0.0 and 0.0 otherwise
     # then sum them, and if the sum is > 0.5, return 1.0, otherwise -1.0.
@@ -65,7 +95,7 @@ def bool_all_true(inp_list: List[Node]) -> Node:
     .. noise-footer::
 
        Max error: 0 abs, 0 rel over 4096 samples;
-       measured at commit 95cf02b. See docs/numerical_noise.md.
+       measured at commit e07fc22. See docs/numerical_noise.md.
     """
     return compare(
         sum_nodes(inp_list),
@@ -88,7 +118,7 @@ def bool_not(inp: Node) -> Node:
     .. noise-footer::
 
        Max error: 0 abs, 0 rel over 4096 samples;
-       measured at commit 95cf02b. See docs/numerical_noise.md.
+       measured at commit e07fc22. See docs/numerical_noise.md.
     """
     return compare(inp, thresh=0.0, true_level=-1.0, false_level=1.0)
 
@@ -126,7 +156,7 @@ def equals_vector(inp: Node, vector: torch.Tensor) -> Node:
     .. noise-footer::
 
        Max error: 0 abs, 0 rel over 4096 samples;
-       measured at commit 95cf02b. See docs/numerical_noise.md.
+       measured at commit e07fc22. See docs/numerical_noise.md.
     """
     speed = embedding_step_sharpness
     gate_proj = scale * vector.unsqueeze(0)
@@ -145,3 +175,81 @@ def equals_vector(inp: Node, vector: torch.Tensor) -> Node:
     return assert_matches_value_type(
         result, NodeValueType(value_range=Range(-1.0 - low_slack, 1.0))
     )
+
+
+def _cond_gate_output_type(inp: Node) -> NodeValueType:
+    r = inp.value_type.value_range
+    if not r.is_finite():
+        return NodeValueType()
+    return NodeValueType(value_range=Range(min(0.0, r.lo), max(0.0, r.hi)))
+
+
+def cond_gate(cond: Node, inp: Node) -> Node:
+    """Output ``inp`` if ``cond`` is true, else 0.
+
+    One gated lane per component::
+
+        cond_gate(cond, inp) = Swish(scale·cond) · inp / scale
+
+    ``Swish(scale·cond)/scale ≈ ReLU(cond)``: 1 at ``cond=+1``, 0 at
+    ``cond=−1`` — ``select`` with the false branch pinned to zero.
+    ``cond`` is ±1, enforced by an assert (same ``e^{−scale}``-class gate
+    error as select: at clean conds the off-path is exactly zero in fp32
+    and the on-path passes with ~1 ulp relative rounding).  Because the
+    multiply is direct, cond noise lands proportionally to the *actual*
+    value of ``inp``, not a range maximum — the ReLU-era offset
+    apparatus (``M``, the finite-range requirement, the ``c_tol·M``
+    widening) does not exist here; ``inp`` may have an unbounded range.
+
+    Args:
+        cond (Node): Condition node.
+        inp (Node): The node whose value is to be gated.
+
+    Returns:
+        Node: Output node after applying the gate based on condition.
+
+    .. noise-footer::
+
+       Max error: 4.768e-07 abs, 1.188e-07 rel over 4096 samples;
+       measured at commit e07fc22. See docs/numerical_noise.md.
+    """
+    assert len(cond) == 1
+    d = len(inp)
+
+    cond = _assert_cond_pm1(cond)
+
+    # d gated lanes: every gate row reads scale·cond, up row j picks
+    # component j of inp, /scale folds into out_proj.
+    gate_proj = torch.zeros(d, 1 + d)
+    gate_proj[:, 0] = scale
+    up_proj = torch.zeros(d, 1 + d)
+    up_proj[:, 1:] = torch.eye(d)
+    output_proj = torch.eye(d) / scale
+
+    x = Concatenate([cond, inp])
+    result = swiglu_ffn(
+        x,
+        gate_proj,
+        torch.zeros(d),
+        output_proj,
+        torch.zeros(d),
+        up_proj=up_proj,
+        up_bias=torch.zeros(d),
+        name="cond_gate",
+    )
+
+    vt = _cond_gate_output_type(inp)
+    if vt != NodeValueType.unknown():
+        r = inp.value_type.value_range
+        gate_atol = _GATE_C_TOL * max(abs(r.lo), abs(r.hi))
+        result = assert_matches_value_type(result, vt, atol=gate_atol)
+    from torchwright.graph.affine_rules import (
+        _apply_semantic_override,
+        _cond_gate_semantic_bound,
+    )
+
+    _apply_semantic_override(
+        result,
+        _cond_gate_semantic_bound(inp._affine_bound, inp, rel_tol=_GATE_C_TOL),
+    )
+    return result

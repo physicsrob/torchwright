@@ -597,12 +597,23 @@ def _cond_gate_semantic_bound(
     inp_node: Optional["Node"] = None,
     c_tol: float = 0.0,
     M: float = 0.0,
+    rel_tol: float = 0.0,
 ) -> AffineBound:
     """Per-component [min(0, inp), max(0, inp)] envelope for cond_gate.
 
-    When ``c_tol > 0`` and ``M > 0``, widens the envelope by
-    ``c_tol * M`` per component to account for amplified condition noise
-    in the approximate gate path.
+    Two widening modes for condition noise, matching the two gate
+    machines:
+
+    - ReLU (additive-cancellation gate): ``c_tol > 0`` and ``M > 0``
+      widen the envelope by the absolute ``c_tol * M`` per component —
+      a cond off ±1 by δ leaks δ·M of the offset.
+    - swish (direct gated lanes): ``rel_tol > 0`` scales the whole
+      envelope by ``(1 + rel_tol)`` — a saturated swish gate is linear
+      in the cond, so a cond off ±1 by δ mis-scales the output by
+      exactly δ·|actual value|, never δ·M.  Scaling is sound on both
+      sides: the upper envelope bounds a pointwise non-negative
+      function (so ``(1+δ)·U ≥ max(0, (1+δ')·v)``), the lower a
+      pointwise non-positive one.
     """
     intervals = inp_ab.to_interval()
     d = inp_ab.d_output
@@ -647,6 +658,11 @@ def _cond_gate_semantic_bound(
     b_lo -= widen
     b_hi += widen
 
+    if rel_tol > 0.0:
+        s = 1.0 + rel_tol
+        A_lo, A_hi = s * A_lo, s * A_hi
+        b_lo, b_hi = s * b_lo, s * b_hi
+
     return AffineBound(
         A_lo=A_lo,
         A_hi=A_hi,
@@ -661,11 +677,17 @@ def _select_semantic_bound(
     a_ab: AffineBound,
     b_ab: AffineBound,
     tolerance: float = 0.0,
+    rel_tolerance: float = 0.0,
 ) -> AffineBound:
     """Per-component hull of a and b intervals for select.
 
-    When ``tolerance > 0``, widens the hull by that amount per component
-    to account for amplified condition noise in the approximate gate path.
+    Two widening modes for condition noise, matching the two gate
+    machines: ``tolerance`` widens the hull by an absolute amount per
+    component (ReLU gate: a cond off ±1 by δ leaks δ·M of the offset);
+    ``rel_tolerance`` widens each hull side by ``rel_tolerance·|side|``
+    (swish gate: the saturated gate is linear in the cond, so a cond off
+    by δ mis-scales the winning branch by exactly δ·|actual value| —
+    the extreme scaled values are ``lo − δ·|lo|`` and ``hi + δ·|hi|``).
     """
     import torch
 
@@ -684,6 +706,10 @@ def _select_semantic_bound(
 
     b_lo -= tolerance
     b_hi += tolerance
+
+    if rel_tolerance > 0.0:
+        b_lo -= rel_tolerance * b_lo.abs()
+        b_hi += rel_tolerance * b_hi.abs()
 
     return AffineBound(
         A_lo=torch.zeros(d, a_ab.n_cols, dtype=torch.float64),

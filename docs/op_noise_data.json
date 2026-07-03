@@ -1,6 +1,6 @@
 {
   "schema_version": 2,
-  "commit": "95cf02b",
+  "commit": "e07fc22",
   "measured_at": "2026-07-03",
   "ops": [
     {
@@ -569,6 +569,30 @@
       ]
     },
     {
+      "name": "cond_gate",
+      "machine": "swiglu",
+      "module": "torchwright.ops.swiglu.logic_ops",
+      "notes": "One gated lane per component: `Swish(scale·cond)·inp/scale`. At clean ±1 conds the off-path is exactly zero in fp32 (σ(−scale) computes as 0.0) and the on-path passes with ~1 ulp relative rounding. No offset M, no finite-range requirement — cond noise lands as δ·|actual value|.",
+      "distributions": [
+        {
+          "name": "cond_gate_signed_bool_times_value",
+          "description": "±1 conditions paired with scalar values in [-5, 5]. Expected output: `value` when cond=+1, `0` when cond=-1.",
+          "n_samples": 4096,
+          "max_abs_error": 4.76837e-07,
+          "mean_abs_error": 2.00016e-08,
+          "p99_abs_error": 2.38419e-07,
+          "max_rel_error": 1.18755e-07,
+          "mean_rel_error": 1.63774e-08,
+          "p99_rel_error": 1.09702e-07,
+          "rel_valid_samples": 2089,
+          "worst_input": {
+            "cond": 1.0,
+            "inp": -4.97868
+          }
+        }
+      ]
+    },
+    {
       "name": "equals_vector",
       "machine": "swiglu",
       "module": "torchwright.ops.swiglu.logic_ops",
@@ -629,6 +653,31 @@
           "worst_input": {
             "a": -15.873,
             "b": -873.016
+          }
+        }
+      ]
+    },
+    {
+      "name": "select",
+      "machine": "swiglu",
+      "module": "torchwright.ops.swiglu.map_select",
+      "notes": "Complementary gated pair: `Swish(scale·cond)·a/scale + Swish(−scale·cond)·b/scale`. The losing branch contributes exactly zero at clean conds; the winner passes with ~1 ulp relative rounding. (The relu-machine select was never measured — its additive-cancellation error class, half an ulp of M, is documented in the findings doc instead.)",
+      "distributions": [
+        {
+          "name": "select_signed_bool_two_values",
+          "description": "±1 conditions paired with two independent branch values in [-5, 5]. Expected output: `a` when cond=+1, `b` when cond=-1.",
+          "n_samples": 4096,
+          "max_abs_error": 4.76837e-07,
+          "mean_abs_error": 3.86644e-08,
+          "p99_abs_error": 4.76837e-07,
+          "max_rel_error": 1.1897e-07,
+          "mean_rel_error": 1.61917e-08,
+          "p99_rel_error": 1.08853e-07,
+          "rel_valid_samples": 4096,
+          "worst_input": {
+            "cond": -1.0,
+            "a": -4.97029,
+            "b": -4.68839
           }
         }
       ]

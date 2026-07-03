@@ -351,6 +351,24 @@ def _cond_gate_distribution(
     )
 
 
+def _select_distribution(
+    name: str, description: str, n_samples: int = 4096, seed: int = 0
+) -> InputDistribution:
+    """±1 cond plus two independent uniform branch values in [-5, 5]."""
+    gen = torch.Generator().manual_seed(seed)
+    cond = (
+        torch.randint(0, 2, (n_samples, 1), generator=gen).to(torch.float32) * 2.0 - 1.0
+    )
+    a = torch.rand((n_samples, 1), generator=gen) * 10.0 - 5.0
+    b = torch.rand((n_samples, 1), generator=gen) * 10.0 - 5.0
+    return InputDistribution(
+        name=name,
+        description=description,
+        inputs={"cond": cond, "a": a, "b": b},
+        n_samples=n_samples,
+    )
+
+
 def _bin_index_distribution(
     name: str,
     description: str,
@@ -643,6 +661,11 @@ def _distributions() -> Dict[str, InputDistribution]:
             "±1 conditions paired with scalar values in [-5, 5]. Expected "
             "output: `value` when cond=+1, `0` when cond=-1.",
         ),
+        "select_signed_bool_two_values": _select_distribution(
+            "select_signed_bool_two_values",
+            "±1 conditions paired with two independent branch values in "
+            "[-5, 5]. Expected output: `a` when cond=+1, `b` when cond=-1.",
+        ),
     }
 
 
@@ -670,6 +693,8 @@ def _target_ops() -> List[TargetOp]:
     _SWIGLU_ARITH_FILE = "torchwright/ops/swiglu/arithmetic_ops.py"
     _SWIGLU_LOGIC = "torchwright.ops.swiglu.logic_ops"
     _SWIGLU_LOGIC_FILE = "torchwright/ops/swiglu/logic_ops.py"
+    _SWIGLU_SELECT = "torchwright.ops.swiglu.map_select"
+    _SWIGLU_SELECT_FILE = "torchwright/ops/swiglu/map_select.py"
 
     return [
         TargetOp(
@@ -1144,6 +1169,51 @@ def _target_ops() -> List[TargetOp]:
                 "-1 - 2·swish_dip·speed/scale (-1.0056 at scale=100) — the "
                 "value-range assert carries that low-side slack. Inside the "
                 "margin ball the output interpolates, as today."
+            ),
+        ),
+        TargetOp(
+            name="cond_gate",
+            machine="swiglu",
+            module=_SWIGLU_LOGIC,
+            source_file=_SWIGLU_LOGIC_FILE,
+            input_specs={"cond": 1, "inp": 1},
+            build_graph=lambda nodes: swiglu_ops.cond_gate(
+                nodes["cond"], nodes["inp"]
+            ),
+            reference_fn=lambda inputs: torch.where(
+                inputs["cond"] > 0,
+                inputs["inp"],
+                torch.zeros_like(inputs["inp"]),
+            ),
+            distribution_names=("cond_gate_signed_bool_times_value",),
+            notes=(
+                "One gated lane per component: `Swish(scale·cond)·inp/scale`. "
+                "At clean ±1 conds the off-path is exactly zero in fp32 "
+                "(σ(−scale) computes as 0.0) and the on-path passes with ~1 "
+                "ulp relative rounding. No offset M, no finite-range "
+                "requirement — cond noise lands as δ·|actual value|."
+            ),
+        ),
+        TargetOp(
+            name="select",
+            machine="swiglu",
+            module=_SWIGLU_SELECT,
+            source_file=_SWIGLU_SELECT_FILE,
+            input_specs={"cond": 1, "a": 1, "b": 1},
+            build_graph=lambda nodes: swiglu_ops.select(
+                nodes["cond"], nodes["a"], nodes["b"]
+            ),
+            reference_fn=lambda inputs: torch.where(
+                inputs["cond"] > 0, inputs["a"], inputs["b"]
+            ),
+            distribution_names=("select_signed_bool_two_values",),
+            notes=(
+                "Complementary gated pair: `Swish(scale·cond)·a/scale + "
+                "Swish(−scale·cond)·b/scale`. The losing branch contributes "
+                "exactly zero at clean conds; the winner passes with ~1 ulp "
+                "relative rounding. (The relu-machine select was never "
+                "measured — its additive-cancellation error class, half an "
+                "ulp of M, is documented in the findings doc instead.)"
             ),
         ),
     ]
