@@ -6,8 +6,8 @@ CPU, and a few measurements sit on precision boundaries where local-CPU and
 Modal-CPU round differently. This entrypoint runs `scripts.measure_op_noise` on a
 Modal CPU worker (the same environment as the drift check) and returns the
 regenerated `docs/op_noise_data.json`, `docs/numerical_noise.md`, and every
-`torchwright/ops/*.py` (for the in-place noise-footer edits) so the local tree
-matches what `make test` will measure.
+footer-bearing op module (for the in-place noise-footer edits) so the local
+tree matches what `make test` will measure.
 
 This is the artefact-sync-back case the CLAUDE.md "Running scripts on GPU" rules
 carve out as the only acceptable reason for a purpose-built `modal_*.py` — and it
@@ -33,18 +33,21 @@ app = modal.App("torchwright-measure-noise", image=IMAGE)
 # p99) match what the drift check under `make test` measures.
 @app.function(gpu="a100-80gb", cpu=8, memory=32768, timeout=1800)
 def measure() -> dict:
-    rc = subprocess.run(
-        [sys.executable, "-m", "scripts.measure_op_noise"]
-    ).returncode
+    rc = subprocess.run([sys.executable, "-m", "scripts.measure_op_noise"]).returncode
     if rc != 0:
         raise RuntimeError(f"scripts.measure_op_noise exited {rc}")
 
-    from scripts.measure_op_noise import DOCS_JSON, DOCS_MD, REPO_ROOT
+    from scripts.measure_op_noise import (
+        DOCS_JSON,
+        DOCS_MD,
+        REPO_ROOT,
+        footer_source_files,
+    )
 
     out: dict[str, str] = {}
     for p in (DOCS_JSON, DOCS_MD):
         out[str(p.relative_to(REPO_ROOT))] = p.read_text()
-    for f in sorted((REPO_ROOT / "torchwright" / "ops").glob("*.py")):
+    for f in footer_source_files():
         out[str(f.relative_to(REPO_ROOT))] = f.read_text()
     return out
 

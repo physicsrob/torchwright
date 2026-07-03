@@ -69,6 +69,16 @@ DOCS_JSON = REPO_ROOT / "docs" / "op_noise_data.json"
 DOCS_MD = REPO_ROOT / "docs" / "numerical_noise.md"
 
 
+def footer_source_files() -> list[Path]:
+    """Every op-library module carrying a generated noise footer.
+
+    Derived from ``_target_ops()`` so the set tracks the library layout
+    (``ops/relu/``, ``ops/swiglu/``) — ``modal_measure_noise.py`` syncs
+    exactly these files back after a remote measurement run.
+    """
+    return sorted({REPO_ROOT / t.source_file for t in _target_ops()})
+
+
 # ---------------------------------------------------------------------------
 # Target-op records
 # ---------------------------------------------------------------------------
@@ -432,8 +442,7 @@ def _broadcast_select_distribution(
     """±1 masks over n_slots plus per-slot true/false values in [-5, 5]."""
     gen = torch.Generator().manual_seed(seed)
     masks = (
-        torch.randint(0, 2, (n_samples, n_slots), generator=gen).to(torch.float32)
-        * 2.0
+        torch.randint(0, 2, (n_samples, n_slots), generator=gen).to(torch.float32) * 2.0
         - 1.0
     )
     t = torch.rand((n_samples, n_slots), generator=gen) * 10.0 - 5.0
@@ -870,9 +879,7 @@ def _onehot_lookup_ref(x: torch.Tensor) -> torch.Tensor:
     return out
 
 
-_TL2D_TABLE = (
-    (torch.arange(48, dtype=torch.float32).reshape(8, 6) * 7.0) % 23.0 - 11.0
-)
+_TL2D_TABLE = (torch.arange(48, dtype=torch.float32).reshape(8, 6) * 7.0) % 23.0 - 11.0
 
 
 def _table_lookup_2d_ref(inputs: Dict[str, torch.Tensor]) -> torch.Tensor:
@@ -1372,9 +1379,7 @@ def _target_ops() -> List[TargetOp]:
             module=_SWIGLU_LOGIC,
             source_file=_SWIGLU_LOGIC_FILE,
             input_specs={"cond": 1, "inp": 1},
-            build_graph=lambda nodes: swiglu_ops.cond_gate(
-                nodes["cond"], nodes["inp"]
-            ),
+            build_graph=lambda nodes: swiglu_ops.cond_gate(nodes["cond"], nodes["inp"]),
             reference_fn=lambda inputs: torch.where(
                 inputs["cond"] > 0,
                 inputs["inp"],

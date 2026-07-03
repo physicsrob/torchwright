@@ -76,8 +76,11 @@ def test_compare_true_side_far_field_ulp_class():
     s = step_sharpness
     xs = torch.tensor([0.5, 1.0, 7.3, 80.0, (1.0 + 17.0 / scale) / s]).unsqueeze(1)
     val = out.compute(5, {"x": xs})
-    # 4 ulps of the per-row contribution magnitude, floored at 4 output ulps.
-    budget = torch.clamp(4 * 1.2e-7 * s * xs.abs() * 2.0, min=4 * 1.2e-7)
+    # Worst kernel (gate-FMA + per-product out-proj) leaves 4 half-ulp
+    # roundings at the contribution magnitude C = s·|x−thresh|·|T−F|,
+    # i.e. ≤ 2 ulps of C; the ×6 is ~3x safety over that (binade
+    # position + GPU FP variation), floored at 6 output ulps.
+    budget = torch.clamp(6 * 1.2e-7 * s * xs.abs() * 2.0, min=6 * 1.2e-7)
     assert ((val - 1.0).abs() <= budget).all(), (val - 1.0).flatten()
 
 
@@ -164,7 +167,13 @@ def test_bool_not_truth_table():
     x = create_input("x", 1, value_range=(-1.0, 1.0))
     out = bool_not(x)
     val = out.compute(2, {"x": torch.tensor([[1.0], [-1.0]])})
-    assert torch.equal(val, torch.tensor([[-1.0], [1.0]]))
+    # x=-1 is compare's false side: both lanes exactly 0.0, the output IS
+    # the out_bias literal — bit-exact on every kernel.
+    assert val[1].item() == 1.0
+    # x=+1 is the far field: two saturated lanes differenced through
+    # ±fl(0.02), the kernel-dependent (FMA vs per-product) ulp class —
+    # same budget as test_compare_true_side_far_field_ulp_class.
+    assert val[0].item() == pytest.approx(-1.0, abs=1e-5)
 
 
 @pytest.mark.parametrize(

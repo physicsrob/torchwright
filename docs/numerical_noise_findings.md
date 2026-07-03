@@ -208,6 +208,21 @@ value-range slack. broadcast_select carries **no ±1 mask assert** — the
 junk-mask contract (flagship discards rows with fractional masks) is
 load-bearing and pinned by a unit test instead.
 
+The audit re-derivation (2026-07-03) added one condition to that
+contract: the fractional-mask blend `ReLU(m)·t + ReLU(−m)·f` collapses
+toward **zero** at m ≈ 0, so it stays inside the asserted range (the
+union of the two branch ranges, widened by `_MASK_TOL +
+2·swish_dip/scale`) only when zero lies in that union. Today's only
+caller (`dynamic_extract`, zero-literal false branch) satisfies this by
+construction; a future caller with two live same-signed branches would
+fire the retained value-range assert on exactly its discarded rows. The
+condition is now stated in the op docstring. The semantic-bound
+widenings themselves (`_cond_gate_semantic_bound` scaling all four
+envelope tensors, `_select_semantic_bound`/`_broadcast_select_semantic_bound`
+per-side `±δ·|bound|`) were re-derived and confirmed sound, including
+the straddling-interval and ±inf cases; relu callers pass no widening
+parameters and are byte-identical.
+
 ### swiglu map_to_table/onehot_lookup: winner-ulp class; misses bit-exact
 
 `map_to_table` measures exactly 0 on its match-and-off distribution
@@ -242,6 +257,34 @@ recovered-position test passes at the relu op's own 0.15 empirical
 ceiling. Lesson recorded: the audit is not a formality — dense
 smooth-target grids do *not* self-absorb once fillets overlap the
 grid pitch.
+
+Audit re-derivation (2026-07-03) of the clamp branch's windowed
+stacked-dip slack: sound by the triangle inequality — every bend within
+±17/K of any input lies within ±34/K of some single bend (compared
+inclusively), so the bend-centered maximization over-approximates the
+true worst fillet stack by at most 2×, and the neglected exponential
+tails outside the window total under 0.3% of one dip even at n = 1024.
+The slack loop is O(hinges²·channels) full-scan — sub-second at every
+current call site, and the only 1024-point grid
+(`global_position_from_bos`'s inversion table) bypasses it entirely via
+`clamp=False`; a future dense vector-valued grid (n ≈ 4096, 100+
+channels) would need a sorted two-pointer restructure first. The swiglu
+inversion table is now also validated offline out to `max_positions`
+(`scripts/rope_global_recency_validate.py --machine swiglu`: worst
+error 0.0092 positions, 54× under the 0.5 rounding threshold, with the
+4000 densest-end positions swept one-by-one). The op comment's old
+"K ≈ 1e8" gate-magnitude figure was the unboosted `1/(1+m)` curve's
+number — the boosted head keeps w_min ≈ 0.47, so the flagship derives
+input_scale ≈ 983, K ≈ 9.8e4, and dense-end bias quantization moves
+breakpoints by ~0.02% of a grid gap, not the feared ~1/3.
+
+Coverage note (same audit): the exact-0 `thermometer_floor_div`
+entries (both machines) are measured at divisor=10 on [0, 100], below
+the digit-pipeline call site (divisor=100, max_value=999) where hidden
+magnitudes reach ~10⁶ and GPU run-to-run jitter contributes ~2e-5 per
+digit — amplified ×100 by place value in `number_to_digit_scalars`.
+Composition tolerances there derive from that scaling (the roundtrip
+test's 1e-2 stands ~5× over it), not from the committed entry.
 
 ### swiglu floor_int/ceil_int/scalar_to_embedding: the two-stage depth ports intact
 

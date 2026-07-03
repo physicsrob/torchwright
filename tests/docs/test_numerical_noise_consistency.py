@@ -28,6 +28,7 @@ from scripts.measure_op_noise import (
     REPO_ROOT,
     _footer_summary,
     _target_ops,
+    footer_source_files,
     render_markdown,
 )
 from torchwright.debug.noise import NOISE_FOOTER_MARKER
@@ -56,6 +57,25 @@ def test_every_target_op_has_data() -> None:
         f"ops in {DOCS_JSON.name} but not declared in _target_ops(): {sorted(extra)}. "
         f"Run `make measure-noise`."
     )
+
+
+def test_footer_source_files_cover_both_libraries() -> None:
+    """The sync-back file set (modal_measure_noise.py) covers every
+    target op's module in both library subpackages.  Pins the B0-split
+    regression where a non-recursive ``ops/*.py`` glob returned zero
+    footer-bearing files once the ops moved into ``ops/relu/`` and
+    ``ops/swiglu/``."""
+    files = footer_source_files()
+    declared = {REPO_ROOT / t.source_file for t in _target_ops()}
+    assert declared <= set(files), (
+        f"footer_source_files() misses op modules: "
+        f"{sorted(str(p) for p in declared - set(files))}"
+    )
+    rels = {f.relative_to(REPO_ROOT).as_posix() for f in files}
+    assert any(r.startswith("torchwright/ops/relu/") for r in rels), rels
+    assert any(r.startswith("torchwright/ops/swiglu/") for r in rels), rels
+    for f in files:
+        assert f.exists(), f"footer_source_files() names a missing file: {f}"
 
 
 def test_markdown_matches_json() -> None:

@@ -140,6 +140,7 @@ def switch(conditions: List[Node], values: List[Node]) -> Node:
     """
     return sum_nodes([cond_gate(c, v) for c, v in zip(conditions, values)])
 
+
 _MASK_TOL = 4.0 * swish_dip / scale
 """Mask tolerance for :func:`broadcast_select` (≈ 0.0111 at scale=100).
 
@@ -265,8 +266,13 @@ def broadcast_select(
     the flagship builds picks eagerly and discards rows whose masks are
     fractional; once ``|mask| ≥ 0.17`` the gate saturates to the mask
     value itself, so a fractional mask in [-1, 1] blends
-    ``≈ ReLU(m)·t + ReLU(−m)·f``, bounded by the branch hull plus the
-    dip term ``swish_dip/scale·|branch|``.  Where the output is
+    ``≈ ReLU(m)·t + ReLU(−m)·f``, bounded by the hull of **zero and the
+    two branch ranges** plus the dip term ``swish_dip/scale·|branch|`` —
+    at m ≈ 0 both gates vanish and the blend collapses toward zero, so
+    the junk-mask bound stays inside the asserted range only when zero
+    lies in the union of the branch ranges (true for every current
+    caller; two live same-signed branches would fire the retained
+    value-range assert on exactly the discarded rows).  Where the output is
     consumed, masks must sit within ``_MASK_TOL`` of ±1 (sized for
     in_range-fed masks — see the module constant); a mask off by δ
     mis-scales the winner by exactly δ·|actual value|, never δ·M.
@@ -440,9 +446,7 @@ def dynamic_extract(
     masked = broadcast_select(
         masks=one_hot,
         true_value=table,
-        false_value=LiteralValue(
-            torch.zeros(d_fill), name="dynamic_extract_zero"
-        ),
+        false_value=LiteralValue(torch.zeros(d_fill), name="dynamic_extract_zero"),
         n_slots=n_entries,
         d_fill=d_fill,
     )
@@ -452,6 +456,7 @@ def dynamic_extract(
         for c in range(d_fill):
             sum_matrix[slot * d_fill + c, c] = 1.0
     return Linear(masked, sum_matrix, name="dynamic_extract_sum")
+
 
 def map_to_table(
     inp: Node, key_to_value: Dict[torch.Tensor, torch.Tensor], default: torch.Tensor
@@ -540,6 +545,7 @@ def map_to_table(
         result,
         NodeValueType(value_range=Range(lo, hi)),
     )
+
 
 def _upper_clamp(index: Node, top: float, gate_mult: float, name: str) -> Node:
     """``min(gate_mult·index, top)`` as one 3-lane degenerate FFN.
@@ -632,9 +638,7 @@ def _table_lookup_row_vector(
             table[0].to(dtype=torch.float32), name=f"{name}_constant_row"
         )
 
-    x_clamped = _upper_clamp(
-        index, float(rows - 1), gate_mult, name=f"{name}_clamp_i"
-    )
+    x_clamped = _upper_clamp(index, float(rows - 1), gate_mult, name=f"{name}_clamp_i")
     deltas = table[1:] - table[:-1]
     partials: List[Node] = []
     for ci, (ks, step) in enumerate(
@@ -828,4 +832,3 @@ def table_lookup_2d(
         NodeValueType(value_range=Range(lo, hi)),
         atol=max(1e-3, row_slack) + 2.0 * swish_dip / scale * max_delta,
     )
-

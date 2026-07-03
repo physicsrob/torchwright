@@ -27,6 +27,10 @@ SCALE = 100.0
 SWISH_PEAK = 0.2784645
 SWISH_ARGMIN = 1.2784645
 
+#: The declared minimum MLP hidden width (ops/const.py); the swiglu
+#: lookup-family chunk caps all derive from it.
+MIN_D_HIDDEN = 1024
+
 
 def test_scale_is_the_module_constant():
     """The value every claim below is derived at IS the shipped module
@@ -47,6 +51,38 @@ def test_swish_dip_is_the_module_constant():
     z = torch.linspace(-3.0, 0.0, 3_000_001, dtype=torch.float64)
     actual = -(z * torch.sigmoid(z)).min().item()
     assert abs(actual - swish_dip) < 1e-6
+
+
+def test_min_d_hidden_is_the_module_constant():
+    """The declared minimum MLP hidden width IS the shipped module
+    constant (ops/const.py).  The flagship compiles at d_hidden = 16384
+    (torchwright_doom configs/e1m1*.yaml) — 16x headroom."""
+    from torchwright.ops.const import min_d_hidden
+
+    assert min_d_hidden == MIN_D_HIDDEN
+
+
+def test_swiglu_chunk_caps_derive_from_min_d_hidden():
+    """The three swiglu lookup-family chunk caps are wired to
+    min_d_hidden rather than hardcoded: piecewise_linear's d_max default
+    is the constant itself; floor_int and table_lookup_2d chunk at
+    min_d_hidden // 2 (two hinge lanes per boundary).  A hardcoded 1024
+    or 512 would pass a value check but silently decouple from the
+    constant, so these pin the derivation in source."""
+    import inspect
+
+    from torchwright.ops.const import min_d_hidden
+    from torchwright.ops.swiglu.arithmetic_ops import floor_int, piecewise_linear
+    from torchwright.ops.swiglu.map_select import table_lookup_2d
+
+    # Behavioral: the default equals the constant's value.
+    assert (
+        inspect.signature(piecewise_linear).parameters["d_max"].default == min_d_hidden
+    )
+    # Derivation: the caps reference the constant, not a literal.
+    assert "d_max: int = min_d_hidden" in inspect.getsource(piecewise_linear)
+    assert "min_d_hidden // 2" in inspect.getsource(floor_int)
+    assert "min_d_hidden // 2" in inspect.getsource(table_lookup_2d)
 
 
 def _swish(z: torch.Tensor) -> torch.Tensor:

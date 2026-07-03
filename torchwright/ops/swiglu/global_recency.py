@@ -110,8 +110,11 @@ def global_position_from_bos(
     # ~0.01 — far under 34/scale — so at input_scale=1 the stacked fillets
     # mis-read position 0 by ~10 positions (measured).  Derive input_scale
     # from the grid's smallest gap (at w_min) so no two fillets overlap;
-    # K multiplies out of the value path, and the gate magnitudes
-    # (~K·1 ≈ 1e8) stay well inside fp32's exact-integer window.
+    # K multiplies out of the value path, and the gate magnitudes stay
+    # well inside fp32's exact-integer window (2^24): the boosted-BOS
+    # head keeps w_min ≈ 0.47 at the flagship geometry (max_positions =
+    # 61440), so input_scale ≈ 983 and K·1 ≈ 1e5 — validated offline by
+    # scripts/rope_global_recency_validate.py --machine swiglu.
     min_gap = w_bps[1] - w_bps[0]
     input_scale = max(1.0, 34.0 / (scale * min_gap))
 

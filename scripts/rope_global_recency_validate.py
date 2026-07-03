@@ -15,8 +15,23 @@ This script verifies:
    over the full range, comfortably inside the 0.5 rounding threshold.
 4. The fp32 softmax precision contribution is bounded and consistent with the
    ~0.008 estimate from the analytical argument.
+
+Two machines share this mechanism.  ``--machine relu`` (default) is the
+original report unchanged: the ReLU inversion table interpolates exactly, so
+the reported position error is purely the piecewise-linear fitting error above.
+``--machine swiglu`` evaluates the *same* table through the swish op's
+sharpened-hinge sum (``Swish(K·z)/K`` with ``K = scale·input_scale``, and
+``input_scale`` derived from the densest breakpoint gap — mirroring
+``torchwright/ops/swiglu/global_recency.py``); the reported error then includes
+the radius-``~17/K`` fillet rounding the ReLU table does not have, and the
+sweep is densified across the positions nearest ``max_positions`` (the
+``w → w_min`` end where the fillets are tightest).  The offline model runs in
+float64, so it captures the fillet rounding but not the on-GPU fp32
+accumulation the unit test measures.  Pass criterion for swiglu: max
+recovered-position error < 0.5.
 """
 
+import argparse
 import math
 
 # ---------------------------------------------------------------------------
@@ -26,6 +41,16 @@ MAX_LEN = 61440
 D_HEAD = 256
 BASE = 5e5
 N_BREAKPOINTS = 1024
+
+# Swish machine only (--machine swiglu).  SCALE must match
+# torchwright/ops/const.py:scale (pinned by tests/docs/test_swish_constants.py);
+# it reconstructs the op's input_scale / K.  Note K = 34/min_gap once
+# input_scale > 1, so SCALE cancels out of the position error and only affects
+# the reported input_scale number.  DENSE_END_SPAN is how many of the positions
+# nearest MAX_LEN to sweep one-by-one — the w → w_min end where the inversion
+# table's fillets are tightest.
+SCALE = 100.0
+DENSE_END_SPAN = 4000
 
 FP32_EPS = 2.0**-23  # machine epsilon (relative error per fp32 operation)
 
@@ -104,15 +129,71 @@ def eval_pwl(w_query: float, w_bps: list, m_bps: list) -> float:
     return m0 + t * (m1 - m0)
 
 
+def swish(u: float) -> float:
+    """Swish activation ``u · sigmoid(u)``, overflow-safe for large |u|."""
+    if u >= 0.0:
+        return u / (1.0 + math.exp(-u))
+    e = math.exp(u)
+    return u * e / (1.0 + e)
+
+
+def build_swish_hinges(w_bps: list, m_bps: list) -> list:
+    """Reconstruct the swiglu op's sharpened-hinge list from the inverse table.
+
+    Mirrors ``torchwright/ops/swiglu/arithmetic_ops.py::piecewise_linear`` with
+    ``clamp=False`` (how ``global_position_from_bos`` calls it): one hinge per
+    slope change, a clamp hinge at the last breakpoint, and two linear-
+    extrapolation hinges for the open ends.  Each entry is
+    ``(input_weight, threshold, delta_slope)``.
+    """
+    n = len(w_bps)
+    slopes = [
+        (m_bps[i + 1] - m_bps[i]) / (w_bps[i + 1] - w_bps[i]) for i in range(n - 1)
+    ]
+    hinges: list = []
+    prev = 0.0
+    for i in range(n - 1):
+        delta = slopes[i] - prev
+        if abs(delta) > 1e-12:
+            hinges.append((1.0, w_bps[i], delta))
+        prev = slopes[i]
+    if abs(prev) > 1e-12:  # cancel the final slope (the clamp hinge)
+        hinges.append((1.0, w_bps[-1], -prev))
+    # clamp=False: two hinges reinstate linear extrapolation past each end.
+    if abs(slopes[0]) > 1e-12:
+        hinges.append((-1.0, w_bps[0], -slopes[0]))
+    if abs(slopes[-1]) > 1e-12:
+        hinges.append((1.0, w_bps[-1], slopes[-1]))
+    return hinges
+
+
+def eval_swish_pwl(w_query: float, hinges: list, y0: float, K: float) -> float:
+    """Evaluate the swiglu inversion through the actual sharpened-hinge sum.
+
+        f(w) = y0 + Σ (delta_i / K) · Swish(K · iw_i · (w − thr_i))
+
+    Unlike ``eval_pwl`` (exact linear interpolation, which is what the ReLU op
+    computes), this reproduces the radius-``~17/K`` fillet rounding at every
+    breakpoint — the swiglu-specific approximation error.
+    """
+    total = y0
+    for iw, thr, delta in hinges:
+        u = K * iw * (w_query - thr)
+        total += (delta / K) * swish(u)
+    return total
+
+
 # ---------------------------------------------------------------------------
 # Validation
 # ---------------------------------------------------------------------------
 
 
-def main() -> None:
+def main(machine: str = "relu") -> None:
     theta = theta_slow(D_HEAD, BASE)
     print(f"Production parameters: MAX_LEN={MAX_LEN}, D_HEAD={D_HEAD}, BASE={BASE:.0e}")
     print(f"θ_slow = {theta:.5e}")
+    if machine == "swiglu":
+        print("Machine: swiglu (sharpened-hinge PL inversion)")
     print()
 
     # 1. Monotonicity and minimum adjacent gap
@@ -135,17 +216,55 @@ def main() -> None:
     print(f"w range: [{w_bps[0]:.6f}, {w_bps[-1]:.6f}]")
     print(f"m range: [{m_bps[-1]:.2f}, {m_bps[0]:.2f}]")
 
+    if machine == "swiglu":
+        # Swish machine: reconstruct the op's derived input_scale and evaluate
+        # the actual sharpened-hinge sum, so the reported error includes the
+        # fillet rounding the ReLU table interpolates away.  See
+        # torchwright/ops/swiglu/global_recency.py.
+        bp_gap = w_bps[1] - w_bps[0]  # smallest breakpoint gap (at w_min)
+        input_scale = max(1.0, 34.0 / (SCALE * bp_gap))
+        K = SCALE * input_scale
+        hinges = build_swish_hinges(w_bps, m_bps)
+
+        def evaluate(w: float) -> float:
+            return eval_swish_pwl(w, hinges, m_bps[0], K)
+
+        print(
+            f"swiglu input_scale = {input_scale:.1f} "
+            f"(K = scale·input_scale = {K:.0f}); smallest breakpoint gap = "
+            f"{bp_gap:.3e} at w_min"
+        )
+        print(
+            f"fillet radius ~17/K = {17.0 / K:.3e}  "
+            f"(≈ gap/2 = {bp_gap / 2:.3e}, so adjacent fillets just touch)"
+        )
+    else:
+
+        def evaluate(w: float) -> float:
+            return eval_pwl(w, w_bps, m_bps)
+
     # Dense test: sample every 10 positions
     step = 10
     max_err = 0.0
     worst_m = 0
     for m_true in range(0, MAX_LEN + 1, step):
         w_t = w_of_m(m_true, MAX_LEN, theta)
-        m_pred = eval_pwl(w_t, w_bps, m_bps)
+        m_pred = evaluate(w_t)
         err = abs(m_pred - m_true)
         if err > max_err:
             max_err = err
             worst_m = m_true
+
+    if machine == "swiglu":
+        # The fillets are tightest at the w → w_min end (positions near
+        # max_positions), so sweep that band one position at a time to catch any
+        # worst case the every-10 grid steps over.
+        for m_true in range(max(0, MAX_LEN - DENSE_END_SPAN), MAX_LEN + 1):
+            w_t = w_of_m(m_true, MAX_LEN, theta)
+            err = abs(evaluate(w_t) - m_true)
+            if err > max_err:
+                max_err = err
+                worst_m = m_true
 
     print(f"Worst-case error: {max_err:.4f} positions (at m={worst_m})")
     print(f"Rounding threshold: 0.5 positions")
@@ -191,13 +310,34 @@ def main() -> None:
     print()
 
     print("=== Summary ===")
-    ok = min_gap > 10 * fp32_floor and max_err < 0.1 and combined < 0.5
-    status = "PASS" if ok else "FAIL"
-    print(
-        f"[{status}] gap={min_gap:.1e}, PWL_err={max_err:.4f}, "
-        f"combined={combined:.4f}"
-    )
+    if machine == "swiglu":
+        # Pass criterion: max recovered-position error below the 0.5 rounding
+        # threshold (integer position recovery), plus the section-1 gap margin.
+        ok = min_gap > 10 * fp32_floor and max_err < 0.5
+        status = "PASS" if ok else "FAIL"
+        print(
+            f"[{status}] machine=swiglu, gap={min_gap:.1e}, "
+            f"position_err={max_err:.4f} (threshold 0.5), combined={combined:.4f}"
+        )
+    else:
+        ok = min_gap > 10 * fp32_floor and max_err < 0.1 and combined < 0.5
+        status = "PASS" if ok else "FAIL"
+        print(
+            f"[{status}] gap={min_gap:.1e}, PWL_err={max_err:.4f}, "
+            f"combined={combined:.4f}"
+        )
 
 
 if __name__ == "__main__":
-    main()
+    parser = argparse.ArgumentParser(
+        description="Validate the boosted-BOS global-recency inversion offline."
+    )
+    parser.add_argument(
+        "--machine",
+        choices=["relu", "swiglu"],
+        default="relu",
+        help="Which global_position_from_bos variant to validate "
+        "(default: relu, byte-for-byte the original report).",
+    )
+    args = parser.parse_args()
+    main(args.machine)

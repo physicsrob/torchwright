@@ -64,7 +64,7 @@ def test_in_band_linear_blend_is_contract():
         0.5 * (table[0, 1] + table[0, 2]).item(), abs=1e-3
     )
     assert val[1].item() == pytest.approx(
-        (0.75 * table[0, 1] + 0.25 * table[0, 2]).item(), abs=2e-2
+        (0.75 * table[0, 1] + 0.25 * table[0, 2]).item(), abs=1e-3
     )
 
 
@@ -106,9 +106,7 @@ def test_chunked_axes_match_table():
     j2 = create_input("j", 1, value_range=(0.0, 599.0))
     out2 = table_lookup_2d(i2, j2, wide)
     val2 = out2.compute(4, {"i": jj.clamp(max=2.0), "j": ii})
-    ref2 = torch.tensor(
-        [[wide[0, 0]], [wide[1, 511]], [wide[2, 512]], [wide[1, 599]]]
-    )
+    ref2 = torch.tensor([[wide[0, 0]], [wide[1, 511]], [wide[2, 512]], [wide[1, 599]]])
     assert torch.allclose(val2, ref2, rtol=0.0, atol=1e-2), (val2 - ref2).flatten()
 
 
