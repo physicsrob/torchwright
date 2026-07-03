@@ -17,6 +17,9 @@ class MLPSubLayer:
     independent — passing ``d_hidden=None`` defaults it to ``d``.
     """
 
+    #: Machine kind (uniform per compiled network; see GatedMLPSubLayer).
+    activation = "relu"
+
     def __init__(self, d: int, d_hidden: Optional[int] = None):
         if d_hidden is None:
             d_hidden = d
@@ -75,4 +78,106 @@ class MLPSubLayer:
         self.linear1.to(device)
         self.relu.to(device)
         self.linear2.to(device)
+        return self
+
+
+class GatedMLPSubLayer:
+    """Gated (SwiGLU) MLP sublayer: the swish machine's physical MLP.
+
+    Forward: out = down_proj(swish(gate_proj(inp)) * up_proj(inp)) + inp
+
+    where ``swish(g) = g * sigmoid(g)`` — written exactly that way (not a
+    fused silu kernel) to match the expression whose fp32 saturation
+    profile the A0 probes pinned (``tests/docs/test_swish_constants.py``,
+    ``test_swish_saturation_cuda.py``) and the :class:`~torchwright.graph.ffn.FFN`
+    oracle's ``compute``.
+
+    Component naming follows the canonical SwiGLU reference (HF Llama):
+    ``gate_proj`` / ``up_proj`` are ``d -> d_hidden``, ``down_proj`` is
+    ``d_hidden -> d``.  Hidden-slot semantics mirror :class:`MLPSubLayer`:
+    the scheduler packs FFN lanes into contiguous slots from index 0, one
+    lane per slot; a slot's lane value is ``swish(gate) * up``.  Degenerate
+    lanes (up ≡ 1) are written by the weight writer as up-row 0 / up-bias 1.
+    """
+
+    #: Machine kind (uniform per compiled network; see MLPSubLayer).
+    activation = "swish"
+
+    def __init__(self, d: int, d_hidden: Optional[int] = None):
+        if d_hidden is None:
+            d_hidden = d
+        self.d = d
+        self.d_hidden = d_hidden
+        self.in_state = ResidualStreamState(name="GatedMLPSubLayer In State")
+        self.out_state = ResidualStreamState(name="GatedMLPSubLayer Out State")
+        self.gate_proj = LinearLayerComponent(d, d_hidden, name="gate_proj")
+        self.up_proj = LinearLayerComponent(d, d_hidden, name="up_proj")
+        self.down_proj = LinearLayerComponent(d_hidden, d, name="down_proj")
+
+    def forward(self, inp: torch.Tensor, return_states=False):
+        states = {}
+
+        g = self.gate_proj.forward(inp)
+        states["gate_proj_out_state"] = (self.gate_proj.out_state, g)
+        u = self.up_proj.forward(inp)
+        states["up_proj_out_state"] = (self.up_proj.out_state, u)
+        h = g * torch.sigmoid(g) * u
+        x = self.down_proj.forward(h)
+        states["down_proj_out_state"] = (self.down_proj.out_state, x)
+        x = x + inp
+        states["skip"] = (self.out_state, x)
+        if return_states:
+            return x, states
+        else:
+            return x
+
+    def trim_unused_slots(self):
+        """Remove trailing unused (all-zero) hidden slots after compilation.
+
+        Slots are allocated contiguously from index 0, so slicing
+        [:used] is safe.  Keeps at least 1 slot to avoid degenerate
+        empty-tensor shapes.
+
+        Unlike the ReLU trim, biases count toward usedness: a written
+        degenerate lane carries up-bias 1 (its only up-side signature),
+        and a constant lane's gate can be pure bias.  An unwritten slot
+        is all-zero across all five tensors, so this never keeps a
+        genuinely unused slot.
+        """
+        g_used = (self.gate_proj.output_matrix != 0).any(dim=0) | (
+            self.gate_proj.output_bias != 0
+        )
+        u_used = (self.up_proj.output_matrix != 0).any(dim=0) | (
+            self.up_proj.output_bias != 0
+        )
+        d_used = (self.down_proj.output_matrix != 0).any(dim=1)
+        used = g_used | u_used | d_used
+        if used.any():
+            last_used = used.nonzero()[-1].item() + 1
+        else:
+            last_used = 1
+        n = max(last_used, 1)
+        if n < self.d_hidden:
+            self.gate_proj.output_matrix = self.gate_proj.output_matrix[
+                :, :n
+            ].contiguous()
+            self.gate_proj.output_bias = self.gate_proj.output_bias[:n].contiguous()
+            self.up_proj.output_matrix = self.up_proj.output_matrix[:, :n].contiguous()
+            self.up_proj.output_bias = self.up_proj.output_bias[:n].contiguous()
+            self.down_proj.output_matrix = self.down_proj.output_matrix[
+                :n, :
+            ].contiguous()
+            self.d_hidden = n
+
+    def num_params(self):
+        return (
+            self.gate_proj.num_params()
+            + self.up_proj.num_params()
+            + self.down_proj.num_params()
+        )
+
+    def to(self, device):
+        self.gate_proj.to(device)
+        self.up_proj.to(device)
+        self.down_proj.to(device)
         return self

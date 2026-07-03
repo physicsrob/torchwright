@@ -38,10 +38,21 @@ class HeadlessTransformer:
         d: int,
         d_head: int,
         d_hidden: Optional[int] = None,
+        activation: str = "relu",
     ):
+        if activation not in ("relu", "swish"):
+            raise ValueError(
+                f"HeadlessTransformer activation must be 'relu' or 'swish', "
+                f"got {activation!r}"
+            )
         self.d = d
         self.d_hidden = d if d_hidden is None else d_hidden
         self.d_head = d_head
+        # Machine kind, uniform across all layers: "relu" compiles MLP
+        # sublayers as linear1->ReLU->linear2, "swish" as the gated
+        # (SwiGLU) sublayer.  Chosen by the compiler from the graph's
+        # FFN nodes' uniform activation.
+        self.activation = activation
         self.layers = []
         self.residual_assignment = None
         self.assert_aliases = None
@@ -59,7 +70,9 @@ class HeadlessTransformer:
         return self
 
     def add_layer(self, append: bool = False) -> TransformerLayer:
-        layer = TransformerLayer(self.d, self.d_head, d_hidden=self.d_hidden)
+        layer = TransformerLayer(
+            self.d, self.d_head, d_hidden=self.d_hidden, activation=self.activation
+        )
         if append:
             self.layers.append(layer)
         else:
