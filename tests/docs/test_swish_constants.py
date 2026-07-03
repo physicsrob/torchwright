@@ -28,6 +28,15 @@ SWISH_PEAK = 0.2784645
 SWISH_ARGMIN = 1.2784645
 
 
+def test_scale_is_the_module_constant():
+    """The value every claim below is derived at IS the shipped module
+    constant (ops/const.py) — the one the compiler's swish bypass pair and
+    the swiglu ops fold into weights."""
+    from torchwright.ops.const import scale
+
+    assert scale == SCALE
+
+
 def _swish(z: torch.Tensor) -> torch.Tensor:
     return z * torch.sigmoid(z)
 

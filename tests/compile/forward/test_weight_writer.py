@@ -1249,3 +1249,242 @@ def test_mlp_linear_bypass_concatenated_input():
 
     expected = linear_node.compute(N_POS, {"a": a_values, "b": b_values})
     assert torch.allclose(result.cpu(), expected, atol=1e-4)
+
+
+# ---------------------------------------------------------------------------
+# Swish machine (gated MLP sublayer) — swiglu plan A2
+# ---------------------------------------------------------------------------
+
+
+def _swish_ffn(x, n_lanes=6, d_out=3, gated=True, seed=0):
+    """A directly-authored swish FFN fixture (the spec's constructions are
+    op-level; writer tests need only the node shape)."""
+    from torchwright.graph import FFN
+
+    g = torch.Generator().manual_seed(seed)
+    kwargs = {}
+    if gated:
+        kwargs["up_proj"] = torch.randn(n_lanes, len(x), generator=g)
+        kwargs["up_bias"] = torch.randn(n_lanes, generator=g)
+    return FFN(
+        x,
+        gate_proj=torch.randn(n_lanes, len(x), generator=g),
+        gate_bias=torch.randn(n_lanes, generator=g),
+        out_proj=torch.randn(n_lanes, d_out, generator=g),
+        out_bias=torch.randn(d_out, generator=g),
+        activation="swish",
+        name="swish_ffn",
+        **kwargs,
+    )
+
+
+def test_swish_mlp_ffn_gated():
+    """A gated swish FFN compiled through the gated MLP sublayer."""
+    x = InputNode("x", 4, value_range=(-10.0, 10.0))
+    ffn = _swish_ffn(x, gated=True)
+
+    rmap = ResidualStreamMap(D)
+    rmap.allocate(x)
+    out_cols = rmap.allocate(ffn)
+
+    layer = TransformerLayer(D, D_HEAD, activation="swish")
+    op = _make_mlp_op(rmap, "compute_ffn", ffn, out_cols, mlp_slots=list(range(6)))
+    write_mlp_sublayer(layer, [op], rmap)
+    layer.to(device_mod.get_device(verbose=False))
+
+    x_values = torch.randn(N_POS, 4)
+    res = _build_residual_stream(rmap, {x: x_values})
+
+    out = layer.mlp.forward(res)
+    expected = ffn.compute(N_POS, {"x": x_values})
+    assert torch.allclose(out[:, out_cols].cpu(), expected, atol=1e-4)
+
+
+def test_swish_mlp_ffn_degenerate():
+    """A degenerate swish FFN (up ≡ 1): the writer emits up-row 0 / up-bias 1
+    and the compiled value matches the node's bare-swish math."""
+    x = InputNode("x", 4, value_range=(-10.0, 10.0))
+    ffn = _swish_ffn(x, gated=False)
+    slots = list(range(3, 9))  # off-origin slots to catch indexing slips
+
+    rmap = ResidualStreamMap(D)
+    rmap.allocate(x)
+    out_cols = rmap.allocate(ffn)
+
+    layer = TransformerLayer(D, D_HEAD, activation="swish")
+    op = _make_mlp_op(rmap, "compute_ffn", ffn, out_cols, mlp_slots=slots)
+    write_mlp_sublayer(layer, [op], rmap)
+
+    # The degenerate up factor: bias 1, matrix column untouched (zero).
+    assert (layer.mlp.up_proj.output_bias[slots] == 1.0).all()
+    assert (layer.mlp.up_proj.output_matrix[:, slots] == 0.0).all()
+
+    layer.to(device_mod.get_device(verbose=False))
+    x_values = torch.randn(N_POS, 4)
+    res = _build_residual_stream(rmap, {x: x_values})
+
+    out = layer.mlp.forward(res)
+    expected = ffn.compute(N_POS, {"x": x_values})
+    assert torch.allclose(out[:, out_cols].cpu(), expected, atol=1e-4)
+
+
+def test_swish_mlp_ffn_deferred_bias_fold():
+    """A gated FFN reading a deferred-bias Linear folds the leaf bias into
+    BOTH hidden biases (gate and up) — the up matmul reads the biasless
+    columns too."""
+    x = InputNode("x", 4, value_range=(-10.0, 10.0))
+    W_leaf = torch.randn(4, 5)
+    b_leaf = torch.randn(5)
+    leaf = Linear(x, W_leaf, b_leaf, name="biased_leaf")
+    ffn = _swish_ffn(leaf, n_lanes=6, gated=True, seed=1)
+
+    rmap = ResidualStreamMap(D)
+    rmap.allocate(x)
+    rmap.allocate(leaf)
+    out_cols = rmap.allocate(ffn)
+
+    layer = TransformerLayer(D, D_HEAD, activation="swish")
+    op = _make_mlp_op(rmap, "compute_ffn", ffn, out_cols, mlp_slots=list(range(6)))
+    write_mlp_sublayer(layer, [op], rmap, biased_linears={leaf})
+    layer.to(device_mod.get_device(verbose=False))
+
+    x_values = torch.randn(N_POS, 4)
+    # The deferred-bias contract: the leaf's columns hold Wx WITHOUT the bias
+    # when the FFN reads them in the same layer.
+    leaf_biasless = x_values @ W_leaf
+    res = _build_residual_stream(rmap, {x: x_values, leaf: leaf_biasless})
+
+    out = layer.mlp.forward(res)
+    expected = ffn.compute(N_POS, {"x": x_values})  # oracle sees the full bias
+    assert torch.allclose(out[:, out_cols].cpu(), expected, atol=1e-4)
+
+
+def test_swish_mlp_linear_bypass():
+    """The swish bypass pair: Swish(scale·z)/scale − Swish(−scale·z)/scale = z."""
+    x = InputNode("x", 4, value_range=(-100.0, 100.0))
+    W = torch.randn(4, 3)
+    linear_node = Linear(x, W, torch.zeros(3), name="lin")
+
+    rmap = ResidualStreamMap(D)
+    rmap.allocate(x)
+    out_cols = rmap.allocate(linear_node)
+
+    layer = TransformerLayer(D, D_HEAD, activation="swish")
+    op = _make_mlp_op(
+        rmap, "compute_linear_bypass", linear_node, out_cols, mlp_slots=list(range(6))
+    )
+    write_mlp_sublayer(layer, [op], rmap)
+
+    # Both slot halves are degenerate lanes on the swish machine.
+    assert (layer.mlp.up_proj.output_bias[list(range(6))] == 1.0).all()
+
+    layer.to(device_mod.get_device(verbose=False))
+    x_values = torch.randn(N_POS, 4)
+    res = _build_residual_stream(rmap, {x: x_values})
+
+    out = layer.mlp.forward(res)
+    expected = linear_node.compute(N_POS, {"x": x_values})
+    assert torch.allclose(out[:, out_cols].cpu(), expected, atol=1e-4)
+
+
+def test_swish_mlp_linear_bypass_with_bias():
+    x = InputNode("x", 4, value_range=(-100.0, 100.0))
+    W = torch.randn(4, 3)
+    b = torch.randn(3)
+    linear_node = Linear(x, W, b, name="biased_lin")
+
+    rmap = ResidualStreamMap(D)
+    rmap.allocate(x)
+    out_cols = rmap.allocate(linear_node)
+
+    layer = TransformerLayer(D, D_HEAD, activation="swish")
+    op = _make_mlp_op(
+        rmap, "compute_linear_bypass", linear_node, out_cols, mlp_slots=list(range(6))
+    )
+    write_mlp_sublayer(layer, [op], rmap)
+    layer.to(device_mod.get_device(verbose=False))
+
+    x_values = torch.randn(N_POS, 4)
+    res = _build_residual_stream(rmap, {x: x_values})
+
+    out = layer.mlp.forward(res)
+    expected = linear_node.compute(N_POS, {"x": x_values})
+    assert torch.allclose(out[:, out_cols].cpu(), expected, atol=1e-4)
+
+
+def test_swish_mlp_constant_literal():
+    """LiteralValue lands in the down projection's output bias."""
+    const = LiteralValue(torch.tensor([1.0, -2.0, 3.5]))
+
+    rmap = ResidualStreamMap(D)
+    out_cols = rmap.allocate(const)
+
+    layer = TransformerLayer(D, D_HEAD, activation="swish")
+    op = MLPOp(
+        op_type="compute_literal_value", node=const, target_cols=out_cols, mlp_slots=[]
+    )
+    write_mlp_sublayer(layer, [op], rmap)
+    device = device_mod.get_device(verbose=False)
+    layer.to(device)
+
+    out = layer.mlp.forward(torch.zeros(N_POS, D, device=device))
+    expected = const.compute(N_POS, {})
+    assert torch.allclose(out[:, out_cols].cpu(), expected, atol=1e-6)
+
+
+def test_machine_mismatch_asserts():
+    """A node/machine activation mismatch is a compiler bug and must fire the
+    writer's assert (the uniformity check makes it unreachable in a real
+    compile)."""
+    import pytest
+
+    x = InputNode("x", 4, value_range=(-10.0, 10.0))
+
+    # swish FFN on the ReLU machine
+    ffn_swish = _swish_ffn(x, gated=False)
+    rmap = ResidualStreamMap(D)
+    rmap.allocate(x)
+    out_cols = rmap.allocate(ffn_swish)
+    op = _make_mlp_op(
+        rmap, "compute_ffn", ffn_swish, out_cols, mlp_slots=list(range(6))
+    )
+    with pytest.raises(AssertionError, match="machine mismatch"):
+        write_mlp_sublayer(TransformerLayer(D, D_HEAD), [op], rmap)
+
+    # relu FFN on the swish machine
+    relu_ffn = linear_relu_linear(
+        x, torch.randn(6, 4), torch.randn(6), torch.randn(6, 3), torch.randn(3)
+    )
+    rmap2 = ResidualStreamMap(D)
+    rmap2.allocate(x)
+    out_cols2 = rmap2.allocate(relu_ffn)
+    op2 = _make_mlp_op(
+        rmap2, "compute_ffn", relu_ffn, out_cols2, mlp_slots=list(range(6))
+    )
+    with pytest.raises(AssertionError, match="machine mismatch"):
+        write_mlp_sublayer(
+            TransformerLayer(D, D_HEAD, activation="swish"), [op2], rmap2
+        )
+
+    # gated relu FFN on the ReLU machine: activation matches but the machine
+    # has no up projection to realize the gated lanes.
+    from torchwright.graph import FFN
+
+    gated_relu = FFN(
+        x,
+        gate_proj=torch.randn(6, 4),
+        gate_bias=torch.randn(6),
+        out_proj=torch.randn(6, 3),
+        out_bias=torch.randn(3),
+        up_proj=torch.randn(6, 4),
+        up_bias=torch.randn(6),
+        activation="relu",
+    )
+    rmap3 = ResidualStreamMap(D)
+    rmap3.allocate(x)
+    out_cols3 = rmap3.allocate(gated_relu)
+    op3 = _make_mlp_op(
+        rmap3, "compute_ffn", gated_relu, out_cols3, mlp_slots=list(range(6))
+    )
+    with pytest.raises(AssertionError, match="no up projection"):
+        write_mlp_sublayer(TransformerLayer(D, D_HEAD), [op3], rmap3)

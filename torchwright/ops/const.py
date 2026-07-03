@@ -12,3 +12,12 @@ embedding_step_sharpness = 1.0  # For embedding-space ops (map_to_table, equals_
 # absorb dot-product errors from approximate embeddings.
 # Embedding norms are ~40 (self-dot ~1600), so even tiny
 # Euclidean errors become large dot-product errors.
+
+# Hinge sharpening for the swish machine (docs/swiglu_step2_plan.md, settled
+# decision 5).  Only ever used self-normalizing — folded into gate rows with
+# the matching /scale folded into out_proj (``Swish(scale·z)/scale``), so no
+# value path carries it; never a per-call knob.  Recorded cost: hidden slots
+# saturate at ~1e5-magnitude values, foreclosing fp16 export (the artifact is
+# fp32 everywhere today).  The numeric claims tied to this value are pinned
+# by tests/docs/test_swish_constants.py.
+scale = 100.0

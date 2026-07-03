@@ -18,6 +18,11 @@ from torchwright.graph.misc import LiteralValue
 from torchwright.graph.ffn import FFN
 from torchwright.graph.rope import ROPE_BASE
 
+# The swish machine's hinge-sharpening constant (a sideways import of a leaf
+# constants module — ops/const.py has no imports, so no cycle).  Used only by
+# the swish bypass pair below; ops fold it into FFN weights themselves.
+from torchwright.ops.const import scale as _SWISH_SCALE
+
 # Self-match attention hardness: scales the constant-1 self-match logit so the
 # diagonal softmax weight is 1.0 to fp32 (Δ=0 transport is bit-identical).
 _SELF_MATCH_HARDNESS = 100.0
@@ -640,6 +645,18 @@ def _write_add_into(
 # ---------------------------------------------------------------------------
 
 
+def _mlp_in_out(mlp):
+    """The hidden pool's (input-side, output-side) projections, either machine.
+
+    ReLU machine: ``(linear1, linear2)``.  Swish machine: ``(gate_proj,
+    down_proj)`` — the gate is the input-side projection every op writes;
+    the up projection is swish-machine-specific and accessed explicitly.
+    """
+    if mlp.activation == "swish":
+        return mlp.gate_proj, mlp.down_proj
+    return mlp.linear1, mlp.linear2
+
+
 def _write_compute_ffn(
     mlp,
     op: MLPOp,
@@ -647,11 +664,13 @@ def _write_compute_ffn(
     biased_linears: Optional[Set[Node]] = None,
     recorder: Optional[PlacementRecorder] = None,
 ):
-    """Compile a degenerate-ReLU :class:`FFN` through the MLP sublayer.
+    """Compile an :class:`FFN` through the MLP sublayer (either machine).
 
     The FFN is the only MLP composite: it maps its input through the gate
-    projection into the hidden slots, applies the sublayer's built-in ReLU, and
-    maps back out through the output projection:
+    projection into the hidden slots, applies the machine's nonlinearity, and
+    maps back out through the output projection.
+
+    ReLU machine (``mlp.activation == "relu"``, degenerate FFNs only):
 
     - ``linear1``: input columns -> mlp_slots, weight ``gate_proj.T`` (the
       FFN stores ``gate_proj`` as ``(n_lanes, d_input)``; the MLP linear1
@@ -659,13 +678,30 @@ def _write_compute_ffn(
     - ReLU: applied elementwise (the sublayer's built-in nonlinearity).
     - ``linear2``: mlp_slots -> target columns, weight ``out_proj``
       ``(n_lanes, d_output)``, bias ``out_bias``.
+
+    Swish machine (``mlp.activation == "swish"``): gate rows land the same
+    way in ``gate_proj``; every lane additionally gets its up-side row in
+    ``up_proj`` — the FFN's own ``up_proj``/``up_bias`` for gated lanes, or
+    up-row 0 / up-bias 1 for degenerate lanes (the constant-1 up factor);
+    ``down_proj`` takes ``out_proj``/``out_bias``.
+
+    The machine kind is uniform per network and selected from the graph's
+    FFNs (the compile-time uniformity check), so a node/machine activation
+    mismatch here is a compiler bug, not a user error.
     """
     ffn = op.node
     assert isinstance(ffn, FFN)
-    assert ffn.activation == "relu" and ffn.up_proj is None, (
-        f"compute_ffn supports only degenerate ReLU FFNs in step 1, got "
-        f"activation={ffn.activation!r}, gated={ffn.up_proj is not None}"
+    assert ffn.activation == mlp.activation, (
+        f"compute_ffn machine mismatch for {ffn!r}: node activation "
+        f"{ffn.activation!r} on a {mlp.activation!r}-machine MLP sublayer. "
+        f"The uniformity check selects the machine from the graph's FFNs, "
+        f"so this is a compiler bug."
     )
+    if mlp.activation == "relu":
+        assert ffn.up_proj is None, (
+            f"compute_ffn: gated FFN {ffn!r} on the ReLU machine — the ReLU "
+            f"MLP sublayer has no up projection to realize a gated lane."
+        )
 
     assert op.source_cols is not None, "compute_ffn requires source_cols"
     input_node = ffn.inputs[0]
@@ -677,19 +713,34 @@ def _write_compute_ffn(
     slots_t = torch.as_tensor(mlp_slots, dtype=torch.long)
     out_idx_t = torch.as_tensor(out_idx, dtype=torch.long)
 
-    target_dtype = mlp.linear1.output_matrix.dtype
+    in_lin, out_lin = _mlp_in_out(mlp)
+    target_dtype = in_lin.output_matrix.dtype
 
-    # linear1: rows=input columns, cols=mlp slots.  gate matrix is
-    # (d_input, n_lanes) = gate_proj.T; gate bias is (n_lanes,).
+    # Input-side projection: rows=input columns, cols=mlp slots.  gate matrix
+    # is (d_input, n_lanes) = gate_proj.T; gate bias is (n_lanes,).
     gate_matrix = ffn.gate_proj.t()
-    mlp.linear1.output_matrix[in_idx_t.unsqueeze(1), slots_t.unsqueeze(0)] = (
-        gate_matrix.to(target_dtype)
+    in_lin.output_matrix[in_idx_t.unsqueeze(1), slots_t.unsqueeze(0)] = gate_matrix.to(
+        target_dtype
     )
-    mlp.linear1.output_bias[slots_t] = ffn.gate_bias.to(target_dtype)
+    in_lin.output_bias[slots_t] = ffn.gate_bias.to(target_dtype)
 
-    # Fold deferred biased-Linear inputs into the gate's hidden bias, because
-    # the FFN reads those columns in linear1 before the deferred output_bias
-    # is written.
+    # Swish machine: the up-side rows.  A degenerate lane's up factor is the
+    # constant 1 (row 0, bias 1); a gated lane carries its own affine.
+    up_matrix = None
+    if mlp.activation == "swish":
+        if ffn.up_proj is None:
+            up_bias = torch.ones(len(mlp_slots))
+        else:
+            up_matrix = ffn.up_proj.t()
+            up_bias = ffn.up_bias
+            mlp.up_proj.output_matrix[in_idx_t.unsqueeze(1), slots_t.unsqueeze(0)] = (
+                up_matrix.to(target_dtype)
+            )
+        mlp.up_proj.output_bias[slots_t] = up_bias.to(target_dtype)
+
+    # Fold deferred biased-Linear inputs into the hidden biases, because the
+    # FFN reads those columns in the input-side matmuls (gate, and up when
+    # gated) before the deferred output_bias is written.
     if biased_linears:
         leaves = (
             flatten_concat_nodes([input_node])
@@ -701,20 +752,29 @@ def _write_compute_ffn(
             if leaf in biased_linears:
                 assert isinstance(leaf, Linear)
                 contrib = leaf.output_bias @ gate_matrix[offset : offset + len(leaf), :]
-                mlp.linear1.output_bias[slots_t] += contrib.to(target_dtype)
+                in_lin.output_bias[slots_t] += contrib.to(target_dtype)
+                if up_matrix is not None:
+                    up_contrib = (
+                        leaf.output_bias @ up_matrix[offset : offset + len(leaf), :]
+                    )
+                    mlp.up_proj.output_bias[slots_t] += up_contrib.to(target_dtype)
             offset += len(leaf)
 
-    # linear2: rows=mlp slots, cols=output columns.  out_proj is
-    # (n_lanes, d_output); out_bias is (d_output,).
-    mlp.linear2.output_matrix[slots_t.unsqueeze(1), out_idx_t.unsqueeze(0)] = (
+    # Output-side projection: rows=mlp slots, cols=output columns.  out_proj
+    # is (n_lanes, d_output); out_bias is (d_output,).
+    out_lin.output_matrix[slots_t.unsqueeze(1), out_idx_t.unsqueeze(0)] = (
         ffn.out_proj.to(target_dtype)
     )
-    mlp.linear2.output_bias[out_idx_t] = ffn.out_bias.to(target_dtype)
+    out_lin.output_bias[out_idx_t] = ffn.out_bias.to(target_dtype)
 
     if recorder is not None:
-        # Both dense weight blocks attributed to the FFN node (it carries all
-        # the weights, unlike a mined chain's split across L1/L2).
+        # All dense weight blocks attributed to the FFN node (it carries all
+        # the weights, unlike a mined chain's split across L1/L2).  The up
+        # matrix is recorded only when real rows were written (a degenerate
+        # FFN touches only the up bias, which occupancy does not track).
         recorder.add("mlp.W_in", ffn, op.op_type, in_idx, mlp_slots, "dense")
+        if up_matrix is not None:
+            recorder.add("mlp.W_up", ffn, op.op_type, in_idx, mlp_slots, "dense")
         recorder.add("mlp.W_out", ffn, op.op_type, mlp_slots, out_idx, "dense")
 
 
@@ -729,8 +789,9 @@ def _write_compute_literal_value(mlp, op: MLPOp):
         f"Slicing would silently lose trailing entries — compiler bug."
     )
     cols_t = torch.as_tensor(op.target_cols, dtype=torch.long)
-    target_dtype = mlp.linear2.output_bias.dtype
-    mlp.linear2.output_bias[cols_t] = node.value.to(target_dtype)
+    out_lin = _mlp_in_out(mlp)[1]
+    target_dtype = out_lin.output_bias.dtype
+    out_lin.output_bias[cols_t] = node.value.to(target_dtype)
 
 
 def _write_compute_bias(mlp, op: MLPOp):
@@ -744,8 +805,9 @@ def _write_compute_bias(mlp, op: MLPOp):
         f"Slicing would silently lose trailing entries — compiler bug."
     )
     cols_t = torch.as_tensor(op.target_cols, dtype=torch.long)
-    target_dtype = mlp.linear2.output_bias.dtype
-    mlp.linear2.output_bias[cols_t] += node.output_bias.to(target_dtype)
+    out_lin = _mlp_in_out(mlp)[1]
+    target_dtype = out_lin.output_bias.dtype
+    out_lin.output_bias[cols_t] += node.output_bias.to(target_dtype)
 
 
 def _write_compute_linear_bypass(
@@ -755,10 +817,17 @@ def _write_compute_linear_bypass(
     biased_linears: Optional[Set[Node]] = None,
     recorder: Optional[PlacementRecorder] = None,
 ):
-    """Compile a standalone Linear via MLP using the ReLU bypass trick.
+    """Compile a standalone Linear via MLP using the activation bypass pair.
 
-    ReLU(z) - ReLU(-z) = z, so two MLP slots per output column recover
-    an arbitrary linear function without the ReLU nonlinearity.
+    ReLU machine: ``ReLU(z) - ReLU(-z) = z``.  Swish machine:
+    ``Swish(scale·z)/scale - Swish(-scale·z)/scale = z`` — exact at any
+    sharpening (``σ(z) + σ(-z) = 1``), sharpened by the module ``scale``
+    by convention: the value is exact either way, but the affine-bound
+    sandwich slack on the pair is ``±0.2785/scale`` sharpened versus
+    ``±0.2785`` raw (see the spec's ``min`` entry).  Either way, two MLP
+    slots per output column recover an arbitrary linear function without
+    the nonlinearity; on the swish machine both slots are degenerate
+    lanes (up-row 0, up-bias 1).
 
     Slot layout: mlp_slots[:d_output] are the positive slots,
     mlp_slots[d_output:] are the negative slots.
@@ -785,16 +854,31 @@ def _write_compute_linear_bypass(
     pos_slots_t = torch.as_tensor(pos_slots, dtype=torch.long)
     neg_slots_t = torch.as_tensor(neg_slots, dtype=torch.long)
 
-    target_dtype = mlp.linear1.output_matrix.dtype
+    in_lin, out_lin = _mlp_in_out(mlp)
+    swish = mlp.activation == "swish"
+    # The self-normalizing fold: gate rows carry scale·W, the output side
+    # carries 1/scale, so no value path is amplified.  1.0 on the ReLU
+    # machine (no sharpening — ReLU needs none).
+    in_gain = _SWISH_SCALE if swish else 1.0
+    out_gain = 1.0 / _SWISH_SCALE if swish else 1.0
+
+    target_dtype = in_lin.output_matrix.dtype
     W = node.output_matrix.to(target_dtype)  # (d_input, d_output)
 
-    # linear1: positive slots get +W columns, negative slots get -W columns.
-    # Each positive slot j computes W[:,j]^T @ x; after ReLU → max(0, W[:,j]^T @ x).
-    # Each negative slot j computes -W[:,j]^T @ x; after ReLU → max(0, -W[:,j]^T @ x).
-    mlp.linear1.output_matrix[in_idx_t.unsqueeze(1), pos_slots_t.unsqueeze(0)] = W
-    mlp.linear1.output_matrix[in_idx_t.unsqueeze(1), neg_slots_t.unsqueeze(0)] = -W
+    # Input side: positive slots get +in_gain·W columns, negative slots get
+    # -in_gain·W columns.  Each positive slot j computes act(in_gain·W[:,j]^T @ x),
+    # each negative slot act(-in_gain·W[:,j]^T @ x); the output side's ±out_gain
+    # recombines them to W[:,j]^T @ x exactly.
+    in_lin.output_matrix[in_idx_t.unsqueeze(1), pos_slots_t.unsqueeze(0)] = in_gain * W
+    in_lin.output_matrix[in_idx_t.unsqueeze(1), neg_slots_t.unsqueeze(0)] = -in_gain * W
 
-    # Fold deferred biased-Linear inputs into linear1 slot biases.
+    # Swish machine: both slot halves are degenerate lanes (up ≡ 1).
+    if swish:
+        mlp.up_proj.output_bias[pos_slots_t] = 1.0
+        mlp.up_proj.output_bias[neg_slots_t] = 1.0
+
+    # Fold deferred biased-Linear inputs into the input-side slot biases
+    # (scaled with the gate rows; the up rows are zero, so no up-side fold).
     if biased_linears:
         input_node = node.inputs[0]
         leaves = (
@@ -802,26 +886,27 @@ def _write_compute_linear_bypass(
             if isinstance(input_node, Concatenate)
             else [input_node]
         )
-        bias_dtype = mlp.linear1.output_bias.dtype
+        bias_dtype = in_lin.output_bias.dtype
         offset = 0
         for leaf in leaves:
             if leaf in biased_linears:
                 assert isinstance(leaf, Linear)
-                # contrib[j] = sum_i W[offset+i, j] * leaf.bias[i]
-                contrib = (leaf.output_bias @ W[offset : offset + len(leaf), :]).to(
-                    bias_dtype
-                )
-                mlp.linear1.output_bias[pos_slots_t] += contrib
-                mlp.linear1.output_bias[neg_slots_t] -= contrib
+                # contrib[j] = in_gain * sum_i W[offset+i, j] * leaf.bias[i]
+                contrib = (
+                    in_gain * (leaf.output_bias @ W[offset : offset + len(leaf), :])
+                ).to(bias_dtype)
+                in_lin.output_bias[pos_slots_t] += contrib
+                in_lin.output_bias[neg_slots_t] -= contrib
             offset += len(leaf)
 
-    # linear2: positive slots write +1 to output columns, negative write -1.
-    # Combined: max(0, W[:,j]^T @ x) - max(0, -W[:,j]^T @ x) = W[:,j]^T @ x.
-    mlp.linear2.output_matrix[pos_slots_t, out_idx_t] = 1.0
-    mlp.linear2.output_matrix[neg_slots_t, out_idx_t] = -1.0
+    # Output side: positive slots write +out_gain to output columns,
+    # negative write -out_gain.  Combined (ReLU machine, out_gain=1):
+    # max(0, W[:,j]^T @ x) - max(0, -W[:,j]^T @ x) = W[:,j]^T @ x.
+    out_lin.output_matrix[pos_slots_t, out_idx_t] = out_gain
+    out_lin.output_matrix[neg_slots_t, out_idx_t] = -out_gain
 
-    # Output bias via linear2 output bias.
-    mlp.linear2.output_bias[out_idx_t] += node.output_bias.to(target_dtype)
+    # Output bias via the output-side projection's bias.
+    out_lin.output_bias[out_idx_t] += node.output_bias.to(target_dtype)
 
     if recorder is not None:
         # W_in: dense ±W blocks into the positive and negative slot halves.

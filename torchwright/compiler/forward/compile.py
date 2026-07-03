@@ -516,19 +516,28 @@ def _count_heads_by_type(
     return counts
 
 
+def _params_per_slot(d: int, activation: str) -> int:
+    """Parameters one occupied hidden slot costs, by machine.
+
+    ReLU machine: a linear1 column + bias and a linear2 row + bias
+    (``2d + 2``).  Swish machine: gate and up columns + biases and a down
+    row + bias (``3d + 3``).  Independent of ``d_hidden``.
+    """
+    return (3 * d + 3) if activation == "swish" else (2 * d + 2)
+
+
 def _count_layer_params(
     attn_ops: list[AttnHeadOp],
     mlp_ops: list[MLPOp],
     d: int,
     d_head: int,
+    activation: str = "relu",
 ) -> int:
     """Count transformer parameters used by one layer's ops.
 
     Attention ops consume whole heads (4 * d * d_head params each).
-    MLP ops consume slots (2*d + 2 params each) or bias entries (1 each).
-    The per-slot cost is independent of ``d_hidden`` — each occupied
-    hidden slot still costs one column in linear1 plus one row in linear2
-    plus two biases.
+    MLP ops consume slots (:func:`_params_per_slot` each) or bias
+    entries (1 each).
     """
     params_per_head = 4 * d * d_head
 
@@ -561,7 +570,7 @@ def _count_layer_params(
         if mlp_op.op_type in ("compute_literal_value", "compute_bias"):
             bias_entries += len(mlp_op.target_cols)
 
-    params_per_slot = 2 * d + 2  # linear1 column + bias + linear2 row + bias
+    params_per_slot = _params_per_slot(d, activation)
     return heads_used * params_per_head + slots_used * params_per_slot + bias_entries
 
 
@@ -720,11 +729,37 @@ def forward_compile(
             f"global — build every head from one RopeConfig."
         )
 
+    # Machine uniformity (docs/swiglu_step2_plan.md, settled decision 1): every
+    # compiled network is one machine — all-ReLU or all-swish — selected here
+    # from the graph's FFN nodes.  A mixed graph is a compile error, not a
+    # warning; a graph with no FFNs compiles to the ReLU machine (the machines
+    # differ only in the MLP sublayer's realization of FFN lanes).  Not a
+    # numbered invariant: this guards a policy, not allocator soundness.
+    from torchwright.graph.ffn import FFN as _FFN
+
+    ffn_nodes = [n for n in graph.get_all_nodes() if isinstance(n, _FFN)]
+    activations = {n.activation for n in ffn_nodes}
+    if len(activations) > 1:
+        raise ValueError(
+            f"Mixed FFN activations {sorted(activations)}: every compiled graph "
+            f"is uniformly one machine (all-ReLU or all-swish).  Build the whole "
+            f"graph from a single op package (ops/relu or ops/swiglu)."
+        )
+    activation = activations.pop() if activations else "relu"
+    if activation == "relu":
+        gated = [n for n in ffn_nodes if n.up_proj is not None]
+        if gated:
+            raise ValueError(
+                f"{len(gated)} ReLU FFN node(s) carry gated lanes (up_proj), "
+                f"e.g. {gated[0]!r} — the ReLU machine's MLP sublayer has no up "
+                f"projection.  Gated lanes require activation='swish'."
+            )
+
     if d_hidden is None:
         d_hidden = d
 
     # 2. Initialize
-    net = HeadlessTransformer(d, d_head, d_hidden=d_hidden)
+    net = HeadlessTransformer(d, d_head, d_hidden=d_hidden, activation=activation)
     # Solver provenance, populated only when CP-SAT runs (optimize>0); stays
     # None for the heuristic path so callers can always query it.
     net.cpsat_solve_stats = None
@@ -1139,13 +1174,17 @@ def forward_compile(
 
     graph_params = sum(n.num_params() for n in graph.get_all_nodes())
 
-    # Per-layer tensor capacity (Q/K/V/O attention matrices + linear1/linear2
-    # weights & biases).  Computed once instead of via `layer.num_params()` so
-    # the verbose log still works after `on_layer_compiled` nulls the layer's
-    # weight attributes.  Decomposes as 4*d*d (attention QKVO) +
-    # 2*d*d_hidden (rectangular MLP matrices) + d_hidden (linear1 bias) +
-    # d (linear2 bias).
-    layer_capacity = 4 * d * d + 2 * d * d_hidden + d_hidden + d
+    # Per-layer tensor capacity (Q/K/V/O attention matrices + MLP weights &
+    # biases).  Computed once instead of via `layer.num_params()` so the
+    # verbose log still works after `on_layer_compiled` nulls the layer's
+    # weight attributes.  Decomposes as 4*d*d (attention QKVO) + the machine's
+    # rectangular MLP matrices and hidden biases (ReLU: linear1+linear2,
+    # 2*d*d_hidden + d_hidden; swish: gate+up+down, 3*d*d_hidden +
+    # 2*d_hidden) + d (output-side bias).
+    n_mlp_mats = 3 if activation == "swish" else 2
+    layer_capacity = (
+        4 * d * d + n_mlp_mats * d * d_hidden + (n_mlp_mats - 1) * d_hidden + d
+    )
 
     if verbose:
         print(
@@ -1248,7 +1287,7 @@ def forward_compile(
             for node in computed - prev_computed:
                 on_node_scheduled(node, i)
 
-        layer_params = _count_layer_params(attn_ops, mlp_ops, d, d_head)
+        layer_params = _count_layer_params(attn_ops, mlp_ops, d, d_head, activation)
         per_layer_head_counts.append(_count_heads_by_type(attn_ops, d_head))
         total_params += layer_params
         occupied_after = d - residual_map.get_free_count()
@@ -1403,7 +1442,7 @@ def forward_compile(
         if verbose:
             mlp_before = d_hidden * len(net.layers)
             mlp_after = sum(layer.mlp.d_hidden for layer in net.layers)
-            mlp_saved = (mlp_before - mlp_after) * (2 * d + 2)
+            mlp_saved = (mlp_before - mlp_after) * _params_per_slot(d, activation)
             print(
                 f"\n  MLP trimming: {mlp_before - mlp_after}/{mlp_before} "
                 f"slots trimmed ({mlp_saved:,} params saved)"
