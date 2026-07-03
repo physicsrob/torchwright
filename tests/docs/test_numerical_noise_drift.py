@@ -51,7 +51,15 @@ _ERROR_METRIC_KEYS = [
 # gross drift (a number moving by >40%); it is not a tight regression bound.
 # See docs/numerical_noise_findings.md.
 _RTOL = 0.40
-_ATOL = 1e-6
+# 5e-4 (was 1e-6): the swiglu ops' measured floor is fp32 product rounding at
+# the lane-contribution magnitude, and that rounding is kernel-dependent (FMA
+# vs per-product) — an entry measuring exactly 0.0 on one CPU reads a few
+# contribution-ulps on another (observed: compare_uniform_pm80 p99 0.0 locally
+# vs 5.8e-5 on Modal's EPYC; worst contribution in the table is ~1600, so up
+# to ~2e-4). The relu exact ops never exposed this — their identities are
+# exact on every kernel. Absolute moves above 5e-4 are genuine drift; tight
+# per-op budgets live in the ops' unit tests, not here.
+_ATOL = 5e-4
 
 
 def _close_enough(a: float, b: float) -> bool:

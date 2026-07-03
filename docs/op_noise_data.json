@@ -1,6 +1,6 @@
 {
   "schema_version": 2,
-  "commit": "23fee36",
+  "commit": "ec32fa3",
   "measured_at": "2026-07-03",
   "ops": [
     {
@@ -569,6 +569,40 @@
       ]
     },
     {
+      "name": "broadcast_select",
+      "machine": "swiglu",
+      "module": "torchwright.ops.swiglu.map_select",
+      "notes": "Per slot, select's complementary gated pair with mask_i as the cond — one form for every caller (the approximate flag, the (M+v)−M offsets, and the two-sublayer exact path all died). Junk-mask safe with no ±1 assert; a mask off ±1 by δ mis-scales the winner by δ·|value|. (The relu broadcast_select was never measured; its offset class is the findings doc's (M+v)−M entry.)",
+      "distributions": [
+        {
+          "name": "broadcast_select_pm1_masks_4x1",
+          "description": "±1 masks over 4 slots with per-slot true/false values in [-5, 5] (d_fill=1). Losing branches exactly zero at clean masks; winners ~1 ulp relative.",
+          "n_samples": 4096,
+          "max_abs_error": 4.76837e-07,
+          "mean_abs_error": 4.07526e-08,
+          "p99_abs_error": 4.76837e-07,
+          "max_rel_error": 1.19186e-07,
+          "mean_rel_error": 1.67837e-08,
+          "p99_rel_error": 1.09348e-07,
+          "rel_valid_samples": 16384,
+          "worst_input": {
+            "masks[0]": -1.0,
+            "masks[1]": 1.0,
+            "masks[2]": 1.0,
+            "masks[3]": -1.0,
+            "t[0]": 3.47276,
+            "t[1]": 4.92131,
+            "t[2]": -1.41127,
+            "t[3]": 1.11525,
+            "f[0]": 1.67479,
+            "f[1]": 4.05369,
+            "f[2]": -2.4284,
+            "f[3]": -2.0506
+          }
+        }
+      ]
+    },
+    {
       "name": "compare",
       "machine": "swiglu",
       "module": "torchwright.ops.swiglu.arithmetic_ops",
@@ -631,6 +665,37 @@
       ]
     },
     {
+      "name": "dynamic_extract",
+      "machine": "swiglu",
+      "module": "torchwright.ops.swiglu.map_select",
+      "notes": "in_range one-hot → broadcast_select (zero-literal false branch, lanes dropped) → free Linear sum. Losing slots are exactly zero at clean masks, so the sum degenerates to a copy of the selected slot.",
+      "distributions": [
+        {
+          "name": "dynamic_extract_int_idx_4x2",
+          "description": "Runtime 4×2 tables in [-5, 5] with integer indices — the in_range → broadcast_select → sum composition on clean integer inputs.",
+          "n_samples": 4096,
+          "max_abs_error": 4.76837e-07,
+          "mean_abs_error": 4.1262e-08,
+          "p99_abs_error": 4.76837e-07,
+          "max_rel_error": 1.19132e-07,
+          "mean_rel_error": 1.69201e-08,
+          "p99_rel_error": 1.0951e-07,
+          "rel_valid_samples": 8192,
+          "worst_input": {
+            "table[0]": 3.91779,
+            "table[1]": 2.51304,
+            "table[2]": 4.2406,
+            "table[3]": 2.89222,
+            "table[4]": -1.51677,
+            "table[5]": -3.31736,
+            "table[6]": -0.372015,
+            "table[7]": 4.13819,
+            "idx": 3.0
+          }
+        }
+      ]
+    },
+    {
       "name": "equals_vector",
       "machine": "swiglu",
       "module": "torchwright.ops.swiglu.logic_ops",
@@ -651,6 +716,30 @@
             "x[0]": 1.0,
             "x[1]": 2.0,
             "x[2]": 3.0
+          }
+        }
+      ]
+    },
+    {
+      "name": "in_range",
+      "machine": "swiglu",
+      "module": "torchwright.ops.swiglu.map_select",
+      "notes": "Per slot, two compare-shaped sharpened ramps combined in out_proj. Integer bounds are exact to the folded ulp class; continuous bounds inherit compare's ramp contract per boundary plus up to 4·swish_dip/scale ≈ 0.011 of fillet dip (the value-range assert and broadcast_select's mask tolerance both carry it). (The relu in_range was never measured.)",
+      "distributions": [
+        {
+          "name": "in_range_integer_bounds_8",
+          "description": "Integer (lower, upper) pairs over [0, 8], 8 slots — integer bounds keep every hinge ≥ 4 units from its bend (bit-exact modulo the folded-/scale ulp class).",
+          "n_samples": 4096,
+          "max_abs_error": 5.96046e-08,
+          "mean_abs_error": 3.24144e-09,
+          "p99_abs_error": 5.96046e-08,
+          "max_rel_error": 5.96046e-08,
+          "mean_rel_error": 3.24144e-09,
+          "p99_rel_error": 5.96046e-08,
+          "rel_valid_samples": 32768,
+          "worst_input": {
+            "lower": 6.0,
+            "upper": 6.0
           }
         }
       ]

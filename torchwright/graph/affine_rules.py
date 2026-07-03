@@ -729,12 +729,21 @@ def _broadcast_select_semantic_bound(
     true_is_broadcast: bool,
     false_is_broadcast: bool,
     tolerance: float = 0.0,
+    rel_tolerance: float = 0.0,
 ) -> AffineBound:
     """Per-component hull across slots for broadcast_select.
 
     Each output slot picks true or false, so the per-channel bound is
     the hull of the corresponding true/false channel. When a branch is
     broadcast, its single-slot interval applies to every slot.
+
+    Widening modes mirror :func:`_select_semantic_bound`: ``tolerance``
+    is the ReLU machine's absolute ``c_tol·M`` per component;
+    ``rel_tolerance`` is the swish machine's per-side
+    ``rel_tolerance·|hull side|`` (a saturated gate is linear in the
+    mask, so a mask off ±1 by δ mis-scales the winner by δ·|actual
+    value| — for broadcast_select δ is the *mask* tolerance, sized to
+    absorb in_range's dip, not the stricter select/cond_gate c_tol).
     """
     import torch
 
@@ -764,6 +773,10 @@ def _broadcast_select_semantic_bound(
 
     b_lo -= tolerance
     b_hi += tolerance
+
+    if rel_tolerance > 0.0:
+        b_lo -= rel_tolerance * b_lo.abs()
+        b_hi += rel_tolerance * b_hi.abs()
 
     return AffineBound(
         A_lo=torch.zeros(d, 0, dtype=torch.float64),

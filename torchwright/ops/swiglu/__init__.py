@@ -27,6 +27,9 @@ from torchwright.ops.swiglu.logic_ops import (
     equals_vector,
 )
 from torchwright.ops.swiglu.map_select import (
+    broadcast_select,
+    dynamic_extract,
+    in_range,
     select,
     switch,
 )

@@ -13,6 +13,19 @@ observations and removing findings a fix has invalidated. See the
 
 ## Findings
 
+### Drift `_ATOL` is 5e-4: the swiglu ulp floor is kernel-dependent
+
+The swiglu entries' measured floor is fp32 product rounding at the lane
+contribution magnitude, and that rounding differs across CPU kernels
+(FMA vs per-product): `compare_uniform_pm80`'s p99 measures exactly 0.0
+on one dev machine and 5.8e-5 on Modal's EPYC — same code, same seed.
+The relu exact ops never exposed this (their identities are exact on
+every kernel), so the drift check's old `_ATOL = 1e-6` was tight enough
+until swiglu landed. Raised to 5e-4 (covers the worst contribution
+magnitude in the table, ~1600 → ~2e-4); the drift test remains a
+gross-movement guard, and tight per-op budgets are pinned by the ops'
+unit tests instead.
+
 ### `reciprocal` p99 is bistable at the drift-check boundary (drift `_RTOL` is 0.40)
 
 `reciprocal_03_200`'s p99 error is bistable on Modal — ~4.0e-4 in some runs,
@@ -174,6 +187,26 @@ larger operand's ulp, unchanged from the ReLU machine). Its *dip* class
 ~0.2% of it — so the committed number reflects fp rounding, not the
 dip; the dip bound is pinned by the op's unit test sweep instead
 (`tests/ops/swiglu/test_arithmetic_ops.py`).
+
+### swiglu in_range/broadcast_select/dynamic_extract: ulp-floor on clean inputs; the interlock is a static budget, not a measured number
+
+All three measure at the fp32 ulp floor on their contract inputs
+(integer bounds / ±1 masks / integer indices): in_range 6e-8,
+broadcast_select and dynamic_extract 4.8e-7 abs at 1.2e-7 rel — losing
+branches exactly zero, winners ~1 ulp relative. (Neither relu
+counterpart was ever measured; relu broadcast_select's error class is
+the `(M+v)−M` entry above.) What the numbers deliberately don't show is
+the **in_range → broadcast_select noise interlock**: continuous bounds
+near a ramp edge push in_range's output up to `4·swish_dip/scale`
+≈ 0.011 off ±1 (unit-test-pinned, out of these distributions'
+support), and a saturated gate is linear in the mask, so that δ lands
+on broadcast_select's winner as exactly δ·|value|. The port encodes it
+statically: `_MASK_TOL = 4·swish_dip/scale` in swiglu/map_select.py
+(replacing the ReLU-era 0.005, which cannot survive for in_range-fed
+masks), the mask-tolerance widening of the semantic hull, and in_range's
+value-range slack. broadcast_select carries **no ±1 mask assert** — the
+junk-mask contract (flagship discards rows with fractional masks) is
+load-bearing and pinned by a unit test instead.
 
 ### Softmax inside attention is not measured here
 

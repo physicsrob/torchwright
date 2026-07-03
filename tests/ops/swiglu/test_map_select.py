@@ -199,3 +199,153 @@ def test_select_and_switch_compile_clean():
     for name, start, w in compiled._input_specs:
         packed[:, start : start + w] = inputs[name]
     compiled(packed, debug=True)
+
+
+# ---------------------------------------------------------------------------
+# in_range / broadcast_select / dynamic_extract
+# ---------------------------------------------------------------------------
+
+
+def test_in_range_structure_and_integer_bounds():
+    from torchwright.ops.swiglu import in_range
+
+    lo = create_input("lo", 1, value_range=(0.0, 8.0))
+    hi = create_input("hi", 1, value_range=(0.0, 8.0))
+    out = in_range(lo, hi, 8)
+    ffn = _unwrap(out)
+    assert ffn.is_degenerate
+    assert ffn.n_lanes == 32  # 4 per slot
+    # Integer bounds: slots [lo, hi) read +1, others -1, to the folded
+    # ulp class (products at scale·S·center magnitudes).
+    val = out.compute(
+        2, {"lo": torch.tensor([[2.0], [0.0]]), "hi": torch.tensor([[5.0], [8.0]])}
+    )
+    ref = torch.tensor(
+        [[-1.0, -1.0, 1.0, 1.0, 1.0, -1.0, -1.0, -1.0], [1.0] * 8]
+    )
+    assert torch.allclose(val, ref, atol=1e-5, rtol=0.0)
+
+
+def test_in_range_dip_slack_and_claimed_range():
+    """Continuous bounds near a ramp edge dip past ±1 by up to
+    4·swish_dip/scale; the claimed value range carries that slack."""
+    from torchwright.ops.const import scale, swish_dip
+    from torchwright.ops.swiglu import in_range
+
+    lo = create_input("lo", 1, value_range=(0.0, 4.0))
+    hi = create_input("hi", 1, value_range=(0.0, 4.0))
+    out = in_range(lo, hi, 4)
+    slack = 4.0 * swish_dip / scale
+    r = out.value_type.value_range
+    assert r.lo == pytest.approx(-1.0 - slack)
+    assert r.hi == pytest.approx(1.0 + slack)
+    # Sweep lower bound through a slot's ramp+fillet zone; outputs stay
+    # within the claimed slack and do exceed 1 (the dip is real).
+    los = torch.linspace(0.3, 0.6, 3001).unsqueeze(1)
+    his = torch.full((3001, 1), 4.0)
+    val = out.compute(3001, {"lo": los, "hi": his})
+    assert val.min() >= -1.0 - slack - 1e-6
+    assert val.max() <= 1.0 + slack + 1e-6
+    assert val.max() > 1.0 + 1e-4
+
+
+def test_broadcast_select_per_slot_and_broadcast():
+    from torchwright.ops.swiglu import broadcast_select
+
+    m = create_input("m", 2, value_range=(-1.0, 1.0))
+    t = create_input("t", 4, value_range=(-9.0, 9.0))  # per-slot, d_fill=2
+    f = create_input("f", 2, value_range=(-9.0, 9.0))  # broadcast
+    out = broadcast_select(m, t, f, n_slots=2, d_fill=2)
+    ffn = _unwrap(out)
+    assert not ffn.is_degenerate
+    assert ffn.n_lanes == 8  # 2 per output column
+    inputs = {
+        "m": torch.tensor([[1.0, -1.0]]),
+        "t": torch.tensor([[1.0, 2.0, 3.0, 4.0]]),
+        "f": torch.tensor([[7.0, 8.0]]),
+    }
+    val = out.compute(1, inputs)
+    # slot 0 true -> t[0:2]; slot 1 false -> broadcast f
+    assert torch.allclose(
+        val, torch.tensor([[1.0, 2.0, 7.0, 8.0]]), rtol=1e-6, atol=1e-7
+    )
+
+
+def test_broadcast_select_junk_mask_safe_no_assert():
+    """Fractional masks blend smoothly — no ±1 assert fires, and the
+    blend stays inside the hull plus the dip term."""
+    from torchwright.ops.swiglu import broadcast_select
+
+    m = create_input("m", 1, value_range=(-1.0, 1.0))
+    t = create_input("t", 1, value_range=(0.0, 8.0))
+    f = create_input("f", 1, value_range=(-2.0, 0.0))
+    out = broadcast_select(m, t, f, n_slots=1, d_fill=1)
+    ms = torch.linspace(-1.0, 1.0, 201).unsqueeze(1)
+    ts = torch.full((201, 1), 8.0)
+    fs = torch.full((201, 1), -2.0)
+    val = out.compute(201, {"m": ms, "t": ts, "f": fs})  # must not raise
+    # saturated-gate blend: ReLU(m)·8 + ReLU(-m)·(-2) within hull+dips
+    assert val.min() >= -2.0 - 0.028 - 1e-6
+    assert val.max() <= 8.0 + 0.028 + 1e-6
+
+
+def test_broadcast_select_zero_literal_branch_drops_lanes():
+    from torchwright.graph.misc import LiteralValue
+    from torchwright.ops.swiglu import broadcast_select
+
+    m = create_input("m", 3, value_range=(-1.0, 1.0))
+    t = create_input("t", 3, value_range=(-5.0, 5.0))
+    zero = LiteralValue(torch.zeros(1), name="z")
+    out = broadcast_select(m, t, zero, n_slots=3, d_fill=1)
+    ffn = _unwrap(out)
+    assert ffn.n_lanes == 3  # false lanes dropped: per-slot cond_gate
+    inputs = {"m": torch.tensor([[1.0, -1.0, 1.0]]), "t": torch.tensor([[2.0, 3.0, 4.0]])}
+    val = out.compute(1, inputs)
+    # losing slots exactly zero (sigma(-scale) = 0)
+    assert val[0, 1].item() == 0.0
+    assert torch.allclose(val, torch.tensor([[2.0, 0.0, 4.0]]), rtol=1e-6, atol=1e-7)
+
+
+def test_broadcast_select_semantic_bound_mask_tol_widening():
+    from torchwright.ops.swiglu import broadcast_select
+    from torchwright.ops.swiglu.map_select import _MASK_TOL
+
+    m = create_input("m", 1, value_range=(-1.0, 1.0))
+    t = create_input("t", 1, value_range=(2.0, 6.0))
+    f = create_input("f", 1, value_range=(-4.0, 1.0))
+    out = broadcast_select(m, t, f, n_slots=1, d_fill=1)
+    iv = out.affine_bound.to_interval()
+    assert iv[0].lo == pytest.approx(-4.0 - _MASK_TOL * 4.0)
+    assert iv[0].hi == pytest.approx(6.0 + _MASK_TOL * 6.0)
+
+
+def test_dynamic_extract_picks_row_and_out_of_range_zeros():
+    from torchwright.ops.swiglu import dynamic_extract
+
+    table = create_input("table", 8, value_range=(-9.0, 9.0))
+    idx = create_input("idx", 1, value_range=(0.0, 3.0))
+    out = dynamic_extract(table, idx, n_entries=4, d_fill=2)
+    assert len(out) == 2
+    tt = torch.arange(1.0, 9.0).unsqueeze(0).repeat(5, 1)
+    ii = torch.tensor([[0.0], [1.0], [2.0], [3.0], [9.0]])
+    val = out.compute(5, {"table": tt, "idx": ii})
+    ref = torch.tensor(
+        [[1.0, 2.0], [3.0, 4.0], [5.0, 6.0], [7.0, 8.0], [0.0, 0.0]]
+    )
+    assert torch.allclose(val, ref, rtol=1e-5, atol=1e-5)
+
+
+def test_dynamic_extract_compiles_clean():
+    from torchwright.ops.swiglu import dynamic_extract
+
+    table = create_input("table", 6, value_range=(-9.0, 9.0))
+    idx = create_input("idx", 1, value_range=(0.0, 2.0))
+    out = dynamic_extract(table, idx, n_entries=3, d_fill=2)
+    compiled = compile_headless(out, d=D, d_head=D_HEAD)
+    assert compiled._net.activation == "swish"
+    inputs = {
+        "table": torch.arange(1.0, 7.0).unsqueeze(0).repeat(3, 1),
+        "idx": torch.tensor([[0.0], [1.0], [2.0]]),
+    }
+    report = probe_compiled(compiled, out, inputs, 3, atol=1e-3)
+    assert report.first_divergent is None, report.format_short()

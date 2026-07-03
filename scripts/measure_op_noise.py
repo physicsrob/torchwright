@@ -369,6 +369,64 @@ def _select_distribution(
     )
 
 
+def _in_range_distribution(
+    name: str, description: str, n_slots: int = 8, n_samples: int = 4096, seed: int = 0
+) -> InputDistribution:
+    """Integer (lower, upper) bound pairs over [0, n_slots], lower ≤ upper
+    (the op contract — inverted bounds are out of contract and read -3)."""
+    gen = torch.Generator().manual_seed(seed)
+    a = torch.randint(0, n_slots + 1, (n_samples, 1), generator=gen).to(torch.float32)
+    b = torch.randint(0, n_slots + 1, (n_samples, 1), generator=gen).to(torch.float32)
+    lower = torch.minimum(a, b)
+    upper = torch.maximum(a, b)
+    return InputDistribution(
+        name=name,
+        description=description,
+        inputs={"lower": lower, "upper": upper},
+        n_samples=n_samples,
+    )
+
+
+def _broadcast_select_distribution(
+    name: str, description: str, n_slots: int = 4, n_samples: int = 4096, seed: int = 0
+) -> InputDistribution:
+    """±1 masks over n_slots plus per-slot true/false values in [-5, 5]."""
+    gen = torch.Generator().manual_seed(seed)
+    masks = (
+        torch.randint(0, 2, (n_samples, n_slots), generator=gen).to(torch.float32)
+        * 2.0
+        - 1.0
+    )
+    t = torch.rand((n_samples, n_slots), generator=gen) * 10.0 - 5.0
+    f = torch.rand((n_samples, n_slots), generator=gen) * 10.0 - 5.0
+    return InputDistribution(
+        name=name,
+        description=description,
+        inputs={"masks": masks, "t": t, "f": f},
+        n_samples=n_samples,
+    )
+
+
+def _dynamic_extract_distribution(
+    name: str,
+    description: str,
+    n_entries: int = 4,
+    d_fill: int = 2,
+    n_samples: int = 4096,
+    seed: int = 0,
+) -> InputDistribution:
+    """Runtime tables in [-5, 5] plus integer indices in [0, n_entries-1]."""
+    gen = torch.Generator().manual_seed(seed)
+    table = torch.rand((n_samples, n_entries * d_fill), generator=gen) * 10.0 - 5.0
+    idx = torch.randint(0, n_entries, (n_samples, 1), generator=gen).to(torch.float32)
+    return InputDistribution(
+        name=name,
+        description=description,
+        inputs={"table": table, "idx": idx},
+        n_samples=n_samples,
+    )
+
+
 def _bin_index_distribution(
     name: str,
     description: str,
@@ -668,6 +726,24 @@ def _distributions() -> Dict[str, InputDistribution]:
             "cond_gate_signed_bool_times_value",
             "±1 conditions paired with scalar values in [-5, 5]. Expected "
             "output: `value` when cond=+1, `0` when cond=-1.",
+        ),
+        "in_range_integer_bounds_8": _in_range_distribution(
+            "in_range_integer_bounds_8",
+            "Integer (lower, upper) pairs over [0, 8], 8 slots — integer "
+            "bounds keep every hinge ≥ 4 units from its bend (bit-exact "
+            "modulo the folded-/scale ulp class).",
+        ),
+        "broadcast_select_pm1_masks_4x1": _broadcast_select_distribution(
+            "broadcast_select_pm1_masks_4x1",
+            "±1 masks over 4 slots with per-slot true/false values in "
+            "[-5, 5] (d_fill=1). Losing branches exactly zero at clean "
+            "masks; winners ~1 ulp relative.",
+        ),
+        "dynamic_extract_int_idx_4x2": _dynamic_extract_distribution(
+            "dynamic_extract_int_idx_4x2",
+            "Runtime 4×2 tables in [-5, 5] with integer indices — the "
+            "in_range → broadcast_select → sum composition on clean "
+            "integer inputs.",
         ),
         "select_signed_bool_two_values": _select_distribution(
             "select_signed_bool_two_values",
@@ -1257,6 +1333,78 @@ def _target_ops() -> List[TargetOp]:
                 "over-estimate ≤ swish_dip/scale (0.0028), only when "
                 "|a−b| ≲ 0.2; ties exact; far-apart operands carry the "
                 "folded-/scale product-rounding ulp class."
+            ),
+        ),
+        TargetOp(
+            name="in_range",
+            machine="swiglu",
+            module=_SWIGLU_SELECT,
+            source_file=_SWIGLU_SELECT_FILE,
+            input_specs={"lower": 1, "upper": 1},
+            build_graph=lambda nodes: swiglu_ops.in_range(
+                nodes["lower"], nodes["upper"], 8
+            ),
+            reference_fn=lambda inputs: torch.where(
+                (inputs["lower"] <= torch.arange(8, dtype=torch.float32) + 0.5)
+                & (torch.arange(8, dtype=torch.float32) + 0.5 < inputs["upper"]),
+                torch.ones(inputs["lower"].shape[0], 8),
+                -torch.ones(inputs["lower"].shape[0], 8),
+            ),
+            distribution_names=("in_range_integer_bounds_8",),
+            notes=(
+                "Per slot, two compare-shaped sharpened ramps combined in "
+                "out_proj. Integer bounds are exact to the folded ulp "
+                "class; continuous bounds inherit compare's ramp contract "
+                "per boundary plus up to 4·swish_dip/scale ≈ 0.011 of "
+                "fillet dip (the value-range assert and broadcast_select's "
+                "mask tolerance both carry it). (The relu in_range was "
+                "never measured.)"
+            ),
+        ),
+        TargetOp(
+            name="broadcast_select",
+            machine="swiglu",
+            module=_SWIGLU_SELECT,
+            source_file=_SWIGLU_SELECT_FILE,
+            input_specs={"masks": 4, "t": 4, "f": 4},
+            build_graph=lambda nodes: swiglu_ops.broadcast_select(
+                nodes["masks"], nodes["t"], nodes["f"], n_slots=4, d_fill=1
+            ),
+            reference_fn=lambda inputs: torch.where(
+                inputs["masks"] > 0, inputs["t"], inputs["f"]
+            ),
+            distribution_names=("broadcast_select_pm1_masks_4x1",),
+            notes=(
+                "Per slot, select's complementary gated pair with mask_i "
+                "as the cond — one form for every caller (the approximate "
+                "flag, the (M+v)−M offsets, and the two-sublayer exact "
+                "path all died). Junk-mask safe with no ±1 assert; a mask "
+                "off ±1 by δ mis-scales the winner by δ·|value|. (The relu "
+                "broadcast_select was never measured; its offset class is "
+                "the findings doc's (M+v)−M entry.)"
+            ),
+        ),
+        TargetOp(
+            name="dynamic_extract",
+            machine="swiglu",
+            module=_SWIGLU_SELECT,
+            source_file=_SWIGLU_SELECT_FILE,
+            input_specs={"table": 8, "idx": 1},
+            build_graph=lambda nodes: swiglu_ops.dynamic_extract(
+                nodes["table"], nodes["idx"], n_entries=4, d_fill=2
+            ),
+            reference_fn=lambda inputs: inputs["table"]
+            .view(-1, 4, 2)[
+                torch.arange(inputs["table"].shape[0]),
+                inputs["idx"].flatten().long(),
+            ]
+            .view(-1, 2),
+            distribution_names=("dynamic_extract_int_idx_4x2",),
+            notes=(
+                "in_range one-hot → broadcast_select (zero-literal false "
+                "branch, lanes dropped) → free Linear sum. Losing slots "
+                "are exactly zero at clean masks, so the sum degenerates "
+                "to a copy of the selected slot."
             ),
         ),
     ]
