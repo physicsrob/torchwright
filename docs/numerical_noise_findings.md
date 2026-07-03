@@ -208,6 +208,20 @@ value-range slack. broadcast_select carries **no ±1 mask assert** — the
 junk-mask contract (flagship discards rows with fractional masks) is
 load-bearing and pinned by a unit test instead.
 
+### swiglu map_to_table/onehot_lookup: winner-ulp class; misses bit-exact
+
+`map_to_table` measures exactly 0 on its match-and-off distribution
+(matching indicators saturate to exactly 1 and the value products round
+clean at these magnitudes; no-match indicators underflow, so misses
+return the default bit-exactly). `onehot_lookup` measures 7.6e-6 abs at
+7.6e-8 rel — one ulp of its ~300-magnitude winner value, the spec's
+"×scale/÷scale round trip" class; its losing-lane leak (`hinge(-0.5)`
+≈ −1e-22, representable but invisible) never surfaces. Neither relu
+counterpart was ever measured. The pessimistic-vs-tight range-claim
+split ports unchanged: map_to_table keeps `default ± Σ|Δ|` (overlap
+soundness) and onehot_lookup keeps the tight `[min, max]` (the reason
+it exists), with no new slack on either.
+
 ### Softmax inside attention is not measured here
 
 The plan originally called for a per-op measurement of the "piecewise

@@ -7,7 +7,7 @@ finite-range requirement) does not exist on this machine — cond noise
 lands proportionally to the actual branch values.
 """
 
-from typing import List
+from typing import Dict, List
 
 import torch
 
@@ -15,7 +15,12 @@ from torchwright.graph import Concatenate, Linear, Node
 from torchwright.graph.asserts import assert_matches_value_type
 from torchwright.graph.misc import LiteralValue
 from torchwright.graph.value_type import NodeValueType, Range
-from torchwright.ops.const import scale, step_sharpness, swish_dip
+from torchwright.ops.const import (
+    embedding_step_sharpness,
+    scale,
+    step_sharpness,
+    swish_dip,
+)
 
 # sum_nodes is purely linear (Add hardware, no activation) — machine-neutral
 # in substance, shared with the frozen relu package until its retirement
@@ -60,7 +65,7 @@ def select(cond: Node, true_node: Node, false_node: Node) -> Node:
     .. noise-footer::
 
        Max error: 4.768e-07 abs, 1.19e-07 rel over 4096 samples;
-       measured at commit ec32fa3. See docs/numerical_noise.md.
+       measured at commit 249512e. See docs/numerical_noise.md.
     """
     assert len(cond) == 1
     assert len(true_node) == len(false_node)
@@ -180,7 +185,7 @@ def in_range(lower: Node, upper: Node, n_slots: int) -> Node:
     .. noise-footer::
 
        Max error: 5.96e-08 abs, 5.96e-08 rel over 4096 samples;
-       measured at commit ec32fa3. See docs/numerical_noise.md.
+       measured at commit 249512e. See docs/numerical_noise.md.
     """
     assert len(lower) == 1
     assert len(upper) == 1
@@ -278,7 +283,7 @@ def broadcast_select(
     .. noise-footer::
 
        Max error: 4.768e-07 abs, 1.192e-07 rel over 4096 samples;
-       measured at commit ec32fa3. See docs/numerical_noise.md.
+       measured at commit 249512e. See docs/numerical_noise.md.
     """
     assert len(masks) == n_slots
     true_is_broadcast = len(true_value) == d_fill
@@ -413,7 +418,7 @@ def dynamic_extract(
     .. noise-footer::
 
        Max error: 4.768e-07 abs, 1.191e-07 rel over 4096 samples;
-       measured at commit ec32fa3. See docs/numerical_noise.md.
+       measured at commit 249512e. See docs/numerical_noise.md.
     """
     assert len(idx) == 1, "idx must be a 1D scalar node"
     assert len(table) == n_entries * d_fill, (
@@ -441,4 +446,92 @@ def dynamic_extract(
         for c in range(d_fill):
             sum_matrix[slot * d_fill + c, c] = 1.0
     return Linear(masked, sum_matrix, name="dynamic_extract_sum")
+
+def map_to_table(
+    inp: Node, key_to_value: Dict[torch.Tensor, torch.Tensor], default: torch.Tensor
+) -> Node:
+    """Map the value of the input node to a lookup table.
+
+    A bank of equals_vector-shaped hinges — one degenerate lane per
+    table entry, rescaled to 0/1, with each entry's value-delta folded
+    into out_proj::
+
+        m_i     = key_i·inp − key_i·key_i
+        match_i = speed · Swish(scale·(m_i + 1/speed))/scale
+        result  = default + Σ_i match_i · (value_i − default)
+
+    Today's ReLU construction ported hinge-for-hinge (the deltas are
+    constants, so no live multiply anywhere).  A matching entry's
+    indicator is bit-exact 1 (hinge argument ``scale/speed``, fully
+    saturated), so the result is ``value_i`` to ~1 ulp (the
+    ``×scale/÷scale`` round trip) plus leakage from the other entries —
+    and in real vocabularies that leakage is zero: a non-matching key's
+    margin sits far below the bend, deep in fp32 underflow, so a
+    no-match input returns ``default`` bit-exactly.  Sensitivity to
+    embedding noise at a match is ``speed`` per dot-product unit —
+    identical to the ReLU form (self-normalizing hinge).  Between-keys
+    inputs can partially fire several indicators, as today: the
+    contract is approximate match, not exact selection.
+
+    Args:
+        inp (Node): Node whose values will be looked up.
+        key_to_value (Dict[torch.Tensor, torch.Tensor]): Lookup table
+            mapping from keys to values.
+        default (torch.Tensor): Default tensor to return if the input
+            value doesn't exist in the table.
+
+    Returns:
+        Node: Output node with mapped values.
+
+    .. noise-footer::
+
+       Max error: 0 abs, 0 rel over 4096 samples;
+       measured at commit 249512e. See docs/numerical_noise.md.
+    """
+    d_keys = {len(x) for x in key_to_value.keys()}
+    d_values = {len(x) for x in key_to_value.values()}
+    assert len(d_keys) == 1
+    assert len(d_values) == 1
+    d_key = d_keys.pop()
+    d_value = d_values.pop()
+    assert len(inp) == d_key
+    assert len(default) == d_value
+
+    n_lanes = len(key_to_value)
+    speed = embedding_step_sharpness
+
+    gate_proj = torch.zeros(n_lanes, d_key)
+    gate_bias = torch.zeros(n_lanes)
+    output_proj = torch.zeros(n_lanes, d_value)
+
+    for i, (key, value) in enumerate(key_to_value.items()):
+        gate_proj[i, :] = scale * key
+        gate_bias[i] = scale * (1.0 / speed - (key @ key))
+        output_proj[i, :] = speed * (value - default) / scale
+
+    result = swiglu_ffn(
+        inp,
+        gate_proj,
+        gate_bias,
+        output_proj,
+        default,
+        name="map_to_table",
+    )
+
+    # Output = default + sum_i match_i * (value_i - default).  When
+    # multiple keys overlap, multiple indicators can fire at once, so
+    # bound per channel by |default[j]| + sum_i |value_i[j] - default[j]|
+    # — the hand-written claim ports unchanged (without it, interval
+    # arithmetic blows up after a few chained lookups).  Dips sit
+    # comfortably inside it (each entry's worst contribution is
+    # swish_dip/scale·|Δ_i| against a claim of |Δ_i|): no new slack.
+    diff_abs_sum = torch.zeros(d_value)
+    for value in key_to_value.values():
+        diff_abs_sum = diff_abs_sum + (value - default).abs()
+    lo = float((default - diff_abs_sum).min().item())
+    hi = float((default + diff_abs_sum).max().item())
+    return assert_matches_value_type(
+        result,
+        NodeValueType(value_range=Range(lo, hi)),
+    )
 

@@ -335,6 +335,45 @@ def _equals_vector_distribution(
     )
 
 
+def _map_to_table_distribution(
+    name: str, description: str, n_samples: int = 4096, seed: int = 0
+) -> InputDistribution:
+    """Half exact key matches (cycling three keys), half far-off vectors in
+    [-1, 1]^3 (no-match → default; dot products stay below every key's
+    self-dot, per the op contract — see _equals_vector_distribution)."""
+    gen = torch.Generator().manual_seed(seed)
+    keys = torch.tensor([[2.0, 0.0, 1.0], [0.0, 3.0, -1.0], [-1.0, -1.0, 2.0]])
+    n_match = n_samples // 2
+    matches = keys[torch.arange(n_match) % 3]
+    rand = torch.rand((n_samples - n_match, 3), generator=gen) * 2.0 - 1.0
+    data = torch.cat([matches, rand], dim=0)
+    return InputDistribution(
+        name=name,
+        description=description,
+        inputs={"x": data},
+        n_samples=n_samples,
+    )
+
+
+def _onehot_lookup_distribution(
+    name: str, description: str, n_samples: int = 4096, seed: int = 0
+) -> InputDistribution:
+    """Two-block one-hot inputs (digit 3 ⊕ carry 2), uniformly over all six
+    combinations — half hit the three-row table, half miss → default."""
+    gen = torch.Generator().manual_seed(seed)
+    d = torch.randint(0, 3, (n_samples,), generator=gen)
+    c = torch.randint(0, 2, (n_samples,), generator=gen)
+    data = torch.zeros(n_samples, 5)
+    data[torch.arange(n_samples), d] = 1.0
+    data[torch.arange(n_samples), 3 + c] = 1.0
+    return InputDistribution(
+        name=name,
+        description=description,
+        inputs={"x": data},
+        n_samples=n_samples,
+    )
+
+
 def _cond_gate_distribution(
     name: str, description: str, n_samples: int = 4096, seed: int = 0
 ) -> InputDistribution:
@@ -745,6 +784,17 @@ def _distributions() -> Dict[str, InputDistribution]:
             "in_range → broadcast_select → sum composition on clean "
             "integer inputs.",
         ),
+        "map_to_table_match_and_off": _map_to_table_distribution(
+            "map_to_table_match_and_off",
+            "Exact key matches (three 3-wide keys) and far-off vectors in "
+            "[-1, 1]^3 — matches read their value to ~1 ulp, misses return "
+            "the default bit-exactly (indicators underflow).",
+        ),
+        "onehot_lookup_two_block": _onehot_lookup_distribution(
+            "onehot_lookup_two_block",
+            "digit(3) ⊕ carry(2) one-hot pairs over all six combinations; "
+            "three are table rows, three miss → default.",
+        ),
         "select_signed_bool_two_values": _select_distribution(
             "select_signed_bool_two_values",
             "±1 conditions paired with two independent branch values in "
@@ -768,6 +818,34 @@ def _bin_index_ref(
     r = x_max - x_min
     v = (x - x_min) * n_bins / r
     return torch.clamp(torch.floor(v), 0, n_bins - 1)
+
+
+def _oh_key(d: int, c: int) -> torch.Tensor:
+    key = torch.zeros(5)
+    key[d] = 1.0
+    key[3 + c] = 1.0
+    return key
+
+
+def _map_to_table_ref(x: torch.Tensor) -> torch.Tensor:
+    keys = torch.tensor([[2.0, 0.0, 1.0], [0.0, 3.0, -1.0], [-1.0, -1.0, 2.0]])
+    values = torch.tensor([[10.0, -1.0], [20.0, -2.0], [30.0, -3.0]])
+    default = torch.tensor([5.0, 0.5])
+    out = default.unsqueeze(0).repeat(x.shape[0], 1)
+    for k, v in zip(keys, values):
+        hit = (x == k).all(dim=-1)
+        out[hit] = v
+    return out
+
+
+def _onehot_lookup_ref(x: torch.Tensor) -> torch.Tensor:
+    table = {(0, 0): 100.0, (1, 0): 200.0, (2, 1): 300.0}
+    d = x[:, :3].argmax(dim=-1)
+    c = x[:, 3:].argmax(dim=-1)
+    out = torch.full((x.shape[0], 1), -7.0)
+    for (dd, cc), v in table.items():
+        out[(d == dd) & (c == cc)] = v
+    return out
 
 
 def _target_ops() -> List[TargetOp]:
@@ -1405,6 +1483,60 @@ def _target_ops() -> List[TargetOp]:
                 "branch, lanes dropped) → free Linear sum. Losing slots "
                 "are exactly zero at clean masks, so the sum degenerates "
                 "to a copy of the selected slot."
+            ),
+        ),
+        TargetOp(
+            name="map_to_table",
+            machine="swiglu",
+            module=_SWIGLU_SELECT,
+            source_file=_SWIGLU_SELECT_FILE,
+            input_specs={"x": 3},
+            build_graph=lambda nodes: swiglu_ops.map_to_table(
+                nodes["x"],
+                {
+                    torch.tensor([2.0, 0.0, 1.0]): torch.tensor([10.0, -1.0]),
+                    torch.tensor([0.0, 3.0, -1.0]): torch.tensor([20.0, -2.0]),
+                    torch.tensor([-1.0, -1.0, 2.0]): torch.tensor([30.0, -3.0]),
+                },
+                torch.tensor([5.0, 0.5]),
+            ),
+            reference_fn=lambda inputs: _map_to_table_ref(inputs["x"]),
+            distribution_names=("map_to_table_match_and_off",),
+            notes=(
+                "Bank of equals_vector hinges rescaled to 0/1, one "
+                "degenerate lane per entry, ported hinge-for-hinge. "
+                "Matches read their value to ~1 ulp (the ×scale/÷scale "
+                "round trip); no-match indicators underflow, so misses "
+                "return the default bit-exactly. Between-keys inputs can "
+                "partially fire several indicators, as today. (The relu "
+                "map_to_table was never measured.)"
+            ),
+        ),
+        TargetOp(
+            name="onehot_lookup",
+            machine="swiglu",
+            module="torchwright.ops.swiglu.onehot_table",
+            source_file="torchwright/ops/swiglu/onehot_table.py",
+            input_specs={"x": 5},
+            build_graph=lambda nodes: swiglu_ops.onehot_lookup(
+                nodes["x"],
+                {
+                    _oh_key(0, 0): torch.tensor([100.0]),
+                    _oh_key(1, 0): torch.tensor([200.0]),
+                    _oh_key(2, 1): torch.tensor([300.0]),
+                },
+                torch.tensor([-7.0]),
+            ),
+            reference_fn=lambda inputs: _onehot_lookup_ref(inputs["x"]),
+            distribution_names=("onehot_lookup_two_block",),
+            notes=(
+                "Exact integer block counting: the -(n_blocks - 0.5) bias "
+                "parks the winner's sharpened hinge argument at +scale/2 "
+                "and everyone else's at ≤ -scale/2. Winner indicator is "
+                "exactly 0.5 in fp32; losing lanes leak hinge(-0.5) ≈ "
+                "-1e-22 — invisible. The tight [min, max] range claim is "
+                "the reason this op exists. (The relu onehot_lookup was "
+                "never measured.)"
             ),
         ),
     ]

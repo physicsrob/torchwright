@@ -30,7 +30,9 @@ from torchwright.ops.swiglu.map_select import (
     broadcast_select,
     dynamic_extract,
     in_range,
+    map_to_table,
     select,
     switch,
 )
+from torchwright.ops.swiglu.onehot_table import onehot_lookup
 from torchwright.ops.swiglu.swiglu_ffn import swiglu_ffn

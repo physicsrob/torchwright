@@ -1,6 +1,6 @@
 {
   "schema_version": 2,
-  "commit": "ec32fa3",
+  "commit": "249512e",
   "measured_at": "2026-07-03",
   "ops": [
     {
@@ -745,6 +745,31 @@
       ]
     },
     {
+      "name": "map_to_table",
+      "machine": "swiglu",
+      "module": "torchwright.ops.swiglu.map_select",
+      "notes": "Bank of equals_vector hinges rescaled to 0/1, one degenerate lane per entry, ported hinge-for-hinge. Matches read their value to ~1 ulp (the ×scale/÷scale round trip); no-match indicators underflow, so misses return the default bit-exactly. Between-keys inputs can partially fire several indicators, as today. (The relu map_to_table was never measured.)",
+      "distributions": [
+        {
+          "name": "map_to_table_match_and_off",
+          "description": "Exact key matches (three 3-wide keys) and far-off vectors in [-1, 1]^3 — matches read their value to ~1 ulp, misses return the default bit-exactly (indicators underflow).",
+          "n_samples": 4096,
+          "max_abs_error": 0.0,
+          "mean_abs_error": 0.0,
+          "p99_abs_error": 0.0,
+          "max_rel_error": 0.0,
+          "mean_rel_error": 0.0,
+          "p99_rel_error": 0.0,
+          "rel_valid_samples": 8192,
+          "worst_input": {
+            "x[0]": 2.0,
+            "x[1]": 0.0,
+            "x[2]": 1.0
+          }
+        }
+      ]
+    },
+    {
       "name": "min",
       "machine": "swiglu",
       "module": "torchwright.ops.swiglu.arithmetic_ops",
@@ -804,6 +829,33 @@
           "worst_input": {
             "a": -15.873,
             "b": -873.016
+          }
+        }
+      ]
+    },
+    {
+      "name": "onehot_lookup",
+      "machine": "swiglu",
+      "module": "torchwright.ops.swiglu.onehot_table",
+      "notes": "Exact integer block counting: the -(n_blocks - 0.5) bias parks the winner's sharpened hinge argument at +scale/2 and everyone else's at ≤ -scale/2. Winner indicator is exactly 0.5 in fp32; losing lanes leak hinge(-0.5) ≈ -1e-22 — invisible. The tight [min, max] range claim is the reason this op exists. (The relu onehot_lookup was never measured.)",
+      "distributions": [
+        {
+          "name": "onehot_lookup_two_block",
+          "description": "digit(3) ⊕ carry(2) one-hot pairs over all six combinations; three are table rows, three miss → default.",
+          "n_samples": 4096,
+          "max_abs_error": 7.62939e-06,
+          "mean_abs_error": 1.28709e-06,
+          "p99_abs_error": 7.62939e-06,
+          "max_rel_error": 7.62939e-08,
+          "mean_rel_error": 1.28709e-08,
+          "p99_rel_error": 7.62939e-08,
+          "rel_valid_samples": 4096,
+          "worst_input": {
+            "x[0]": 1.0,
+            "x[1]": 0.0,
+            "x[2]": 0.0,
+            "x[3]": 1.0,
+            "x[4]": 0.0
           }
         }
       ]
