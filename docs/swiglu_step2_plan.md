@@ -105,28 +105,56 @@ serve as fixtures); no swiglu ops exist yet.
   MODULE=scripts.…` for committed investigation scripts (D8), and
   nothing for `make measure-noise`, which is deliberately local CPU
   (`measure_op_noise.py` pins `torch.set_default_device("cpu")`).
-- **A1 — physical module.** A gated MLP component alongside
-  `linear1→ReLU→linear2`: gate matmul, up matmul, Swish, elementwise
-  mul, down matmul. Per-network kind, chosen from the graph's uniform
-  activation.
-- **A2 — weight writer.** `compute_ffn` drops its step-1
-  degenerate-ReLU assert and gains the gated path: gate rows as today,
-  up rows written per lane (degenerate lanes get up-row 0, up-bias 1).
-  `compute_linear_bypass` gets the swish bypass pair
-  (`Swish(scale·z)/scale − Swish(−scale·z)/scale = z`, exact; sharpened
-  by convention — 100× tighter sandwich slack for free, see the spec's
-  `min` entry).
-- **A3 — uniformity check.** The compile-time all-FFNs-one-activation
-  check, with a negative test. (Not a numbered invariant — it guards a
-  policy, not allocator soundness.)
-- **A4 — ONNX export + debug.** The gated emission pattern; machine
-  kind in `OnnxArtifact` metadata and the debug sidecar;
-  `OnnxDebugSession`/probes verified activation-agnostic (residual
-  capture doesn't inspect the MLP internals, but confirm).
-- **A5 — cost model.** CP-SAT / cost_summary already count lanes;
-  confirm nothing assumes 2 matrices per MLP (per-lane weights go
-  ~2d → ~3d; layer capacity formula in `compile.py` gains the up
-  matrix).
+- **A1 — physical module. DONE (2026-07-02).** `GatedMLPSubLayer`
+  (`compiler/groups/mlp_sublayer.py`) alongside the ReLU sublayer:
+  `down_proj(swish(gate_proj(x)) · up_proj(x)) + x`, HF-Llama component
+  naming, swish computed exactly as `g * sigmoid(g)` (the expression the
+  A0 probes pinned — not a fused silu). Machine kind threads
+  `HeadlessTransformer(activation=…)` → `TransformerLayer` → sublayer
+  choice; both sublayer classes carry an `activation` attribute. The
+  gated trim counts *biases* toward slot usedness (a written degenerate
+  lane's only up-side signature is its bias 1). Unit tests:
+  `tests/compile/forward/test_gated_mlp_sublayer.py`.
+- **A2 — weight writer. DONE (2026-07-02).** `compute_ffn`'s step-1
+  assert became a machine-mismatch assert (node activation must equal
+  the sublayer's; unreachable in a real compile once A3 selects the
+  machine) plus the gated path: gate rows as today, up rows per lane
+  (degenerate lanes get up-row 0, up-bias 1). Deferred biased-Linear
+  folding lands in **both** hidden biases — the up matmul reads the
+  biasless columns too. `compute_linear_bypass` gained the swish bypass
+  pair (`Swish(scale·z)/scale − Swish(−scale·z)/scale = z`), sharpened
+  by the module `scale`. The `scale = 100` constant landed early in
+  `ops/const.py` (Phase B item 1 consumes it); the writer imports it
+  sideways (a leaf constants module — no cycle), and
+  `test_swish_constants.py` now pins the doc constant to the shipped
+  one. Writer-level tests appended to `test_weight_writer.py`.
+- **A3 — uniformity check. DONE (2026-07-02).** In `forward_compile`,
+  next to the rope_d_rot global check: all FFNs must share one
+  `activation` (mixed → `ValueError`), the machine is selected from it
+  (no FFNs → relu), and relu FFNs carrying `up_proj` are rejected at
+  the boundary. (The FFN *node* still allows the relu-gated combo — the
+  McCormick bound rule is deliberately tested in that generality;
+  rejection is the compiler's job.) Negative + end-to-end tests in
+  `test_ffn_compile.py` (probe_compiled clean on pure-swish graphs).
+- **A4 — ONNX export + debug. DONE (2026-07-02).** Gated emission:
+  `l{i}_Wgate/bgate/Wup/bup/Wdown/bdown` inits; MLP as
+  MatMul→Add→Sigmoid→Mul (the pinned swish pattern) →Mul with the up
+  affine→MatMul→Add→skip; residual tensor names unchanged, so the debug
+  session and every probe work as-is (confirmed activation-agnostic).
+  Machine kind recorded as `"activation"` in `OnnxArtifact`, the token
+  meta, and the debug sidecar — deliberately **outside** the frozen
+  topology fingerprint; `OnnxDebugSession` cross-checks it explicitly
+  (a same-shape relu rebuild trips it; negative test). The HF converter
+  refuses swish artifacts loudly (the native module is relu-only).
+  Tests: `tests/debug/test_swish_onnx_debug.py`.
+- **A5 — cost model. DONE (2026-07-02).** CP-SAT and `cost_summary`
+  confirmed lane/slot-based with no per-slot param math — no change
+  needed; schedules are machine-blind (so a schedule-cache hit across a
+  machine flip of the same topology is correct, not a bug). The three
+  param-accounting spots in `compile.py` (layer capacity,
+  `_count_layer_params`, trim savings) now use the machine's matrix
+  count (per-slot `2d+2` → `3d+3`; capacity gains the up matrix and up
+  bias).
 
 ## Phase B — `ops/swiglu`, incrementally on main
 
