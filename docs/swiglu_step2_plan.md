@@ -76,7 +76,25 @@ serve as fixtures); no swiglu ops exist yet.
   `σ(−scale) = 0.0` (CPU-pinned in `test_swish_constants.py`). If a
   deployed kernel misses by an ulp, budgets survive but the spec's
   "bit-exact" claims and any exact-equality tests must be softened
-  before ops land.
+  before ops land. Form and infrastructure:
+  - *torch-CUDA*: a permanent GPU test file (not a one-shot
+    `modal-run` script) — `make test` already runs on Modal A100s, and
+    kernel behavior can shift under torch upgrades, so the probe should
+    re-verify on every suite run. `test_swish_constants.py` stays
+    CPU-only by design; this is a separate small test.
+  - *onnxruntime-CUDA*: **cannot run on the torchwright Modal image
+    today** — `modal_image.py`'s `test-onnx` group installs CPU
+    onnxruntime only. Run this half on torchwright_doom's runtime
+    environment (its `OnnxTokenRuntime` pins the ORT version + CUDA
+    execution provider that actually deploys — the pair the claim is
+    about), or add `onnxruntime-gpu` to the image (+ `make modal-lock`)
+    if a torchwright-local test is preferred.
+  All other Modal use in this plan is the existing plumbing: `make
+  test` for suites (full-suite runs are also what surface
+  `c_tol`-boundary FP flakes — `-k` filters never do), `make modal-run
+  MODULE=scripts.…` for committed investigation scripts (D8), and
+  nothing for `make measure-noise`, which is deliberately local CPU
+  (`measure_op_noise.py` pins `torch.set_default_device("cpu")`).
 - **A1 — physical module.** A gated MLP component alongside
   `linear1→ReLU→linear2`: gate matmul, up matmul, Swish, elementwise
   mul, down matmul. Per-network kind, chosen from the graph's uniform
