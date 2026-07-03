@@ -59,9 +59,13 @@ def test_number_to_digit_scalars_roundtrip():
         [7.0, 4.0, 9.0, 0.0],
         [9.0, 0.0, 9.0, 0.0],
     ]
+    # abs=1e-2: on GPU, the remainder subtraction amplifies staircase
+    # matmul noise by the place value (100·~2e-5 ≈ 2e-3 — the
+    # _lookup_numeric_slack GPU class); the downstream consumer
+    # (scalar_to_embedding) tolerates ±0.4.
     for place, exp in enumerate(expected):
         for row, e in enumerate(exp):
-            assert vals[place][row, 0].item() == pytest.approx(e, abs=1e-3), (
+            assert vals[place][row, 0].item() == pytest.approx(e, abs=1e-2), (
                 place,
                 row,
             )

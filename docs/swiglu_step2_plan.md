@@ -158,6 +158,47 @@ serve as fixtures); no swiglu ops exist yet.
 
 ## Phase B — `ops/swiglu`, incrementally on main
 
+**COMPLETE (2026-07-03).** All eleven items landed on main, one commit
+per item, full suite green on Modal after each batch. What a fresh
+session should know beyond the per-op entries:
+
+- **The chunk-cap question resolved as declared-minimum.**
+  `min_d_hidden = 1024` in `ops/const.py`; piecewise_linear's `d_max`,
+  floor_int's per-chunk boundary count, and table_lookup_2d's axis
+  chunks all derive from it. Flagship geometry confirmed:
+  `d_hidden = 16384` in both e1m1 configs (16x headroom).
+- **The grid-spacing audit (34/K) caught two real call sites**:
+  reciprocal's geometric grid (stacked fillets ~2e-2 at input_scale=1)
+  and global_position_from_bos's inversion table (~10 positions of
+  error at position 0). Both derive `input_scale` from the grid's
+  smallest gap now; measured numbers land at relu parity (reciprocal
+  byte-identical). Dense smooth-target grids do NOT self-absorb once
+  fillets overlap the grid pitch.
+- **The noise pipeline gained the machine axis** (`(machine, name)`
+  keying, schema_version 2); relu numbers frozen with zero drift. The
+  drift test's `_ATOL` is 5e-4 — the swiglu ulp floor is
+  kernel-dependent (FMA vs per-product; 0.0 locally vs 5.8e-5 on
+  Modal's EPYC for the same seed).
+- **`_MASK_TOL = 4·swish_dip/scale` (swiglu/map_select.py)** encodes
+  the in_range → broadcast_select interlock; broadcast_select carries
+  no ±1 mask assert (junk-mask contract is unit-test-pinned).
+- **Semantic-override widenings re-derived in actual-value terms**:
+  `_compare_semantic_bound` gained `slack`, `_select_semantic_bound` /
+  `_broadcast_select_semantic_bound` gained `rel_tolerance` (per-side
+  δ·|hull side|), `_cond_gate_semantic_bound` gained `rel_tol`
+  ((1+δ) envelope scaling). relu callers pass none of them —
+  byte-identical behavior.
+- **Machine-neutral seams**: swiglu modules import purely-linear ops
+  (sum_nodes, concat, add_const, …), attention hardware, and pure-math
+  helpers from the frozen relu package, each site commented; these
+  relocate at relu retirement.
+- Swiglu op tests live in `tests/ops/swiglu/` (the frozen relu
+  baseline files in `tests/ops/` are untouched). `swish_dip` and
+  `min_d_hidden` live in `ops/const.py`, pinned by
+  `test_swish_constants.py`.
+
+The original sequencing:
+
 `git mv` today's ops to `ops/relu/` first (plus import shims for
 existing callers), then land swiglu ops in dependency order, roughly:
 
@@ -253,8 +294,8 @@ from `δ·M` to `δ·|actual value|` semantics — mostly relaxations).
 ## Parked / open
 
 - `ops/relu` retirement timing (default: first real refactor cost).
-- Chunk caps vs pool size: `_LOOKUP_D_MAX = 1024` and floor_int's
-  512-boundary chunks require `d_hidden ≥ 1024` (an FFN must fit one
-  sublayer's pool). Confirm flagship geometry before porting the
-  lookups, or derive the caps from a declared minimum `d_hidden`.
+- ~~Chunk caps vs pool size~~ — resolved 2026-07-03 as the
+  declared-minimum option: `min_d_hidden = 1024` in `ops/const.py`,
+  swiglu chunk caps derive from it, flagship geometry confirmed at
+  `d_hidden = 16384`.
 - fp16 export: foreclosed by scale=100 (recorded, not planned around).
