@@ -70,25 +70,35 @@ settled decisions, the execution order, and the parked questions.
 Tested with directly-authored FFN fixtures (the spec's constructions
 serve as fixtures); no swiglu ops exist yet.
 
-- **A0 — runtime saturation probe.** Gates every bit-exactness claim in
-  the spec: verify on torch-CUDA and onnxruntime-CUDA that fp32
-  `σ(z) = 1.0` exactly for `z ≥ 17`, `Swish(0) = 0`, and
-  `σ(−scale) = 0.0` (CPU-pinned in `test_swish_constants.py`). If a
-  deployed kernel misses by an ulp, budgets survive but the spec's
-  "bit-exact" claims and any exact-equality tests must be softened
-  before ops land. Form and infrastructure:
-  - *torch-CUDA*: a permanent GPU test file (not a one-shot
-    `modal-run` script) — `make test` already runs on Modal A100s, and
-    kernel behavior can shift under torch upgrades, so the probe should
-    re-verify on every suite run. `test_swish_constants.py` stays
-    CPU-only by design; this is a separate small test.
-  - *onnxruntime-CUDA*: **cannot run on the torchwright Modal image
-    today** — `modal_image.py`'s `test-onnx` group installs CPU
-    onnxruntime only. Run this half on torchwright_doom's runtime
-    environment (its `OnnxTokenRuntime` pins the ORT version + CUDA
-    execution provider that actually deploys — the pair the claim is
-    about), or add `onnxruntime-gpu` to the image (+ `make modal-lock`)
-    if a torchwright-local test is preferred.
+- **A0 — runtime saturation probe. DONE (2026-07-02).** Gated every
+  bit-exactness claim in the spec: verify on torch-CUDA and
+  onnxruntime-CUDA that fp32 `σ(z) = 1.0` exactly for `z ≥ 17`,
+  `Swish(0) = 0`, and `σ(−scale) = 0.0` (CPU-pinned in
+  `test_swish_constants.py`). **Verdict: the spec's claims hold
+  unchanged on both deployed kernels.** Three permanent probe tests
+  landed, all green on Modal A100s:
+  - *torch-CUDA* — `tests/docs/test_swish_saturation_cuda.py` (skips
+    without CUDA; re-verifies on every `make test`). Saturation at 17,
+    compare contract points, abs integer grid, dead-branch zero: all
+    bit-exact, matching torch-CPU.
+  - *onnxruntime-CUDA 1.26.0* — torchwright_doom
+    `tests/inference/test_ort_cuda_saturation.py`, run on the deployed
+    pair its Modal image pins. Placed doom-side as planned; the
+    alternative (onnxruntime-gpu on the torchwright image) turned out
+    to be a swap, not an addition — the CPU and GPU ORT builds collide
+    on one import path (see the `test-onnx` comment in
+    `pyproject.toml`). All claims hold, matching torch.
+  - *CPU onnxruntime — the one divergent kernel.* The `OnnxTokenModule`
+    parity oracle reaches exact 1.0 only from **z ≥ 18** (up to ~1.8e-7
+    below 1.0 on [17, 18)) and is exactly 0.0 for every z ≤ −18 (torch
+    keeps denormals down to ~−103). Every claim the spec leans on still
+    holds there (`σ(−100) = 0`, `Swish(0) = 0`, `Swish(100) = 100`, the
+    ±50 onehot indicator — whose leak is even exactly zero); what moves
+    is the fillet radius on that kernel alone, 17/scale → 18/scale, so
+    exact-equality tests against the CPU-ORT oracle need hinge
+    arguments ≥ 18/scale past the bend (and the piecewise grid-spacing
+    audit constant reads 36/K there, not 34/K). Pinned in
+    `tests/docs/test_ort_cpu_saturation.py`; spec preamble updated.
   All other Modal use in this plan is the existing plumbing: `make
   test` for suites (full-suite runs are also what surface
   `c_tol`-boundary FP flakes — `-k` filters never do), `make modal-run

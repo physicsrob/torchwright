@@ -9,7 +9,16 @@ out of every value path; and once the sigmoid's input exceeds ~17, fp32
 computes σ as exactly 1.0 (`e^{−17}` is below fp32's resolution next to 1),
 so a hinge whose input sits ≥ `17/scale` past its bend is evaluated with
 zero error — at scale=100 that's nearly the whole input range, and the fp
-cancellation error of hinge pairs is scale-neutral besides. An op whose own
+cancellation error of hinge pairs is scale-neutral besides. (Measured
+per-kernel, plan A0: torch-CPU, torch-CUDA, and onnxruntime-CUDA — the
+deployed inference pair — all saturate by 17. CPU onnxruntime, the
+parity-test oracle, reaches exact 1.0 only from **18**, sits up to
+~1.8e-7 below 1.0 on [17, 18), and is exactly 0.0 for every input
+≤ −18; so a claim of *exactness on every kernel* needs its hinge
+argument ≥ `18/scale` past the bend, while every error *budget* is
+unaffected — the shortfall is five orders below the 0.2785/scale
+sandwich. Pinned in `tests/docs/test_ort_cpu_saturation.py` and the two
+CUDA probe files.) An op whose own
 sharpness multiplies a *noisy value* without the matching `/scale` must
 keep its own, separately budgeted constant — but no current op does: the
 table lookups port as self-normalizing hinges too (see `map_to_table`,

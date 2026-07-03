@@ -10,9 +10,11 @@ corresponding doc claim needs revisiting — the doc cites this file.
 All tests are CPU-only: exact-math checks in float64, plus explicit
 float32 checks for the saturation-dependent claims.  The doc's
 bit-exactness claims additionally assume the *deployed* kernels
-(torch-CUDA, onnxruntime-CUDA) saturate identically — that one-time
-probe is a migration-checklist item in the doc, deliberately not covered
-here.
+(torch-CUDA, onnxruntime-CUDA) saturate identically — probed
+permanently in ``test_swish_saturation_cuda.py`` (torch-CUDA),
+torchwright_doom's ``tests/inference/test_ort_cuda_saturation.py``
+(the deployed ORT pair), and ``test_ort_cpu_saturation.py`` (the CPU
+onnxruntime parity oracle, the one kernel with a different profile).
 """
 
 import torch
