@@ -1,16 +1,25 @@
 """Scalar↔embedding conversion on the swish machine.
 
-Only ``scalar_to_embedding`` lands here for now — the rest of the digit
-pipeline (``digit_to_scaled_scalar``, ``digits_to_number``,
-``number_to_digit_scalars``) are compositions that migrate with their
-ingredients (docs/swiglu_step2_plan.md, Phase B item 11).
+The digit pipeline: ``digits_to_number`` → scalar arithmetic →
+``number_to_digit_scalars`` → ``scalar_to_embedding``.  The conversions
+are compositions of swiglu ingredients (map_to_table banks and the
+thermometer staircase); the pipeline structure is unchanged from relu.
 """
+
+from typing import List
 
 import torch
 
 from torchwright.graph import Node
 from torchwright.graph.embedding import Embedding
+from torchwright.graph.asserts import assert_matches_value_type
+from torchwright.graph.value_type import NodeValueType, Range
 from torchwright.ops.const import scale, step_sharpness
+
+# Purely linear ops — machine-neutral, shared with the frozen relu package.
+from torchwright.ops.relu.arithmetic_ops import add_scaled_nodes, sum_nodes
+from torchwright.ops.swiglu.arithmetic_ops import thermometer_floor_div
+from torchwright.ops.swiglu.map_select import map_to_table
 from torchwright.ops.swiglu.swiglu_ffn import swiglu_ffn
 
 
@@ -82,3 +91,62 @@ def scalar_to_embedding(inp: Node, embedding: Embedding) -> Node:
         output_bias,
         name="scalar_to_embedding",
     )
+
+def digit_to_scaled_scalar(
+    embedding: Embedding, digit_node: Node, place_value: float
+) -> Node:
+    """Convert a digit embedding to a scalar multiplied by place_value.
+
+    Example: embed("5") with place_value=100 → 500.0
+
+    A 10-entry :func:`map_to_table` lookup — inherits that entry.
+    """
+    table = {}
+    for i in range(10):
+        table[embedding.get_embedding(str(i))] = torch.tensor([float(i) * place_value])
+    return map_to_table(inp=digit_node, key_to_value=table, default=torch.tensor([0.0]))
+
+
+def digits_to_number(embedding: Embedding, digit_nodes: List[Node]) -> Node:
+    """Convert digit embeddings (MSB first) to a single scalar.
+
+    Example: [embed("1"), embed("2"), embed("3")]
+           → 1*100 + 2*10 + 3*1 = 123.0
+    """
+    num_digits = len(digit_nodes)
+    scaled = []
+    for i, digit in enumerate(digit_nodes):
+        place_value = 10.0 ** (num_digits - 1 - i)
+        scaled.append(digit_to_scaled_scalar(embedding, digit, place_value))
+    return sum_nodes(scaled)
+
+
+def number_to_digit_scalars(inp: Node, num_digits: int, max_value: int) -> List[Node]:
+    """Extract individual digit scalars (0.0-9.0) from a scalar number, MSB first.
+
+    Greedy extraction via :func:`thermometer_floor_div`: peel off the most
+    significant digit, subtract it, repeat on the remainder — structure
+    unchanged from relu.
+    """
+    digits = []
+    remainder = inp
+    for i in range(num_digits):
+        place = 10 ** (num_digits - 1 - i)
+        if place == 1:
+            digits.append(
+                assert_matches_value_type(
+                    remainder,
+                    NodeValueType(value_range=Range(0.0, 9.0)),
+                )
+            )
+        else:
+            digit = thermometer_floor_div(remainder, place, max_value)
+            digits.append(digit)
+            remainder = add_scaled_nodes(1.0, remainder, -float(place), digit)
+            remainder = assert_matches_value_type(
+                remainder,
+                NodeValueType(value_range=Range(0.0, float(place - 1))),
+            )
+            max_value = place - 1
+    return digits
+
