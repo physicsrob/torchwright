@@ -13,7 +13,14 @@ weight writer imports it too).
 """
 
 from torchwright.ops.swiglu.arithmetic_ops import (
+    compare,
     multiply,
     square,
+)
+from torchwright.ops.swiglu.logic_ops import (
+    bool_all_true,
+    bool_any_true,
+    bool_not,
+    equals_vector,
 )
 from torchwright.ops.swiglu.swiglu_ffn import swiglu_ffn

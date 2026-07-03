@@ -668,6 +668,8 @@ def _target_ops() -> List[TargetOp]:
     _ARITH_FILE = "torchwright/ops/relu/arithmetic_ops.py"
     _SWIGLU_ARITH = "torchwright.ops.swiglu.arithmetic_ops"
     _SWIGLU_ARITH_FILE = "torchwright/ops/swiglu/arithmetic_ops.py"
+    _SWIGLU_LOGIC = "torchwright.ops.swiglu.logic_ops"
+    _SWIGLU_LOGIC_FILE = "torchwright/ops/swiglu/logic_ops.py"
 
     return [
         TargetOp(
@@ -1030,6 +1032,118 @@ def _target_ops() -> List[TargetOp]:
                 "≥ 0. Exact in real math for all x — no [0, max_value] "
                 "contract, no grid, and none of the piecewise version's "
                 "near-zero relative-error blowup."
+            ),
+        ),
+        TargetOp(
+            name="compare",
+            machine="swiglu",
+            module=_SWIGLU_ARITH,
+            source_file=_SWIGLU_ARITH_FILE,
+            input_specs={"x": 1},
+            build_graph=lambda nodes: swiglu_ops.compare(
+                nodes["x"], thresh=0.0, true_level=1.0, false_level=-1.0
+            ),
+            reference_fn=lambda inputs: torch.where(
+                inputs["x"] > 0.0,
+                torch.ones_like(inputs["x"]),
+                -torch.ones_like(inputs["x"]),
+            ),
+            distribution_names=("compare_uniform_pm80", "compare_near_thresh_0"),
+            notes=(
+                "Sharpened-hinge ramp (`hinge(z) − hinge(z−1)`, "
+                "`hinge(z) = Swish(scale·z)/scale`). Same ramp-zone contract "
+                "as the ReLU form (in-ramp inputs interpolate; the "
+                "near-thresh distribution deliberately stresses it). What's "
+                "new vs relu: fillet dips within ~17/(scale·sharpness) of "
+                "the two bends can overshoot either level by up to "
+                "swish_dip/scale·|T−F| (0.0056 total span at scale=100); "
+                "true-side far-field outputs carry fp32 product rounding at "
+                "the lane-contribution magnitude — the same class as relu's "
+                "far-field noise; the false side is exactly out_bias."
+            ),
+        ),
+        TargetOp(
+            name="bool_not",
+            machine="swiglu",
+            module=_SWIGLU_LOGIC,
+            source_file=_SWIGLU_LOGIC_FILE,
+            input_specs={"x": 1},
+            build_graph=lambda nodes: swiglu_ops.bool_not(nodes["x"]),
+            reference_fn=lambda inputs: -inputs["x"],
+            distribution_names=("bool_single_signed",),
+            notes=(
+                "Single swiglu `compare` with inverted levels — inherits "
+                "compare's entry. On ±1 inputs the false side (input +1) is "
+                "exact and the true side is ulp-class."
+            ),
+        ),
+        TargetOp(
+            name="bool_any_true",
+            machine="swiglu",
+            module=_SWIGLU_LOGIC,
+            source_file=_SWIGLU_LOGIC_FILE,
+            input_specs={"a": 1, "b": 1, "c": 1},
+            build_graph=lambda nodes: swiglu_ops.bool_any_true(
+                [nodes["a"], nodes["b"], nodes["c"]]
+            ),
+            reference_fn=lambda inputs: torch.where(
+                (inputs["a"] > 0) | (inputs["b"] > 0) | (inputs["c"] > 0),
+                torch.ones_like(inputs["a"]),
+                -torch.ones_like(inputs["a"]),
+            ),
+            distribution_names=("bool_triple_signed",),
+            notes=(
+                "Two stacked swiglu `compare` layers. On clean ±1 inputs "
+                "the intermediate sum lands well outside every ramp zone "
+                "and fillet; the composition is exact to the stacked "
+                "far-field ulp class (~1e-6)."
+            ),
+        ),
+        TargetOp(
+            name="bool_all_true",
+            machine="swiglu",
+            module=_SWIGLU_LOGIC,
+            source_file=_SWIGLU_LOGIC_FILE,
+            input_specs={"a": 1, "b": 1, "c": 1},
+            build_graph=lambda nodes: swiglu_ops.bool_all_true(
+                [nodes["a"], nodes["b"], nodes["c"]]
+            ),
+            reference_fn=lambda inputs: torch.where(
+                (inputs["a"] > 0) & (inputs["b"] > 0) & (inputs["c"] > 0),
+                torch.ones_like(inputs["a"]),
+                -torch.ones_like(inputs["a"]),
+            ),
+            distribution_names=("bool_triple_signed",),
+            notes=(
+                "Single swiglu `compare` at threshold `N-1` over the sum of "
+                "N ±1 inputs — sum is N only when all are +1, otherwise "
+                "≤ N-2. Exact to the far-field ulp class on ±1 inputs."
+            ),
+        ),
+        TargetOp(
+            name="equals_vector",
+            machine="swiglu",
+            module=_SWIGLU_LOGIC,
+            source_file=_SWIGLU_LOGIC_FILE,
+            input_specs={"x": 3},
+            build_graph=lambda nodes: swiglu_ops.equals_vector(
+                nodes["x"], torch.tensor([1.0, 2.0, 3.0])
+            ),
+            reference_fn=lambda inputs: torch.where(
+                (inputs["x"] == torch.tensor([1.0, 2.0, 3.0])).all(
+                    dim=-1, keepdim=True
+                ),
+                torch.ones_like(inputs["x"][:, :1]),
+                -torch.ones_like(inputs["x"][:, :1]),
+            ),
+            distribution_names=("equals_vector_match_and_off",),
+            notes=(
+                "One sharpened hinge on the dot-product margin. Matches are "
+                "bit-exact +1; non-matches within ~17/scale past the "
+                "1/speed margin land in the hinge dip and read as low as "
+                "-1 - 2·swish_dip·speed/scale (-1.0056 at scale=100) — the "
+                "value-range assert carries that low-side slack. Inside the "
+                "margin ball the output interpolates, as today."
             ),
         ),
     ]

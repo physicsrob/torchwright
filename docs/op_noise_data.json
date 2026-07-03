@@ -1,6 +1,6 @@
 {
   "schema_version": 2,
-  "commit": "7a0636d",
+  "commit": "95cf02b",
   "measured_at": "2026-07-03",
   "ops": [
     {
@@ -453,6 +453,142 @@
           "rel_valid_samples": 3699,
           "worst_input": {
             "x": 64.0
+          }
+        }
+      ]
+    },
+    {
+      "name": "bool_all_true",
+      "machine": "swiglu",
+      "module": "torchwright.ops.swiglu.logic_ops",
+      "notes": "Single swiglu `compare` at threshold `N-1` over the sum of N ±1 inputs — sum is N only when all are +1, otherwise ≤ N-2. Exact to the far-field ulp class on ±1 inputs.",
+      "distributions": [
+        {
+          "name": "bool_triple_signed",
+          "description": "Three independent ±1 boolean streams — exercises all 8 truth-table rows of `bool_any_true` and `bool_all_true`.",
+          "n_samples": 4096,
+          "max_abs_error": 0.0,
+          "mean_abs_error": 0.0,
+          "p99_abs_error": 0.0,
+          "max_rel_error": 0.0,
+          "mean_rel_error": 0.0,
+          "p99_rel_error": 0.0,
+          "rel_valid_samples": 4096,
+          "worst_input": {
+            "a": -1.0,
+            "b": 1.0,
+            "c": 1.0
+          }
+        }
+      ]
+    },
+    {
+      "name": "bool_any_true",
+      "machine": "swiglu",
+      "module": "torchwright.ops.swiglu.logic_ops",
+      "notes": "Two stacked swiglu `compare` layers. On clean ±1 inputs the intermediate sum lands well outside every ramp zone and fillet; the composition is exact to the stacked far-field ulp class (~1e-6).",
+      "distributions": [
+        {
+          "name": "bool_triple_signed",
+          "description": "Three independent ±1 boolean streams — exercises all 8 truth-table rows of `bool_any_true` and `bool_all_true`.",
+          "n_samples": 4096,
+          "max_abs_error": 0.0,
+          "mean_abs_error": 0.0,
+          "p99_abs_error": 0.0,
+          "max_rel_error": 0.0,
+          "mean_rel_error": 0.0,
+          "p99_rel_error": 0.0,
+          "rel_valid_samples": 4096,
+          "worst_input": {
+            "a": -1.0,
+            "b": 1.0,
+            "c": 1.0
+          }
+        }
+      ]
+    },
+    {
+      "name": "bool_not",
+      "machine": "swiglu",
+      "module": "torchwright.ops.swiglu.logic_ops",
+      "notes": "Single swiglu `compare` with inverted levels — inherits compare's entry. On ±1 inputs the false side (input +1) is exact and the true side is ulp-class.",
+      "distributions": [
+        {
+          "name": "bool_single_signed",
+          "description": "Random ±1 inputs (discrete, no ramp-zone samples) — `bool_not` is only defined on clean boolean inputs.",
+          "n_samples": 4096,
+          "max_abs_error": 0.0,
+          "mean_abs_error": 0.0,
+          "p99_abs_error": 0.0,
+          "max_rel_error": 0.0,
+          "mean_rel_error": 0.0,
+          "p99_rel_error": 0.0,
+          "rel_valid_samples": 4096,
+          "worst_input": {
+            "x": -1.0
+          }
+        }
+      ]
+    },
+    {
+      "name": "compare",
+      "machine": "swiglu",
+      "module": "torchwright.ops.swiglu.arithmetic_ops",
+      "notes": "Sharpened-hinge ramp (`hinge(z) − hinge(z−1)`, `hinge(z) = Swish(scale·z)/scale`). Same ramp-zone contract as the ReLU form (in-ramp inputs interpolate; the near-thresh distribution deliberately stresses it). What's new vs relu: fillet dips within ~17/(scale·sharpness) of the two bends can overshoot either level by up to swish_dip/scale·|T−F| (0.0056 total span at scale=100); true-side far-field outputs carry fp32 product rounding at the lane-contribution magnitude — the same class as relu's far-field noise; the false side is exactly out_bias.",
+      "distributions": [
+        {
+          "name": "compare_near_thresh_0",
+          "description": "Samples within ±0.3 of the threshold at 0.0 — stresses the 2-neuron ramp zone (width 1/step_sharpness).",
+          "n_samples": 4096,
+          "max_abs_error": 1.99868,
+          "mean_abs_error": 0.16802,
+          "p99_abs_error": 1.90179,
+          "max_rel_error": 1.99868,
+          "mean_rel_error": 0.16802,
+          "p99_rel_error": 1.90179,
+          "rel_valid_samples": 4096,
+          "worst_input": {
+            "x": 0.000123948
+          }
+        },
+        {
+          "name": "compare_uniform_pm80",
+          "description": "Uniform samples on [-80, 80] — measures compare's ramp error well away from the threshold (expected ≈ 0).",
+          "n_samples": 4096,
+          "max_abs_error": 1.33899,
+          "mean_abs_error": 0.000479571,
+          "p99_abs_error": 0.0,
+          "max_rel_error": 1.33899,
+          "mean_rel_error": 0.000479571,
+          "p99_rel_error": 0.0,
+          "rel_valid_samples": 4096,
+          "worst_input": {
+            "x": 0.0330505
+          }
+        }
+      ]
+    },
+    {
+      "name": "equals_vector",
+      "machine": "swiglu",
+      "module": "torchwright.ops.swiglu.logic_ops",
+      "notes": "One sharpened hinge on the dot-product margin. Matches are bit-exact +1; non-matches within ~17/scale past the 1/speed margin land in the hinge dip and read as low as -1 - 2·swish_dip·speed/scale (-1.0056 at scale=100) — the value-range assert carries that low-side slack. Inside the margin ball the output interpolates, as today.",
+      "distributions": [
+        {
+          "name": "equals_vector_match_and_off",
+          "description": "Half exact-match against target vector [1, 2, 3], half random vectors in [-3, 3]³ — measures the ReLU-based equality test's margin of separation between matches and non-matches.",
+          "n_samples": 4096,
+          "max_abs_error": 0.0,
+          "mean_abs_error": 0.0,
+          "p99_abs_error": 0.0,
+          "max_rel_error": 0.0,
+          "mean_rel_error": 0.0,
+          "p99_rel_error": 0.0,
+          "rel_valid_samples": 4096,
+          "worst_input": {
+            "x[0]": 1.0,
+            "x[1]": 2.0,
+            "x[2]": 3.0
           }
         }
       ]

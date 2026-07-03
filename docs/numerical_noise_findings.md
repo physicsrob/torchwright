@@ -100,6 +100,37 @@ which fp32 does at |gate| ≈ 89+ (e^{|a|} overflow), *not* at the σ=1
 saturation threshold 17 — between those, the dead lane leaks a
 representable `~e^{-|a|}·|a·b|`, still inside the 2-ulp relative class.
 
+### swiglu compare/bool/equals_vector: relu-equal numbers; the dip and the fold are the two real differences
+
+The swiglu `compare` measures within a hair of the relu entry on both
+distributions — identical max on `compare_uniform_pm80` (1.33899, the
+same worst in-ramp sample interpolating against a discrete-step
+reference; a ramp-zone artefact, see the rel-error section below) and
+1.99868 vs 1.99752 on `compare_near_thresh_0` (the extra ~1e-3 is the
+fillet dip). The bool compositions and `equals_vector` measure exactly
+0 on their clean-input distributions, like relu. Two behavioral notes
+the aggregate numbers don't show, pinned in
+`tests/ops/swiglu/test_logic_ops.py`:
+
+- **Dip overshoot is structural, not noise**: inputs inside a fillet
+  (within `~17/(scale·sharpness)` of a bend) legitimately read up to
+  `swish_dip/scale·|T−F|` beyond either level; equals_vector's
+  low side reaches `-1 - 2·swish_dip·speed/scale` (-1.0056). The ops'
+  value-range asserts and compare's semantic bound carry exactly these
+  slacks — downstream ±1-cond budgets must too (0.005 `c_tol` still
+  clears the 0.0028 compare dip).
+- **The folded `/scale` keeps, not changes, the far-field fp class**:
+  true-side outputs carry fp32 product rounding at the
+  lane-contribution magnitude `s·|x−thresh|·|T−F|` (kernel-dependent,
+  FMA vs per-product; measured up to ~2e-6 on stacked bools in
+  single-row eval, exact 0 in the batched measurement config). The relu
+  machine has the same class at the same magnitudes (its lanes are
+  100× smaller but its out_proj 100× bigger); it's the long-known
+  "far-field compare noise" the 0.005 budgets were sized for. Only
+  contract points, the false side, and thresh itself are robustly
+  bit-exact (all lane contributions exactly ±0.0, or the
+  `scale·fl((T−F)/scale)` product provably rounding clean).
+
 ### Softmax inside attention is not measured here
 
 The plan originally called for a per-op measurement of the "piecewise

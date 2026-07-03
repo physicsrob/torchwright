@@ -37,6 +37,18 @@ def test_scale_is_the_module_constant():
     assert scale == SCALE
 
 
+def test_swish_dip_is_the_module_constant():
+    """The dip magnitude the swiglu ops size their assert slacks and
+    semantic-bound widenings with (ops/const.py) IS the doc's 0.2785 —
+    and both match the actual minimum of z·sigmoid(z)."""
+    from torchwright.ops.const import swish_dip
+
+    assert swish_dip == SWISH_PEAK
+    z = torch.linspace(-3.0, 0.0, 3_000_001, dtype=torch.float64)
+    actual = -(z * torch.sigmoid(z)).min().item()
+    assert abs(actual - swish_dip) < 1e-6
+
+
 def _swish(z: torch.Tensor) -> torch.Tensor:
     return z * torch.sigmoid(z)
 

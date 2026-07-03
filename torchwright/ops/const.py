@@ -21,3 +21,12 @@ embedding_step_sharpness = 1.0  # For embedding-space ops (map_to_table, equals_
 # fp32 everywhere today).  The numeric claims tied to this value are pinned
 # by tests/docs/test_swish_constants.py.
 scale = 100.0
+
+# Swish's global-minimum magnitude: |min_z z·sigmoid(z)| = 0.2784645... at
+# z = -1.2784645...  This is the worst gap between the sharpened hinge
+# ``Swish(scale·z)/scale`` and ``ReLU(z)`` — ``swish_dip/scale`` in value
+# units — so it sizes every dip slack the swish op library adds to its
+# value-range asserts and semantic bounds (compare's bend overshoot,
+# equals_vector's low-side dip, in_range's per-slot slack).  Pinned against
+# the doc's 0.2785 by tests/docs/test_swish_constants.py.
+swish_dip = 0.2784645

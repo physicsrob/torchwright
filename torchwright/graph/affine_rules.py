@@ -754,8 +754,21 @@ def _compare_semantic_bound(
     thresh: float,
     true_level: float,
     false_level: float,
+    slack: float = 0.0,
 ) -> AffineBound:
-    """Constant or degenerate bound for compare, depending on inp vs thresh."""
+    """Constant or degenerate bound for compare, depending on inp vs thresh.
+
+    The soundness argument is the caller contract, not the construction:
+    inputs never land inside the ramp, so an input interval clearing
+    ``thresh`` collapses the bound to the corresponding level.
+
+    ``slack`` widens every case symmetrically.  The ReLU compare passes 0
+    (its saturated levels are exact); the swish compare passes its bend
+    overshoot ``swish_dip/scale · |true_level - false_level|`` — inputs
+    within the fillet just past a contract point legitimately read up to
+    that far beyond the level, so the constant collapse is an interval
+    there, not a constant.
+    """
     import torch
 
     intervals = inp_ab.to_interval()
@@ -766,7 +779,13 @@ def _compare_semantic_bound(
     hi = max(true_level, false_level)
 
     if l > thresh:
-        return AffineBound.constant(torch.tensor([true_level], dtype=torch.float64))
+        if slack == 0.0:
+            return AffineBound.constant(torch.tensor([true_level], dtype=torch.float64))
+        return AffineBound.degenerate(1, lo=true_level - slack, hi=true_level + slack)
     if h <= thresh:
-        return AffineBound.constant(torch.tensor([false_level], dtype=torch.float64))
-    return AffineBound.degenerate(1, lo=lo, hi=hi)
+        if slack == 0.0:
+            return AffineBound.constant(
+                torch.tensor([false_level], dtype=torch.float64)
+            )
+        return AffineBound.degenerate(1, lo=false_level - slack, hi=false_level + slack)
+    return AffineBound.degenerate(1, lo=lo - slack, hi=hi + slack)
