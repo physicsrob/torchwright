@@ -14,8 +14,10 @@ weight writer imports it too).
 
 from torchwright.ops.swiglu.arithmetic_ops import (
     abs,
+    ceil_int,
     clamp,
     compare,
+    floor_int,
     min,
     mod_const,
     multiply,
@@ -41,4 +43,5 @@ from torchwright.ops.swiglu.map_select import (
     switch,
 )
 from torchwright.ops.swiglu.onehot_table import onehot_lookup
+from torchwright.ops.swiglu.scalar_encoding import scalar_to_embedding
 from torchwright.ops.swiglu.swiglu_ffn import swiglu_ffn

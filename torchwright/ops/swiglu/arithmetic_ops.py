@@ -6,7 +6,8 @@ Each op assembles gated-FFN lanes per its entry in
 """
 
 import builtins
-from typing import List
+import math
+from typing import List, Optional
 
 import torch
 
@@ -18,7 +19,9 @@ from torchwright.ops.const import min_d_hidden, scale, step_sharpness, swish_dip
 # Purely linear ops (no activation) — machine-neutral in substance, shared
 # with the frozen relu package until its retirement relocates them.
 from torchwright.ops.relu.arithmetic_ops import (
+    add_const,
     multiply_const,
+    negate,
     subtract,
     sum_nodes,
 )
@@ -70,7 +73,7 @@ def compare(
     .. noise-footer::
 
        Max error: 1.999 abs, 1.999 rel over 8192 samples;
-       measured at commit 3d08c2e. See docs/numerical_noise.md.
+       measured at commit 2843d96. See docs/numerical_noise.md.
     """
     assert len(inp) == 1, "Input must be a 1D scalar node"
 
@@ -137,7 +140,7 @@ def multiply(inp1: Node, inp2: Node) -> Node:
     .. noise-footer::
 
        Max error: 0.0009766 abs, 2.241e-07 rel over 8192 samples;
-       measured at commit 3d08c2e. See docs/numerical_noise.md.
+       measured at commit 2843d96. See docs/numerical_noise.md.
     """
     assert len(inp1) == 1, "Input must be a 1D scalar node"
     assert len(inp2) == 1, "Input must be a 1D scalar node"
@@ -183,7 +186,7 @@ def abs(inp: Node) -> Node:
     .. noise-footer::
 
        Max error: 0.005569 abs, 0.9964 rel over 8192 samples;
-       measured at commit 3d08c2e. See docs/numerical_noise.md.
+       measured at commit 2843d96. See docs/numerical_noise.md.
     """
     d = len(inp)
     eye = torch.eye(d)
@@ -228,7 +231,7 @@ def min(inp1: Node, inp2: Node) -> Node:
     .. noise-footer::
 
        Max error: 1.144e-05 abs, 6.759e-06 rel over 4096 samples;
-       measured at commit 3d08c2e. See docs/numerical_noise.md.
+       measured at commit 2843d96. See docs/numerical_noise.md.
     """
     assert len(inp1) == len(inp2)
     d = len(inp1)
@@ -277,7 +280,7 @@ def square(inp: Node) -> Node:
     .. noise-footer::
 
        Max error: 3.052e-05 abs, 2.266e-07 rel over 8192 samples;
-       measured at commit 3d08c2e. See docs/numerical_noise.md.
+       measured at commit 2843d96. See docs/numerical_noise.md.
     """
     assert len(inp) == 1, "Input must be a 1D scalar node"
 
@@ -355,7 +358,7 @@ def piecewise_linear(
     .. noise-footer::
 
        Max error: 0.25 abs, 139.7 rel over 4096 samples;
-       measured at commit 3d08c2e. See docs/numerical_noise.md.
+       measured at commit 2843d96. See docs/numerical_noise.md.
     """
     assert len(inp) == 1, "Input must be a 1D scalar node"
     n = len(breakpoints)
@@ -489,7 +492,7 @@ def clamp(inp: Node, lo: float, hi: float) -> Node:
     .. noise-footer::
 
        Max error: 2.861e-06 abs, 0.000331 rel over 4096 samples;
-       measured at commit 3d08c2e. See docs/numerical_noise.md.
+       measured at commit 2843d96. See docs/numerical_noise.md.
     """
     assert len(inp) == 1, "Input must be a 1D scalar node"
     assert hi > lo, "hi must exceed lo"
@@ -533,7 +536,7 @@ def reciprocal(
     .. noise-footer::
 
        Max error: 0.0008245 abs, 0.1117 rel over 4096 samples;
-       measured at commit 3d08c2e. See docs/numerical_noise.md.
+       measured at commit 2843d96. See docs/numerical_noise.md.
     """
     assert len(inp) == 1, "Input must be a 1D scalar node"
     assert min_value > 0, "min_value must be positive"
@@ -590,7 +593,7 @@ def thermometer_floor_div(inp: Node, divisor: int, max_value: int) -> Node:
     .. noise-footer::
 
        Max error: 0 abs, 0 rel over 4096 samples;
-       measured at commit 3d08c2e. See docs/numerical_noise.md.
+       measured at commit 2843d96. See docs/numerical_noise.md.
     """
     assert len(inp) == 1, "Input must be a 1D scalar node"
     n = max_value // divisor
@@ -639,10 +642,158 @@ def mod_const(inp: Node, divisor: int, max_value: int) -> Node:
     .. noise-footer::
 
        Max error: 0 abs, 0 rel over 4096 samples;
-       measured at commit 3d08c2e. See docs/numerical_noise.md.
+       measured at commit 2843d96. See docs/numerical_noise.md.
     """
     assert len(inp) == 1, "Input must be a 1D scalar node"
     assert divisor > 0, "divisor must be positive"
     q = thermometer_floor_div(inp, divisor, max_value)
     return subtract(inp, multiply_const(q, float(divisor)))
+
+def floor_int(
+    inp: Node,
+    min_value: int,
+    max_value: int,
+    sharpness: Optional[float] = None,
+) -> Node:
+    """Compute floor(x) for a continuous-valued scalar input.
+
+    **Not a flat staircase, and the depth is load-bearing.**  The
+    single-FFN form piecewise_linear would emit sums ~n terms of
+    magnitude ``sharpness·x`` in one projection, whose partial sums
+    overflow fp32's 2^24 exact-integer window at production magnitudes
+    and collapse.  The two-stage form keeps every accumulated term
+    bounded — that constraint is about fp32 accumulation, not the
+    activation; do not "simplify" this back to one layer::
+
+        t_k    = sharpness·(x − k) + 1                # per boundary k
+        step_k = hinge(t_k) − hinge(t_k − W)          # FFN 1: bounded step ∈ [0, W]
+        floor  = min + n − Σ_k hinge(1 − step_k)      # FFN 2: count not-yet-ON steps
+
+    Contract unchanged from the ReLU form: inputs stay out of the
+    ``1/sharpness``-wide ramp zone just below each boundary; the flat
+    zone ``[k, k+1−1/sharpness]`` is the home of legal inputs.
+    Flat-zone interiors and exact integer inputs are exact to the folded
+    ulp class (at ``x = k`` the critical hinges sit exactly on a bend,
+    where ``Swish(0) = 0``, or fully saturated).  The port adds fillet
+    zones of width ``~17/(scale·sharpness)`` at each ramp edge
+    contributing ``≤ swish_dip/scale`` apiece — at most a couple live at
+    once, so the closing range claim carries ``2·swish_dip/scale`` of
+    slack.  **The W-slack absorbs fillets too**: an ON step parks stage
+    2's hinge argument at ``1 − W = −1`` — ``scale`` past saturation —
+    so stage-1 fillet noise on an ON step still reads exactly 0 in stage
+    2, the same mechanism that absorbs fp ulps today; the existing
+    sizing ``W = max(2, 8·ulp(sharpness·n))`` already dominates the
+    swish requirement ``W ≥ 1 + 17/scale``.
+
+    Args:
+        inp: 1D scalar node with value in [min_value, max_value].
+        min_value: Lower bound (integer).
+        max_value: Upper bound (integer).
+        sharpness: Override the global ``step_sharpness`` for this op.
+            Higher values narrow the ramp zone at each boundary.
+
+    Returns:
+        1D scalar node containing floor(x).
+
+    .. noise-footer::
+
+       Max error: 0.9996 abs, 0.9534 rel over 8192 samples;
+       measured at commit 2843d96. See docs/numerical_noise.md.
+    """
+    assert len(inp) == 1, "Input must be a 1D scalar node"
+    assert max_value >= min_value
+
+    if max_value == min_value:
+        from torchwright.ops.inout_nodes import create_literal_value
+
+        return create_literal_value(torch.tensor([float(min_value)]))
+
+    s = float(sharpness if sharpness is not None else step_sharpness)
+    n = max_value - min_value
+    # Stage-1 lanes are 2 per boundary: a chunk must fit one MLP
+    # sublayer's hidden pool (min_d_hidden).
+    _CHUNK = min_d_hidden // 2
+
+    max_t = s * n + 1.0
+    ulp = 2.0 ** (math.floor(math.log2(max_t)) - 23) if max_t >= 1.0 else 2.0**-23
+    step_cap = builtins.max(2.0, 8.0 * ulp)  # W
+
+    neg_partials = []  # each chunk contributes −Σ_k hinge(1 − step_k)
+    for c0 in range(0, n, _CHUNK):
+        ks = list(
+            range(
+                min_value + 1 + c0,
+                builtins.min(min_value + 1 + c0 + _CHUNK, max_value + 1),
+            )
+        )
+        c = len(ks)
+        # stage 1: step_k = hinge(t_k) − hinge(t_k − W), t_k = s·x − s·k + 1;
+        # scale folds into the gate rows, /scale into out_proj.
+        gate_proj = torch.full((2 * c, 1), scale * s)
+        gate_bias = torch.empty(2 * c)
+        out_proj = torch.zeros((2 * c, c))
+        for j, k in enumerate(ks):
+            gate_bias[2 * j] = scale * (1.0 - s * k)  # t_k
+            gate_bias[2 * j + 1] = scale * (1.0 - step_cap - s * k)  # t_k − W
+            out_proj[2 * j, j] = 1.0 / scale
+            out_proj[2 * j + 1, j] = -1.0 / scale
+        step = swiglu_ffn(
+            inp,
+            gate_proj,
+            gate_bias,
+            out_proj,
+            torch.zeros(c),
+            name="floor_int_step",
+        )
+        # stage 2: −Σ_k hinge(1 − step_k), single output column
+        neg_partials.append(
+            swiglu_ffn(
+                step,
+                -scale * torch.eye(c),
+                scale * torch.ones(c),
+                -torch.ones((c, 1)) / scale,
+                torch.zeros(1),
+                name="floor_int_saturate",
+            )
+        )
+
+    summed = neg_partials[0] if len(neg_partials) == 1 else sum_nodes(neg_partials)
+    result = add_const(summed, float(min_value + n))  # min + n − Σ hinge(1 − step_k)
+    slack = 2.0 * swish_dip / scale
+    return assert_matches_value_type(
+        result,
+        NodeValueType(
+            value_range=Range(float(min_value) - slack, float(max_value) + slack)
+        ),
+    )
+
+
+def ceil_int(
+    inp: Node,
+    min_value: int,
+    max_value: int,
+    sharpness: Optional[float] = None,
+) -> Node:
+    """Compute ceil(x) using the identity ``ceil(x) = -floor(-x)``.
+
+    Inherits :func:`floor_int`'s entry (contract, two-stage depth,
+    fillet slack).
+
+    Args:
+        inp: 1D scalar node with value in [min_value, max_value].
+        min_value: Lower bound (integer).
+        max_value: Upper bound (integer).
+        sharpness: Override the global ``step_sharpness`` for the inner
+            ``floor_int``.
+
+    Returns:
+        1D scalar node containing ceil(x).
+
+    .. noise-footer::
+
+       Max error: 0 abs, 0 rel over 4096 samples;
+       measured at commit 2843d96. See docs/numerical_noise.md.
+    """
+    assert len(inp) == 1, "Input must be a 1D scalar node"
+    return negate(floor_int(negate(inp), -max_value, -min_value, sharpness=sharpness))
 

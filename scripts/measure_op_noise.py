@@ -1634,6 +1634,41 @@ def _target_ops() -> List[TargetOp]:
                 "class, as on relu."
             ),
         ),
+        TargetOp(
+            name="floor_int",
+            machine="swiglu",
+            module=_SWIGLU_ARITH,
+            source_file=_SWIGLU_ARITH_FILE,
+            input_specs={"x": 1},
+            build_graph=lambda nodes: swiglu_ops.floor_int(
+                nodes["x"], min_value=-5, max_value=10
+            ),
+            reference_fn=lambda inputs: _floor_ref(inputs["x"], -5.0, 10.0),
+            distribution_names=("floor_uniform_neg5_10", "floor_near_boundary_10"),
+            notes=(
+                "Two chained FFNs (bounded step, then not-yet-ON counting) "
+                "— the depth is load-bearing exactly as on relu (fp32 2^24 "
+                "accumulation), and the W-slack absorbs stage-1 fillet "
+                "noise on ON steps the same way it absorbs fp ulps. Ramp "
+                "and fillet zones near boundaries interpolate, as today; "
+                "flat zones and integers are exact to the folded ulp class."
+            ),
+        ),
+        TargetOp(
+            name="ceil_int",
+            machine="swiglu",
+            module=_SWIGLU_ARITH,
+            source_file=_SWIGLU_ARITH_FILE,
+            input_specs={"x": 1},
+            build_graph=lambda nodes: swiglu_ops.ceil_int(
+                nodes["x"], min_value=-5, max_value=10
+            ),
+            reference_fn=lambda inputs: torch.clamp(
+                torch.ceil(inputs["x"]), -5.0, 10.0
+            ),
+            distribution_names=("ceil_integers_neg5_10",),
+            notes="−floor_int(−x); inherits floor_int's entry.",
+        ),
     ]
 
 

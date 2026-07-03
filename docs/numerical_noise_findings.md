@@ -243,6 +243,22 @@ ceiling. Lesson recorded: the audit is not a formality — dense
 smooth-target grids do *not* self-absorb once fillets overlap the
 grid pitch.
 
+### swiglu floor_int/ceil_int/scalar_to_embedding: the two-stage depth ports intact
+
+`floor_int` measures at relu parity on both distributions (0.999-class
+max — in-ramp samples against the discrete floor reference, the same
+legitimate ramp-zone artefact both machines report); `ceil_int` exact 0.
+The load-bearing structure survived unchanged: the bounded-step stage
+keeps every accumulated term in [0, W] (fp32 2^24 safety), and the
+W-slack that absorbed fp ulps on relu also absorbs stage-1 *fillet*
+noise on ON steps (an ON step parks stage 2's hinge argument a full
+scale past saturation). The closing range claim gains 2·swish_dip/scale
+of fillet slack. The stage-1 chunk cap now derives from `min_d_hidden`
+(ops/const.py) instead of a literal 512. `scalar_to_embedding` follows
+relu precedent in having no noise entry (embedding-space output); its
+unit tests pin exact digit reconstruction and the ±0.4 input headroom,
+and its spacing audit closes in closed form (scale > 34, cleared 3x).
+
 ### Softmax inside attention is not measured here
 
 The plan originally called for a per-op measurement of the "piecewise

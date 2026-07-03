@@ -1,6 +1,6 @@
 {
   "schema_version": 2,
-  "commit": "3d08c2e",
+  "commit": "2843d96",
   "measured_at": "2026-07-03",
   "ops": [
     {
@@ -603,6 +603,29 @@
       ]
     },
     {
+      "name": "ceil_int",
+      "machine": "swiglu",
+      "module": "torchwright.ops.swiglu.arithmetic_ops",
+      "notes": "−floor_int(−x); inherits floor_int's entry.",
+      "distributions": [
+        {
+          "name": "ceil_integers_neg5_10",
+          "description": "Integer inputs on [-5, 10]. `ceil_int(k) = k` for integer k (flat zones in the floor staircase reused under -floor(-x)).",
+          "n_samples": 4096,
+          "max_abs_error": 0.0,
+          "mean_abs_error": 0.0,
+          "p99_abs_error": 0.0,
+          "max_rel_error": 0.0,
+          "mean_rel_error": 0.0,
+          "p99_rel_error": 0.0,
+          "rel_valid_samples": 3834,
+          "worst_input": {
+            "x": 7.0
+          }
+        }
+      ]
+    },
+    {
       "name": "clamp",
       "machine": "swiglu",
       "module": "torchwright.ops.swiglu.arithmetic_ops",
@@ -739,6 +762,44 @@
             "x[0]": 1.0,
             "x[1]": 2.0,
             "x[2]": 3.0
+          }
+        }
+      ]
+    },
+    {
+      "name": "floor_int",
+      "machine": "swiglu",
+      "module": "torchwright.ops.swiglu.arithmetic_ops",
+      "notes": "Two chained FFNs (bounded step, then not-yet-ON counting) — the depth is load-bearing exactly as on relu (fp32 2^24 accumulation), and the W-slack absorbs stage-1 fillet noise on ON steps the same way it absorbs fp ulps. Ramp and fillet zones near boundaries interpolate, as today; flat zones and integers are exact to the folded ulp class.",
+      "distributions": [
+        {
+          "name": "floor_near_boundary_10",
+          "description": "Samples within ±1/step_sharpness of integer k=5 — stresses the ramp zone where `floor_int` interpolates.",
+          "n_samples": 4096,
+          "max_abs_error": 0.999628,
+          "mean_abs_error": 0.128797,
+          "p99_abs_error": 0.971827,
+          "max_rel_error": 0.249907,
+          "mean_rel_error": 0.032198,
+          "p99_rel_error": 0.242957,
+          "rel_valid_samples": 4096,
+          "worst_input": {
+            "x": 4.99993
+          }
+        },
+        {
+          "name": "floor_uniform_neg5_10",
+          "description": "Uniform continuous samples on [-5, 10] — most land in flat zones; measures baseline `floor_int` accuracy.",
+          "n_samples": 4096,
+          "max_abs_error": 0.998995,
+          "mean_abs_error": 0.0465591,
+          "p99_abs_error": 0.895855,
+          "max_rel_error": 0.953446,
+          "mean_rel_error": 0.018495,
+          "p99_rel_error": 0.461098,
+          "rel_valid_samples": 3828,
+          "worst_input": {
+            "x": 5.99982
           }
         }
       ]
