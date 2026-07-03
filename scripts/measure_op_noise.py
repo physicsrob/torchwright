@@ -641,7 +641,7 @@ def _bin_index_ref(
 
 def _target_ops() -> List[TargetOp]:
     _ARITH = "torchwright.ops.arithmetic_ops"
-    _ARITH_FILE = "torchwright/ops/arithmetic_ops.py"
+    _ARITH_FILE = "torchwright/ops/relu/arithmetic_ops.py"
 
     return [
         TargetOp(
@@ -877,7 +877,7 @@ def _target_ops() -> List[TargetOp]:
         TargetOp(
             name="bool_not",
             module="torchwright.ops.logic_ops",
-            source_file="torchwright/ops/logic_ops.py",
+            source_file="torchwright/ops/relu/logic_ops.py",
             input_specs={"x": 1},
             build_graph=lambda nodes: bool_not(nodes["x"]),
             reference_fn=lambda inputs: -inputs["x"],
@@ -890,7 +890,7 @@ def _target_ops() -> List[TargetOp]:
         TargetOp(
             name="bool_any_true",
             module="torchwright.ops.logic_ops",
-            source_file="torchwright/ops/logic_ops.py",
+            source_file="torchwright/ops/relu/logic_ops.py",
             input_specs={"a": 1, "b": 1, "c": 1},
             build_graph=lambda nodes: bool_any_true(
                 [nodes["a"], nodes["b"], nodes["c"]]
@@ -910,7 +910,7 @@ def _target_ops() -> List[TargetOp]:
         TargetOp(
             name="bool_all_true",
             module="torchwright.ops.logic_ops",
-            source_file="torchwright/ops/logic_ops.py",
+            source_file="torchwright/ops/relu/logic_ops.py",
             input_specs={"a": 1, "b": 1, "c": 1},
             build_graph=lambda nodes: bool_all_true(
                 [nodes["a"], nodes["b"], nodes["c"]]
@@ -930,7 +930,7 @@ def _target_ops() -> List[TargetOp]:
         TargetOp(
             name="equals_vector",
             module="torchwright.ops.logic_ops",
-            source_file="torchwright/ops/logic_ops.py",
+            source_file="torchwright/ops/relu/logic_ops.py",
             input_specs={"x": 3},
             build_graph=lambda nodes: equals_vector(
                 nodes["x"], torch.tensor([1.0, 2.0, 3.0])
@@ -952,7 +952,7 @@ def _target_ops() -> List[TargetOp]:
         TargetOp(
             name="cond_gate",
             module="torchwright.ops.logic_ops",
-            source_file="torchwright/ops/logic_ops.py",
+            source_file="torchwright/ops/relu/logic_ops.py",
             input_specs={"cond": 1, "inp": 1},
             build_graph=lambda nodes: cond_gate(nodes["cond"], nodes["inp"]),
             reference_fn=lambda inputs: torch.where(

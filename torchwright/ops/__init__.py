@@ -1,5 +1,39 @@
+# Machine-selection boundary: `torchwright.ops.relu` is today's op
+# library (moved, frozen); `torchwright.ops.swiglu` is the swish-machine
+# library.  The import path *is* the machine choice — no mode flags.
+# `const` and `inout_nodes` stay at this level: both machines use them.
+#
+# Compatibility aliases: every pre-split import path
+# (``torchwright.ops.<mod>``) must keep working with preserved module
+# identity — the relu modules' own cross-imports use those paths, and so
+# do ~50 torchwright_doom files and the frozen `tests/ops/*` baseline.
+# Registration order is the modules' dependency order, and each alias is
+# registered *before* the next module loads, so the byte-identical moved
+# files resolve their cross-imports through `sys.modules`.
+import importlib as _importlib
+import sys as _sys
+
+_RELU_MODULES = (
+    "linear_relu_linear",
+    "attention_ops",
+    "arithmetic_ops",
+    "logic_ops",
+    "map_select",
+    "onehot_table",
+    "scalar_encoding",
+    "embedding_arithmetic",
+    "marker_count",
+    "global_recency",
+    "sequence_ops",
+)
+for _name in _RELU_MODULES:
+    _mod = _importlib.import_module(f"torchwright.ops.relu.{_name}")
+    _sys.modules[f"torchwright.ops.{_name}"] = _mod
+    globals()[_name] = _mod
+del _importlib, _sys, _name, _mod
+
 # Arithmetic
-from torchwright.ops.arithmetic_ops import (
+from torchwright.ops.relu.arithmetic_ops import (
     add,
     add_const,
     add_scaled_nodes,
@@ -25,7 +59,7 @@ from torchwright.ops.arithmetic_ops import (
 )
 
 # Logic
-from torchwright.ops.logic_ops import (
+from torchwright.ops.relu.logic_ops import (
     bool_all_true,
     bool_any_true,
     bool_not,
@@ -34,7 +68,7 @@ from torchwright.ops.logic_ops import (
 )
 
 # Selection and lookup
-from torchwright.ops.map_select import (
+from torchwright.ops.relu.map_select import (
     broadcast_select,
     dynamic_extract,
     in_range,
@@ -54,7 +88,7 @@ from torchwright.ops.inout_nodes import (
 )
 
 # Scalar encoding
-from torchwright.ops.scalar_encoding import (
+from torchwright.ops.relu.scalar_encoding import (
     digit_to_scaled_scalar,
     digits_to_number,
     number_to_digit_scalars,
@@ -62,13 +96,13 @@ from torchwright.ops.scalar_encoding import (
 )
 
 # Embedding-space arithmetic
-from torchwright.ops.embedding_arithmetic import (
+from torchwright.ops.relu.embedding_arithmetic import (
     sum_digit_seqs,
     sum_digits,
 )
 
 # Sequence
-from torchwright.ops.sequence_ops import (
+from torchwright.ops.relu.sequence_ops import (
     NumericSequence,
     check_is_digit,
     output_sequence,
@@ -76,4 +110,4 @@ from torchwright.ops.sequence_ops import (
 )
 
 # FFN builder
-from torchwright.ops.linear_relu_linear import linear_relu_linear
+from torchwright.ops.relu.linear_relu_linear import linear_relu_linear

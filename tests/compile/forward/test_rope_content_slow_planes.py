@@ -45,7 +45,7 @@ D_HEAD = 256
 BASE = ROPE_BASE
 PROD = 42000  # production rollout distance (§9)
 
-# Head constants (mirrors torchwright/ops/attention_ops.py).
+# Head constants (mirrors torchwright/ops/relu/attention_ops.py).
 _QUERY_GAIN = 8.0
 _MAX_SCORE_ABS = 120.0
 _VALIDITY_BONUS = 256.0

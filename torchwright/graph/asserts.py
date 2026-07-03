@@ -16,7 +16,7 @@ during compiled-graph probing (``probe_compiled``).
 Naming convention (matches the rest of the codebase)
 ----------------------------------------------------
 * ``bool`` values are ±1 — see ``ops/arithmetic_ops.bool_to_01`` at
-  ``torchwright/ops/arithmetic_ops.py:97``.
+  ``torchwright/ops/relu/arithmetic_ops.py:97``.
 * ``01`` values are {0, 1} — matches ``bool_to_01``'s output.
 
 Safe placement notes live in each helper's docstring.  The core split
