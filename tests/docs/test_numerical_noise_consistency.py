@@ -42,8 +42,10 @@ def _load_json() -> dict:
 
 def test_every_target_op_has_data() -> None:
     data = _load_json()
-    json_ops = {op["name"] for op in data["ops"]}
-    declared = {t.name for t in _target_ops()}
+    # Ops are identified by (machine, name) — the relu and swiglu
+    # libraries share op names (both have a `square`).
+    json_ops = {(op["machine"], op["name"]) for op in data["ops"]}
+    declared = {(t.machine, t.name) for t in _target_ops()}
     missing = declared - json_ops
     extra = json_ops - declared
     assert not missing, (
@@ -69,9 +71,9 @@ def test_markdown_matches_json() -> None:
 def test_docstring_footers_match_json() -> None:
     data = _load_json()
     commit = data["commit"]
-    targets = {t.name: t for t in _target_ops()}
+    targets = {(t.machine, t.name): t for t in _target_ops()}
     for op in data["ops"]:
-        target = targets[op["name"]]
+        target = targets[(op["machine"], op["name"])]
         source = (REPO_ROOT / target.source_file).read_text()
         summary = _footer_summary(op)
         rel_txt = (

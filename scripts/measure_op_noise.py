@@ -62,6 +62,7 @@ from torchwright.ops.logic_ops import (
     cond_gate,
     equals_vector,
 )
+from torchwright.ops import swiglu as swiglu_ops
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 DOCS_JSON = REPO_ROOT / "docs" / "op_noise_data.json"
@@ -86,6 +87,12 @@ class TargetOp:
     same op use different parameters (e.g., `reciprocal` with different
     `min_value` in `wall.py:431` vs `wall.py:813`), and a single combined
     graph would have weaker precision than either production configuration.
+
+    ``machine`` is the op-library axis: ``"relu"`` (`torchwright/ops/relu/`,
+    frozen) or ``"swiglu"`` (`torchwright/ops/swiglu/`). The two libraries
+    share op names (both have a ``square``), so ops are identified by
+    ``(machine, name)`` everywhere downstream — the JSON, the markdown, and
+    the drift/consistency tests.
     """
 
     name: str
@@ -96,6 +103,7 @@ class TargetOp:
     distribution_names: Sequence[str]
     source_file: str
     notes: str = ""
+    machine: str = "relu"
     build_graphs_per_distribution: Dict[str, Callable[[Dict[str, Node]], Node]] = field(
         default_factory=dict
     )
@@ -468,6 +476,22 @@ def _distributions() -> Dict[str, InputDistribution]:
             -10.0,
             10.0,
         ),
+        "multiply_uniform_pm1000": _uniform_2d(
+            "multiply_uniform_pm1000",
+            "a·b over [-1000, 1000]² — magnitudes far beyond any ReLU-era "
+            "grid; probes the range-free claim of the exact gated product.",
+            -1000.0,
+            1000.0,
+            -1000.0,
+            1000.0,
+        ),
+        "square_uniform_pm100": _uniform_1d(
+            "square_uniform_pm100",
+            "x² over [-100, 100] — signed and wide; probes the range-free "
+            "claim of the exact gated square (no [0, max_value] contract).",
+            -100.0,
+            100.0,
+        ),
         "diff_trig_nonuniform": _uniform_2d(
             "diff_trig_nonuniform",
             "Two-input product over DIFF_BP × TRIG_BP — DIFF in [-40, 40] "
@@ -642,6 +666,8 @@ def _bin_index_ref(
 def _target_ops() -> List[TargetOp]:
     _ARITH = "torchwright.ops.arithmetic_ops"
     _ARITH_FILE = "torchwright/ops/relu/arithmetic_ops.py"
+    _SWIGLU_ARITH = "torchwright.ops.swiglu.arithmetic_ops"
+    _SWIGLU_ARITH_FILE = "torchwright/ops/swiglu/arithmetic_ops.py"
 
     return [
         TargetOp(
@@ -967,6 +993,45 @@ def _target_ops() -> List[TargetOp]:
                 "round-off; noisy conditions blur the gate."
             ),
         ),
+        # -------------------------------------------------------------------
+        # swiglu machine (torchwright/ops/swiglu/) — entries land op by op
+        # per docs/swiglu_step2_plan.md Phase B. Expected error class per
+        # docs/ops_plain_english.md.
+        # -------------------------------------------------------------------
+        TargetOp(
+            name="multiply",
+            machine="swiglu",
+            module=_SWIGLU_ARITH,
+            source_file=_SWIGLU_ARITH_FILE,
+            input_specs={"a": 1, "b": 1},
+            build_graph=lambda nodes: swiglu_ops.multiply(nodes["a"], nodes["b"]),
+            reference_fn=lambda inputs: inputs["a"] * inputs["b"],
+            distribution_names=("multiply_uniform_pm10", "multiply_uniform_pm1000"),
+            notes=(
+                "Exact ± gated-lane pair: `Swish(a)·b + Swish(-a)·(-b) = a·b` "
+                "(σ(a) + σ(-a) = 1). Exact in real math at any magnitude — "
+                "no grid, no range limit; measured error is fp32 rounding, "
+                "relative to the actual product. Replaces the quarter-square "
+                "`multiply_2d` and the `multiply_integers` chain."
+            ),
+        ),
+        TargetOp(
+            name="square",
+            machine="swiglu",
+            module=_SWIGLU_ARITH,
+            source_file=_SWIGLU_ARITH_FILE,
+            input_specs={"x": 1},
+            build_graph=lambda nodes: swiglu_ops.square(nodes["x"]),
+            reference_fn=lambda inputs: inputs["x"] ** 2,
+            distribution_names=("square_unsigned_0_10", "square_uniform_pm100"),
+            notes=(
+                "`multiply` with both operands the same input: "
+                "`Swish(x)·x + Swish(-x)·(-x) = x²`, both terms `x²·σ(±x)` "
+                "≥ 0. Exact in real math for all x — no [0, max_value] "
+                "contract, no grid, and none of the piecewise version's "
+                "near-zero relative-error blowup."
+            ),
+        ),
     ]
 
 
@@ -994,6 +1059,7 @@ def _measure_all() -> List[NoiseMeasurement]:
                 reference_fn=target.reference_fn,
                 distribution=dists[dname],
                 notes=target.notes,
+                machine=target.machine,
             )
             out.append(m)
     return out
@@ -1020,19 +1086,26 @@ def _round_float(x: float, sig: int = 6) -> Optional[float]:
 def render_json(
     measurements: Sequence[NoiseMeasurement], commit: str, measured_at: str
 ) -> str:
-    """Render the canonical JSON document."""
-    by_op: Dict[str, Dict] = {}
+    """Render the canonical JSON document.
+
+    Ops are keyed by ``(machine, name)`` — the relu and swiglu libraries
+    share op names — and sorted machine-first, so the frozen relu block
+    stays contiguous and diff-stable as swiglu entries land.
+    """
+    by_op: Dict[tuple, Dict] = {}
     for m in measurements:
+        key = (m.machine, m.op_name)
         by_op.setdefault(
-            m.op_name,
+            key,
             {
                 "name": m.op_name,
+                "machine": m.machine,
                 "module": m.module,
                 "notes": m.notes,
                 "distributions": [],
             },
         )
-        by_op[m.op_name]["distributions"].append(
+        by_op[key]["distributions"].append(
             {
                 "name": m.distribution_name,
                 "description": m.distribution_description,
@@ -1047,11 +1120,11 @@ def render_json(
                 "worst_input": {k: _round_float(v) for k, v in m.worst_input.items()},
             }
         )
-    ops_sorted = sorted(by_op.values(), key=lambda d: d["name"])
+    ops_sorted = sorted(by_op.values(), key=lambda d: (d["machine"], d["name"]))
     for op in ops_sorted:
         op["distributions"].sort(key=lambda d: d["name"])
     doc = {
-        "schema_version": 1,
+        "schema_version": 2,
         "commit": commit,
         "measured_at": measured_at,
         "ops": ops_sorted,
@@ -1097,8 +1170,11 @@ def render_markdown(data: Dict) -> str:
     lines.append("")
     lines.append("## Summary")
     lines.append("")
-    lines.append("| Op | Module | Max abs error | Max rel error | Worst distribution |")
-    lines.append("| --- | --- | --- | --- | --- |")
+    lines.append(
+        "| Op | Machine | Module | Max abs error | Max rel error "
+        "| Worst distribution |"
+    )
+    lines.append("| --- | --- | --- | --- | --- | --- |")
     for op in data["ops"]:
         worst = max(op["distributions"], key=lambda d: d["max_abs_error"])
         worst_rel = max(
@@ -1110,7 +1186,7 @@ def render_markdown(data: Dict) -> str:
             default=None,
         )
         lines.append(
-            f"| `{op['name']}` | `{op['module']}` "
+            f"| `{op['name']}` | {op['machine']} | `{op['module']}` "
             f"| {_fmt(worst['max_abs_error'])} "
             f"| {_fmt_opt(worst_rel)} "
             f"| `{worst['name']}` |"
@@ -1153,7 +1229,7 @@ def render_markdown(data: Dict) -> str:
     lines.append("most likely responsible.")
     lines.append("")
     for op in data["ops"]:
-        lines.append(f"## `{op['name']}`")
+        lines.append(f"## `{op['name']}` ({op['machine']})")
         lines.append("")
         if op["notes"]:
             lines.append(op["notes"])
@@ -1278,12 +1354,15 @@ def _apply_docstring_footers(data: Dict, *, check: bool) -> List[str]:
 
     Returns the list of file paths that were (or would be) changed.
     """
-    target_map = {t.name: t for t in _target_ops()}
+    target_map = {(t.machine, t.name): t for t in _target_ops()}
     changed: List[str] = []
     for op in data["ops"]:
-        target = target_map.get(op["name"])
+        target = target_map.get((op["machine"], op["name"]))
         if target is None:
-            raise KeyError(f"JSON contains op {op['name']!r} with no TargetOp record")
+            raise KeyError(
+                f"JSON contains op ({op['machine']!r}, {op['name']!r}) "
+                f"with no TargetOp record"
+            )
         path = REPO_ROOT / target.source_file
         source = path.read_text()
         summary = _footer_summary(op)

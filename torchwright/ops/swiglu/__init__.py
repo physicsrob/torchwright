@@ -12,4 +12,8 @@ The hinge-sharpening constant ``scale`` lives in
 weight writer imports it too).
 """
 
+from torchwright.ops.swiglu.arithmetic_ops import (
+    multiply,
+    square,
+)
 from torchwright.ops.swiglu.swiglu_ffn import swiglu_ffn

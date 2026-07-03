@@ -65,9 +65,13 @@ def _close_enough(a: float, b: float) -> bool:
 
 
 def _compare_ops(committed: dict, regenerated: dict) -> List[str]:
-    """Compare two stripped JSON dicts and return a list of failure messages."""
-    c_ops = {op["name"]: op for op in committed["ops"]}
-    r_ops = {op["name"]: op for op in regenerated["ops"]}
+    """Compare two stripped JSON dicts and return a list of failure messages.
+
+    Ops are keyed by ``(machine, name)`` — the relu and swiglu libraries
+    share op names (both have a ``square``).
+    """
+    c_ops = {(op["machine"], op["name"]): op for op in committed["ops"]}
+    r_ops = {(op["machine"], op["name"]): op for op in regenerated["ops"]}
 
     failures: List[str] = []
 
@@ -80,9 +84,10 @@ def _compare_ops(committed: dict, regenerated: dict) -> List[str]:
     if extra:
         failures.append(f"Ops in fresh measurement but not in committed JSON: {extra}")
 
-    for op_name in sorted(c_ops.keys() & r_ops.keys()):
-        c_dists = {d["name"]: d for d in c_ops[op_name]["distributions"]}
-        r_dists = {d["name"]: d for d in r_ops[op_name]["distributions"]}
+    for op_key in sorted(c_ops.keys() & r_ops.keys()):
+        op_name = "/".join(op_key)
+        c_dists = {d["name"]: d for d in c_ops[op_key]["distributions"]}
+        r_dists = {d["name"]: d for d in r_ops[op_key]["distributions"]}
 
         d_missing = sorted(c_dists.keys() - r_dists.keys())
         if d_missing:

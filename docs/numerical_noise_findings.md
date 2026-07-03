@@ -72,6 +72,34 @@ while the piecewise segment does not. **These are expected by design**, not
 bugs — the numbers exist to keep callers honest about where these ops can and
 cannot substitute for exact arithmetic.
 
+### The machine axis: ops are now keyed `(machine, name)` (2026-07)
+
+`op_noise_data.json` (schema_version 2), `measure_op_noise.py`, and the
+drift/consistency tests carry a `machine` dimension — `"relu"` for the
+frozen library in `torchwright/ops/relu/`, `"swiglu"` for the swish
+machine in `torchwright/ops/swiglu/` (the two share op names; both have
+a `square`). Swiglu entries land op-by-op per `docs/swiglu_step2_plan.md`
+Phase B. The relu numbers are frozen: the axis landed with all 18 relu
+entries byte-identical, and the drift test keeps validating them at zero
+maintenance.
+
+### swiglu `multiply`/`square` measure at the fp32 ulp floor — the near-zero pathology is gone
+
+The exact ± gated-lane pair (`Swish(a)·b + Swish(-a)·(-b) = a·b`)
+measures max **relative** error ~2.3e-7 (≈2 ulps) on every distribution,
+including `multiply_uniform_pm1000` — magnitudes no ReLU-era grid could
+reach (its absolute number, 9.8e-4, is just an ulp of a 10⁶-magnitude
+product; rel there is 9.9e-8). Contrast the relu entries these ops
+replace: `multiply_2d` ~0.0625 abs / ~2.15 rel at small `|a·b|`, relu
+`square` 0.25 abs / 231× rel near x=0. The quarter-square cancellation
+class and the near-zero relative blowup are both structurally absent —
+error rides the *actual* product, not the grid. One caveat carried in
+the op tests instead of the numbers: bit-exactness (`torch.equal`
+against `a*b`) needs the dead lane's sigmoid to compute exactly 0.0,
+which fp32 does at |gate| ≈ 89+ (e^{|a|} overflow), *not* at the σ=1
+saturation threshold 17 — between those, the dead lane leaks a
+representable `~e^{-|a|}·|a·b|`, still inside the 2-ulp relative class.
+
 ### Softmax inside attention is not measured here
 
 The plan originally called for a per-op measurement of the "piecewise

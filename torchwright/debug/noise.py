@@ -56,7 +56,12 @@ zero. ``rel_valid_samples`` records how many samples contributed.
 
 @dataclass(frozen=True)
 class NoiseMeasurement:
-    """Result of running one op against one ``InputDistribution``."""
+    """Result of running one op against one ``InputDistribution``.
+
+    ``machine`` is the op-library axis (``"relu"`` or ``"swiglu"``) —
+    the two libraries share op names (both have a ``square``), so
+    measurements are identified by ``(machine, op_name)``.
+    """
 
     op_name: str
     module: str
@@ -72,6 +77,7 @@ class NoiseMeasurement:
     rel_valid_samples: int
     worst_input: Dict[str, float]
     notes: str = ""
+    machine: str = "relu"
 
 
 # ---------------------------------------------------------------------------
@@ -88,6 +94,7 @@ def measure_op_isolated(
     reference_fn: Callable[[Dict[str, torch.Tensor]], torch.Tensor],
     distribution: InputDistribution,
     notes: str = "",
+    machine: str = "relu",
 ) -> NoiseMeasurement:
     """Measure max/mean/p99 absolute error of ``build_graph`` on one distribution.
 
@@ -102,6 +109,8 @@ def measure_op_isolated(
             and returns an ``(N, d_out)`` tensor of oracle values.
         distribution: the sample batch to run.
         notes: free-form text carried through to JSON/markdown.
+        machine: op-library axis (``"relu"`` or ``"swiglu"``), carried
+            through to the measurement record.
     """
     torch.manual_seed(0)
 
@@ -179,6 +188,7 @@ def measure_op_isolated(
         rel_valid_samples=rel_valid,
         worst_input=worst_input_flat,
         notes=notes,
+        machine=machine,
     )
 
 
