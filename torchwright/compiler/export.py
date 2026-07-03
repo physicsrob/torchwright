@@ -155,6 +155,9 @@ class OnnxArtifact:
     d_head: int
     cache_stride: int
     vocab_size: Optional[int] = None  # token kind only
+    # Machine kind ("relu" | "swish") — which MLP-sublayer emission the
+    # artifact carries.  Uniform per network by the compile-time check.
+    activation: str = "relu"
 
     def load(self, providers=None):
         """Load the artifact via :func:`torchwright.compiler.onnx_load.load_onnx`.
@@ -195,6 +198,9 @@ _MATRIX_AXES = {
     "attn.W_V": ("residual_in", "head"),
     "attn.W_O": ("head", "residual_out"),
     "mlp.W_in": ("residual_in", "hidden"),
+    # Swish machine only: the gated sublayer's up projection ("mlp.W_in" is
+    # the gate there; the ReLU machine has no W_up).
+    "mlp.W_up": ("residual_in", "hidden"),
     "mlp.W_out": ("hidden", "residual_out"),
 }
 
@@ -273,6 +279,8 @@ def _build_matrix_occupancy(compiled, canon, d: int, d_head: int):
             "mlp.W_in": (d, d_hidden),
             "mlp.W_out": (d_hidden, d),
         }
+        if getattr(layer.mlp, "activation", "relu") == "swish":
+            shapes["mlp.W_up"] = (d, d_hidden)
         for kind, (a_rows, a_cols) in shapes.items():
             axis0, axis1 = _MATRIX_AXES[kind]
             matrices[f"L{i}.{kind}"] = {
@@ -483,6 +491,11 @@ def _write_debug_sidecar(
         "format": DEBUG_META_FORMAT,
         "kind": kind,  # always "token"
         "fingerprint": debug_fingerprint(out, d=d, d_head=d_head),
+        # Machine kind ("relu" | "swish").  Deliberately OUTSIDE the
+        # fingerprint (whose topology encoding predates the swish machine and
+        # must keep hashing byte-identically for existing artifacts); the
+        # debug session cross-checks it against the rebuilt graph explicitly.
+        "activation": getattr(compiled, "activation", "relu"),
         "d": d,
         "d_head": d_head,
         "n_heads": n_heads,
@@ -818,14 +831,29 @@ def _make_stream_layer_weights_cb(
             dense_inits,
         )
 
-        emit(f"l{i}_W1", mlp.linear1.output_matrix.cpu().numpy())
-        mlp.linear1.output_matrix = None
-        emit(f"l{i}_b1", mlp.linear1.output_bias.cpu().numpy())
-        mlp.linear1.output_bias = None
-        emit(f"l{i}_W2", mlp.linear2.output_matrix.cpu().numpy())
-        mlp.linear2.output_matrix = None
-        emit(f"l{i}_b2", mlp.linear2.output_bias.cpu().numpy())
-        mlp.linear2.output_bias = None
+        if getattr(mlp, "activation", "relu") == "swish":
+            # Gated (SwiGLU) sublayer: gate / up / down projections.
+            emit(f"l{i}_Wgate", mlp.gate_proj.output_matrix.cpu().numpy())
+            mlp.gate_proj.output_matrix = None
+            emit(f"l{i}_bgate", mlp.gate_proj.output_bias.cpu().numpy())
+            mlp.gate_proj.output_bias = None
+            emit(f"l{i}_Wup", mlp.up_proj.output_matrix.cpu().numpy())
+            mlp.up_proj.output_matrix = None
+            emit(f"l{i}_bup", mlp.up_proj.output_bias.cpu().numpy())
+            mlp.up_proj.output_bias = None
+            emit(f"l{i}_Wdown", mlp.down_proj.output_matrix.cpu().numpy())
+            mlp.down_proj.output_matrix = None
+            emit(f"l{i}_bdown", mlp.down_proj.output_bias.cpu().numpy())
+            mlp.down_proj.output_bias = None
+        else:
+            emit(f"l{i}_W1", mlp.linear1.output_matrix.cpu().numpy())
+            mlp.linear1.output_matrix = None
+            emit(f"l{i}_b1", mlp.linear1.output_bias.cpu().numpy())
+            mlp.linear1.output_bias = None
+            emit(f"l{i}_W2", mlp.linear2.output_matrix.cpu().numpy())
+            mlp.linear2.output_matrix = None
+            emit(f"l{i}_b2", mlp.linear2.output_bias.cpu().numpy())
+            mlp.linear2.output_bias = None
 
     return on_layer_compiled
 
@@ -960,6 +988,7 @@ def _emit_cached_layer_nodes(
     scatter_idx_col: str = "_cache_pos_col",
     rms_norm: bool = False,
     rms_eps_name: Optional[str] = None,
+    activation: str = "relu",
 ) -> str:
     """Emit cached attention + MLP-sublayer nodes for one layer.
 
@@ -1156,12 +1185,28 @@ def _emit_cached_layer_nodes(
         )
 
     # MLP sublayer + skip
-    node("MatMul", [mlp_in, f"{p}_W1"], [f"{p}_l1_m"])
-    node("Add", [f"{p}_l1_m", f"{p}_b1"], [f"{p}_l1_b"])
-    node("Relu", [f"{p}_l1_b"], [f"{p}_l1_r"])
-    node("MatMul", [f"{p}_l1_r", f"{p}_W2"], [f"{p}_l2_m"])
-    node("Add", [f"{p}_l2_m", f"{p}_b2"], [f"{p}_l2_b"])
-    node("Add", [f"{p}_res_attn", f"{p}_l2_b"], [f"{p}_res_next"])
+    if activation == "swish":
+        # Gated (SwiGLU) sublayer: down(swish(gate(x)) * up(x)) + x.  Swish is
+        # emitted as Mul(z, Sigmoid(z)) — the exact op pair whose fp32
+        # saturation profile the A0 probes pinned (tests/docs/
+        # test_ort_cpu_saturation.py; ORT fuses it where profitable).
+        node("MatMul", [mlp_in, f"{p}_Wgate"], [f"{p}_gate_m"])
+        node("Add", [f"{p}_gate_m", f"{p}_bgate"], [f"{p}_gate"])
+        node("Sigmoid", [f"{p}_gate"], [f"{p}_gate_sig"])
+        node("Mul", [f"{p}_gate", f"{p}_gate_sig"], [f"{p}_gate_sw"])
+        node("MatMul", [mlp_in, f"{p}_Wup"], [f"{p}_up_m"])
+        node("Add", [f"{p}_up_m", f"{p}_bup"], [f"{p}_up"])
+        node("Mul", [f"{p}_gate_sw", f"{p}_up"], [f"{p}_hidden"])
+        node("MatMul", [f"{p}_hidden", f"{p}_Wdown"], [f"{p}_down_m"])
+        node("Add", [f"{p}_down_m", f"{p}_bdown"], [f"{p}_down_b"])
+        node("Add", [f"{p}_res_attn", f"{p}_down_b"], [f"{p}_res_next"])
+    else:
+        node("MatMul", [mlp_in, f"{p}_W1"], [f"{p}_l1_m"])
+        node("Add", [f"{p}_l1_m", f"{p}_b1"], [f"{p}_l1_b"])
+        node("Relu", [f"{p}_l1_b"], [f"{p}_l1_r"])
+        node("MatMul", [f"{p}_l1_r", f"{p}_W2"], [f"{p}_l2_m"])
+        node("Add", [f"{p}_l2_m", f"{p}_b2"], [f"{p}_l2_b"])
+        node("Add", [f"{p}_res_attn", f"{p}_l2_b"], [f"{p}_res_next"])
 
     return f"{p}_res_next"
 
@@ -1574,6 +1619,7 @@ def compile_to_onnx(
             scatter_idx_col="_cache_pos_col",
             rms_norm=rms_spec is not None,
             rms_eps_name="_rms_eps" if rms_spec is not None else None,
+            activation=compiled.activation,
         )
 
     # Final norm before the unembed (Llama-style), the bit-exact identity.  It
@@ -1642,6 +1688,10 @@ def compile_to_onnx(
         # from the initializers, but eps is not a tensor).
         "rms_norm": rms_spec is not None,
         "rms_norm_eps": rms_spec.eps if rms_spec is not None else None,
+        # Machine kind ("relu" | "swish"): which MLP-sublayer emission the
+        # artifact carries (l{i}_W1/W2 + Relu vs l{i}_Wgate/Wup/Wdown +
+        # Sigmoid·Mul).  Uniform per network by the compile-time check.
+        "activation": compiled.activation,
         # Solver provenance: distinguishes a real CP-SAT schedule (status
         # OPTIMAL/FEASIBLE/CACHED) from the heuristic fallback (UNKNOWN/
         # INFEASIBLE with optimize>0) — a fallback artifact is value-correct
@@ -1696,6 +1746,7 @@ def compile_to_onnx(
         d_head=d_head,
         cache_stride=cache_stride_resolved,
         vocab_size=int(vocab_size),
+        activation=compiled.activation,
     )
 
 

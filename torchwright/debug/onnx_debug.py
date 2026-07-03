@@ -171,6 +171,28 @@ class OnnxDebugSession:
         # --- Remap the sidecar's canonical-id residual assignment onto
         # the rebuilt graph's live nodes.
         by_canon = nodes_by_canonical_id(out)
+
+        # --- Machine kind: the topology fingerprint predates the swish
+        # machine and cannot see FFN activation (its encoding is frozen), so
+        # a relu-vs-swish rebuild of the same shapes would slip through it.
+        # Cross-check explicitly against the sidecar's recorded machine
+        # (pre-swish sidecars lack the key: they are all ReLU artifacts).
+        from torchwright.graph.ffn import FFN as _FFN
+
+        rebuilt_acts = {n.activation for n in by_canon.values() if isinstance(n, _FFN)}
+        rebuilt_act = (
+            next(iter(rebuilt_acts))
+            if len(rebuilt_acts) == 1
+            else ("relu" if not rebuilt_acts else "mixed")
+        )
+        sidecar_act = sidecar.get("activation", "relu")
+        if rebuilt_act != sidecar_act:
+            raise ValueError(
+                f"{debug_meta_path_for(onnx_path)}: machine mismatch — the "
+                f"artifact was compiled as the {sidecar_act!r} machine but the "
+                f"rebuilt graph's FFNs give {rebuilt_act!r}.  Rebuild with the "
+                f"same op package the compile used."
+            )
         states: List[ResidualStreamState] = []
         key_to_state: Dict[str, ResidualStreamState] = {}
         for entry in sidecar["states"]:

@@ -114,6 +114,14 @@ def build_config(
         f"converter reads the vanilla untied token layout — re-export the "
         f"artifact with the current exporter."
     )
+    activation = meta.get("activation", "relu")
+    if activation != "relu":
+        raise NotImplementedError(
+            f"HF conversion of the {activation!r} machine is not implemented: "
+            f"the native module models linear1/ReLU/linear2 MLPs only.  "
+            f"(The gated artifact's l{{i}}_Wgate/Wup/Wdown initializers would "
+            f"also trip the unmapped-initializer check below.)"
+        )
 
     vocab: List[str] = list(meta["vocab"])
 
