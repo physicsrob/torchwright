@@ -259,6 +259,22 @@ relu precedent in having no noise entry (embedding-space output); its
 unit tests pin exact digit reconstruction and the ±0.4 input headroom,
 and its spacing audit closes in closed form (scale > 34, cleared 3x).
 
+### swiglu table_lookup_2d: exact 0 on the integer grid; the family's last offset dies
+
+The gated column stage — one gated lane per boundary whose up row reads
+the live row vector's adjacent difference — replaces the ReLU machine's
+mask staircase plus offset-cancellation gate, and measures exactly 0 on
+integer indices (every indicator saturates to exactly 0 or 1; the value
+path is the delta telescoping's fp32 accumulation, which lands below
+6-sig-fig rounding on the 8×6 measurement table). The closing guard's
+`offset·0.005` term — the lookup family's last range-coupled offset —
+is deleted, replaced by the band-edge dip term
+`2·swish_dip/scale·max|Δ|`. In-band behavior upgrades from disclaimer
+to contract (unit-test-pinned): a one-axis band gives the clean
+two-entry linear blend, a corner band genuine bilinear interpolation.
+The relu op was never measured; its offset-gate class is the `(M+v)−M`
+findings entry.
+
 ### Softmax inside attention is not measured here
 
 The plan originally called for a per-op measurement of the "piecewise

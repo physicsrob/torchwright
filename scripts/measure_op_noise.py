@@ -466,6 +466,22 @@ def _dynamic_extract_distribution(
     )
 
 
+def _table_lookup_2d_distribution(
+    name: str, description: str, n_samples: int = 4096, seed: int = 0
+) -> InputDistribution:
+    """Integer (i, j) index pairs over an 8×6 table, plus 25% out-of-range
+    indices (the clamp path)."""
+    gen = torch.Generator().manual_seed(seed)
+    i = torch.randint(-2, 10, (n_samples, 1), generator=gen).to(torch.float32)
+    j = torch.randint(-2, 8, (n_samples, 1), generator=gen).to(torch.float32)
+    return InputDistribution(
+        name=name,
+        description=description,
+        inputs={"i": i, "j": j},
+        n_samples=n_samples,
+    )
+
+
 def _bin_index_distribution(
     name: str,
     description: str,
@@ -795,6 +811,12 @@ def _distributions() -> Dict[str, InputDistribution]:
             "digit(3) ⊕ carry(2) one-hot pairs over all six combinations; "
             "three are table rows, three miss → default.",
         ),
+        "table_lookup_2d_int_8x6": _table_lookup_2d_distribution(
+            "table_lookup_2d_int_8x6",
+            "Integer (i, j) over an 8×6 table with 25%% out-of-range "
+            "(clamped) indices — every indicator saturated, the value "
+            "path is the delta telescoping's fp32 accumulation.",
+        ),
         "select_signed_bool_two_values": _select_distribution(
             "select_signed_bool_two_values",
             "±1 conditions paired with two independent branch values in "
@@ -846,6 +868,17 @@ def _onehot_lookup_ref(x: torch.Tensor) -> torch.Tensor:
     for (dd, cc), v in table.items():
         out[(d == dd) & (c == cc)] = v
     return out
+
+
+_TL2D_TABLE = (
+    (torch.arange(48, dtype=torch.float32).reshape(8, 6) * 7.0) % 23.0 - 11.0
+)
+
+
+def _table_lookup_2d_ref(inputs: Dict[str, torch.Tensor]) -> torch.Tensor:
+    i = inputs["i"].flatten().long().clamp(0, 7)
+    j = inputs["j"].flatten().long().clamp(0, 5)
+    return _TL2D_TABLE[i, j].unsqueeze(1)
 
 
 def _target_ops() -> List[TargetOp]:
@@ -1668,6 +1701,30 @@ def _target_ops() -> List[TargetOp]:
             ),
             distribution_names=("ceil_integers_neg5_10",),
             notes="−floor_int(−x); inherits floor_int's entry.",
+        ),
+        TargetOp(
+            name="table_lookup_2d",
+            machine="swiglu",
+            module=_SWIGLU_SELECT,
+            source_file=_SWIGLU_SELECT_FILE,
+            input_specs={"i": 1, "j": 1},
+            build_graph=lambda nodes: swiglu_ops.table_lookup_2d(
+                nodes["i"], nodes["j"], _TL2D_TABLE
+            ),
+            reference_fn=_table_lookup_2d_ref,
+            distribution_names=("table_lookup_2d_int_8x6",),
+            notes=(
+                "Both axes floor_int's two-stage staircase; the column "
+                "stage is one gated lane per boundary (up row = the live "
+                "row vector's adjacent difference) — the ReLU machine's "
+                "mask staircase and offset-cancellation gate collapse into "
+                "it, deleting the offset·0.005 guard term (the family's "
+                "last range-coupled offset). On the integer grid every "
+                "indicator is exactly 0/1, so the error is the delta "
+                "telescoping's fp32 accumulation. (The relu table_lookup_2d "
+                "was never measured; its offset-gate error class is the "
+                "(M+v)−M findings entry.)"
+            ),
         ),
     ]
 

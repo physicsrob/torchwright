@@ -7,6 +7,7 @@ finite-range requirement) does not exist on this machine — cond noise
 lands proportionally to the actual branch values.
 """
 
+import math
 from typing import Dict, List
 
 import torch
@@ -17,10 +18,15 @@ from torchwright.graph.misc import LiteralValue
 from torchwright.graph.value_type import NodeValueType, Range
 from torchwright.ops.const import (
     embedding_step_sharpness,
+    min_d_hidden,
     scale,
     step_sharpness,
     swish_dip,
 )
+
+# The output-range guard slack and axis-scale validation are pure functions
+# with no machine choice — shared with the frozen relu package.
+from torchwright.ops.relu.map_select import _lookup_axis_scale, _lookup_numeric_slack
 
 # sum_nodes is purely linear (Add hardware, no activation) — machine-neutral
 # in substance, shared with the frozen relu package until its retirement
@@ -65,7 +71,7 @@ def select(cond: Node, true_node: Node, false_node: Node) -> Node:
     .. noise-footer::
 
        Max error: 4.768e-07 abs, 1.19e-07 rel over 4096 samples;
-       measured at commit 2843d96. See docs/numerical_noise.md.
+       measured at commit 63af83a. See docs/numerical_noise.md.
     """
     assert len(cond) == 1
     assert len(true_node) == len(false_node)
@@ -185,7 +191,7 @@ def in_range(lower: Node, upper: Node, n_slots: int) -> Node:
     .. noise-footer::
 
        Max error: 5.96e-08 abs, 5.96e-08 rel over 4096 samples;
-       measured at commit 2843d96. See docs/numerical_noise.md.
+       measured at commit 63af83a. See docs/numerical_noise.md.
     """
     assert len(lower) == 1
     assert len(upper) == 1
@@ -283,7 +289,7 @@ def broadcast_select(
     .. noise-footer::
 
        Max error: 4.768e-07 abs, 1.192e-07 rel over 4096 samples;
-       measured at commit 2843d96. See docs/numerical_noise.md.
+       measured at commit 63af83a. See docs/numerical_noise.md.
     """
     assert len(masks) == n_slots
     true_is_broadcast = len(true_value) == d_fill
@@ -418,7 +424,7 @@ def dynamic_extract(
     .. noise-footer::
 
        Max error: 4.768e-07 abs, 1.191e-07 rel over 4096 samples;
-       measured at commit 2843d96. See docs/numerical_noise.md.
+       measured at commit 63af83a. See docs/numerical_noise.md.
     """
     assert len(idx) == 1, "idx must be a 1D scalar node"
     assert len(table) == n_entries * d_fill, (
@@ -486,7 +492,7 @@ def map_to_table(
     .. noise-footer::
 
        Max error: 0 abs, 0 rel over 4096 samples;
-       measured at commit 2843d96. See docs/numerical_noise.md.
+       measured at commit 63af83a. See docs/numerical_noise.md.
     """
     d_keys = {len(x) for x in key_to_value.keys()}
     d_values = {len(x) for x in key_to_value.values()}
@@ -533,5 +539,293 @@ def map_to_table(
     return assert_matches_value_type(
         result,
         NodeValueType(value_range=Range(lo, hi)),
+    )
+
+def _upper_clamp(index: Node, top: float, gate_mult: float, name: str) -> Node:
+    """``min(gate_mult·index, top)`` as one 3-lane degenerate FFN.
+
+    The swish :func:`min` with a constant second operand folded into the
+    biases: a hinge lane subtracting ``hinge(g·x − top)`` plus the
+    sharpened bypass pair carrying ``g·x`` exactly.  ``gate_mult`` folds
+    the caller's index_scale into the gate rows — no separate scaling
+    Linear.
+    """
+    g = gate_mult
+    gate_proj = torch.tensor([[scale * g], [scale * g], [-scale * g]])
+    gate_bias = torch.tensor([-scale * top, 0.0, 0.0])
+    out_proj = torch.tensor([[-1.0], [1.0], [-1.0]]) / scale
+    return swiglu_ffn(
+        index,
+        gate_proj,
+        gate_bias,
+        out_proj,
+        torch.zeros(1),
+        name=name,
+    )
+
+
+def _bounded_step_chunks(
+    x_clamped: Node,
+    n: int,
+    s: float,
+    chunk_size: int,
+    name: str,
+) -> List[tuple]:
+    """floor_int's bounded-step stage per boundary ``k − 0.5``, chunked.
+
+    Returns ``[(ks, step_node), ...]`` where ``step_node`` is the
+    width-``len(ks)`` vector of steps
+    ``step_k = hinge(t_k) − hinge(t_k − W)``,
+    ``t_k = s·(x − (k − 0.5)) + 0.5`` — bounded in [0, W], so downstream
+    accumulation never sees ``s·x``-magnitude terms (the fp32 2^24
+    rationale, unchanged from relu).  W keeps today's sizing plus the
+    swish saturation floor ``W ≥ 1 + 17/scale`` (dominated by the 2).
+    """
+    max_t = s * float(n - 1) + 1.0
+    ulp = 2.0 ** (math.floor(math.log2(max_t)) - 23) if max_t >= 1.0 else 2.0**-23
+    step_cap = max(2.0, 8.0 * ulp)  # W
+
+    out = []
+    for c0 in range(1, n, chunk_size):
+        ks = list(range(c0, min(c0 + chunk_size, n)))
+        c = len(ks)
+        gate_proj = torch.full((2 * c, 1), scale * s)
+        gate_bias = torch.empty(2 * c)
+        out_proj = torch.zeros((2 * c, c))
+        for j, k in enumerate(ks):
+            t_bias = 0.5 - s * (float(k) - 0.5)
+            gate_bias[2 * j] = scale * t_bias  # t_k
+            gate_bias[2 * j + 1] = scale * (t_bias - step_cap)  # t_k − W
+            out_proj[2 * j, j] = 1.0 / scale
+            out_proj[2 * j + 1, j] = -1.0 / scale
+        step = swiglu_ffn(
+            x_clamped,
+            gate_proj,
+            gate_bias,
+            out_proj,
+            torch.zeros(c),
+            name=f"{name}_step",
+        )
+        out.append((ks, step))
+    return out
+
+
+def _table_lookup_row_vector(
+    index: Node,
+    table: torch.Tensor,
+    *,
+    sharpness: float,
+    gate_mult: float,
+    chunk_size: int,
+    name: str,
+) -> Node:
+    """Row stage: the selected table row as a live width-``cols`` vector.
+
+    floor_int's two-stage staircase with vector-valued deltas — the
+    third stage is 1 *degenerate* lane per boundary (the deltas are
+    table constants, folded into out_proj): ``row = T[A−1] −
+    Σ_k hinge(1 − step_k)·(T[k] − T[k−1])``.
+    """
+    rows, cols = table.shape
+    if rows == 1:
+        return LiteralValue(
+            table[0].to(dtype=torch.float32), name=f"{name}_constant_row"
+        )
+
+    x_clamped = _upper_clamp(
+        index, float(rows - 1), gate_mult, name=f"{name}_clamp_i"
+    )
+    deltas = table[1:] - table[:-1]
+    partials: List[Node] = []
+    for ci, (ks, step) in enumerate(
+        _bounded_step_chunks(x_clamped, rows, sharpness, chunk_size, f"{name}_row")
+    ):
+        c = len(ks)
+        out_proj = torch.zeros((c, cols))
+        for j, k in enumerate(ks):
+            out_proj[j, :] = -deltas[k - 1] / scale
+        out_bias = table[rows - 1].clone() if ci == 0 else torch.zeros(cols)
+        partials.append(
+            swiglu_ffn(
+                step,
+                -scale * torch.eye(c),
+                scale * torch.ones(c),
+                out_proj,
+                out_bias,
+                name=f"{name}_row_deltas",
+            )
+        )
+    result = partials[0] if len(partials) == 1 else sum_nodes(partials)
+    max_abs = float(table.abs().max().item())
+    return assert_matches_value_type(
+        result,
+        NodeValueType(
+            value_range=Range(float(table.min().item()), float(table.max().item()))
+        ),
+        atol=_lookup_numeric_slack(max_abs, sharpness, rows),
+    )
+
+
+def table_lookup_2d(
+    i: Node,
+    j: Node,
+    table,
+    *,
+    index_scale=1.0,
+    sharpness: float = 100.0,
+    name: str = "table_lookup_2d",
+) -> Node:
+    """Lookup a scalar from a compile-time constant 2D table.
+
+    Both axes are the same machine — floor_int's two-stage saturating
+    staircase, a bounded per-boundary step then a "boundary not yet
+    reached" indicator ``hinge(1 − step_k)`` weighting that boundary's
+    table delta.  **The two axes differ only in whether the deltas are
+    live, and that is the whole redesign**: row-axis deltas are table
+    constants (folded into out_proj, degenerate lanes, hinge-for-hinge
+    with relu); column-axis deltas are differences of the just-built
+    live row vector — a live multiply, one *gated* lane per boundary
+    (gate row ``scale·(1 − step_k(j))``, up row ``row_{k−1} − row_k``)::
+
+        row_c = T[A−1, c] − Σ_k hinge(1 − step_k(i)) · (T[k,c] − T[k−1,c])
+        out   = row_{B−1} + Σ_k hinge(1 − step_k(j)) · (row_{k−1} − row_k)
+
+    The ReLU machine's column detour — a second full mask staircase plus
+    the ``0.5·[ReLU(offset·mask + v) − ReLU(offset·mask − v)]`` offset
+    gate — collapses into that one gated lane; the mask staircase, the
+    offset, and the ``offset·0.005`` guard term all die.  The gate is a
+    hinge (not the exact ± multiply pair) because the indicator must be
+    *snapped*: a deeply-on step carries fp noise at ``ulp(scale·s·x)``
+    scale, and the hinge's saturated ends read it as exactly 0 or 1
+    where the exact pair would faithfully reproduce it times the delta.
+
+    Exactness: on the integer grid and outside boundary bands every
+    indicator is exactly 0 or 1 (off steps exactly 0; on steps land in
+    the W-slack where ``1 − step ≤ −1`` saturates the hinge), so the
+    value path is the delta telescoping's fp32 accumulation — what
+    disappears is the offset gate's absolute error at ``ulp(offset)``
+    scale.  **In-band behavior upgrades from disclaimer to contract**:
+    the band coefficient is the blend fraction itself (``hinge(α) = α``
+    exactly for ``α ≥ 17/scale``), so a band on one axis gives the clean
+    two-entry linear blend and a corner band genuine bilinear
+    interpolation; below ``α = 0.17`` the coefficient rolls through the
+    dip (error ``≤ swish_dip/scale·|Δ|`` per band edge).
+
+    What survives: ``sharpness`` and its contract (ramp width ``1/s`` on
+    half-integer boundaries), ``index_scale`` (now folded into the
+    clamp/step gate rows — the separate scaling Linear is deleted), the
+    chunking (derived from ``min_d_hidden``), the min-clamps (swish
+    ``min``, 3 lanes), and the output-range guard with
+    ``_lookup_numeric_slack``.
+
+    Args:
+        i: 1D scalar row index (integer-ish; out-of-range clamps).
+        j: 1D scalar column index.
+        table: 2D compile-time constant array.
+        index_scale: scalar or per-axis (row, col) multiplier folded
+            into the staircase gate rows.
+        sharpness: ramp width ``1/sharpness`` at half-integer
+            boundaries (flagship uses 1000).
+        name: debug label prefix.
+
+    Returns:
+        1D scalar node with ``table[round(i·scale_i), round(j·scale_j)]``.
+
+    .. noise-footer::
+
+       Max error: 0 abs, 0 rel over 4096 samples;
+       measured at commit 63af83a. See docs/numerical_noise.md.
+    """
+    assert len(i) == 1, "i must be a 1D scalar node"
+    assert len(j) == 1, "j must be a 1D scalar node"
+    s = float(sharpness)
+    if not math.isfinite(s) or s <= 1.0:
+        raise ValueError(f"sharpness must be finite and > 1, got {s}")
+    chunk_size = max(1, min_d_hidden // 2)
+
+    table_t = torch.as_tensor(table, dtype=torch.float32)
+    if table_t.ndim != 2:
+        raise ValueError(f"table must be 2D, got shape {tuple(table_t.shape)}")
+    rows, cols = table_t.shape
+    if rows < 1 or cols < 1:
+        raise ValueError(f"table must be non-empty, got shape {tuple(table_t.shape)}")
+    if not torch.isfinite(table_t).all():
+        raise ValueError("table must contain only finite values")
+
+    scale_i = _lookup_axis_scale(index_scale, 0)
+    scale_j = _lookup_axis_scale(index_scale, 1)
+
+    row = _table_lookup_row_vector(
+        i,
+        table_t,
+        sharpness=s,
+        gate_mult=scale_i,
+        chunk_size=chunk_size,
+        name=name,
+    )
+    if cols == 1:
+        return row
+
+    # Column stage: gated lanes reading the live row vector.
+    j_clamped = _upper_clamp(j, float(cols - 1), scale_j, name=f"{name}_clamp_j")
+    step_chunks = _bounded_step_chunks(j_clamped, cols, s, chunk_size, f"{name}_col")
+
+    chunks: List[Node] = []
+    for ci, (ks, step) in enumerate(step_chunks):
+        c = len(ks)
+        first = ci == 0
+        n_lanes = c + (1 if first else 0)
+        d_input = c + cols
+        gate_proj = torch.zeros(n_lanes, d_input)
+        gate_bias = torch.zeros(n_lanes)
+        up_proj = torch.zeros(n_lanes, d_input)
+        out_proj = torch.zeros(n_lanes, 1)
+        for lj, k in enumerate(ks):
+            # gate: scale·(1 − step_k(j)) — indicator snapped by saturation
+            gate_proj[lj, lj] = -scale
+            gate_bias[lj] = scale
+            # up: row_{k−1} − row_k, read from the live row section
+            up_proj[lj, c + k - 1] = 1.0
+            up_proj[lj, c + k] = -1.0
+            out_proj[lj, 0] = 1.0 / scale
+        if first:
+            # Always-on lane carrying the live top entry (out_bias cannot —
+            # row_{B−1} is a live value, not a constant).
+            gate_bias[c] = scale
+            up_proj[c, c + cols - 1] = 1.0
+            out_proj[c, 0] = 1.0 / scale
+        x = Concatenate([step, row])
+        chunks.append(
+            swiglu_ffn(
+                x,
+                gate_proj,
+                gate_bias,
+                out_proj,
+                torch.zeros(1),
+                up_proj=up_proj,
+                up_bias=torch.zeros(n_lanes),
+                name=f"{name}_col_gate",
+            )
+        )
+
+    result = chunks[0] if len(chunks) == 1 else sum_nodes(chunks)
+    lo = float(table_t.min().item())
+    hi = float(table_t.max().item())
+    max_abs = float(table_t.abs().max().item())
+    row_slack = _lookup_numeric_slack(max_abs, s, rows)
+    # The relu guard's offset·0.005 term dies with the offset gate; the
+    # band-edge dip term (swish_dip/scale·max|Δ| per axis, ≤ 2 live) is
+    # the swish-specific addition.
+    max_delta = 0.0
+    if rows > 1:
+        max_delta = float((table_t[1:] - table_t[:-1]).abs().max().item())
+    if cols > 1:
+        max_delta = max(
+            max_delta, float((table_t[:, 1:] - table_t[:, :-1]).abs().max().item())
+        )
+    return assert_matches_value_type(
+        result,
+        NodeValueType(value_range=Range(lo, hi)),
+        atol=max(1e-3, row_slack) + 2.0 * swish_dip / scale * max_delta,
     )
 

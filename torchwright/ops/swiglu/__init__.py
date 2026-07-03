@@ -41,6 +41,7 @@ from torchwright.ops.swiglu.map_select import (
     map_to_table,
     select,
     switch,
+    table_lookup_2d,
 )
 from torchwright.ops.swiglu.onehot_table import onehot_lookup
 from torchwright.ops.swiglu.scalar_encoding import scalar_to_embedding

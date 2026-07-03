@@ -1,6 +1,6 @@
 {
   "schema_version": 2,
-  "commit": "2843d96",
+  "commit": "63af83a",
   "measured_at": "2026-07-03",
   "ops": [
     {
@@ -1072,6 +1072,30 @@
           "rel_valid_samples": 4094,
           "worst_input": {
             "x": 8.68994
+          }
+        }
+      ]
+    },
+    {
+      "name": "table_lookup_2d",
+      "machine": "swiglu",
+      "module": "torchwright.ops.swiglu.map_select",
+      "notes": "Both axes floor_int's two-stage staircase; the column stage is one gated lane per boundary (up row = the live row vector's adjacent difference) — the ReLU machine's mask staircase and offset-cancellation gate collapse into it, deleting the offset·0.005 guard term (the family's last range-coupled offset). On the integer grid every indicator is exactly 0/1, so the error is the delta telescoping's fp32 accumulation. (The relu table_lookup_2d was never measured; its offset-gate error class is the (M+v)−M findings entry.)",
+      "distributions": [
+        {
+          "name": "table_lookup_2d_int_8x6",
+          "description": "Integer (i, j) over an 8×6 table with 25%% out-of-range (clamped) indices — every indicator saturated, the value path is the delta telescoping's fp32 accumulation.",
+          "n_samples": 4096,
+          "max_abs_error": 0.0,
+          "mean_abs_error": 0.0,
+          "p99_abs_error": 0.0,
+          "max_rel_error": 0.0,
+          "mean_rel_error": 0.0,
+          "p99_rel_error": 0.0,
+          "rel_valid_samples": 3869,
+          "worst_input": {
+            "i": 6.0,
+            "j": -2.0
           }
         }
       ]
