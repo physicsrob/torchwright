@@ -261,6 +261,9 @@ spec entries.
 signature changes (`approximate=False` args disappear, offset-related
 kwargs die); re-derive graph tolerances (`c_tol`-style budgets move
 from `δ·M` to `δ·|actual value|` semantics — mostly relaxations).
+The flagship configs also flip `bias=False` (no-bias emission,
+`docs/no_bias_plan.md`), gated on re-measuring op noise under the
+flag (D7).
 
 **Blocking decisions at cutover:**
 
