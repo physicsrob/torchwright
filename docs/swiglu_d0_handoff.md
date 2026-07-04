@@ -151,6 +151,8 @@ mirroring `test_bias_lane_constants_exact_unit_lane` and importing
 - **Commit the dirty `docs/swiglu_step2_plan.md` hunk.** It is the
   Phase D handoff note pointing at the doom plan (verified — nothing
   else is mixed into the diff).
+- **Commit this file** (`docs/swiglu_d0_handoff.md`) alongside the
+  work it describes — it arrived untracked from the doom side.
 - **Push.** `main` is ahead 3 of `origin/main` before this punch list
   starts. Doom's compile cache keys on both repos' HEAD SHAs plus
   working-tree digests, and the doom cutover wants to start from a
@@ -174,8 +176,10 @@ global_position_from_bos, broadcast_select`
 Between this punch list landing and doom's D2+D3 landing, treat as
 frozen:
 
-- public signatures of those 18 swiglu ops, plus `multiply` and
-  `swiglu_ffn`;
+- public signatures of those 18 swiglu ops, plus `multiply`,
+  `swiglu_ffn`, and `attend_most_recent_globally` in its post-move
+  home (doom's `past.py` imports it from `ops/attention_ops.py` at
+  their D2, including the `recency_scale=_RECENCY_SCALE` default);
 - the `ops/const.py` values (`scale`, `swish_dip`, `bias_lane_gate`,
   `bias_lane_up`, `min_d_hidden`);
 - `broadcast_select`'s documented mask contract (fractional masks
