@@ -50,11 +50,18 @@ class LayerScheduler:
         policy: Optional[SchedulingPolicy] = None,
         eager_free: bool = True,
         realization_table: Optional[RealizationTable] = None,
+        bias: bool = True,
     ):
         self.graph = graph
         self.d = d
         self.d_hidden = d if d_hidden is None else d_hidden
         self.d_head = d_head
+        # bias=False reserves hidden slot 0 for the constant lane (the
+        # weight-writer's BiasFold): packing starts at slot 1, so the
+        # effective per-layer capacity is d_hidden - 1.  Must agree with the
+        # capacity CP-SAT models (forward_compile passes the solver
+        # d_hidden - 1) or a solver-feasible layer is unpackable on replay.
+        self.bias = bias
         self.n_heads = d // d_head
         self.pos_encoding = pos_encoding
         self.policy = policy if policy is not None else SchedulingPolicy()
@@ -549,7 +556,9 @@ class LayerScheduler:
         heads_used,
     ):
         mlp_ops = []
-        next_slot = 0
+        # Slot 0 is the constant lane under bias=False — see LayerScheduler
+        # __init__ and weight_writer.BiasFold.
+        next_slot = 0 if self.bias else 1
 
         def try_add_cancel(new_cols):
             """Try to fold ``new_cols`` into the shared batched cancel.
@@ -1151,6 +1160,7 @@ class DirectedLayerScheduler(LayerScheduler):
         admission_budget_fraction: float = 0.4,
         policy: Optional[SchedulingPolicy] = None,
         realization_table: Optional[RealizationTable] = None,
+        bias: bool = True,
     ):
         # The directed path's resolver is the solve itself: its per-node
         # sublayer decisions (node_to_routing) resolve the table the walk
@@ -1169,6 +1179,7 @@ class DirectedLayerScheduler(LayerScheduler):
             admission_budget_fraction=admission_budget_fraction,
             policy=policy,
             realization_table=realization_table,
+            bias=bias,
         )
         self._assignment = assignment
         self._current_layer: int = -1

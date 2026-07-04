@@ -40,3 +40,17 @@ min_d_hidden = 1024
 # equals_vector's low-side dip, in_range's per-slot slack).  Pinned against
 # the doc's 0.2785 by tests/docs/test_swish_constants.py.
 swish_dip = 0.2784645
+
+# The no-bias constant lane (docs/no_bias_plan.md).  Under a ``bias=False``
+# compile every output-side constant (literals, deferred Linear biases, FFN
+# out biases) routes through one hidden slot per layer whose value is exactly
+# 1.0, so its down-projection row carries the constant verbatim.  On the
+# swish machine the lane's gate row reads ``bias_lane_gate`` times the pinned
+# constant-1 column and saturates (fp32 sigma(z) == 1.0 bit-exactly for
+# z >= 17 on torch/ORT-CUDA and z >= 18 on CPU-ORT — the A0 probes), and the
+# up row reads ``bias_lane_up``; both are powers of two, so
+# ``swish(32) * (1/32) = 32 * 1.0 * 2**-5 = 1.0`` with no rounding anywhere.
+# The ReLU machine's lane is a gate row of 1.0 (``ReLU(1) = 1``) and uses
+# neither constant.  Pinned by tests/docs/test_swish_constants.py.
+bias_lane_gate = 32.0
+bias_lane_up = 0.03125  # 2**-5, exactly representable

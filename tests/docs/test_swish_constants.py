@@ -396,3 +396,20 @@ def test_hinge_fillet_width():
         zt = torch.tensor(z, dtype=torch.float64)
         assert abs(_hinge(zt).item() - z) < 1e-8  # positive side -> identity
         assert abs(_hinge(-zt).item()) < 1e-8  # negative side -> zero
+
+
+def test_bias_lane_constants_exact_unit_lane():
+    """The no-bias constant lane (docs/no_bias_plan.md): both shipped
+    constants (ops/const.py) are powers of two, the gate value saturates
+    sigma bit-exactly (>= 17 on this kernel; the CPU-ORT floor of 18 also
+    clears), and the full lane expression — the GatedMLPSubLayer's
+    ``g * sigmoid(g) * u`` — computes exactly 1.0 in fp32, so a constant
+    routed through the lane's down-projection row lands verbatim."""
+    from torchwright.ops.const import bias_lane_gate, bias_lane_up
+
+    assert bias_lane_gate == 32.0
+    assert bias_lane_up == 2.0**-5
+    g = torch.tensor(bias_lane_gate, dtype=torch.float32)
+    u = torch.tensor(bias_lane_up, dtype=torch.float32)
+    assert torch.sigmoid(g).item() == 1.0
+    assert (g * torch.sigmoid(g) * u).item() == 1.0

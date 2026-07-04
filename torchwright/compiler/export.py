@@ -1314,6 +1314,7 @@ def compile_to_onnx(
     rms_norm: Optional[bool] = None,
     rms_norm_eps: float = 1e-5,
     rms_norm_const_exp: Optional[int] = None,
+    bias: bool = True,
 ) -> OnnxArtifact:
     """Compile a token-I/O graph to a KV-cached ONNX model.
 
@@ -1443,6 +1444,7 @@ def compile_to_onnx(
         trim_heads=trim_heads,
         optimize=optimize,
         assume_zero_init=assume_zero_init,
+        bias=bias,
         d_hidden=d_hidden,
         rms_norm=rms_norm_on,
         rms_norm_eps=rms_norm_eps,
@@ -2202,6 +2204,7 @@ def compile_headless(
     trim_heads: bool = True,
     optimize: int = 0,
     assume_zero_init: bool = False,
+    bias: bool = True,
 ) -> CompiledHeadless:
     """Compile a graph to an in-process callable.
 
@@ -2218,12 +2221,12 @@ def compile_headless(
     when omitted; pass an explicit value to decouple the MLP intermediate
     width from the residual stream width.
 
-    ``optimize`` and ``assume_zero_init`` thread straight to
-    ``forward_compile`` (same meaning as on :func:`compile_to_onnx`) —
-    so this in-process debug backend can reproduce a production
-    ``optimize=2`` / ``assume_zero_init=True`` schedule exactly.  The
-    defaults reproduce ``forward_compile``'s own defaults (today's
-    behavior).
+    ``optimize``, ``assume_zero_init``, and ``bias`` thread straight to
+    ``forward_compile`` (same meaning as on :func:`compile_to_onnx`) — so
+    this in-process debug backend can reproduce a production
+    ``optimize=2`` / ``assume_zero_init=True`` / ``bias=False`` schedule
+    exactly.  The defaults reproduce ``forward_compile``'s own defaults
+    (today's behavior).
     """
     from torchwright.graph.asserts import collect_debug_nodes
 
@@ -2250,6 +2253,7 @@ def compile_headless(
         trim_heads=trim_heads,
         optimize=optimize,
         assume_zero_init=assume_zero_init,
+        bias=bias,
     )
 
     assert net.residual_assignment is not None

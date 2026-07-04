@@ -101,6 +101,7 @@ def graph_fingerprint(
     cancel_slack: Optional[int],
     policy,
     reserve_residual: int = 0,
+    bias: bool = True,
 ) -> str:
     """Topology + geometry + solver-knob hash for the CP-SAT schedule cache.
 
@@ -138,6 +139,12 @@ def graph_fingerprint(
     }
     if reserve_residual:
         payload["reserve_residual"] = reserve_residual
+    # bias=False reserves hidden slot 0 (the constant lane), changing the
+    # modeled slot capacity, hence the schedule — it MUST key the cache.
+    # Added only when False (the ``reserve_residual`` compatibility pattern)
+    # so every existing biased-compile entry keeps hashing byte-identically.
+    if not bias:
+        payload["bias"] = False
     encoded = json.dumps(payload, sort_keys=True, default=str).encode("utf-8")
     return hashlib.sha256(encoded).hexdigest()
 

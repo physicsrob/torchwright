@@ -298,6 +298,8 @@ def _run_heuristic_warm_start(
     residual_map: ResidualStreamMap,
     computed: Set[Node],
     clusters,
+    *,
+    bias: bool = True,
     admission_budget_fraction: float,
     policy: Optional[SchedulingPolicy],
     output_node: Node,
@@ -332,6 +334,7 @@ def _run_heuristic_warm_start(
         # incumbent to improve from (d=4096/d_head=32: 87 -> ~81 vs the eager
         # heuristic's 85).  The heuristic *fallback* below stays eager.
         eager_free=False,
+        bias=bias,
     )
     hint_layers: dict = {}
     hint_routing: dict = {}
@@ -516,14 +519,18 @@ def _count_heads_by_type(
     return counts
 
 
-def _params_per_slot(d: int, activation: str) -> int:
+def _params_per_slot(d: int, activation: str, bias: bool = True) -> int:
     """Parameters one occupied hidden slot costs, by machine.
 
     ReLU machine: a linear1 column + bias and a linear2 row + bias
     (``2d + 2``).  Swish machine: gate and up columns + biases and a down
-    row + bias (``3d + 3``).  Independent of ``d_hidden``.
+    row + bias (``3d + 3``).  Under ``bias=False`` each per-slot bias entry
+    relocates 1:1 to a const-column matrix cell except the output-side one,
+    which is shared per layer (the constant lane) rather than per slot —
+    ``2d + 1`` / ``3d + 2``.  Independent of ``d_hidden``.
     """
-    return (3 * d + 3) if activation == "swish" else (2 * d + 2)
+    per_slot = (3 * d + 3) if activation == "swish" else (2 * d + 2)
+    return per_slot if bias else per_slot - 1
 
 
 def _count_layer_params(
@@ -532,12 +539,14 @@ def _count_layer_params(
     d: int,
     d_head: int,
     activation: str = "relu",
+    bias: bool = True,
 ) -> int:
     """Count transformer parameters used by one layer's ops.
 
     Attention ops consume whole heads (4 * d * d_head params each).
     MLP ops consume slots (:func:`_params_per_slot` each) or bias
-    entries (1 each).
+    entries (1 each — under ``bias=False`` these are constant-lane
+    down-row cells, same count).
     """
     params_per_head = 4 * d * d_head
 
@@ -570,7 +579,7 @@ def _count_layer_params(
         if mlp_op.op_type in ("compute_literal_value", "compute_bias"):
             bias_entries += len(mlp_op.target_cols)
 
-    params_per_slot = _params_per_slot(d, activation)
+    params_per_slot = _params_per_slot(d, activation, bias)
     return heads_used * params_per_head + slots_used * params_per_slot + bias_entries
 
 
@@ -598,6 +607,7 @@ def forward_compile(
     rms_norm: bool = False,
     rms_norm_eps: float = 1e-5,
     rms_norm_const_exp: int = _RMS_NORM_CONST_EXP,
+    bias: bool = True,
 ) -> HeadlessTransformer:
     """Compile a computation graph into a HeadlessTransformer.
 
@@ -673,6 +683,19 @@ def forward_compile(
             give the deepest-layer data energy margin under ``2^(2q-24)`` or the
             identity silently breaks (see :data:`_RMS_NORM_CONST_EXP`).  Ignored
             when ``rms_norm`` is False.
+        bias: When True (default), MLP biases are physical bias vectors —
+            today's behavior, unchanged.  When False, no bias parameters
+            exist anywhere in the compiled transformer: every bias write
+            folds into the weight matrices against the pinned constant-1
+            column — hidden-side biases as const-column rows, output-side
+            constants (literals, deferred Linear biases, FFN out biases)
+            through the constant lane at hidden slot 0, which both
+            schedulers reserve (effective capacity ``d_hidden - 1``; the
+            schedule-cache fingerprint keys on the flag).  Machine-
+            independent (works on ReLU and swish alike); requires
+            ``d_hidden >= 2``.  In-process bias tensors remain as zeros so
+            probes and debug work unchanged; the ONNX exporter emits no
+            bias initializers.  See docs/no_bias_plan.md.
 
     Returns:
         A HeadlessTransformer whose compute() method reproduces
@@ -757,9 +780,17 @@ def forward_compile(
 
     if d_hidden is None:
         d_hidden = d
+    if not bias and d_hidden < 2:
+        raise ValueError(
+            f"bias=False reserves hidden slot 0 for the constant lane, so "
+            f"d_hidden must be at least 2 (got {d_hidden})."
+        )
 
     # 2. Initialize
     net = HeadlessTransformer(d, d_head, d_hidden=d_hidden, activation=activation)
+    # Emission mode: False means no physical bias parameters (the exporter
+    # reads this; in-process bias tensors stay as zeros).
+    net.bias = bias
     # Solver provenance, populated only when CP-SAT runs (optimize>0); stays
     # None for the heuristic path so callers can always query it.
     net.cpsat_solve_stats = None
@@ -853,6 +884,12 @@ def forward_compile(
         len(net.rms_norm_spec.reserved_cols) if net.rms_norm_spec is not None else 0
     )
 
+    # bias=False reserves hidden slot 0 (the constant lane), so the solver's
+    # cumulative slot capacity must drop by one — mirroring the heuristic's
+    # slot-1 packing base — or a solver-feasible layer that exactly fills
+    # d_hidden is unpackable on replay.
+    solver_d_hidden = d_hidden if bias else d_hidden - 1
+
     if use_cpsat:
         # Architecture doc §3 marks admission_control as a model
         # precondition; the CP-SAT cumulative does not represent the
@@ -886,6 +923,7 @@ def forward_compile(
             cancel_slack=2,
             policy=policy,
             reserve_residual=n_reserved_residual,
+            bias=bias,
         )
         cached = load_assignment(schedule_fp, output_node)
         if cached is not None:
@@ -931,6 +969,7 @@ def forward_compile(
                     policy=policy,
                     output_node=output_node,
                     max_layers=max_layers,
+                    bias=bias,
                 )
             )
             if verbose:
@@ -986,7 +1025,7 @@ def forward_compile(
                         pos_encoding,
                         d=d,
                         d_head=d_head,
-                        d_hidden=d_hidden,
+                        d_hidden=solver_d_hidden,
                         costs=cpsat_costs,
                         flex_routing=cpsat_flex_routing,
                         time_budget_s=probe_budget,
@@ -1021,7 +1060,7 @@ def forward_compile(
                     pos_encoding,
                     d=d,
                     d_head=d_head,
-                    d_hidden=d_hidden,
+                    d_hidden=solver_d_hidden,
                     costs=cpsat_costs,
                     flex_routing=cpsat_flex_routing,
                     time_budget_s=cpsat_time_budget_s,
@@ -1121,6 +1160,7 @@ def forward_compile(
                 policy=policy,
                 # Fallback resolves statically, same as optimize=0.
                 realization_table=lowered.realization_table.resolve_static(policy),
+                bias=bias,
             )
         else:
             if verbose and net.cpsat_solve_stats.status_name != "CACHED":
@@ -1144,6 +1184,7 @@ def forward_compile(
                 realization_table=lowered.realization_table.resolve_from_assignment(
                     assignment.node_to_routing
                 ),
+                bias=bias,
             )
     else:
         scheduler = LayerScheduler(
@@ -1157,6 +1198,7 @@ def forward_compile(
             policy=policy,
             # The static policy is the optimize=0 resolver.
             realization_table=lowered.realization_table.resolve_static(policy),
+            bias=bias,
         )
 
     # Realization completeness: every schedulable node's entry is resolved
@@ -1185,6 +1227,10 @@ def forward_compile(
     layer_capacity = (
         4 * d * d + n_mlp_mats * d * d_hidden + (n_mlp_mats - 1) * d_hidden + d
     )
+    if not bias:
+        # No bias vectors in the emitted artifact (in-process they remain as
+        # zero tensors, which this display capacity does not count).
+        layer_capacity = 4 * d * d + n_mlp_mats * d * d_hidden
 
     if verbose:
         print(
@@ -1255,6 +1301,8 @@ def forward_compile(
             residual_map,
             set(biased_linears),
             recorder=placement_recorder,
+            const_one=const_one,
+            bias=bias,
         )
         t_layer_end = time.perf_counter()
 
@@ -1287,7 +1335,9 @@ def forward_compile(
             for node in computed - prev_computed:
                 on_node_scheduled(node, i)
 
-        layer_params = _count_layer_params(attn_ops, mlp_ops, d, d_head, activation)
+        layer_params = _count_layer_params(
+            attn_ops, mlp_ops, d, d_head, activation, bias
+        )
         per_layer_head_counts.append(_count_heads_by_type(attn_ops, d_head))
         total_params += layer_params
         occupied_after = d - residual_map.get_free_count()
@@ -1442,7 +1492,7 @@ def forward_compile(
         if verbose:
             mlp_before = d_hidden * len(net.layers)
             mlp_after = sum(layer.mlp.d_hidden for layer in net.layers)
-            mlp_saved = (mlp_before - mlp_after) * _params_per_slot(d, activation)
+            mlp_saved = (mlp_before - mlp_after) * _params_per_slot(d, activation, bias)
             print(
                 f"\n  MLP trimming: {mlp_before - mlp_after}/{mlp_before} "
                 f"slots trimmed ({mlp_saved:,} params saved)"

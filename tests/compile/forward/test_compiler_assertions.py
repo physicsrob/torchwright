@@ -295,3 +295,68 @@ def test_reserve_blocks_subsequent_allocation():
     rmap.allocate(a)
     # a must get the unreserved columns [4,5,6,7], not the reserved ones.
     assert rmap.get_indices(a) == [4, 5, 6, 7]
+
+
+# ---------------------------------------------------------------------------
+# bias=False writer contracts (docs/no_bias_plan.md)
+# ---------------------------------------------------------------------------
+
+
+def _no_bias_setup():
+    """Residual map with the pinned const-1 column allocated."""
+    rmap = ResidualStreamMap(D)
+    const_one = LiteralValue(torch.ones(1), name="const_one")
+    rmap.allocate(const_one)
+    return rmap, const_one
+
+
+def test_no_bias_slot0_claim_fires():
+    """An MLPOp claiming hidden slot 0 under bias=False is a scheduler bug:
+    slot 0 is the constant lane, packing must start at slot 1."""
+    from torchwright.compiler.forward.weight_writer import write_mlp_sublayer
+    from torchwright.graph import FFN
+
+    rmap, const_one = _no_bias_setup()
+    x = InputNode("x", 4, value_range=(-1.0, 1.0))
+    rmap.allocate(x)
+    ffn = FFN(
+        x,
+        gate_proj=torch.randn(4, 4),
+        gate_bias=torch.zeros(4),
+        out_proj=torch.randn(4, 4),
+        out_bias=torch.zeros(4),
+        activation="relu",
+    )
+    cols = rmap.allocate(ffn)
+    op = MLPOp("compute_ffn", ffn, cols, mlp_slots=[0, 1, 2, 3], source_cols=rmap.get_indices(x))
+    layer = TransformerLayer(D, D_HEAD)
+    with pytest.raises(AssertionError, match="constant lane"):
+        write_mlp_sublayer(layer, [op], rmap, const_one=const_one, bias=False)
+
+
+def test_no_bias_const_column_aliasing_fires():
+    """An FFN whose captured input columns include the pinned constant-1
+    column would collide with the bias-fold row — the writer must refuse."""
+    from torchwright.compiler.forward.weight_writer import write_mlp_sublayer
+    from torchwright.graph import FFN
+
+    rmap, const_one = _no_bias_setup()
+    x = InputNode("x", 4, value_range=(-1.0, 1.0))
+    rmap.allocate(x)
+    ffn = FFN(
+        x,
+        gate_proj=torch.randn(4, 4),
+        gate_bias=torch.zeros(4),
+        out_proj=torch.randn(4, 4),
+        out_bias=torch.zeros(4),
+        activation="relu",
+    )
+    cols = rmap.allocate(ffn)
+    # Forge source columns that alias the const-1 column (never producible
+    # by the allocator; the assert is the backstop).
+    bad_source = list(rmap.get_indices(x))
+    bad_source[0] = rmap.get_indices(const_one)[0]
+    op = MLPOp("compute_ffn", ffn, cols, mlp_slots=[1, 2, 3, 4], source_cols=bad_source)
+    layer = TransformerLayer(D, D_HEAD)
+    with pytest.raises(AssertionError, match="constant-1 column"):
+        write_mlp_sublayer(layer, [op], rmap, const_one=const_one, bias=False)

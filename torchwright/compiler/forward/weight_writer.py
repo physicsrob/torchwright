@@ -21,7 +21,12 @@ from torchwright.graph.rope import ROPE_BASE
 # The swish machine's hinge-sharpening constant (a sideways import of a leaf
 # constants module — ops/const.py has no imports, so no cycle).  Used only by
 # the swish bypass pair below; ops fold it into FFN weights themselves.
-from torchwright.ops.const import scale as _SWISH_SCALE
+# The bias-lane constants build the no-bias constant lane (see BiasFold).
+from torchwright.ops.const import (
+    bias_lane_gate as _BIAS_LANE_GATE,
+    bias_lane_up as _BIAS_LANE_UP,
+    scale as _SWISH_SCALE,
+)
 
 # Self-match attention hardness: scales the constant-1 self-match logit so the
 # diagonal softmax weight is 1.0 to fp32 (Δ=0 transport is bit-identical).
@@ -170,20 +175,43 @@ def write_mlp_sublayer(
     residual_map: ResidualStreamMap,
     biased_linears: Optional[Set[Node]] = None,
     recorder: Optional[PlacementRecorder] = None,
+    const_one: Optional[Node] = None,
+    bias: bool = True,
 ):
-    """Write MLP operations into a layer's MLPSubLayer components."""
+    """Write MLP operations into a layer's MLPSubLayer components.
+
+    Under ``bias=False`` (docs/no_bias_plan.md) every bias write folds into
+    the weight matrices against the pinned constant-1 column: hidden-side
+    biases as const-column rows, output-side constants through the constant
+    lane at hidden slot 0 (see :class:`BiasFold`).  ``const_one`` is required
+    then; the scheduler must have reserved slot 0 (packing from slot 1).
+    """
     if biased_linears is None:
         biased_linears = set()
+    bias_fold: Optional[BiasFold] = None
+    if not bias:
+        assert const_one is not None, "bias=False requires const_one"
+        const_col = residual_map.get_indices(const_one)[0]
+        bias_fold = BiasFold(layer.mlp, const_col, recorder)
+        for op in ops:
+            assert BiasFold.LANE_SLOT not in op.mlp_slots, (
+                f"{op.op_type} for {op.node!r} claims hidden slot "
+                f"{BiasFold.LANE_SLOT}, which bias=False reserves for the "
+                f"constant lane — the scheduler must pack from slot 1. "
+                f"Compiler bug."
+            )
     for op in ops:
         if op.op_type == "compute_ffn":
-            _write_compute_ffn(layer.mlp, op, residual_map, biased_linears, recorder)
+            _write_compute_ffn(
+                layer.mlp, op, residual_map, biased_linears, recorder, bias_fold
+            )
         elif op.op_type == "compute_literal_value":
-            _write_compute_literal_value(layer.mlp, op)
+            _write_compute_literal_value(layer.mlp, op, bias_fold)
         elif op.op_type == "compute_bias":
-            _write_compute_bias(layer.mlp, op)
+            _write_compute_bias(layer.mlp, op, bias_fold)
         elif op.op_type == "compute_linear_bypass":
             _write_compute_linear_bypass(
-                layer.mlp, op, residual_map, biased_linears, recorder
+                layer.mlp, op, residual_map, biased_linears, recorder, bias_fold
             )
         else:
             raise ValueError(f"Unknown mlp op_type: {op.op_type}")
@@ -645,6 +673,120 @@ def _write_add_into(
 # ---------------------------------------------------------------------------
 
 
+class BiasFold:
+    """Bias-write redirector for ``bias=False`` compiles (docs/no_bias_plan.md).
+
+    Hidden-side biases (**fold 1**) become rows of the input-side matrices at
+    the pinned constant-1 column: that residual column always holds exactly
+    1.0, so the matmul picks up the bias term.  Output-side constants
+    (**fold 2** — literals, deferred Linear biases, FFN out biases) route
+    through the **constant lane**: hidden slot 0, reserved by the scheduler
+    under ``bias=False`` and written lazily here to compute exactly 1.0, so
+    its down-projection row carries each constant verbatim.
+
+    Lane exactness: ReLU machine ``ReLU(1·1) = 1``; swish machine
+    ``swish(32·1) · ((1/32)·1) = 32 · σ(32) · 2⁻⁵ = 1.0`` bit-exactly — fp32
+    σ saturates to 1.0 from z ≥ 17 (torch/ORT-CUDA; z ≥ 18 CPU-ORT, the A0
+    probes) and both lane constants are powers of two, so no product rounds.
+    Constants live in ``ops/const.py`` (``bias_lane_gate``/``bias_lane_up``).
+    """
+
+    LANE_SLOT = 0
+
+    def __init__(
+        self,
+        mlp,
+        const_col: int,
+        recorder: Optional[PlacementRecorder] = None,
+    ):
+        self.mlp = mlp
+        self.const_col = const_col
+        self.recorder = recorder
+        self._lane_written = False
+
+    def hidden_bias(
+        self,
+        lin,
+        matrix_kind: str,
+        slots: List[int],
+        values: torch.Tensor,
+        *,
+        node: Node,
+        op_type: str,
+        accumulate: bool = False,
+    ) -> None:
+        """Fold 1: write ``values`` at ``lin.output_matrix[const_col, slots]``."""
+        slots_t = torch.as_tensor(slots, dtype=torch.long)
+        vals = values.to(lin.output_matrix.dtype)
+        if accumulate:
+            lin.output_matrix[self.const_col, slots_t] += vals
+        else:
+            lin.output_matrix[self.const_col, slots_t] = vals
+        if self.recorder is not None:
+            self.recorder.add(
+                matrix_kind, node, op_type, [self.const_col], list(slots), "dense"
+            )
+
+    def out_bias(
+        self,
+        out_lin,
+        cols: List[int],
+        values: torch.Tensor,
+        *,
+        node: Node,
+        op_type: str,
+        accumulate: bool = False,
+    ) -> None:
+        """Fold 2: write ``values`` at the constant lane's down-projection row."""
+        vals = values.to(out_lin.output_matrix.dtype)
+        if not bool((vals != 0).any()):
+            # An all-zero write contributes nothing whether or not the lane
+            # exists — skip so a zero-bias layer never activates the lane.
+            return
+        self._ensure_lane(node, op_type)
+        cols_t = torch.as_tensor(cols, dtype=torch.long)
+        if accumulate:
+            out_lin.output_matrix[self.LANE_SLOT, cols_t] += vals
+        else:
+            out_lin.output_matrix[self.LANE_SLOT, cols_t] = vals
+        if self.recorder is not None:
+            self.recorder.add(
+                "mlp.W_out", node, op_type, [self.LANE_SLOT], list(cols), "dense"
+            )
+
+    def _ensure_lane(self, node: Node, op_type: str) -> None:
+        """Write the lane's gate/up rows once per layer, on first use."""
+        if self._lane_written:
+            return
+        self._lane_written = True
+        in_lin, _ = _mlp_in_out(self.mlp)
+        assert in_lin.output_matrix[self.const_col, self.LANE_SLOT] == 0.0, (
+            f"constant-lane slot {self.LANE_SLOT} gate cell already written — "
+            f"the scheduler must reserve slot {self.LANE_SLOT} under "
+            f"bias=False.  Compiler bug."
+        )
+        if self.mlp.activation == "swish":
+            in_lin.output_matrix[self.const_col, self.LANE_SLOT] = _BIAS_LANE_GATE
+            self.mlp.up_proj.output_matrix[self.const_col, self.LANE_SLOT] = (
+                _BIAS_LANE_UP
+            )
+        else:
+            in_lin.output_matrix[self.const_col, self.LANE_SLOT] = 1.0
+        if self.recorder is not None:
+            self.recorder.add(
+                "mlp.W_in", node, op_type, [self.const_col], [self.LANE_SLOT], "dense"
+            )
+            if self.mlp.activation == "swish":
+                self.recorder.add(
+                    "mlp.W_up",
+                    node,
+                    op_type,
+                    [self.const_col],
+                    [self.LANE_SLOT],
+                    "dense",
+                )
+
+
 def _mlp_in_out(mlp):
     """The hidden pool's (input-side, output-side) projections, either machine.
 
@@ -663,6 +805,7 @@ def _write_compute_ffn(
     rmap: ResidualStreamMap,
     biased_linears: Optional[Set[Node]] = None,
     recorder: Optional[PlacementRecorder] = None,
+    bias_fold: Optional[BiasFold] = None,
 ):
     """Compile an :class:`FFN` through the MLP sublayer (either machine).
 
@@ -716,16 +859,32 @@ def _write_compute_ffn(
     in_lin, out_lin = _mlp_in_out(mlp)
     target_dtype = in_lin.output_matrix.dtype
 
+    # The const-column rows are the bias-fold destination and must never
+    # alias a real input row (const_one is compiler-internal, so no graph
+    # node can resolve to its column — this pins that invariant).
+    if bias_fold is not None:
+        assert bias_fold.const_col not in set(in_idx), (
+            f"compute_ffn input for {ffn!r} reads the pinned constant-1 "
+            f"column {bias_fold.const_col}, which bias=False uses as the "
+            f"bias-fold row.  Compiler bug."
+        )
+
     # Input-side projection: rows=input columns, cols=mlp slots.  gate matrix
     # is (d_input, n_lanes) = gate_proj.T; gate bias is (n_lanes,).
     gate_matrix = ffn.gate_proj.t()
     in_lin.output_matrix[in_idx_t.unsqueeze(1), slots_t.unsqueeze(0)] = gate_matrix.to(
         target_dtype
     )
-    in_lin.output_bias[slots_t] = ffn.gate_bias.to(target_dtype)
+    if bias_fold is None:
+        in_lin.output_bias[slots_t] = ffn.gate_bias.to(target_dtype)
+    else:
+        bias_fold.hidden_bias(
+            in_lin, "mlp.W_in", mlp_slots, ffn.gate_bias, node=ffn, op_type=op.op_type
+        )
 
     # Swish machine: the up-side rows.  A degenerate lane's up factor is the
-    # constant 1 (row 0, bias 1); a gated lane carries its own affine.
+    # constant 1 (row 0, bias 1 — or, under bias=False, const-column row 1);
+    # a gated lane carries its own affine.
     up_matrix = None
     if mlp.activation == "swish":
         if ffn.up_proj is None:
@@ -736,7 +895,17 @@ def _write_compute_ffn(
             mlp.up_proj.output_matrix[in_idx_t.unsqueeze(1), slots_t.unsqueeze(0)] = (
                 up_matrix.to(target_dtype)
             )
-        mlp.up_proj.output_bias[slots_t] = up_bias.to(target_dtype)
+        if bias_fold is None:
+            mlp.up_proj.output_bias[slots_t] = up_bias.to(target_dtype)
+        else:
+            bias_fold.hidden_bias(
+                mlp.up_proj,
+                "mlp.W_up",
+                mlp_slots,
+                up_bias,
+                node=ffn,
+                op_type=op.op_type,
+            )
 
     # Fold deferred biased-Linear inputs into the hidden biases, because the
     # FFN reads those columns in the input-side matmuls (gate, and up when
@@ -752,12 +921,34 @@ def _write_compute_ffn(
             if leaf in biased_linears:
                 assert isinstance(leaf, Linear)
                 contrib = leaf.output_bias @ gate_matrix[offset : offset + len(leaf), :]
-                in_lin.output_bias[slots_t] += contrib.to(target_dtype)
+                if bias_fold is None:
+                    in_lin.output_bias[slots_t] += contrib.to(target_dtype)
+                else:
+                    bias_fold.hidden_bias(
+                        in_lin,
+                        "mlp.W_in",
+                        mlp_slots,
+                        contrib,
+                        node=ffn,
+                        op_type=op.op_type,
+                        accumulate=True,
+                    )
                 if up_matrix is not None:
                     up_contrib = (
                         leaf.output_bias @ up_matrix[offset : offset + len(leaf), :]
                     )
-                    mlp.up_proj.output_bias[slots_t] += up_contrib.to(target_dtype)
+                    if bias_fold is None:
+                        mlp.up_proj.output_bias[slots_t] += up_contrib.to(target_dtype)
+                    else:
+                        bias_fold.hidden_bias(
+                            mlp.up_proj,
+                            "mlp.W_up",
+                            mlp_slots,
+                            up_contrib,
+                            node=ffn,
+                            op_type=op.op_type,
+                            accumulate=True,
+                        )
             offset += len(leaf)
 
     # Output-side projection: rows=mlp slots, cols=output columns.  out_proj
@@ -765,7 +956,10 @@ def _write_compute_ffn(
     out_lin.output_matrix[slots_t.unsqueeze(1), out_idx_t.unsqueeze(0)] = (
         ffn.out_proj.to(target_dtype)
     )
-    out_lin.output_bias[out_idx_t] = ffn.out_bias.to(target_dtype)
+    if bias_fold is None:
+        out_lin.output_bias[out_idx_t] = ffn.out_bias.to(target_dtype)
+    else:
+        bias_fold.out_bias(out_lin, out_idx, ffn.out_bias, node=ffn, op_type=op.op_type)
 
     if recorder is not None:
         # All dense weight blocks attributed to the FFN node (it carries all
@@ -778,8 +972,13 @@ def _write_compute_ffn(
         recorder.add("mlp.W_out", ffn, op.op_type, mlp_slots, out_idx, "dense")
 
 
-def _write_compute_literal_value(mlp, op: MLPOp):
-    """Write a constant value via MLP output bias."""
+def _write_compute_literal_value(mlp, op: MLPOp, bias_fold: Optional[BiasFold] = None):
+    """Write a constant value via MLP output bias (or the constant lane).
+
+    Under ``bias=False`` the value rides the constant lane's down-projection
+    row instead: the lane's value is exactly 1.0 and no other lane touches a
+    literal's columns, so the constant still lands bit-exactly.
+    """
     node = op.node
     assert isinstance(node, LiteralValue)
     assert len(op.target_cols) == node.value.numel(), (
@@ -788,14 +987,23 @@ def _write_compute_literal_value(mlp, op: MLPOp):
         f"target_cols len={len(op.target_cols)}. "
         f"Slicing would silently lose trailing entries — compiler bug."
     )
-    cols_t = torch.as_tensor(op.target_cols, dtype=torch.long)
     out_lin = _mlp_in_out(mlp)[1]
+    if bias_fold is not None:
+        bias_fold.out_bias(
+            out_lin, op.target_cols, node.value, node=node, op_type=op.op_type
+        )
+        return
+    cols_t = torch.as_tensor(op.target_cols, dtype=torch.long)
     target_dtype = out_lin.output_bias.dtype
     out_lin.output_bias[cols_t] = node.value.to(target_dtype)
 
 
-def _write_compute_bias(mlp, op: MLPOp):
-    """Add bias to MLP output bias (for biased Linear split)."""
+def _write_compute_bias(mlp, op: MLPOp, bias_fold: Optional[BiasFold] = None):
+    """Add bias to MLP output bias (for biased Linear split).
+
+    Under ``bias=False`` the deferred bias rides the constant lane's
+    down-projection row — same layer, same ordering as the bias add.
+    """
     node = op.node
     assert isinstance(node, Linear)
     assert len(op.target_cols) == node.output_bias.numel(), (
@@ -804,8 +1012,18 @@ def _write_compute_bias(mlp, op: MLPOp):
         f"target_cols len={len(op.target_cols)}. "
         f"Slicing would silently lose trailing entries — compiler bug."
     )
-    cols_t = torch.as_tensor(op.target_cols, dtype=torch.long)
     out_lin = _mlp_in_out(mlp)[1]
+    if bias_fold is not None:
+        bias_fold.out_bias(
+            out_lin,
+            op.target_cols,
+            node.output_bias,
+            node=node,
+            op_type=op.op_type,
+            accumulate=True,
+        )
+        return
+    cols_t = torch.as_tensor(op.target_cols, dtype=torch.long)
     target_dtype = out_lin.output_bias.dtype
     out_lin.output_bias[cols_t] += node.output_bias.to(target_dtype)
 
@@ -816,6 +1034,7 @@ def _write_compute_linear_bypass(
     rmap: ResidualStreamMap,
     biased_linears: Optional[Set[Node]] = None,
     recorder: Optional[PlacementRecorder] = None,
+    bias_fold: Optional[BiasFold] = None,
 ):
     """Compile a standalone Linear via MLP using the activation bypass pair.
 
@@ -862,6 +1081,15 @@ def _write_compute_linear_bypass(
     in_gain = _SWISH_SCALE if swish else 1.0
     out_gain = 1.0 / _SWISH_SCALE if swish else 1.0
 
+    # See the matching assert in _write_compute_ffn: the const-column rows
+    # are the bias-fold destination and must never alias a real input row.
+    if bias_fold is not None:
+        assert bias_fold.const_col not in set(in_idx), (
+            f"compute_linear_bypass input for {node!r} reads the pinned "
+            f"constant-1 column {bias_fold.const_col}, which bias=False uses "
+            f"as the bias-fold row.  Compiler bug."
+        )
+
     target_dtype = in_lin.output_matrix.dtype
     W = node.output_matrix.to(target_dtype)  # (d_input, d_output)
 
@@ -874,8 +1102,18 @@ def _write_compute_linear_bypass(
 
     # Swish machine: both slot halves are degenerate lanes (up ≡ 1).
     if swish:
-        mlp.up_proj.output_bias[pos_slots_t] = 1.0
-        mlp.up_proj.output_bias[neg_slots_t] = 1.0
+        if bias_fold is None:
+            mlp.up_proj.output_bias[pos_slots_t] = 1.0
+            mlp.up_proj.output_bias[neg_slots_t] = 1.0
+        else:
+            bias_fold.hidden_bias(
+                mlp.up_proj,
+                "mlp.W_up",
+                mlp_slots,
+                torch.ones(len(mlp_slots)),
+                node=node,
+                op_type=op.op_type,
+            )
 
     # Fold deferred biased-Linear inputs into the input-side slot biases
     # (scaled with the gate rows; the up rows are zero, so no up-side fold).
@@ -895,8 +1133,28 @@ def _write_compute_linear_bypass(
                 contrib = (
                     in_gain * (leaf.output_bias @ W[offset : offset + len(leaf), :])
                 ).to(bias_dtype)
-                in_lin.output_bias[pos_slots_t] += contrib
-                in_lin.output_bias[neg_slots_t] -= contrib
+                if bias_fold is None:
+                    in_lin.output_bias[pos_slots_t] += contrib
+                    in_lin.output_bias[neg_slots_t] -= contrib
+                else:
+                    bias_fold.hidden_bias(
+                        in_lin,
+                        "mlp.W_in",
+                        pos_slots,
+                        contrib,
+                        node=node,
+                        op_type=op.op_type,
+                        accumulate=True,
+                    )
+                    bias_fold.hidden_bias(
+                        in_lin,
+                        "mlp.W_in",
+                        neg_slots,
+                        -contrib,
+                        node=node,
+                        op_type=op.op_type,
+                        accumulate=True,
+                    )
             offset += len(leaf)
 
     # Output side: positive slots write +out_gain to output columns,
@@ -905,8 +1163,18 @@ def _write_compute_linear_bypass(
     out_lin.output_matrix[pos_slots_t, out_idx_t] = out_gain
     out_lin.output_matrix[neg_slots_t, out_idx_t] = -out_gain
 
-    # Output bias via the output-side projection's bias.
-    out_lin.output_bias[out_idx_t] += node.output_bias.to(target_dtype)
+    # Output bias via the output-side projection's bias (or the constant lane).
+    if bias_fold is None:
+        out_lin.output_bias[out_idx_t] += node.output_bias.to(target_dtype)
+    else:
+        bias_fold.out_bias(
+            out_lin,
+            out_idx,
+            node.output_bias,
+            node=node,
+            op_type=op.op_type,
+            accumulate=True,
+        )
 
     if recorder is not None:
         # W_in: dense ±W blocks into the positive and negative slot halves.

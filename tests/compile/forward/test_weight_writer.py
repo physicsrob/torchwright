@@ -14,6 +14,8 @@ Conventions:
 
 from typing import cast, Literal
 
+import pytest
+
 import torch
 import torch.nn.functional as F
 
@@ -1488,3 +1490,243 @@ def test_machine_mismatch_asserts():
     )
     with pytest.raises(AssertionError, match="no up projection"):
         write_mlp_sublayer(TransformerLayer(D, D_HEAD), [op3], rmap3)
+
+
+# ---------------------------------------------------------------------------
+# No-bias emission (bias=False): the two folds and the constant lane
+# ---------------------------------------------------------------------------
+
+
+def _assert_bias_vectors_zero(layer):
+    """bias=False must leave every physical bias vector untouched (zero)."""
+    mlp = layer.mlp
+    if mlp.activation == "swish":
+        vecs = {
+            "gate": mlp.gate_proj.output_bias,
+            "up": mlp.up_proj.output_bias,
+            "down": mlp.down_proj.output_bias,
+        }
+    else:
+        vecs = {"linear1": mlp.linear1.output_bias, "linear2": mlp.linear2.output_bias}
+    for name, v in vecs.items():
+        assert (v == 0.0).all(), f"bias=False wrote the {name} bias vector"
+
+
+def _const_col(rmap, const_one):
+    return rmap.get_indices(const_one)[0]
+
+
+@pytest.mark.parametrize("activation", ["relu", "swish"])
+def test_no_bias_literal_bit_exact(activation):
+    """A literal under bias=False rides the constant lane and lands
+    BITWISE-equal: the lane's value is exactly 1.0 (power-of-two gate/up,
+    saturated sigma) and no other lane touches the literal's columns."""
+    const_value = torch.tensor([1.0, -2.0, 3.5, 0.3333333])
+    const = LiteralValue(const_value)
+
+    rmap = ResidualStreamMap(D)
+    c1 = _const_one(rmap)
+    out_cols = rmap.allocate(const)
+
+    layer = TransformerLayer(D, D_HEAD, activation=activation)
+    op = _make_mlp_op(rmap, "compute_literal_value", const, out_cols)
+    write_mlp_sublayer(layer, [op], rmap, const_one=c1, bias=False)
+    _assert_bias_vectors_zero(layer)
+
+    # The lane's input-side cells landed at the const column of slot 0.
+    cc = _const_col(rmap, c1)
+    if activation == "swish":
+        assert layer.mlp.gate_proj.output_matrix[cc, 0].item() == 32.0
+        assert layer.mlp.up_proj.output_matrix[cc, 0].item() == 2.0**-5
+    else:
+        assert layer.mlp.linear1.output_matrix[cc, 0].item() == 1.0
+
+    layer.to(device_mod.get_device(verbose=False))
+    res = _build_residual_stream(rmap, {})
+    out = layer.mlp.forward(res)
+    expected = const.compute(N_POS, {})
+    assert torch.equal(out[:, out_cols].cpu(), expected), (
+        f"literal not bit-exact under bias=False: "
+        f"{out[:, out_cols].cpu()} vs {expected}"
+    )
+
+
+@pytest.mark.parametrize("gated", [True, False])
+def test_no_bias_swish_ffn_const_row(gated):
+    """A swish FFN under bias=False: gate/up biases land as const-column
+    rows (a degenerate lane's up signature is const-row 1.0), out_bias
+    rides the lane, and the compiled value still matches the oracle."""
+    x = InputNode("x", 4, value_range=(-10.0, 10.0))
+    ffn = _swish_ffn(x, gated=gated)
+    slots = list(range(1, 7))  # slot 0 is the constant lane
+
+    rmap = ResidualStreamMap(D)
+    c1 = _const_one(rmap)
+    rmap.allocate(x)
+    out_cols = rmap.allocate(ffn)
+
+    layer = TransformerLayer(D, D_HEAD, activation="swish")
+    op = _make_mlp_op(rmap, "compute_ffn", ffn, out_cols, mlp_slots=slots)
+    write_mlp_sublayer(layer, [op], rmap, const_one=c1, bias=False)
+    _assert_bias_vectors_zero(layer)
+
+    cc = _const_col(rmap, c1)
+    assert torch.equal(
+        layer.mlp.gate_proj.output_matrix[cc, slots].cpu(), ffn.gate_bias
+    )
+    if gated:
+        assert torch.equal(
+            layer.mlp.up_proj.output_matrix[cc, slots].cpu(), ffn.up_bias
+        )
+    else:
+        assert (layer.mlp.up_proj.output_matrix[cc, slots] == 1.0).all()
+
+    layer.to(device_mod.get_device(verbose=False))
+    x_values = torch.randn(N_POS, 4)
+    res = _build_residual_stream(rmap, {x: x_values})
+    out = layer.mlp.forward(res)
+    expected = ffn.compute(N_POS, {"x": x_values})
+    assert torch.allclose(out[:, out_cols].cpu(), expected, atol=1e-4)
+
+
+def test_no_bias_relu_ffn():
+    """A relu FFN under bias=False: gate bias as const-column row, out
+    bias via the lane, oracle agreement."""
+    from torchwright.graph import FFN
+
+    x = InputNode("x", 4, value_range=(-10.0, 10.0))
+    g = torch.Generator().manual_seed(3)
+    ffn = FFN(
+        x,
+        gate_proj=torch.randn(6, 4, generator=g),
+        gate_bias=torch.randn(6, generator=g),
+        out_proj=torch.randn(6, 3, generator=g),
+        out_bias=torch.randn(3, generator=g),
+        activation="relu",
+        name="relu_ffn",
+    )
+    slots = list(range(1, 7))
+
+    rmap = ResidualStreamMap(D)
+    c1 = _const_one(rmap)
+    rmap.allocate(x)
+    out_cols = rmap.allocate(ffn)
+
+    layer = TransformerLayer(D, D_HEAD)
+    op = _make_mlp_op(rmap, "compute_ffn", ffn, out_cols, mlp_slots=slots)
+    write_mlp_sublayer(layer, [op], rmap, const_one=c1, bias=False)
+    _assert_bias_vectors_zero(layer)
+
+    layer.to(device_mod.get_device(verbose=False))
+    x_values = torch.randn(N_POS, 4)
+    res = _build_residual_stream(rmap, {x: x_values})
+    out = layer.mlp.forward(res)
+    expected = ffn.compute(N_POS, {"x": x_values})
+    assert torch.allclose(out[:, out_cols].cpu(), expected, atol=1e-4)
+
+
+def test_no_bias_deferred_bias_fold():
+    """The deferred biased-Linear fold under bias=False targets the
+    const-column rows of gate AND up instead of the hidden bias vectors."""
+    x = InputNode("x", 4, value_range=(-10.0, 10.0))
+    W_leaf = torch.randn(4, 5)
+    b_leaf = torch.randn(5)
+    leaf = Linear(x, W_leaf, b_leaf, name="biased_leaf")
+    ffn = _swish_ffn(leaf, n_lanes=6, gated=True, seed=1)
+    slots = list(range(1, 7))
+
+    rmap = ResidualStreamMap(D)
+    c1 = _const_one(rmap)
+    rmap.allocate(x)
+    rmap.allocate(leaf)
+    out_cols = rmap.allocate(ffn)
+
+    layer = TransformerLayer(D, D_HEAD, activation="swish")
+    op = _make_mlp_op(rmap, "compute_ffn", ffn, out_cols, mlp_slots=slots)
+    write_mlp_sublayer(
+        layer, [op], rmap, biased_linears={leaf}, const_one=c1, bias=False
+    )
+    _assert_bias_vectors_zero(layer)
+
+    layer.to(device_mod.get_device(verbose=False))
+    x_values = torch.randn(N_POS, 4)
+    leaf_biasless = x_values @ W_leaf  # deferred-bias contract
+    res = _build_residual_stream(rmap, {x: x_values, leaf: leaf_biasless})
+    out = layer.mlp.forward(res)
+    expected = ffn.compute(N_POS, {"x": x_values})
+    assert torch.allclose(out[:, out_cols].cpu(), expected, atol=1e-4)
+
+
+@pytest.mark.parametrize("activation", ["relu", "swish"])
+def test_no_bias_compute_bias_via_lane(activation):
+    """A deferred compute_bias under bias=False adds the Linear's bias to
+    columns already holding the attention-computed matmul, via the lane."""
+    x = InputNode("x", 4, value_range=(-10.0, 10.0))
+    W = torch.randn(4, 3)
+    b = torch.tensor([0.5, -1.5, 2.0])
+    node = Linear(x, W, b, name="lin")
+
+    rmap = ResidualStreamMap(D)
+    c1 = _const_one(rmap)
+    rmap.allocate(x)
+    out_cols = rmap.allocate(node)
+
+    layer = TransformerLayer(D, D_HEAD, activation=activation)
+    op = _make_mlp_op(rmap, "compute_bias", node, out_cols)
+    write_mlp_sublayer(layer, [op], rmap, const_one=c1, bias=False)
+    _assert_bias_vectors_zero(layer)
+
+    layer.to(device_mod.get_device(verbose=False))
+    x_values = torch.randn(N_POS, 4)
+    matmul_only = x_values @ W  # what the attention head already wrote
+    res = _build_residual_stream(rmap, {x: x_values, node: matmul_only})
+    out = layer.mlp.forward(res)
+    expected = node.compute(N_POS, {"x": x_values})
+    assert torch.allclose(out[:, out_cols].cpu(), expected, atol=1e-5)
+
+
+@pytest.mark.parametrize("activation", ["relu", "swish"])
+def test_no_bias_linear_bypass(activation):
+    """A biased Linear through the MLP bypass under bias=False: folds into
+    const-column rows (degenerate up rows on swish), out bias via lane."""
+    x = InputNode("x", 4, value_range=(-10.0, 10.0))
+    W = torch.randn(4, 3)
+    b = torch.tensor([1.0, -0.5, 0.25])
+    node = Linear(x, W, b, name="lin")
+    d_out = 3
+    slots = list(range(1, 1 + 2 * d_out))
+
+    rmap = ResidualStreamMap(D)
+    c1 = _const_one(rmap)
+    rmap.allocate(x)
+    out_cols = rmap.allocate(node)
+
+    layer = TransformerLayer(D, D_HEAD, activation=activation)
+    op = _make_mlp_op(rmap, "compute_linear_bypass", node, out_cols, mlp_slots=slots)
+    write_mlp_sublayer(layer, [op], rmap, const_one=c1, bias=False)
+    _assert_bias_vectors_zero(layer)
+
+    layer.to(device_mod.get_device(verbose=False))
+    x_values = torch.randn(N_POS, 4)
+    res = _build_residual_stream(rmap, {x: x_values})
+    out = layer.mlp.forward(res)
+    expected = node.compute(N_POS, {"x": x_values})
+    assert torch.allclose(out[:, out_cols].cpu(), expected, atol=1e-4)
+
+
+def test_no_bias_zero_out_bias_leaves_lane_unwritten():
+    """An all-zero output-side write must not activate the constant lane —
+    a layer whose constants are all zero stays lane-free (trimmable)."""
+    const = LiteralValue(torch.zeros(3))
+
+    rmap = ResidualStreamMap(D)
+    c1 = _const_one(rmap)
+    out_cols = rmap.allocate(const)
+
+    layer = TransformerLayer(D, D_HEAD, activation="swish")
+    op = _make_mlp_op(rmap, "compute_literal_value", const, out_cols)
+    write_mlp_sublayer(layer, [op], rmap, const_one=c1, bias=False)
+
+    cc = _const_col(rmap, c1)
+    assert layer.mlp.gate_proj.output_matrix[cc, 0].item() == 0.0
+    assert layer.mlp.up_proj.output_matrix[cc, 0].item() == 0.0
