@@ -170,11 +170,12 @@ class ValueLogger(Node):
 class Assert(Node):
     """Pass-through node that validates its input's value against a predicate.
 
-    Invisible to the compiler — stripped in ``GraphAnalyzer`` before
-    scheduling, so compiled transformer weights are identical with or
-    without Asserts.  During reference evaluation (``reference_eval``)
-    and compiled-graph probing (``probe_compiled``), runs the predicate
-    on the input value and raises ``AssertionError`` on rejection.
+    Invisible to the compiler — ``lower()`` strips wrappers from the
+    compiler-private copy (the source graph keeps them), so compiled
+    transformer weights are identical with or without Asserts.  During
+    reference evaluation (``reference_eval``) and compiled-graph probing
+    (``probe_compiled``), runs the predicate on the input value and
+    raises ``AssertionError`` on rejection.
 
     The raised message incorporates this Assert's ``annotation`` (set by
     the surrounding ``annotate()`` context manager) plus the predicate's
@@ -182,10 +183,10 @@ class Assert(Node):
 
     When ``claimed_type`` is supplied, the Assert also *promotes* the
     wrapped node's static type: downstream graph analysis sees the
-    claimed ``NodeValueType`` on this Assert's output, and the compiler's
-    Assert-stripping pass tightens the wrapped node's ``value_type`` to
-    the intersection of its own inferred type and this claim.  The
-    runtime predicate is the safety net that keeps the claim honest.
+    claimed ``NodeValueType`` on this Assert's output, and the lowering
+    strip tightens the copied wrapped node's ``value_type`` to the
+    intersection of its own inferred type and this claim.  The runtime
+    predicate is the safety net that keeps the claim honest.
     """
 
     def __init__(
@@ -236,9 +237,9 @@ class DebugWatch(Node):
     """Pass-through node that prints when a predicate fires.
 
     Like Assert but observational: prints instead of raising.  Stripped
-    at compile time alongside Assert nodes.  Exercised during both
-    ``compute()`` (oracle path) and compiled debug forward when
-    ``debug=True``.
+    from the compiler-private copy alongside Assert nodes (the source
+    graph keeps both).  Exercised during both ``compute()`` (oracle
+    path) and compiled debug forward when ``debug=True``.
     """
 
     def __init__(self, inp: Node, predicate: Predicate, message: str = ""):

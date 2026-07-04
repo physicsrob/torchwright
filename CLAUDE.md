@@ -506,9 +506,11 @@ should never appear in a healthy forward pass.
 ## Assert and DebugWatch nodes
 
 Graph-level invariants are encoded as `Assert` and `DebugWatch`
-nodes that wrap intermediate values.  Both are stripped at compile
-time (the compiled transformer is identical with or without them)
-and re-checked during `debug=True` forward passes.
+nodes that wrap intermediate values.  Both are stripped from the
+compiler-private copy `lower()` builds (the compiled transformer is
+identical with or without them); the source graph keeps its wrappers
+forever — compilation never mutates it — and their predicates are
+re-checked during `debug=True` forward passes.
 
 Helpers in `torchwright/graph/asserts.py`:
 

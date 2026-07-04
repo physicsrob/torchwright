@@ -217,12 +217,15 @@ def fuse_consecutive_linears(
     Because each fold rewrites a surviving node's weights and inputs in place,
     that node's eagerly-cached ``_affine_bound`` / ``_structural_type`` (and
     every downstream node's, which was derived from it) go stale.  A stale
-    bound can be unsound once a downstream ``Assert`` later tightens a node's
-    structural type (``GraphAnalyzer`` strip) — the affine and structural
-    ranges then disagree and the RMSNorm certification's soundness check
-    fires.  So after all folds settle, refresh the bounds of every mutated
-    node and everything downstream of one (see
-    :func:`_recompute_bounds_after_fusion`).
+    bound can be unsound once a downstream ``Assert``'s claim later tightens
+    a node's structural type (the lowering strip, applied to the compile's
+    private copy of this graph) — the affine and structural ranges then
+    disagree and the RMSNorm certification's soundness check fires.  So
+    after all folds settle, refresh the bounds of every mutated node and
+    everything downstream of one (see
+    :func:`_recompute_bounds_after_fusion`).  The refresh re-derives claims
+    through the Assert affine rule because this pass runs on *source*
+    graphs, which keep their wrappers.
 
     Args:
         output_nodes: The graph's output nodes (used to find all ancestors and

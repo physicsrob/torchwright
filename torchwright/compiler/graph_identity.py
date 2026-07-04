@@ -11,11 +11,11 @@ depends only on the topology.
 Assert and DebugWatch wrappers are **transparent** to every function in
 this module: the traversal steps through them to the wrapped node and
 never assigns them an id.  This matches the compiled graph exactly —
-``GraphAnalyzer`` strips both wrapper kinds in-place before scheduling —
-so a freshly *rebuilt* graph that still carries its Assert wrappers
-canonicalizes (and fingerprints) identically to the stripped graph the
-compiler actually processed.  Unlike ``GraphAnalyzer``, nothing here
-mutates the graph.
+``lower()`` strips both wrapper kinds from the compiler-private copy
+before any pipeline stage runs — so the source graph (which keeps its
+wrappers forever) canonicalizes and fingerprints identically to the
+stripped copy the compiler actually processed, and so does any fresh
+deterministic rebuild of it.  Nothing here mutates the graph.
 """
 
 from __future__ import annotations
@@ -43,7 +43,7 @@ def _canonical_walk(output_node: Node) -> List[Node]:
     ``inputs`` list; first visit assigns the next canonical number.
     Assert/DebugWatch wrappers are stepped through transparently — the
     wrapped node is visited at the wrapper's position — so the order is
-    identical to walking the ``GraphAnalyzer``-stripped graph.
+    identical to walking the stripped compiler-private copy.
     """
     seen: set = set()
     ordered: List[Node] = []
