@@ -34,13 +34,13 @@ from torchwright.ops.inout_nodes import (
     create_rope_config,
     create_unembedding,
 )
-from torchwright.ops.relu.logic_ops import equals_vector
-from torchwright.ops.relu.scalar_encoding import (
+from torchwright.ops.swiglu.logic_ops import equals_vector
+from torchwright.ops.swiglu.scalar_encoding import (
     digits_to_number,
     number_to_digit_scalars,
     scalar_to_embedding,
 )
-from torchwright.ops.relu.sequence_ops import output_sequence
+from torchwright.ops.swiglu.sequence_ops import output_sequence
 
 D_MODEL = 512
 # Rotary width the graph is built against; must match the d_head it is

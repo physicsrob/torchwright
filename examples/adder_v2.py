@@ -25,13 +25,13 @@ from torchwright.ops.inout_nodes import (
     create_rope_config,
     create_unembedding,
 )
-from torchwright.ops.relu.logic_ops import equals_vector
-from torchwright.ops.relu.scalar_encoding import (
+from torchwright.ops.swiglu.logic_ops import equals_vector
+from torchwright.ops.swiglu.scalar_encoding import (
     digits_to_number,
     number_to_digit_scalars,
     scalar_to_embedding,
 )
-from torchwright.ops.relu.sequence_ops import (
+from torchwright.ops.swiglu.sequence_ops import (
     NumericSequence,
     output_sequence,
     remove_leading_0s,

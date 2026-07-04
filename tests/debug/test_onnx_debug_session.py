@@ -385,11 +385,11 @@ def test_corrupted_initializer_is_detected(token_artifact, tmp_path):
     import onnx
 
     model = onnx.load(token_artifact)
-    target = next(i for i in model.graph.initializer if i.name == "l0_b1")
+    target = next(i for i in model.graph.initializer if i.name == "l0_bgate")
     arr = onnx.numpy_helper.to_array(target).copy()
     arr = arr * 1.5
     arr.flat[0] += 7.0
-    target.CopyFrom(onnx.numpy_helper.from_array(arr.astype(np.float32), "l0_b1"))
+    target.CopyFrom(onnx.numpy_helper.from_array(arr.astype(np.float32), "l0_bgate"))
 
     corrupt = str(tmp_path / "corrupt.onnx")
     onnx.save_model(model, corrupt)

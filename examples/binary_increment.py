@@ -30,6 +30,12 @@ from torchwright.ops.inout_nodes import (
     create_rope_config,
     create_unembedding,
 )
+# This example stays on the ReLU machine: it is the fixture behind
+# tests/hf/test_convert.py, and the HF converter's native module is
+# relu-only by design — it refuses swish artifacts.  It flips to swiglu
+# when the LlamaForCausalLM conversion lands (docs/no_bias_plan.md
+# follow-ups).  Every other example except calculator_v2 builds the
+# swish machine via ops/swiglu.
 from torchwright.ops.relu.logic_ops import bool_all_true, equals_vector
 from torchwright.ops.relu.map_select import map_to_table, select
 from torchwright.ops.relu.sequence_ops import output_sequence, remove_leading_0s

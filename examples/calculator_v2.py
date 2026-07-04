@@ -22,6 +22,13 @@ import torch
 
 from torchwright.graph import Node, Embedding, RopeConfig
 from torchwright.graph.embedding import Unembedding
+
+# This example stays on the ReLU machine: it is the graph behind
+# calculator_hf_export.py (and tests/hf/), and the HF converter's native
+# module is relu-only by design — it refuses swish artifacts.  It is
+# also the remaining exerciser of relu-only ops (relu_add,
+# multiply_integers).  Every other example builds the swish machine via
+# ops/swiglu.
 from torchwright.ops.relu.arithmetic_ops import compare, relu_add, multiply_integers
 from torchwright.ops.linear import add, negate, subtract
 from torchwright.ops.attention_ops import get_prev_value

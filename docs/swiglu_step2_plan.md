@@ -251,11 +251,30 @@ never drift — the drift test keeps validating them at zero maintenance.
 
 ## Phase C — examples cutover
 
-Flip the calculator/adder/fibonacci examples to `ops/swiglu` (they
+**COMPLETE (2026-07-04).** All examples flipped to `ops/swiglu` (they
 exercise the digit pipeline end to end: `onehot_lookup`,
-`scalar_to_embedding`, `thermometer_floor_div`). Full suite green with
-both packages. After this, `ops/relu`'s only consumers are its own
-tests.
+`scalar_to_embedding`, `thermometer_floor_div`), pure import flips —
+every op the examples use has an identical signature across the two
+packages, and none used the deleted offset apparatus. Full suite green
+with both packages. Notes for a fresh session:
+
+- **Two examples stay on the ReLU machine, deliberately**:
+  `calculator_v2` (the graph behind `calculator_hf_export.py` and
+  `tests/hf/test_rms_norm_identity.py`; also the remaining exerciser
+  of relu-only `relu_add` / `multiply_integers`) and
+  `binary_increment` (the fixture behind `tests/hf/test_convert.py`).
+  The HF converter's native module is relu-only by the A4 decision;
+  both flip when the `LlamaForCausalLM` conversion lands
+  (`docs/no_bias_plan.md` follow-ups). So `ops/relu`'s consumers are
+  its own tests plus these two HF-facing examples.
+- The cutover surfaced the same-graph-recompile bound-loosening bug
+  (machine-independent, but only swish envelopes crossed a raising
+  threshold) and was parked until compilation became a pure function —
+  `docs/lowering_copy_plan.md`, landed 2026-07-04.
+- Compiler tests that borrow example graphs as fixtures follow the
+  fixture's machine: the token-module tests now pin
+  `meta["activation"] == "swish"` and read gated initializer names
+  (`l{i}_Wgate`/`l{i}_bgate`) for the adder fixture.
 
 **Status (2026-07-03): started, parked on a compiler bug.** The flip
 itself was clean — every op the examples use has an identical signature

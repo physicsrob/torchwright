@@ -29,7 +29,7 @@ import torch
 
 from torchwright.graph import Embedding, Linear, Node, RopeConfig
 from torchwright.graph.embedding import bos_token
-from torchwright.ops.relu.arithmetic_ops import compare as _compare_scalar
+from torchwright.ops.swiglu.arithmetic_ops import compare as _compare_scalar
 from torchwright.ops.linear import concat
 from torchwright.ops.attention_ops import get_prev_value
 from torchwright.ops.inout_nodes import (
@@ -37,15 +37,15 @@ from torchwright.ops.inout_nodes import (
     create_onehot_embedding,
     create_rope_config,
 )
-from torchwright.ops.relu.logic_ops import (
+from torchwright.ops.swiglu.logic_ops import (
     bool_all_true,
     bool_any_true,
     bool_not,
     equals_vector,
 )
-from torchwright.ops.relu.map_select import select, switch
-from torchwright.ops.relu.onehot_table import onehot_lookup
-from torchwright.ops.relu.sequence_ops import (
+from torchwright.ops.swiglu.map_select import select, switch
+from torchwright.ops.swiglu.onehot_table import onehot_lookup
+from torchwright.ops.swiglu.sequence_ops import (
     NumericSequence,
     output_sequence,
     remove_leading_0s,

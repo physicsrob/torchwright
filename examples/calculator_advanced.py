@@ -46,8 +46,8 @@ import torch
 from torchwright.graph import Embedding, Linear, Node
 from torchwright.ops.linear import add_const, bool_to_01, concat, sum_nodes
 from torchwright.ops.inout_nodes import create_literal_value
-from torchwright.ops.relu.map_select import in_range
-from torchwright.ops.relu.onehot_table import onehot_lookup
+from torchwright.ops.swiglu.map_select import in_range
+from torchwright.ops.swiglu.onehot_table import onehot_lookup
 
 from examples._calculator_common import (
     CALC_VOCAB,

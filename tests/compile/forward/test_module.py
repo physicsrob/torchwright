@@ -406,8 +406,9 @@ def test_token_onnx_meta_has_no_extra_key_when_omitted():
             "bias",
             "schedule",
         }
-        # The adder is an all-ReLU graph — the machine kind records that.
-        assert meta["activation"] == "relu"
+        # The adder builds the swish machine (Phase C examples cutover) —
+        # the machine kind records that.
+        assert meta["activation"] == "swish"
         # Emission mode ("bias") is recorded for every model post-no-bias
         # (docs/no_bias_plan.md); default compiles are biased.
         assert meta["bias"] is True
@@ -620,12 +621,16 @@ def _l_w1_d_hidden(onnx_path):
         dims_by_name[sp.values.name] = list(sp.dims)
     widths = []
     i = 0
-    while f"l{i}_W1" in dims_by_name:
-        dims = dims_by_name[f"l{i}_W1"]
-        assert dims[0] == D, f"l{i}_W1 first dim {dims[0]} != d {D}"
+    # The hidden-width-bearing initializer is l{i}_W1 on the relu machine
+    # and l{i}_Wgate on the gated machine; accept either so the helper
+    # follows the fixture's machine.
+    while f"l{i}_W1" in dims_by_name or f"l{i}_Wgate" in dims_by_name:
+        name = f"l{i}_W1" if f"l{i}_W1" in dims_by_name else f"l{i}_Wgate"
+        dims = dims_by_name[name]
+        assert dims[0] == D, f"{name} first dim {dims[0]} != d {D}"
         widths.append(int(dims[1]))
         i += 1
-    assert widths, "no l{i}_W1 initializers found"
+    assert widths, "no l{i}_W1 / l{i}_Wgate initializers found"
     return widths
 
 
@@ -661,7 +666,7 @@ def test_token_onnx_no_trim_preserves_full_width():
 
 
 def test_token_onnx_trim_shrinks_mlp_slots():
-    """trim_heads=True shrinks some l{i}_W1 below full d_hidden; False keeps all."""
+    """trim_heads=True shrinks some hidden widths below full d_hidden; False keeps all."""
     full_d_hidden = D  # d_hidden defaults to d
     with tempfile.TemporaryDirectory() as tmpdir:
         trim_path, _ = _export_token(tmpdir, "trim.onnx", trim_heads=True)

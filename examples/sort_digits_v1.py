@@ -56,7 +56,7 @@ import torch
 
 from torchwright.graph import Concatenate, Node, Embedding
 from torchwright.graph.embedding import Unembedding
-from torchwright.ops.relu.arithmetic_ops import compare
+from torchwright.ops.swiglu.arithmetic_ops import compare
 from torchwright.ops.linear import add_scaled_nodes
 from torchwright.ops.attention_ops import attend_argmin_above_integer, get_prev_value
 from torchwright.ops.inout_nodes import (
@@ -65,14 +65,14 @@ from torchwright.ops.inout_nodes import (
     create_rope_config,
     create_unembedding,
 )
-from torchwright.ops.relu.logic_ops import (
+from torchwright.ops.swiglu.logic_ops import (
     bool_all_true,
     bool_not,
     equals_vector,
 )
-from torchwright.ops.relu.map_select import in_range, select
-from torchwright.ops.relu.scalar_encoding import digit_to_scaled_scalar
-from torchwright.ops.relu.sequence_ops import check_is_digit, output_sequence
+from torchwright.ops.swiglu.map_select import in_range, select
+from torchwright.ops.swiglu.scalar_encoding import digit_to_scaled_scalar
+from torchwright.ops.swiglu.sequence_ops import check_is_digit, output_sequence
 
 D_MODEL = 384
 # Rotary width the graph is built against; must match the d_head it is compiled
