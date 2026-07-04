@@ -311,8 +311,16 @@ tests. Parked state and findings:
 ## Phase D — flagship cutover and follow-ups (handoffs)
 
 Tracked here until torchwright_doom picks them up; the detailed
-doom-side plan lands there when cutover approaches. Pointers are to
-spec entries.
+doom-side plan is drafted — torchwright_doom `swiglu_cutover_plan.md`
+(2026-07-04), which supersedes the bullets below as the execution
+document (they remain the handoff record). Pointers are to spec
+entries. Two torchwright-side prerequisites the doom plan names as
+its Phase D0: relocating `attend_most_recent_globally` to the
+machine-neutral level (it has no swiglu counterpart but is pure
+attention hardware), and resolving the bias=False noise-re-measure
+obligation, whose `make measure-noise` knob turns out not to exist —
+the noise harness evaluates via `node.compute()` and never compiles,
+while the fold is export-time (options recorded in the doom plan).
 
 **Cutover mechanics:** flip the `std.py` import block; call-site
 signature changes (`approximate=False` args disappear, offset-related
