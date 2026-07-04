@@ -5,12 +5,14 @@ For each registered arithmetic implementation, each operation
 this records two structural metrics of the standalone ``op(a, b)`` graph:
 
 * **depth** — the *critical-path* length: the longest chain of neuron-producing
-  nodes (ReLU lookups / attention) from the inputs to the outputs.  This is the
-  number of transformer layers the algorithm needs *given enough width per
-  layer* — i.e. its true depth complexity.
-* **size** — the total neuron count: the sum of every ReLU node's width.  This
-  is the algorithm's total compute width and is proportional to the compiled
-  parameter count (``params ≈ 2·d·neurons``), so it is the "width cost" axis.
+  nodes (FFN units / ReLU lookups / attention) from the inputs to the outputs.
+  This is the number of transformer layers the algorithm needs *given enough
+  width per layer* — i.e. its true depth complexity.
+* **size** — the total neuron count: the sum of every FFN's lane count (plus
+  any ReLU node's width).  This is the algorithm's total compute width and is
+  roughly proportional to the compiled parameter count (``params ≈ 2·d·neurons``
+  for degenerate/relu lanes, ``≈ 3·d`` per gated swish lane), so it is the
+  "width cost" axis.
 
 Both are read directly from the graph — **no compile** — which is what makes
 the figure trustworthy.  The compiled layer count is *not* used: it is
@@ -113,9 +115,18 @@ def log(message: str) -> None:
 
 
 def _is_neuron(node) -> bool:
-    """A node that lowers to a hidden ReLU layer (or an attention sublayer)."""
+    """A node that lowers to hidden compute: an FFN (the packable lane unit
+    the swiglu ops build), a legacy ReLU layer, or an attention sublayer."""
     t = type(node).__name__
-    return "ReLU" in t or "Attn" in t
+    return t == "FFN" or "ReLU" in t or "Attn" in t
+
+
+def _neuron_width(node) -> int:
+    """The hidden width a neuron node contributes: an FFN's lane count
+    (``gate_proj`` rows), otherwise the node's output width."""
+    if type(node).__name__ == "FFN":
+        return node.gate_proj.shape[0]
+    return len(node)
 
 
 def _walk(outputs):
@@ -160,7 +171,7 @@ def critical_path_depth(outputs) -> int:
 
 def total_neurons(outputs) -> int:
     """Sum of every neuron-producing node's width (total compute, ~params/2d)."""
-    return sum(len(node) for node in _walk(outputs) if _is_neuron(node))
+    return sum(_neuron_width(node) for node in _walk(outputs) if _is_neuron(node))
 
 
 def _operand(embedding, n):
@@ -192,6 +203,14 @@ _SCRATCHPAD_OPS = {
 # materialization of all N digits — the old ~O(n^4) term).  Its depth is flat in
 # n, so a short sweep shows the whole story; the cap is comfortably affordable now.
 SCRATCHPAD_OP_CAP = 12
+
+# Under the RoPE end-state every head rotates, so content-matching heads route
+# their content columns onto the slowest rotary planes — capping content width
+# at d_head/2 (graph/rope.py::place_on_slow_planes).  The scratchpad's answer
+# gather matches a one-hot over all answer digits at once, and an n-digit
+# multiply has 2n of them, so its kernel only builds while 2n <= D_HEAD/2.
+# Add/subtract answers have n+1 digits and clear the budget up to the op cap.
+SCRATCHPAD_MULTIPLY_PLANE_CAP = calculator_scratchpad.D_HEAD // 4
 
 
 def measure_scratchpad_op(op_fn, n):
@@ -246,11 +265,15 @@ def run(digit_sweep, multiply_cap=DEFAULT_MULTIPLY_CAP):
     results["scratchpad"] = {}
     for op_name, op_fn in _SCRATCHPAD_OPS.items():
         records = []
-        sweep = [
-            n
-            for n in _sweep_for(op_name, digit_sweep, multiply_cap)
-            if n <= SCRATCHPAD_OP_CAP
-        ]
+        cap = SCRATCHPAD_OP_CAP
+        if op_name == "multiply" and SCRATCHPAD_MULTIPLY_PLANE_CAP < cap:
+            cap = SCRATCHPAD_MULTIPLY_PLANE_CAP
+            log(
+                f"scratchpad/multiply: capping at n<={cap} — the answer gather's "
+                f"content width (2n digits) is limited to D_HEAD/2 = "
+                f"{calculator_scratchpad.D_HEAD // 2} slow rotary planes"
+            )
+        sweep = [n for n in _sweep_for(op_name, digit_sweep, multiply_cap) if n <= cap]
         for n in sweep:
             depth, neurons = measure_scratchpad_op(op_fn, n)
             records.append({"n": n, "depth": depth, "neurons": neurons})
@@ -319,8 +342,9 @@ def build_payload(results, model_results, digit_sweep, model_digit_sweep, multip
             "digit_sweep": digit_sweep,
             "model_digit_sweep": model_digit_sweep,
             "multiply_cap": multiply_cap,
+            "scratchpad_multiply_plane_cap": SCRATCHPAD_MULTIPLY_PLANE_CAP,
             "depth_metric": "critical-path length over neuron-producing nodes",
-            "size_metric": "total neuron count (~ params / 2d)",
+            "size_metric": "total neuron count (FFN lanes + ReLU widths; ~ params / 2d, gated lanes ~ params / 3d)",
             "model_depth_metric": "whole-model critical-path depth (parse + ops + dispatch + emit)",
             "decode_steps_metric": "emitted tokens per query (scratchpad: 6n+3)",
         },
