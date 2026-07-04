@@ -25,13 +25,22 @@ only one is machine-specific:
 Because exactly one row fires (or none → ``default``), the claimed value
 range is the *tight* ``[min, max]`` over the values and the default —
 the reason this op exists (``map_to_table``'s pessimistic
-``default ± Σ|Δ|`` widening blew up chained interval arithmetic).  It
-survives with no new slack: winner rounding (~1 ulp of the value, the
-``×scale/÷scale`` round trip) and dip leaks sit far inside the closing
-assert's existing 1e-3 tolerance.  Noise pass-through is unchanged from
-the ReLU form: an input one-hot off by ε shifts the winner's indicator
-by exactly ε (the saturated gate is linear down to a count deviation of
-0.33), so output error is ``2ε·|value_i − default|``.
+``default ± Σ|Δ|`` widening blew up chained interval arithmetic).  The
+closing assert's slack must budget the *accumulated* input leak: a
+machine-built one-hot (in_range indicators through ``bool_to_01``)
+carries a per-element fp32 round-trip leak of order 1e-5 — individually
+invisible, but a ``d_key``-wide key sums ``d_key`` of them, each
+weighted by up to the largest table magnitude (measured on the
+calculator digit pipeline: ``d_key = 61``, values ≤ 6, output error up
+to ~2e-3 in exact math — past the 1e-3 default).  The assert atol is
+therefore sized by ``_lookup_numeric_slack(max_abs, 1.0, d_key)`` —
+check-only slack; the claimed range downstream analysis sees stays
+tight.  Winner rounding itself (~1 ulp of the value, the
+``×scale/÷scale`` round trip) and dip leaks are inside that budget by
+construction.  Noise pass-through is unchanged from the ReLU form: an
+input one-hot off by ε shifts the winner's indicator by exactly ε (the
+saturated gate is linear down to a count deviation of 0.33), so output
+error is ``2ε·|value_i − default|``.
 """
 
 from typing import Dict
@@ -41,6 +50,7 @@ import torch
 from torchwright.graph import Linear, Node
 from torchwright.graph.asserts import assert_matches_value_type
 from torchwright.graph.value_type import NodeValueType, Range
+from torchwright.ops._math import _lookup_numeric_slack
 from torchwright.ops.const import scale
 from torchwright.ops.swiglu.swiglu_ffn import swiglu_ffn
 
@@ -147,4 +157,13 @@ def onehot_lookup(
             name="onehot_lookup",
         )
 
-    return assert_matches_value_type(result, NodeValueType(value_range=out_range))
+    # Check-only slack for the accumulated input leak (see module
+    # docstring): d_key summed per-element ~1e-5 round-trip leaks, each
+    # weighted by up to the largest table magnitude.  The claimed range
+    # itself stays tight — atol never reaches static analysis.
+    max_abs = max(abs(out_range.lo), abs(out_range.hi))
+    return assert_matches_value_type(
+        result,
+        NodeValueType(value_range=out_range),
+        atol=_lookup_numeric_slack(max_abs, 1.0, d_key),
+    )

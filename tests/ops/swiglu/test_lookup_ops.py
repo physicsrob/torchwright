@@ -171,3 +171,42 @@ def test_onehot_lookup_compiles_clean():
     xs = torch.stack([key(0, 0), key(2, 1), key(1, 1)])
     report = probe_compiled(compiled, out, {"x": xs}, 3, atol=1e-3)
     assert report.first_divergent is None, report.format_short()
+
+
+def test_onehot_lookup_wide_key_accumulated_leak_within_guard():
+    """D6 repro (Phase C, calculator_simple 123*456): a machine-built
+    one-hot carries ~1e-5 per-element round-trip leak, and a wide key
+    (d_key = 61 on the digit pipeline) sums d_key of them, each weighted
+    by up to the largest table magnitude — past the old fixed 1e-3
+    closing-assert slack in exact math.  The guard is now sized by
+    _lookup_numeric_slack(max_abs, 1.0, d_key)."""
+    d_key = 61
+    keys = [torch.zeros(d_key) for _ in range(d_key)]
+    for i, k in enumerate(keys):
+        k[i] = 1.0
+    # half the rows carry the max-magnitude value, like the digit table
+    table = {
+        keys[i]: torch.tensor([6.0 if i % 2 == 0 else 0.0]) for i in range(d_key)
+    }
+    x = create_input("x", d_key, value_range=(0.0, 1.0))
+    out = onehot_lookup(x, table, torch.tensor([0.0]))
+
+    noisy = keys[0].clone()
+    noisy += 1.5e-5  # per-element leak, ~the measured machine magnitude
+    val = out.compute(1, {"x": noisy.unsqueeze(0)})  # asserts run here
+    # accumulated error is real (past the old 1e-3 fixed slack) but the
+    # derived guard absorbs it
+    assert abs(val.item() - 6.0) > 1e-3
+
+
+def test_onehot_lookup_small_table_guard_stays_tight():
+    """The derived slack stays small for small tables (max_abs=300,
+    d_key=5 → 0.015): a gross input error that pushes the output past
+    the claimed [min, max] still fires the closing assert."""
+    table, key = _two_block_table()
+    x = create_input("x", 5, value_range=(0.0, 1.0))
+    out = onehot_lookup(x, table, torch.tensor([-7.0]))
+    noisy = key(2, 1)  # the 300-valued row
+    noisy[2] += 0.05  # count 1.05 → output ≈ 315, past hi=300 + 0.015
+    with pytest.raises(AssertionError, match="range"):
+        out.compute(1, {"x": noisy.unsqueeze(0)})
