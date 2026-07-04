@@ -1,5 +1,24 @@
 # Compile as a pure function — lower() returns a copy
 
+**LANDED 2026-07-04** (L0 e610988, determinism sweep 807a754, L1+L2
+94b32ed, L3 338ed91, wrapper-transparent lookups 00c1784; full suite
+green; Phase C resumed at 049d9ca). Decision 2 settled as **(a)**
+wrapper-cloning — the parity gate (`tests/compile/test_lowering_parity.py`)
+measured bit-identical bounds against the old pipeline. Two additions
+the plan did not anticipate, both caught by the suite: scheduling
+predecessors are scheduling-only edges (a *sibling* may not be cloned
+yet when its dependent is — remapped in a second pass), and node-keyed
+lookup surfaces (`ResidualAssignment`, `flatten_concat_nodes`, the
+extraction helpers) must resolve through the wrappers the source now
+keeps — the old in-place strip used to rewire user Concatenate children
+away from them. The end-of-compile translation is a single re-key of
+the net's node-keyed artifacts (residual assignment, placements,
+realization table) onto source nodes — "the net speaks source" — rather
+than per-surface map threading. Copy overhead measured ~1.6 KB/node
+retained on the 1-digit adder. Handed off to the next doom compile:
+render-walkthrough re-verification, flagship schedule-cache-hit check,
+and the flagship-scale memory measurement.
+
 Execution plan for making compilation never mutate the source graph:
 `lower()` builds a compiler-private copy of the graph, every downstream
 pass consumes the copy, and the user's graph objects are untouched by
