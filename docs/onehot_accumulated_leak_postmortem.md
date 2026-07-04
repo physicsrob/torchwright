@@ -106,3 +106,65 @@ survive summation — any guard over an output that sums many
 machine-built approximate values must budget `Σ leak·|weight|`, not
 `max leak`. When adding an op whose input is a wide indicator vector,
 size the closing assert with `_lookup_numeric_slack` from the start.
+
+## Addendum (2026-07-04, follow-up investigation)
+
+`scripts/investigate_onehot_leak.py` swept the full mechanism space —
+the carry lookup's input is completely described by (integer total
+0..60, bounded upstream noise), so 61 totals × a dense noise grid
+covers every reachable case — on two hosts (local, Modal container).
+One sharpening and two corrections to the account above.
+
+**The bit-level source of the per-element leak.** The sharpened
+hinges saturate to exact integers; the leak enters in `in_range`'s
+output projection, whose folded weight `2/scale = 0.02` is **not
+representable in fp32** (`fl(0.02)` is off by −4.5e-10). Each
+saturated lane's product `hinge_value × fl(0.02)` rounds at the
+product's magnitude — up to ~1220 for the 61-slot staircase, where
+one fp32 ulp is 1.2e-4 — and the near-cancellation of each ramp's two
+hinges preserves those product roundings as the residue. Measured
+structure: leak exactly 0.0 on every slot below the winner (those
+lanes underflow to signed zero), ≤ 2.4e-7 at the winner, ≤ 4.6e-5 per
+slot above it (the 3.4e-5 above was one input's max, not the
+mechanism's bound). Proof of attribution: patching `scale` to 128
+(`2/scale = 2⁻⁶`, exactly representable) makes every product exact
+and the measured leak is identically 0.0 across all 61×61
+total/slot combinations, on both hosts.
+
+**The failing eval ran on CPU, not GPU.** Reference eval computes on
+whatever device the graph's tensors were built on — plain CPU for the
+calculator tests; the conftest `device` fixture steers only the
+compiler. The run-to-run variation that flipped the verdict is CPU
+matmul reduction order, which varies with thread count and host
+microarchitecture: measured 3.9e-4 shift in a carry value between
+torch thread settings on one machine, and the whole leak pattern
+shifts host-to-host (Σ|leak| max 1.339e-3 local vs 1.327e-3 Modal,
+identical code and inputs) — same order as the observed
+−0.0009/−0.0011 flake pair. The "GPU float variation" story above was
+right that an environment-dependent reduction order flips a
+boundary-straddling value, wrong about the device.
+
+**Measured guard margin is 1.5×, not ~2.3×.** Worst *range violation*
+(what the assert actually checks) of the carry lookup over the swept
+space: 2.41e-3 local / 2.35e-3 Modal, at t=0 under ≈−2e-3 upstream
+noise, against the derived slack 3.66e-3. The "observed worst
+~1.6e-3" above was the flaking input, not the worst case. A table
+with the D6 repro's shape (max-magnitude values on half the rows)
+violates the old fixed 1e-3 deterministically at zero upstream noise
+(1.19e-3 at δ=0). The derived slack holds, with thinner margin than
+the fix commit implied.
+
+**Root-fix option, not taken here.** `scale = 128` eliminates the
+class rather than budgeting it: integer-fed
+`in_range`/`bool_to_01`/`onehot_lookup` chains become bit-exact (leak
+0.0, host- and thread-invariant), and injected-noise pass-through
+drops to ≤ 2.4e-5 against the same slacks (150–960× headroom on the
+swept tables). This is the same power-of-two-exactness trick the
+no-bias constant lane already uses deliberately
+(`bias_lane_gate`/`bias_lane_up` in `ops/const.py`). Cost: `scale` is
+a settled design constant (docs/swiglu_step2_plan.md, decision 5)
+baked into every swiglu op's weights — changing it means a full
+`make measure-noise` cycle plus `tests/docs/test_swish_constants.py`.
+Recorded as the principled alternative; the sizing lesson above still
+stands for genuinely-approximate wide inputs (non-integer bounds,
+embedding-fed keys).
