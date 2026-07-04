@@ -264,9 +264,10 @@ with both packages. Notes for a fresh session:
   of relu-only `relu_add` / `multiply_integers`) and
   `binary_increment` (the fixture behind `tests/hf/test_convert.py`).
   The HF converter's native module is relu-only by the A4 decision;
-  both flip when the `LlamaForCausalLM` conversion lands
-  (`docs/no_bias_plan.md` follow-ups). So `ops/relu`'s consumers are
-  its own tests plus these two HF-facing examples.
+  both flip when the stock-HF conversion lands
+  (`docs/phi3_conversion_plan.md` — the Llama target died in audit).
+  So `ops/relu`'s consumers are its own tests plus these two HF-facing
+  examples.
 - The cutover surfaced the same-graph-recompile bound-loosening bug
   (machine-independent, but only swish envelopes crossed a raising
   threshold) and was parked until compilation became a pure function —

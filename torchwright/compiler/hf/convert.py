@@ -125,8 +125,8 @@ def build_config(
     if meta.get("bias", True) is False:
         raise NotImplementedError(
             "HF conversion of a bias=False artifact is not implemented: the "
-            "native module hardcodes biased MLP linears (a true biasless "
-            "Llama emission is the planned follow-up — docs/no_bias_plan.md)."
+            "native module hardcodes biased MLP linears (the stock Phi-3 "
+            "emission is the planned follow-up — docs/phi3_conversion_plan.md)."
         )
 
     vocab: List[str] = list(meta["vocab"])

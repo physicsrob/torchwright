@@ -277,9 +277,12 @@ untouched — only the final write destination moves.
 
 ## Follow-ups / parked
 
-- True `LlamaForCausalLM` conversion for `bias=False` + `rms_norm` +
-  swish artifacts (the HF module gains a gated MLP; the converter
-  maps to stock Llama weights).
+- ~~True `LlamaForCausalLM` conversion for `bias=False` + `rms_norm` +
+  swish artifacts~~ — superseded 2026-07-04: stock Llama cannot express
+  the flagship's partial rotary (`LlamaForCausalLM` accepts
+  `partial_rotary_factor` in config but the modeling code silently
+  ignores it — measured on transformers 5.12.1). The audited stock
+  target is `Phi3ForCausalLM`; plan: `docs/phi3_conversion_plan.md`.
 - Flagship cutover flips `bias=False` in the e1m1 configs at swiglu
   Phase D, gated on re-measured noise and a green walkthrough.
 - Default flip (`bias=False` becoming the default) — not planned;
