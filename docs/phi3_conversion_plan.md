@@ -5,11 +5,19 @@ checkpoint that loads as **stock `Phi3ForCausalLM`** — no custom
 modeling file, no `trust_remote_code`, no custom tokenizer code.
 Written 2026-07-04, after the partial-rotary audit killed the
 `LlamaForCausalLM` target that `docs/no_bias_plan.md` had recorded as
-the follow-up (that bullet now points here). Unscheduled. Example-scale
-work is unblocked today — Phase C gives swish example graphs, the
-N-series gives `bias=False` emission, rms_norm is landed. The flagship
+the follow-up (that bullet now points here). The flagship
 checkpoint additionally waits on the Phase D cutover
 (`docs/swiglu_step2_plan.md`).
+
+**Status (2026-07-04): P0–P2 landed.** The probes are
+`tests/hf/test_phi3_rope_parity.py`, the converter is the Phi-3 path in
+`compiler/hf/convert.py` (routing + `build_phi3_config` /
+`build_phi3_state_dict` / `build_fast_tokenizer`), and the parity gate
+is `tests/hf/test_phi3_convert.py` (1-digit adder fixture — swish,
+`bias=False`, non-uniform heads (1,4,4,1,2,1,1), so padding is
+genuinely exercised — plus a partial-rotary offset-head artifact).
+P0/P2 findings folded into the sections below. **P3 remains blocked on
+Phase D.**
 
 ## Why Phi-3 and not Llama
 
@@ -130,14 +138,25 @@ max_seq_len`, `sliding_window = None`, `hidden_act = "silu"`,
 **Padding to uniform.** Per-layer trimmed heads pad back to the
 uniform count with all-zero Q/K/V rows and zero `o_proj` columns; MLP
 widths pad with all-zero gate/up rows and zero `down_proj` columns.
-Both are *bit-exact no-ops*: a zero gate lane contributes
-`silu(0)·up = 0` and a zero down-column reads nothing; a zero head
-produces uniform softmax over V-rows that are exactly zero, so the
-head output is exactly zero into zero o-columns. Cost is parameters
-and KV cache only (measure at P3). Default: pad heads to `d / d_head`
-(so `hidden_size / num_heads` matches `head_dim` with no explicit
-knob); if `Phi3Config` accepts an explicit `head_dim`, padding to the
-per-layer max is the cheaper alternative — settle at P0(c).
+Every padded *contribution* is exactly zero: a zero gate lane
+contributes `silu(0)·up = 0` and a zero down-column reads nothing; a
+zero head produces uniform softmax over V-rows that are exactly zero,
+so the head output is exactly zero into zero o-columns. (P2
+correction to the original "bit-exact no-op" phrasing: whole-tensor
+bitwise equality against a hypothetical unpadded module is
+kernel-dependent — a wider matmul can regroup the reduction of the
+*real* terms by an ulp; measured on CPU torch, `Phi3MLP` at
+intermediate 5 vs 8 differs in the last ulp. The contributions are
+exactly zero; the regrouping sits inside the parity bound. Pinned by
+the padding repros in `test_phi3_convert.py`.) Cost is parameters
+and KV cache only (measure at P3). **P0(c) settled:** `Phi3Config`
+accepts an explicit `head_dim`, persists it through `config.json`
+round trips, and the modeling code honors it (attention shapes and
+the rotary table both size from it) — so the converter pads heads to
+the **per-layer max** with `head_dim` set explicitly, the cheaper
+alternative. Pinned by `test_head_dim_accepted_persisted_and_honored`;
+if a transformers upgrade drops the field, fall back to padding heads
+to `d / d_head`.
 
 ## Numerical implications (stated upfront)
 
@@ -153,7 +172,12 @@ sources, none removable:
 3. **Mask semantics**: additive `finfo.min` vs our sentinel overwrite.
    With engineered logit magnitudes (~1e5–1e6), `finfo.min` dominance
    should still give masked weights exactly 0.0 in fp32 — verify with
-   our magnitudes at P0, don't assume.
+   our magnitudes at P0, don't assume. **Verified at P0(b)**: masked
+   weights are exactly 0.0 at ±1e5..3e6 in isolation and through the
+   converted model's real eager path (`output_attentions` upper
+   triangle all == 0.0). Note the converter additionally pins the
+   in-memory model to eager itself — plain `Phi3ForCausalLM(config)`
+   silently defaults to SDPA on the pinned transformers.
 4. **Kernel choice**: parity gates pin `attn_implementation="eager"`;
    SDPA/flash consumers get token-level claims only.
 
@@ -165,9 +189,19 @@ the artifact itself already relies on (pinned energy `2^{2m}` swamps
 eps below fp32 resolution). No op implementations change, so D7
 requires no noise re-measurement.
 
+**Measured at P2 (adder fixture):** teacher-forced logits are
+**bit-exact** (max |Δlogit| = 0.0 across all prompts and decode steps)
+— the engineered saturation absorbs the Q-side perturbations before
+they reach any value path (attention weights at exactly 1.0/0.0,
+saturated swish lanes). An unsaturated random-weight swish graph
+measures ~2e-7 relative, matching the derivation. The gate's bound is
+1e-5 relative; the decisive-gap margin (min top-1−top-2 = 400 against
+the observed perturbation) is recorded in
+`test_logit_perturbation_margin_factor`.
+
 ## Phases
 
-- **P0 — probes and audits.**
+- **P0 — probes and audits.** *(landed)*
   - *(a) Rotary parity probe* (`tests/hf/test_phi3_rope_parity.py`):
     pins the split, the pairing, NoPE-tail bit-exactness, and
     `inv_freq` 1-ulp agreement against `graph/rope.py`, at flagship
@@ -180,7 +214,7 @@ requires no noise re-measurement.
     artifact (flagship at P3). Gate: recorded margin factor.
   - *(c) Config constraint check*: explicit `head_dim` support vs
     pad-to-`d/d_head`.
-- **P1 — the converter.** A Phi-3 path in `compiler/hf/convert.py`:
+- **P1 — the converter.** *(landed)* A Phi-3 path in `compiler/hf/convert.py`:
   routing on meta (`swish` + `bias=False` + `rms_norm` → Phi-3; relu →
   the existing native module, unchanged; anything else refuses
   loudly — today's two `NotImplementedError`s become this routing).
@@ -190,7 +224,7 @@ requires no noise re-measurement.
   `PreTrainedTokenizerFast` — the current character-level
   `TorchwrightTokenizer` semantics, zero custom code in the bundle.
   Unit scale: adder-size swish `bias=False` exports.
-- **P2 — parity gate.** A Phi-3 mirror of `tests/hf/test_convert.py`:
+- **P2 — parity gate.** *(landed — `tests/hf/test_phi3_convert.py`)* A Phi-3 mirror of `tests/hf/test_convert.py`:
   teacher-forced max-logit-diff under the derived bound, greedy decode
   token-exact against the `load_onnx` oracle, eager attention pinned;
   D6-scale repros for each mapping piece (fold, padding, norms,
@@ -209,7 +243,7 @@ requires no noise re-measurement.
   stays serving relu artifacts and `tests/hf` until relu retirement,
   then dies with it — the HF surface becomes Phi-3-only.
 - `build_config`'s swish and `bias=False` refusals die at P1 (they
-  become the routing).
+  become the routing — done, `_conversion_target`).
 - The `no_bias_plan.md` follow-up bullet ("True `LlamaForCausalLM`
   conversion") is superseded by this document.
 

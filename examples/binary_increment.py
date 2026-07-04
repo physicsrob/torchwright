@@ -30,10 +30,13 @@ from torchwright.ops.inout_nodes import (
     create_rope_config,
     create_unembedding,
 )
+
 # This example stays on the ReLU machine: it is the fixture behind
-# tests/hf/test_convert.py, and the HF converter's native module is
-# relu-only by design — it refuses swish artifacts.  It flips to swiglu
-# when the stock-HF conversion lands (docs/phi3_conversion_plan.md).
+# tests/hf/test_convert.py, which gates the native (relu-only) HF module.
+# The stock Phi-3 conversion for swish artifacts landed with its own
+# fixture (the 1-digit adder, tests/hf/test_phi3_convert.py), so this
+# example flips to swiglu only at relu retirement, when the native module
+# and its gate die (docs/phi3_conversion_plan.md "What dies / what stays").
 # Every other example except calculator_v2 builds the swish machine via
 # ops/swiglu.
 from torchwright.ops.relu.logic_ops import bool_all_true, equals_vector
