@@ -65,12 +65,14 @@ from torchwright.graph.asserts import (
     assert_softmax_hardness,
 )
 from torchwright.graph.rope import (
+    rope_inv_freq,
     rope_lobe_band,
     rotary_content_head,
     rotary_offset_head,
     rotary_recency_head,
 )
 from torchwright.graph.value_type import NodeValueType
+from torchwright.ops._math import _theta_slow
 
 # Default tolerance for hard-selection output assertions.  At
 # ``_QUERY_GAIN = 8`` the runner-up softmax weight is ``exp(-8) ≈ 3.4e-4``,
@@ -228,6 +230,17 @@ _ABOVE_MATCH_BONUS = 256.0
 # content-dominance bound in its docstring — low-dot content needs a large
 # ``match_gain``, high-dot E8 content clears it at the default).
 _LOCAL_RECENCY_GAIN = 600.0
+
+# Per-position logit gain for the position tiebreak in attend_most_recent_globally.
+# Each unit of absolute position contributes recency_scale to the attention logit
+# so adjacent positions differ by recency_scale in logit.
+#
+# Constraints the caller must verify:
+#   (1) representability: recency_scale >> ULP(content_score)
+#       For E8 content (score≈320000): ULP≈0.038, so recency_scale=1.0 gives 26× margin.
+#   (2) content dominance: match_gain · min_match_dot_gap > recency_scale · max_positions
+#       For E8 (match_gain=200, dot_gap=1600): 320000 > 1.0 · 61440 ✓ (5.2× margin).
+_RECENCY_SCALE = 1.0
 
 
 def attend_argmin_above_integer(
@@ -910,3 +923,201 @@ def get_prev_value(
         base=rope.base,
         recency_gain=_LOCAL_RECENCY_GAIN,
     )
+
+
+def attend_most_recent_globally(
+    rope: RopeConfig,
+    query_vector: Node,
+    key_vector: Node,
+    global_position: Node,
+    value: Node,
+    *,
+    match_gain: float = 200.0,
+    recency_scale: float = _RECENCY_SCALE,
+    exclude_self: bool = False,
+    assert_hardness_gt: float | None = None,
+) -> Node:
+    """Attend to the **most recent** key whose content matches — **global** recency.
+
+    The unbounded companion to the local recency lobe (:func:`get_prev_value`).
+    Uses a precomputed per-token absolute position (from
+    :func:`~torchwright.ops.relu.global_recency.global_position_from_bos` or its
+    swiglu twin) as the tiebreak among matching keys, so "most recent" is resolved
+    by true global position rather than the local lobe — no window limit.
+
+    The logit at ``(query j, key i)`` is
+
+        match_gain · (query_vector_j · key_vector_i) + recency_scale · global_position_i
+
+    Among keys whose content matches (high dot product), the one with the largest
+    ``global_position`` (i.e. the most recent) wins.
+
+    **Content-dominance invariant.**  A matching key at *any* position must beat a
+    non-matching key at *any* position, which requires
+
+        match_gain · min_match_dot_gap > recency_scale · max_positions
+
+    With E8 content codes (dot gap = 1600, match_gain=200): 320,000 > 1.0 · 61,440 ✓.
+
+    **Float32 representability.**  Adjacent positions must differ in logit by more
+    than the fp32 ULP at the content score scale.  For E8 content (score ≈ 320,000)
+    the ULP is ≈ 0.038; ``recency_scale = 1.0`` gives an adjacent-position gap of
+    1.0 — 26× above the floor.  For content types with smaller scores, reduce
+    ``recency_scale`` so that ``recency_scale · max_positions`` stays below the
+    content gap.
+
+    **No window limit.**  Unlike the lobe-based Phase-6 mechanism, this head
+    correctly orders matching keys at any distance — the position signal is
+    monotone over the full ``[0, max_positions]`` range.  The compile cost is 1
+    additional attention head vs Phase 6 (plus the upstream
+    ``global_position_from_bos`` MLP sublayer, shared across all callers).
+
+    **Placement (full vs partial rotary).**  Under full rotary the content match
+    and the position tiebreak both ride slow planes of the ``d_head`` grid (the
+    content on the slowest ``W``, the tiebreak on the next).  Under partial rotary
+    (``rope.d_rot < rope.d_head``) the content rides the unrotated NoPE tail — an
+    *exact* position-free match, dissolving the slow-plane ``d_head`` budget — and
+    only the position tiebreak rides a rotated plane (the slowest, ``d_rot/2−1``).
+    The two signals are on disjoint dims either way, so they never interact; the
+    partial path is what lets the wide unbounded clip read coexist with the global
+    position tiebreak in one feasible-``d_head`` head.
+
+    Args:
+        rope: RoPE config.
+        query_vector: width-W content query.
+        key_vector: width-W content key.  Must have same width as
+            ``query_vector``.
+        global_position: length-1 node; each key's approximate absolute
+            position from ``global_position_from_bos``.
+        value: node to read at the selected key position.
+        match_gain: coefficient on the content dot-product term.
+        recency_scale: per-unit-position logit gain for the position tiebreak.
+            Must satisfy ``recency_scale · max_positions < match_gain · min_match_dot_gap``
+            (content-dominance invariant; see above).
+        exclude_self: if True, shift ``key_vector``, ``global_position``,
+            and ``value`` back one position so the current token cannot
+            select itself.
+        assert_hardness_gt: if set, wraps the output in a softmax hardness
+            assert checked during ``debug=True`` passes.
+
+    Returns:
+        Attn node of width ``len(value)``.
+    """
+    assert len(query_vector) == len(key_vector), (
+        "query_vector and key_vector must have the same width "
+        f"(got {len(query_vector)} and {len(key_vector)})"
+    )
+    assert len(global_position) == 1, "global_position must be 1-D"
+
+    if exclude_self:
+        key_vector = attend_to_offset(rope, key_vector, delta_pos=-1)
+        global_position = attend_to_offset(rope, global_position, delta_pos=-1)
+        value = attend_to_offset(rope, value, delta_pos=-1)
+
+    W = len(query_vector)
+
+    # Per-position logit gain: each unit of absolute position contributes
+    # recency_scale to the logit.  NOT divided by max_positions — the raw
+    # position value ≈ i is used directly so adjacent positions differ by
+    # recency_scale in logit.  Float32 at content score ~320000 has ULP ≈ 0.038;
+    # recency_scale=1.0 gives adjacent diff = 1.0 >> 0.038 (26× margin).
+    alpha = recency_scale
+
+    # Shared inputs: content vector + a constant 1.0 (query side) / global_position
+    # (key side, ≈ absolute position i ∈ [0, max_positions]) for the tiebreak.
+    query_one = LiteralValue(torch.tensor([1.0]), name="global_recency_query_one")
+    query_in = Concatenate([query_vector, query_one])
+    key_in = Concatenate([key_vector, global_position])
+
+    d_head = rope.d_head
+    if rope.d_rot < d_head:
+        # --- Partial rotary ---
+        # Content (W match dims) rides the unrotated NoPE tail [d_rot:d_rot+W]: an
+        # EXACT, position-free content dot product at any distance.  The position
+        # tiebreak rides the slowest rotated plane d_rot/2-1, where the RoPE
+        # attenuation cos((i−j)·θ_slow) stays positive (the guard below), so among
+        # content-matching keys the largest global_position (most recent) wins.
+        # The two signals live on disjoint dims, so they do not interact.  This
+        # cannot delegate to rotary_content_head, which would route ALL columns
+        # uniformly (content to the tail AND the position column to the tail, where
+        # there is no rotation to order keys at distance — wrong).
+        tail = d_head - rope.d_rot
+        if W > tail:
+            raise ValueError(
+                f"attend_most_recent_globally: content width W={W} exceeds the "
+                f"{tail}-wide NoPE tail (d_head={d_head}, d_rot={rope.d_rot}); "
+                f"raise d_head or lower d_rot."
+            )
+        pos_plane = rope.d_rot // 2 - 1
+        theta_pos = _theta_slow(rope)
+        if rope.max_positions * theta_pos >= math.pi / 2:
+            raise ValueError(
+                f"attend_most_recent_globally: the position tiebreak on the "
+                f"slowest rotated plane {pos_plane} (θ={theta_pos:.3e}) has "
+                f"max_positions={rope.max_positions} × θ = "
+                f"{rope.max_positions * theta_pos:.3f} ≥ π/2 ({math.pi/2:.3f}); a "
+                f"negative cosine would reverse the tiebreak ordering.  Increase "
+                f"d_rot/base or reduce max_positions."
+            )
+        query_matrix = torch.zeros((W + 1, d_head))
+        key_matrix = torch.zeros((W + 1, d_head))
+        for c in range(W):
+            query_matrix[c, rope.d_rot + c] = match_gain  # content on the tail
+            key_matrix[c, rope.d_rot + c] = 1.0
+        query_matrix[W, pos_plane] = alpha  # position tiebreak on a rotated plane
+        key_matrix[W, pos_plane] = 1.0  # global_position passes through identity
+        d_v = len(value)
+        attn = Attn(
+            query_in=query_in,
+            key_in=key_in,
+            value_in=value,
+            query_matrix=query_matrix,
+            key_matrix=key_matrix,
+            value_matrix=torch.eye(d_v),
+            output_matrix=torch.eye(d_v),
+            rope_base=rope.base,
+            rope_d_rot=rope.d_rot,
+        )
+    else:
+        # --- Full rotary ---
+        # Content + position both on slow planes of the d_head grid; the position
+        # column occupies the (W+1)-th slowest plane (after the W content planes).
+        # Guard: that plane's frequency θ_pos must satisfy max_positions × θ_pos <
+        # π/2 so cos((i−j)·θ_pos) stays positive for all key offsets; a negative
+        # cosine would reverse the tiebreak ordering.
+        theta_pos = float(rope_inv_freq(d_head, rope.base)[d_head // 2 - 1 - W])
+        if rope.max_positions * theta_pos >= math.pi / 2:
+            raise ValueError(
+                f"attend_most_recent_globally: content width W={W} places the "
+                f"position tiebreak on plane {d_head // 2 - 1 - W} "
+                f"(θ={theta_pos:.3e}); max_positions={rope.max_positions} × θ = "
+                f"{rope.max_positions * theta_pos:.3f} ≥ π/2 ({math.pi/2:.3f}).  "
+                f"Narrow the content vector, increase d_head/base, or reduce "
+                f"max_positions."
+            )
+        # d_qk layout (W+1 columns placed on slowest W+1 planes):
+        #   cols 0..W-1: content match (match_gain · Q · K)
+        #   col W:       position tiebreak (recency_scale · 1_query · gp_key)
+        d_qk = W + 1
+        query_matrix = torch.zeros((W + 1, d_qk))
+        for c in range(W):
+            query_matrix[c, c] = match_gain
+        query_matrix[W, W] = alpha  # constant 1.0 × recency_scale for position col
+        key_matrix = torch.zeros((W + 1, d_qk))
+        for c in range(W):
+            key_matrix[c, c] = 1.0
+        key_matrix[W, W] = 1.0  # global_position passes through identity
+        attn = rotary_content_head(
+            query_in,
+            key_in,
+            value,
+            query_matrix,
+            key_matrix,
+            d_head=d_head,
+            d_rot=rope.d_rot,
+            base=rope.base,
+        )
+
+    if assert_hardness_gt is not None:
+        attn = assert_softmax_hardness(attn, assert_hardness_gt)
+    return attn

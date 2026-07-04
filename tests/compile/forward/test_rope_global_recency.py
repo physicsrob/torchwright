@@ -19,10 +19,8 @@ import torch
 from torchwright.compiler.export import compile_headless
 from torchwright.debug.probe import probe_compiled
 from torchwright.graph.spherical_codes import index_to_vector
-from torchwright.ops.relu.global_recency import (
-    attend_most_recent_globally,
-    global_position_from_bos,
-)
+from torchwright.ops.attention_ops import attend_most_recent_globally
+from torchwright.ops.relu.global_recency import global_position_from_bos
 from torchwright.ops.inout_nodes import create_input, create_rope_config
 
 D_HEAD = 256

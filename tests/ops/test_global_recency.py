@@ -23,10 +23,8 @@ import torch
 from torchwright.graph import InputNode
 from torchwright.graph.spherical_codes import index_to_vector
 from torchwright.ops._math import _theta_slow, _w_of_m
-from torchwright.ops.relu.global_recency import (
-    attend_most_recent_globally,
-    global_position_from_bos,
-)
+from torchwright.ops.attention_ops import attend_most_recent_globally
+from torchwright.ops.relu.global_recency import global_position_from_bos
 from torchwright.ops.inout_nodes import create_rope_config
 
 D_HEAD = 256
