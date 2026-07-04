@@ -304,6 +304,16 @@ def broadcast_select(
     drop_true = _is_zero_literal(true_value)
     drop_false = _is_zero_literal(false_value)
 
+    if drop_true and drop_false:
+        # Both branches are all-zero literals: the gated pair is identically
+        # zero at every mask value (junk or clean), so the op collapses to
+        # the zero literal itself.  Without this, lanes_per_col == 0 below
+        # and a zero-lane FFN reaches the affine rules, where the empty
+        # per-lane comparison tensors default to float32 and torch.where
+        # rejects them.  The flagship hits this through pick_by_one_hot over
+        # an all-zero table (a missing-texture bank's palette rows).
+        return LiteralValue(torch.zeros(d_out), name="broadcast_select_zero")
+
     # Build the concatenated input from the live branches only; a dropped
     # zero branch never enters the graph.
     parts = [masks]

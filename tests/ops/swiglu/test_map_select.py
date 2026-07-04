@@ -306,6 +306,29 @@ def test_broadcast_select_zero_literal_branch_drops_lanes():
     assert torch.allclose(val, torch.tensor([[2.0, 0.0, 4.0]]), rtol=1e-6, atol=1e-7)
 
 
+def test_broadcast_select_both_branches_zero_collapses_to_literal():
+    """BOTH branches all-zero literals: the op is identically zero at any
+    mask value, so it must collapse to a zero LiteralValue rather than build
+    a zero-lane FFN — the zero-lane bound reaches _gated_lane_affine with
+    empty per-lane comparison lists, whose torch.tensor([]) defaults to
+    float32 and crashes torch.where.  The flagship hits this construction
+    through pick_by_one_hot over an all-zero table (a missing-texture
+    bank's palette rows)."""
+    from torchwright.graph.misc import LiteralValue
+    from torchwright.ops.swiglu import broadcast_select
+
+    m = create_input("m", 4, value_range=(-1.0, 1.0))
+    table_zero = LiteralValue(torch.zeros(4), name="tz")
+    zero = LiteralValue(torch.zeros(1), name="z")
+    out = broadcast_select(m, table_zero, zero, n_slots=4, d_fill=1)  # no raise
+    assert isinstance(out, LiteralValue)
+    assert len(out) == 4
+    masks = torch.tensor([[1.0, -1.0, 1.0, -1.0], [0.3, 0.0, -0.2, 1.0]])
+    val = out.compute(2, {"m": masks})
+    assert val.shape == (2, 4)
+    assert (val == 0.0).all()
+
+
 def test_broadcast_select_semantic_bound_mask_tol_widening():
     from torchwright.ops.swiglu import broadcast_select
     from torchwright.ops.swiglu.map_select import _MASK_TOL

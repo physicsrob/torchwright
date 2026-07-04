@@ -384,8 +384,15 @@ def _gated_lane_affine(
 
     iv1 = bound(A_L1, b_L1, A_U1, b_U1).to_interval()
     iv2 = bound(A_L2, b_L2, A_U2, b_U2).to_interval()
-    lo2 = torch.tensor([r2.lo > r1.lo for r1, r2 in zip(iv1, iv2)])
-    hi2 = torch.tensor([r2.hi < r1.hi for r1, r2 in zip(iv1, iv2)])
+    # dtype=torch.bool: an empty comparison list would otherwise default to
+    # float32, which torch.where rejects as a condition (a zero-lane FFN's
+    # bound is legitimately empty and must flow through well-typed).
+    lo2 = torch.tensor(
+        [r2.lo > r1.lo for r1, r2 in zip(iv1, iv2)], dtype=torch.bool
+    )
+    hi2 = torch.tensor(
+        [r2.hi < r1.hi for r1, r2 in zip(iv1, iv2)], dtype=torch.bool
+    )
     return bound(
         torch.where(lo2.unsqueeze(1), A_L2, A_L1),
         torch.where(lo2, b_L2, b_L1),
