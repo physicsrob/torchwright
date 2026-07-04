@@ -257,6 +257,29 @@ exercise the digit pipeline end to end: `onehot_lookup`,
 both packages. After this, `ops/relu`'s only consumers are its own
 tests.
 
+**Status (2026-07-03): started, parked on a compiler bug.** The flip
+itself was clean — every op the examples use has an identical signature
+across the two packages, no example uses the deleted offset apparatus,
+and all flipped graphs build and pass their compiled-forward example
+tests. Parked state and findings:
+
+- **Blocked by the recompile bug** the flip surfaced (same-object
+  double compile silently loosens bounds; fires on swish via the
+  rms_norm energy cert). Fix plan: `docs/lowering_copy_plan.md` —
+  Phase C resumes at its L4.
+- **`calculator_v2` and `binary_increment` stay on relu.** Both sit
+  behind the HF conversion path (`calculator_hf_export.py` /
+  `tests/hf/`), and the HF converter's native module is relu-only by
+  the A4 decision. calculator_v2 is also the remaining exerciser of
+  relu-only ops (`relu_add`, `multiply_integers`). So the Phase C
+  end-state sentence weakens to: after cutover, `ops/relu`'s consumers
+  are its own tests plus the two HF-path examples.
+- Three fixture-expectation updates ride with the flip (the adder
+  fixture becomes a swish artifact): `test_module.py`'s
+  `meta["activation"]` and `l{i}_W1`-name helper, and
+  `test_onnx_debug_session.py`'s corrupted-initializer target
+  (`l0_b1` → gated names).
+
 ## Phase D — flagship cutover and follow-ups (handoffs)
 
 Tracked here until torchwright_doom picks them up; the detailed
