@@ -109,11 +109,11 @@ def test_content_head_builds_on_nope_tail_partial_rotary():
     content rides the NoPE tail, so the Attn carries ``rope_d_rot == D_ROT`` and the
     rotary front of its Q/K projection is all zero (the logit is pure content
     dot)."""
-    from torchwright.compiler.forward.graph_analysis import GraphAnalyzer
+    from torchwright.compiler.utils import get_ancestor_nodes
     from torchwright.graph.attn import Attn
 
     sel = _content_dot_graph()
-    attns = [n for n in GraphAnalyzer(sel).get_all_nodes() if isinstance(n, Attn)]
+    attns = [n for n in get_ancestor_nodes({sel}) if isinstance(n, Attn)]
     assert attns, "expected a content Attn head"
     head = attns[0]
     assert head.rope_d_rot == D_ROT

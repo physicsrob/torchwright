@@ -168,18 +168,12 @@ def _clone_default(
         clone.__dict__[key] = value
 
     clone.node_id = new_ids[src]
-    try:
-        clone.inputs = [clone_map[inp] for inp in src.inputs]
-        clone.scheduling_predecessors = {
-            clone_map[pred] for pred in src.scheduling_predecessors
-        }
-    except KeyError as e:
-        raise GraphCloneError(
-            f"clone of {src!r} references a node outside the output's "
-            f"ancestor cone (missing from the clone map): {e.args[0]!r}. "
-            f"A scheduling predecessor that is not itself reachable from "
-            f"the output can never be scheduled — fix the hint wiring."
-        ) from None
+    clone.inputs = [clone_map[inp] for inp in src.inputs]
+    # Remapped in clone_graph's second pass: a scheduling predecessor is
+    # a scheduling-only edge, so it may be a *sibling* (not an ancestor
+    # via ``inputs``) that the data-topological clone order has not
+    # reached yet.
+    clone.scheduling_predecessors = set()
 
     override = src._semantic_affine_override
     clone._semantic_affine_override = (
@@ -299,6 +293,23 @@ def clone_graph(output_node: Node, dispatch: Dict[type, Callable]) -> GraphCopy:
                 f"lowering vocabulary."
             )
         clone_map[src] = impl(src, clone_map, new_ids, id_map)
+
+    # Second pass: scheduling predecessors are scheduling-only edges and
+    # may point at siblings the data-topological order visited later, so
+    # they can only be remapped once every clone exists.
+    for src, clone in clone_map.items():
+        try:
+            clone.scheduling_predecessors = {
+                clone_map[pred] for pred in src.scheduling_predecessors
+            }
+        except KeyError as e:
+            raise GraphCloneError(
+                f"scheduling predecessor of {src!r} is outside the "
+                f"output's ancestor cone (no clone exists for "
+                f"{e.args[0]!r}).  A predecessor that is not reachable "
+                f"from the output can never be scheduled — fix the hint "
+                f"wiring."
+            ) from None
 
     return GraphCopy(
         output_node=clone_map[output_node],

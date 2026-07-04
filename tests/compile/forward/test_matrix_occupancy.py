@@ -287,16 +287,18 @@ def test_occupancy_stable_across_cache_hit(monkeypatch):
     # The schedule cache replays the CP-SAT solve, but weight writing (and thus
     # placement recording) always runs — a cache hit must still yield identical
     # occupancy data.
-    # Compile the SAME graph object twice: head-column assignment is ordered by
-    # node id(), so two FRESH rebuilds would permute heads independently of the
-    # cache; reusing one graph keeps node ids (hence occupancy) identical
-    # between the cold solve and the warm replay.
-    parts = _token_parts()
+    # Two FRESH rebuilds, deliberately: the determinism sweep (node_id
+    # tie-breaks + sorted node-set iteration, docs/lowering_copy_plan.md
+    # decision 4) makes the schedule a function of topology and *relative*
+    # id order, so a rebuild with different absolute ids must produce
+    # identical occupancy between the cold solve and the warm replay.
     with tempfile.TemporaryDirectory() as cache_dir:
         monkeypatch.setenv("TW_SCHEDULE_CACHE_DIR", cache_dir)
         with tempfile.TemporaryDirectory() as tmpdir:
-            first = _compile_sidecar(parts, tmpdir, "a.onnx")  # cold: solves + caches
-            second = _compile_sidecar(parts, tmpdir, "b.onnx")  # warm: cache hit
+            # cold: solves + caches
+            first = _compile_sidecar(_token_parts(), tmpdir, "a.onnx")
+            # warm: cache hit, fresh graph
+            second = _compile_sidecar(_token_parts(), tmpdir, "b.onnx")
 
     for key in ("n_heads", "d_hidden", "matrices", "placements"):
         assert first[key] == second[key], f"{key} differs across cache hit"

@@ -74,13 +74,12 @@ DEBUG_META_FORMAT = "torchwright.debug.v1"
 def _unwrap_output_node(node: Node) -> Node:
     """Strip Assert/DebugWatch wrappers from an output node.
 
-    Assert and DebugWatch are stripped at compile time (GraphAnalyzer), so
-    the residual assignment only carries indices for the *wrapped* node —
-    looking the wrapper itself up KeyErrors.  ``compile_headless`` (the
-    in-process path) already unwraps via ``GraphAnalyzer.get_output_node``;
-    the ONNX exporters do their own residual lookups and need the same
-    treatment (ops like ``compare``/``select`` return Assert-wrapped
-    outputs).
+    Wrappers never receive residual columns (compilation strips them
+    from the compiler-private copy), so the residual assignment only
+    carries indices for the *wrapped* node — looking the wrapper itself
+    up KeyErrors.  Ops like ``compare``/``select`` return Assert-wrapped
+    outputs, so every residual lookup keyed by an output node needs this
+    treatment.
     """
     while isinstance(node, (Assert, DebugWatch)):
         node = node.inputs[0]
@@ -356,9 +355,9 @@ def _write_debug_sidecar(
     dict object as an earlier state's (``duplicate_state`` sharing) are
     stored as ``{"same_as": <key>}`` to keep the file small.
 
-    ``asserts``/``watches`` must have been collected BEFORE
-    ``forward_compile`` ran — compilation strips both wrapper kinds from
-    the graph in-place.
+    ``asserts``/``watches`` come from the source graph, which keeps its
+    wrappers through compilation (the compiler strips only its private
+    copy).
     """
     from torchwright.compiler.graph_identity import (
         canonical_ids,
@@ -1454,8 +1453,9 @@ def compile_to_onnx(
             f"without the norm."
         )
 
-    # Assert/DebugWatch coverage must be collected BEFORE forward_compile
-    # strips both wrapper kinds from the graph in-place.
+    # Assert/DebugWatch coverage for the debug sidecar.  Collection
+    # order no longer matters: compilation strips wrappers only from its
+    # private copy, so the source graph keeps them.
     from torchwright.graph.asserts import collect_debug_nodes
 
     all_asserts, all_watches = collect_debug_nodes(output_node)
@@ -2287,9 +2287,11 @@ def compile_headless(
             f"argument, got {type(graph).__name__}"
         )
 
-    # Unwrap Assert nodes at the output root — compilation strips them from
-    # the interior of the graph, but the caller's reference may still point
-    # at one, and downstream lookups must match the compiled terminal node.
+    # Unwrap Assert nodes at the output root — wrappers never receive
+    # residual columns, so downstream lookups must use the wrapped
+    # terminal node.  The collected asserts/watches are re-checked
+    # against compiled values on debug=True forwards (the source graph
+    # keeps its wrappers; compilation strips only its private copy).
     all_asserts, all_watches = collect_debug_nodes(graph)
     combined_output = _unwrap_output_node(graph)
 

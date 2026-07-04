@@ -359,3 +359,30 @@ def test_clone_raises_on_out_of_cone_scheduling_predecessor():
     lin.scheduling_predecessors = {outside}
     with pytest.raises(GraphCloneError, match="ancestor cone"):
         clone_graph(lin, DISPATCH)
+
+
+def test_clone_remaps_sibling_scheduling_predecessor():
+    """A scheduling predecessor may be a *sibling* (scheduling-only edge,
+    not an ancestor via inputs), which the data-topological clone order
+    can visit after its dependent — the remap runs as a second pass."""
+    from torchwright.graph.scheduling_hints import sequential_scope
+
+    x = create_input("x", 4, value_range=(-1.0, 1.0))
+
+    def factory(i):
+        return lambda: Linear(x, _rand(4, 3, seed=31 + i), name=f"r_{i}")
+
+    r1, r2, r3 = sequential_scope([factory(0), factory(1), factory(2)])
+    out = Concatenate([r1, r2, r3])
+    assert any(
+        n.scheduling_predecessors for n in (r1, r2, r3)
+    ), "sequential_scope should have wired sibling predecessors"
+
+    copy = clone_graph(out, DISPATCH)
+    for src_node in (r1, r2, r3):
+        clone = copy.node_map[src_node]
+        assert clone.scheduling_predecessors == {
+            copy.node_map[p] for p in src_node.scheduling_predecessors
+        }
+        for pred in src_node.scheduling_predecessors:
+            assert copy.node_map[pred] is not pred  # remapped, not verbatim

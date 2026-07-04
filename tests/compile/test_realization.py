@@ -91,81 +91,92 @@ def test_attn_candidate_class():
 
 
 def test_lower_builds_unresolved_table():
+    # The lowered table is keyed by the compiler-private copy's node ids
+    # (the scheduler consumes it); translate source nodes via copy_of.
     out, a, b, add, blk, lit = _test_graph()
-    table = lower(out).realization_table
+    lowered = lower(out)
+    table = lowered.realization_table
+    cid = lambda n: lowered.copy_of(n).node_id
 
-    ea = table.entries[a.node_id]
+    ea = table.entries[cid(a)]
     assert ea.resolved is None and not ea.conditional
     assert ea.candidates == (ATTN_TRANSPORT, MLP_BYPASS)
 
-    eadd = table.entries[add.node_id]
+    eadd = table.entries[cid(add)]
     assert eadd.conditional and eadd.resolved is None
 
-    assert table.entries[blk.node_id].resolved == MLP_COMPOSITE
-    assert table.entries[lit.node_id].resolved == MLP_LITERAL
+    assert table.entries[cid(blk)].resolved == MLP_COMPOSITE
+    assert table.entries[cid(lit)].resolved == MLP_LITERAL
     # Non-schedulable nodes get no entry.
-    assert out.node_id not in table.entries
+    assert cid(out) not in table.entries
 
 
 def test_resolve_static_both_policies():
     out, a, b, add, blk, lit = _test_graph()
-    table = lower(out).realization_table
+    lowered = lower(out)
+    table = lowered.realization_table
+    ca, cb, cadd, cblk = (lowered.copy_of(n) for n in (a, b, add, blk))
 
     bypass = table.resolve_static(SchedulingPolicy())  # local_in_attention="never"
-    assert bypass.entries[a.node_id].resolved == MLP_BYPASS
-    assert bypass.entries[b.node_id].resolved == MLP_BYPASS
-    assert not bypass.is_attention_routed(a)
+    assert bypass.entries[ca.node_id].resolved == MLP_BYPASS
+    assert bypass.entries[cb.node_id].resolved == MLP_BYPASS
+    assert not bypass.is_attention_routed(ca)
 
     attn = table.resolve_static(LEGACY_POLICY)  # "always"
-    assert attn.entries[a.node_id].resolved == ATTN_TRANSPORT
-    assert attn.is_attention_routed(a)
+    assert attn.entries[ca.node_id].resolved == ATTN_TRANSPORT
+    assert attn.is_attention_routed(ca)
 
     # Conditional and single-candidate entries are untouched by resolution.
     for t in (bypass, attn):
-        assert t.entries[add.node_id].conditional
-        assert t.entries[blk.node_id].resolved == MLP_COMPOSITE
+        assert t.entries[cadd.node_id].conditional
+        assert t.entries[cblk.node_id].resolved == MLP_COMPOSITE
 
     # The unresolved source table is not mutated (resolvers return new).
-    assert table.entries[a.node_id].resolved is None
+    assert table.entries[ca.node_id].resolved is None
 
 
 def test_resolve_from_assignment():
     out, a, b, add, blk, lit = _test_graph()
-    table = lower(out).realization_table
+    lowered = lower(out)
+    table = lowered.realization_table
+    cid = lambda n: lowered.copy_of(n).node_id
 
     routing = {
-        a.node_id: "attn",
-        b.node_id: "mlp",
-        add.node_id: "attn",
-        blk.node_id: "mlp",
-        lit.node_id: "mlp",
+        cid(a): "attn",
+        cid(b): "mlp",
+        cid(add): "attn",
+        cid(blk): "mlp",
+        cid(lit): "mlp",
     }
     resolved = table.resolve_from_assignment(routing)
-    assert resolved.entries[a.node_id].resolved == ATTN_TRANSPORT
-    assert resolved.entries[b.node_id].resolved == MLP_BYPASS
-    assert resolved.entries[add.node_id].conditional
-    assert resolved.entries[blk.node_id].resolved == MLP_COMPOSITE
+    assert resolved.entries[cid(a)].resolved == ATTN_TRANSPORT
+    assert resolved.entries[cid(b)].resolved == MLP_BYPASS
+    assert resolved.entries[cid(add)].conditional
+    assert resolved.entries[cid(blk)].resolved == MLP_COMPOSITE
 
 
 def test_resolve_from_assignment_rejects_contradiction():
     out, a, b, add, blk, lit = _test_graph()
-    table = lower(out).realization_table
+    lowered = lower(out)
     # The solve routing an FFN to attention contradicts its only class.
     with pytest.raises(UnresolvedRealizationError, match="only realization"):
-        table.resolve_from_assignment({blk.node_id: "attn"})
+        lowered.realization_table.resolve_from_assignment(
+            {lowered.copy_of(blk).node_id: "attn"}
+        )
 
 
 def test_check_complete_and_unresolved_read():
     out, a, b, add, blk, lit = _test_graph()
     from torchwright.compiler.utils import get_ancestor_nodes
 
-    nodes = get_ancestor_nodes({out})
-    table = lower(out).realization_table
+    lowered = lower(out)
+    nodes = get_ancestor_nodes({lowered.output_node})
+    table = lowered.realization_table
 
     with pytest.raises(UnresolvedRealizationError, match="incomplete"):
         table.check_complete(nodes)
     with pytest.raises(UnresolvedRealizationError, match="before resolution"):
-        table.resolved_class(a)
+        table.resolved_class(lowered.copy_of(a))
 
     resolved = table.resolve_static(SchedulingPolicy())
     resolved.check_complete(nodes)  # no raise

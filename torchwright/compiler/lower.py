@@ -1,9 +1,9 @@
-"""The lowering boundary: certify a graph is scheduler-ready.
+"""The lowering boundary: certify a graph and hand the pipeline a private copy.
 
 ``lower()`` is the single moment a graph transitions from "whatever the
 ops layer built" to "certified compilable vocabulary"
-(``docs/lowering_boundary_plan.md``).  Constructing a :class:`LoweredGraph`
-validates two things:
+(``docs/lowering_boundary_plan.md``, ``docs/lowering_copy_plan.md``).
+Constructing a :class:`LoweredGraph` does three things:
 
 1. **Closed vocabulary** — every reachable node is one of the compilable
    types (FFN, Attn, Linear, Add), bookkeeping (InputNode, LiteralValue,
@@ -15,27 +15,29 @@ validates two things:
    miner that used to live in ``graph/blockify.py`` is folded in here as
    the error-reporting detector.
 
-2. **Fresh derived caches** — ``_affine_bound`` / ``_structural_type`` are
-   computed eagerly in ``Node.__init__``, so any in-place graph mutation
-   (a fusion fold, a hand edit) leaves them describing the pre-mutation
-   graph.  ``lower()`` recomputes both for every reachable node in true
-   topological order (NOT node-id order — the "inputs have smaller ids"
-   property is a fusion-fold invariant, not a general graph property) and
-   re-applies each node's semantic affine override, reproducing
-   construction-time bounds exactly.  The stale-bounds class of bug
-   (commit 0570af1) becomes structurally impossible at this boundary
-   instead of being guarded by per-pass discipline.
+2. **A compiler-private copy** — compilation is a pure function of the
+   source graph.  The copy duplicates every node object (weights shared
+   by reference), recomputes ``_affine_bound`` / ``_structural_type``
+   fresh in topological order (subsuming the refresh loop that used to
+   live here — the stale-bounds bug class of commit 0570af1 stays
+   structurally impossible), and is the only graph any compile pass ever
+   touches.  The source keeps its Assert/DebugWatch wrappers and its
+   bounds forever; recompiling is re-lowering the same pristine source.
 
-``forward_compile`` calls ``lower()`` as its first step, ahead of
-``GraphAnalyzer`` — the ordering matters: GraphAnalyzer's Assert-strip
-tightens structural types and bound input-ranges from claimed ranges, and
-that tightening must land on top of *fresh* bounds, not be wiped by a
-later recompute.
+3. **The wrapper strip, on the copy** — Assert/DebugWatch wrappers are
+   removed from the *copy* (their claimed ranges tightened onto the
+   wrapped nodes' types first), so the scheduler, weight writer, and
+   certifications see a wrapper-free graph with claim-tightened bounds.
+   ``GraphAnalyzer`` is pure analysis and receives no wrappers.
 """
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Set, Tuple
 
+from torchwright.compiler.graph_clone import (
+    build_clone_dispatch,
+    clone_graph,
+)
 from torchwright.compiler.realization import (
     CostSummary,
     RealizationTable,
@@ -43,7 +45,6 @@ from torchwright.compiler.realization import (
 )
 from torchwright.compiler.utils import get_ancestor_nodes
 from torchwright.graph import Node
-from torchwright.graph.affine_rules import refresh_node_caches
 from torchwright.graph.attn import Attn
 from torchwright.graph.ffn import FFN
 from torchwright.graph.embedding import Embedding
@@ -79,6 +80,10 @@ VOCABULARY: Tuple[type, ...] = (
     ValueLogger,
 )
 
+# Clone dispatch generated from the vocabulary — a vocabulary type without
+# a registered clone path fails HERE, at import, not mid-compile.
+_CLONE_DISPATCH = build_clone_dispatch(VOCABULARY)
+
 
 class LoweringError(ValueError):
     """A graph failed certification at the lowering boundary."""
@@ -88,17 +93,40 @@ class LoweringError(ValueError):
 class LoweredGraph:
     """Certificate that a graph passed the lowering boundary.
 
-    Holds the certified output node and the **unresolved realization
-    table** — every schedulable node's candidate realization classes
+    Holds the **compiler-private copy** of the graph (``output_node``, a
+    wrapper-free clone with claim-tightened fresh bounds), the untouched
+    source graph's output (``source_output_node``), the source→copy node
+    map, and the **unresolved realization table** built from the copy —
+    every schedulable node's candidate realization classes
     (:mod:`torchwright.compiler.realization`).  Produced only by
     :func:`lower`; the compile pipeline's scheduling stages consume this
     type, so an uncertified graph cannot reach the scheduler.  A resolver
     (the static policy at ``optimize=0``; the CP-SAT solve on the directed
     path) turns the table into the resolved artifact the layer walk reads.
+
+    ``node_map`` maps every reachable source node to its clone; source
+    Assert/DebugWatch wrappers map to the clone of the node they wrap
+    (the copy is stripped, so the wrappers' clones are not part of it).
+    The realization table — like everything the compile pipeline sees —
+    is keyed by *copy* node ids; translate through :meth:`copy_of` when
+    querying it with source nodes.
     """
 
     output_node: Node
     realization_table: RealizationTable
+    source_output_node: Optional[Node] = None
+    node_map: Dict[Node, Node] = field(default_factory=dict)
+
+    def copy_of(self, source_node: Node) -> Node:
+        """The compiler-private clone of ``source_node`` (wrappers resolve
+        to the clone of the node they wrap)."""
+        try:
+            return self.node_map[source_node]
+        except KeyError:
+            raise KeyError(
+                f"{source_node!r} is not reachable from the lowered graph's "
+                f"source output — no clone exists for it"
+            ) from None
 
     def cost_summary(
         self,
@@ -130,6 +158,84 @@ def _unwrap(node: Node) -> Node:
     while isinstance(node, (Assert, DebugWatch)):
         node = node.inputs[0]
     return node
+
+
+def _strip_debug_wrappers(output_node: Node) -> Node:
+    """Remove Assert/DebugWatch wrappers from the (compiler-private) graph.
+
+    Runs only on the copy ``lower()`` just built — never on a user's
+    graph.  Two steps, ported unchanged from the pre-copy
+    ``GraphAnalyzer._strip_asserts``:
+
+    1. Each Assert's claimed range is transferred onto the node it wraps
+       — the wrapped node's ``_structural_type`` is tightened with the
+       claim, and any input-range tightening the Assert's affine bound
+       carries (the leaf-claim channel of ``_assert_rule``) is
+       intersected into the wrapped node's bound.  This is what makes
+       the copy's ``value_type``s claim-tightened even though the
+       wrappers are gone.
+
+    2. Every consumer of a wrapper is rewired to the wrapped node, and
+       the unwrapped output is returned.
+
+    Order note: asserts are processed in ``node_id`` order for
+    determinism, though the transfer itself commutes (range
+    intersections are min/max).
+    """
+    from torchwright.graph.value_type import tightened_with
+
+    all_nodes = get_ancestor_nodes({output_node})
+    asserts = sorted(
+        (n for n in all_nodes if isinstance(n, Assert)), key=lambda n: n.node_id
+    )
+    watches = [n for n in all_nodes if isinstance(n, DebugWatch)]
+    if not asserts and not watches:
+        return output_node
+
+    for a in asserts:
+        if a.claimed_type is None:
+            continue
+        target = _unwrap(a)
+        target._structural_type = tightened_with(
+            target._structural_type, a.claimed_type
+        )
+
+        import torch
+
+        from torchwright.graph.affine_bound import AffineBound
+
+        a_ab = a._affine_bound
+        t_ab = target._affine_bound
+        new_ranges = dict(t_ab.input_ranges)
+        changed = False
+        for nid, (a_lo, a_hi) in a_ab.input_ranges.items():
+            if nid in new_ranges:
+                old_lo, old_hi = new_ranges[nid]
+                tighter_lo = torch.maximum(old_lo, a_lo)
+                tighter_hi = torch.minimum(old_hi, a_hi)
+                if not (
+                    torch.equal(tighter_lo, old_lo) and torch.equal(tighter_hi, old_hi)
+                ):
+                    new_ranges[nid] = (tighter_lo, tighter_hi)
+                    changed = True
+        if changed:
+            target._affine_bound = AffineBound(
+                A_lo=t_ab.A_lo,
+                A_hi=t_ab.A_hi,
+                b_lo=t_ab.b_lo,
+                b_hi=t_ab.b_hi,
+                columns=t_ab.columns,
+                input_ranges=new_ranges,
+            )
+
+    for node in all_nodes:
+        if isinstance(node, (Assert, DebugWatch)):
+            continue
+        for i, inp in enumerate(node.inputs):
+            if isinstance(inp, (Assert, DebugWatch)):
+                node.inputs[i] = _unwrap(inp)
+
+    return _unwrap(output_node)
 
 
 class _ChainMiner:
@@ -249,42 +355,24 @@ def _check_vocabulary(all_nodes: Set[Node]) -> None:
     )
 
 
-def _topological_order(output_node: Node) -> List[Node]:
-    """Inputs-before-consumers order over the ancestor cone (iterative)."""
-    order: List[Node] = []
-    visited: Set[Node] = set()
-    stack: List[Tuple[Node, bool]] = [(output_node, False)]
-    while stack:
-        node, expanded = stack.pop()
-        if expanded:
-            order.append(node)
-            continue
-        if node in visited:
-            continue
-        visited.add(node)
-        stack.append((node, True))
-        for inp in node.inputs:
-            if inp not in visited:
-                stack.append((inp, False))
-    return order
-
-
 def lower(output_node: Node, *, verbose: bool = False) -> LoweredGraph:
-    """Certify the graph reachable from ``output_node`` for scheduling.
+    """Certify the graph reachable from ``output_node`` and return its copy.
 
-    Runs the two boundary validations (closed vocabulary; fresh derived
-    caches) and returns the :class:`LoweredGraph` certificate the compile
-    pipeline consumes.  Raises :class:`LoweringError` on a vocabulary
-    violation.  The cache refresh mutates the graph's nodes in place
-    (recomputed ``_affine_bound`` / ``_structural_type``, semantic
-    overrides re-applied) and is idempotent.
+    Compilation is a pure function of the source graph: this validates
+    the closed vocabulary, builds the compiler-private copy (fresh
+    derived caches by construction), strips Assert/DebugWatch wrappers
+    from the copy with their claims tightened onto the wrapped nodes,
+    and returns the :class:`LoweredGraph` certificate the compile
+    pipeline consumes.  The source graph — nodes, wiring, wrappers,
+    cached bounds — is never touched.
 
     Args:
-        output_node: The graph's output node.
+        output_node: The source graph's output node.
         verbose: Print the certified node count.
 
     Returns:
-        A :class:`LoweredGraph` holding ``output_node``.
+        A :class:`LoweredGraph` holding the copy's output node, the
+        source output, and the source→copy node map.
 
     Raises:
         LoweringError: if any reachable node is outside the compilable
@@ -297,9 +385,23 @@ def lower(output_node: Node, *, verbose: bool = False) -> LoweredGraph:
         )
     all_nodes = get_ancestor_nodes({output_node})
     _check_vocabulary(all_nodes)
-    for node in _topological_order(output_node):
-        refresh_node_caches(node)
-    table = RealizationTable.build(all_nodes)
+
+    copy = clone_graph(output_node, _CLONE_DISPATCH)
+    copy_output = _strip_debug_wrappers(copy.output_node)
+    # Wrapper sources resolve to the clone of the node they wrap — the
+    # stripped wrapper clones are no longer part of the copy.
+    node_map = {src: _unwrap(clone) for src, clone in copy.node_map.items()}
+
+    copy_nodes = get_ancestor_nodes({copy_output})
+    table = RealizationTable.build(copy_nodes)
     if verbose:
-        print(f"lower(): certified {len(all_nodes)} nodes (vocabulary + fresh caches)")
-    return LoweredGraph(output_node=output_node, realization_table=table)
+        print(
+            f"lower(): certified {len(all_nodes)} nodes "
+            f"(vocabulary + compiler-private copy)"
+        )
+    return LoweredGraph(
+        output_node=copy_output,
+        realization_table=table,
+        source_output_node=output_node,
+        node_map=node_map,
+    )

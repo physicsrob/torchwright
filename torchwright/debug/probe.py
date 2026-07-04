@@ -36,7 +36,7 @@ from typing import Any, Dict, Iterator, List, Optional, Protocol, Sequence, Tupl
 import torch
 
 from torchwright.compiler.export import CompiledHeadless, compile_headless
-from torchwright.compiler.forward.graph_analysis import GraphAnalyzer
+from torchwright.compiler.graph_clone import topological_order
 from torchwright.compiler.residual_assignment import (
     ResidualAssignment,
     ResidualStreamState,
@@ -50,7 +50,13 @@ from torchwright.debug.extraction import (
 )
 from torchwright.graph import Concatenate, Node
 from torchwright.graph.attn import Attn, CAUSAL_MASK_SENTINEL
-from torchwright.graph.misc import Assert, InputNode, LiteralValue, Placeholder
+from torchwright.graph.misc import (
+    Assert,
+    DebugWatch,
+    InputNode,
+    LiteralValue,
+    Placeholder,
+)
 
 # Backward-compatible aliases — the implementations moved to
 # torchwright.debug.extraction so the ONNX debug backend can share them.
@@ -130,11 +136,8 @@ def reference_eval(
     # Collect all node subclasses reachable from the output graph so we
     # only patch classes actually in use.  Walking by class lets us
     # restore every patch in a tight finally block even if compute()
-    # raises mid-run.
-    #
-    # We walk via ``get_ancestor_nodes`` rather than ``GraphAnalyzer``
-    # because ``GraphAnalyzer`` strips ``Assert`` nodes in-place — the
-    # oracle pass must still see them so their predicates fire.
+    # raises mid-run.  Assert/DebugWatch wrappers are part of the walk —
+    # the oracle pass runs their predicates.
     all_nodes = get_ancestor_nodes({output_node})
     classes_in_graph = {type(n) for n in all_nodes}
 
@@ -333,10 +336,14 @@ def probe_compiled(
     )
     ordered_states = [s for _, _, s in ordered]
 
-    graph = GraphAnalyzer(output_node)
     report = ProbeReport(atol=atol)
 
-    for node in graph.get_topological_order():
+    for node in topological_order(output_node):
+        if isinstance(node, (Assert, DebugWatch)):
+            # The source graph keeps its wrappers through compilation
+            # (the compiler strips only its private copy); each wrapped
+            # node is checked directly, so wrapper rows would be noise.
+            continue
         if isinstance(node, (InputNode, LiteralValue, Placeholder)):
             report.skipped[node] = "input/literal/placeholder"
             continue
@@ -922,10 +929,10 @@ def check_asserts_on_compiled(
     input node — catching invariants that reference math satisfies but
     compiled approximations violate.
 
-    ``asserts`` must have been collected via
-    ``torchwright.graph.asserts.collect_asserts(output_node)`` **before**
-    ``compile_headless`` was called, since compilation strips Asserts
-    from the graph.
+    Collect ``asserts`` via
+    ``torchwright.graph.asserts.collect_asserts(output_node)`` — before
+    or after compiling; compilation strips only its private copy, so the
+    source graph keeps its wrappers.
 
     Raises ``AssertionError`` on the first violation, with the same
     annotation-tagged message format as ``Assert.compute``.  Asserts

@@ -8,10 +8,11 @@ construction reads naturally::
     position_onehot = assert_onehot(position_onehot)
     sentinel = assert_strictly_less(real_score, sentinel)
 
-The wrapped node is stripped during compilation, so Asserts cost
-nothing in the compiled transformer's weights or schedule.  They run
-during reference evaluation (``reference_eval``) and, when available,
-during compiled-graph probing (``probe_compiled``).
+Wrappers are stripped from the compiler-private copy during
+compilation (the source graph keeps them), so Asserts cost nothing in
+the compiled transformer's weights or schedule.  They run during
+reference evaluation (``reference_eval``) and, when available, during
+compiled-graph probing (``probe_compiled``).
 
 Naming convention (matches the rest of the codebase)
 ----------------------------------------------------
@@ -50,11 +51,9 @@ from torchwright.graph.value_type import NodeValueType, Range
 def collect_asserts(output_node: Node) -> List[Assert]:
     """Walk the graph from ``output_node`` and collect every reachable Assert.
 
-    Call this **before** passing the graph to ``compile_headless`` —
-    compile-time analysis strips Asserts in-place, so post-compile
-    traversal won't find them.  Tests that want to verify Asserts hold
-    on *compiled* values (via ``probe_compiled``) collect the list up
-    front and pass it through.
+    Safe before or after compiling: compilation strips wrappers only
+    from its private copy (``lower()`` clones the graph), so the source
+    graph keeps its Asserts forever.
     """
     seen: Set[int] = set()
     asserts: List[Assert] = []
@@ -74,8 +73,8 @@ def collect_asserts(output_node: Node) -> List[Assert]:
 def collect_watches(output_node: Node) -> List[DebugWatch]:
     """Walk the graph from ``output_node`` and collect every reachable DebugWatch.
 
-    Call this **before** passing the graph to ``compile_headless`` —
-    compile-time analysis strips DebugWatch nodes in-place.
+    Safe before or after compiling — the source graph keeps its wrappers
+    (compilation strips only its private copy).
     """
     seen: Set[int] = set()
     watches: List[DebugWatch] = []
