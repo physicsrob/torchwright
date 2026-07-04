@@ -6,7 +6,8 @@ machine-specific, so this module rebuilds the same boosted-BOS head (the
 mechanism and its monotonicity guard are identical) and inverts the BOS
 weight through the swiglu :func:`piecewise_linear`.  The pure-math
 helpers (``_theta_slow``, ``_w_of_m``, ``_bisect_m``) and the table size
-are shared with the frozen relu module — they contain no machine choice.
+live in ``torchwright/ops/_math.py``, shared with the relu twin — they
+contain no machine choice.
 
 The inversion table is this library's densest committed grid: 1024
 log-uniform breakpoints on ``w ∈ [w_min, 1]``, far below the ``34/K``
@@ -24,7 +25,7 @@ import torch
 from torchwright.graph import Attn, LiteralValue, Node, RopeConfig
 from torchwright.graph.asserts import assert_in_range
 from torchwright.ops.const import scale
-from torchwright.ops.relu.global_recency import (
+from torchwright.ops._math import (
     _N_BPS,
     _bisect_m,
     _theta_slow,

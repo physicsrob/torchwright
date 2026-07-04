@@ -25,7 +25,7 @@ import torch
 import examples.calculator_simple as calc
 from torchwright.compiler.export import compile_headless, compile_to_onnx
 from torchwright.graph import Concatenate
-from torchwright.ops.arithmetic_ops import concat
+from torchwright.ops.linear import concat
 from torchwright.ops.inout_nodes import create_input, create_onehot_embedding
 from examples._calculator_common import _CARRY_W, _NO, _state
 from examples.calculator_simple import (

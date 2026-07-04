@@ -20,7 +20,7 @@ from typing import List
 import torch
 
 from torchwright.graph import Node, Embedding, RopeConfig
-from torchwright.ops.arithmetic_ops import sum_nodes
+from torchwright.ops.linear import sum_nodes
 from torchwright.ops.attention_ops import attend_to_offset, get_prev_value
 from torchwright.ops.inout_nodes import create_literal_value
 from torchwright.ops.logic_ops import (

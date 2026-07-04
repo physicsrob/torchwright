@@ -19,7 +19,7 @@ from typing import Tuple, List
 import torch
 
 from torchwright.graph import Node, Embedding
-from torchwright.ops.arithmetic_ops import concat
+from torchwright.ops.linear import concat
 from torchwright.ops.inout_nodes import create_literal_value
 from torchwright.ops.map_select import map_to_table
 

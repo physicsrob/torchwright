@@ -25,7 +25,7 @@ from torchwright.graph import FFN
 from torchwright.graph.misc import LiteralValue
 from torchwright.ops.inout_nodes import create_input
 from torchwright.ops.linear_relu_linear import linear_relu_linear
-from torchwright.ops.relu.arithmetic_ops import add, add_const
+from torchwright.ops.linear import add, add_const
 from torchwright.ops.swiglu.swiglu_ffn import swiglu_ffn
 
 N_POS = 4

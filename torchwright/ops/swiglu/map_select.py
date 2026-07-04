@@ -24,14 +24,8 @@ from torchwright.ops.const import (
     swish_dip,
 )
 
-# The output-range guard slack and axis-scale validation are pure functions
-# with no machine choice — shared with the frozen relu package.
-from torchwright.ops.relu.map_select import _lookup_axis_scale, _lookup_numeric_slack
-
-# sum_nodes is purely linear (Add hardware, no activation) — machine-neutral
-# in substance, shared with the frozen relu package until its retirement
-# relocates the linear ops.
-from torchwright.ops.relu.arithmetic_ops import add_const, sum_nodes
+from torchwright.ops._math import _lookup_axis_scale, _lookup_numeric_slack
+from torchwright.ops.linear import add_const, sum_nodes
 from torchwright.ops.swiglu.logic_ops import _GATE_C_TOL, _assert_cond_pm1, cond_gate
 from torchwright.ops.swiglu.swiglu_ffn import swiglu_ffn
 

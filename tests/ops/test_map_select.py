@@ -2,7 +2,7 @@ import pytest
 
 from torchwright.graph.asserts import assert_matches_value_type
 from torchwright.graph.value_type import NodeValueType, Range
-from torchwright.ops.arithmetic_ops import add_const
+from torchwright.ops.linear import add_const
 from torchwright.ops.inout_nodes import (
     create_input,
     create_literal_value,

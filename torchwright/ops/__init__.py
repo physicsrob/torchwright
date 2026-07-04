@@ -1,21 +1,23 @@
 # Machine-selection boundary: `torchwright.ops.relu` is today's op
 # library (moved, frozen); `torchwright.ops.swiglu` is the swish-machine
 # library.  The import path *is* the machine choice — no mode flags.
-# `const` and `inout_nodes` stay at this level: both machines use them.
+# Machine-neutral code lives at this level: `const`, `inout_nodes`,
+# `linear` (purely linear ops — no MLP sublayer, so no activation
+# choice), `attention_ops` (attention hardware), and `_math` (shared
+# pure-math helpers).  Both machines build on it.
 #
 # Compatibility aliases: every pre-split import path
 # (``torchwright.ops.<mod>``) must keep working with preserved module
-# identity — the relu modules' own cross-imports use those paths, and so
-# do ~50 torchwright_doom files and the frozen `tests/ops/*` baseline.
+# identity — some relu-module cross-imports use those paths, and so do
+# torchwright_doom files and the frozen `tests/ops/*` baseline.
 # Registration order is the modules' dependency order, and each alias is
-# registered *before* the next module loads, so the byte-identical moved
-# files resolve their cross-imports through `sys.modules`.
+# registered *before* the next module loads, so the moved files resolve
+# their cross-imports through `sys.modules`.
 import importlib as _importlib
 import sys as _sys
 
 _RELU_MODULES = (
     "linear_relu_linear",
-    "attention_ops",
     "arithmetic_ops",
     "logic_ops",
     "map_select",
@@ -32,29 +34,33 @@ for _name in _RELU_MODULES:
     globals()[_name] = _mod
 del _importlib, _sys, _name, _mod
 
-# Arithmetic
-from torchwright.ops.relu.arithmetic_ops import (
+# Linear (machine-neutral)
+from torchwright.ops.linear import (
     add,
     add_const,
     add_scaled_nodes,
-    abs,
     bool_to_01,
+    concat,
+    multiply_const,
+    negate,
+    subtract,
+    sum_nodes,
+)
+
+# Arithmetic
+from torchwright.ops.relu.arithmetic_ops import (
+    abs,
     ceil_int,
     compare,
-    concat,
     min,
     floor_int,
     mod_const,
     multiply_2d,
-    multiply_const,
     multiply_integers,
-    negate,
     piecewise_linear,
     reciprocal,
     relu_add,
     square,
-    subtract,
-    sum_nodes,
     thermometer_floor_div,
 )
 

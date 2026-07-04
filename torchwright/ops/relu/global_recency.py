@@ -57,14 +57,9 @@ from torchwright.graph.rope import (
     rope_inv_freq,
     rotary_content_head,
 )
+from torchwright.ops._math import _N_BPS, _bisect_m, _theta_slow, _w_of_m
 from torchwright.ops.arithmetic_ops import piecewise_linear
 from torchwright.ops.attention_ops import attend_to_offset
-
-# How many log-uniform breakpoints to use for the PWL inverse w → m.
-# Validation (scripts/rope_global_recency_validate.py) shows 1024 achieves
-# max error ~0.013 positions, well within the 0.5 rounding threshold.
-# 1024 neurons fit in a single MLP sublayer (d_max=1024 default).
-_N_BPS = 1024
 
 # Per-position logit gain for the position tiebreak in attend_most_recent_globally.
 # Each unit of absolute position contributes recency_scale to the attention logit
@@ -76,53 +71,6 @@ _N_BPS = 1024
 #   (2) content dominance: match_gain · min_match_dot_gap > recency_scale · max_positions
 #       For E8 (match_gain=200, dot_gap=1600): 320000 > 1.0 · 61440 ✓ (5.2× margin).
 _RECENCY_SCALE = 1.0
-
-
-# ---------------------------------------------------------------------------
-# Internal helpers
-# ---------------------------------------------------------------------------
-
-
-def _theta_slow(rope: RopeConfig) -> float:
-    """Frequency of the slowest **rotated** plane for this rope config.
-
-    The runtime rotation runs over the rotary front ``d_rot`` (``apply_rope`` uses
-    width ``d_rot``, so per-plane frequencies are ``base^(-2p/d_rot)``), so the
-    slowest rotated plane is index ``d_rot/2 − 1`` with frequency
-    ``rope_inv_freq(d_rot, base)[-1]``.  Under full rotary ``d_rot == d_head`` and
-    this is the slowest plane of the ``d_head`` grid — byte-identical to the
-    pre-partial form.  This is the plane the BOS-weight feature must ride so its
-    ``cos(m·θ_slow)`` attenuation matches the PWL inversion table."""
-    return float(rope_inv_freq(rope.d_rot, rope.base)[-1])
-
-
-def _w_of_m(m: float, max_len: int, theta: float) -> float:
-    """True BOS softmax weight at position m (exact math)."""
-    if m <= 0.0:
-        return 1.0
-    cos_m = math.cos(m * theta)
-    eff = math.pow(max_len, cos_m)  # MAX_LEN^cos(m·θ) — the actual attention score
-    if eff <= 0.0:
-        return 0.0
-    return eff / (eff + m)
-
-
-def _bisect_m(w_target: float, max_len: int, theta: float) -> float:
-    """Invert _w_of_m: find m ∈ [0, max_len] with _w_of_m(m) ≈ w_target."""
-    if w_target >= 1.0:
-        return 0.0
-    w_at_max = _w_of_m(max_len, max_len, theta)
-    if w_target <= w_at_max:
-        return float(max_len)
-    lo, hi = 0.0, float(max_len)
-    for _ in range(64):  # converges to <1e-15 in 64 steps
-        mid = 0.5 * (lo + hi)
-        # w is decreasing in m: w_of_m(mid) > w_target ⟹ true m is larger
-        if _w_of_m(mid, max_len, theta) > w_target:
-            lo = mid
-        else:
-            hi = mid
-    return 0.5 * (lo + hi)
 
 
 # ---------------------------------------------------------------------------

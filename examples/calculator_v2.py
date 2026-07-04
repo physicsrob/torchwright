@@ -22,14 +22,8 @@ import torch
 
 from torchwright.graph import Node, Embedding, RopeConfig
 from torchwright.graph.embedding import Unembedding
-from torchwright.ops.arithmetic_ops import (
-    add,
-    subtract,
-    negate,
-    compare,
-    relu_add,
-    multiply_integers,
-)
+from torchwright.ops.arithmetic_ops import compare, relu_add, multiply_integers
+from torchwright.ops.linear import add, negate, subtract
 from torchwright.ops.attention_ops import get_prev_value
 from torchwright.ops.inout_nodes import (
     create_literal_value,

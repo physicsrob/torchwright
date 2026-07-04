@@ -354,7 +354,7 @@ def test_debug_value_on_intermediate():
     """debug_value works on intermediate nodes, not just the output."""
     x = create_input("x", 1)
     y = clamp(x, -1.0, 1.0)
-    from torchwright.ops.arithmetic_ops import add_const
+    from torchwright.ops.linear import add_const
 
     z = add_const(y, 1.0)
     mod = _compile(z)

@@ -11,7 +11,7 @@ import torch
 
 from torchwright.graph import FFN, Linear
 from torchwright.graph.misc import Assert
-from torchwright.ops.arithmetic_ops import concat
+from torchwright.ops.linear import concat
 from torchwright.ops.inout_nodes import create_input, create_onehot_embedding
 from torchwright.ops.onehot_table import onehot_lookup
 

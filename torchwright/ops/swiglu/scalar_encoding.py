@@ -16,8 +16,7 @@ from torchwright.graph.asserts import assert_matches_value_type
 from torchwright.graph.value_type import NodeValueType, Range
 from torchwright.ops.const import scale, step_sharpness
 
-# Purely linear ops — machine-neutral, shared with the frozen relu package.
-from torchwright.ops.relu.arithmetic_ops import add_scaled_nodes, sum_nodes
+from torchwright.ops.linear import add_scaled_nodes, sum_nodes
 from torchwright.ops.swiglu.arithmetic_ops import thermometer_floor_div
 from torchwright.ops.swiglu.map_select import map_to_table
 from torchwright.ops.swiglu.swiglu_ffn import swiglu_ffn

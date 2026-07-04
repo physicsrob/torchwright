@@ -18,7 +18,7 @@ explanation.
 """
 
 from torchwright.graph.embedding import Unembedding
-from torchwright.ops.arithmetic_ops import add
+from torchwright.ops.linear import add
 from torchwright.ops.inout_nodes import (
     create_literal_value,
     create_embedding,

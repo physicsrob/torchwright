@@ -14,8 +14,7 @@ import torch
 
 from torchwright.graph import Embedding, Node
 
-# Purely linear ops — machine-neutral, shared with the frozen relu package.
-from torchwright.ops.relu.arithmetic_ops import concat
+from torchwright.ops.linear import concat
 from torchwright.ops.inout_nodes import create_literal_value
 from torchwright.ops.swiglu.map_select import map_to_table
 

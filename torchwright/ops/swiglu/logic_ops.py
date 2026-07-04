@@ -15,10 +15,7 @@ from torchwright.graph.asserts import assert_matches_value_type
 from torchwright.graph.value_type import NodeValueType, Range
 from torchwright.ops.const import embedding_step_sharpness, scale, swish_dip
 
-# sum_nodes is purely linear (Add hardware, no activation) — machine-neutral
-# in substance, shared with the frozen relu package until its retirement
-# relocates the linear ops.
-from torchwright.ops.relu.arithmetic_ops import sum_nodes
+from torchwright.ops.linear import sum_nodes
 from torchwright.ops.swiglu.arithmetic_ops import compare
 from torchwright.ops.swiglu.swiglu_ffn import swiglu_ffn
 

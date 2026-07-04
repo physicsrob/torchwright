@@ -13,10 +13,8 @@ import torch
 
 from torchwright.graph import Embedding, Node, RopeConfig
 
-# Attention hardware and purely linear ops — machine-neutral, shared with
-# the frozen relu package.
-from torchwright.ops.relu.arithmetic_ops import sum_nodes
-from torchwright.ops.relu.attention_ops import attend_to_offset, get_prev_value
+from torchwright.ops.attention_ops import attend_to_offset, get_prev_value
+from torchwright.ops.linear import sum_nodes
 from torchwright.ops.inout_nodes import create_literal_value
 from torchwright.ops.swiglu.logic_ops import (
     bool_all_true,

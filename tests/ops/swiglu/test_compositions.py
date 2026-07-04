@@ -74,7 +74,7 @@ def test_number_to_digit_scalars_roundtrip():
 def test_full_digit_pipeline_compiles(embedding):
     """digits_to_number → arithmetic → number_to_digit_scalars →
     scalar_to_embedding, compiled end to end on the swish machine."""
-    from torchwright.ops.relu.arithmetic_ops import add_const
+    from torchwright.ops.linear import add_const
 
     number = digits_to_number(embedding, [embedding])
     shifted = add_const(number, 3.0)

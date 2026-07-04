@@ -2,9 +2,10 @@
 
 ``count_since_marker`` is attention hardware (a uniform mean over the
 marker window — machine-neutral) plus one :func:`reciprocal` inversion;
-only the reciprocal is machine-specific, so this module reuses the relu
-twin's guard math verbatim and swaps in the swiglu reciprocal (whose
-grid-spacing audit derives ``input_scale`` internally).
+only the reciprocal is machine-specific, so this module reuses the
+shared guard math from ``torchwright/ops/_math.py`` verbatim and swaps
+in the swiglu reciprocal (whose grid-spacing audit derives
+``input_scale`` internally).
 """
 
 import math
@@ -12,11 +13,9 @@ import math
 from torchwright.graph import Node, RopeConfig
 from torchwright.graph.rope import rope_inv_freq
 
-# Attention hardware and purely linear ops — machine-neutral, shared with
-# the frozen relu package.
-from torchwright.ops.relu.arithmetic_ops import add_const
-from torchwright.ops.relu.attention_ops import attend_mean_where
-from torchwright.ops.relu.marker_count import _RECIP_REL_SAFETY
+from torchwright.ops._math import _RECIP_REL_SAFETY
+from torchwright.ops.attention_ops import attend_mean_where
+from torchwright.ops.linear import add_const
 from torchwright.ops.swiglu.arithmetic_ops import reciprocal
 
 

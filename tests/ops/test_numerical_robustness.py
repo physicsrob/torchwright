@@ -13,7 +13,7 @@ import pytest
 import torch
 
 from torchwright.graph import Embedding
-from torchwright.ops.arithmetic_ops import concat
+from torchwright.ops.linear import concat
 from torchwright.ops.inout_nodes import create_literal_value, create_embedding
 from torchwright.ops.logic_ops import equals_vector
 from torchwright.ops.map_select import map_to_table, select

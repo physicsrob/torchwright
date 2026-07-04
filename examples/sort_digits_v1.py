@@ -56,10 +56,8 @@ import torch
 
 from torchwright.graph import Concatenate, Node, Embedding
 from torchwright.graph.embedding import Unembedding
-from torchwright.ops.arithmetic_ops import (
-    add_scaled_nodes,
-    compare,
-)
+from torchwright.ops.arithmetic_ops import compare
+from torchwright.ops.linear import add_scaled_nodes
 from torchwright.ops.attention_ops import attend_argmin_above_integer, get_prev_value
 from torchwright.ops.inout_nodes import (
     create_embedding,

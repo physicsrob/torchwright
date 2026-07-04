@@ -8,7 +8,8 @@ from torchwright.ops.linear_relu_linear import linear_relu_linear
 
 import torch
 
-from torchwright.ops.arithmetic_ops import sum_nodes, compare
+from torchwright.ops.arithmetic_ops import compare
+from torchwright.ops.linear import sum_nodes
 from torchwright.ops.const import embedding_step_sharpness
 
 _GATE_OFFSET_SAFETY_FACTOR = 2.0

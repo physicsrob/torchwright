@@ -32,14 +32,10 @@ import math
 
 from torchwright.graph import Node, RopeConfig
 from torchwright.graph.rope import rope_inv_freq
-from torchwright.ops.arithmetic_ops import add_const, reciprocal
+from torchwright.ops._math import _RECIP_REL_SAFETY
+from torchwright.ops.arithmetic_ops import reciprocal
+from torchwright.ops.linear import add_const
 from torchwright.ops.attention_ops import attend_mean_where
-
-# Per-segment relative interpolation error of 1/x on a geometric grid with
-# ratio r is ~ (r-1)^2 / 8.  We want gap+1 within +/-0.5 at the bound, i.e.
-# relative error < 0.5/(max_gap+1).  Solving for the breakpoint count with a
-# safety factor keeps the inversion comfortably inside that budget.
-_RECIP_REL_SAFETY = 16.0
 
 
 def count_since_marker(

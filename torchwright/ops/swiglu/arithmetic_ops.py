@@ -16,9 +16,7 @@ from torchwright.graph.asserts import assert_matches_value_type
 from torchwright.graph.value_type import NodeValueType, Range
 from torchwright.ops.const import min_d_hidden, scale, step_sharpness, swish_dip
 
-# Purely linear ops (no activation) — machine-neutral in substance, shared
-# with the frozen relu package until its retirement relocates them.
-from torchwright.ops.relu.arithmetic_ops import (
+from torchwright.ops.linear import (
     add_const,
     multiply_const,
     negate,

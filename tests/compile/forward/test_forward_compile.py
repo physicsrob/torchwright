@@ -16,14 +16,8 @@ from torchwright.ops.inout_nodes import (
     create_rope_config,
 )
 from torchwright.ops.linear_relu_linear import linear_relu_linear
-from torchwright.ops.arithmetic_ops import (
-    add,
-    add_const,
-    add_scaled_nodes,
-    relu_add,
-    concat,
-    sum_nodes,
-)
+from torchwright.ops.arithmetic_ops import relu_add
+from torchwright.ops.linear import add, add_const, add_scaled_nodes, concat, sum_nodes
 from torchwright.ops.logic_ops import cond_gate
 from torchwright.ops.map_select import select, map_to_table
 from torchwright.ops.attention_ops import (

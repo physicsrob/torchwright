@@ -20,13 +20,8 @@ import torch
 from torchwright.graph import Concatenate, Linear, Node
 from torchwright.graph.asserts import assert_01, assert_integer, assert_onehot
 from torchwright.graph.spherical_codes import index_to_vector
-from torchwright.ops.arithmetic_ops import (
-    add,
-    add_const,
-    add_scaled_nodes,
-    compare,
-    subtract,
-)
+from torchwright.ops.arithmetic_ops import compare
+from torchwright.ops.linear import add, add_const, add_scaled_nodes, subtract
 from torchwright.ops.attention_ops import attend_argmin_unmasked
 from torchwright.ops.inout_nodes import (
     create_input,

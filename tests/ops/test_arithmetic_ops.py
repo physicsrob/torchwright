@@ -1,14 +1,9 @@
 import torch
 from torchwright import ops
 from torchwright.ops.arithmetic_ops import (
-    add_const,
-    bool_to_01,
     clamp,
     relu_add,
     compare,
-    negate,
-    subtract,
-    multiply_const,
     mod_const,
     piecewise_linear,
     square,
@@ -16,6 +11,13 @@ from torchwright.ops.arithmetic_ops import (
     reciprocal,
     floor_int,
     ceil_int,
+)
+from torchwright.ops.linear import (
+    add_const,
+    bool_to_01,
+    multiply_const,
+    negate,
+    subtract,
 )
 from torchwright.ops.inout_nodes import create_input
 

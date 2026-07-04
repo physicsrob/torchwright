@@ -72,11 +72,11 @@ from typing import Callable, Dict, List, Tuple
 import torch
 
 from torchwright.graph import Embedding, Node, RopeConfig
-from torchwright.ops.arithmetic_ops import (
+from torchwright.ops.arithmetic_ops import compare
+from torchwright.ops.linear import (
     add,
     add_const,
     bool_to_01,
-    compare,
     concat,
     negate,
     subtract,

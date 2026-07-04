@@ -22,7 +22,7 @@ import torch
 
 from torchwright.graph import Node, Embedding, Concatenate, RopeConfig
 from torchwright.graph.embedding import Unembedding
-from torchwright.ops.arithmetic_ops import concat
+from torchwright.ops.linear import concat
 from torchwright.ops.attention_ops import attend_to_offset, get_prev_value
 from torchwright.ops.inout_nodes import (
     create_literal_value,

@@ -29,7 +29,8 @@ import torch
 
 from torchwright.graph import Embedding, Linear, Node, RopeConfig
 from torchwright.graph.embedding import bos_token
-from torchwright.ops.arithmetic_ops import compare as _compare_scalar, concat
+from torchwright.ops.arithmetic_ops import compare as _compare_scalar
+from torchwright.ops.linear import concat
 from torchwright.ops.attention_ops import get_prev_value
 from torchwright.ops.inout_nodes import (
     create_literal_value,

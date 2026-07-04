@@ -26,7 +26,7 @@ import torch
 
 from torchwright.graph import Node, Embedding
 from torchwright.graph.embedding import Unembedding
-from torchwright.ops.arithmetic_ops import add
+from torchwright.ops.linear import add
 from torchwright.ops.attention_ops import attend_to_offset
 from torchwright.ops.inout_nodes import (
     create_literal_value,

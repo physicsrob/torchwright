@@ -2,7 +2,6 @@ from torchwright.graph import Node, Concatenate, Linear
 from torchwright.graph.misc import LiteralValue
 from typing import List, Dict
 import math
-import numbers
 import torch
 
 from torchwright.graph.asserts import assert_integer, assert_matches_value_type
@@ -56,7 +55,8 @@ def _broadcast_select_per_column_offsets(
     return per_column_offsets(union, scalar_M)
 
 
-from torchwright.ops.arithmetic_ops import sum_nodes
+from torchwright.ops._math import _lookup_axis_scale, _lookup_numeric_slack
+from torchwright.ops.linear import sum_nodes
 from torchwright.ops.linear_relu_linear import linear_relu_linear
 
 
@@ -127,21 +127,6 @@ def map_to_table(
     )
 
 
-def _lookup_axis_scale(index_scale, axis: int, n_axes: int = 2) -> float:
-    if isinstance(index_scale, numbers.Real):
-        scale = float(index_scale)
-    else:
-        if len(index_scale) != n_axes:
-            raise ValueError(
-                f"index_scale must be a scalar or length-{n_axes} tuple, "
-                f"got {index_scale!r}"
-            )
-        scale = float(index_scale[axis])
-    if not math.isfinite(scale) or scale <= 0.0:
-        raise ValueError(f"index_scale values must be finite and > 0, got {scale}")
-    return scale
-
-
 def _scale_lookup_index(inp: Node, scale: float, name: str) -> Node:
     if scale == 1.0:
         return inp
@@ -150,21 +135,6 @@ def _scale_lookup_index(inp: Node, scale: float, name: str) -> Node:
 
 def _constant_vector(values: torch.Tensor, name: str) -> Node:
     return LiteralValue(values.to(dtype=torch.float32), name=name)
-
-
-def _lookup_numeric_slack(max_abs: float, sharpness: float, n_steps: int) -> float:
-    # Per-element slack for the row-vector / staircase output-range *guards*
-    # (assert_matches_value_type), not the correctness path. The guard must
-    # have margin above accumulated fp32 noise in the wide PWL AND above GPU
-    # cross-test FP variation (cuBLAS algorithm selection / TF32), which the
-    # noise notes peg at ~1e-5..1e-6 — an order of magnitude above the fp32
-    # single-run unit. At the 16x128x128 target (rows = A*B = 2048) the hidden
-    # PWL activations reach ~20k*sharpness, so reduced-precision matmul on A100
-    # can push the guarded value to ~max_abs*sharpness*rows*1e-5; a 1e-6 budget
-    # tripped intermittently in the full sharded suite (passes in isolation and
-    # under fp32). Using 1e-5 gives the guard headroom for GPU variation without
-    # loosening real correctness (the caller's value-match test stays tight).
-    return max(1e-3, max_abs * sharpness * max(n_steps, 1) * 1e-5)
 
 
 def _saturating_step_select(
@@ -718,7 +688,7 @@ def dynamic_extract(
     """
     from torchwright.graph import Linear
     from torchwright.graph.misc import LiteralValue
-    from torchwright.ops.arithmetic_ops import add_const
+    from torchwright.ops.linear import add_const
 
     assert len(idx) == 1, "idx must be a 1D scalar node"
     assert len(table) == n_entries * d_fill, (

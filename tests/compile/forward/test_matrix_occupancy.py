@@ -27,7 +27,8 @@ from torchwright.compiler.export import (
 )
 from torchwright.compiler.forward.compile import forward_compile
 from torchwright.compiler.graph_identity import canonical_ids, unwrap_debug
-from torchwright.ops.arithmetic_ops import add, multiply_2d
+from torchwright.ops.arithmetic_ops import multiply_2d
+from torchwright.ops.linear import add
 from torchwright.ops.inout_nodes import create_input
 
 D = 256

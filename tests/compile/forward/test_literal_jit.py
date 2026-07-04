@@ -25,7 +25,7 @@ import torch
 from torchwright.compiler.forward.compile import forward_compile
 from torchwright.compiler.forward.graph_analysis import GraphAnalyzer
 from torchwright.graph import Linear
-from torchwright.ops.arithmetic_ops import add, concat
+from torchwright.ops.linear import add, concat
 from torchwright.ops.attention_ops import attend_to_offset
 from torchwright.ops.inout_nodes import (
     create_input,
