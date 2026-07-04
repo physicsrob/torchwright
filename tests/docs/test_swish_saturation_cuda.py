@@ -101,3 +101,18 @@ def test_onehot_winner_indicator_exact():
     half = _cuda(SCALE * 0.5)
     assert (_swish(half) / SCALE).item() == 0.5
     assert (_swish(-half) / SCALE).abs().item() <= 1e-27
+
+
+def test_bias_lane_constants_exact_unit_lane():
+    """The no-bias constant lane (docs/no_bias_plan.md) on this kernel:
+    the gate value saturates sigma bit-exactly, and the full lane
+    expression — the GatedMLPSubLayer's ``g * sigmoid(g) * u`` — computes
+    exactly 1.0 in fp32, so a constant routed through the lane's
+    down-projection row lands verbatim in a ``bias=False`` artifact.
+    Mirrors the torch-CPU pin in ``test_swish_constants.py``."""
+    from torchwright.ops.const import bias_lane_gate, bias_lane_up
+
+    g = _cuda(bias_lane_gate)
+    u = _cuda(bias_lane_up)
+    assert torch.sigmoid(g).item() == 1.0
+    assert (g * torch.sigmoid(g) * u).item() == 1.0

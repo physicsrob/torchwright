@@ -122,3 +122,21 @@ def test_swish_fixed_points_and_onehot_indicator():
     assert swish[1] == SCALE
     assert swish[2] == SCALE / 2
     assert swish[3] == 0.0
+
+
+def test_bias_lane_constants_exact_unit_lane():
+    """The no-bias constant lane (docs/no_bias_plan.md) on this kernel:
+    sigma(bias_lane_gate) is exactly 1.0 (input 32 sits comfortably past
+    this kernel's late exact-1.0 threshold of 18), and the full lane
+    expression — the GatedMLPSubLayer's ``g * sigmoid(g) * u`` — computes
+    exactly 1.0 in fp32, so a constant routed through the lane's
+    down-projection row lands verbatim in a ``bias=False`` artifact.
+    Mirrors the torch-CPU pin in ``test_swish_constants.py``."""
+    from torchwright.ops.const import bias_lane_gate, bias_lane_up
+
+    z = np.array([bias_lane_gate], dtype=np.float32)
+    sig, swish = _run_sigmoid_swish(z)
+    assert sig[0] == 1.0
+    assert swish[0] == bias_lane_gate
+    # The x(1/32) fold is a plain IEEE fp32 multiply on both kernels.
+    assert np.float32(swish[0]) * np.float32(bias_lane_up) == 1.0

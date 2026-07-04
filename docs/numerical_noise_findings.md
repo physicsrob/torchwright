@@ -13,7 +13,7 @@ observations and removing findings a fix has invalidated. See the
 
 ## Findings
 
-### All committed numbers are measured on the biased machine (`bias=True`)
+### The committed numbers cannot depend on the `bias` compile flag
 
 The `bias=False` compile option (docs/no_bias_plan.md) folds every bias
 into the weight matrices: a bias previously added *after* a matmul enters
@@ -24,9 +24,33 @@ measured end-to-end on a two-FFN swish token graph: logits move by up to
 small cancelling logits (`tests/debug/test_no_bias_onnx.py`). Literals and
 the constant lane itself are bit-exact by construction (power-of-two lane
 constants + saturated sigmoid, pinned in `test_swish_constants.py`).
-**Before the flagship flips `bias=False`, re-run `make measure-noise`
-under the flag and re-derive any budget that assumed the biased-machine
-numbers** (D7). Until then every committed number reflects `bias=True`.
+
+An earlier version of this finding (`2c4e338`) demanded a `make
+measure-noise` re-run "under the flag" before the flagship flips
+`bias=False`, and claimed every committed number reflects `bias=True`.
+Both statements were a category error. The measurement harness evaluates
+its "compiled" leg via `node.compute()`
+(`torchwright/debug/noise.py:137`) — recursive graph-semantics
+evaluation that never invokes the compiler. Whether a bias is folded
+into a matmul row or added after the matmul is a property only a
+compiled transformer has; in `node.compute()` a bias is an exact
+addition, full stop. The committed numbers therefore reflect *neither*
+bias mode and are structurally incapable of moving under the flag. The
+quantity that genuinely differs between bias modes — fp32 accumulation
+order inside the artifact's matmuls — is the end-to-end bound above,
+not a per-op number.
+
+Consequently no noise re-measurement gates the flagship's `bias=False`
+flip. The doom cutover holds no per-op tolerance budgets that folded
+per-op numbers would re-derive (verified during the doom plan's
+drafting inventory: doom passes no explicit `c_tol` or assert
+tolerances). The operative gate is doom's D3 on the real `bias=False`
+artifact: `debug=True` asserts, the `probe_compiled` oracle, and two
+scored walkthrough renders. **Fallback trigger:** if a D3 gate surfaces
+a divergence the end-to-end bound above does not explain, doom stops
+(D4) and a per-op measurement path through
+`compile_headless(..., bias=False)` — a new measurement, not a re-run
+of this pipeline — must be built and run before their D3 proceeds.
 
 ### Drift `_ATOL` is 5e-4: the swiglu ulp floor is kernel-dependent
 
