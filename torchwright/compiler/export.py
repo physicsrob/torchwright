@@ -161,6 +161,9 @@ class OnnxArtifact:
     # Machine kind ("relu" | "swish") — which MLP-sublayer emission the
     # artifact carries.  Uniform per network by the compile-time check.
     activation: str = "relu"
+    # Emission mode: False means no bias parameters exist in the artifact
+    # (biases folded against the pinned constant-1 column; no_bias_plan.md).
+    bias: bool = True
 
     def load(self, providers=None):
         """Load the artifact via :func:`torchwright.compiler.onnx_load.load_onnx`.
@@ -499,6 +502,10 @@ def _write_debug_sidecar(
         # must keep hashing byte-identically for existing artifacts); the
         # debug session cross-checks it against the rebuilt graph explicitly.
         "activation": getattr(compiled, "activation", "relu"),
+        # Emission mode — also outside the fingerprint (a compile option,
+        # not a graph property); the debug session cross-checks it against
+        # the artifact's own initializer set.
+        "bias": bool(getattr(compiled, "bias", True)),
         "d": d,
         "d_head": d_head,
         "n_heads": n_heads,
@@ -730,6 +737,7 @@ def _make_stream_layer_weights_cb(
     per_layer_n_heads: list,
     per_layer_rotary: Optional[list] = None,
     trim_heads: bool = True,
+    bias: bool = True,
 ) -> Callable[[int, object], None]:
     """Factory for the forward_compile on_layer_compiled callback.
 
@@ -834,29 +842,39 @@ def _make_stream_layer_weights_cb(
             dense_inits,
         )
 
+        def emit_bias(name: str, lin) -> None:
+            # bias=False: no bias initializers exist in the artifact.  The
+            # writer folded every bias into the matrices, so the in-process
+            # vectors must be exactly zero — assert it (defense in depth
+            # against a missed writer site) instead of emitting.
+            if bias:
+                emit(name, lin.output_bias.cpu().numpy())
+            else:
+                assert (lin.output_bias == 0.0).all(), (
+                    f"{name}: nonzero bias vector under bias=False — a "
+                    f"writer site skipped the BiasFold redirect.  Compiler "
+                    f"bug."
+                )
+            lin.output_bias = None
+
         if getattr(mlp, "activation", "relu") == "swish":
             # Gated (SwiGLU) sublayer: gate / up / down projections.
             emit(f"l{i}_Wgate", mlp.gate_proj.output_matrix.cpu().numpy())
             mlp.gate_proj.output_matrix = None
-            emit(f"l{i}_bgate", mlp.gate_proj.output_bias.cpu().numpy())
-            mlp.gate_proj.output_bias = None
+            emit_bias(f"l{i}_bgate", mlp.gate_proj)
             emit(f"l{i}_Wup", mlp.up_proj.output_matrix.cpu().numpy())
             mlp.up_proj.output_matrix = None
-            emit(f"l{i}_bup", mlp.up_proj.output_bias.cpu().numpy())
-            mlp.up_proj.output_bias = None
+            emit_bias(f"l{i}_bup", mlp.up_proj)
             emit(f"l{i}_Wdown", mlp.down_proj.output_matrix.cpu().numpy())
             mlp.down_proj.output_matrix = None
-            emit(f"l{i}_bdown", mlp.down_proj.output_bias.cpu().numpy())
-            mlp.down_proj.output_bias = None
+            emit_bias(f"l{i}_bdown", mlp.down_proj)
         else:
             emit(f"l{i}_W1", mlp.linear1.output_matrix.cpu().numpy())
             mlp.linear1.output_matrix = None
-            emit(f"l{i}_b1", mlp.linear1.output_bias.cpu().numpy())
-            mlp.linear1.output_bias = None
+            emit_bias(f"l{i}_b1", mlp.linear1)
             emit(f"l{i}_W2", mlp.linear2.output_matrix.cpu().numpy())
             mlp.linear2.output_matrix = None
-            emit(f"l{i}_b2", mlp.linear2.output_bias.cpu().numpy())
-            mlp.linear2.output_bias = None
+            emit_bias(f"l{i}_b2", mlp.linear2)
 
     return on_layer_compiled
 
@@ -992,6 +1010,7 @@ def _emit_cached_layer_nodes(
     rms_norm: bool = False,
     rms_eps_name: Optional[str] = None,
     activation: str = "relu",
+    bias: bool = True,
 ) -> str:
     """Emit cached attention + MLP-sublayer nodes for one layer.
 
@@ -1187,29 +1206,48 @@ def _emit_cached_layer_nodes(
             f"{p}_mlp_norm",
         )
 
-    # MLP sublayer + skip
+    # MLP sublayer + skip.  Under bias=False the bias Adds do not exist —
+    # the writer folded every bias into the matrices (docs/no_bias_plan.md)
+    # — so each projection is its bare MatMul.  Residual tensor names
+    # ({p}_res_attn / {p}_res_next) are identical in both modes, keeping
+    # the debug session's taps mode-blind.
     if activation == "swish":
         # Gated (SwiGLU) sublayer: down(swish(gate(x)) * up(x)) + x.  Swish is
         # emitted as Mul(z, Sigmoid(z)) — the exact op pair whose fp32
         # saturation profile the A0 probes pinned (tests/docs/
         # test_ort_cpu_saturation.py; ORT fuses it where profitable).
-        node("MatMul", [mlp_in, f"{p}_Wgate"], [f"{p}_gate_m"])
-        node("Add", [f"{p}_gate_m", f"{p}_bgate"], [f"{p}_gate"])
+        if bias:
+            node("MatMul", [mlp_in, f"{p}_Wgate"], [f"{p}_gate_m"])
+            node("Add", [f"{p}_gate_m", f"{p}_bgate"], [f"{p}_gate"])
+        else:
+            node("MatMul", [mlp_in, f"{p}_Wgate"], [f"{p}_gate"])
         node("Sigmoid", [f"{p}_gate"], [f"{p}_gate_sig"])
         node("Mul", [f"{p}_gate", f"{p}_gate_sig"], [f"{p}_gate_sw"])
-        node("MatMul", [mlp_in, f"{p}_Wup"], [f"{p}_up_m"])
-        node("Add", [f"{p}_up_m", f"{p}_bup"], [f"{p}_up"])
+        if bias:
+            node("MatMul", [mlp_in, f"{p}_Wup"], [f"{p}_up_m"])
+            node("Add", [f"{p}_up_m", f"{p}_bup"], [f"{p}_up"])
+        else:
+            node("MatMul", [mlp_in, f"{p}_Wup"], [f"{p}_up"])
         node("Mul", [f"{p}_gate_sw", f"{p}_up"], [f"{p}_hidden"])
         node("MatMul", [f"{p}_hidden", f"{p}_Wdown"], [f"{p}_down_m"])
-        node("Add", [f"{p}_down_m", f"{p}_bdown"], [f"{p}_down_b"])
-        node("Add", [f"{p}_res_attn", f"{p}_down_b"], [f"{p}_res_next"])
+        if bias:
+            node("Add", [f"{p}_down_m", f"{p}_bdown"], [f"{p}_down_b"])
+            node("Add", [f"{p}_res_attn", f"{p}_down_b"], [f"{p}_res_next"])
+        else:
+            node("Add", [f"{p}_res_attn", f"{p}_down_m"], [f"{p}_res_next"])
     else:
         node("MatMul", [mlp_in, f"{p}_W1"], [f"{p}_l1_m"])
-        node("Add", [f"{p}_l1_m", f"{p}_b1"], [f"{p}_l1_b"])
-        node("Relu", [f"{p}_l1_b"], [f"{p}_l1_r"])
+        if bias:
+            node("Add", [f"{p}_l1_m", f"{p}_b1"], [f"{p}_l1_b"])
+            node("Relu", [f"{p}_l1_b"], [f"{p}_l1_r"])
+        else:
+            node("Relu", [f"{p}_l1_m"], [f"{p}_l1_r"])
         node("MatMul", [f"{p}_l1_r", f"{p}_W2"], [f"{p}_l2_m"])
-        node("Add", [f"{p}_l2_m", f"{p}_b2"], [f"{p}_l2_b"])
-        node("Add", [f"{p}_res_attn", f"{p}_l2_b"], [f"{p}_res_next"])
+        if bias:
+            node("Add", [f"{p}_l2_m", f"{p}_b2"], [f"{p}_l2_b"])
+            node("Add", [f"{p}_res_attn", f"{p}_l2_b"], [f"{p}_res_next"])
+        else:
+            node("Add", [f"{p}_res_attn", f"{p}_l2_m"], [f"{p}_res_next"])
 
     return f"{p}_res_next"
 
@@ -1360,6 +1398,12 @@ def compile_to_onnx(
     fully static shapes per run — the properties that make decode steps
     CUDA-graph capturable, one captured graph per (S_eff, width) bucket.
 
+    ``bias`` threads to ``forward_compile`` (see its docstring for the fold
+    mechanics): ``bias=False`` emits no bias initializers and no bias Adds —
+    each MLP projection is its bare MatMul, the standard biasless decoder
+    layout.  The emission mode is recorded in the artifact, the token meta,
+    and the debug sidecar (``"bias"``).
+
     ``assume_zero_init`` defaults to ``True`` here (unlike ``forward_compile``,
     which defaults ``False``): the ONNX runtime always constructs the residual
     stream from zeros plus the input projections (see
@@ -1429,6 +1473,7 @@ def compile_to_onnx(
         per_layer_n_heads,
         per_layer_rotary,
         trim_heads=trim_heads,
+        bias=bias,
     )
 
     # --- Phase 1: streaming compile ---------------------------------------
@@ -1635,6 +1680,7 @@ def compile_to_onnx(
             rms_norm=rms_spec is not None,
             rms_eps_name="_rms_eps" if rms_spec is not None else None,
             activation=compiled.activation,
+            bias=bias,
         )
 
     # Final norm before the unembed (Llama-style), the bit-exact identity.  It
@@ -1707,6 +1753,10 @@ def compile_to_onnx(
         # artifact carries (l{i}_W1/W2 + Relu vs l{i}_Wgate/Wup/Wdown +
         # Sigmoid·Mul).  Uniform per network by the compile-time check.
         "activation": compiled.activation,
+        # Emission mode: False means no bias initializers or bias Adds exist
+        # anywhere (docs/no_bias_plan.md; biases folded into the matrices
+        # against the pinned constant-1 column).
+        "bias": bool(bias),
         # Solver provenance: distinguishes a real CP-SAT schedule (status
         # OPTIMAL/FEASIBLE/CACHED) from the heuristic fallback (UNKNOWN/
         # INFEASIBLE with optimize>0) — a fallback artifact is value-correct
@@ -1762,6 +1812,7 @@ def compile_to_onnx(
         cache_stride=cache_stride_resolved,
         vocab_size=int(vocab_size),
         activation=compiled.activation,
+        bias=bool(bias),
     )
 
 

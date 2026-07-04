@@ -13,6 +13,21 @@ observations and removing findings a fix has invalidated. See the
 
 ## Findings
 
+### All committed numbers are measured on the biased machine (`bias=True`)
+
+The `bias=False` compile option (docs/no_bias_plan.md) folds every bias
+into the weight matrices: a bias previously added *after* a matmul enters
+the matmul's accumulation instead (as `1.0 × bias` against the pinned
+constant-1 column). Same error class, but accumulation order shifts —
+measured end-to-end on a two-FFN swish token graph: logits move by up to
+~4e-4 absolute at ~700 magnitude (5e-7 relative), worst ~8e-5 relative on
+small cancelling logits (`tests/debug/test_no_bias_onnx.py`). Literals and
+the constant lane itself are bit-exact by construction (power-of-two lane
+constants + saturated sigmoid, pinned in `test_swish_constants.py`).
+**Before the flagship flips `bias=False`, re-run `make measure-noise`
+under the flag and re-derive any budget that assumed the biased-machine
+numbers** (D7). Until then every committed number reflects `bias=True`.
+
 ### Drift `_ATOL` is 5e-4: the swiglu ulp floor is kernel-dependent
 
 The swiglu entries' measured floor is fp32 product rounding at the lane

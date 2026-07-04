@@ -403,10 +403,14 @@ def test_token_onnx_meta_has_no_extra_key_when_omitted():
             "rms_norm",
             "rms_norm_eps",
             "activation",
+            "bias",
             "schedule",
         }
         # The adder is an all-ReLU graph — the machine kind records that.
         assert meta["activation"] == "relu"
+        # Emission mode ("bias") is recorded for every model post-no-bias
+        # (docs/no_bias_plan.md); default compiles are biased.
+        assert meta["bias"] is True
         # optimize defaults to 0 here, so the solver never ran: provenance
         # records that as status None.
         assert meta["schedule"] == {"optimize": 0, "status": None}

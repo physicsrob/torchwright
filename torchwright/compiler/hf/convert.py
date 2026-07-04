@@ -122,6 +122,12 @@ def build_config(
             f"(The gated artifact's l{{i}}_Wgate/Wup/Wdown initializers would "
             f"also trip the unmapped-initializer check below.)"
         )
+    if meta.get("bias", True) is False:
+        raise NotImplementedError(
+            "HF conversion of a bias=False artifact is not implemented: the "
+            "native module hardcodes biased MLP linears (a true biasless "
+            "Llama emission is the planned follow-up — docs/no_bias_plan.md)."
+        )
 
     vocab: List[str] = list(meta["vocab"])
 

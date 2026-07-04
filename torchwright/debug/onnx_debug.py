@@ -286,6 +286,28 @@ class OnnxDebugSession:
                 f"{onnx_path}: no past_K_0 input — not a cached-protocol model"
             )
 
+        # Emission-mode cross-check: the sidecar's recorded bias flag (a
+        # compile option — the rebuilt graph cannot reveal it, so unlike
+        # the machine check this compares sidecar against the artifact's
+        # own initializer set).  Pre-feature sidecars lack the key: they
+        # are all biased artifacts.
+        sidecar_bias = bool(sidecar.get("bias", True))
+        init_names = {t.name for t in model.graph.initializer} | {
+            s.values.name for s in model.graph.sparse_initializer
+        }
+        artifact_bias = any(
+            name in init_names
+            for name in ("l0_b1", "l0_b2", "l0_bgate", "l0_bup", "l0_bdown")
+        )
+        if sidecar_bias != artifact_bias:
+            raise ValueError(
+                f"{debug_meta_path_for(onnx_path)}: emission-mode mismatch — "
+                f"the sidecar records bias={sidecar_bias} but the artifact "
+                f"{'carries' if artifact_bias else 'carries no'} bias "
+                f"initializers.  The sidecar does not belong to this model; "
+                f"re-export the pair together."
+            )
+
         def _dim(vi, k):
             d = vi.type.tensor_type.shape.dim[k]
             return d.dim_value if d.HasField("dim_value") else None
