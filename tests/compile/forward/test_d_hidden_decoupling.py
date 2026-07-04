@@ -12,7 +12,7 @@ from torchwright.compiler.export import compile_headless
 from torchwright.compiler.forward.compile import forward_compile
 from torchwright.compiler.groups.mlp_sublayer import MLPSubLayer
 from torchwright.ops.inout_nodes import create_input
-from torchwright.ops.linear_relu_linear import linear_relu_linear
+from torchwright.ops.relu.linear_relu_linear import linear_relu_linear
 
 
 def _build_relu_chain_graph(d_input: int, d_hidden_chain: int, d_output: int):

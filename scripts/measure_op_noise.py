@@ -40,7 +40,7 @@ from torchwright.debug.noise import (
     update_docstring_footer,
 )
 from torchwright.graph import Node
-from torchwright.ops.arithmetic_ops import (
+from torchwright.ops.relu.arithmetic_ops import (
     abs as abs_op,
     ceil_int,
     clamp,
@@ -55,7 +55,7 @@ from torchwright.ops.arithmetic_ops import (
     square,
     thermometer_floor_div,
 )
-from torchwright.ops.logic_ops import (
+from torchwright.ops.relu.logic_ops import (
     bool_all_true,
     bool_any_true,
     bool_not,
@@ -889,7 +889,7 @@ def _table_lookup_2d_ref(inputs: Dict[str, torch.Tensor]) -> torch.Tensor:
 
 
 def _target_ops() -> List[TargetOp]:
-    _ARITH = "torchwright.ops.arithmetic_ops"
+    _ARITH = "torchwright.ops.relu.arithmetic_ops"
     _ARITH_FILE = "torchwright/ops/relu/arithmetic_ops.py"
     _SWIGLU_ARITH = "torchwright.ops.swiglu.arithmetic_ops"
     _SWIGLU_ARITH_FILE = "torchwright/ops/swiglu/arithmetic_ops.py"
@@ -1131,7 +1131,7 @@ def _target_ops() -> List[TargetOp]:
         # -------------------------------------------------------------------
         TargetOp(
             name="bool_not",
-            module="torchwright.ops.logic_ops",
+            module="torchwright.ops.relu.logic_ops",
             source_file="torchwright/ops/relu/logic_ops.py",
             input_specs={"x": 1},
             build_graph=lambda nodes: bool_not(nodes["x"]),
@@ -1144,7 +1144,7 @@ def _target_ops() -> List[TargetOp]:
         ),
         TargetOp(
             name="bool_any_true",
-            module="torchwright.ops.logic_ops",
+            module="torchwright.ops.relu.logic_ops",
             source_file="torchwright/ops/relu/logic_ops.py",
             input_specs={"a": 1, "b": 1, "c": 1},
             build_graph=lambda nodes: bool_any_true(
@@ -1164,7 +1164,7 @@ def _target_ops() -> List[TargetOp]:
         ),
         TargetOp(
             name="bool_all_true",
-            module="torchwright.ops.logic_ops",
+            module="torchwright.ops.relu.logic_ops",
             source_file="torchwright/ops/relu/logic_ops.py",
             input_specs={"a": 1, "b": 1, "c": 1},
             build_graph=lambda nodes: bool_all_true(
@@ -1184,7 +1184,7 @@ def _target_ops() -> List[TargetOp]:
         ),
         TargetOp(
             name="equals_vector",
-            module="torchwright.ops.logic_ops",
+            module="torchwright.ops.relu.logic_ops",
             source_file="torchwright/ops/relu/logic_ops.py",
             input_specs={"x": 3},
             build_graph=lambda nodes: equals_vector(
@@ -1206,7 +1206,7 @@ def _target_ops() -> List[TargetOp]:
         ),
         TargetOp(
             name="cond_gate",
-            module="torchwright.ops.logic_ops",
+            module="torchwright.ops.relu.logic_ops",
             source_file="torchwright/ops/relu/logic_ops.py",
             input_specs={"cond": 1, "inp": 1},
             build_graph=lambda nodes: cond_gate(nodes["cond"], nodes["inp"]),

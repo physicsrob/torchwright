@@ -27,7 +27,7 @@ import torch
 
 from torchwright.compiler.forward.compile import forward_compile
 from torchwright.ops.inout_nodes import create_input
-from torchwright.ops.linear_relu_linear import linear_relu_linear
+from torchwright.ops.relu.linear_relu_linear import linear_relu_linear
 
 
 def _null_layer_weights(layer) -> None:

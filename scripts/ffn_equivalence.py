@@ -297,7 +297,7 @@ def equivalence_report(
 if __name__ == "__main__":
     # Self-check on a small two-MLP graph.
     from torchwright.ops.inout_nodes import create_input
-    from torchwright.ops.linear_relu_linear import linear_relu_linear
+    from torchwright.ops.relu.linear_relu_linear import linear_relu_linear
 
     def build():
         x = create_input("x", 8, value_range=(-1.0, 1.0))

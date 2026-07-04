@@ -13,7 +13,7 @@ from torchwright.debug.probe import probe_compiled
 from torchwright.graph import FFN
 from torchwright.graph.asserts import assert_in_range
 from torchwright.ops.inout_nodes import create_input
-from torchwright.ops.linear_relu_linear import linear_relu_linear
+from torchwright.ops.relu.linear_relu_linear import linear_relu_linear
 
 
 def _build():

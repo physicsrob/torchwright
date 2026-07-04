@@ -34,7 +34,7 @@ from examples.calculator_simple import (
     multiply_digit_seqs,
     subtract_digit_seqs,
 )
-from torchwright.ops.onehot_table import onehot_lookup
+from torchwright.ops.relu.onehot_table import onehot_lookup
 
 D = 1024
 D_HEAD = 16

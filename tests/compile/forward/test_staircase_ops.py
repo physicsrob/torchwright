@@ -21,7 +21,7 @@ import torch
 
 from torchwright.compiler.export import compile_headless
 from torchwright.graph import Concatenate
-from torchwright.ops.arithmetic_ops import mod_const, thermometer_floor_div
+from torchwright.ops.relu.arithmetic_ops import mod_const, thermometer_floor_div
 from torchwright.ops.inout_nodes import create_input
 
 # Representative (divisor, max_value) sweep:

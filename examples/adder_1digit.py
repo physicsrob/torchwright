@@ -22,8 +22,8 @@ from torchwright.ops.inout_nodes import (
     create_rope_config,
     create_unembedding,
 )
-from torchwright.ops.logic_ops import equals_vector
-from torchwright.ops.map_select import map_to_table, select
+from torchwright.ops.relu.logic_ops import equals_vector
+from torchwright.ops.relu.map_select import map_to_table, select
 
 # Rotary width the graph is built against; must match the d_head it is
 # compiled at (the token-example harness compiles at d_head=16).

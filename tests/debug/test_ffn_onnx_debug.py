@@ -14,7 +14,7 @@ from torchwright.compiler.export import compile_to_onnx
 from torchwright.debug.probe import probe_compiled
 from torchwright.graph import FFN
 from torchwright.ops.inout_nodes import create_embedding
-from torchwright.ops.linear_relu_linear import linear_relu_linear
+from torchwright.ops.relu.linear_relu_linear import linear_relu_linear
 
 onnxruntime = pytest.importorskip("onnxruntime")
 

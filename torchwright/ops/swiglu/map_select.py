@@ -65,7 +65,7 @@ def select(cond: Node, true_node: Node, false_node: Node) -> Node:
     .. noise-footer::
 
        Max error: 4.768e-07 abs, 1.19e-07 rel over 4096 samples;
-       measured at commit 63af83a. See docs/numerical_noise.md.
+       measured at commit 6694f64. See docs/numerical_noise.md.
     """
     assert len(cond) == 1
     assert len(true_node) == len(false_node)
@@ -186,7 +186,7 @@ def in_range(lower: Node, upper: Node, n_slots: int) -> Node:
     .. noise-footer::
 
        Max error: 5.96e-08 abs, 5.96e-08 rel over 4096 samples;
-       measured at commit 63af83a. See docs/numerical_noise.md.
+       measured at commit 6694f64. See docs/numerical_noise.md.
     """
     assert len(lower) == 1
     assert len(upper) == 1
@@ -289,7 +289,7 @@ def broadcast_select(
     .. noise-footer::
 
        Max error: 4.768e-07 abs, 1.192e-07 rel over 4096 samples;
-       measured at commit 63af83a. See docs/numerical_noise.md.
+       measured at commit 6694f64. See docs/numerical_noise.md.
     """
     assert len(masks) == n_slots
     true_is_broadcast = len(true_value) == d_fill
@@ -424,7 +424,7 @@ def dynamic_extract(
     .. noise-footer::
 
        Max error: 4.768e-07 abs, 1.191e-07 rel over 4096 samples;
-       measured at commit 63af83a. See docs/numerical_noise.md.
+       measured at commit 6694f64. See docs/numerical_noise.md.
     """
     assert len(idx) == 1, "idx must be a 1D scalar node"
     assert len(table) == n_entries * d_fill, (
@@ -491,7 +491,7 @@ def map_to_table(
     .. noise-footer::
 
        Max error: 0 abs, 0 rel over 4096 samples;
-       measured at commit 63af83a. See docs/numerical_noise.md.
+       measured at commit 6694f64. See docs/numerical_noise.md.
     """
     d_keys = {len(x) for x in key_to_value.keys()}
     d_values = {len(x) for x in key_to_value.values()}
@@ -732,7 +732,7 @@ def table_lookup_2d(
     .. noise-footer::
 
        Max error: 0 abs, 0 rel over 4096 samples;
-       measured at commit 63af83a. See docs/numerical_noise.md.
+       measured at commit 6694f64. See docs/numerical_noise.md.
     """
     assert len(i) == 1, "i must be a 1D scalar node"
     assert len(j) == 1, "j must be a 1D scalar node"

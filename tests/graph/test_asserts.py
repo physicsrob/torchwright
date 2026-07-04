@@ -262,7 +262,7 @@ def test_collect_asserts_returns_empty_for_no_asserts():
 
 def _build_simple_graph(with_assert: bool):
     """Simple compilable graph: ``y = clamp(x, -1, 1)`` optionally asserted."""
-    from torchwright.ops.arithmetic_ops import clamp
+    from torchwright.ops.relu.arithmetic_ops import clamp
 
     x = create_input("x", 1)
     clamped = clamp(x, -1.0, 1.0)
@@ -317,7 +317,7 @@ def test_compile_strips_asserts_and_preserves_output():
 
 def test_check_asserts_on_compiled_passes_when_invariant_holds():
     """A predicate that the compiled value satisfies should not raise."""
-    from torchwright.ops.arithmetic_ops import clamp
+    from torchwright.ops.relu.arithmetic_ops import clamp
 
     x = create_input("x", 1)
     clamped = clamp(x, -1.0, 1.0)
@@ -357,7 +357,7 @@ def test_check_asserts_on_compiled_raises_when_compiled_violates():
     breakpoints where the compiled approximation will drift beyond our
     atol but reference math is still exact (interpolating).
     """
-    from torchwright.ops.arithmetic_ops import piecewise_linear
+    from torchwright.ops.relu.arithmetic_ops import piecewise_linear
 
     x = create_input("x", 1)
     # Jagged function with sharp slope changes — PL approximation will

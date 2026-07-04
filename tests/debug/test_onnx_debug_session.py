@@ -137,8 +137,8 @@ def _build_annotated_graph():
     """
     from torchwright.graph.node import annotate
     from torchwright.ops.inout_nodes import create_embedding, create_literal_value
-    from torchwright.ops.logic_ops import equals_vector
-    from torchwright.ops.map_select import select
+    from torchwright.ops.relu.logic_ops import equals_vector
+    from torchwright.ops.relu.map_select import select
 
     vocab = list("0123456789+") + ["\n", "<bos>", "<eos>", "default"]
     embedding = create_embedding(vocab=vocab)

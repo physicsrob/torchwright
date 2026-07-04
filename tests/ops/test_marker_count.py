@@ -19,7 +19,7 @@ from torchwright.debug.probe import reference_eval
 from torchwright.graph.asserts import assert_in_range
 from torchwright.graph.value_type import NodeValueType, Range
 from torchwright.ops.inout_nodes import create_input, create_rope_config
-from torchwright.ops.marker_count import count_since_marker
+from torchwright.ops.relu.marker_count import count_since_marker
 
 MAX_GAP = 350
 

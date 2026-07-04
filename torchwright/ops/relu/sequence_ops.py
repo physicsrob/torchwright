@@ -23,13 +23,13 @@ from torchwright.graph import Node, Embedding, RopeConfig
 from torchwright.ops.linear import sum_nodes
 from torchwright.ops.attention_ops import attend_to_offset, get_prev_value
 from torchwright.ops.inout_nodes import create_literal_value
-from torchwright.ops.logic_ops import (
+from torchwright.ops.relu.logic_ops import (
     equals_vector,
     cond_gate,
     bool_not,
     bool_all_true,
 )
-from torchwright.ops.map_select import map_to_table, select
+from torchwright.ops.relu.map_select import map_to_table, select
 
 
 def check_is_digit(embedding: Embedding) -> Node:

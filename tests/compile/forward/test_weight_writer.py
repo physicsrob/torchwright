@@ -29,7 +29,7 @@ from torchwright.compiler.forward.weight_writer import (
 )
 from torchwright.compiler.groups.transformer_layer import TransformerLayer
 from torchwright.graph import Linear, Attn, Add, Concatenate
-from torchwright.ops.linear_relu_linear import linear_relu_linear
+from torchwright.ops.relu.linear_relu_linear import linear_relu_linear
 from torchwright.graph.misc import InputNode, LiteralValue
 
 D = 64

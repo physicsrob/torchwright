@@ -678,7 +678,7 @@ def attend_mean_where(
     weighted combination.
 
     A typical use is reduce-any: map boolean flags to 0/1 with
-    :func:`~torchwright.ops.arithmetic_ops.bool_to_01`, average them
+    :func:`~torchwright.ops.relu.arithmetic_ops.bool_to_01`, average them
     with this primitive, and threshold the result.
 
     **When no position is valid.** The softmax still runs and produces a
@@ -763,7 +763,7 @@ def attend_argmax_dot(
 
     **Type isolation.**  This primitive does not include a validity
     parameter.  Callers should use
-    :func:`~torchwright.ops.logic_ops.cond_gate` to zero out
+    :func:`~torchwright.ops.relu.logic_ops.cond_gate` to zero out
     ``key_vector`` and ``value`` at non-participating positions.  A
     zero ``key_vector`` produces a dot product of 0, well below
     ``match_gain`` for any matching position — providing effective type

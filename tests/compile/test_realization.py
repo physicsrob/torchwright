@@ -32,7 +32,7 @@ from torchwright.graph import Add, Linear
 from torchwright.graph.ffn import FFN
 from torchwright.graph.misc import Concatenate, LiteralValue
 from torchwright.ops.inout_nodes import create_input
-from torchwright.ops.linear_relu_linear import linear_relu_linear
+from torchwright.ops.relu.linear_relu_linear import linear_relu_linear
 
 
 def _block(x, d_input, n_lanes, d_output, seed=0):

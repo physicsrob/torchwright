@@ -1,12 +1,12 @@
 {
   "schema_version": 2,
-  "commit": "63af83a",
-  "measured_at": "2026-07-03",
+  "commit": "6694f64",
+  "measured_at": "2026-07-04",
   "ops": [
     {
       "name": "abs",
       "machine": "relu",
-      "module": "torchwright.ops.arithmetic_ops",
+      "module": "torchwright.ops.relu.arithmetic_ops",
       "notes": "Exact decomposition: `ReLU(x) + ReLU(-x)`. Any non-zero measurement here would indicate a compiler or float32 bug.",
       "distributions": [
         {
@@ -29,7 +29,7 @@
     {
       "name": "bool_all_true",
       "machine": "relu",
-      "module": "torchwright.ops.logic_ops",
+      "module": "torchwright.ops.relu.logic_ops",
       "notes": "Single `compare` at threshold `N-1` over the sum of N ±1 inputs. Sum is N only when all are +1; otherwise ≤ N-2 — threshold cleanly separates the two, so exact on ±1 inputs.",
       "distributions": [
         {
@@ -54,7 +54,7 @@
     {
       "name": "bool_any_true",
       "machine": "relu",
-      "module": "torchwright.ops.logic_ops",
+      "module": "torchwright.ops.relu.logic_ops",
       "notes": "Two stacked `compare` layers. On clean ±1 inputs the intermediate sum lands well outside every ramp zone, so the composition is exact.",
       "distributions": [
         {
@@ -79,7 +79,7 @@
     {
       "name": "bool_not",
       "machine": "relu",
-      "module": "torchwright.ops.logic_ops",
+      "module": "torchwright.ops.relu.logic_ops",
       "notes": "Single `compare` with inverted levels. Exact on clean ±1 inputs; inherits `compare`'s ramp-zone error for inputs near 0.",
       "distributions": [
         {
@@ -102,7 +102,7 @@
     {
       "name": "ceil_int",
       "machine": "relu",
-      "module": "torchwright.ops.arithmetic_ops",
+      "module": "torchwright.ops.relu.arithmetic_ops",
       "notes": "Reduction to `-floor_int(-x)`. On integer inputs every value lands in a flat zone of the floor staircase, so the op is exact here even though it inherits approximate semantics for continuous inputs.",
       "distributions": [
         {
@@ -125,7 +125,7 @@
     {
       "name": "clamp",
       "machine": "relu",
-      "module": "torchwright.ops.arithmetic_ops",
+      "module": "torchwright.ops.relu.arithmetic_ops",
       "notes": "Piecewise-linear identity with 4 breakpoints at `[lo, lo + eps, hi - eps, hi]`. In the interior flat zone (this distribution) the op is a pure identity; boundary samples would fall inside the `eps`-wide ramp and lose precision but are out of scope for this negative-control distribution.",
       "distributions": [
         {
@@ -148,7 +148,7 @@
     {
       "name": "compare",
       "machine": "relu",
-      "module": "torchwright.ops.arithmetic_ops",
+      "module": "torchwright.ops.relu.arithmetic_ops",
       "notes": "ReLU-pair ramp. Inputs within `1/step_sharpness` of the threshold land inside the ramp zone and yield an interpolated value; inputs further away match the step function exactly. The `compare_near_thresh_*` distributions deliberately stress the ramp — the reference is a discrete step function, so samples inside the ramp legitimately report large error.",
       "distributions": [
         {
@@ -186,7 +186,7 @@
     {
       "name": "cond_gate",
       "machine": "relu",
-      "module": "torchwright.ops.logic_ops",
+      "module": "torchwright.ops.relu.logic_ops",
       "notes": "`big_offset` ReLU gate. On clean ±1 conditions the output is exactly `inp` (cond=+1) or `0` (cond=-1) up to float32 round-off; noisy conditions blur the gate.",
       "distributions": [
         {
@@ -210,7 +210,7 @@
     {
       "name": "equals_vector",
       "machine": "relu",
-      "module": "torchwright.ops.logic_ops",
+      "module": "torchwright.ops.relu.logic_ops",
       "notes": "Single-ReLU approximate equality test. Inside the `1/embedding_step_sharpness`-wide transition ball around the target the output interpolates between -1 and +1.",
       "distributions": [
         {
@@ -235,7 +235,7 @@
     {
       "name": "floor_int",
       "machine": "relu",
-      "module": "torchwright.ops.arithmetic_ops",
+      "module": "torchwright.ops.relu.arithmetic_ops",
       "notes": "Staircase with ramp width `1/step_sharpness` directly below each integer. Inputs near integer boundaries land in the ramp zone and produce interpolated values; callers with integer-ish inputs should use `thermometer_floor_div` instead, whose ramps sit at half-integer thresholds.",
       "distributions": [
         {
@@ -273,7 +273,7 @@
     {
       "name": "min",
       "machine": "relu",
-      "module": "torchwright.ops.arithmetic_ops",
+      "module": "torchwright.ops.relu.arithmetic_ops",
       "notes": "Exact via `(a + b - |a - b|) / 2`.",
       "distributions": [
         {
@@ -297,7 +297,7 @@
     {
       "name": "mod_const",
       "machine": "relu",
-      "module": "torchwright.ops.arithmetic_ops",
+      "module": "torchwright.ops.relu.arithmetic_ops",
       "notes": "Identity `x % d = x - d · thermometer_floor_div(x, d)`. Exact on integer inputs (the input class this op is declared for).",
       "distributions": [
         {
@@ -320,7 +320,7 @@
     {
       "name": "multiply_2d",
       "machine": "relu",
-      "module": "torchwright.ops.arithmetic_ops",
+      "module": "torchwright.ops.relu.arithmetic_ops",
       "notes": "Single-sublayer product built analytically via the quarter-square identity `a*b = ((a+b)^2 - (a-b)^2)/4` (O(n) neurons, no least-squares solve). Worst-cell absolute bound is `step1*step2/4 = 0.25` for this configuration.",
       "distributions": [
         {
@@ -344,7 +344,7 @@
     {
       "name": "multiply_integers",
       "machine": "relu",
-      "module": "torchwright.ops.arithmetic_ops",
+      "module": "torchwright.ops.relu.arithmetic_ops",
       "notes": "Polarization + `square` on non-negative integer inputs. Exact on integer inputs by construction (the polarization identity is exact; `square` is exact at integer grid points).",
       "distributions": [
         {
@@ -368,7 +368,7 @@
     {
       "name": "piecewise_linear",
       "machine": "relu",
-      "module": "torchwright.ops.arithmetic_ops",
+      "module": "torchwright.ops.relu.arithmetic_ops",
       "notes": "Foundation 1D piecewise-linear primitive; measured on the canonical x² test function with 11 integer breakpoints. Error is zero at breakpoints and bounded by the interpolation error of the reference function over each segment.",
       "distributions": [
         {
@@ -391,7 +391,7 @@
     {
       "name": "reciprocal",
       "machine": "relu",
-      "module": "torchwright.ops.arithmetic_ops",
+      "module": "torchwright.ops.relu.arithmetic_ops",
       "notes": "Geometric breakpoint spacing keeps relative interpolation error roughly constant across the range. Measured against a reciprocal graph with `(min_value, max_value, step) = (0.3, 200.0, 1.0)`.",
       "distributions": [
         {
@@ -414,7 +414,7 @@
     {
       "name": "square",
       "machine": "relu",
-      "module": "torchwright.ops.arithmetic_ops",
+      "module": "torchwright.ops.relu.arithmetic_ops",
       "notes": "Always an underestimate of x² between grid points. Max segment error is `(step/2)²` at half-integers.",
       "distributions": [
         {
@@ -437,7 +437,7 @@
     {
       "name": "thermometer_floor_div",
       "machine": "relu",
-      "module": "torchwright.ops.arithmetic_ops",
+      "module": "torchwright.ops.relu.arithmetic_ops",
       "notes": "Integer-input-only staircase. Ramps sit at `k*divisor - 0.5`, giving clean separation for integer inputs. Feeding continuous floats produces ramp-zone interpolation artefacts — those belong to `floor_int`, not this op.",
       "distributions": [
         {

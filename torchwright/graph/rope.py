@@ -283,7 +283,7 @@ def rotary_content_head(
 
     Note this routes only the *content* placement.  Heads that also need a
     position/recency signal on a *rotated* plane (the BOS-weight head and
-    :func:`~torchwright.ops.global_recency.attend_most_recent_globally`) cannot
+    :func:`~torchwright.ops.relu.global_recency.attend_most_recent_globally`) cannot
     delegate here under partial rotary — they place the rotated column explicitly.
     The local-recency lobe (:func:`rotary_recency_head`) stays full-rotary only.
     """

@@ -1,7 +1,7 @@
 """One-hot-native lookup table: the compiled weight matrix *is* the table.
 
 ``onehot_lookup`` is the one-hot counterpart of
-:func:`torchwright.ops.map_select.map_to_table`.  ``map_to_table`` does a soft
+:func:`torchwright.ops.relu.map_select.map_to_table`.  ``map_to_table`` does a soft
 nearest-key dot-product match that only resolves because the spherical-code
 embeddings are geometrically well separated and a sharpness term concentrates
 onto the winner.  ``onehot_lookup`` instead *assumes* its inputs are one-hot
@@ -37,7 +37,7 @@ import torch
 from torchwright.graph import Node, Linear
 from torchwright.graph.asserts import assert_matches_value_type
 from torchwright.graph.value_type import NodeValueType, Range
-from torchwright.ops.linear_relu_linear import linear_relu_linear
+from torchwright.ops.relu.linear_relu_linear import linear_relu_linear
 
 _ONEHOT_ATOL = 1e-6
 

@@ -32,7 +32,7 @@ from torchwright.ops.inout_nodes import (
     create_literal_value,
     create_rope_config,
 )
-from torchwright.ops.map_select import select
+from torchwright.ops.relu.map_select import select
 
 D = 256
 D_HEAD = 16

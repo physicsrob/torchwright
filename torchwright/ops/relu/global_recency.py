@@ -58,7 +58,7 @@ from torchwright.graph.rope import (
     rotary_content_head,
 )
 from torchwright.ops._math import _N_BPS, _bisect_m, _theta_slow, _w_of_m
-from torchwright.ops.arithmetic_ops import piecewise_linear
+from torchwright.ops.relu.arithmetic_ops import piecewise_linear
 from torchwright.ops.attention_ops import attend_to_offset
 
 # Per-position logit gain for the position tiebreak in attend_most_recent_globally.

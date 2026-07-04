@@ -9,7 +9,7 @@ import torch
 from torchwright.compiler.export import compile_headless
 from torchwright.compiler.forward.compile import forward_compile
 from torchwright.ops.inout_nodes import create_input
-from torchwright.ops.map_select import in_range
+from torchwright.ops.relu.map_select import in_range
 
 
 def test_in_range_headless_values_are_pm1():

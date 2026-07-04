@@ -161,7 +161,7 @@ def test_attn_propagates_value_range_from_value_input():
 
 
 def test_compare_has_bounded_range():
-    from torchwright.ops.arithmetic_ops import compare
+    from torchwright.ops.relu.arithmetic_ops import compare
 
     inp = LiteralValue(torch.tensor([3.0]))
     out = compare(inp, 2.0)
@@ -170,7 +170,7 @@ def test_compare_has_bounded_range():
 
 
 def test_compare_01_levels():
-    from torchwright.ops.arithmetic_ops import compare
+    from torchwright.ops.relu.arithmetic_ops import compare
 
     inp = LiteralValue(torch.tensor([3.0]))
     out = compare(inp, 2.0, true_level=1.0, false_level=0.0)
@@ -179,7 +179,7 @@ def test_compare_01_levels():
 
 
 def test_compare_arbitrary_levels():
-    from torchwright.ops.arithmetic_ops import compare
+    from torchwright.ops.relu.arithmetic_ops import compare
 
     inp = LiteralValue(torch.tensor([3.0]))
     out = compare(inp, 2.0, true_level=5.0, false_level=-3.0)
@@ -189,7 +189,7 @@ def test_compare_arbitrary_levels():
 
 
 def test_compare_float_levels():
-    from torchwright.ops.arithmetic_ops import compare
+    from torchwright.ops.relu.arithmetic_ops import compare
 
     inp = LiteralValue(torch.tensor([3.0]))
     out = compare(inp, 2.0, true_level=0.5, false_level=-0.5)
@@ -198,7 +198,7 @@ def test_compare_float_levels():
 
 
 def test_equals_vector_has_bounded_range():
-    from torchwright.ops.logic_ops import equals_vector
+    from torchwright.ops.relu.logic_ops import equals_vector
 
     inp = LiteralValue(torch.tensor([1.0, 0.0, 0.0]))
     out = equals_vector(inp, torch.tensor([1.0, 0.0, 0.0]))
@@ -207,7 +207,7 @@ def test_equals_vector_has_bounded_range():
 
 
 def test_select_bounded_range():
-    from torchwright.ops.map_select import select
+    from torchwright.ops.relu.map_select import select
     from torchwright.graph.asserts import assert_bool
 
     cond = assert_bool(LiteralValue(torch.tensor([1.0])))
@@ -220,7 +220,7 @@ def test_select_bounded_range():
 
 
 def test_select_binary_branches():
-    from torchwright.ops.map_select import select
+    from torchwright.ops.relu.map_select import select
     from torchwright.graph.asserts import assert_bool
 
     cond = assert_bool(LiteralValue(torch.tensor([1.0])))
@@ -232,7 +232,7 @@ def test_select_binary_branches():
 
 
 def test_select_unknown_cond():
-    from torchwright.ops.map_select import select
+    from torchwright.ops.relu.map_select import select
 
     cond = InputNode("cond", 1, value_range=(-100.0, 100.0))
     a = LiteralValue(torch.tensor([2.0, 3.0]))
@@ -244,7 +244,7 @@ def test_select_unknown_cond():
 
 
 def test_cond_gate_bounded_range():
-    from torchwright.ops.logic_ops import cond_gate
+    from torchwright.ops.relu.logic_ops import cond_gate
     from torchwright.graph.asserts import assert_bool
 
     cond = assert_bool(LiteralValue(torch.tensor([1.0])))
@@ -256,7 +256,7 @@ def test_cond_gate_bounded_range():
 
 
 def test_cond_gate_binary_inp():
-    from torchwright.ops.logic_ops import cond_gate
+    from torchwright.ops.relu.logic_ops import cond_gate
     from torchwright.graph.asserts import assert_bool
 
     cond = assert_bool(LiteralValue(torch.tensor([1.0])))
@@ -267,7 +267,7 @@ def test_cond_gate_binary_inp():
 
 
 def test_cond_gate_unknown_cond():
-    from torchwright.ops.logic_ops import cond_gate
+    from torchwright.ops.relu.logic_ops import cond_gate
 
     cond = InputNode("cond", 1, value_range=(-100.0, 100.0))
     inp = LiteralValue(torch.tensor([3.0, 5.0]))
@@ -281,7 +281,7 @@ def test_cond_gate_unknown_cond():
 
 
 def test_in_range_bounded():
-    from torchwright.ops.map_select import in_range
+    from torchwright.ops.relu.map_select import in_range
 
     lower = LiteralValue(torch.tensor([1.0]))
     upper = LiteralValue(torch.tensor([3.0]))
@@ -291,7 +291,7 @@ def test_in_range_bounded():
 
 
 def test_floor_int_bounded():
-    from torchwright.ops.arithmetic_ops import floor_int
+    from torchwright.ops.relu.arithmetic_ops import floor_int
     from torchwright.graph.asserts import assert_in_range
 
     inp = assert_in_range(LiteralValue(torch.tensor([2.5])), 0.0, 10.0)
@@ -302,7 +302,7 @@ def test_floor_int_bounded():
 
 
 def test_ceil_int_bounded():
-    from torchwright.ops.arithmetic_ops import ceil_int
+    from torchwright.ops.relu.arithmetic_ops import ceil_int
     from torchwright.graph.asserts import assert_in_range
 
     inp = assert_in_range(LiteralValue(torch.tensor([2.5])), 0.0, 10.0)
@@ -313,7 +313,7 @@ def test_ceil_int_bounded():
 
 
 def test_thermometer_floor_div_bounded():
-    from torchwright.ops.arithmetic_ops import thermometer_floor_div
+    from torchwright.ops.relu.arithmetic_ops import thermometer_floor_div
 
     inp = LiteralValue(torch.tensor([35.0]))
     out = thermometer_floor_div(inp, 10, 100)

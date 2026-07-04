@@ -23,7 +23,7 @@ import torch
 from torchwright.graph import InputNode
 from torchwright.graph.spherical_codes import index_to_vector
 from torchwright.ops._math import _theta_slow, _w_of_m
-from torchwright.ops.global_recency import (
+from torchwright.ops.relu.global_recency import (
     attend_most_recent_globally,
     global_position_from_bos,
 )

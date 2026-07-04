@@ -27,7 +27,7 @@ from torchwright.compiler.forward.scheduling_policy import (
 from torchwright.compiler.forward.weight_writer import AttnHeadOp, MLPOp
 from torchwright.graph import Linear, Attn, Add, Concatenate
 from torchwright.graph.misc import InputNode, LiteralValue
-from torchwright.ops.linear_relu_linear import linear_relu_linear
+from torchwright.ops.relu.linear_relu_linear import linear_relu_linear
 
 D = 64
 D_HEAD = 16

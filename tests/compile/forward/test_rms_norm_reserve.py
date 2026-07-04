@@ -30,7 +30,7 @@ from torchwright.compiler.forward.cpsat_scheduler import (
 from torchwright.compiler.forward.residual_map import ResidualStreamMap
 from torchwright.compiler.graph_identity import graph_fingerprint
 from torchwright.graph import Linear
-from torchwright.ops.linear_relu_linear import linear_relu_linear
+from torchwright.ops.relu.linear_relu_linear import linear_relu_linear
 from torchwright.graph.value_type import Range
 from torchwright.ops.inout_nodes import create_input
 

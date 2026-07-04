@@ -531,7 +531,7 @@ class TestSemanticBounds:
         with fresh_graph_session():
             cond = InputNode(1, name="cond", value_range=(-1.0, 1.0))
             inp = InputNode(2, name="inp", value_range=(1.0, 5.0))
-            from torchwright.ops.logic_ops import cond_gate
+            from torchwright.ops.relu.logic_ops import cond_gate
 
             result = cond_gate(cond, inp)
             intervals = result.affine_bound.to_interval()
@@ -544,7 +544,7 @@ class TestSemanticBounds:
         with fresh_graph_session():
             cond = InputNode(1, name="cond", value_range=(-1.0, 1.0))
             inp = InputNode(2, name="inp", value_range=(-5.0, -1.0))
-            from torchwright.ops.logic_ops import cond_gate
+            from torchwright.ops.relu.logic_ops import cond_gate
 
             result = cond_gate(cond, inp)
             intervals = result.affine_bound.to_interval()
@@ -557,7 +557,7 @@ class TestSemanticBounds:
         with fresh_graph_session():
             cond = InputNode(1, name="cond", value_range=(-1.0, 1.0))
             inp = InputNode(1, name="inp", value_range=(-3.0, 5.0))
-            from torchwright.ops.logic_ops import cond_gate
+            from torchwright.ops.relu.logic_ops import cond_gate
 
             result = cond_gate(cond, inp)
             iv = result.affine_bound.to_interval()[0]
@@ -571,7 +571,7 @@ class TestSemanticBounds:
         with fresh_graph_session():
             cond = InputNode(1, name="cond", value_range=(-1.0, 1.0))
             inp = InputNode(2, name="inp", value_range=(-3.0, 7.0))
-            from torchwright.ops.logic_ops import cond_gate
+            from torchwright.ops.relu.logic_ops import cond_gate
 
             result = cond_gate(cond, inp)
             intervals = result.affine_bound.to_interval()
@@ -588,7 +588,7 @@ class TestSemanticBounds:
         with fresh_graph_session():
             cond = InputNode(1, name="cond", value_range=(-1.0, 1.0))
             inp = InputNode(1, name="inp", value_range=(1.0, 5.0))
-            from torchwright.ops.logic_ops import cond_gate
+            from torchwright.ops.relu.logic_ops import cond_gate
 
             result = cond_gate(cond, inp)
             iv = result.affine_bound.to_interval()[0]
@@ -601,7 +601,7 @@ class TestSemanticBounds:
             cond = InputNode(1, name="cond", value_range=(-1.0, 1.0))
             a = InputNode(1, name="a", value_range=(2.0, 5.0))
             b = InputNode(1, name="b", value_range=(-1.0, 3.0))
-            from torchwright.ops.map_select import select
+            from torchwright.ops.relu.map_select import select
 
             result = select(cond, a, b)
             iv = result.affine_bound.to_interval()[0]
@@ -614,7 +614,7 @@ class TestSemanticBounds:
             cond = InputNode(1, name="cond", value_range=(-1.0, 1.0))
             a = InputNode(2, name="a", value_range=(0.0, 10.0))
             b = InputNode(2, name="b", value_range=(-5.0, 3.0))
-            from torchwright.ops.map_select import select
+            from torchwright.ops.relu.map_select import select
 
             result = select(cond, a, b)
             intervals = result.affine_bound.to_interval()
@@ -631,7 +631,7 @@ class TestSemanticBounds:
         """When input is definitely above threshold, compare is constant."""
         with fresh_graph_session():
             inp = InputNode(1, name="inp", value_range=(5.0, 10.0))
-            from torchwright.ops.arithmetic_ops import compare
+            from torchwright.ops.relu.arithmetic_ops import compare
 
             result = compare(inp, thresh=3.0, true_level=1.0, false_level=-1.0)
             iv = result.affine_bound.to_interval()[0]
@@ -642,7 +642,7 @@ class TestSemanticBounds:
         """When input is definitely below threshold, compare is constant."""
         with fresh_graph_session():
             inp = InputNode(1, name="inp", value_range=(-10.0, -1.0))
-            from torchwright.ops.arithmetic_ops import compare
+            from torchwright.ops.relu.arithmetic_ops import compare
 
             result = compare(inp, thresh=0.0, true_level=1.0, false_level=-1.0)
             iv = result.affine_bound.to_interval()[0]
@@ -653,7 +653,7 @@ class TestSemanticBounds:
         """When input straddles threshold, compare bound is [min, max] of levels."""
         with fresh_graph_session():
             inp = InputNode(1, name="inp", value_range=(-5.0, 5.0))
-            from torchwright.ops.arithmetic_ops import compare
+            from torchwright.ops.relu.arithmetic_ops import compare
 
             result = compare(inp, thresh=0.0, true_level=1.0, false_level=-1.0)
             iv = result.affine_bound.to_interval()[0]
@@ -664,7 +664,7 @@ class TestSemanticBounds:
         """Randomized: actual compare output within semantic bounds."""
         with fresh_graph_session():
             inp = InputNode(1, name="inp", value_range=(-5.0, 5.0))
-            from torchwright.ops.arithmetic_ops import compare
+            from torchwright.ops.relu.arithmetic_ops import compare
 
             result = compare(inp, thresh=2.0, true_level=7.0, false_level=-3.0)
             iv = result.affine_bound.to_interval()[0]
@@ -679,7 +679,7 @@ class TestSemanticBounds:
         with fresh_graph_session():
             cond = InputNode(1, name="cond", value_range=(-1.0, 1.0))
             inp = InputNode(1, name="inp", value_range=(2.0, 5.0))
-            from torchwright.ops.logic_ops import cond_gate
+            from torchwright.ops.relu.logic_ops import cond_gate
 
             result = cond_gate(cond, inp)
             ab = result.affine_bound

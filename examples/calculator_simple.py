@@ -3,7 +3,7 @@ to ``max_digits`` digits, parsed from ``"A op B\\n"`` and emitted digit by
 digit.  This is the *legible* variant — the one the blog explains line by line.
 
 Every operation is the same two ideas — an exhaustive **lookup table** over
-digit combinations (:func:`torchwright.ops.onehot_table.onehot_lookup`), and a
+digit combinations (:func:`torchwright.ops.relu.onehot_table.onehot_lookup`), and a
 **fold** that threads one piece of state along the digits: a carry for
 addition, a borrow for subtraction, a running less/equal/greater verdict for
 comparison, a per-column running sum for multiplication.  With one-hot
@@ -33,8 +33,8 @@ import torch
 from torchwright.graph import Embedding, Node
 from torchwright.ops.linear import add, add_const, bool_to_01, concat, sum_nodes
 from torchwright.ops.inout_nodes import create_literal_value
-from torchwright.ops.map_select import in_range
-from torchwright.ops.onehot_table import onehot_lookup
+from torchwright.ops.relu.map_select import in_range
+from torchwright.ops.relu.onehot_table import onehot_lookup
 
 from examples._calculator_common import (
     CALC_VOCAB,

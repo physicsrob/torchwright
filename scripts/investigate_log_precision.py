@@ -14,7 +14,7 @@ import math
 
 import torch
 
-from torchwright.ops.arithmetic_ops import log
+from torchwright.ops.relu.arithmetic_ops import log
 from torchwright.ops.inout_nodes import create_input
 
 

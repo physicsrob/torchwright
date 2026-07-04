@@ -19,11 +19,8 @@ import pytest
 import torch
 
 from torchwright.debug.probe import probe_graph, reference_eval
-from torchwright.ops import (
-    create_input,
-    dynamic_extract,
-    table_lookup_2d,
-)
+from torchwright.ops.inout_nodes import create_input
+from torchwright.ops.relu.map_select import dynamic_extract, table_lookup_2d
 
 # ---------------------------------------------------------------------------
 # table_lookup_2d

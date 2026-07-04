@@ -30,7 +30,7 @@ import tracemalloc
 
 import torch
 
-from torchwright.ops.arithmetic_ops import multiply_2d
+from torchwright.ops.relu.arithmetic_ops import multiply_2d
 from torchwright.ops.inout_nodes import create_input
 
 

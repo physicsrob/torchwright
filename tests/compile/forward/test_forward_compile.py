@@ -15,11 +15,11 @@ from torchwright.ops.inout_nodes import (
     create_literal_value,
     create_rope_config,
 )
-from torchwright.ops.linear_relu_linear import linear_relu_linear
-from torchwright.ops.arithmetic_ops import relu_add
+from torchwright.ops.relu.linear_relu_linear import linear_relu_linear
+from torchwright.ops.relu.arithmetic_ops import relu_add
 from torchwright.ops.linear import add, add_const, add_scaled_nodes, concat, sum_nodes
-from torchwright.ops.logic_ops import cond_gate
-from torchwright.ops.map_select import select, map_to_table
+from torchwright.ops.relu.logic_ops import cond_gate
+from torchwright.ops.relu.map_select import select, map_to_table
 from torchwright.ops.attention_ops import (
     attend_to_offset,
     get_prev_value,
@@ -343,7 +343,7 @@ def test_compile_switch():
     Exercises the case where cond_gate creates Add(inp, chain_output) nodes
     whose live addends must survive cancellation during compilation.
     """
-    from torchwright.ops.map_select import switch
+    from torchwright.ops.relu.map_select import switch
 
     cond1 = create_input("c1", 1)
     cond2 = create_input("c2", 1)
@@ -384,8 +384,8 @@ def test_compile_multi_switch_shared_constants():
     operations. The shared constants + many cond_gate chains create a graph where
     add_into live addends can be incorrectly freed.
     """
-    from torchwright.ops.map_select import switch
-    from torchwright.ops.logic_ops import cond_gate
+    from torchwright.ops.relu.map_select import switch
+    from torchwright.ops.relu.logic_ops import cond_gate
 
     rope = _rope()
     flag = create_input("flag", 1)
@@ -424,8 +424,8 @@ def test_compile_switch_with_attention_conditions():
     graph triggers multi-layer scheduling where add_into live addends
     can be incorrectly cancelled.
     """
-    from torchwright.ops.map_select import switch
-    from torchwright.ops.logic_ops import equals_vector
+    from torchwright.ops.relu.map_select import switch
+    from torchwright.ops.relu.logic_ops import equals_vector
 
     rope = _rope()
     embedding_dim = 8
@@ -645,7 +645,7 @@ def test_compile_attend_mean_where():
 def test_compile_attend_argmax_dot():
     """attend_argmax_dot — vector dot-product matching in attention."""
     from torchwright.ops.attention_ops import attend_argmax_dot
-    from torchwright.ops.logic_ops import cond_gate
+    from torchwright.ops.relu.logic_ops import cond_gate
 
     rope = _rope()
     qv = create_input("qv", 4)

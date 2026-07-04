@@ -81,7 +81,7 @@ def onehot_lookup(
     .. noise-footer::
 
        Max error: 7.629e-06 abs, 7.629e-08 rel over 4096 samples;
-       measured at commit 63af83a. See docs/numerical_noise.md.
+       measured at commit 6694f64. See docs/numerical_noise.md.
     """
     if not key_to_value:
         raise ValueError("onehot_lookup requires a non-empty table")

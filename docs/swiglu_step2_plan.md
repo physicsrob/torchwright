@@ -188,10 +188,16 @@ session should know beyond the per-op entries:
   δ·|hull side|), `_cond_gate_semantic_bound` gained `rel_tol`
   ((1+δ) envelope scaling). relu callers pass none of them —
   byte-identical behavior.
-- **Machine-neutral seams**: swiglu modules import purely-linear ops
-  (sum_nodes, concat, add_const, …), attention hardware, and pure-math
-  helpers from the frozen relu package, each site commented; these
-  relocate at relu retirement.
+- **Machine-neutral seams — relocated (2026-07-03, ahead of Phase C).**
+  The purely-linear ops (`ops/linear.py`), the attention hardware
+  (`ops/attention_ops.py`, whole module), and the shared pure-math
+  helpers (`ops/_math.py`) moved to the machine-neutral top level of
+  `ops/`, next to `const.py` and `inout_nodes.py`.  swiglu imports
+  nothing from relu anymore.  In the same stroke the pre-split
+  compatibility aliases (`torchwright.ops.<mod>` → `ops/relu/<mod>`)
+  and the top-level re-exports in `ops/__init__.py` were deleted —
+  every caller imports the explicit path, and the import is the
+  machine choice everywhere.  relu retirement is now a pure deletion.
 - Swiglu op tests live in `tests/ops/swiglu/` (the frozen relu
   baseline files in `tests/ops/` are untouched). `swish_dip` and
   `min_d_hidden` live in `ops/const.py`, pinned by
@@ -297,6 +303,9 @@ flag (D7).
 ## Parked / open
 
 - `ops/relu` retirement timing (default: first real refactor cost).
+  Since the 2026-07-03 machine-neutral relocation it is a pure
+  deletion: `ops/relu/` + `tests/ops/` (minus the swiglu subtree),
+  nothing else.
 - ~~Chunk caps vs pool size~~ — resolved 2026-07-03 as the
   declared-minimum option: `min_d_hidden = 1024` in `ops/const.py`,
   swiglu chunk caps derive from it, flagship geometry confirmed at

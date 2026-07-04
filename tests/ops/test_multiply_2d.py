@@ -13,7 +13,7 @@ import pytest
 import torch
 
 from torchwright.debug.probe import probe_graph, reference_eval
-from torchwright.ops.arithmetic_ops import multiply_2d
+from torchwright.ops.relu.arithmetic_ops import multiply_2d
 from torchwright.ops.inout_nodes import create_input
 
 # ---------------------------------------------------------------------------

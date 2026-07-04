@@ -74,7 +74,7 @@ def create_onehot_embedding(vocab: List[str]) -> Embedding:
     The table is the identity ``eye(len(vocab))`` and there are no special
     tokens, so ``d_embed == len(vocab)`` and every embedding row is an exact
     one-hot.  This makes lookups exact integer counting (see
-    :func:`torchwright.ops.onehot_table.onehot_lookup`) and makes the unembed
+    :func:`torchwright.ops.relu.onehot_table.onehot_lookup`) and makes the unembed
     an identity — ``argmax(output · eᵢ)`` over the equal-norm rows selects the
     hot column directly, so argmax-decode is exact.
 

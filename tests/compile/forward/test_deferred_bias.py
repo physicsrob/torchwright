@@ -13,7 +13,7 @@ from torchwright.compiler.forward.compile import forward_compile
 from torchwright.graph import Add, Linear
 from torchwright.graph.misc import LiteralValue
 from torchwright.ops.inout_nodes import create_input
-from torchwright.ops.map_select import in_range
+from torchwright.ops.relu.map_select import in_range
 
 
 def test_block_with_two_biased_linear_inputs():

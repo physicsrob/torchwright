@@ -1,9 +1,10 @@
 import torch
-from torchwright import ops
-from torchwright.ops.arithmetic_ops import (
+from torchwright.ops.relu.arithmetic_ops import (
+    abs as abs_node,
     clamp,
     relu_add,
     compare,
+    min as min_node,
     mod_const,
     piecewise_linear,
     square,
@@ -255,18 +256,18 @@ def test_piecewise_linear_chunking():
 
 
 def test_abs():
-    """ops.abs on a 3-wide node with positive, negative, and zero."""
+    """abs on a 3-wide node with positive, negative, and zero."""
     x = create_input("x", 3)
-    out = ops.abs(x)
+    out = abs_node(x)
     vals = torch.tensor([[5.0, -3.0, 0.0]])
     result = out.compute(n_pos=1, input_values={"x": vals})
     assert torch.allclose(result, torch.tensor([[5.0, 3.0, 0.0]]))
 
 
 def test_abs_scalar():
-    """ops.abs on scalar inputs."""
+    """abs on scalar inputs."""
     x = create_input("x", 1)
-    out = ops.abs(x)
+    out = abs_node(x)
     for v in [-7.0, 0.0, 4.5]:
         result = out.compute(n_pos=1, input_values={"x": torch.tensor([[v]])})
         assert abs(result.item() - abs(v)) < 0.01
@@ -275,7 +276,7 @@ def test_abs_scalar():
 def test_min():
     a = create_input("a", 3)
     b = create_input("b", 3)
-    out = ops.min(a, b)
+    out = min_node(a, b)
     va = torch.tensor([[5.0, -2.0, 7.0]])
     vb = torch.tensor([[3.0, 1.0, 7.0]])
     result = out.compute(n_pos=1, input_values={"a": va, "b": vb})

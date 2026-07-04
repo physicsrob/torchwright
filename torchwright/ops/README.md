@@ -1,18 +1,31 @@
 # Ops Module
 
+## Layout: the import path is the machine choice
+
+- `torchwright.ops.relu` — the frozen ReLU-machine op library.
+- `torchwright.ops.swiglu` — the swish-machine op library.
+- Machine-neutral code lives at this level: `const`, `inout_nodes`,
+  `linear` (purely linear ops — no MLP sublayer, so no activation
+  choice), `attention_ops` (attention hardware), `_math` (private
+  shared helpers).
+
+There are no re-exports at this level and no mode flags — importing
+from a machine package *is* the machine choice, and the compiler's
+uniformity check (all FFNs in a graph share one activation) is the
+backstop against accidental mixing.
+
 ## Recommended import style
 
-Use namespace-qualified access, like PyTorch (`torch.min`, `torch.abs`):
+Import from the specific module that owns the op:
 
 ```python
-from torchwright import ops
-
-result = ops.min(a, ops.max(b, c))
-d = ops.abs(ops.subtract(x, y))
+from torchwright.ops.linear import add_const, subtract
+from torchwright.ops.swiglu.arithmetic_ops import compare
+from torchwright.ops.swiglu.arithmetic_ops import min as min_node
 ```
 
-This avoids shadowing Python builtins (`abs`, `min`, `max`) and keeps
-call sites concise.
+Ops that shadow Python builtins (`abs`, `min`) get an `as` alias at the
+call site, as in the last line.
 
 ## Operation Naming Convention
 

@@ -17,7 +17,7 @@ from torchwright.graph.affine_rules import compute_affine_bound
 from torchwright.graph.asserts import assert_in_range
 from torchwright.graph.misc import Concatenate
 from torchwright.ops.inout_nodes import create_input
-from torchwright.ops.linear_relu_linear import linear_relu_linear
+from torchwright.ops.relu.linear_relu_linear import linear_relu_linear
 
 
 def _block(x, d_input, n_lanes, d_output, seed=0, name=""):
@@ -151,7 +151,7 @@ def test_lower_preserves_semantic_overrides():
     """Ops install semantic affine overrides (tighter than pure propagation)
     via _apply_semantic_override; lower()'s recompute must re-apply them, not
     wipe them — a wipe would silently loosen every downstream bound."""
-    from torchwright.ops.arithmetic_ops import compare
+    from torchwright.ops.relu.arithmetic_ops import compare
 
     x = create_input("x", 1, value_range=(-10.0, 10.0))
     cmp = compare(x, 0.0, true_level=1.0, false_level=-1.0)

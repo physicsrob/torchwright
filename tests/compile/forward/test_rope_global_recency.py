@@ -19,7 +19,7 @@ import torch
 from torchwright.compiler.export import compile_headless
 from torchwright.debug.probe import probe_compiled
 from torchwright.graph.spherical_codes import index_to_vector
-from torchwright.ops.global_recency import (
+from torchwright.ops.relu.global_recency import (
     attend_most_recent_globally,
     global_position_from_bos,
 )

@@ -2,7 +2,7 @@ from torchwright.graph.asserts import assert_matches_value_type
 from torchwright.graph.spherical_codes import index_to_vector
 from torchwright.graph.value_type import NodeValueType, Range
 from torchwright.ops.inout_nodes import create_literal_value, create_input
-from torchwright.ops.logic_ops import (
+from torchwright.ops.relu.logic_ops import (
     equals_vector,
     cond_gate,
     bool_any_true,

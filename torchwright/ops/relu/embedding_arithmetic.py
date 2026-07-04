@@ -21,7 +21,7 @@ import torch
 from torchwright.graph import Node, Embedding
 from torchwright.ops.linear import concat
 from torchwright.ops.inout_nodes import create_literal_value
-from torchwright.ops.map_select import map_to_table
+from torchwright.ops.relu.map_select import map_to_table
 
 # ---------------------------------------------------------------------------
 # Addition

@@ -8,7 +8,7 @@ from torchwright.ops.inout_nodes import (
     create_literal_value,
     create_embedding,
 )
-from torchwright.ops.map_select import (
+from torchwright.ops.relu.map_select import (
     select,
     map_to_table,
     switch,

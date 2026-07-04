@@ -22,7 +22,7 @@ import torch
 
 from torchwright.graph import Node, Embedding, RopeConfig
 from torchwright.graph.embedding import Unembedding
-from torchwright.ops.arithmetic_ops import compare, relu_add, multiply_integers
+from torchwright.ops.relu.arithmetic_ops import compare, relu_add, multiply_integers
 from torchwright.ops.linear import add, negate, subtract
 from torchwright.ops.attention_ops import get_prev_value
 from torchwright.ops.inout_nodes import (
@@ -31,19 +31,19 @@ from torchwright.ops.inout_nodes import (
     create_rope_config,
     create_unembedding,
 )
-from torchwright.ops.logic_ops import (
+from torchwright.ops.relu.logic_ops import (
     equals_vector,
     bool_any_true,
     bool_all_true,
     bool_not,
 )
-from torchwright.ops.map_select import select, switch
-from torchwright.ops.scalar_encoding import (
+from torchwright.ops.relu.map_select import select, switch
+from torchwright.ops.relu.scalar_encoding import (
     digits_to_number,
     number_to_digit_scalars,
     scalar_to_embedding,
 )
-from torchwright.ops.sequence_ops import (
+from torchwright.ops.relu.sequence_ops import (
     NumericSequence,
     output_sequence,
     remove_leading_0s,

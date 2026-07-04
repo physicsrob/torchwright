@@ -11,7 +11,7 @@ import torch
 
 from torchwright.compiler.export import compile_headless
 from torchwright.compiler.transformer import HeadlessTransformer
-from torchwright.ops.arithmetic_ops import relu_add
+from torchwright.ops.relu.arithmetic_ops import relu_add
 from torchwright.ops.linear import add, add_const, multiply_const
 from torchwright.ops.inout_nodes import create_input
 

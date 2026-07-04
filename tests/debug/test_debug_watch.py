@@ -24,7 +24,7 @@ from torchwright.graph.asserts import (
     collect_debug_nodes,
     debug_watch,
 )
-from torchwright.ops.arithmetic_ops import clamp
+from torchwright.ops.relu.arithmetic_ops import clamp
 from torchwright.ops.inout_nodes import create_input
 
 # ---------------------------------------------------------------------------

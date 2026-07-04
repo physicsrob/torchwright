@@ -11,7 +11,7 @@ import torch
 
 from torchwright.graph import FFN
 from torchwright.ops.inout_nodes import create_input
-from torchwright.ops.linear_relu_linear import linear_relu_linear
+from torchwright.ops.relu.linear_relu_linear import linear_relu_linear
 
 
 def _rand_block_params(d_input, n_lanes, d_output, seed=0):

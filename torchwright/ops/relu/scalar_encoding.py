@@ -24,11 +24,11 @@ import torch
 from torchwright.graph import Node, Embedding
 from torchwright.graph.asserts import assert_matches_value_type
 from torchwright.graph.value_type import NodeValueType, Range
-from torchwright.ops.arithmetic_ops import thermometer_floor_div
+from torchwright.ops.relu.arithmetic_ops import thermometer_floor_div
 from torchwright.ops.linear import add_scaled_nodes, sum_nodes
 from torchwright.ops.const import step_sharpness
-from torchwright.ops.linear_relu_linear import linear_relu_linear
-from torchwright.ops.map_select import map_to_table
+from torchwright.ops.relu.linear_relu_linear import linear_relu_linear
+from torchwright.ops.relu.map_select import map_to_table
 
 
 def digit_to_scaled_scalar(

@@ -1,5 +1,5 @@
 from torchwright.ops.inout_nodes import create_embedding, create_unembedding
-from torchwright.ops.map_select import map_to_table
+from torchwright.ops.relu.map_select import map_to_table
 
 
 def test_embedding():

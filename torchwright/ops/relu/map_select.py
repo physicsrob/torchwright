@@ -7,7 +7,7 @@ import torch
 from torchwright.graph.asserts import assert_integer, assert_matches_value_type
 from torchwright.graph.value_type import NodeValueType, Range
 from torchwright.ops.const import step_sharpness, embedding_step_sharpness
-from torchwright.ops.logic_ops import (
+from torchwright.ops.relu.logic_ops import (
     cond_gate,
     _max_abs_or_raise,
     _intersect_intervals,
@@ -57,7 +57,7 @@ def _broadcast_select_per_column_offsets(
 
 from torchwright.ops._math import _lookup_axis_scale, _lookup_numeric_slack
 from torchwright.ops.linear import sum_nodes
-from torchwright.ops.linear_relu_linear import linear_relu_linear
+from torchwright.ops.relu.linear_relu_linear import linear_relu_linear
 
 
 def map_to_table(

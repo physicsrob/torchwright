@@ -19,7 +19,7 @@ from torchwright.compiler.forward.scheduling_policy import SchedulingPolicy
 from torchwright.graph import Linear
 from torchwright.graph.optimize import fuse_consecutive_linears
 from torchwright.ops.inout_nodes import create_input
-from torchwright.ops.linear_relu_linear import linear_relu_linear
+from torchwright.ops.relu.linear_relu_linear import linear_relu_linear
 
 
 def _repro_graph():

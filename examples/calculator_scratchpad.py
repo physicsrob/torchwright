@@ -72,7 +72,7 @@ from typing import Callable, Dict, List, Tuple
 import torch
 
 from torchwright.graph import Embedding, Node, RopeConfig
-from torchwright.ops.arithmetic_ops import compare
+from torchwright.ops.relu.arithmetic_ops import compare
 from torchwright.ops.linear import (
     add,
     add_const,
@@ -82,27 +82,27 @@ from torchwright.ops.linear import (
     subtract,
     sum_nodes,
 )
-from torchwright.ops.arithmetic_ops import min as min_node
+from torchwright.ops.relu.arithmetic_ops import min as min_node
 from torchwright.ops.inout_nodes import (
     create_literal_value,
     create_onehot_embedding,
     create_rope_config,
 )
-from torchwright.ops.logic_ops import (
+from torchwright.ops.relu.logic_ops import (
     bool_all_true,
     bool_any_true,
     bool_not,
     cond_gate,
     equals_vector,
 )
-from torchwright.ops.map_select import in_range, select, switch
-from torchwright.ops.onehot_table import onehot_lookup
+from torchwright.ops.relu.map_select import in_range, select, switch
+from torchwright.ops.relu.onehot_table import onehot_lookup
 from torchwright.ops.attention_ops import (
     attend_argmax_dot,
     attend_to_offset,
     get_prev_value,
 )
-from torchwright.ops.marker_count import count_since_marker
+from torchwright.ops.relu.marker_count import count_since_marker
 
 from examples._calculator_common import (
     CALC_VOCAB,
@@ -874,7 +874,7 @@ def _emit_by_slot_index(
 ) -> Node:
     """Autoregressive emission gated by the exact integer step counter.
 
-    A drop-in replacement for :func:`~torchwright.ops.sequence_ops.output_sequence`
+    A drop-in replacement for :func:`~torchwright.ops.relu.sequence_ops.output_sequence`
     that avoids ``attend_to_offset`` for the slot-index gating — the same helper
     ``sort_digits_v1`` carries, lifted here for the same
     reason.  ``output_sequence`` gates slot ``k`` with
