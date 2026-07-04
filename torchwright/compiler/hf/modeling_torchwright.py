@@ -1,56 +1,26 @@
-"""``TorchwrightForCausalLM`` — a native HuggingFace causal LM that reproduces a
-compiled torchwright token model.
+"""PyTorch Torchwright model — a pre-norm causal decoder with rotary position
+embeddings, per-layer head and MLP widths, and an untied LM head.
 
-This is a **shipped** file: it rides into every saved model directory (copied
-verbatim by ``transformers``' ``custom_object_save``, together with its one
-relative-imported sibling ``configuration_torchwright``) and must load on a
-stranger's machine with only ``torch`` + ``transformers`` installed — no
-``torchwright``. So it imports only the standard library, ``torch``,
-``transformers``, and ``.configuration_torchwright``. The hermetic test
-``tests/hf/test_shipped_model.py`` enforces that statically.
+The forward path:
 
-The forward path is transcribed one-for-one from the compiler's ONNX emission
-(``compiler/export.py`` ``compile_to_onnx`` token head +
-``_emit_cached_layer_nodes``):
-
-    res      = embed_table[input_ids]              # (B, T, d) — vanilla lookup;
-                                                   # rows carry the const seeds
+    h = embed_tokens(input_ids)                    # (B, T, d)
     for each layer:
-        res  = res + attn(norm(res))               # causal, scale=1.0, RoPE, no bias
-        res  = res + linear2(relu(linear1(norm(res))))  # both linears biased
-    logits   = lm_head(norm(res))                  # UNTIED, full-width, no bias
+        h = h + attn(norm(h))                      # causal, scale=1.0, RoPE, no bias
+        h = h + mlp(norm(h))                       # fc2(relu(fc1(h))), biased
+    logits = lm_head(norm(h))                      # untied, no bias
 
-The ``norm`` is a real RMSNorm that computes the **identity** (the compiler
-pins the residual RMS to a power of two and sets the gain to cancel it; see
-:class:`TorchwrightRMSNorm`).  When ``config.rms_norm`` is off it is
-``nn.Identity`` and the path reduces to plain ``res + attn(res)``.
+``norm`` is a Llama-style RMSNorm when ``config.rms_norm`` is set and
+``nn.Identity`` otherwise.
 
-Position is a rotation applied inside attention (RoPE, ``rotate_half`` over
-``d_head`` by absolute ``cache_position``) — there is no additive positional
-encoding table.
-
-Correctness invariants (all from the compiler source; see the config docstring):
-
-* Normalization is a pre-norm RMSNorm (plus a final norm) that is the exact
-  identity, or absent (``rms_norm`` off) — never a value-changing norm.
-* Attention uses ``scale=1.0`` (no ``1/sqrt(d_head)``) and the exact-math SDPA
-  backend. The cancel-heads trick the compiler uses relies on
-  ``attn_out + skip == 0`` *algebraically*; a single fp32-LSB perturbation from
-  the flash / efficient attention kernels flips output bits, so we force
-  ``SDPBackend.MATH`` and keep everything fp32. **Never downcast to fp16/bf16.**
-* The mask is an overwrite of hidden positions, equivalent to the compiler's
-  ``Where(slot > query_pos, sentinel, logit)``: a key at absolute position ``j``
-  is visible to a query at absolute position ``p`` iff ``j <= p``. The mask
-  derives purely from ``cache_position`` — the only position fact the host
-  supplies — exactly as the ONNX preamble does.
-
-Generation is plain greedy argmax-append with an EOS stop, i.e. stock
-``generate(do_sample=False)``. The native model uses a stock unbounded
-``DynamicCache``.
+The model is fp32-only: it is built for exact fp32 arithmetic, and reduced
+precision or non-deterministic attention kernels change its outputs.
+``forward`` raises on non-fp32 hidden states or active autocast, and
+attention is pinned to the deterministic math SDPA backend.
 
 Padding is not modeled: the mask is causal-only, so batched generation with
-left/right padding is unsupported. The consumers (calculator, DOOM) run a
-single greedy sequence, which is exactly what this covers.
+left/right padding is unsupported. The intended use is a single greedy
+sequence — stock ``generate(do_sample=False)`` over an unbounded
+``DynamicCache``.
 """
 
 from __future__ import annotations
@@ -71,27 +41,17 @@ from transformers.modeling_outputs import (
 
 from .configuration_torchwright import TorchwrightConfig
 
-# The compiler emits attention against the exact-math softmax+matmul. On A100 the
-# default fp32 SDPA backend is EFFICIENT_ATTENTION, which perturbs values by a
-# single fp32 mantissa-LSB on some inputs — enough to break the algebraic
-# cancellation the compiled heads depend on (concretely: at a large operand
-# q ~= 22855 one fp32 ULP is ~1/512, which leaks into a cancel-head's residual
-# column and flips a Gray-code bit at boundary q values; see components/attn.py).
-# The exact zero a cancel-head produces is consumed categorically downstream, so
-# this is a regime change, not tolerable noise — which is why model.forward
-# hard-raises on any non-fp32 dtype / autocast rather than warning (a silent
-# wrong forward has no symptom). MATH matches the compiler bit-for-bit.
+# The fused flash/efficient attention kernels round differently across devices
+# and runs; this model's outputs must be bit-reproducible, so attention is
+# pinned to the deterministic math backend (plain softmax + matmul).
 _SDPA_BACKEND = [SDPBackend.MATH]
 
 
 class TorchwrightAttention(nn.Module):
-    """Per-layer causal multi-head attention, ``scale=1.0``, no bias.
+    """Causal multi-head attention, ``scale=1.0``, no bias.
 
-    Q/K/V/O are plain ``nn.Linear(bias=False)`` whose weights are the compiled
-    projection matrices (transposed into ``nn.Linear``'s ``(out, in)`` layout by
-    the converter). The head count ``n_heads`` is this layer's trimmed count, so
-    each layer carries only the heads it uses; ``d_head`` is shared across all
-    layers.
+    ``n_heads`` is this layer's own head count (layers may differ);
+    ``d_head`` is shared across all layers.
     """
 
     def __init__(self, config: TorchwrightConfig, layer_idx: int):
@@ -106,20 +66,13 @@ class TorchwrightAttention(nn.Module):
         self.v_proj = nn.Linear(self.d, hd, bias=False)
         self.o_proj = nn.Linear(hd, self.d, bias=False)
 
-        # RoPE (LLaMA3 rotate_half, half-split, scale baked into base), rotation by
-        # ABSOLUTE position (cache_position) on the one global grid.  Vanilla
-        # partial rotary: the first ``d_rot`` dims of every head rotate and the last
-        # ``d_head - d_rot`` are the unrotated NoPE tail.  ``d_rot == d_head`` is
-        # full rotary (the LLaMA3 end state); there is no per-head enable.
-        #
-        # The rotary frequency grid is derived purely from the serialized config
-        # and is cheap, so it is recomputed in ``forward`` on the input's device
-        # rather than stored as a buffer. A buffer would be the obvious choice, but
-        # ``from_pretrained``'s meta-device (low_cpu_mem_usage) load path does NOT
-        # materialize a non-persistent buffer — it is absent from the checkpoint
-        # and never re-run — so it would reload full of uninitialized garbage and
-        # the rotary multiply would propagate NaN to every logit. Plain Python
-        # scalars are immune to that path.
+        # Rotary embedding (rotate_half), partial width: the first ``d_rot``
+        # dims of every head rotate, the rest pass through unrotated;
+        # ``d_rot == d_head`` is full rotary. The frequency grid is derived
+        # purely from the config and is cheap, so it is recomputed in
+        # ``forward`` on the input's device rather than stored as a buffer —
+        # ``from_pretrained``'s meta-device (low_cpu_mem_usage) load path
+        # does not materialize non-persistent buffers.
         self.rope_base = float(config.rope_base)
         self.d_rot = int(getattr(config, "d_rot", self.d_head))
 
@@ -135,14 +88,7 @@ class TorchwrightAttention(nn.Module):
         sin: torch.Tensor,
     ) -> torch.Tensor:
         # x: (B, n_heads, T, d_head); cos/sin: (T, d_rot) -> (1, 1, T, d_rot).
-        # Rotate the first d_rot dims (rotate_half over d_rot) and pass the last
-        # d_head - d_rot dims (the NoPE tail) through unchanged.  d_rot == d_head
-        # (cos as wide as x) is full rotary and takes the exact pre-partial path,
-        # byte-identical to before.  Emitted directly, matching export.py:
-        # cross-backend ONNX/torch agreement is not algebraic (the cancel-head rows
-        # that cancel to denormal magnitude differ by one denormal ULP regardless
-        # of the form, which the test_convert parity bound tolerates — no token or
-        # meaningful logit moves), so the `x + (rot - x)` reconstruction is gone.
+        # Rotate the first d_rot dims; dims past d_rot pass through unchanged.
         cos = cos[None, None]
         sin = sin[None, None]
         d_rot = cos.shape[-1]
@@ -166,10 +112,8 @@ class TorchwrightAttention(nn.Module):
         k = self.k_proj(hidden_states).view(shape).transpose(1, 2)
         v = self.v_proj(hidden_states).view(shape).transpose(1, 2)
 
-        # RoPE rotates Q and the NEW K by absolute position, before the cache
-        # update, so the cache stores already-rotated K (slot == position).  The
-        # frequency grid spans the rotary front d_rot (normalized by d_rot); the
-        # NoPE tail is handled by _apply_rope.
+        # Rotate Q and the new K by absolute position (cache_position) before
+        # the cache update, so the cache holds already-rotated keys.
         device = hidden_states.device
         p = torch.arange(0, self.d_rot, 2, dtype=torch.float64, device=device)
         inv = (self.rope_base ** (-p / self.d_rot)).to(torch.float32)
@@ -183,8 +127,8 @@ class TorchwrightAttention(nn.Module):
         if past_key_values is not None:
             k, v = past_key_values.update(k, v, self.layer_idx)
 
-        # attn_mask is (1, 1, T, T_total) boolean, True == visible; it broadcasts
-        # over the batch and head axes (the head count varies per layer).
+        # attn_mask is (1, 1, T, T_total) boolean, True == visible; it
+        # broadcasts over the batch and head axes.
         with sdpa_kernel(_SDPA_BACKEND):
             attn = F.scaled_dot_product_attention(
                 q, k, v, attn_mask=attn_mask, scale=1.0
@@ -195,28 +139,21 @@ class TorchwrightAttention(nn.Module):
 
 
 class TorchwrightMLP(nn.Module):
-    """``linear2(relu(linear1(x)))`` — both linears biased."""
+    """``fc2(relu(fc1(x)))`` — both linears biased."""
 
     def __init__(self, config: TorchwrightConfig, layer_idx: int):
         super().__init__()
         d_hidden = config.d_hidden_per_layer[layer_idx]
-        self.linear1 = nn.Linear(config.d, d_hidden, bias=True)
-        self.linear2 = nn.Linear(d_hidden, config.d, bias=True)
+        self.fc1 = nn.Linear(config.d, d_hidden, bias=True)
+        self.fc2 = nn.Linear(d_hidden, config.d, bias=True)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.linear2(F.relu(self.linear1(x)))
+        return self.fc2(F.relu(self.fc1(x)))
 
 
 class TorchwrightRMSNorm(nn.Module):
-    """RMSNorm ``x / sqrt(mean(x^2, -1) + eps) * weight`` — exactly Llama's.
-
-    In a compiled torchwright model it computes the **identity**: a reserved
-    residual column pins ``mean(x^2)`` to a power of two and ``weight`` is the
-    uniform gain that cancels it, so ``norm(x) == x`` bit-for-bit. It is still a
-    genuine RMSNorm op (runs on any standard engine); the magnitude of
-    ``weight`` is the only tell that it was compiled rather than trained. fp32
-    only, like the rest of the model.
-    """
+    """Root-mean-square norm, ``x / sqrt(mean(x^2, -1) + eps) * weight`` —
+    the same form as Llama's."""
 
     def __init__(self, d: int, eps: float):
         super().__init__()
@@ -229,18 +166,15 @@ class TorchwrightRMSNorm(nn.Module):
 
 
 class TorchwrightDecoderLayer(nn.Module):
-    """One block. Pre-norm Llama-style when ``config.rms_norm`` (the norm is an
-    identity — see :class:`TorchwrightRMSNorm`): ``x = x + attn(norm(x)); x = x
-    + mlp(norm(x))``. With ``rms_norm`` off the norms are ``nn.Identity`` and it
-    is plain ``x = x + attn(x); x = x + mlp(x)``."""
+    """Pre-norm decoder block: ``x = x + attn(norm(x)); x = x + mlp(norm(x))``.
+    The norms are ``nn.Identity`` when ``config.rms_norm`` is off."""
 
     def __init__(self, config: TorchwrightConfig, layer_idx: int):
         super().__init__()
         self.self_attn = TorchwrightAttention(config, layer_idx)
         self.mlp = TorchwrightMLP(config, layer_idx)
-        # Pre-norm on each sublayer input; the residual skip stays un-normed.
-        # Identity when the artifact has no norm, so no stray weights appear in
-        # the state dict (the converter emits gains only when rms_norm is on).
+        # Norm weights exist in the checkpoint only when rms_norm is on;
+        # Identity keeps the no-norm state dict free of stray parameters.
         if config.rms_norm:
             self.input_layernorm = TorchwrightRMSNorm(config.d, config.rms_norm_eps)
             self.post_attention_layernorm = TorchwrightRMSNorm(
@@ -277,15 +211,11 @@ class TorchwrightPreTrainedModel(PreTrainedModel):
     _supports_sdpa = True
 
     def _init_weights(self, module):
-        # Real weights are loaded over this by the converter / from_pretrained;
-        # this only has to be finite and shape-correct for a fresh construction.
-        #
-        # Use ``nn.init.*`` ON THE PARAMETER (not ``.data.normal_()``): under
-        # ``from_pretrained`` transformers patches the ``torch.nn.init``
-        # functions to respect each param's ``_is_hf_initialized`` flag, so
-        # already-loaded weights are skipped. Calling the raw ``Tensor.normal_``
-        # on ``.data`` bypasses that guard and silently re-randomizes loaded
-        # weights — the bug that made reloaded models emit garbage.
+        # Real weights come from the checkpoint; a fresh construction only has
+        # to be finite and shape-correct. Use ``nn.init.*`` on the parameter
+        # (not ``.data.normal_()``): under ``from_pretrained``, transformers
+        # patches ``torch.nn.init`` to skip already-loaded parameters, and raw
+        # ``.data`` mutation bypasses that guard.
         std = 0.02
         if isinstance(module, nn.Linear):
             nn.init.normal_(module.weight, mean=0.0, std=std)
@@ -296,22 +226,15 @@ class TorchwrightPreTrainedModel(PreTrainedModel):
 
 
 class TorchwrightModel(TorchwrightPreTrainedModel):
-    """The token transformer trunk: embed + project + additive PE + N blocks."""
+    """Decoder trunk: token embedding, ``n_layers`` decoder blocks, final norm."""
 
     def __init__(self, config: TorchwrightConfig):
         super().__init__(config)
         self.embed_tokens = nn.Embedding(config.vocab_size, config.d)
-        # Position is a rotation applied inside attention (RoPE) — there is no
-        # additive positional-encoding table.  The input constant seeds
-        # (including the reserved const-1 self-match column) ride the
-        # embedding table's rows, folded there by the exporter (token.v5) —
-        # there is no separate constant_values buffer.
         self.layers = nn.ModuleList(
             [TorchwrightDecoderLayer(config, i) for i in range(config.n_layers)]
         )
-        # Final norm before the unembed (Llama-style). Identity when off, like
-        # the per-layer norms — and an identity even when on (see
-        # TorchwrightRMSNorm).
+        # Final norm before the LM head; Identity when rms_norm is off.
         self.norm = (
             TorchwrightRMSNorm(config.d, config.rms_norm_eps)
             if config.rms_norm
@@ -337,14 +260,7 @@ class TorchwrightModel(TorchwrightPreTrainedModel):
         **kwargs,
     ) -> BaseModelOutputWithPast:
         if inputs_embeds is not None:
-            # The (B, T, d) embedding lookup IS the residual seed now, so the
-            # width would fit — but the seed also adds the absolute PE and the
-            # constant term, so a raw inputs_embeds contract is ambiguous. Reject
-            # it rather than guess whether the caller pre-added those.
-            raise NotImplementedError(
-                "inputs_embeds is not supported for torchwright token models; "
-                "pass input_ids."
-            )
+            raise NotImplementedError("inputs_embeds is not supported; pass input_ids.")
         if input_ids is None:
             raise ValueError("TorchwrightModel requires input_ids.")
         # `use_cache` is a generation parameter, which transformers 5.x strips
@@ -353,18 +269,16 @@ class TorchwrightModel(TorchwrightPreTrainedModel):
         if use_cache is None:
             use_cache = getattr(self.config, "use_cache", True)
 
-        tok = self.embed_tokens(input_ids)  # (B, T, d)
-        B, T = tok.shape[0], tok.shape[1]
-        device = tok.device
+        hidden_states = self.embed_tokens(input_ids)  # (B, T, d)
+        B, T = hidden_states.shape[0], hidden_states.shape[1]
+        device = hidden_states.device
 
-        # fp32-only: the compiled attention relies on exact algebraic
-        # cancellation (cancel heads: attn_out + skip == 0); a fp16/bf16
-        # downcast or active autocast runs the matmuls in reduced precision and
-        # silently breaks correctness. Fail loud rather than emit wrong tokens.
-        if tok.dtype != torch.float32:
+        # fp32-only: reduced precision changes this model's outputs. Fail loud
+        # rather than emit wrong tokens.
+        if hidden_states.dtype != torch.float32:
             raise RuntimeError(
-                "torchwright token models are fp32-only; got "
-                f"{tok.dtype}. Load/keep the model in float32 (no "
+                "This model is fp32-only; got "
+                f"{hidden_states.dtype}. Load/keep the model in float32 (no "
                 "torch_dtype=fp16/bf16, no .half())."
             )
         try:
@@ -373,9 +287,8 @@ class TorchwrightModel(TorchwrightPreTrainedModel):
             autocast_on = torch.is_autocast_enabled()
         if autocast_on:
             raise RuntimeError(
-                "torchwright token models are fp32-only; autocast is active, "
-                "which runs matmuls in reduced precision and breaks the "
-                "compiled cancellation contract. Run outside autocast."
+                "This model is fp32-only; autocast is active, which runs "
+                "matmuls in reduced precision. Run outside autocast."
             )
 
         if use_cache and past_key_values is None:
@@ -386,29 +299,22 @@ class TorchwrightModel(TorchwrightPreTrainedModel):
         if cache_position is None:
             if position_ids is not None:
                 # Honor caller-supplied absolute positions (single sequence):
-                # the PE gather and the causal mask both key off cache_position,
-                # so map position_ids onto it rather than silently ignoring it.
+                # the rotary rotation and the causal mask both key off
+                # cache_position, so map position_ids onto it rather than
+                # silently ignoring it.
                 cache_position = position_ids[0].to(device=device, dtype=torch.long)
             else:
                 cache_position = torch.arange(past_seen, past_seen + T, device=device)
 
-        # Vanilla token residual seed; position enters only through the rotary
-        # rotation inside attention.  The token embedding's rows carry the
-        # pinned RMSNorm constant and the const-1 self-match column (folded by
-        # the exporter), so the lookup alone seeds the residual stream.
-        res = tok  # (B, T, d)
-
-        # Causal mask over absolute positions: key j visible to query p iff j<=p.
+        # Causal mask over absolute positions: key j is visible to query p iff
+        # j <= p.
         total = past_seen + T
         key_pos = torch.arange(total, device=device)
         mask = (key_pos[None, :] <= cache_position[:, None])[None, None, :, :]
-        # Fold in a key-padding mask when one is supplied. The supported shape is
-        # a 2D (batch, total_keys) mask covering every key — exactly what
-        # `generate` passes (all-ones, a no-op, for the single greedy sequence).
-        # Anything else (4D prebuilt masks, or a 2D mask that doesn't cover all
-        # keys) is NOT part of this model's contract: refuse it loudly rather
-        # than silently fall back to causal-only and emit plausible-but-wrong
-        # logits on padded input.
+        # Fold in a key-padding mask when one is supplied. The supported shape
+        # is a 2D (batch, total_keys) mask covering every key — what `generate`
+        # passes for a single unpadded sequence. Anything else is refused
+        # loudly rather than silently reduced to causal-only.
         if attention_mask is not None:
             if attention_mask.dim() == 2 and attention_mask.shape[-1] == total:
                 pad = attention_mask[:, None, None, :].to(torch.bool)
@@ -421,23 +327,21 @@ class TorchwrightModel(TorchwrightPreTrainedModel):
                 )
 
         for layer in self.layers:
-            res = layer(res, mask, past_key_values, cache_position)
+            hidden_states = layer(hidden_states, mask, past_key_values, cache_position)
 
-        res = self.norm(res)  # final norm (identity); no-op when rms_norm off
+        hidden_states = self.norm(hidden_states)
 
         return BaseModelOutputWithPast(
-            last_hidden_state=res,
+            last_hidden_state=hidden_states,
             past_key_values=past_key_values if use_cache else None,
         )
 
 
 class TorchwrightForCausalLM(TorchwrightPreTrainedModel, GenerationMixin):
-    """Compiled torchwright token model as a standard causal LM.
+    """Torchwright decoder with a language-modeling head.
 
-    The unembed is an untied ``lm_head``: a separate ``(vocab, d)`` Linear over
-    the full residual stream, ``logits = lm_head(res)``. Its weight is zero off
-    the output node's residual columns, so the rest of the residual contributes
-    nothing.
+    The head is untied: a separate ``(vocab_size, d)`` Linear over the final
+    hidden state, no bias.
     """
 
     def __init__(self, config: TorchwrightConfig):
@@ -496,7 +400,6 @@ class TorchwrightForCausalLM(TorchwrightPreTrainedModel, GenerationMixin):
             slice_idx = logits_to_keep
         hidden = hidden[:, slice_idx, :]
 
-        # Untied unembed over the full residual stream.
         logits = self.lm_head(hidden)  # (B, T', vocab)
 
         loss = None

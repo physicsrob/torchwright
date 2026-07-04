@@ -1,25 +1,12 @@
-"""``TorchwrightTokenizer`` — a generic character-level tokenizer over a compiled
-token model's vocabulary.
+"""``TorchwrightTokenizer`` — a character-level tokenizer over a fixed
+vocabulary.
 
-This is a **shipped** file: it rides into a saved tokenizer directory (copied
-verbatim by ``transformers``' ``custom_object_save``) and must load on a
-stranger's machine with only ``transformers`` installed — no ``torch``, no
-``torchwright``. So it imports only the standard library and ``transformers``,
-with no relative imports. The hermetic test
-``tests/hf/test_shipped_model.py`` enforces that statically.
-
-The vocabulary is the compiler's token list (the ``vocab`` array in the ONNX
-``meta.json``): one entry per row of the embedding table, in id order. For the
-trivial-ASCII surfaces this serves (e.g. the calculator: digits, ``+ - *``,
-newline), every printable token is a single character, so encoding is
-character-level — ``"12*34\n"`` → ids for ``1 2 * 3 4 \n``. Multi-character
-control tokens (``<bos>`` / ``<eos>`` / ``<unk>``) are registered as special
-tokens and split out before the character pass, exactly as ``transformers``
-does for any added token.
-
-DOOM ships its own richer ``DoomTokenizer`` (a value-carrier fold over a
-WordLevel surface); this generic tokenizer is for the simple token models whose
-readable form is just their characters.
+The vocabulary is a JSON list of tokens in id order (``vocab.json``), one
+entry per row of the model's embedding table. Every printable token is a
+single character, so encoding is character-level: each character of the input
+maps to one id. Multi-character control tokens (``<bos>`` / ``<eos>`` /
+``<unk>``) are registered as special tokens and split out before the
+character pass, exactly as ``transformers`` does for any added token.
 """
 
 from __future__ import annotations
@@ -34,7 +21,7 @@ VOCAB_FILES_NAMES = {"vocab_file": "vocab.json"}
 
 
 class TorchwrightTokenizer(PreTrainedTokenizer):
-    """Standalone slow ``PreTrainedTokenizer`` over a compiled model's vocab.
+    """Standalone slow ``PreTrainedTokenizer`` over a fixed vocabulary.
 
     A character-level encoder backed by the ``{token: id}`` bijection read from
     ``vocab.json`` (a JSON list of tokens in id order). ``bos`` is prepended on
@@ -63,9 +50,7 @@ class TorchwrightTokenizer(PreTrainedTokenizer):
         # Build the id<->token bijection BEFORE super().__init__ (which processes
         # special tokens and consults get_vocab()).
         self._tokens: list[str] = list(json.loads(Path(vocab_file).read_text()))
-        self._token_to_id: dict[str, int] = {
-            t: i for i, t in enumerate(self._tokens)
-        }
+        self._token_to_id: dict[str, int] = {t: i for i, t in enumerate(self._tokens)}
         # transformers 5.x deliberately strips `add_bos_token` from the saved
         # tokenizer_config, so it can't round-trip under that name. Persist it
         # under our own key `prepend_bos` (set into init_kwargs below), which

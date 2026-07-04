@@ -3,10 +3,10 @@ models — the torch-native counterpart to ``compiler/onnx_load.py``'s ONNX
 runtime loaders.
 
 A compiled torchwright token artifact is a bona-fide standard transformer: a
-``token`` head (table lookup + tied unembed) over a uniform-width residual
-stream with causal ``scale=1.0`` attention and ``relu`` MLP blocks, no
-normalization anywhere. This package reimplements that exact forward path as
-real ``nn.Module``s so the artifact loads as an ordinary
+``token`` head (table lookup + untied unembed) over a uniform-width residual
+stream with causal ``scale=1.0`` attention, ``relu`` MLP blocks, and
+(optionally) identity RMSNorms. This package reimplements that exact forward
+path as real ``nn.Module``s so the artifact loads as an ordinary
 ``AutoModelForCausalLM`` and runs under stock ``generate``.
 
 - :class:`TorchwrightConfig` / :class:`TorchwrightForCausalLM` — the shipped

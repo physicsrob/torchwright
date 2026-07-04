@@ -34,8 +34,7 @@ def _tiny_model(rope_base):
         n_layers=3,
         n_heads_per_layer=[3, 3, 3],
         d_hidden_per_layer=[24, 24, 24],
-        max_seq=64,
-        cache_stride=64,
+        max_position_embeddings=64,
         rope_base=rope_base,
     )
     model = TorchwrightForCausalLM(cfg).eval()

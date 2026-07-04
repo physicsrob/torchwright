@@ -24,10 +24,10 @@ Initializer → parameter map (ground truth: ``compiler/export.py``
     final_norm               -> model.norm.weight          (d,)   [rms_norm only]
     l{i}_WQ/WK/WV  (d, hd)   -> q/k/v_proj.weight  = M.T    (hd, d)
     l{i}_WO        (hd, d)   -> o_proj.weight      = M.T    (d, hd)
-    l{i}_W1        (d, d_h)  -> linear1.weight     = M.T    (d_h, d)
-    l{i}_b1        (d_h,)    -> linear1.bias
-    l{i}_W2        (d_h, d)  -> linear2.weight     = M.T    (d, d_h)
-    l{i}_b2        (d,)      -> linear2.bias
+    l{i}_W1        (d, d_h)  -> fc1.weight         = M.T    (d_h, d)
+    l{i}_b1        (d_h,)    -> fc1.bias
+    l{i}_W2        (d_h, d)  -> fc2.weight         = M.T    (d, d_h)
+    l{i}_b2        (d,)      -> fc2.bias
 
 ``nn.Linear`` stores weights as ``(out, in)`` and computes ``x @ W.T``; the
 compiler stores ``M`` and computes ``x @ M``. So every Linear weight is ``M.T``.
@@ -118,7 +118,7 @@ def build_config(
     if activation != "relu":
         raise NotImplementedError(
             f"HF conversion of the {activation!r} machine is not implemented: "
-            f"the native module models linear1/ReLU/linear2 MLPs only.  "
+            f"the native module models fc1/ReLU/fc2 MLPs only.  "
             f"(The gated artifact's l{{i}}_Wgate/Wup/Wdown initializers would "
             f"also trip the unmapped-initializer check below.)"
         )
@@ -145,9 +145,9 @@ def build_config(
     assert (
         len(vocab) <= vocab_size
     ), f"meta vocab len {len(vocab)} exceeds embed_table rows {vocab_size}"
-    # No additive PE table under RoPE; the rollout bound is the baked slot
-    # count arange_S (= cache_stride).  config.max_seq is otherwise vestigial.
-    max_seq = inits["arange_S"].shape[0]
+    # No additive PE table under RoPE; the artifact's position bound is the
+    # baked slot count arange_S.
+    max_position_embeddings = inits["arange_S"].shape[0]
 
     n_layers = sum(1 for k in inits if re.fullmatch(r"l\d+_WQ", k))
     assert n_layers > 0, "no l{i}_WQ initializers — not a token transformer?"
@@ -213,9 +213,7 @@ def build_config(
         n_layers=int(n_layers),
         n_heads_per_layer=n_heads_per_layer,
         d_hidden_per_layer=d_hidden_per_layer,
-        max_seq=int(max_seq),
-        head_kind="token",
-        cache_stride=meta.get("cache_stride"),
+        max_position_embeddings=int(max_position_embeddings),
         rope_base=rope_base,
         d_rot=rope_d_rot,
         bos_token_id=bos_id,
@@ -258,10 +256,10 @@ def build_state_dict(config, inits: Dict[str, np.ndarray]) -> Tuple[dict, set]:
         sd[f"{p}.self_attn.k_proj.weight"] = _t(take(f"l{i}_WK").T)
         sd[f"{p}.self_attn.v_proj.weight"] = _t(take(f"l{i}_WV").T)
         sd[f"{p}.self_attn.o_proj.weight"] = _t(take(f"l{i}_WO").T)  # (d, hd)
-        sd[f"{p}.mlp.linear1.weight"] = _t(take(f"l{i}_W1").T)  # (d_h, d)
-        sd[f"{p}.mlp.linear1.bias"] = _t(take(f"l{i}_b1"))
-        sd[f"{p}.mlp.linear2.weight"] = _t(take(f"l{i}_W2").T)  # (d, d_h)
-        sd[f"{p}.mlp.linear2.bias"] = _t(take(f"l{i}_b2"))
+        sd[f"{p}.mlp.fc1.weight"] = _t(take(f"l{i}_W1").T)  # (d_h, d)
+        sd[f"{p}.mlp.fc1.bias"] = _t(take(f"l{i}_b1"))
+        sd[f"{p}.mlp.fc2.weight"] = _t(take(f"l{i}_W2").T)  # (d, d_h)
+        sd[f"{p}.mlp.fc2.bias"] = _t(take(f"l{i}_b2"))
         # RMSNorm gains (Llama3 names): uniform (d,) = 2^m.  Present iff norm on.
         if config.rms_norm:
             sd[f"{p}.input_layernorm.weight"] = _t(take(f"l{i}_input_layernorm"))
