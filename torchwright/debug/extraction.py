@@ -49,8 +49,13 @@ def extract_compiled_value(
 
     Returns ``None`` if the node is not materialised at ``state``.
     Concatenate nodes resolve to the concatenation of their children's
-    columns via ``ResidualAssignment.get_node_indices``.
+    columns via ``ResidualAssignment.get_node_indices``;
+    Assert/DebugWatch wrappers resolve to the node they wrap (the
+    source graph keeps its wrappers — only the compiler's private copy
+    is stripped).
     """
+    while isinstance(node, (Assert, DebugWatch)):
+        node = node.inputs[0]
     nodes_here = ra.get_nodes(state)
     if node not in nodes_here and not isinstance(node, Concatenate):
         return None
@@ -68,7 +73,11 @@ def first_state_with(
     ra: ResidualAssignment,
     ordered_states: List[ResidualStreamState],
 ) -> Optional[ResidualStreamState]:
-    """Earliest sublayer state in which ``node`` is materialised."""
+    """Earliest sublayer state in which ``node`` is materialised.
+
+    Assert/DebugWatch wrappers resolve to the node they wrap."""
+    while isinstance(node, (Assert, DebugWatch)):
+        node = node.inputs[0]
     if isinstance(node, Concatenate):
         # Concatenate is resolved transparently — pick the earliest
         # state where *all* of its leaves are present.

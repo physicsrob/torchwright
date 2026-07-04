@@ -151,11 +151,11 @@ def test_partial_global_recency_placement():
     """Under partial rotary the global-recency head splits placement: the 8-wide
     content rides the NoPE tail [d_rot:d_rot+8] and the position tiebreak rides the
     slowest rotated plane d_rot/2-1; the head carries rope_d_rot == d_rot."""
-    from torchwright.compiler.forward.graph_analysis import GraphAnalyzer
+    from torchwright.compiler.utils import get_ancestor_nodes
     from torchwright.graph.attn import Attn
 
     sel = _global_recency_graph(d_head=D_HEAD_PARTIAL, d_rot=D_ROT_PARTIAL)
-    attns = [n for n in GraphAnalyzer(sel).get_all_nodes() if isinstance(n, Attn)]
+    attns = [n for n in get_ancestor_nodes({sel}) if isinstance(n, Attn)]
     # The recency head is the one with the widest content query (W+1 input rows).
     rec = max(attns, key=lambda a: a.d_query_in)
     assert rec.rope_d_rot == D_ROT_PARTIAL
