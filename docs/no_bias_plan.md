@@ -12,7 +12,13 @@ Settled in discussion 2026-07-03; adversarially reviewed (Codex) the
 same day and revised — the review's real findings (placement-recorder
 gap, `const_one` terminology, trim ambiguity, fingerprint
 compatibility, kernel-complete pins) are folded in below. Status:
-**planned, not started**.
+**N0–N3 landed 2026-07-03** (three commits: N0 seed unification /
+token.v5, N1+N2 folds + constant lane + scheduling, N3 emission +
+debug + metadata), full Modal suite green after each.  What remains is
+the follow-ups section: the doom-side ORT-CUDA lane pin and the noise
+re-measure land at the flagship's Phase D `bias=False` flip; the
+Llama conversion is unscheduled.  Measured biased/no-bias parity and
+the D7 obligation are recorded in `numerical_noise_findings.md`.
 
 ## Settled decisions
 
