@@ -165,7 +165,11 @@ class LayerScheduler:
         ready = set()
         free_adds = []
         deferred_adds = []
-        for node in all_ready:
+        # Iterate node sets in node_id order wherever the iteration
+        # order can reach the schedule (list build order feeds stable
+        # sorts and append-order scheduling below) — set iteration is
+        # keyed on absolute id values and does not survive a rebuild.
+        for node in sorted(all_ready, key=lambda n: n.node_id):
             if isinstance(node, Add):
                 a0, a1 = node.inputs
                 d0 = self._is_dead_for_add(a0, node, computed_nodes)
@@ -228,7 +232,7 @@ class LayerScheduler:
         # model's same_layer_ok rule (docs/cpsat_scheduler.md §3 Dependency
         # constraints) assumes the same-layer placement is realised.
         bypass_set = set(bypass_linears)
-        for node in ready:
+        for node in sorted(ready, key=lambda n: n.node_id):
             if not isinstance(node, Linear) or node in bypass_set:
                 continue
             if not self.realization_table.is_attention_routed(node):
@@ -367,7 +371,7 @@ class LayerScheduler:
         # scheduled via bypass in _schedule_mlp_sublayer.
         compute_candidates = []
         bypass_linears: list[Node] = []
-        for node in ready:
+        for node in sorted(ready, key=lambda n: n.node_id):
             if isinstance(node, Attn):
                 n_heads = (node.d_v + self.d_head - 1) // self.d_head
                 compute_candidates.append(("compute_attn", node, n_heads))
@@ -393,14 +397,14 @@ class LayerScheduler:
                 key=lambda t: (
                     0 if t[0] == "compute_attn" else 1,
                     self._net_column_cost(t[1], computed_nodes, residual_map),
-                    -self.graph.get_critical_path_length(t[1]),
+                    *self._critical_path_key(t[1]),
                 )
             )
         else:
             compute_candidates.sort(
                 key=lambda t: (
                     0 if t[0] == "compute_attn" else 1,
-                    -self.graph.get_critical_path_length(t[1]),
+                    *self._critical_path_key(t[1]),
                 )
             )
 
@@ -410,7 +414,7 @@ class LayerScheduler:
             for n in dead
             if n is not self.pos_encoding and n not in add_into_live_addends
         ]
-        cancel_candidates.sort(key=lambda n: -len(n))  # largest first
+        cancel_candidates.sort(key=lambda n: (-len(n), n.node_id))  # largest first
 
         # 2b-2d. Schedule compute ops with cancellation promotion
         for op_type, node, n_heads_needed in compute_candidates:
@@ -506,7 +510,7 @@ class LayerScheduler:
                     continue
                 cancel_candidates.append(fresh)
                 already_pending.add(fresh)
-            cancel_candidates.sort(key=lambda n: -len(n))
+            cancel_candidates.sort(key=lambda n: (-len(n), n.node_id))
 
             if (
                 op_type == "compute_linear"
@@ -926,7 +930,7 @@ class LayerScheduler:
     ) -> List[Node]:
         graph_nodes = self.graph.get_all_nodes()
         dead = []
-        for node in residual_map.get_allocated_nodes():
+        for node in sorted(residual_map.get_allocated_nodes(), key=lambda n: n.node_id):
             if node not in graph_nodes:
                 continue
             if node not in computed_nodes:
@@ -983,7 +987,16 @@ class LayerScheduler:
         return residual_map.allocate(node)
 
     def _critical_path_key(self, node: Node):
-        return -self.graph.get_critical_path_length(node)
+        # node_id tie-break: critical-path ties are common, and a stable
+        # sort without a total key inherits whatever order the candidate
+        # list was built in — for node sets that is hash-table order
+        # keyed on absolute node_id values, which differs between a
+        # graph and its fresh rebuild (or its lowered copy).  The
+        # tie-break makes every sort over this key reproduce across
+        # rebuilds and processes; relative node_id order is
+        # construction-order, which deterministic builders (and the
+        # lowering clone pass) preserve.
+        return (-self.graph.get_critical_path_length(node), node.node_id)
 
     # ------------------------------------------------------------------
     # Admission control (sibling-cluster-based gating)
@@ -1219,7 +1232,7 @@ class DirectedLayerScheduler(LayerScheduler):
         graph_nodes = self.graph.get_all_nodes()
         n2cl = self._assignment.node_to_cancel_layer
         dead: List[Node] = []
-        for node in residual_map.get_allocated_nodes():
+        for node in sorted(residual_map.get_allocated_nodes(), key=lambda n: n.node_id):
             if node not in graph_nodes:
                 continue
             if node not in computed_nodes:

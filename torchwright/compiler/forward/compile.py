@@ -717,7 +717,13 @@ def forward_compile(
     # the effective output from here on so the loop's termination check
     # matches the graph's actual terminal node.
     output_node = graph.get_output_node()
-    input_nodes = [n for n in graph.get_all_nodes() if graph.is_input_node(n)]
+    # node_id order: these are allocated into the residual stream below,
+    # so their iteration order fixes column assignment — set order keyed
+    # on absolute ids would not survive a rebuild or the lowering copy.
+    input_nodes = sorted(
+        (n for n in graph.get_all_nodes() if graph.is_input_node(n)),
+        key=lambda n: n.node_id,
+    )
 
     # RoPE end state (docs/rope_port_plan.md §1, Phase 5): position is a
     # rotation applied inside attention, not a residual node — there is no

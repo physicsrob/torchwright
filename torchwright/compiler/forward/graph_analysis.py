@@ -153,7 +153,13 @@ class GraphAnalyzer:
         return self._output_node
 
     def _build_topo_order(self) -> List[Node]:
-        """Kahn's algorithm — returns nodes with inputs before dependents."""
+        """Kahn's algorithm — returns nodes with inputs before dependents.
+
+        Seeds and consumer drains iterate in ``node_id`` order: the
+        result order feeds critical-path computation and (transitively)
+        scheduling decisions, and set iteration keyed on absolute id
+        values would not survive a graph rebuild or the lowering copy.
+        """
         in_degree: Dict[Node, int] = {node: 0 for node in self._all_nodes}
         for node in self._all_nodes:
             # Use set to avoid double-counting duplicate inputs
@@ -162,12 +168,19 @@ class GraphAnalyzer:
                 if inp in in_degree:
                     in_degree[node] += 1
 
-        queue = deque(n for n, deg in in_degree.items() if deg == 0)
+        queue = deque(
+            sorted(
+                (n for n, deg in in_degree.items() if deg == 0),
+                key=lambda n: n.node_id,
+            )
+        )
         order = []
         while queue:
             node = queue.popleft()
             order.append(node)
-            for consumer in self._consumers.get(node, set()):
+            for consumer in sorted(
+                self._consumers.get(node, set()), key=lambda n: n.node_id
+            ):
                 in_degree[consumer] -= 1
                 if in_degree[consumer] == 0:
                     queue.append(consumer)
