@@ -13,8 +13,8 @@ The forward path is transcribed one-for-one from the compiler's ONNX emission
 (``compiler/export.py`` ``compile_to_onnx`` token head +
 ``_emit_cached_layer_nodes``):
 
-    res      = embed_table[input_ids]              # (B, T, d) — vanilla lookup
-    res      = res + constant_values               # const seed (self-match col)
+    res      = embed_table[input_ids]              # (B, T, d) — vanilla lookup;
+                                                   # rows carry the const seeds
     for each layer:
         res  = res + attn(norm(res))               # causal, scale=1.0, RoPE, no bias
         res  = res + linear2(relu(linear1(norm(res))))  # both linears biased
@@ -302,10 +302,10 @@ class TorchwrightModel(TorchwrightPreTrainedModel):
         super().__init__(config)
         self.embed_tokens = nn.Embedding(config.vocab_size, config.d)
         # Position is a rotation applied inside attention (RoPE) — there is no
-        # additive positional-encoding table.  The input constant vector
-        # (including the reserved const-1 self-match column) is lookup/bias data,
-        # not a matmul weight — a persistent buffer saved into the state dict.
-        self.register_buffer("constant_values", torch.zeros(config.d), persistent=True)
+        # additive positional-encoding table.  The input constant seeds
+        # (including the reserved const-1 self-match column) ride the
+        # embedding table's rows, folded there by the exporter (token.v5) —
+        # there is no separate constant_values buffer.
         self.layers = nn.ModuleList(
             [TorchwrightDecoderLayer(config, i) for i in range(config.n_layers)]
         )
@@ -392,10 +392,11 @@ class TorchwrightModel(TorchwrightPreTrainedModel):
             else:
                 cache_position = torch.arange(past_seen, past_seen + T, device=device)
 
-        # Vanilla token + constant residual seed (all (·, d)); position enters
-        # only through the rotary rotation inside attention.  The token embedding
-        # also carries the pinned RMSNorm constant in its reserved column(s).
-        res = tok + self.constant_values  # (B, T, d)
+        # Vanilla token residual seed; position enters only through the rotary
+        # rotation inside attention.  The token embedding's rows carry the
+        # pinned RMSNorm constant and the const-1 self-match column (folded by
+        # the exporter), so the lookup alone seeds the residual stream.
+        res = tok  # (B, T, d)
 
         # Causal mask over absolute positions: key j visible to query p iff j<=p.
         total = past_seen + T

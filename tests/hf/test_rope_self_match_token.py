@@ -12,8 +12,9 @@ transport head(s) the schedule emits.
 This pins that the migration survives export + convert on both non-in-process
 surfaces:
 
-* the reserved constant-1 column rides the ONNX/HF ``constant_values`` seed
-  (no new emission code) and reaches the HF model as a literal 1.0 column,
+* the reserved constant-1 column rides the embedding table's rows (the
+  token.v5 fold) and reaches the HF model as a literal 1.0 column in every
+  vocab row,
 * the self-match heads are full-width rotary like every other head (one global
   grid, no per-head enable), so transport stays correct and the model still
   predicts the previous token,
@@ -76,11 +77,13 @@ def test_hf_self_match_rotary_heads_and_const_column():
     # is full-width rotary on the one global grid; the single shared base carried
     # through the converter (there is no per-head enable).
     assert hf.config.rope_base == ROPE_BASE
-    # The const-1 column rode the constant_values seed: at least one residual
-    # column is a literal 1.0.
+    # The const-1 column is folded into the embedding table (token.v5): at
+    # least one residual column is a literal 1.0 in EVERY vocab row, so the
+    # per-token lookup reproduces it at every position.
+    emb = hf.model.embed_tokens.weight
     assert bool(
-        (hf.model.constant_values == 1.0).any()
-    ), "no constant-1 column in the HF constant_values seed"
+        (emb == 1.0).all(dim=0).any()
+    ), "no all-rows constant-1 column in the HF embedding table"
 
 
 def test_hf_self_match_predicts_previous_token():

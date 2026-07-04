@@ -768,7 +768,7 @@ def forward_compile(
     # every Linear/Add/Cancel/add_into.  It is a LiteralValue input node, so all
     # three runtime surfaces initialise it to 1.0 with no new emission code
     # (in-process get_input_res_stream's LiteralValue branch; the ONNX/HF
-    # `constant_values` seed).  It is allocated once and never freed — no graph
+    # embed-table row fold, token.v5).  It is allocated once and never freed — no graph
     # node owns it and no op targets it — so the column holds 1.0 unchanged
     # through every layer.  The runtime rotates it by absolute position
     # (rotate_half over d_head), making the self-match logit ∝ Σ_p cos((i−j)·θ_p)

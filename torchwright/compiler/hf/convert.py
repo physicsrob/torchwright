@@ -16,8 +16,8 @@ Initializer → parameter map (ground truth: ``compiler/export.py``
 ``compile_to_onnx``; layouts confirmed against ``components/*``):
 
     embed_table              -> model.embed_tokens.weight  (vocab, d)
+                                (rows carry the folded const seeds, token.v5)
     lm_head                  -> lm_head.weight              (vocab, d)  UNTIED
-    constant_values          -> model.constant_values      (d,)
     rope_freq/_base/_split   -> TorchwrightConfig.rope_base (config-derived; not a param)
     l{i}_input_layernorm     -> model.layers.{i}.input_layernorm.weight          (d,)
     l{i}_post_attention_layernorm -> model.layers.{i}.post_attention_layernorm.weight (d,)
@@ -240,11 +240,10 @@ def build_state_dict(config, inits: Dict[str, np.ndarray]) -> Tuple[dict, set]:
         consumed.add(name)
         return inits[name]
 
-    embed_table = take("embed_table")  # (vocab, d)
+    embed_table = take("embed_table")  # (vocab, d) — rows carry the const seeds
     sd: dict = {
         "model.embed_tokens.weight": _t(embed_table),
         "lm_head.weight": _t(take("lm_head")),  # untied (vocab, d)
-        "model.constant_values": _t(take("constant_values")),  # (d,)
     }
 
     for i in range(config.n_layers):

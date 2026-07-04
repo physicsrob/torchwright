@@ -5,7 +5,7 @@ metadata; ``artifact.load()`` / ``artifact.debug_session(...)``):
 
     compile_to_onnx(output_node, embedding, path, ...)
         Token I/O: token_ids -> logits.  Sidecar format
-        ``TOKEN_META_FORMAT`` (currently ``torchwright.token.v4``)
+        ``TOKEN_META_FORMAT`` (currently ``torchwright.token.v5``)
         carries the vocab.  Consumer: ``OnnxTokenModule`` via
         :func:`torchwright.compiler.onnx_load.load_onnx`.
 
@@ -58,13 +58,16 @@ from torchwright.graph.attn import CAUSAL_MASK_SENTINEL
 from torchwright.graph.rope import ROPE_BASE
 from torchwright.graph.misc import Assert, DebugWatch, InputNode
 
-# v4: rotary positional encoding (no `pos_encoding_full` table; position enters
-# only through the in-attention rotation) plus an optional identity RMSNorm
-# (per-sublayer + final gain weights).  `constant_values` is retained — it seeds
-# the rotary Δ=0 self-match const-1 column.  The binary initializer set differs
-# from both the pre-rotary v3 and the pre-RMSNorm v2, so an older artifact must
-# be re-exported rather than loaded against this converter.
-TOKEN_META_FORMAT = "torchwright.token.v4"
+# v5: input-state constant seeds (the rotary Δ=0 self-match const-1 column)
+# are folded into ``embed_table`` rows — the mechanism the pinned RMSNorm
+# constants already used — so the ``constant_values`` initializer and the
+# post-Gather seed Add are gone and the residual seed is the token gather
+# alone (docs/no_bias_plan.md Phase N0; bit-identical values).  v4 was the
+# rotary positional encoding (no `pos_encoding_full` table) plus the optional
+# identity RMSNorm.  The binary initializer set differs from every earlier
+# version, so an older artifact must be re-exported rather than loaded
+# against this converter.
+TOKEN_META_FORMAT = "torchwright.token.v5"
 DEBUG_META_FORMAT = "torchwright.debug.v1"
 
 
@@ -1324,7 +1327,7 @@ def compile_to_onnx(
 
     Writes three files:
         ``<output_path>``     — the ONNX model
-        ``<stem>.meta.json``  — ``{"format": "torchwright.token.v4",
+        ``<stem>.meta.json``  — ``{"format": "torchwright.token.v5",
                                    "vocab": [...]}``
         ``<stem>.debug.json`` — the debug sidecar (residual assignment
                                 keyed by canonical node id, structural
@@ -1472,19 +1475,22 @@ def compile_to_onnx(
     out_state = compiled.layers[-1].mlp.out_state
 
     embedding_indices: Optional[List[int]] = None
-    constant_values = np.zeros(d, dtype=np.float32)
+    # Input-state literal seeds as (column, value) pairs, folded into
+    # embed_table rows below (token.v5) — there is no separate
+    # constant_values initializer or post-Gather seed Add anymore.
+    literal_seeds: List[Tuple[int, float]] = []
 
     for node in compiled.residual_assignment.get_nodes(in_state):
         indices = compiled.residual_assignment.get_node_indices(in_state, node)
         if isinstance(node, Embedding):
             embedding_indices = indices
         elif isinstance(node, LiteralValue):
-            # The rotary Δ=0 self-match const-1 column: a reserved LiteralValue
-            # explicitly placed in in_state (see forward_compile), seeded to 1.0.
-            # The graph's own constants are NOT here — they are JIT-materialized
-            # into the per-layer MLP bias near their consumer.
+            # The rotary Δ=0 self-match const-1 column: an input-state
+            # LiteralValue explicitly placed there by forward_compile, seeded
+            # to 1.0.  The graph's own constants are NOT here — they are
+            # JIT-materialized into the per-layer MLP near their consumer.
             for k, idx in enumerate(indices):
-                constant_values[idx] = float(node.value[k])
+                literal_seeds.append((idx, float(node.value[k])))
         elif isinstance(node, (Concatenate, InputNode)):
             # Concatenate is structural; a raw InputNode is populated at
             # forward-time by get_input_res_stream, not folded into embed_table.
@@ -1541,6 +1547,16 @@ def compile_to_onnx(
         for j in rms_spec.reserved_cols:
             embed_table[:, j] = rms_spec.const_value
 
+    # Input-state literal seeds (the const-1 self-match column): folded into
+    # every vocab row exactly like the RMSNorm constant above, so the
+    # per-token gather reproduces the constant at every position.  The
+    # literal's columns are disjoint from the embedding's and the RMSNorm's
+    # (residual allocation is pairwise disjoint, I1), so these cells are zero
+    # before the fold and the gathered row is bit-identical to the pre-v5
+    # ``Gather -> Add(constant_values)`` pair this replaces.
+    for idx, val in literal_seeds:
+        embed_table[:, idx] = val
+
     # Untied unembed weight in nn.Linear (out, in) == (vocab, d) convention,
     # nonzero only at the output node's residual columns.  logits = res @ W.T
     # sums over all d columns, but W is exactly zero off the output columns, so
@@ -1549,7 +1565,6 @@ def compile_to_onnx(
     lm_head[:, output_indices] = embed_table_compact
 
     # Initializers
-    _add_float_init("constant_values", constant_values, dense_inits, sparse_inits)
     _add_float_init("embed_table", embed_table, dense_inits, sparse_inits)
     _add_float_init("lm_head", lm_head, dense_inits, sparse_inits)
     # Pinned-constant RMSNorm gain weights (Llama3-named on the HF side): one
@@ -1599,12 +1614,10 @@ def compile_to_onnx(
     )
     _emit_cached_preamble(nodes)
     # the residual seed (no projection).  Position is a rotation applied inside
-    # attention (RoPE), so there is no additive position table — the seed is the
-    # token embedding (which also carries the pinned RMSNorm constant in its
-    # reserved column(s), seeded above) plus the residual constants in
-    # ``constant_values`` (the const-1 self-match column).
-    add("Gather", ["embed_table", "token_ids"], ["inp_res"], axis=0)
-    add("Add", ["inp_res", "constant_values"], ["res_0"])
+    # attention (RoPE), so there is no additive position table — the seed is
+    # the token embedding alone, whose rows carry the pinned RMSNorm constant
+    # and the const-1 self-match column (both folded above, token.v5).
+    add("Gather", ["embed_table", "token_ids"], ["res_0"], axis=0)
 
     current_res = "res_0"
     for i in range(n_layers):
