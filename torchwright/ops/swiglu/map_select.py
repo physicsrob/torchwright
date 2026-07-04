@@ -64,8 +64,8 @@ def select(cond: Node, true_node: Node, false_node: Node) -> Node:
 
     .. noise-footer::
 
-       Max error: 4.768e-07 abs, 1.19e-07 rel over 4096 samples;
-       measured at commit 6694f64. See docs/numerical_noise.md.
+       Max error: 0 abs, 0 rel over 4096 samples;
+       measured at commit 2d6463c. See docs/numerical_noise.md.
     """
     assert len(cond) == 1
     assert len(true_node) == len(false_node)
@@ -136,7 +136,7 @@ def switch(conditions: List[Node], values: List[Node]) -> Node:
 
 
 _MASK_TOL = 4.0 * swish_dip / scale
-"""Mask tolerance for :func:`broadcast_select` (≈ 0.0111 at scale=100).
+"""Mask tolerance for :func:`broadcast_select` (≈ 0.0087 at scale=128).
 
 Unlike select/cond_gate's ±1 cond contract (c_tol = 0.005),
 broadcast_select's masks arrive from :func:`in_range`, whose in-contract
@@ -165,13 +165,16 @@ def in_range(lower: Node, upper: Node, n_slots: int) -> Node:
 
     Integer-valued bounds are bit-exact across the whole slot vector:
     the +0.5 center offset keeps every hinge argument at least 4 units
-    from its bend — fully saturated/underflowed at scale=100 (modulo
-    the folded-/scale product-rounding ulp class).  Continuous bounds
+    from its bend — fully saturated/underflowed, and with ``scale`` a
+    power of two the folded ``2/scale`` products of the saturated
+    integer hinge values are exact too (at scale=100 those products
+    rounded, leaking ~1e-5 per slot above the winner — see
+    docs/onehot_accumulated_leak_postmortem.md).  Continuous bounds
     inherit compare's contract per boundary: a bound inside a center's
     ramp zone makes that slot an interpolated intermediate (as today),
     and a bound within ``~17/(scale·S)`` of a ramp edge adds a fillet
     dip.  At most two hinges per slot can sit in fillets at once, so the
-    worst in-contract deviation from ±1 is ``4·swish_dip/scale`` ≈ 0.011
+    worst in-contract deviation from ±1 is ``4·swish_dip/scale`` ≈ 0.0087
     — the value-range assert carries that slack, and it is what lands on
     :func:`broadcast_select`'s mask contract (see ``_MASK_TOL``).
 
@@ -185,8 +188,8 @@ def in_range(lower: Node, upper: Node, n_slots: int) -> Node:
 
     .. noise-footer::
 
-       Max error: 5.96e-08 abs, 5.96e-08 rel over 4096 samples;
-       measured at commit 6694f64. See docs/numerical_noise.md.
+       Max error: 0 abs, 0 rel over 4096 samples;
+       measured at commit 2d6463c. See docs/numerical_noise.md.
     """
     assert len(lower) == 1
     assert len(upper) == 1
@@ -288,8 +291,8 @@ def broadcast_select(
 
     .. noise-footer::
 
-       Max error: 4.768e-07 abs, 1.192e-07 rel over 4096 samples;
-       measured at commit 6694f64. See docs/numerical_noise.md.
+       Max error: 0 abs, 0 rel over 4096 samples;
+       measured at commit 2d6463c. See docs/numerical_noise.md.
     """
     assert len(masks) == n_slots
     true_is_broadcast = len(true_value) == d_fill
@@ -423,8 +426,8 @@ def dynamic_extract(
 
     .. noise-footer::
 
-       Max error: 4.768e-07 abs, 1.191e-07 rel over 4096 samples;
-       measured at commit 6694f64. See docs/numerical_noise.md.
+       Max error: 0 abs, 0 rel over 4096 samples;
+       measured at commit 2d6463c. See docs/numerical_noise.md.
     """
     assert len(idx) == 1, "idx must be a 1D scalar node"
     assert len(table) == n_entries * d_fill, (
@@ -491,7 +494,7 @@ def map_to_table(
     .. noise-footer::
 
        Max error: 0 abs, 0 rel over 4096 samples;
-       measured at commit 6694f64. See docs/numerical_noise.md.
+       measured at commit 2d6463c. See docs/numerical_noise.md.
     """
     d_keys = {len(x) for x in key_to_value.keys()}
     d_values = {len(x) for x in key_to_value.values()}
@@ -732,7 +735,7 @@ def table_lookup_2d(
     .. noise-footer::
 
        Max error: 0 abs, 0 rel over 4096 samples;
-       measured at commit 6694f64. See docs/numerical_noise.md.
+       measured at commit 2d6463c. See docs/numerical_noise.md.
     """
     assert len(i) == 1, "i must be a 1D scalar node"
     assert len(j) == 1, "j must be a 1D scalar node"

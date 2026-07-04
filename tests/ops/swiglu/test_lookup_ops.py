@@ -132,8 +132,8 @@ def test_onehot_lookup_multi_block_counting():
     xs = torch.stack([key(0, 0), key(1, 0), key(2, 1), key(0, 1), key(2, 0)])
     val = out.compute(5, {"x": xs})
     # Matches to ~1 ulp of the value; misses return default plus a
-    # ~1e-22-class dip leak (hinge(-0.5) — representable, not exactly
-    # zero, twenty orders below visibility).
+    # ~1e-28-class dip leak (hinge(-0.5) — representable, not exactly
+    # zero, nearly thirty orders below visibility).
     ref = torch.tensor([[100.0], [200.0], [300.0], [-7.0], [-7.0]])
     assert torch.allclose(val, ref, rtol=1e-6, atol=1e-9)
 
@@ -185,9 +185,7 @@ def test_onehot_lookup_wide_key_accumulated_leak_within_guard():
     for i, k in enumerate(keys):
         k[i] = 1.0
     # half the rows carry the max-magnitude value, like the digit table
-    table = {
-        keys[i]: torch.tensor([6.0 if i % 2 == 0 else 0.0]) for i in range(d_key)
-    }
+    table = {keys[i]: torch.tensor([6.0 if i % 2 == 0 else 0.0]) for i in range(d_key)}
     x = create_input("x", d_key, value_range=(0.0, 1.0))
     out = onehot_lookup(x, table, torch.tensor([0.0]))
 

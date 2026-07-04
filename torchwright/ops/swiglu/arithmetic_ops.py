@@ -50,8 +50,8 @@ def compare(
     exactly confined to ``[false_level, true_level]`` — inputs landing in
     a fillet (within ``~1.3/(scale·sharpness)`` of one of the two bends)
     can overshoot either level by up to
-    ``swish_dip/scale · |true_level − false_level|`` (0.0028 at
-    scale=100).  The value-range assert and the semantic bound both carry
+    ``swish_dip/scale · |true_level − false_level|`` (0.0022 at
+    scale=128).  The value-range assert and the semantic bound both carry
     that slack, and every downstream ``c_tol`` budget must too.
 
     Args:
@@ -71,7 +71,7 @@ def compare(
     .. noise-footer::
 
        Max error: 1.999 abs, 1.999 rel over 8192 samples;
-       measured at commit 6694f64. See docs/numerical_noise.md.
+       measured at commit 2d6463c. See docs/numerical_noise.md.
     """
     assert len(inp) == 1, "Input must be a 1D scalar node"
 
@@ -138,7 +138,7 @@ def multiply(inp1: Node, inp2: Node) -> Node:
     .. noise-footer::
 
        Max error: 0.0009766 abs, 2.241e-07 rel over 8192 samples;
-       measured at commit 6694f64. See docs/numerical_noise.md.
+       measured at commit 2d6463c. See docs/numerical_noise.md.
     """
     assert len(inp1) == 1, "Input must be a 1D scalar node"
     assert len(inp2) == 1, "Input must be a 1D scalar node"
@@ -168,8 +168,8 @@ def abs(inp: Node) -> Node:
     exact swish form: ``|x|`` has a corner, and every finite sum of
     Swish lanes is smooth).  The error is one-sided and bounded: the
     output always lies in ``[0, |x|]`` — never negative, never above the
-    true value.  Worst underestimate is ``2·swish_dip/scale`` (0.0056 at
-    scale=100), hit at ``|x| = 1.278/scale``; for ``|x| ≳ 0.2`` tanh
+    true value.  Worst underestimate is ``2·swish_dip/scale`` (0.0044 at
+    scale=128), hit at ``|x| = 1.278/scale``; for ``|x| ≳ 0.2`` tanh
     saturates and the op is bit-exact in fp32 — the entire integer
     grid.  Only consumers that need ``abs`` to *not under-read* near the
     origin (dividing by it, comparing it against a small threshold)
@@ -183,8 +183,8 @@ def abs(inp: Node) -> Node:
 
     .. noise-footer::
 
-       Max error: 0.005569 abs, 0.9964 rel over 8192 samples;
-       measured at commit 6694f64. See docs/numerical_noise.md.
+       Max error: 0.004351 abs, 0.9954 rel over 8192 samples;
+       measured at commit 2d6463c. See docs/numerical_noise.md.
     """
     d = len(inp)
     eye = torch.eye(d)
@@ -210,7 +210,7 @@ def min(inp1: Node, inp2: Node) -> Node:
     (``Swish(scale·a)/scale - Swish(-scale·a)/scale = a``, exact at any
     sharpening — the identity the ``mlp_bypass`` realization class
     relies on).  Error is one-sided: min is *over*-estimated by at most
-    ``swish_dip/scale`` (0.0028 at scale=100), and only when
+    ``swish_dip/scale`` (0.0022 at scale=128), and only when
     ``|a-b| ≲ 0.2``; ties are exact (``Swish(0) = 0``).  The
     construction is asymmetric but the error is not: the hinge's gap to
     ReLU is an even function of ``a-b``.  fp note: min of far-apart
@@ -228,8 +228,8 @@ def min(inp1: Node, inp2: Node) -> Node:
 
     .. noise-footer::
 
-       Max error: 1.144e-05 abs, 6.759e-06 rel over 4096 samples;
-       measured at commit 6694f64. See docs/numerical_noise.md.
+       Max error: 3.815e-06 abs, 1.953e-06 rel over 4096 samples;
+       measured at commit 2d6463c. See docs/numerical_noise.md.
     """
     assert len(inp1) == len(inp2)
     d = len(inp1)
@@ -278,7 +278,7 @@ def square(inp: Node) -> Node:
     .. noise-footer::
 
        Max error: 3.052e-05 abs, 2.266e-07 rel over 8192 samples;
-       measured at commit 6694f64. See docs/numerical_noise.md.
+       measured at commit 2d6463c. See docs/numerical_noise.md.
     """
     assert len(inp) == 1, "Input must be a 1D scalar node"
 
@@ -292,6 +292,7 @@ def square(inp: Node) -> Node:
         up_bias=torch.zeros(2),
         name="square",
     )
+
 
 def piecewise_linear(
     inp: Node,
@@ -355,8 +356,8 @@ def piecewise_linear(
 
     .. noise-footer::
 
-       Max error: 0.25 abs, 139.7 rel over 4096 samples;
-       measured at commit 6694f64. See docs/numerical_noise.md.
+       Max error: 0.25 abs, 146.3 rel over 4096 samples;
+       measured at commit 2d6463c. See docs/numerical_noise.md.
     """
     assert len(inp) == 1, "Input must be a 1D scalar node"
     n = len(breakpoints)
@@ -489,8 +490,8 @@ def clamp(inp: Node, lo: float, hi: float) -> Node:
 
     .. noise-footer::
 
-       Max error: 2.861e-06 abs, 0.000331 rel over 4096 samples;
-       measured at commit 6694f64. See docs/numerical_noise.md.
+       Max error: 1.907e-06 abs, 0.0002899 rel over 4096 samples;
+       measured at commit 2d6463c. See docs/numerical_noise.md.
     """
     assert len(inp) == 1, "Input must be a 1D scalar node"
     assert hi > lo, "hi must exceed lo"
@@ -534,7 +535,7 @@ def reciprocal(
     .. noise-footer::
 
        Max error: 0.0008245 abs, 0.1117 rel over 4096 samples;
-       measured at commit 6694f64. See docs/numerical_noise.md.
+       measured at commit 2d6463c. See docs/numerical_noise.md.
     """
     assert len(inp) == 1, "Input must be a 1D scalar node"
     assert min_value > 0, "min_value must be positive"
@@ -591,7 +592,7 @@ def thermometer_floor_div(inp: Node, divisor: int, max_value: int) -> Node:
     .. noise-footer::
 
        Max error: 0 abs, 0 rel over 4096 samples;
-       measured at commit 6694f64. See docs/numerical_noise.md.
+       measured at commit 2d6463c. See docs/numerical_noise.md.
     """
     assert len(inp) == 1, "Input must be a 1D scalar node"
     n = max_value // divisor
@@ -640,12 +641,13 @@ def mod_const(inp: Node, divisor: int, max_value: int) -> Node:
     .. noise-footer::
 
        Max error: 0 abs, 0 rel over 4096 samples;
-       measured at commit 6694f64. See docs/numerical_noise.md.
+       measured at commit 2d6463c. See docs/numerical_noise.md.
     """
     assert len(inp) == 1, "Input must be a 1D scalar node"
     assert divisor > 0, "divisor must be positive"
     q = thermometer_floor_div(inp, divisor, max_value)
     return subtract(inp, multiply_const(q, float(divisor)))
+
 
 def floor_int(
     inp: Node,
@@ -695,8 +697,8 @@ def floor_int(
 
     .. noise-footer::
 
-       Max error: 0.9996 abs, 0.9534 rel over 8192 samples;
-       measured at commit 6694f64. See docs/numerical_noise.md.
+       Max error: 0.9996 abs, 0.9531 rel over 8192 samples;
+       measured at commit 2d6463c. See docs/numerical_noise.md.
     """
     assert len(inp) == 1, "Input must be a 1D scalar node"
     assert max_value >= min_value
@@ -790,8 +792,7 @@ def ceil_int(
     .. noise-footer::
 
        Max error: 0 abs, 0 rel over 4096 samples;
-       measured at commit 6694f64. See docs/numerical_noise.md.
+       measured at commit 2d6463c. See docs/numerical_noise.md.
     """
     assert len(inp) == 1, "Input must be a 1D scalar node"
     return negate(floor_int(negate(inp), -max_value, -min_value, sharpness=sharpness))
-

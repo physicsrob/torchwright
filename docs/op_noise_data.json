@@ -1,6 +1,6 @@
 {
   "schema_version": 2,
-  "commit": "6694f64",
+  "commit": "2d6463c",
   "measured_at": "2026-07-04",
   "ops": [
     {
@@ -461,33 +461,33 @@
       "name": "abs",
       "machine": "swiglu",
       "module": "torchwright.ops.swiglu.arithmetic_ops",
-      "notes": "`hinge(x) + hinge(-x)` = x·tanh(scale·x/2) — the rare op that regresses under swish (the relu identity is exact; |x| has a corner no smooth lane sum can express). Error is one-sided and bounded: output in [0, |x|], worst underestimate 2·swish_dip/scale (0.0056) at |x| = 1.278/scale; bit-exact for |x| ≳ 0.2 (the whole integer grid).",
+      "notes": "`hinge(x) + hinge(-x)` = x·tanh(scale·x/2) — the rare op that regresses under swish (the relu identity is exact; |x| has a corner no smooth lane sum can express). Error is one-sided and bounded: output in [0, |x|], worst underestimate 2·swish_dip/scale (0.0044) at |x| = 1.278/scale; bit-exact for |x| ≳ 0.2 (the whole integer grid).",
       "distributions": [
         {
           "name": "abs_near_zero_pm02",
           "description": "|x| ≤ 0.2 — the swish abs fillet zone, where the one-sided underestimate peaks (2·swish_dip/scale at |x| = 1.278/scale); the relu abs is exact here.",
           "n_samples": 4096,
-          "max_abs_error": 0.00556928,
-          "mean_abs_error": 0.000825454,
-          "p99_abs_error": 0.00555473,
-          "max_rel_error": 0.996398,
-          "mean_rel_error": 0.0729097,
-          "p99_rel_error": 0.929879,
+          "max_abs_error": 0.00435101,
+          "mean_abs_error": 0.00050427,
+          "p99_abs_error": 0.00432379,
+          "max_rel_error": 0.99539,
+          "mean_rel_error": 0.057717,
+          "p99_rel_error": 0.910339,
           "rel_valid_samples": 4096,
           "worst_input": {
-            "x": 0.0128039
+            "x": 0.00998977
           }
         },
         {
           "name": "abs_uniform_pm50",
           "description": "Uniform signed inputs on [-50, 50]. `abs` is exact (ReLU(x) + ReLU(-x)) so any residual is float32 round-off only.",
           "n_samples": 4096,
-          "max_abs_error": 0.00510581,
-          "mean_abs_error": 5.9226e-06,
-          "p99_abs_error": 3.8147e-06,
-          "max_rel_error": 0.283571,
-          "mean_rel_error": 0.000262228,
-          "p99_rel_error": 1.1274e-07,
+          "max_abs_error": 0.00326745,
+          "mean_abs_error": 3.1177e-06,
+          "p99_abs_error": 0.0,
+          "max_rel_error": 0.181471,
+          "mean_rel_error": 0.000156479,
+          "p99_rel_error": 0.0,
           "rel_valid_samples": 4096,
           "worst_input": {
             "x": -0.0180054
@@ -578,26 +578,26 @@
           "name": "broadcast_select_pm1_masks_4x1",
           "description": "±1 masks over 4 slots with per-slot true/false values in [-5, 5] (d_fill=1). Losing branches exactly zero at clean masks; winners ~1 ulp relative.",
           "n_samples": 4096,
-          "max_abs_error": 4.76837e-07,
-          "mean_abs_error": 4.07526e-08,
-          "p99_abs_error": 4.76837e-07,
-          "max_rel_error": 1.19186e-07,
-          "mean_rel_error": 1.67837e-08,
-          "p99_rel_error": 1.09348e-07,
+          "max_abs_error": 0.0,
+          "mean_abs_error": 0.0,
+          "p99_abs_error": 0.0,
+          "max_rel_error": 0.0,
+          "mean_rel_error": 0.0,
+          "p99_rel_error": 0.0,
           "rel_valid_samples": 16384,
           "worst_input": {
             "masks[0]": -1.0,
             "masks[1]": 1.0,
             "masks[2]": 1.0,
             "masks[3]": -1.0,
-            "t[0]": 3.47276,
-            "t[1]": 4.92131,
-            "t[2]": -1.41127,
-            "t[3]": 1.11525,
-            "f[0]": 1.67479,
-            "f[1]": 4.05369,
-            "f[2]": -2.4284,
-            "f[3]": -2.0506
+            "t[0]": -1.78241,
+            "t[1]": 2.0328,
+            "t[2]": 1.57318,
+            "t[3]": -1.12968,
+            "f[0]": 1.67421,
+            "f[1]": -2.59887,
+            "f[2]": 3.61479,
+            "f[3]": 4.3783
           }
         }
       ]
@@ -635,15 +635,15 @@
           "name": "clamp_flat_zone_pm20",
           "description": "Uniform samples on [-8, 8] with clamp bounds [-10, 10] — every sample is inside the flat identity zone. Residual measures float32 round-off only.",
           "n_samples": 4096,
-          "max_abs_error": 2.86102e-06,
-          "mean_abs_error": 4.60077e-07,
-          "p99_abs_error": 1.90735e-06,
-          "max_rel_error": 0.000331016,
-          "mean_rel_error": 6.65646e-07,
-          "p99_rel_error": 6.85662e-06,
+          "max_abs_error": 1.90735e-06,
+          "mean_abs_error": 2.46433e-07,
+          "p99_abs_error": 9.53674e-07,
+          "max_rel_error": 0.000289855,
+          "mean_rel_error": 1.98993e-07,
+          "p99_rel_error": 1.66109e-06,
           "rel_valid_samples": 4096,
           "worst_input": {
-            "x": 7.65666
+            "x": 6.45994
           }
         }
       ]
@@ -652,18 +652,18 @@
       "name": "compare",
       "machine": "swiglu",
       "module": "torchwright.ops.swiglu.arithmetic_ops",
-      "notes": "Sharpened-hinge ramp (`hinge(z) − hinge(z−1)`, `hinge(z) = Swish(scale·z)/scale`). Same ramp-zone contract as the ReLU form (in-ramp inputs interpolate; the near-thresh distribution deliberately stresses it). What's new vs relu: fillet dips within ~17/(scale·sharpness) of the two bends can overshoot either level by up to swish_dip/scale·|T−F| (0.0056 total span at scale=100); true-side far-field outputs carry fp32 product rounding at the lane-contribution magnitude — the same class as relu's far-field noise; the false side is exactly out_bias.",
+      "notes": "Sharpened-hinge ramp (`hinge(z) − hinge(z−1)`, `hinge(z) = Swish(scale·z)/scale`). Same ramp-zone contract as the ReLU form (in-ramp inputs interpolate; the near-thresh distribution deliberately stresses it). What's new vs relu: fillet dips within ~17/(scale·sharpness) of the two bends can overshoot either level by up to swish_dip/scale·|T−F| (0.0044 total span at scale=128); true-side far-field outputs carry fp32 product rounding at the lane-contribution magnitude — the same class as relu's far-field noise; the false side is exactly out_bias.",
       "distributions": [
         {
           "name": "compare_near_thresh_0",
           "description": "Samples within ±0.3 of the threshold at 0.0 — stresses the 2-neuron ramp zone (width 1/step_sharpness).",
           "n_samples": 4096,
-          "max_abs_error": 1.99868,
-          "mean_abs_error": 0.16802,
-          "p99_abs_error": 1.90179,
-          "max_rel_error": 1.99868,
-          "mean_rel_error": 0.16802,
-          "p99_rel_error": 1.90179,
+          "max_abs_error": 1.99866,
+          "mean_abs_error": 0.167993,
+          "p99_abs_error": 1.90127,
+          "max_rel_error": 1.99866,
+          "mean_rel_error": 0.167993,
+          "p99_rel_error": 1.90127,
           "rel_valid_samples": 4096,
           "worst_input": {
             "x": 0.000123948
@@ -674,10 +674,10 @@
           "description": "Uniform samples on [-80, 80] — measures compare's ramp error well away from the threshold (expected ≈ 0).",
           "n_samples": 4096,
           "max_abs_error": 1.33899,
-          "mean_abs_error": 0.000479571,
+          "mean_abs_error": 0.000479534,
           "p99_abs_error": 0.0,
           "max_rel_error": 1.33899,
-          "mean_rel_error": 0.000479571,
+          "mean_rel_error": 0.000479534,
           "p99_rel_error": 0.0,
           "rel_valid_samples": 4096,
           "worst_input": {
@@ -696,16 +696,16 @@
           "name": "cond_gate_signed_bool_times_value",
           "description": "±1 conditions paired with scalar values in [-5, 5]. Expected output: `value` when cond=+1, `0` when cond=-1.",
           "n_samples": 4096,
-          "max_abs_error": 4.76837e-07,
-          "mean_abs_error": 2.00016e-08,
-          "p99_abs_error": 2.38419e-07,
-          "max_rel_error": 1.18755e-07,
-          "mean_rel_error": 1.63774e-08,
-          "p99_rel_error": 1.09702e-07,
+          "max_abs_error": 0.0,
+          "mean_abs_error": 0.0,
+          "p99_abs_error": 0.0,
+          "max_rel_error": 0.0,
+          "mean_rel_error": 0.0,
+          "p99_rel_error": 0.0,
           "rel_valid_samples": 2089,
           "worst_input": {
-            "cond": 1.0,
-            "inp": -4.97868
+            "cond": -1.0,
+            "inp": 3.63724
           }
         }
       ]
@@ -720,22 +720,22 @@
           "name": "dynamic_extract_int_idx_4x2",
           "description": "Runtime 4×2 tables in [-5, 5] with integer indices — the in_range → broadcast_select → sum composition on clean integer inputs.",
           "n_samples": 4096,
-          "max_abs_error": 4.76837e-07,
-          "mean_abs_error": 4.1262e-08,
-          "p99_abs_error": 4.76837e-07,
-          "max_rel_error": 1.19132e-07,
-          "mean_rel_error": 1.69201e-08,
-          "p99_rel_error": 1.0951e-07,
+          "max_abs_error": 0.0,
+          "mean_abs_error": 0.0,
+          "p99_abs_error": 0.0,
+          "max_rel_error": 0.0,
+          "mean_rel_error": 0.0,
+          "p99_rel_error": 0.0,
           "rel_valid_samples": 8192,
           "worst_input": {
-            "table[0]": 3.91779,
-            "table[1]": 2.51304,
-            "table[2]": 4.2406,
-            "table[3]": 2.89222,
-            "table[4]": -1.51677,
-            "table[5]": -3.31736,
-            "table[6]": -0.372015,
-            "table[7]": 4.13819,
+            "table[0]": -0.0374341,
+            "table[1]": 2.68222,
+            "table[2]": -4.11523,
+            "table[3]": -3.6797,
+            "table[4]": -1.92577,
+            "table[5]": 1.34079,
+            "table[6]": -0.0990658,
+            "table[7]": 3.96445,
             "idx": 3.0
           }
         }
@@ -745,7 +745,7 @@
       "name": "equals_vector",
       "machine": "swiglu",
       "module": "torchwright.ops.swiglu.logic_ops",
-      "notes": "One sharpened hinge on the dot-product margin. Matches are bit-exact +1; non-matches within ~17/scale past the 1/speed margin land in the hinge dip and read as low as -1 - 2·swish_dip·speed/scale (-1.0056 at scale=100) — the value-range assert carries that low-side slack. Inside the margin ball the output interpolates, as today.",
+      "notes": "One sharpened hinge on the dot-product margin. Matches are bit-exact +1; non-matches within ~17/scale past the 1/speed margin land in the hinge dip and read as low as -1 - 2·swish_dip·speed/scale (-1.0044 at scale=128) — the value-range assert carries that low-side slack. Inside the margin ball the output interpolates, as today.",
       "distributions": [
         {
           "name": "equals_vector_match_and_off",
@@ -776,12 +776,12 @@
           "name": "floor_near_boundary_10",
           "description": "Samples within ±1/step_sharpness of integer k=5 — stresses the ramp zone where `floor_int` interpolates.",
           "n_samples": 4096,
-          "max_abs_error": 0.999628,
-          "mean_abs_error": 0.128797,
-          "p99_abs_error": 0.971827,
-          "max_rel_error": 0.249907,
-          "mean_rel_error": 0.032198,
-          "p99_rel_error": 0.242957,
+          "max_abs_error": 0.999623,
+          "mean_abs_error": 0.128781,
+          "p99_abs_error": 0.971024,
+          "max_rel_error": 0.249906,
+          "mean_rel_error": 0.0321946,
+          "p99_rel_error": 0.242756,
           "rel_valid_samples": 4096,
           "worst_input": {
             "x": 4.99993
@@ -791,12 +791,12 @@
           "name": "floor_uniform_neg5_10",
           "description": "Uniform continuous samples on [-5, 10] — most land in flat zones; measures baseline `floor_int` accuracy.",
           "n_samples": 4096,
-          "max_abs_error": 0.998995,
-          "mean_abs_error": 0.0465591,
-          "p99_abs_error": 0.895855,
-          "max_rel_error": 0.953446,
-          "mean_rel_error": 0.018495,
-          "p99_rel_error": 0.461098,
+          "max_abs_error": 0.998973,
+          "mean_abs_error": 0.0465544,
+          "p99_abs_error": 0.895853,
+          "max_rel_error": 0.953136,
+          "mean_rel_error": 0.0184937,
+          "p99_rel_error": 0.461095,
           "rel_valid_samples": 3828,
           "worst_input": {
             "x": 5.99982
@@ -814,16 +814,16 @@
           "name": "in_range_integer_bounds_8",
           "description": "Integer (lower, upper) pairs over [0, 8], 8 slots — integer bounds keep every hinge ≥ 4 units from its bend (bit-exact modulo the folded-/scale ulp class).",
           "n_samples": 4096,
-          "max_abs_error": 5.96046e-08,
-          "mean_abs_error": 3.24144e-09,
-          "p99_abs_error": 5.96046e-08,
-          "max_rel_error": 5.96046e-08,
-          "mean_rel_error": 3.24144e-09,
-          "p99_rel_error": 5.96046e-08,
+          "max_abs_error": 0.0,
+          "mean_abs_error": 0.0,
+          "p99_abs_error": 0.0,
+          "max_rel_error": 0.0,
+          "mean_rel_error": 0.0,
+          "p99_rel_error": 0.0,
           "rel_valid_samples": 32768,
           "worst_input": {
-            "lower": 6.0,
-            "upper": 6.0
+            "lower": 0.0,
+            "upper": 8.0
           }
         }
       ]
@@ -857,21 +857,21 @@
       "name": "min",
       "machine": "swiglu",
       "module": "torchwright.ops.swiglu.arithmetic_ops",
-      "notes": "`a − hinge(a−b)` plus a's sharpened bypass pair. One-sided over-estimate ≤ swish_dip/scale (0.0028), only when |a−b| ≲ 0.2; ties exact; far-apart operands carry the folded-/scale product-rounding ulp class.",
+      "notes": "`a − hinge(a−b)` plus a's sharpened bypass pair. One-sided over-estimate ≤ swish_dip/scale (0.0022), only when |a−b| ≲ 0.2; ties exact; far-apart operands carry the folded-/scale product-rounding ulp class.",
       "distributions": [
         {
           "name": "minmax_uniform_pm50",
           "description": "Two independent uniform streams on [-50, 50]². `min`/`max` are exact via the abs-trick; residual is float32 round-off only.",
           "n_samples": 4096,
-          "max_abs_error": 1.14441e-05,
-          "mean_abs_error": 9.21631e-07,
-          "p99_abs_error": 5.72205e-06,
-          "max_rel_error": 6.75917e-06,
-          "mean_rel_error": 6.64772e-08,
-          "p99_rel_error": 7.20978e-07,
+          "max_abs_error": 3.8147e-06,
+          "mean_abs_error": 2.76981e-07,
+          "p99_abs_error": 3.8147e-06,
+          "max_rel_error": 1.95265e-06,
+          "mean_rel_error": 3.29583e-08,
+          "p99_rel_error": 4.50612e-07,
           "rel_valid_samples": 4096,
           "worst_input": {
-            "a": 21.4286,
+            "a": -8.73016,
             "b": -46.8254
           }
         }
@@ -944,23 +944,23 @@
       "name": "onehot_lookup",
       "machine": "swiglu",
       "module": "torchwright.ops.swiglu.onehot_table",
-      "notes": "Exact integer block counting: the -(n_blocks - 0.5) bias parks the winner's sharpened hinge argument at +scale/2 and everyone else's at ≤ -scale/2. Winner indicator is exactly 0.5 in fp32; losing lanes leak hinge(-0.5) ≈ -1e-22 — invisible. The tight [min, max] range claim is the reason this op exists. (The relu onehot_lookup was never measured.)",
+      "notes": "Exact integer block counting: the -(n_blocks - 0.5) bias parks the winner's sharpened hinge argument at +scale/2 and everyone else's at ≤ -scale/2. Winner indicator is exactly 0.5 in fp32; losing lanes leak hinge(-0.5) ≈ -1e-28 — invisible. The tight [min, max] range claim is the reason this op exists. (The relu onehot_lookup was never measured.)",
       "distributions": [
         {
           "name": "onehot_lookup_two_block",
           "description": "digit(3) ⊕ carry(2) one-hot pairs over all six combinations; three are table rows, three miss → default.",
           "n_samples": 4096,
-          "max_abs_error": 7.62939e-06,
-          "mean_abs_error": 1.28709e-06,
-          "p99_abs_error": 7.62939e-06,
-          "max_rel_error": 7.62939e-08,
-          "mean_rel_error": 1.28709e-08,
-          "p99_rel_error": 7.62939e-08,
+          "max_abs_error": 0.0,
+          "mean_abs_error": 0.0,
+          "p99_abs_error": 0.0,
+          "max_rel_error": 0.0,
+          "mean_rel_error": 0.0,
+          "p99_rel_error": 0.0,
           "rel_valid_samples": 4096,
           "worst_input": {
-            "x[0]": 1.0,
+            "x[0]": 0.0,
             "x[1]": 0.0,
-            "x[2]": 0.0,
+            "x[2]": 1.0,
             "x[3]": 1.0,
             "x[4]": 0.0
           }
@@ -977,15 +977,15 @@
           "name": "parabola_0_10_step1",
           "description": "f(x)=x² on [0, 10] with integer breakpoints — probes generic `piecewise_linear` precision between grid points.",
           "n_samples": 4096,
-          "max_abs_error": 0.25,
-          "mean_abs_error": 0.163654,
+          "max_abs_error": 0.250004,
+          "mean_abs_error": 0.163719,
           "p99_abs_error": 0.249977,
-          "max_rel_error": 139.677,
-          "mean_rel_error": 0.514982,
-          "p99_rel_error": 11.3921,
+          "max_rel_error": 146.27,
+          "mean_rel_error": 0.528398,
+          "p99_rel_error": 11.3956,
           "rel_valid_samples": 4094,
           "worst_input": {
-            "x": 8.49967
+            "x": 6.49947
           }
         }
       ]
@@ -1023,17 +1023,17 @@
           "name": "select_signed_bool_two_values",
           "description": "±1 conditions paired with two independent branch values in [-5, 5]. Expected output: `a` when cond=+1, `b` when cond=-1.",
           "n_samples": 4096,
-          "max_abs_error": 4.76837e-07,
-          "mean_abs_error": 3.86644e-08,
-          "p99_abs_error": 4.76837e-07,
-          "max_rel_error": 1.1897e-07,
-          "mean_rel_error": 1.61917e-08,
-          "p99_rel_error": 1.08853e-07,
+          "max_abs_error": 0.0,
+          "mean_abs_error": 0.0,
+          "p99_abs_error": 0.0,
+          "max_rel_error": 0.0,
+          "mean_rel_error": 0.0,
+          "p99_rel_error": 0.0,
           "rel_valid_samples": 4096,
           "worst_input": {
             "cond": -1.0,
-            "a": -4.97029,
-            "b": -4.68839
+            "a": 3.63724,
+            "b": -0.166708
           }
         }
       ]

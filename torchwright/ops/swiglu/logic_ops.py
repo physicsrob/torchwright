@@ -25,7 +25,7 @@ _GATE_C_TOL = 0.005
 the cond, so a cond off ±1 by δ mis-scales the gated value by exactly
 δ·|actual value| — the semantic bounds widen by that relative amount (no
 range maximum ``M`` anywhere).  0.005 matches typical far-field compare
-noise and clears compare's fillet dip (0.0028) with margin."""
+noise and clears compare's fillet dip (0.0022 at scale=128) with margin."""
 
 
 def _assert_cond_pm1(cond: Node, c_tol: float = _GATE_C_TOL) -> Node:
@@ -62,12 +62,12 @@ def bool_any_true(inp_list: List[Node]) -> Node:
     .. noise-footer::
 
        Max error: 0 abs, 0 rel over 4096 samples;
-       measured at commit 6694f64. See docs/numerical_noise.md.
+       measured at commit 2d6463c. See docs/numerical_noise.md.
     """
     # Convert all the values to 1.0 if they're > 0.0 and 0.0 otherwise
     # then sum them, and if the sum is > 0.5, return 1.0, otherwise -1.0.
     # Each 0/1 indicator carries compare's dip slack (±swish_dip/scale),
-    # so the sum sits within N·0.0028 of an integer — far outside the
+    # so the sum sits within N·0.0022 of an integer — far outside the
     # final compare's (0.5, 0.6) ramp.
     sum_node = sum_nodes(
         [compare(n, thresh=0.0, true_level=1.0, false_level=0.0) for n in inp_list]
@@ -92,7 +92,7 @@ def bool_all_true(inp_list: List[Node]) -> Node:
     .. noise-footer::
 
        Max error: 0 abs, 0 rel over 4096 samples;
-       measured at commit 6694f64. See docs/numerical_noise.md.
+       measured at commit 2d6463c. See docs/numerical_noise.md.
     """
     return compare(
         sum_nodes(inp_list),
@@ -115,7 +115,7 @@ def bool_not(inp: Node) -> Node:
     .. noise-footer::
 
        Max error: 0 abs, 0 rel over 4096 samples;
-       measured at commit 6694f64. See docs/numerical_noise.md.
+       measured at commit 2d6463c. See docs/numerical_noise.md.
     """
     return compare(inp, thresh=0.0, true_level=-1.0, false_level=1.0)
 
@@ -138,7 +138,7 @@ def equals_vector(inp: Node, vector: torch.Tensor) -> Node:
     ``scale/speed``, fully saturated); a non-match exactly at the margin
     is exact -1; non-matches within ``~17/scale`` past the margin land in
     the hinge's dip and read as low as ``-1 - 2·swish_dip·speed/scale``
-    (-1.0056 at scale=100) — the value-range assert carries that low-side
+    (-1.0044 at scale=128) — the value-range assert carries that low-side
     slack.  The top stays unclamped, as today: ``m > 0`` (a vector
     out-dotting the key) exceeds +1 — contract-excluded, caught by the
     assert.
@@ -153,7 +153,7 @@ def equals_vector(inp: Node, vector: torch.Tensor) -> Node:
     .. noise-footer::
 
        Max error: 0 abs, 0 rel over 4096 samples;
-       measured at commit 6694f64. See docs/numerical_noise.md.
+       measured at commit 2d6463c. See docs/numerical_noise.md.
     """
     speed = embedding_step_sharpness
     gate_proj = scale * vector.unsqueeze(0)
@@ -207,8 +207,8 @@ def cond_gate(cond: Node, inp: Node) -> Node:
 
     .. noise-footer::
 
-       Max error: 4.768e-07 abs, 1.188e-07 rel over 4096 samples;
-       measured at commit 6694f64. See docs/numerical_noise.md.
+       Max error: 0 abs, 0 rel over 4096 samples;
+       measured at commit 2d6463c. See docs/numerical_noise.md.
     """
     assert len(cond) == 1
     d = len(inp)

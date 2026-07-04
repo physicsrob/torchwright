@@ -8,7 +8,7 @@ per-call knob. It only ever appears in the self-normalizing pattern
 out of every value path; and once the sigmoid's input exceeds ~17, fp32
 computes σ as exactly 1.0 (`e^{−17}` is below fp32's resolution next to 1),
 so a hinge whose input sits ≥ `17/scale` past its bend is evaluated with
-zero error — at scale=100 that's nearly the whole input range, and the fp
+zero error — at scale=128 that's nearly the whole input range, and the fp
 cancellation error of hinge pairs is scale-neutral besides. (Measured
 per-kernel, plan A0: torch-CPU, torch-CUDA, and onnxruntime-CUDA — the
 deployed inference pair — all saturate by 17. CPU onnxruntime, the
@@ -25,8 +25,15 @@ table lookups port as self-normalizing hinges too (see `map_to_table`,
 which supersedes the C-lift bump sketched in earlier drafts of this doc).
 (`embedding_step_sharpness` is a different thing: the embedding-space
 *margin* knob, a `sharpness` analog — see `equals_vector`.) One recorded cost:
-scale=100 saturates hidden slots at ~10⁵-magnitude values, closing the door
-on any future fp16 export (the artifact is fp32 everywhere today).
+scale=128 saturates hidden slots at ~1.3·10⁵-magnitude values, closing the
+door on any future fp16 export (the artifact is fp32 everywhere today). One
+recorded gain (the reason the constant moved off the original 100 on
+2026-07-04): 128 is a power of two, so the folded `k/scale` out-proj weights
+are exactly representable and a saturated integer hinge value times such a
+weight does not round — integer-fed indicator chains (`in_range` →
+`bool_to_01` → `onehot_lookup`) are bit-exact end to end, where scale=100
+leaked ~1e-5 per element and the leaks summed across wide keys (see
+docs/onehot_accumulated_leak_postmortem.md).
 
 ## The FFN, and how to read the formulas
 
@@ -169,12 +176,12 @@ Notes:
   at or below `thresh` read false. `scale` is new and internal: how closely
   the smooth hinge imitates the exact ReLU hinge.
 - Error at the contract points is `~e^{−scale}` in exact math (each hinge
-  sits a full `scale` away from the *other* hinge's bend); at scale=100 in
+  sits a full `scale` away from the *other* hinge's bend); at scale=128 in
   fp32 it vanishes outright — the sigmoid's input at a contract point is
   ±scale, far past the ~17 where fp32 computes σ as exactly 1.0 — so
   contract-point outputs are bit-exact. The worst case
-  anywhere is `0.2785/scale · |true_level − false_level|` (0.0028 at
-  scale=100), paid only by inputs landing within ~`1.3/(scale·sharpness)`
+  anywhere is `0.2785/scale · |true_level − false_level|` (0.0022 at
+  scale=128), paid only by inputs landing within ~`1.3/(scale·sharpness)`
   of one of the two bend points (`thresh` and `thresh + 1/sharpness`) —
   that's Swish's negative dip. The two bends are `scale` apart in Swish
   units, so the two dips never stack.
@@ -310,12 +317,13 @@ Notes:
   refuses: tolerance for junk masks (no ±1 assert — see the mask-contract
   note) and a bit-exact winning row. One gated FFN serves both callers, so
   the mode split loses its reason.
-- Exactness at clean masks, fp32 at scale=100: the losing branch
-  contributes **exactly zero** — `σ(−100)` computes as 0.0 (pinned on CPU;
-  a kernel returning the denormal `e^{−100}` instead leaks
-  ≤ ~10⁻⁴²·|branch|, equally nothing). The winning branch passes with at
-  most 1 ulp *relative* rounding (~1.2·10⁻⁷ — the value rides through
-  `×scale` then `÷scale`), often bit-exact but not always.
+- Exactness at clean masks, fp32 at scale=128: the losing branch
+  contributes **exactly zero** — `σ(−128)` computes as 0.0 (pinned on CPU;
+  `e^{−128}` sits below fp32's subnormal floor, so even a kernel that
+  materialized the exponential would underflow to 0). The winning branch is
+  **bit-exact**: the value rides through `×scale` then `÷scale`, and both
+  factors are powers of two, so neither product rounds. (At the original
+  scale=100 this carried up to 1 ulp relative rounding.)
 - Versus today's default mode that is strictly better: the `(M+t)−M`
   cancellation recovers the winner with absolute error up to half an ulp
   *of M* (3·10⁻⁵ at M = 1000) — error at the offset's magnitude even when
@@ -403,7 +411,7 @@ Notes:
   fully saturated). A non-match sitting exactly at the margin is exact
   (−1 — argument 0, on the bend). Non-matches within `~17/scale` *past*
   the margin land in the dip and read as low as
-  `−1 − 0.557·speed/scale` (−1.0056 at scale=100); anything deeper is
+  `−1 − 0.557·speed/scale` (−1.0044 at scale=128); anything deeper is
   bit-exact −1.
 - The value-range assert (`[−1, 1]` today) needs `0.557·speed/scale`
   slack on the low side. The top stays unclamped, as today: `m > 0` (a
@@ -438,7 +446,7 @@ Notes:
   entry** (`Swish(push·m + C)/C`). That form existed to keep the winner's
   value un-shrunk in Swish's curved region at scale ~15, and it carried a
   real cost: the winner's sensitivity to dot-product noise was `push/C` —
-  a second constant to budget. At scale=100 the plain hinge is bit-exact
+  a second constant to budget. At scale=128 the plain hinge is bit-exact
   at matches, so there is no second constant and no push amplification.
 - Exactness: a matching entry's indicator is bit-exact 1 (hinge argument
   `scale/speed`, fully saturated), so the result is exactly `value_i`

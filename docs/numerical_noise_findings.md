@@ -111,6 +111,25 @@ Phase B. The relu numbers are frozen: the axis landed with all 18 relu
 entries byte-identical, and the drift test keeps validating them at zero
 maintenance.
 
+### scale = 128 (2026-07-04): the saturated-lane product-rounding class is gone
+
+The hinge-sharpening constant moved 100 → 128 (a power of two) after the
+Phase C accumulated-one-hot-leak flake was root-caused to fp32 rounding
+of the folded `k/scale` out-proj products
+(`docs/onehot_accumulated_leak_postmortem.md`;
+`scripts/investigate_onehot_leak.py` is the verification harness). With
+`2/scale = 2⁻⁶` exactly representable, a saturated integer hinge value
+times a folded weight no longer rounds, and six swiglu entries dropped
+to **exactly 0**: `in_range` (was 6e-8), `onehot_lookup` (7.6e-6),
+`select`/`cond_gate`/`broadcast_select`/`dynamic_extract` (4.8e-7 each).
+Dip-derived bounds shrank by 100/128 (`abs` 5.6e-3 → 4.4e-3 near zero;
+`min`/`clamp` similarly), and the by-design ramp/staircase numbers
+(`compare` near-thresh, `floor_int` near-boundary, `piecewise_linear`'s
+0.25 chord) are unchanged. One statistical ripple: `piecewise_linear`'s
+parabola *relative* error moved 139.7 → 146.3 with identical absolute
+error — the near-zero-reference denominators land at slightly different
+chord offsets; a reporting artifact, not a regression.
+
 ### swiglu `multiply`/`square` measure at the fp32 ulp floor — the near-zero pathology is gone
 
 The exact ± gated-lane pair (`Swish(a)·b + Swish(-a)·(-b) = a·b`)
@@ -134,7 +153,7 @@ The swiglu `compare` measures within a hair of the relu entry on both
 distributions — identical max on `compare_uniform_pm80` (1.33899, the
 same worst in-ramp sample interpolating against a discrete-step
 reference; a ramp-zone artefact, see the rel-error section below) and
-1.99868 vs 1.99752 on `compare_near_thresh_0` (the extra ~1e-3 is the
+1.99866 vs 1.99752 on `compare_near_thresh_0` (the extra ~1e-3 is the
 fillet dip). The bool compositions and `equals_vector` measure exactly
 0 on their clean-input distributions, like relu. Two behavioral notes
 the aggregate numbers don't show, pinned in
@@ -143,10 +162,10 @@ the aggregate numbers don't show, pinned in
 - **Dip overshoot is structural, not noise**: inputs inside a fillet
   (within `~17/(scale·sharpness)` of a bend) legitimately read up to
   `swish_dip/scale·|T−F|` beyond either level; equals_vector's
-  low side reaches `-1 - 2·swish_dip·speed/scale` (-1.0056). The ops'
+  low side reaches `-1 - 2·swish_dip·speed/scale` (-1.0044). The ops'
   value-range asserts and compare's semantic bound carry exactly these
   slacks — downstream ±1-cond budgets must too (0.005 `c_tol` still
-  clears the 0.0028 compare dip).
+  clears the 0.0022 compare dip).
 - **The folded `/scale` keeps, not changes, the far-field fp class**:
   true-side outputs carry fp32 product rounding at the
   lane-contribution magnitude `s·|x−thresh|·|T−F|` (kernel-dependent,
@@ -161,21 +180,23 @@ the aggregate numbers don't show, pinned in
 
 ### swiglu cond_gate/select: the offset-cancellation error class is gone
 
-swiglu `cond_gate` measures 4.8e-7 abs / 1.2e-7 rel on the same
-distribution where relu `cond_gate` measures 9.8e-4 abs / 0.39 rel: the
-relu gate recovers the value through `(M+v)−M`, paying half an ulp *of
-the offset M* even when the value is tiny, while the gated lane passes
-the winner directly with ~1 ulp *relative* rounding and a losing branch
-that is exactly zero (`σ(−scale)` computes as 0.0 in fp32). `select`
+swiglu `cond_gate` measures **exactly 0** on the same distribution
+where relu `cond_gate` measures 9.8e-4 abs / 0.39 rel: the relu gate
+recovers the value through `(M+v)−M`, paying half an ulp *of the offset
+M* even when the value is tiny, while the gated lane passes the winner
+through `×scale` then `÷scale` — both powers of two since scale=128, so
+neither product rounds — and a losing branch that is exactly zero
+(`σ(−scale)` computes as 0.0 in fp32). (At scale=100 the winner carried
+~1 ulp relative rounding, 4.8e-7 on this distribution.) `select`
 (measured for the first time — the relu select was never in the table;
-it shares relu cond_gate's `(M+v)−M` class) lands at the same 1-ulp
-relative floor. The whole offset apparatus is absent from the swiglu
+it shares relu cond_gate's `(M+v)−M` class) lands at the same exact
+zero. The whole offset apparatus is absent from the swiglu
 ops: no `M`, no finite-range requirement (unbounded branch ranges
 build fine), and the semantic bounds widen *relatively* —
 `δ·|actual value|`, implemented as per-side `rel_tol·|hull side|` for
 select's interval hull and a `(1+rel_tol)` scaling of cond_gate's
 pass-through affine envelope. The ±1 cond assert (c_tol = 0.005) is
-unchanged in form; compare's 0.0028 fillet dip fits inside it.
+unchanged in form; compare's 0.0022 fillet dip fits inside it.
 
 ### swiglu abs: the one designed regression, measuring exactly its predicted peak
 
@@ -183,8 +204,8 @@ relu `abs` is a 0-error negative control (`ReLU(x) + ReLU(−x)` is an
 identity); swiglu `abs` is the rare op the migration makes *worse* —
 `|x|` has a corner no smooth lane sum can express. The new
 `abs_near_zero_pm02` distribution pins the designed error dead-on:
-max_abs 0.00556928 at x = 0.0128039, i.e. `2·swish_dip/scale` at
-`|x| = 1.278/scale` to six figures. The error is one-sided (output in
+max_abs 0.00435101 at x = 0.00998977, i.e. `2·swish_dip/scale` at
+`|x| = 1.278/scale` to five figures. The error is one-sided (output in
 `[0, |x|]`, never negative, never above), so the ≥ 0 range claim
 carries no slack; the ~1.0 max *relative* error in the near-zero
 distribution is the same one-sidedness read at tiny `|x|` (deep in the
@@ -192,12 +213,12 @@ fillet the output is a near-total underestimate of a near-zero
 reference) — expected, not a pathology. Bit-exact for `|x| ≳ 0.2`, so
 the whole integer grid is clean. Only consumers needing abs to not
 under-read near the origin (dividing by it, thresholding it small)
-budget the 0.0056.
+budget the 0.0044.
 
-swiglu `min` (`a − hinge(a−b)`) measures 1.1e-5 on `minmax_uniform_pm50`
+swiglu `min` (`a − hinge(a−b)`) measures 3.8e-6 on `minmax_uniform_pm50`
 — the far-apart-operand fp class (the `a − (a−b)` cancellation at the
 larger operand's ulp, unchanged from the ReLU machine). Its *dip* class
-(one-sided over-estimate ≤ `swish_dip/scale` = 0.0028, only when
+(one-sided over-estimate ≤ `swish_dip/scale` = 0.0022, only when
 `|a−b| ≲ 0.2`) is essentially unsampled by that distribution — ties are
 ~0.2% of it — so the committed number reflects fp rounding, not the
 dip; the dip bound is pinned by the op's unit test sweep instead
@@ -205,15 +226,16 @@ dip; the dip bound is pinned by the op's unit test sweep instead
 
 ### swiglu in_range/broadcast_select/dynamic_extract: ulp-floor on clean inputs; the interlock is a static budget, not a measured number
 
-All three measure at the fp32 ulp floor on their contract inputs
-(integer bounds / ±1 masks / integer indices): in_range 6e-8,
-broadcast_select and dynamic_extract 4.8e-7 abs at 1.2e-7 rel — losing
-branches exactly zero, winners ~1 ulp relative. (Neither relu
-counterpart was ever measured; relu broadcast_select's error class is
-the `(M+v)−M` entry above.) What the numbers deliberately don't show is
+All three measure **exactly 0** on their contract inputs
+(integer bounds / ±1 masks / integer indices) — losing branches exactly
+zero, winners bit-exact through the power-of-two `×scale/÷scale` ride.
+(At scale=100 they sat at the ~1-ulp floor: in_range 6e-8, the gated
+pair 4.8e-7. Neither relu counterpart was ever measured; relu
+broadcast_select's error class is the `(M+v)−M` entry above.) What the
+numbers deliberately don't show is
 the **in_range → broadcast_select noise interlock**: continuous bounds
 near a ramp edge push in_range's output up to `4·swish_dip/scale`
-≈ 0.011 off ±1 (unit-test-pinned, out of these distributions'
+≈ 0.0087 off ±1 (unit-test-pinned, out of these distributions'
 support), and a saturated gate is linear in the mask, so that δ lands
 on broadcast_select's winner as exactly δ·|value|. The port encodes it
 statically: `_MASK_TOL = 4·swish_dip/scale` in swiglu/map_select.py
@@ -243,10 +265,12 @@ parameters and are byte-identical.
 `map_to_table` measures exactly 0 on its match-and-off distribution
 (matching indicators saturate to exactly 1 and the value products round
 clean at these magnitudes; no-match indicators underflow, so misses
-return the default bit-exactly). `onehot_lookup` measures 7.6e-6 abs at
-7.6e-8 rel — one ulp of its ~300-magnitude winner value, the spec's
-"×scale/÷scale round trip" class; its losing-lane leak (`hinge(-0.5)`
-≈ −1e-22, representable but invisible) never surfaces. Neither relu
+return the default bit-exactly). `onehot_lookup` now also measures
+**exactly 0** — the winner's "×scale/÷scale round trip" is a
+power-of-two pair since scale=128 (at scale=100 it measured 7.6e-6 abs,
+one ulp of its ~300-magnitude winner); its losing-lane leak
+(`hinge(-0.5)` ≈ −1e-28, representable but invisible) never surfaces.
+Neither relu
 counterpart was ever measured. The pessimistic-vs-tight range-claim
 split ports unchanged: map_to_table keeps `default ± Σ|Δ|` (overlap
 soundness) and onehot_lookup keeps the tight `[min, max]` (the reason
@@ -256,8 +280,9 @@ it exists), with no new slack on either.
 
 The five measured entries land at relu parity: `piecewise_linear` 0.25
 (the chord error both machines share — the fillets change nothing on a
-well-spaced grid), `clamp` 2.9e-6 vs 1.9e-6 (one extra fillet's ulp),
-`thermometer_floor_div`/`mod_const` exact 0, and `reciprocal`
+well-spaced grid), `clamp` 1.9e-6 on both machines (the scale=100
+extra-fillet ulp washed out at 128), `thermometer_floor_div`/`mod_const`
+exact 0, and `reciprocal`
 **byte-identical** to the relu number (0.000824451). That last one is
 the payoff of the grid-spacing audit the spec mandates
 (`34/K` per call site): at `input_scale = 1`, reciprocal's geometric

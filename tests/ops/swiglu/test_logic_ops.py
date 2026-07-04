@@ -2,7 +2,7 @@
 
 Spec: docs/ops_plain_english.md (compare, equals_vector entries; the bool
 ops inherit compare's).  The pinned facts these tests lean on — contract
-points bit-exact at scale=100, bend overshoot ≤ swish_dip/scale·|T−F|,
+points bit-exact at scale=128, bend overshoot ≤ swish_dip/scale·|T−F|,
 equals_vector's low-side dip 2·swish_dip·speed/scale — live in
 tests/docs/test_swish_constants.py.
 """

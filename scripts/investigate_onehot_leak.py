@@ -21,10 +21,12 @@ P2  **Guard soundness.**  The carry lookup's input is fully described
     (the reference eval runs on CPU; run-to-run flake variation must
     come from environment-dependent reduction order, not CUDA).
 
-P3  **Root fix counterfactual.**  With ``scale`` patched to 128
-    (``2/scale = 2**-6``, exactly representable), every product in the
-    saturated lanes is exact and integer-fed chains should be
-    bit-exact: leak identically zero.
+P3  **Scale comparison.**  With ``scale`` a power of two
+    (``2/scale`` exactly representable), every product in the
+    saturated lanes is exact and integer-fed chains are bit-exact:
+    leak identically zero.  The script runs the shipped scale (128
+    since 2026-07-04) against the legacy 100 to pin that delta — the
+    legacy leg reproduces the flake-era leak for reference.
 
 Run locally:         ../.venv/bin/python -m scripts.investigate_onehot_leak
 Cross-host (Modal):  make modal-run MODULE=scripts.investigate_onehot_leak CPU_ONLY=1
@@ -264,7 +266,11 @@ def run(device: torch.device) -> None:
         f"times-table={_fmt(slack_tt)}  (old fixed: 1.000e-03)\n"
     )
 
-    for scale_override, label in ((None, "scale=100 (shipped)"), (128.0, "scale=128")):
+    shipped = float(_map_select.scale)
+    for scale_override, label in (
+        (None, f"scale={shipped:g} (shipped)"),
+        (100.0, "scale=100 (legacy)"),
+    ):
         print(f"=== {label} ===")
         chain = build_carry_chain(scale_override)
         tt = build_times_table(scale_override)
@@ -291,7 +297,7 @@ def run(device: torch.device) -> None:
             f"  sum_k |leak_k| per total: max = {_fmt(row_sum.max().item())} "
             f"at t={worst_t}, mean = {_fmt(row_sum.mean().item())}"
         )
-        eff_scale = scale_override if scale_override is not None else 100.0
+        eff_scale = scale_override if scale_override is not None else shipped
         pred = predict_in_range_slots(eff_scale, _map_select.step_sharpness)
         mismatch = (pred - leak).abs()
         exact_frac = float((mismatch == 0).float().mean())

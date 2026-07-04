@@ -19,8 +19,10 @@ onnxruntime parity oracle, the one kernel with a different profile).
 
 import torch
 
-#: The module hinge-sharpening constant the doc pins (`scale = 100`).
-SCALE = 100.0
+#: The module hinge-sharpening constant the doc pins (`scale = 128` — a
+#: power of two, so folded k/scale weights and ×scale/÷scale round trips
+#: are exact in fp32; see docs/onehot_accumulated_leak_postmortem.md).
+SCALE = 128.0
 
 #: Swish's global-minimum magnitude and location:
 #: min_z z*sigmoid(z) = -0.2784645... at z = -1.2784645...
@@ -136,7 +138,7 @@ def test_fp32_sigmoid_saturation_threshold():
 
 
 def test_compare_contract_points_bit_exact_fp32():
-    """compare: at scale=100 in fp32, the contract-point outputs are
+    """compare: at scale=128 in fp32, the contract-point outputs are
     bit-exact (+1/-1), because both hinges are saturated or on-bend."""
 
     def compare_out(z: float) -> float:
@@ -183,7 +185,7 @@ def test_abs_error_peak_and_one_sidedness():
 
 
 def test_abs_integer_grid_bit_exact_fp32():
-    """abs: at scale=100 in fp32, bit-exact on the whole integer grid
+    """abs: at scale=128 in fp32, bit-exact on the whole integer grid
     (tanh/sigmoid saturation)."""
     x = torch.arange(-1000.0, 1001.0, dtype=torch.float32)
     f = _swish(SCALE * x) / SCALE + _swish(-SCALE * x) / SCALE
@@ -208,39 +210,40 @@ def test_min_hinge_form():
 
 
 def test_gated_select_off_branch_exact_zero_fp32():
-    """broadcast_select/select: at mask=-1, scale=100 in fp32, the losing
-    branch contributes exactly zero — sigmoid(-100) computes as 0.0 on the
-    CPU kernel.  (A kernel returning the denormal e^-100 instead would leak
-    <= ~1e-42 * |branch| — the deployed-kernel probe is a migration-
-    checklist item.)"""
-    assert torch.sigmoid(torch.tensor(-100.0, dtype=torch.float32)).item() == 0.0
+    """broadcast_select/select: at mask=-1, scale=128 in fp32, the losing
+    branch contributes exactly zero — sigmoid(-128) computes as 0.0 on the
+    CPU kernel, and e^-128 ~ 2.6e-56 sits below fp32's subnormal floor
+    (~1.4e-45), so even a kernel that materialized the exponential would
+    underflow to exactly 0."""
+    assert torch.sigmoid(torch.tensor(-SCALE, dtype=torch.float32)).item() == 0.0
     f = torch.linspace(-4096, 4096, 1001, dtype=torch.float32)
     leak = _swish(torch.tensor(-SCALE, dtype=torch.float32)) * f / SCALE
     assert (leak == 0.0).all()
 
 
-def test_gated_select_winning_branch_one_ulp():
-    """broadcast_select: at mask=+1 the winning branch passes with at most
-    1 fp32 ulp *relative* rounding (the value rides through x scale, then
-    / scale) — often bit-exact, but not always: the recorded regression
-    versus today's approximate=False path, which is bit-exact."""
+def test_gated_select_winning_branch_bit_exact():
+    """broadcast_select: at mask=+1 the winning branch is bit-exact at
+    scale=128 — the value rides through x scale then / scale, and both
+    factors are powers of two, so neither product rounds.  (At scale=100
+    this carried up to 1 fp32 ulp relative rounding, the recorded
+    regression versus the approximate=False path; the power-of-two scale
+    erases it.)"""
     t = torch.linspace(-5000, 5000, 100_001, dtype=torch.float32)
-    t = t[t != 0]
-    gate = _swish(torch.tensor(SCALE, dtype=torch.float32))  # Swish(100) = 100.0
+    gate = _swish(torch.tensor(SCALE, dtype=torch.float32))  # Swish(128) = 128.0
+    assert gate.item() == SCALE
     out = gate * t * torch.tensor(1.0 / SCALE, dtype=torch.float32)
-    rel = ((out - t) / t).abs()
-    assert rel.max().item() <= 1.3e-7  # ~1 ulp (eps = 1.19e-7)
-    assert (out != t).any()  # the bit-exactness regression is real
+    assert torch.equal(out, t)
 
 
 def test_gated_select_mask_deviation_passthrough():
     """broadcast_select: a saturated gate IS the mask (sigma == 1.0 for
-    scale*m >= 17, i.e. m >= 0.17), so a mask off +1 by delta mis-scales
-    the winner by exactly delta * value — actual value, not the range
-    maximum M."""
+    scale*m >= 17, i.e. m >= 0.14 at scale=128), so a mask off +1 by delta
+    mis-scales the winner by exactly delta * value — actual value, not the
+    range maximum M.  With the power-of-two scale the saturated gate equals
+    the mask bit for bit."""
     m = torch.linspace(0.17, 2.0, 4001, dtype=torch.float32)
     gate = _swish(SCALE * m) / SCALE
-    assert ((gate - m) / m).abs().max().item() <= 1.3e-7  # gate == mask, 1 ulp
+    assert torch.equal(gate, m)  # gate == mask, exactly
     # exact math: the deviation passes through linearly
     delta, t, f = 0.011, 1000.0, -777.0
     m1 = torch.tensor(1.0 - delta, dtype=torch.float64)
@@ -314,13 +317,13 @@ def test_table_lookup_2d_telescoping():
 def test_onehot_lookup_counting_margin():
     """onehot_lookup: the -(n_blocks - 0.5) counting trick parks every lane
     at argument +0.5 (winner) or <= -0.5 (rest).  Sharpened: hinge(0.5) is
-    exactly 0.5 in fp32; hinge(-0.5) leaks ~1e-22 per row (e^-50 is
-    representable, unlike sigma(-100) = 0); a slightly-off one-hot shifts
+    exactly 0.5 in fp32; hinge(-0.5) leaks ~1e-28 per row (e^-64 is
+    representable, unlike sigma(-128) = 0); a slightly-off one-hot shifts
     the indicator by exactly its count deviation (saturated gate)."""
     half = torch.tensor(SCALE * 0.5, dtype=torch.float32)
     assert (_swish(half) / SCALE).item() == 0.5  # winner indicator exact
     leak = (_swish(-half) / SCALE).abs().item()
-    assert 0.0 < leak <= 1e-21  # non-match: negligible but not bit-zero
+    assert 0.0 < leak <= 1e-27  # non-match: negligible but not bit-zero
 
     # noise pass-through: linear in the count deviation while saturated
     eps = torch.linspace(0.0, 0.33, 1000, dtype=torch.float32)

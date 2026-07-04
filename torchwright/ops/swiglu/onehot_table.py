@@ -17,30 +17,29 @@ only one is machine-specific:
   ``-(n_blocks - 0.5)`` bias parks every lane's hinge argument at
   exactly ``+0.5`` (the winner) or ``≤ -0.5`` (everyone else).
   Sharpened, those are ``±scale/2`` — deep in saturation on both sides:
-  the winner's indicator is exactly 0.5 (``σ(50) = 1.0`` and ``50/100``
-  is exact), a losing lane leaks ``hinge(-0.5) ≈ -1e-22`` — not the
-  exact zero of ``σ(-scale)`` (``e^{-50}`` is representable) but twenty
-  orders below visibility, vanishing under fp32 addition.
+  the winner's indicator is exactly 0.5 (``σ(64) = 1.0`` and ``64/128``
+  is exact), a losing lane leaks ``hinge(-0.5) ≈ -8e-29`` — not the
+  exact zero of ``σ(-scale)`` (``e^{-64}`` is representable) but nearly
+  thirty orders below visibility, vanishing under fp32 addition.
 
 Because exactly one row fires (or none → ``default``), the claimed value
 range is the *tight* ``[min, max]`` over the values and the default —
 the reason this op exists (``map_to_table``'s pessimistic
-``default ± Σ|Δ|`` widening blew up chained interval arithmetic).  The
-closing assert's slack must budget the *accumulated* input leak: a
-machine-built one-hot (in_range indicators through ``bool_to_01``)
-carries a per-element fp32 round-trip leak of order 1e-5 — individually
-invisible, but a ``d_key``-wide key sums ``d_key`` of them, each
-weighted by up to the largest table magnitude (measured on the
-calculator digit pipeline: ``d_key = 61``, values ≤ 6, output error up
-to ~2e-3 in exact math — past the 1e-3 default).  The assert atol is
-therefore sized by ``_lookup_numeric_slack(max_abs, 1.0, d_key)`` —
-check-only slack; the claimed range downstream analysis sees stays
-tight.  Winner rounding itself (~1 ulp of the value, the
-``×scale/÷scale`` round trip) and dip leaks are inside that budget by
-construction.  Noise pass-through is unchanged from the ReLU form: an
-input one-hot off by ε shifts the winner's indicator by exactly ε (the
-saturated gate is linear down to a count deviation of 0.33), so output
-error is ``2ε·|value_i − default|``.
+``default ± Σ|Δ|`` widening blew up chained interval arithmetic).  With
+``scale`` a power of two, a machine-built one-hot from integer-fed
+``in_range`` through ``bool_to_01`` arrives *bit-exact* (the folded
+``2/scale`` products of saturated integer hinge values are exact — see
+docs/onehot_accumulated_leak_postmortem.md; at scale=100 the same chain
+leaked ~1e-5 per element and the leaks summed).  The closing assert's
+slack still budgets the accumulated-leak shape for keys that are
+genuinely approximate (embedding-fed, non-integer bounds): a
+``d_key``-wide key sums ``d_key`` per-element deviations, each weighted
+by up to the largest table magnitude, so the atol is sized by
+``_lookup_numeric_slack(max_abs, 1.0, d_key)`` — check-only slack; the
+claimed range downstream analysis sees stays tight.  Noise pass-through
+is unchanged from the ReLU form: an input one-hot off by ε shifts the
+winner's indicator by exactly ε (the saturated gate is linear down to a
+count deviation of 0.33), so output error is ``2ε·|value_i − default|``.
 """
 
 from typing import Dict
@@ -90,8 +89,8 @@ def onehot_lookup(
 
     .. noise-footer::
 
-       Max error: 7.629e-06 abs, 7.629e-08 rel over 4096 samples;
-       measured at commit 6694f64. See docs/numerical_noise.md.
+       Max error: 0 abs, 0 rel over 4096 samples;
+       measured at commit 2d6463c. See docs/numerical_noise.md.
     """
     if not key_to_value:
         raise ValueError("onehot_lookup requires a non-empty table")
@@ -157,9 +156,10 @@ def onehot_lookup(
             name="onehot_lookup",
         )
 
-    # Check-only slack for the accumulated input leak (see module
-    # docstring): d_key summed per-element ~1e-5 round-trip leaks, each
-    # weighted by up to the largest table magnitude.  The claimed range
+    # Check-only slack for the accumulated leak of a genuinely-approximate
+    # key (see module docstring): d_key summed per-element deviations, each
+    # weighted by up to the largest table magnitude.  Integer-fed machine
+    # keys arrive bit-exact and never exercise it.  The claimed range
     # itself stays tight — atol never reaches static analysis.
     max_abs = max(abs(out_range.lo), abs(out_range.hi))
     return assert_matches_value_type(

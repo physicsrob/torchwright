@@ -56,6 +56,14 @@ settled decisions, the execution order, and the parked questions.
    (`Swish(scale·z)/scale`); no op carries a push constant. Recorded
    cost: fp16 export is foreclosed (hidden slots saturate at ~10⁵; the
    artifact is fp32 everywhere today). See the spec preamble.
+   *Amended 2026-07-04: raised to `scale = 128`.* 100 is not a power of
+   two, so the folded `k/scale` out-proj weights rounded and saturated
+   integer hinge values picked up ~1e-5 per-element leaks that summed
+   across wide one-hot keys (the Phase C calculator flake —
+   `docs/onehot_accumulated_leak_postmortem.md`). At 128 those products
+   are exact and integer-fed indicator chains are bit-exact; everything
+   else in this decision (self-normalizing use, no push constant, fp16
+   foreclosure) is unchanged.
 
 6. **No semantic-layer builder.** Ops fold `scale` into gate rows and
    `/scale` into out_proj explicitly, matching the spec's Build lines.

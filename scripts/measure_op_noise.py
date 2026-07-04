@@ -1283,7 +1283,7 @@ def _target_ops() -> List[TargetOp]:
                 "near-thresh distribution deliberately stresses it). What's "
                 "new vs relu: fillet dips within ~17/(scale·sharpness) of "
                 "the two bends can overshoot either level by up to "
-                "swish_dip/scale·|T−F| (0.0056 total span at scale=100); "
+                "swish_dip/scale·|T−F| (0.0044 total span at scale=128); "
                 "true-side far-field outputs carry fp32 product rounding at "
                 "the lane-contribution magnitude — the same class as relu's "
                 "far-field noise; the false side is exactly out_bias."
@@ -1368,7 +1368,7 @@ def _target_ops() -> List[TargetOp]:
                 "One sharpened hinge on the dot-product margin. Matches are "
                 "bit-exact +1; non-matches within ~17/scale past the "
                 "1/speed margin land in the hinge dip and read as low as "
-                "-1 - 2·swish_dip·speed/scale (-1.0056 at scale=100) — the "
+                "-1 - 2·swish_dip·speed/scale (-1.0044 at scale=128) — the "
                 "value-range assert carries that low-side slack. Inside the "
                 "margin ball the output interpolates, as today."
             ),
@@ -1430,7 +1430,7 @@ def _target_ops() -> List[TargetOp]:
                 "that regresses under swish (the relu identity is exact; "
                 "|x| has a corner no smooth lane sum can express). Error is "
                 "one-sided and bounded: output in [0, |x|], worst "
-                "underestimate 2·swish_dip/scale (0.0056) at "
+                "underestimate 2·swish_dip/scale (0.0044) at "
                 "|x| = 1.278/scale; bit-exact for |x| ≳ 0.2 (the whole "
                 "integer grid)."
             ),
@@ -1446,7 +1446,7 @@ def _target_ops() -> List[TargetOp]:
             distribution_names=("minmax_uniform_pm50",),
             notes=(
                 "`a − hinge(a−b)` plus a's sharpened bypass pair. One-sided "
-                "over-estimate ≤ swish_dip/scale (0.0028), only when "
+                "over-estimate ≤ swish_dip/scale (0.0022), only when "
                 "|a−b| ≲ 0.2; ties exact; far-apart operands carry the "
                 "folded-/scale product-rounding ulp class."
             ),
@@ -1572,7 +1572,7 @@ def _target_ops() -> List[TargetOp]:
                 "parks the winner's sharpened hinge argument at +scale/2 "
                 "and everyone else's at ≤ -scale/2. Winner indicator is "
                 "exactly 0.5 in fp32; losing lanes leak hinge(-0.5) ≈ "
-                "-1e-22 — invisible. The tight [min, max] range claim is "
+                "-1e-28 — invisible. The tight [min, max] range claim is "
                 "the reason this op exists. (The relu onehot_lookup was "
                 "never measured.)"
             ),

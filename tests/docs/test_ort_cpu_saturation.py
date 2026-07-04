@@ -19,10 +19,10 @@ past the bend (not 17) to be exact on BOTH kernels, and near-bend tail
 values differ between kernels by up to ~2e-7 absolute — noise-level,
 inside every budget, but fatal to exact-equality comparisons between a
 torch oracle and an ORT artifact in the [15.8, 18] band.  The claims
-the spec actually leans on (sigma(-100) = 0 dead branch, Swish(0) = 0,
-Swish(100) = 100 winning gate, Swish(+-50) onehot indicator) hold on
+the spec actually leans on (sigma(-128) = 0 dead branch, Swish(0) = 0,
+Swish(128) = 128 winning gate, Swish(+-64) onehot indicator) hold on
 this kernel — the onehot leak is even exactly zero here, where torch
-leaks ~1e-22.
+leaks ~1e-28.
 
 This file pins the MEASURED ORT-CPU profile so a runtime upgrade that
 shifts it fails loudly.  The torch-CUDA and ORT-CUDA halves of the A0
@@ -42,7 +42,7 @@ ort = pytest.importorskip("onnxruntime")
 from onnx import TensorProto, helper  # noqa: E402
 
 #: The module hinge-sharpening constant (test_swish_constants.SCALE).
-SCALE = 100.0
+SCALE = 128.0
 
 
 def _run_sigmoid_swish(z: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
@@ -96,7 +96,7 @@ def test_positive_saturation_threshold_is_18_not_17():
 def test_negative_saturation_exact_zero_from_minus_18():
     """ORT-CPU sigmoid is exactly 0.0 for every z <= -18 (torch keeps
     denormals down to ~-103).  Strictly safer for the spec's leak
-    claims: sigma(-100) = 0 (dead select branch) is included."""
+    claims: sigma(-128) = 0 (dead select branch) is included."""
     z = np.linspace(-200.0, -18.0, 100_001, dtype=np.float32)
     sig, swish = _run_sigmoid_swish(z)
     bad = z[sig != 0.0]
@@ -113,11 +113,12 @@ def test_negative_saturation_exact_zero_from_minus_18():
 
 def test_swish_fixed_points_and_onehot_indicator():
     """The claims the spec leans on hold on this kernel: Swish(0) = 0,
-    Swish(100) = 100 (saturated winning gate), Swish(50) = 50 (onehot
+    Swish(128) = 128 (saturated winning gate), Swish(64) = 64 (onehot
     winner indicator = exactly 0.5 after /scale), and the onehot leak
-    at -0.5 is exactly zero (sigma(-50) = 0 here, unlike torch)."""
-    _, swish = _run_sigmoid_swish(np.array([0.0, SCALE, 50.0, -50.0], dtype=np.float32))
+    at -0.5 is exactly zero (sigma(-64) = 0 here, unlike torch)."""
+    probe = np.array([0.0, SCALE, SCALE / 2, -SCALE / 2], dtype=np.float32)
+    _, swish = _run_sigmoid_swish(probe)
     assert swish[0] == 0.0
     assert swish[1] == SCALE
-    assert swish[2] == 50.0
+    assert swish[2] == SCALE / 2
     assert swish[3] == 0.0

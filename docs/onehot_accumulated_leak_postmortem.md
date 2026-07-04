@@ -165,6 +165,8 @@ no-bias constant lane already uses deliberately
 a settled design constant (docs/swiglu_step2_plan.md, decision 5)
 baked into every swiglu op's weights — changing it means a full
 `make measure-noise` cycle plus `tests/docs/test_swish_constants.py`.
-Recorded as the principled alternative; the sizing lesson above still
-stands for genuinely-approximate wide inputs (non-integer bounds,
-embedding-fed keys).
+Taken the same day: `scale = 128` landed in the follow-up commit,
+with the probe script as its verification harness. The sizing lesson
+above still stands for genuinely-approximate wide inputs (non-integer
+bounds, embedding-fed keys) — their per-element deviations are real
+and still sum.

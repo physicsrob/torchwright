@@ -4,7 +4,7 @@
 ``docs/ops_plain_english.md`` on the CPU kernels.  The doc's
 bit-exactness claims additionally assume the *deployed* kernels saturate
 identically: fp32 sigmoid computes exactly 1.0 once its input exceeds
-~17, exactly 0.0 at -100 (not the representable denormal e^-100), and
+~17, exactly 0.0 at -128 (e^-128 sits below fp32's subnormal floor), and
 the compositions built on those saturations (compare's contract points,
 abs on the integer grid, a gated select's dead branch) are therefore
 bit-exact end to end.  This file re-verifies those claims on the
@@ -55,7 +55,7 @@ def test_sigmoid_saturates_to_one_from_17():
 
 
 def test_sigmoid_saturates_to_zero_at_minus_scale():
-    """broadcast_select/select: sigma(-100) computes as exactly 0.0 — the
+    """broadcast_select/select: sigma(-128) computes as exactly 0.0 — the
     losing branch of a gated select contributes bit-zero, no denormal
     leak into the output."""
     assert torch.sigmoid(_cuda(-SCALE)).item() == 0.0
@@ -95,9 +95,9 @@ def test_abs_integer_grid_bit_exact():
 
 def test_onehot_winner_indicator_exact():
     """onehot_lookup: hinge(0.5) is exactly 0.5 (the winner indicator);
-    hinge(-0.5) leaks at most ~1e-21 per row (e^-50 is representable,
-    unlike sigma(-100); a kernel that flushes it to zero is fine too —
+    hinge(-0.5) leaks at most ~1e-27 per row (e^-64 is representable,
+    unlike sigma(-128); a kernel that flushes it to zero is fine too —
     the budget-relevant direction is the upper bound)."""
     half = _cuda(SCALE * 0.5)
     assert (_swish(half) / SCALE).item() == 0.5
-    assert (_swish(-half) / SCALE).abs().item() <= 1e-21
+    assert (_swish(-half) / SCALE).abs().item() <= 1e-27

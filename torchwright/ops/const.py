@@ -14,13 +14,19 @@ embedding_step_sharpness = 1.0  # For embedding-space ops (map_to_table, equals_
 # Euclidean errors become large dot-product errors.
 
 # Hinge sharpening for the swish machine (docs/swiglu_step2_plan.md, settled
-# decision 5).  Only ever used self-normalizing — folded into gate rows with
-# the matching /scale folded into out_proj (``Swish(scale·z)/scale``), so no
-# value path carries it; never a per-call knob.  Recorded cost: hidden slots
-# saturate at ~1e5-magnitude values, foreclosing fp16 export (the artifact is
-# fp32 everywhere today).  The numeric claims tied to this value are pinned
-# by tests/docs/test_swish_constants.py.
-scale = 100.0
+# decision 5; raised 100 → 128 on 2026-07-04, see
+# docs/onehot_accumulated_leak_postmortem.md).  Only ever used
+# self-normalizing — folded into gate rows with the matching /scale folded
+# into out_proj (``Swish(scale·z)/scale``), so no value path carries it;
+# never a per-call knob.  A power of two: ``2/scale = 2**-6`` is exactly
+# representable in fp32, so a saturated (exact-integer) hinge value times a
+# folded ±k/scale weight is exact, and integer-fed indicator chains
+# (in_range → bool_to_01 → onehot_lookup) are bit-exact — scale=100's
+# accumulated ~1e-5 per-element one-hot leak class is gone.  Recorded cost:
+# hidden slots saturate at ~1.3e5-magnitude values, foreclosing fp16 export
+# (the artifact is fp32 everywhere today).  The numeric claims tied to this
+# value are pinned by tests/docs/test_swish_constants.py.
+scale = 128.0
 
 # The declared minimum MLP hidden width any compiled graph must provide: an
 # FFN is a packable unit that must fit one MLP sublayer's hidden pool, so the
