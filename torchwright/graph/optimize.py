@@ -237,6 +237,27 @@ def _fold_through_concatenate(
         blocks.append(m)
         new_leaves.append(leaf)
 
+    # Coalesce duplicate leaves: two absorbed selectors over the same input
+    # (or a hand-built duplicate) leave the same node in two slots.  A value
+    # read through blocks B1 and B2 contributes x @ (B1 + B2), so the blocks
+    # merge exactly and the concat narrows — which also keeps duplicate
+    # source columns out of the weight-writer scatters.
+    if allow_value_folds and len({id(x) for x in new_leaves}) != len(new_leaves):
+        slot: Dict[int, int] = {}
+        merged_leaves: List[Node] = []
+        merged_blocks: List[torch.Tensor] = []
+        for leaf, block in zip(new_leaves, blocks):
+            j = slot.get(id(leaf))
+            if j is None:
+                slot[id(leaf)] = len(merged_leaves)
+                merged_leaves.append(leaf)
+                merged_blocks.append(block)
+            else:
+                merged_blocks[j] = merged_blocks[j] + block
+                applied += 1
+                value_folds += 1
+        new_leaves, blocks = merged_leaves, merged_blocks
+
     if applied == 0:
         return 0
 

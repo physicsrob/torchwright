@@ -1802,3 +1802,109 @@ def test_no_bias_zero_out_bias_leaves_lane_unwritten():
     cc = _const_col(rmap, c1)
     assert layer.mlp.gate_proj.output_matrix[cc, 0].item() == 0.0
     assert layer.mlp.up_proj.output_matrix[cc, 0].item() == 0.0
+
+
+# ---------------------------------------------------------------------------
+# Duplicate source columns (same Concatenate leaf twice) — the scatter must
+# coalesce by row-summing, not last-write-wins.
+# ---------------------------------------------------------------------------
+
+
+def test_compute_linear_duplicate_concat_leaf():
+    """Linear over Concat([x, x]) via attention transport: the duplicated
+    source columns must contribute the SUM of their weight rows.  Reproducer
+    for the last-write-wins scatter that read only the second block (the doom
+    instance-index regression's mechanism)."""
+    pos = _make_reserved_block()
+    x = InputNode("x", 2, value_range=(-100.0, 100.0))
+    node = Linear(
+        Concatenate([x, x]),
+        torch.tensor([[1.0], [2.0], [10.0], [20.0]]),
+        name="dup",
+    )
+
+    rmap = ResidualStreamMap(D)
+    rmap.allocate(pos)
+    rmap.allocate(x)
+    out_cols = rmap.allocate(node)
+
+    layer = TransformerLayer(D, D_HEAD)
+    op = _make_op(rmap, "compute_linear", node, out_cols)
+    const_one = _const_one(rmap)
+    write_attn_sublayer(layer, [op], rmap, const_one=const_one)
+    layer.to(device_mod.get_device(verbose=False))
+
+    x_values = torch.randn(N_POS, 2)
+    pe_values = torch.randn(N_POS, len(pos))
+    res = _build_residual_stream(rmap, {pos: pe_values, x: x_values})
+
+    out = layer.attn.forward(res)
+    result = out[:, out_cols]
+
+    expected = node.compute(N_POS, {"x": x_values})
+    assert torch.allclose(result.cpu(), expected, atol=1e-4)
+
+
+def test_compute_ffn_duplicate_concat_leaf():
+    """FFN whose input is Concat([x, x]): gate rows for the duplicated
+    columns must sum (the fold never rewrites FFN inputs, so this reaches the
+    writer directly)."""
+    x = InputNode("x", 2, value_range=(-100.0, 100.0))
+    ffn = linear_relu_linear(
+        Concatenate([x, x]),
+        torch.randn(6, 4),
+        torch.randn(6),
+        torch.randn(6, 3),
+        torch.randn(3),
+        name="ffn",
+    )
+
+    rmap = ResidualStreamMap(D)
+    rmap.allocate(x)
+    out_cols = rmap.allocate(ffn)
+
+    layer = TransformerLayer(D, D_HEAD)
+    op = _make_mlp_op(rmap, "compute_ffn", ffn, out_cols, mlp_slots=list(range(6)))
+    write_mlp_sublayer(layer, [op], rmap)
+    layer.to(device_mod.get_device(verbose=False))
+
+    x_values = torch.randn(N_POS, 2)
+    res = _build_residual_stream(rmap, {x: x_values})
+
+    out = layer.mlp.forward(res)
+    result = out[:, out_cols]
+
+    expected = ffn.compute(N_POS, {"x": x_values})
+    assert torch.allclose(result.cpu(), expected, atol=1e-4)
+
+
+def test_mlp_linear_bypass_duplicate_concat_leaf():
+    """Linear over Concat([x, x]) via the MLP bypass: the ±gain W rows for
+    the duplicated columns must sum."""
+    x = InputNode("x", 2, value_range=(-100.0, 100.0))
+    node = Linear(
+        Concatenate([x, x]),
+        torch.tensor([[1.0, -3.0], [2.0, 0.5], [10.0, 4.0], [20.0, -1.0]]),
+        torch.randn(2),
+        name="dup_bypass",
+    )
+
+    rmap = ResidualStreamMap(D)
+    rmap.allocate(x)
+    out_cols = rmap.allocate(node)
+
+    layer = TransformerLayer(D, D_HEAD)
+    op = _make_mlp_op(
+        rmap, "compute_linear_bypass", node, out_cols, mlp_slots=list(range(4))
+    )
+    write_mlp_sublayer(layer, [op], rmap)
+    layer.to(device_mod.get_device(verbose=False))
+
+    x_values = torch.randn(N_POS, 2)
+    res = _build_residual_stream(rmap, {x: x_values})
+
+    out = layer.mlp.forward(res)
+    result = out[:, out_cols]
+
+    expected = node.compute(N_POS, {"x": x_values})
+    assert torch.allclose(result.cpu(), expected, atol=1e-4)

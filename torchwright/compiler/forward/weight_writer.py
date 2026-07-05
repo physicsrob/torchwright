@@ -5,7 +5,7 @@ ResidualStreamMap. No strategies, no ResidualAssignment — just scatter writes.
 """
 
 from dataclasses import dataclass, field
-from typing import List, Literal, Optional, Set
+from typing import Dict, List, Literal, Optional, Set, Tuple
 
 import torch
 import torch.nn.functional as F
@@ -222,6 +222,36 @@ def write_mlp_sublayer(
 # ---------------------------------------------------------------------------
 
 
+def _coalesce_source_rows(
+    idx: List[int], mat: torch.Tensor
+) -> "Tuple[List[int], torch.Tensor]":
+    """Sum matrix rows that share a source column index.
+
+    Weight scatters assign rows by advanced indexing, which is
+    last-write-wins on duplicate indices.  Duplicate source columns are
+    legal — a ``Concatenate`` can hold the same leaf more than once, so
+    ``resolve_indices`` yields that leaf's columns once per occurrence —
+    and a residual value read through k matrix rows contributes the sum
+    of those rows, so summing is exact.  First-occurrence order is kept
+    (assignment order is irrelevant once indices are unique; this just
+    keeps the result deterministic).
+    """
+    if len(set(idx)) == len(idx):
+        return idx, mat
+    order: List[int] = []
+    row_of: Dict[int, int] = {}
+    rows: List[torch.Tensor] = []
+    for i, col in enumerate(idx):
+        j = row_of.get(col)
+        if j is None:
+            row_of[col] = len(order)
+            order.append(col)
+            rows.append(mat[i])
+        else:
+            rows[j] = rows[j] + mat[i]
+    return order, torch.stack(rows)
+
+
 def _scatter_attn_head(
     attn,
     head,
@@ -250,6 +280,15 @@ def _scatter_attn_head(
         recorder.add("attn.W_K", node, op_type, k_idx, head_cols, "dense")
         recorder.add("attn.W_V", node, op_type, v_idx, head_cols, "dense")
         recorder.add("attn.W_O", node, op_type, head_cols, o_idx, "dense")
+    # A source-column list can carry duplicates (a Concatenate holding the
+    # same leaf twice resolves that leaf's columns once per occurrence);
+    # coalesce them before the vectorized assignment below, which is
+    # last-write-wins on duplicate indices and would silently drop all but
+    # the final occurrence's rows.  Target columns (O) are allocator-unique
+    # by I1 and need no coalescing.
+    q_idx, q_rows = _coalesce_source_rows(q_idx, q_mat[: len(q_idx), :d_head])
+    k_idx, k_rows = _coalesce_source_rows(k_idx, k_mat[: len(k_idx), :d_head])
+    v_idx, v_rows = _coalesce_source_rows(v_idx, v_mat[: len(v_idx), :d_head])
     q_idx_t = torch.as_tensor(q_idx, dtype=torch.long)
     k_idx_t = torch.as_tensor(k_idx, dtype=torch.long)
     v_idx_t = torch.as_tensor(v_idx, dtype=torch.long)
@@ -258,15 +297,9 @@ def _scatter_attn_head(
     # destination is always Float.  Original scalar-loop assignment
     # auto-cast; vectorized assignment does not.
     target_dtype = attn.query_matrix.dtype
-    attn.query_matrix[head, q_idx_t, :d_head] = q_mat[: len(q_idx), :d_head].to(
-        target_dtype
-    )
-    attn.key_matrix[head, k_idx_t, :d_head] = k_mat[: len(k_idx), :d_head].to(
-        target_dtype
-    )
-    attn.value_matrix[head, v_idx_t, :d_head] = v_mat[: len(v_idx), :d_head].to(
-        target_dtype
-    )
+    attn.query_matrix[head, q_idx_t, :d_head] = q_rows.to(target_dtype)
+    attn.key_matrix[head, k_idx_t, :d_head] = k_rows.to(target_dtype)
+    attn.value_matrix[head, v_idx_t, :d_head] = v_rows.to(target_dtype)
     attn.output_matrix[head, :d_head, o_idx_t] = o_mat[:d_head, : len(o_idx)].to(
         target_dtype
     )
@@ -883,7 +916,6 @@ def _write_compute_ffn(
     mlp_slots = op.mlp_slots
     out_idx = op.target_cols
 
-    in_idx_t = torch.as_tensor(in_idx, dtype=torch.long)
     slots_t = torch.as_tensor(mlp_slots, dtype=torch.long)
     out_idx_t = torch.as_tensor(out_idx, dtype=torch.long)
 
@@ -902,9 +934,15 @@ def _write_compute_ffn(
 
     # Input-side projection: rows=input columns, cols=mlp slots.  gate matrix
     # is (d_input, n_lanes) = gate_proj.T; gate bias is (n_lanes,).
+    # Duplicate source columns (same Concatenate leaf twice) coalesce by
+    # row-summing at the scatter only — the vectorized assignment is
+    # last-write-wins.  ``gate_matrix`` keeps the per-occurrence row layout
+    # (the biased-linears fold below walks it by leaf offset).
     gate_matrix = ffn.gate_proj.t()
-    in_lin.output_matrix[in_idx_t.unsqueeze(1), slots_t.unsqueeze(0)] = gate_matrix.to(
-        target_dtype
+    scatter_idx, scatter_rows = _coalesce_source_rows(in_idx, gate_matrix)
+    scatter_idx_t = torch.as_tensor(scatter_idx, dtype=torch.long)
+    in_lin.output_matrix[scatter_idx_t.unsqueeze(1), slots_t.unsqueeze(0)] = (
+        scatter_rows.to(target_dtype)
     )
     if bias_fold is None:
         in_lin.output_bias[slots_t] = ffn.gate_bias.to(target_dtype)
@@ -923,9 +961,10 @@ def _write_compute_ffn(
         else:
             up_matrix = ffn.up_proj.t()
             up_bias = ffn.up_bias
-            mlp.up_proj.output_matrix[in_idx_t.unsqueeze(1), slots_t.unsqueeze(0)] = (
-                up_matrix.to(target_dtype)
-            )
+            _, up_rows = _coalesce_source_rows(in_idx, up_matrix)
+            mlp.up_proj.output_matrix[
+                scatter_idx_t.unsqueeze(1), slots_t.unsqueeze(0)
+            ] = up_rows.to(target_dtype)
         if bias_fold is None:
             mlp.up_proj.output_bias[slots_t] = up_bias.to(target_dtype)
         else:
@@ -1099,7 +1138,6 @@ def _write_compute_linear_bypass(
     pos_slots = mlp_slots[:d_output]
     neg_slots = mlp_slots[d_output:]
 
-    in_idx_t = torch.as_tensor(in_idx, dtype=torch.long)
     out_idx_t = torch.as_tensor(out_idx, dtype=torch.long)
     pos_slots_t = torch.as_tensor(pos_slots, dtype=torch.long)
     neg_slots_t = torch.as_tensor(neg_slots, dtype=torch.long)
@@ -1128,8 +1166,16 @@ def _write_compute_linear_bypass(
     # -in_gain·W columns.  Each positive slot j computes act(in_gain·W[:,j]^T @ x),
     # each negative slot act(-in_gain·W[:,j]^T @ x); the output side's ±out_gain
     # recombines them to W[:,j]^T @ x exactly.
-    in_lin.output_matrix[in_idx_t.unsqueeze(1), pos_slots_t.unsqueeze(0)] = in_gain * W
-    in_lin.output_matrix[in_idx_t.unsqueeze(1), neg_slots_t.unsqueeze(0)] = -in_gain * W
+    # Duplicate source columns (same Concatenate leaf twice) coalesce by
+    # row-summing — the vectorized assignment is last-write-wins.
+    w_idx, W_rows = _coalesce_source_rows(in_idx, W)
+    w_idx_t = torch.as_tensor(w_idx, dtype=torch.long)
+    in_lin.output_matrix[w_idx_t.unsqueeze(1), pos_slots_t.unsqueeze(0)] = (
+        in_gain * W_rows
+    )
+    in_lin.output_matrix[w_idx_t.unsqueeze(1), neg_slots_t.unsqueeze(0)] = (
+        -in_gain * W_rows
+    )
 
     # Swish machine: both slot halves are degenerate lanes (up ≡ 1).
     if swish:

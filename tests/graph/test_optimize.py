@@ -546,3 +546,71 @@ def test_fusion_refreshes_stale_bounds():
             f"stale bound on {type(node).__name__} id={node.node_id}: "
             f"cached={cached} fresh={fresh}"
         )
+
+
+def test_concat_fold_merges_duplicate_leaves():
+    """Two absorbed selector Linears over the SAME input leave the same node
+    in two concat slots; the fold must merge their blocks (x reads through
+    B1 + B2) instead of leaving duplicates — duplicated source columns broke
+    the weight-writer scatter (the doom instance-index regression)."""
+    occ = InputNode("occ", 4, value_range=(0.0, 300.0))
+    p = Linear(occ, torch.tensor([[0.0], [1.0], [0.0], [0.0]]), name="p")
+    vp = Linear(occ, torch.tensor([[0.0], [0.0], [1.0], [0.0]]), name="vp")
+    idx = Linear(Concatenate([p, vp]), torch.tensor([[8.0], [1.0]]), name="idx")
+
+    n_pos = 3
+    vals = {"occ": torch.randn(n_pos, 4)}
+    before = idx.compute(n_pos, vals)
+
+    fused = fuse_consecutive_linears({idx})
+    assert fused == 3  # two leaf folds + one duplicate merge
+    assert idx.inputs[0] is occ  # merged to one leaf -> concat bypassed
+    assert idx.output_matrix.shape == (4, 1)
+    # merged block = 8·p_selector + vp_selector
+    assert torch.equal(
+        idx.output_matrix, torch.tensor([[0.0], [8.0], [1.0], [0.0]])
+    )
+
+    after = idx.compute(n_pos, vals)
+    assert torch.allclose(before, after, atol=1e-5)
+
+
+def test_concat_fold_merges_hand_built_duplicate_leaves():
+    """A hand-built Concat([x, x]) under a Linear merges to a single leaf
+    with summed blocks even though no leaf fold fires."""
+    x = InputNode("x", 2, value_range=(-5.0, 5.0))
+    l = Linear(
+        Concatenate([x, x]),
+        torch.tensor([[1.0], [2.0], [10.0], [20.0]]),
+        name="l",
+    )
+
+    n_pos = 3
+    vals = {"x": torch.randn(n_pos, 2)}
+    before = l.compute(n_pos, vals)
+
+    fused = fuse_consecutive_linears({l})
+    assert fused == 1  # the merge alone
+    assert l.inputs[0] is x
+    assert torch.equal(l.output_matrix, torch.tensor([[11.0], [22.0]]))
+
+    after = l.compute(n_pos, vals)
+    assert torch.allclose(before, after, atol=1e-5)
+
+
+def test_duplicate_selector_shape_compiles_correct():
+    """End-to-end pin of the doom instance-index regression: two selectors
+    over one input, concatenated into a combining Linear, must compile to
+    the oracle value (it compiled to the second block only)."""
+    from torchwright.ops.inout_nodes import create_input
+
+    occ = create_input("occ", 4, value_range=(0.0, 300.0))
+    p = Linear(occ, torch.tensor([[0.0], [1.0], [0.0], [0.0]]), name="p")
+    vp = Linear(occ, torch.tensor([[0.0], [0.0], [1.0], [0.0]]), name="vp")
+    idx = Linear(Concatenate([p, vp]), torch.tensor([[8.0], [1.0]]), name="idx")
+
+    compiled = compile_headless(idx, d=64, d_head=8)
+    x = torch.tensor([[1.0, 31.0, 0.0, 15.0], [1.0, 3.0, 2.0, 7.0]])
+    got = compiled(x)
+    expected = idx.compute(2, {"occ": x})
+    assert torch.allclose(got, expected, atol=1e-4), (got, expected)
