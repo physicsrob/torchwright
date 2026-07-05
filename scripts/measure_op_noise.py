@@ -97,6 +97,10 @@ class TargetOp:
     same op use different parameters (e.g., `reciprocal` with different
     `min_value` in `wall.py:431` vs `wall.py:813`), and a single combined
     graph would have weaker precision than either production configuration.
+    ``reference_fns_per_distribution`` is its sibling for modes whose exact
+    math differs (e.g. `floor_int` with an `output_map`): the mode stays a
+    distribution of the one op — one (machine, name), one docstring footer
+    aggregating across modes — instead of masquerading as a separate op.
 
     ``machine`` is the op-library axis: ``"relu"`` (`torchwright/ops/relu/`,
     frozen) or ``"swiglu"`` (`torchwright/ops/swiglu/`). The two libraries
@@ -117,6 +121,9 @@ class TargetOp:
     build_graphs_per_distribution: Dict[str, Callable[[Dict[str, Node]], Node]] = field(
         default_factory=dict
     )
+    reference_fns_per_distribution: Dict[
+        str, Callable[[Dict[str, torch.Tensor]], torch.Tensor]
+    ] = field(default_factory=dict)
 
 
 # ---------------------------------------------------------------------------
@@ -731,6 +738,16 @@ def _distributions() -> Dict[str, InputDistribution]:
             5.0,
             0.2,
         ),
+        "floor_sawtooth_uniform_0_1023": _uniform_1d(
+            "floor_sawtooth_uniform_0_1023",
+            "Uniform continuous samples on [0, 1023] for `floor_int` with "
+            "`output_map = k % 256` — the sawtooth that folds a following "
+            "piecewise-constant op into the floor. Most land in flat zones; "
+            "those inside a ramp just below a multiple of 256 carry the "
+            "-(H-1)=-255-amplified off-by-one, the worst-case delta.",
+            0.0,
+            1023.0,
+        ),
         "radix_floor_native_uniform": _uniform_1d(
             "radix_floor_native_uniform",
             "Uniform continuous samples on [-1023, 1023] — the DOOM native "
@@ -900,6 +917,11 @@ def _distributions() -> Dict[str, InputDistribution]:
 
 def _floor_ref(x: torch.Tensor, lo: float, hi: float) -> torch.Tensor:
     return torch.clamp(torch.floor(x), lo, hi)
+
+
+def _floor_sawtooth_ref(x: torch.Tensor, lo: float, hi: float, H: int) -> torch.Tensor:
+    """floor_int(x, output_map=k % H): a piecewise-constant op folded in."""
+    return torch.remainder(torch.clamp(torch.floor(x), lo, hi), float(H))
 
 
 def _bin_index_ref(
@@ -1741,14 +1763,37 @@ def _target_ops() -> List[TargetOp]:
                 nodes["x"], min_value=-5, max_value=10
             ),
             reference_fn=lambda inputs: _floor_ref(inputs["x"], -5.0, 10.0),
-            distribution_names=("floor_uniform_neg5_10", "floor_near_boundary_10"),
+            distribution_names=(
+                "floor_uniform_neg5_10",
+                "floor_near_boundary_10",
+                "floor_sawtooth_uniform_0_1023",
+            ),
+            build_graphs_per_distribution={
+                "floor_sawtooth_uniform_0_1023": lambda nodes: swiglu_ops.floor_int(
+                    nodes["x"],
+                    min_value=0,
+                    max_value=1023,
+                    output_map=lambda k: float(k % 256),
+                ),
+            },
+            reference_fns_per_distribution={
+                "floor_sawtooth_uniform_0_1023": lambda inputs: _floor_sawtooth_ref(
+                    inputs["x"], 0.0, 1023.0, 256
+                ),
+            },
             notes=(
                 "Two chained FFNs (bounded step, then not-yet-ON counting) "
                 "— the depth is load-bearing exactly as on relu (fp32 2^24 "
                 "accumulation), and the W-slack absorbs stage-1 fillet "
                 "noise on ON steps the same way it absorbs fp ulps. Ramp "
                 "and fillet zones near boundaries interpolate, as today; "
-                "flat zones and integers are exact to the folded ulp class."
+                "flat zones and integers are exact to the folded ulp class. "
+                "The sawtooth distribution measures the `output_map` mode "
+                "(a following piecewise-constant op folded in by reweighting "
+                "the stage-2 indicators with per-boundary deltas): reweighting "
+                "exact 0/1 indicators is exact, but a ramp-zone off-by-one is "
+                "amplified by the local |delta| — up to -(H-1) = -255 at the "
+                "wrap boundaries, which dominates this op's footer max."
             ),
         ),
         TargetOp(
@@ -1835,12 +1880,15 @@ def _measure_all() -> List[NoiseMeasurement]:
             build_graph = target.build_graphs_per_distribution.get(
                 dname, target.build_graph
             )
+            reference_fn = target.reference_fns_per_distribution.get(
+                dname, target.reference_fn
+            )
             m = measure_op_isolated(
                 op_name=target.name,
                 module=target.module,
                 build_graph=build_graph,
                 input_specs=target.input_specs,
-                reference_fn=target.reference_fn,
+                reference_fn=reference_fn,
                 distribution=dists[dname],
                 notes=target.notes,
                 machine=target.machine,

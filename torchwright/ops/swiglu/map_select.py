@@ -8,7 +8,7 @@ lands proportionally to the actual branch values.
 """
 
 import math
-from typing import Dict, List
+from typing import Dict, List, Tuple
 
 import torch
 
@@ -65,7 +65,7 @@ def select(cond: Node, true_node: Node, false_node: Node) -> Node:
     .. noise-footer::
 
        Max error: 0 abs, 0 rel over 4096 samples;
-       measured at commit 2fb6bd6. See docs/numerical_noise.md.
+       measured at commit eb4a0f8. See docs/numerical_noise.md.
     """
     assert len(cond) == 1
     assert len(true_node) == len(false_node)
@@ -189,7 +189,7 @@ def in_range(lower: Node, upper: Node, n_slots: int) -> Node:
     .. noise-footer::
 
        Max error: 0 abs, 0 rel over 4096 samples;
-       measured at commit 2fb6bd6. See docs/numerical_noise.md.
+       measured at commit eb4a0f8. See docs/numerical_noise.md.
     """
     assert len(lower) == 1
     assert len(upper) == 1
@@ -292,7 +292,7 @@ def broadcast_select(
     .. noise-footer::
 
        Max error: 0 abs, 0 rel over 4096 samples;
-       measured at commit 2fb6bd6. See docs/numerical_noise.md.
+       measured at commit eb4a0f8. See docs/numerical_noise.md.
     """
     assert len(masks) == n_slots
     true_is_broadcast = len(true_value) == d_fill
@@ -437,7 +437,7 @@ def dynamic_extract(
     .. noise-footer::
 
        Max error: 0 abs, 0 rel over 4096 samples;
-       measured at commit 2fb6bd6. See docs/numerical_noise.md.
+       measured at commit eb4a0f8. See docs/numerical_noise.md.
     """
     assert len(idx) == 1, "idx must be a 1D scalar node"
     assert len(table) == n_entries * d_fill, (
@@ -504,7 +504,7 @@ def map_to_table(
     .. noise-footer::
 
        Max error: 0 abs, 0 rel over 4096 samples;
-       measured at commit 2fb6bd6. See docs/numerical_noise.md.
+       measured at commit eb4a0f8. See docs/numerical_noise.md.
     """
     d_keys = {len(x) for x in key_to_value.keys()}
     d_values = {len(x) for x in key_to_value.values()}
@@ -577,22 +577,53 @@ def _upper_clamp(index: Node, top: float, gate_mult: float, name: str) -> Node:
     )
 
 
+def _clamp_or_skip(
+    index: Node, top: float, gate_mult: float, name: str
+) -> Tuple[Node, float]:
+    """Feed an axis index to the staircase, spending the clamp FFN only
+    when the input range doesn't already prove it in-bounds.
+
+    ``_upper_clamp`` both scales by ``gate_mult`` and caps at ``top`` in
+    one FFN sublayer.  When the input's static value range proves
+    ``0 ≤ gate_mult·index ≤ top`` the cap is the identity, so we skip the
+    clamp FFN and defer the scaling into the staircase gate instead
+    (``_bounded_step_chunks(gate_mult=…)``) — the raw index feeds the
+    steps and no sublayer is spent.  Returns ``(step_input,
+    step_gate_mult)``: the clamped scaled index with unit step-gain, or
+    the raw index with ``gate_mult`` deferred.
+
+    ``gate_mult`` is finite and > 0 (``_lookup_axis_scale``), so it
+    preserves the ordering of the range endpoints.  A missing, infinite,
+    or out-of-bounds range keeps the clamp.
+    """
+    r = index.value_type.value_range
+    if r.is_finite() and 0.0 <= gate_mult * r.lo and gate_mult * r.hi <= top:
+        return index, gate_mult
+    return _upper_clamp(index, top, gate_mult, name=name), 1.0
+
+
 def _bounded_step_chunks(
     x_clamped: Node,
     n: int,
     s: float,
     chunk_size: int,
     name: str,
+    *,
+    gate_mult: float = 1.0,
 ) -> List[tuple]:
     """floor_int's bounded-step stage per boundary ``k − 0.5``, chunked.
 
     Returns ``[(ks, step_node), ...]`` where ``step_node`` is the
     width-``len(ks)`` vector of steps
     ``step_k = hinge(t_k) − hinge(t_k − W)``,
-    ``t_k = s·(x − (k − 0.5)) + 0.5`` — bounded in [0, W], so downstream
-    accumulation never sees ``s·x``-magnitude terms (the fp32 2^24
-    rationale, unchanged from relu).  W keeps today's sizing plus the
+    ``t_k = s·(gate_mult·x − (k − 0.5)) + 0.5`` — bounded in [0, W], so
+    downstream accumulation never sees ``s·x``-magnitude terms (the fp32
+    2^24 rationale, unchanged from relu).  W keeps today's sizing plus the
     swish saturation floor ``W ≥ 1 + 17/scale`` (dominated by the 2).
+
+    ``gate_mult`` folds the axis ``index_scale`` into the boundary gate so
+    the raw (unscaled) index can feed the staircase directly when the
+    upstream clamp is skipped; it is 1.0 when ``x`` is already scaled.
     """
     max_t = s * float(n - 1) + 1.0
     ulp = 2.0 ** (math.floor(math.log2(max_t)) - 23) if max_t >= 1.0 else 2.0**-23
@@ -602,7 +633,7 @@ def _bounded_step_chunks(
     for c0 in range(1, n, chunk_size):
         ks = list(range(c0, min(c0 + chunk_size, n)))
         c = len(ks)
-        gate_proj = torch.full((2 * c, 1), scale * s)
+        gate_proj = torch.full((2 * c, 1), scale * s * gate_mult)
         gate_bias = torch.empty(2 * c)
         out_proj = torch.zeros((2 * c, c))
         for j, k in enumerate(ks):
@@ -645,11 +676,15 @@ def _table_lookup_row_vector(
             table[0].to(dtype=torch.float32), name=f"{name}_constant_row"
         )
 
-    x_clamped = _upper_clamp(index, float(rows - 1), gate_mult, name=f"{name}_clamp_i")
+    step_input, step_mult = _clamp_or_skip(
+        index, float(rows - 1), gate_mult, name=f"{name}_clamp_i"
+    )
     deltas = table[1:] - table[:-1]
     partials: List[Node] = []
     for ci, (ks, step) in enumerate(
-        _bounded_step_chunks(x_clamped, rows, sharpness, chunk_size, f"{name}_row")
+        _bounded_step_chunks(
+            step_input, rows, sharpness, chunk_size, f"{name}_row", gate_mult=step_mult
+        )
     ):
         c = len(ks)
         out_proj = torch.zeros((c, cols))
@@ -745,7 +780,7 @@ def table_lookup_2d(
     .. noise-footer::
 
        Max error: 0 abs, 0 rel over 4096 samples;
-       measured at commit 2fb6bd6. See docs/numerical_noise.md.
+       measured at commit eb4a0f8. See docs/numerical_noise.md.
     """
     assert len(i) == 1, "i must be a 1D scalar node"
     assert len(j) == 1, "j must be a 1D scalar node"
@@ -778,8 +813,12 @@ def table_lookup_2d(
         return row
 
     # Column stage: gated lanes reading the live row vector.
-    j_clamped = _upper_clamp(j, float(cols - 1), scale_j, name=f"{name}_clamp_j")
-    step_chunks = _bounded_step_chunks(j_clamped, cols, s, chunk_size, f"{name}_col")
+    j_input, j_mult = _clamp_or_skip(
+        j, float(cols - 1), scale_j, name=f"{name}_clamp_j"
+    )
+    step_chunks = _bounded_step_chunks(
+        j_input, cols, s, chunk_size, f"{name}_col", gate_mult=j_mult
+    )
 
     chunks: List[Node] = []
     for ci, (ks, step) in enumerate(step_chunks):

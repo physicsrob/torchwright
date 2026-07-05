@@ -117,6 +117,95 @@ def test_floor_int_compiles_clean():
 
 
 # ---------------------------------------------------------------------------
+# floor_int output_map (fold a following piecewise-constant op into floor)
+# ---------------------------------------------------------------------------
+
+
+def _saturate_ffns(node):
+    """Collect every stage-2 ``floor_int_saturate`` FFN feeding ``node``."""
+    from collections import deque
+
+    seen, q, acc = set(), deque([node]), []
+    while q:
+        n = q.popleft()
+        if id(n) in seen:
+            continue
+        seen.add(id(n))
+        if isinstance(n, FFN) and n.name == "floor_int_saturate":
+            acc.append(n)
+        q.extend(getattr(n, "inputs", []))
+    return acc
+
+
+def test_floor_int_output_map_default_byte_identical():
+    """No new argument -> no behavior change: the stage-2 output weights are
+    exactly the pre-output_map ``-ones/scale``, and the op still floors."""
+    x = create_input("x", 1, value_range=(-5.0, 10.0))
+    out = floor_int(x, min_value=-5, max_value=10)  # output_map absent
+    (sat,) = _saturate_ffns(out)
+    assert torch.equal(sat.out_proj, -torch.ones_like(sat.out_proj) / scale)
+    xs = torch.tensor([[-5.0], [-4.3], [0.0], [3.0], [7.7], [10.0]])
+    val = out.compute(6, {"x": xs})
+    assert torch.allclose(val, torch.floor(xs), rtol=0.0, atol=1e-4)
+
+
+@pytest.mark.parametrize("H", [3, 256])
+def test_floor_int_output_map_sawtooth_matches_mod(H):
+    """``output_map = k % H`` reproduces ``floor(x) % H`` exactly on
+    flat-zone inputs, including inputs just past multiples of H (the
+    ``-(H-1)`` boundaries, where the largest |delta| lives)."""
+    lo, hi = 0, 3 * H + 2
+    x = create_input("x", 1, value_range=(float(lo), float(hi)))
+    out = floor_int(x, min_value=lo, max_value=hi, output_map=lambda k: float(k % H))
+    pts = [b + 0.3 for b in range(lo, hi)]  # flat-zone interiors
+    pts += [float(m) + 0.05 for m in range(H, hi, H)]  # just past each -(H-1) drop
+    xs = torch.tensor([[p] for p in pts])
+    val = out.compute(len(pts), {"x": xs})
+    ref = torch.tensor([[float(int(p) % H)] for p in pts])
+    assert torch.allclose(val, ref, rtol=0.0, atol=1e-3), (val - ref).abs().max()
+
+
+def test_floor_int_output_map_sawtooth_compiles_clean():
+    H, lo, hi = 8, 0, 40
+    x = create_input("x", 1, value_range=(float(lo), float(hi)))
+    out = floor_int(x, min_value=lo, max_value=hi, output_map=lambda k: float(k % H))
+    compiled = compile_headless(out, d=256, d_head=D_HEAD)
+    xs = torch.tensor([[0.5], [7.3], [8.05], [15.4], [39.5]])
+    report = probe_compiled(compiled, out, {"x": xs}, xs.shape[0], atol=1e-2)
+    assert report.first_divergent is None, report.format_short()
+    ref = torch.tensor([[float(int(p.item()) % H)] for p in xs])
+    assert torch.allclose(compiled(xs), ref, rtol=0.0, atol=1e-2)
+
+
+def test_floor_int_output_map_lookup_step_function():
+    """A non-sawtooth piecewise-constant map (arbitrary per-integer lookup)
+    pins the generality: any g(floor(x)) folds in, not just modular ones."""
+    lut = {-4: 2.0, -3: 2.0, -2: -7.5, -1: 0.0, 0: 9.0, 1: 9.0, 2: -3.25, 3: 1.0}
+    lo, hi = -4, 3
+    x = create_input("x", 1, value_range=(float(lo), float(hi)))
+    out = floor_int(x, min_value=lo, max_value=hi, output_map=lambda k: lut[k])
+    pts = [k + 0.4 for k in range(lo, hi)]
+    xs = torch.tensor([[p] for p in pts])
+    val = out.compute(len(pts), {"x": xs})
+    ref = torch.tensor([[lut[int(p // 1)]] for p in pts])
+    assert torch.allclose(val, ref, rtol=0.0, atol=1e-3), (val - ref).abs().max()
+
+
+def test_floor_int_output_map_integers_and_flat_zones_exact():
+    """Contract inputs — exact integers and flat-zone interiors — are exact
+    under output_map, same as the plain floor path."""
+    H, lo, hi = 5, 0, 14
+    x = create_input("x", 1, value_range=(float(lo), float(hi)))
+    out = floor_int(x, min_value=lo, max_value=hi, output_map=lambda k: float(k % H))
+    xs = torch.tensor(
+        [[0.0], [4.0], [5.0], [9.0], [10.0], [0.6], [4.9], [10.05], [13.3]]
+    )
+    val = out.compute(xs.shape[0], {"x": xs})
+    ref = torch.floor(xs).remainder(H)
+    assert torch.allclose(val, ref, rtol=0.0, atol=1e-3), (val - ref).abs().max()
+
+
+# ---------------------------------------------------------------------------
 # scalar_to_embedding
 # ---------------------------------------------------------------------------
 

@@ -1,6 +1,6 @@
 {
   "schema_version": 2,
-  "commit": "2fb6bd6",
+  "commit": "eb4a0f8",
   "measured_at": "2026-07-05",
   "ops": [
     {
@@ -770,7 +770,7 @@
       "name": "floor_int",
       "machine": "swiglu",
       "module": "torchwright.ops.swiglu.arithmetic_ops",
-      "notes": "Two chained FFNs (bounded step, then not-yet-ON counting) — the depth is load-bearing exactly as on relu (fp32 2^24 accumulation), and the W-slack absorbs stage-1 fillet noise on ON steps the same way it absorbs fp ulps. Ramp and fillet zones near boundaries interpolate, as today; flat zones and integers are exact to the folded ulp class.",
+      "notes": "Two chained FFNs (bounded step, then not-yet-ON counting) — the depth is load-bearing exactly as on relu (fp32 2^24 accumulation), and the W-slack absorbs stage-1 fillet noise on ON steps the same way it absorbs fp ulps. Ramp and fillet zones near boundaries interpolate, as today; flat zones and integers are exact to the folded ulp class. The sawtooth distribution measures the `output_map` mode (a following piecewise-constant op folded in by reweighting the stage-2 indicators with per-boundary deltas): reweighting exact 0/1 indicators is exact, but a ramp-zone off-by-one is amplified by the local |delta| — up to -(H-1) = -255 at the wrap boundaries, which dominates this op's footer max.",
       "distributions": [
         {
           "name": "floor_near_boundary_10",
@@ -785,6 +785,21 @@
           "rel_valid_samples": 4096,
           "worst_input": {
             "x": 4.99993
+          }
+        },
+        {
+          "name": "floor_sawtooth_uniform_0_1023",
+          "description": "Uniform continuous samples on [0, 1023] for `floor_int` with `output_map = k % 256` — the sawtooth that folds a following piecewise-constant op into the floor. Most land in flat zones; those inside a ramp just below a multiple of 256 carry the -(H-1)=-255-amplified off-by-one, the worst-case delta.",
+          "n_samples": 4096,
+          "max_abs_error": 100.73,
+          "mean_abs_error": 0.0757457,
+          "p99_abs_error": 0.88816,
+          "max_rel_error": 0.782898,
+          "mean_rel_error": 0.00176984,
+          "p99_rel_error": 0.0280537,
+          "rel_valid_samples": 4075,
+          "worst_input": {
+            "x": 511.94
           }
         },
         {

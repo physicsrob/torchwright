@@ -7,7 +7,7 @@ Each op assembles gated-FFN lanes per its entry in
 
 import builtins
 import math
-from typing import List, Optional
+from typing import Callable, List, Optional
 
 import torch
 
@@ -71,7 +71,7 @@ def compare(
     .. noise-footer::
 
        Max error: 1.999 abs, 1.999 rel over 8192 samples;
-       measured at commit 2fb6bd6. See docs/numerical_noise.md.
+       measured at commit eb4a0f8. See docs/numerical_noise.md.
     """
     assert len(inp) == 1, "Input must be a 1D scalar node"
 
@@ -138,7 +138,7 @@ def multiply(inp1: Node, inp2: Node) -> Node:
     .. noise-footer::
 
        Max error: 0.0009766 abs, 2.241e-07 rel over 8192 samples;
-       measured at commit 2fb6bd6. See docs/numerical_noise.md.
+       measured at commit eb4a0f8. See docs/numerical_noise.md.
     """
     assert len(inp1) == 1, "Input must be a 1D scalar node"
     assert len(inp2) == 1, "Input must be a 1D scalar node"
@@ -184,7 +184,7 @@ def abs(inp: Node) -> Node:
     .. noise-footer::
 
        Max error: 0.004351 abs, 0.9954 rel over 8192 samples;
-       measured at commit 2fb6bd6. See docs/numerical_noise.md.
+       measured at commit eb4a0f8. See docs/numerical_noise.md.
     """
     d = len(inp)
     eye = torch.eye(d)
@@ -229,7 +229,7 @@ def min(inp1: Node, inp2: Node) -> Node:
     .. noise-footer::
 
        Max error: 3.815e-06 abs, 1.953e-06 rel over 4096 samples;
-       measured at commit 2fb6bd6. See docs/numerical_noise.md.
+       measured at commit eb4a0f8. See docs/numerical_noise.md.
     """
     assert len(inp1) == len(inp2)
     d = len(inp1)
@@ -278,7 +278,7 @@ def square(inp: Node) -> Node:
     .. noise-footer::
 
        Max error: 3.052e-05 abs, 2.266e-07 rel over 8192 samples;
-       measured at commit 2fb6bd6. See docs/numerical_noise.md.
+       measured at commit eb4a0f8. See docs/numerical_noise.md.
     """
     assert len(inp) == 1, "Input must be a 1D scalar node"
 
@@ -357,7 +357,7 @@ def piecewise_linear(
     .. noise-footer::
 
        Max error: 0.25 abs, 146.3 rel over 4096 samples;
-       measured at commit 2fb6bd6. See docs/numerical_noise.md.
+       measured at commit eb4a0f8. See docs/numerical_noise.md.
     """
     assert len(inp) == 1, "Input must be a 1D scalar node"
     n = len(breakpoints)
@@ -491,7 +491,7 @@ def clamp(inp: Node, lo: float, hi: float) -> Node:
     .. noise-footer::
 
        Max error: 1.907e-06 abs, 0.0002899 rel over 4096 samples;
-       measured at commit 2fb6bd6. See docs/numerical_noise.md.
+       measured at commit eb4a0f8. See docs/numerical_noise.md.
     """
     assert len(inp) == 1, "Input must be a 1D scalar node"
     assert hi > lo, "hi must exceed lo"
@@ -535,7 +535,7 @@ def reciprocal(
     .. noise-footer::
 
        Max error: 0.0008245 abs, 0.1117 rel over 4096 samples;
-       measured at commit 2fb6bd6. See docs/numerical_noise.md.
+       measured at commit eb4a0f8. See docs/numerical_noise.md.
     """
     assert len(inp) == 1, "Input must be a 1D scalar node"
     assert min_value > 0, "min_value must be positive"
@@ -592,7 +592,7 @@ def thermometer_floor_div(inp: Node, divisor: int, max_value: int) -> Node:
     .. noise-footer::
 
        Max error: 0 abs, 0 rel over 4096 samples;
-       measured at commit 2fb6bd6. See docs/numerical_noise.md.
+       measured at commit eb4a0f8. See docs/numerical_noise.md.
     """
     assert len(inp) == 1, "Input must be a 1D scalar node"
     n = max_value // divisor
@@ -641,7 +641,7 @@ def mod_const(inp: Node, divisor: int, max_value: int) -> Node:
     .. noise-footer::
 
        Max error: 0 abs, 0 rel over 4096 samples;
-       measured at commit 2fb6bd6. See docs/numerical_noise.md.
+       measured at commit eb4a0f8. See docs/numerical_noise.md.
     """
     assert len(inp) == 1, "Input must be a 1D scalar node"
     assert divisor > 0, "divisor must be positive"
@@ -654,8 +654,9 @@ def floor_int(
     min_value: int,
     max_value: int,
     sharpness: Optional[float] = None,
+    output_map: Optional[Callable[[int], float]] = None,
 ) -> Node:
-    """Compute floor(x) for a continuous-valued scalar input.
+    """Compute floor(x) — or f(floor(x)) — for a continuous scalar input.
 
     **Not a flat staircase, and the depth is load-bearing.**  The
     single-FFN form piecewise_linear would emit sums ~n terms of
@@ -668,6 +669,29 @@ def floor_int(
         t_k    = sharpness·(x − k) + 1                # per boundary k
         step_k = hinge(t_k) − hinge(t_k − W)          # FFN 1: bounded step ∈ [0, W]
         floor  = min + n − Σ_k hinge(1 − step_k)      # FFN 2: count not-yet-ON steps
+
+    ``hinge(1 − step_k)`` is the exact indicator ``[x < k]`` (1 while
+    boundary ``k`` is un-crossed, 0 once crossed): stage 2 subtracts it
+    from ``min + n`` so the result counts crossed boundaries, i.e.
+    ``floor(x)``.
+
+    **``output_map`` collapses a following piecewise-constant function
+    into this op.**  Any ``g(floor(x))`` with ``g`` defined on the
+    integers is itself piecewise-constant with breakpoints *at the same
+    integers* floor_int already switches on — so instead of computing
+    the floor and feeding it to a separate op, pass ``g`` as
+    ``output_map`` and the downstream op disappears.  Writing
+    ``δ_k = g(k) − g(k−1)`` and telescoping
+    ``g(floor(x)) = g(min) + Σ_k δ_k·[x ≥ k] = g(max) − Σ_k δ_k·[x < k]``,
+    stage 2 becomes::
+
+        out = g(max) − Σ_k δ_k · hinge(1 − step_k)    # FFN 2, per-boundary δ_k
+
+    i.e. exactly today's stage 2 with the all-ones output weights
+    replaced by the ``δ_k`` and the closing constant ``min + n`` replaced
+    by ``g(max)``.  The default (``output_map is None``) is the identity
+    ``g(k) = k`` — every ``δ_k = 1``, ``g(max) = min + n`` — and the
+    emitted weights are byte-identical to before.
 
     Contract unchanged from the ReLU form: inputs stay out of the
     ``1/sharpness``-wide ramp zone just below each boundary; the flat
@@ -685,28 +709,68 @@ def floor_int(
     sizing ``W = max(2, 8·ulp(sharpness·n))`` already dominates the
     swish requirement ``W ≥ 1 + 17/scale``.
 
+    **``output_map`` numerics — the δ-amplification.**  Reweighting exact
+    0/1 indicators by constants is itself exact, so the *noise* story is
+    the same saturating stage as the default path — but every error term
+    that path carries is now multiplied by the local ``|δ_k|``:
+
+    - *Near-boundary error.*  An input inside the ``1/sharpness`` ramp
+      just below boundary ``k`` reads off-by-one in the floor and hence
+      off-by-``δ_k`` in the output (vs off-by-1 for plain floor).  The
+      composed op sees its breakpoints on the *raw* pre-floor ``x``,
+      whereas a separate ``g`` applied to the snapped integer floor never
+      sees its own transition band — but this introduces **no new** band,
+      because ``g``'s breakpoints are a subset of floor's (the integers):
+      the only ramp zones are floor's own, unchanged in width and
+      location.  The restriction the caller inherits is exactly floor's:
+      keep inputs out of the sub-integer ramp; there the error scales
+      with ``|δ_k|`` instead of 1.
+    - *Fillet slack.*  The closing range carries ``2·swish_dip/scale ·
+      max_k|δ_k|`` (a couple fillets live at once, each now weighted by
+      its boundary's ``|δ_k|``) instead of the plain ``2·swish_dip/scale``.
+    - *Chunk-sum pin.*  Each chunk's stage-2 sum is pinned to the
+      ``δ_k``-weighted hinge bounds (see the per-chunk assert); the fp32
+      accumulation pad grows to ``max_k|δ_k|`` per chunk, which still
+      dominates the true ``~c·max|δ_k|·ulp`` rounding by orders of
+      magnitude.
+
+    ``output_map`` must be defined (and finite) on every integer in
+    ``[min_value, max_value]``.
+
     Args:
         inp: 1D scalar node with value in [min_value, max_value].
         min_value: Lower bound (integer).
         max_value: Upper bound (integer).
         sharpness: Override the global ``step_sharpness`` for this op.
             Higher values narrow the ramp zone at each boundary.
+        output_map: Optional ``g`` applied as ``g(floor(x))``.  Must be
+            defined on every integer in ``[min_value, max_value]``.  When
+            ``None`` the op returns ``floor(x)`` and emits weights
+            byte-identical to the pre-``output_map`` form.
 
     Returns:
-        1D scalar node containing floor(x).
+        1D scalar node containing ``floor(x)`` (default) or
+        ``output_map(floor(x))``.
 
     .. noise-footer::
 
-       Max error: 0.9996 abs, 0.9531 rel over 8192 samples;
-       measured at commit 2fb6bd6. See docs/numerical_noise.md.
+       Max error: 100.7 abs, 0.9531 rel over 12288 samples;
+       measured at commit eb4a0f8. See docs/numerical_noise.md.
     """
     assert len(inp) == 1, "Input must be a 1D scalar node"
     assert max_value >= min_value
 
+    # δ_k = g(k) − g(k−1) per boundary; the identity g leaves every δ_k = 1
+    # and g(max) = min + n, reproducing the plain-floor weights exactly.
+    g = (lambda k: float(k)) if output_map is None else output_map
+
+    def _delta(k: int) -> float:
+        return float(g(k)) - float(g(k - 1))
+
     if max_value == min_value:
         from torchwright.ops.inout_nodes import create_literal_value
 
-        return create_literal_value(torch.tensor([float(min_value)]))
+        return create_literal_value(torch.tensor([float(g(min_value))]))
 
     s = float(sharpness if sharpness is not None else step_sharpness)
     n = max_value - min_value
@@ -718,7 +782,7 @@ def floor_int(
     ulp = 2.0 ** (math.floor(math.log2(max_t)) - 23) if max_t >= 1.0 else 2.0**-23
     step_cap = builtins.max(2.0, 8.0 * ulp)  # W
 
-    neg_partials = []  # each chunk contributes −Σ_k hinge(1 − step_k)
+    neg_partials = []  # each chunk contributes −Σ_k δ_k·hinge(1 − step_k)
     for c0 in range(0, n, _CHUNK):
         ks = list(
             range(
@@ -766,34 +830,51 @@ def floor_int(
             ),
             atol=1e-5,
         )
-        # stage 2: −Σ_k hinge(1 − step_k), single output column
+        # stage 2: −Σ_k δ_k·hinge(1 − step_k), single output column.  Default
+        # δ_k = 1 makes out_proj byte-identical to the old −ones/scale.
+        dlist = [_delta(k) for k in ks]
+        deltas = torch.tensor(dlist)
         neg_partial = swiglu_ffn(
             step,
             -scale * torch.eye(c),
             scale * torch.ones(c),
-            -torch.ones((c, 1)) / scale,
+            (-deltas / scale).unsqueeze(1),
             torch.zeros(1),
             name="floor_int_saturate",
         )
         # Same universal bound one level up: 1 − step_k ∈ [1−W−dip, 1+dip],
-        # so hinge(1 − step_k) ∈ [−dip, 1+dip] and the negated chunk sum
-        # lies in [−c·(1+dip), c·dip] — plus ±1 absolute for the summed
-        # per-lane fp32 rounding (c ≤ 512 lanes at ~1 magnitude).
+        # so hinge(1 − step_k) ∈ [−dip, 1+dip]; weighting lane k by δ_k, its
+        # term −δ_k·hinge lies in [min(δ_k·dip, −δ_k(1+dip)), max(...)].  Sum
+        # the per-lane extremes, then pad by max|δ_k| for the summed fp32
+        # rounding — that pad dominates the true ~c·max|δ_k|·ulp by orders of
+        # magnitude.  Default δ_k = 1 recovers [−c(1+dip)−1, c·dip+1].
+        lo_sum = sum(builtins.min(d * dip, -d * (1.0 + dip)) for d in dlist)
+        hi_sum = sum(builtins.max(d * dip, -d * (1.0 + dip)) for d in dlist)
+        pad = builtins.max(1.0, builtins.max(builtins.abs(d) for d in dlist))
         neg_partials.append(
             assert_matches_value_type(
                 neg_partial,
-                NodeValueType(value_range=Range(-c * (1.0 + dip) - 1.0, c * dip + 1.0)),
+                NodeValueType(value_range=Range(lo_sum - pad, hi_sum + pad)),
                 atol=1e-5,
             )
         )
 
     summed = neg_partials[0] if len(neg_partials) == 1 else sum_nodes(neg_partials)
-    result = add_const(summed, float(min_value + n))  # min + n − Σ hinge(1 − step_k)
-    slack = 2.0 * swish_dip / scale
+    result = add_const(summed, float(g(max_value)))  # g(max) − Σ δ_k·hinge(1 − step_k)
+    # Output spans g over the integer floors; the couple-of-fillets closing
+    # slack is δ-amplified, so it scales with max|δ_k| (default max|δ_k| = 1
+    # recovers the plain [min − 2·dip, max + 2·dip]).
+    g_vals = [float(g(j)) for j in range(min_value, max_value + 1)]
+    max_abs_delta = builtins.max(
+        builtins.abs(_delta(k)) for k in range(min_value + 1, max_value + 1)
+    )
+    slack = 2.0 * swish_dip / scale * max_abs_delta
     return assert_matches_value_type(
         result,
         NodeValueType(
-            value_range=Range(float(min_value) - slack, float(max_value) + slack)
+            value_range=Range(
+                builtins.min(g_vals) - slack, builtins.max(g_vals) + slack
+            )
         ),
     )
 
@@ -822,7 +903,7 @@ def ceil_int(
     .. noise-footer::
 
        Max error: 0 abs, 0 rel over 4096 samples;
-       measured at commit 2fb6bd6. See docs/numerical_noise.md.
+       measured at commit eb4a0f8. See docs/numerical_noise.md.
     """
     assert len(inp) == 1, "Input must be a 1D scalar node"
     return negate(floor_int(negate(inp), -max_value, -min_value, sharpness=sharpness))
@@ -908,7 +989,7 @@ def radix_floor_int(
     .. noise-footer::
 
        Max error: 1 abs, 1 rel over 12288 samples;
-       measured at commit 2fb6bd6. See docs/numerical_noise.md.
+       measured at commit eb4a0f8. See docs/numerical_noise.md.
     """
     assert len(inp) == 1, "Input must be a 1D scalar node"
     assert max_value >= min_value

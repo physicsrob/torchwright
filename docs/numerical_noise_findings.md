@@ -366,6 +366,43 @@ relu precedent in having no noise entry (embedding-space output); its
 unit tests pin exact digit reconstruction and the ±0.4 input headroom,
 and its spacing audit closes in closed form (scale > 34, cleared 3x).
 
+### swiglu floor_int `output_map` (2026-07-05): the footer max is the sawtooth mode's δ-amplification, by design
+
+`floor_int` grew an `output_map` parameter that folds a following
+piecewise-constant function into its saturating stage (per-boundary
+output deltas replace the all-ones weights — depth handoff item 2).
+The new `floor_sawtooth_uniform_0_1023` distribution measures the
+production shape (`output_map = k % 256` over [0, 1023]) and reads
+**max 100.73 abs / mean 0.076** — and that max now dominates the op's
+docstring footer (100.7, was 0.999). This is the designed
+δ-amplification, not a regression:
+
+- Reweighting exact 0/1 indicators by constants is exact, so flat-zone
+  and integer inputs measure exactly as before (the mean and p99 are
+  the same class as plain floor).
+- An in-ramp sample just below a wrap boundary (a multiple of 256,
+  where the delta is −255) carries the same tolerated ±1-step
+  interpolation artefact both machines have always reported — now
+  multiplied by |δ| = 255. The measured 100.73 at x = 511.94 is that
+  artefact at ~0.395 of the ramp; the theoretical worst is the full
+  255 for a sample at the top of the ramp.
+- The plain-floor distributions are unchanged (0.999-class max), and
+  the default path emits byte-identical weights (unit-pinned with
+  `torch.equal`).
+
+Callers inherit exactly flat floor_int's contract — keep inputs out of
+the sub-integer ramp — with in-ramp error scaled by the local |δ|. The
+composition adds **no new** transition bands: the folded function's
+breakpoints (integers) are a subset of floor's own.
+
+The footer aggregation is deliberate: the sawtooth is a *mode* of
+`floor_int` (one op, one footer — measured via the harness's new
+`reference_fns_per_distribution`), and 255-class error genuinely is
+what the op can emit in that mode for an in-ramp input. Budget plain
+floor against the `floor_uniform_neg5_10` / `floor_near_boundary_10`
+rows, and the folded mode against the sawtooth row scaled by your
+max |δ|.
+
 ### swiglu radix_floor_int: the divisor-boundary sliver measures exactly 0
 
 The radix split (hi floor → integer snap → lo floor over the extended
@@ -410,6 +447,15 @@ to contract (unit-test-pinned): a one-axis band gives the clean
 two-entry linear blend, a corner band genuine bilinear interpolation.
 The relu op was never measured; its offset-gate class is the `(M+v)−M`
 findings entry.
+
+The range-aware clamp skip (2026-07-05, depth handoff item 1) changed
+**no numbers here**: the measurement harness builds its lookup indices
+with the default wide value range, so the clamp is kept and the
+measured graph is byte-identical to before. When a caller's index
+carries a provably in-bounds range the per-axis clamp FFN is skipped —
+verified bit-exact against the clamped form (the clamp only diverges
+from identity in a band near `top` that sits ~0.37 index units from
+the last staircase boundary, where the steps are fully saturated).
 
 ### Softmax inside attention is not measured here
 

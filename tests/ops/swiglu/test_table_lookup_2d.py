@@ -10,8 +10,24 @@ import torch
 
 from torchwright.compiler.export import compile_headless
 from torchwright.debug.probe import probe_compiled
+from torchwright.graph.ffn import FFN
 from torchwright.ops.inout_nodes import create_input
 from torchwright.ops.swiglu import table_lookup_2d
+
+
+def _count_ffns(node):
+    """Number of distinct FFN nodes reachable from ``node``."""
+    seen, stack, n = set(), [node], 0
+    while stack:
+        cur = stack.pop()
+        if id(cur) in seen:
+            continue
+        seen.add(id(cur))
+        if isinstance(cur, FFN):
+            n += 1
+        stack.extend(cur.inputs)
+    return n
+
 
 D = 64
 D_HEAD = 8
@@ -120,3 +136,66 @@ def test_compiles_clean():
     }
     report = probe_compiled(compiled, out, inputs, 3, atol=1e-2)
     assert report.first_divergent is None, report.format_short()
+
+
+# --- Range-aware clamp skip -------------------------------------------------
+#
+# ``_upper_clamp`` caps ``gate_mult·index`` at ``rows-1`` / ``cols-1`` in one
+# FFN sublayer.  When the input's static range proves ``0 ≤ gate_mult·index ≤
+# top`` the cap is the identity, so the clamp FFN is skipped and the scaling
+# is folded into the staircase gate instead.
+
+
+def _build_ranged(i_range, j_range, table=_TABLE, **kw):
+    i = create_input("i", 1, value_range=i_range)
+    j = create_input("j", 1, value_range=j_range)
+    return table_lookup_2d(i, j, table, **kw), table
+
+
+def test_clamp_skip_matches_clamped_form():
+    """In-range: the skipped build equals the clamped build value-for-value
+    on a dense grid — clamping an in-bounds index is the identity."""
+    # _TABLE is 3x4 -> top_i=2, top_j=3.
+    skip, table = _build_ranged((0.0, 2.0), (0.0, 3.0))
+    keep, _ = _build_ranged((-1e4, 1e4), (-1e4, 1e4))
+    ii = torch.linspace(0.0, 2.0, 37)
+    jj = torch.linspace(0.0, 3.0, 41)
+    grid_i, grid_j = torch.meshgrid(ii, jj, indexing="ij")
+    gi = grid_i.reshape(-1, 1)
+    gj = grid_j.reshape(-1, 1)
+    n = gi.shape[0]
+    vs = skip.compute(n, {"i": gi, "j": gj})
+    vk = keep.compute(n, {"i": gi, "j": gj})
+    assert torch.equal(vs, vk), (vs - vk).abs().max().item()
+
+
+def test_clamp_skip_drops_one_ffn_per_axis():
+    """Structural: a range that proves safety on both axes builds two fewer
+    FFNs (the two clamps) than the range-free build of the same lookup."""
+    keep, _ = _build_ranged((-1e4, 1e4), (-1e4, 1e4))
+    skip, _ = _build_ranged((0.0, 2.0), (0.0, 3.0))
+    assert _count_ffns(keep) - _count_ffns(skip) == 2
+
+
+def test_clamp_kept_when_range_violates_bound():
+    """Negative: a range crossing either bound (or the wide default, which
+    stands in for "no useful range") keeps that axis's clamp.  The untested
+    axis is left wide so the FFN count isolates the tested one."""
+    keep, _ = _build_ranged((-1e4, 1e4), (-1e4, 1e4))
+    base = _count_ffns(keep)
+    # i upper bound exceeded (2.5 > top_i=2); j left wide.
+    over_i, _ = _build_ranged((0.0, 2.5), (-1e4, 1e4))
+    # j lower bound below 0; i left wide.
+    under_j, _ = _build_ranged((-1e4, 1e4), (-0.5, 3.0))
+    assert _count_ffns(over_i) == base
+    assert _count_ffns(under_j) == base
+
+
+def test_clamp_skip_is_per_axis():
+    """One axis in-range, the other not: exactly one clamp is skipped."""
+    keep, _ = _build_ranged((-1e4, 1e4), (-1e4, 1e4))
+    base = _count_ffns(keep)
+    i_only, _ = _build_ranged((0.0, 2.0), (-0.5, 3.0))  # skip i, keep j
+    j_only, _ = _build_ranged((-0.5, 2.0), (0.0, 3.0))  # keep i, skip j
+    assert _count_ffns(i_only) == base - 1
+    assert _count_ffns(j_only) == base - 1
