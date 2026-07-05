@@ -6,7 +6,9 @@ layer count and parameter overhead.
 
 from typing import Dict, List, Set
 
-from torchwright.graph import Concatenate, Node
+import torch
+
+from torchwright.graph import Concatenate, LiteralValue, Node
 from torchwright.graph.ffn import FFN
 from torchwright.graph.linear import Linear
 
@@ -91,6 +93,122 @@ def _fold_ffn_into_linear(b: FFN, consumers: Dict[Node, List[Node]]) -> None:
         consumer.replace_input(l, b)
 
 
+def _fold_through_concatenate(
+    l: Linear,
+    c: Concatenate,
+    output_nodes: Set[Node],
+    consumers: Dict[Node, List[Node]],
+    touched: Set[Node],
+    mutated: Set[Node],
+) -> int:
+    """Fold foldable leaves of single-consumer ``c`` into ``l``'s row blocks.
+
+    ``Linear(Concatenate(..., leaf_i, ...))`` reads leaf ``i`` through the
+    row block ``M_i`` of ``l.output_matrix`` at the leaf's column offset::
+
+        y = sum_i (leaf_i @ M_i) + b
+
+    Three leaf rewrites, all exact, mutating only the survivors ``l`` and
+    ``c`` (leaves are orphaned, never mutated):
+
+    - a single-consumer ``Concatenate`` leaf is **spliced** inline (its
+      inputs replace it in ``c.inputs``) — value-identical, and exposes
+      its own leaves to the folds below on a later pass;
+    - a ``LiteralValue`` leaf's constant contribution ``v @ M_i`` moves
+      into ``l.output_bias`` and the leaf is dropped with its block rows
+      — skipped when every leaf is a literal (an input-less Linear is
+      not representable);
+    - a single-consumer ``Linear`` leaf is **absorbed**: its block
+      becomes ``leaf.output_matrix @ M_i``, its bias contribution joins
+      ``l.output_bias``, and ``c`` reads the leaf's input directly.
+      Guarded per leaf so the fold never grows the parameter count.
+
+    When exactly one leaf remains, the concat itself is bypassed
+    (``l`` reads that leaf directly) so the plain Linear→Linear /
+    FFN→Linear folds can continue in later passes.
+
+    Declined outright (except splices, which are value-identical) when
+    ``c`` carries a semantic affine override — the folds change ``c``'s
+    value/width and would leave the override describing the pre-fold
+    node.
+
+    Returns the number of leaf rewrites applied.
+    """
+    # Splice nested single-consumer concat leaves inline first, so the
+    # folds below see a flat leaf list.
+    applied = 0
+    leaves: List[Node] = []
+    for leaf in c.inputs:
+        if (
+            isinstance(leaf, Concatenate)
+            and leaf not in touched
+            and leaf not in output_nodes
+            and len(consumers.get(leaf, [])) == 1
+        ):
+            leaves.extend(leaf.inputs)
+            touched.add(leaf)
+            applied += 1
+        else:
+            leaves.append(leaf)
+
+    allow_value_folds = c._semantic_affine_override is None
+    # Literal folds drop leaves; never drop them all.
+    has_non_literal = any(not isinstance(x, LiteralValue) for x in leaves)
+
+    d_out = l.d_output
+    blocks: List[torch.Tensor] = []
+    new_leaves: List[Node] = []
+    bias = l.output_bias
+    offset = 0
+    for leaf in leaves:
+        w = len(leaf)
+        m = l.output_matrix[offset : offset + w]
+        offset += w
+
+        if allow_value_folds and isinstance(leaf, LiteralValue) and has_non_literal:
+            bias = bias + leaf.value @ m
+            applied += 1
+            continue
+
+        if (
+            allow_value_folds
+            and isinstance(leaf, Linear)
+            and leaf not in touched
+            and leaf not in output_nodes
+            and len(consumers.get(leaf, [])) == 1
+        ):
+            d_x = leaf.output_matrix.shape[0]
+            old = (d_x * w + w) + w * d_out
+            new = d_x * d_out
+            if new <= old:
+                blocks.append(leaf.output_matrix @ m)
+                bias = bias + leaf.output_bias @ m
+                new_leaves.append(leaf.inputs[0])
+                touched.add(leaf)
+                applied += 1
+                continue
+
+        blocks.append(m)
+        new_leaves.append(leaf)
+
+    if applied == 0:
+        return 0
+
+    l.output_matrix = torch.cat(blocks, dim=0)
+    l.output_bias = bias
+    l.d_input = l.output_matrix.shape[0]
+    if len(new_leaves) == 1:
+        l.inputs = [new_leaves[0]]  # bypass the concat entirely
+    else:
+        c.inputs = new_leaves
+        c.d_output = sum(len(x) for x in new_leaves)
+        mutated.add(c)
+    touched.add(c)
+    touched.add(l)
+    mutated.add(l)
+    return applied
+
+
 def _fuse_one_pass(output_nodes: Set[Node], verbose: bool, mutated: Set[Node]) -> int:
     """One fusion round: apply a set of non-overlapping folds, return the count.
 
@@ -121,7 +239,13 @@ def _fuse_one_pass(output_nodes: Set[Node], verbose: bool, mutated: Set[Node]) -
 
         if isinstance(node, Linear):
             inp = node.inputs[0]
-            if isinstance(inp, Concatenate) or inp in touched:
+            if inp in touched:
+                continue
+            if isinstance(inp, Concatenate):
+                if len(consumers.get(inp, [])) == 1:
+                    applied += _fold_through_concatenate(
+                        node, inp, output_nodes, consumers, touched, mutated
+                    )
                 continue
             if len(consumers.get(inp, [])) != 1:
                 continue
@@ -197,7 +321,7 @@ def fuse_consecutive_linears(
 ) -> int:
     """Fuse adjacent linear maps, FFN-aware, until no more folds apply.
 
-    Three folds, each width-safe and gated so it never grows the parameter
+    Four folds, each width-safe and gated so it never grows the parameter
     count:
 
     - **Linear -> Linear** (``l1``'s sole consumer is ``l2``): ``l2`` absorbs
@@ -209,6 +333,15 @@ def fuse_consecutive_linears(
     - **FFN -> Linear** (the FFN's sole consumer is the Linear, and the
       Linear is not a caller-held output): the FFN's output projection folds
       into the downstream Linear (``out_proj @ M_l``), the FFN absorbing it.
+    - **Linear leaves through Concatenate** (the concat's sole consumer is a
+      Linear): each single-consumer Linear leaf is absorbed into its row
+      block of the downstream Linear's matrix, LiteralValue leaves fold into
+      its bias, and nested single-consumer concat leaves are spliced inline
+      — the downstream Linear survives as the summing hardware, so no Add
+      node (which would cost a compiled layer) is ever introduced.  Saves
+      one compiled layer per absorbed leaf stage; collapses the
+      fanout-limited accumulator chains ``sum_nodes`` builds.  See
+      :func:`_fold_through_concatenate`.
 
     All folds mutate a surviving node in place; ``output_nodes`` stay valid
     references (an FFN-into-output-Linear fold is declined to preserve the

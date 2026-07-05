@@ -111,15 +111,24 @@ def test_no_fuse_multiple_consumers():
     assert fused == 0  # Can't fuse because l1 has two consumers
 
 
-def test_no_fuse_concatenate_input():
-    """Don't fuse when L2's input is a Concatenate (even if it wraps a Linear)."""
+def test_fuse_through_single_leaf_concatenate():
+    """A Linear leaf folds through a 1-leaf Concatenate; the concat is bypassed."""
     inp = InputNode("x", 4, value_range=(-100.0, 100.0))
-    l1 = Linear(inp, torch.randn(4, 3), name="l1")
+    l1 = Linear(inp, torch.randn(4, 3), torch.randn(3), name="l1")
     concat = Concatenate([l1])  # Wrap l1 in a Concatenate
-    l2 = Linear(concat, torch.randn(3, 2), name="l2")
+    l2 = Linear(concat, torch.randn(3, 2), torch.randn(2), name="l2")
+
+    n_pos = 5
+    x = torch.randn(n_pos, 4)
+    out_before = l2.compute(n_pos, {"x": x})
 
     fused = fuse_consecutive_linears({l2})
-    assert fused == 0  # Skip Concatenate inputs
+    assert fused == 1
+    assert l2.inputs[0] is inp  # single surviving leaf bypasses the concat
+    assert l2.output_matrix.shape == (4, 2)
+
+    out_after = l2.compute(n_pos, {"x": x})
+    assert torch.allclose(out_before, out_after, atol=1e-5)
 
 
 def test_fuse_preserves_annotation():
@@ -308,6 +317,200 @@ def test_block_folds_preserve_compiled_output():
     c_fused = compile_headless(out_fused, d=64, d_head=8)
 
     assert torch.allclose(c_plain(xt), c_fused(xt), atol=1e-4)
+
+
+# ---------------------------------------------------------------------------
+# Linear-through-Concatenate folds
+# ---------------------------------------------------------------------------
+
+
+def test_fold_linear_leaves_through_concat():
+    """Single-consumer Linear leaves fold into the downstream Linear's row
+    blocks; the concat survives, rewired to the leaves' inputs."""
+    in1 = InputNode("a", 4, value_range=(-2.0, 2.0))
+    in2 = InputNode("b", 5, value_range=(-2.0, 2.0))
+    l1 = Linear(in1, torch.randn(4, 3) * 0.3, torch.randn(3) * 0.1, name="l1")
+    l2 = Linear(in2, torch.randn(5, 2) * 0.3, torch.randn(2) * 0.1, name="l2")
+    c = Concatenate([l1, l2])
+    top = Linear(c, torch.randn(5, 4) * 0.3, torch.randn(4) * 0.1, name="top")
+
+    n_pos = 5
+    vals = {"a": torch.randn(n_pos, 4), "b": torch.randn(n_pos, 5)}
+    before = top.compute(n_pos, vals)
+
+    fused = fuse_consecutive_linears({top})
+    assert fused == 2
+    assert c.inputs == [in1, in2]
+    assert len(c) == 9
+    assert top.output_matrix.shape == (9, 4)
+    assert top.d_input == 9
+
+    after = top.compute(n_pos, vals)
+    assert torch.allclose(before, after, atol=1e-5)
+
+
+def test_concat_fold_declined_multiconsumer_concat():
+    """No leaf folds when the Concatenate itself has two consumers."""
+    in1 = InputNode("a", 4, value_range=(-2.0, 2.0))
+    l1 = Linear(in1, torch.randn(4, 3), name="l1")
+    c = Concatenate([l1, in1])
+    t1 = Linear(c, torch.randn(7, 2), name="t1")
+    t2 = Linear(c, torch.randn(7, 2), name="t2")
+
+    fused = fuse_consecutive_linears({t1, t2})
+    assert fused == 0
+    assert c.inputs == [l1, in1]
+
+
+def test_concat_fold_skips_multiconsumer_leaf():
+    """A leaf with a second consumer is kept; its sibling still folds."""
+    in1 = InputNode("a", 4, value_range=(-2.0, 2.0))
+    in2 = InputNode("b", 5, value_range=(-2.0, 2.0))
+    shared = Linear(in1, torch.randn(4, 3) * 0.3, name="shared")
+    other_consumer = Linear(shared, torch.randn(3, 2) * 0.3, name="other")
+    foldable = Linear(in2, torch.randn(5, 2) * 0.3, name="foldable")
+    c = Concatenate([shared, foldable])
+    top = Linear(c, torch.randn(5, 4) * 0.3, name="top")
+
+    n_pos = 5
+    vals = {"a": torch.randn(n_pos, 4), "b": torch.randn(n_pos, 5)}
+    before = top.compute(n_pos, vals)
+
+    fused = fuse_consecutive_linears({top, other_consumer})
+    assert fused == 1
+    assert c.inputs == [shared, in2]
+
+    after = top.compute(n_pos, vals)
+    assert torch.allclose(before, after, atol=1e-5)
+
+
+def test_concat_fold_declined_output_leaf():
+    """A leaf that is a caller-held output node is never absorbed."""
+    in1 = InputNode("a", 4, value_range=(-2.0, 2.0))
+    leaf = Linear(in1, torch.randn(4, 3), name="leaf")
+    c = Concatenate([leaf, in1])
+    top = Linear(c, torch.randn(7, 2), name="top")
+
+    fused = fuse_consecutive_linears({top, leaf})
+    assert fused == 0
+    assert c.inputs == [leaf, in1]
+
+
+def test_literal_leaf_folds_into_bias():
+    """A LiteralValue leaf's contribution moves into the bias; the leaf and
+    its block rows are dropped."""
+    from torchwright.graph import LiteralValue
+
+    in1 = InputNode("a", 4, value_range=(-2.0, 2.0))
+    lit = LiteralValue(torch.tensor([1.5, -2.0, 0.5]), name="konst")
+    c = Concatenate([in1, lit])
+    top = Linear(c, torch.randn(7, 2) * 0.3, torch.randn(2) * 0.1, name="top")
+
+    n_pos = 5
+    vals = {"a": torch.randn(n_pos, 4)}
+    before = top.compute(n_pos, vals)
+
+    fused = fuse_consecutive_linears({top})
+    assert fused == 1
+    assert top.inputs[0] is in1  # one leaf left -> concat bypassed
+    assert top.output_matrix.shape == (4, 2)
+
+    after = top.compute(n_pos, vals)
+    assert torch.allclose(before, after, atol=1e-5)
+
+
+def test_all_literal_concat_declined():
+    """Literal folds never empty the concat (a 0-input Linear is not
+    representable)."""
+    from torchwright.graph import LiteralValue
+
+    lit1 = LiteralValue(torch.tensor([1.0, 2.0]))
+    lit2 = LiteralValue(torch.tensor([3.0]))
+    c = Concatenate([lit1, lit2])
+    top = Linear(c, torch.randn(3, 2), name="top")
+
+    fused = fuse_consecutive_linears({top})
+    assert fused == 0
+    assert c.inputs == [lit1, lit2]
+
+
+def test_concat_fold_param_guard():
+    """A bottleneck leaf (1-wide output, wide fan-out) is declined."""
+    in1 = InputNode("a", 4, value_range=(-2.0, 2.0))
+    in2 = InputNode("b", 3, value_range=(-2.0, 2.0))
+    bottleneck = Linear(in1, torch.randn(4, 1), name="bottleneck")
+    c = Concatenate([bottleneck, in2])
+    # old for the leaf: 4*1 + 1 + 1*100 = 105; new: 4*100 = 400 -> declined
+    top = Linear(c, torch.randn(4, 100), name="top")
+
+    fused = fuse_consecutive_linears({top})
+    assert fused == 0
+    assert c.inputs == [bottleneck, in2]
+
+
+def test_accumulator_chain_collapses():
+    """The ``sum_nodes`` fanout-limited accumulator shape —
+    ``Linear(Concat(acc_Linear, ...))`` chains — collapses to one flat
+    Linear over the leaves' inputs across passes (fold, splice, fold)."""
+    ins = [InputNode(f"x{i}", 4, value_range=(-2.0, 2.0)) for i in range(3)]
+    gates = [
+        Linear(ins[i], torch.randn(4, 3) * 0.3, torch.randn(3) * 0.1, name=f"g{i}")
+        for i in range(3)
+    ]
+    acc1 = Linear(
+        Concatenate([gates[0], gates[1]]),
+        torch.randn(6, 3) * 0.3,
+        torch.randn(3) * 0.1,
+        name="acc1",
+    )
+    top = Linear(
+        Concatenate([acc1, gates[2]]),
+        torch.randn(6, 2) * 0.3,
+        torch.randn(2) * 0.1,
+        name="top",
+    )
+
+    n_pos = 5
+    vals = {f"x{i}": torch.randn(n_pos, 4) for i in range(3)}
+    before = top.compute(n_pos, vals)
+
+    # Pass 1 folds acc1 + g2 into top (acc1's concat becomes a leaf);
+    # pass 2 splices that concat inline and folds g0 + g1.
+    fused = fuse_consecutive_linears({top})
+    assert fused == 5
+    assert isinstance(top.inputs[0], Concatenate)
+    assert top.inputs[0].inputs == [ins[0], ins[1], ins[2]]
+    assert top.output_matrix.shape == (12, 2)
+
+    after = top.compute(n_pos, vals)
+    assert torch.allclose(before, after, atol=1e-5)
+
+
+def test_concat_fold_refreshes_stale_bounds():
+    """Concat folds mutate the survivor Linear and the concat in place; the
+    cached bounds of both — and everything downstream — must equal a fresh
+    recompute afterwards."""
+    from torchwright.compiler.utils import get_ancestor_nodes
+    from torchwright.graph.affine_rules import compute_affine_bound
+
+    in1 = InputNode("a", 4, value_range=(-1.0, 1.0))
+    in2 = InputNode("b", 5, value_range=(-1.0, 1.0))
+    l1 = Linear(in1, torch.randn(4, 3) * 0.3, torch.randn(3) * 0.1, name="l1")
+    l2 = Linear(in2, torch.randn(5, 2) * 0.3, torch.randn(2) * 0.1, name="l2")
+    c = Concatenate([l1, l2])
+    top = Linear(c, torch.randn(5, 4) * 0.3, torch.randn(4) * 0.1, name="top")
+    sink = Concatenate([top])
+
+    n = fuse_consecutive_linears({sink})
+    assert n == 2
+
+    for node in get_ancestor_nodes({sink}):
+        cached = node._affine_bound.to_scalar_range()
+        fresh = compute_affine_bound(node).to_scalar_range()
+        assert cached.lo == fresh.lo and cached.hi == fresh.hi, (
+            f"stale bound on {type(node).__name__} id={node.node_id}: "
+            f"cached={cached} fresh={fresh}"
+        )
 
 
 def test_fusion_refreshes_stale_bounds():
