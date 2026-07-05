@@ -691,6 +691,80 @@ def test_compute_add_wide():
     assert torch.allclose(result.cpu(), expected, atol=1e-4)
 
 
+def test_compute_add_self_add():
+    """Add(a, a) with ``a`` live (compute_add, not add_into): both addends
+    resolve to the SAME columns.  Reproducer for the combined-single-head
+    scatter collision — the duplicated V-matrix indices were last-write-wins,
+    dropping one addend and emitting ``a`` instead of ``2a``."""
+    pos = _make_reserved_block()
+    a = InputNode("a", 4, value_range=(-100.0, 100.0))
+    add_node = Add(a, a)
+
+    rmap = ResidualStreamMap(D)
+    rmap.allocate(pos)
+    rmap.allocate(a)
+    out_cols = rmap.allocate(add_node)
+
+    layer = TransformerLayer(D, D_HEAD)
+    op = _make_op(rmap, "compute_add", add_node, out_cols)
+    const_one = _const_one(rmap)
+    write_attn_sublayer(layer, [op], rmap, const_one=const_one)
+    layer.to(device_mod.get_device(verbose=False))
+
+    a_values = torch.randn(N_POS, 4)
+    pe_values = torch.randn(N_POS, len(pos))
+    res = _build_residual_stream(rmap, {pos: pe_values, a: a_values})
+
+    out = layer.attn.forward(res)
+    result = out[:, out_cols]
+
+    expected = add_node.compute(N_POS, {"a": a_values})
+    assert torch.allclose(result.cpu(), expected, atol=1e-4)
+
+
+def test_compute_add_self_add_wide():
+    """Self-add wider than d_head: chunks of both shapes (a full-d_head chunk
+    that would take the per-input-head path, and a narrow tail chunk that
+    would take the combined-head path) must be exact."""
+    pos = _make_reserved_block()
+    a = InputNode("a", 20, value_range=(-100.0, 100.0))  # chunks: 16 + 4
+    add_node = Add(a, a)
+
+    d_wide = 128
+    rmap = ResidualStreamMap(d_wide)
+    rmap.allocate(pos)
+    rmap.allocate(a)
+    out_cols = rmap.allocate(add_node)
+
+    layer = TransformerLayer(d_wide, D_HEAD)
+    op = _make_op(rmap, "compute_add", add_node, out_cols)
+    const_one = _const_one(rmap)
+    write_attn_sublayer(layer, [op], rmap, const_one=const_one)
+    layer.to(device_mod.get_device(verbose=False))
+
+    a_values = torch.randn(N_POS, 20)
+    pe_values = torch.randn(N_POS, len(pos))
+    device = device_mod.get_device(verbose=False)
+    res = torch.zeros(N_POS, d_wide, device=device)
+    # _build_residual_stream is hard-wired to the module-level D; build the
+    # wide stream by hand (same as test_compute_add_wide).
+    for node, values in {
+        pos: pe_values,
+        a: a_values,
+        const_one: torch.ones(N_POS, 1),
+    }.items():
+        indices = rmap.get_indices(node)
+        values = values.to(res.device)
+        for i, idx in enumerate(indices):
+            res[:, idx] = values[:, i]
+
+    out = layer.attn.forward(res)
+    result = out[:, out_cols]
+
+    expected = add_node.compute(N_POS, {"a": a_values})
+    assert torch.allclose(result.cpu(), expected, atol=1e-4)
+
+
 # ---------------------------------------------------------------------------
 # MLP — compute_ffn
 # ---------------------------------------------------------------------------
@@ -760,9 +834,7 @@ def test_mlp_block_multiple():
 
     layer = TransformerLayer(D, D_HEAD)
     ops = [
-        _make_mlp_op(
-            rmap, "compute_ffn", ffn1, out1_cols, mlp_slots=list(range(0, 6))
-        ),
+        _make_mlp_op(rmap, "compute_ffn", ffn1, out1_cols, mlp_slots=list(range(0, 6))),
         _make_mlp_op(
             rmap, "compute_ffn", ffn2, out2_cols, mlp_slots=list(range(6, 11))
         ),

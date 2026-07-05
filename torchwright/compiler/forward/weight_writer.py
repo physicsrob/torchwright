@@ -489,6 +489,14 @@ def _write_compute_add(
     head: a0 maps into head dims [0:cs] and a1 into [cs:2cs], with the
     output matrix summing both contributions to the same output columns.
     Otherwise falls back to one head per input.
+
+    A self-add — ``Add(h, h)``, the one case where both addends resolve
+    to the SAME residual columns (I1 forbids column sharing between
+    distinct live nodes) — cannot use the combined-head scatter: the
+    duplicated column indices would collide in the vectorized V-matrix
+    assignment (last write wins), silently dropping one addend.  It gets
+    a single V mapping with a doubled output matrix instead, which is
+    exact.
     """
     node = op.node
     assert isinstance(node, Add)
@@ -502,13 +510,36 @@ def _write_compute_add(
 
     v_idx_a = op.source_cols
     v_idx_b = op.source_cols_b
+    self_add = v_idx_a == v_idx_b
 
     for start in range(0, d_output, d_head):
         end = min(start + d_head, d_output)
         chunk_size = end - start
         o_chunk_idx = o_idx[start:end]
 
-        if 2 * chunk_size <= d_head:
+        if self_add:
+            # One copy of the shared columns, output matrix doubled.
+            v_mat = torch.eye(chunk_size, d_head)
+            o_mat = 2.0 * torch.eye(d_head, chunk_size)
+            head = _allocate_head(attn)
+            attn.rope_base = ROPE_BASE
+            _scatter_attn_head(
+                attn,
+                head,
+                qk_idx,
+                qk_idx,
+                v_idx_a[start:end],
+                o_chunk_idx,
+                q_mat,
+                k_mat,
+                v_mat,
+                o_mat,
+                d_head,
+                recorder=recorder,
+                node=op.node,
+                op_type=op.op_type,
+            )
+        elif 2 * chunk_size <= d_head:
             # Both inputs fit in a single head.
             # a0 occupies head dims [0:cs], a1 occupies [cs:2*cs].
             # Output matrix sums both into the same output columns.
