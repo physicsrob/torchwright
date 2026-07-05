@@ -20,9 +20,10 @@ from typing import List
 import torch
 
 from torchwright.graph import Node, Embedding, RopeConfig
-from torchwright.ops.linear import sum_nodes
+from torchwright.ops.linear import bool_to_01, negate, sum_nodes
 from torchwright.ops.attention_ops import attend_to_offset, get_prev_value
 from torchwright.ops.inout_nodes import create_literal_value
+from torchwright.ops.relu.arithmetic_ops import compare
 from torchwright.ops.relu.logic_ops import (
     equals_vector,
     cond_gate,
@@ -30,6 +31,7 @@ from torchwright.ops.relu.logic_ops import (
     bool_all_true,
 )
 from torchwright.ops.relu.map_select import map_to_table, select
+from torchwright.ops.relu.marker_count import count_since_marker
 
 
 def check_is_digit(embedding: Embedding) -> Node:
@@ -133,6 +135,9 @@ def output_sequence(
     This is the standard pattern for outputting a computed result one token
     at a time during autoregressive decoding.
 
+    The trigger must fire at most once per context (the standard usage: a
+    delimiter like "=" or "\\n" that appears exactly once).
+
     Args:
         rope: RoPE config for the rotary offset / recency attention ops.
         trigger_condition: Boolean node — emission starts when this is true.
@@ -145,12 +150,36 @@ def output_sequence(
     # *among* matches), so the latch holds for the whole rollout.
     has_triggered = get_prev_value(rope, trigger_condition, trigger_condition)
 
+    # Slot gating rides an exact step counter, NOT per-slot offset reads.
+    # Gating slot i with attend_to_offset(trigger_condition, delta_pos=-i)
+    # is broken when the trigger fires fewer than i positions after the
+    # sequence start: the read targets a position before BOS, and with no
+    # real key to match the sharp positional softmax locks onto an arbitrary
+    # in-range key (out-of-range targets are a causal don't-care per
+    # attend_to_offset — they must not be consumed).  A wrong key where the
+    # trigger reads true spuriously sums a deep slot's value into the
+    # emission.  The counter is the bucket-1 near-marker count
+    # pos - trigger_pos, meaningful from the trigger onward; at earlier
+    # positions it is bounded garbage, which the has_triggered select
+    # below discards.
+    steps_since = count_since_marker(
+        rope,
+        window_validity=has_triggered,
+        marker_onehot=bool_to_01(trigger_condition),
+        max_gap=len(seq) + 1,
+    )
+
     out_values = []
     for i, value in enumerate(seq):
-        delta = -i
-        # At position (trigger + i), this fires and gates seq[i] through.
-        trigger = attend_to_offset(rope, trigger_condition, delta_pos=delta)
-        out_values.append(cond_gate(trigger, value))
+        # Fires iff steps_since == i: a ±0.5 band around the integer, wide
+        # enough to absorb the count's sub-integer error.
+        at_slot_i = bool_all_true(
+            [
+                compare(steps_since, thresh=i - 0.5),
+                compare(negate(steps_since), thresh=-(i + 0.5)),
+            ]
+        )
+        out_values.append(cond_gate(at_slot_i, value))
 
     return select(
         cond=has_triggered,

@@ -14,8 +14,9 @@ import torch
 from torchwright.graph import Embedding, Node, RopeConfig
 
 from torchwright.ops.attention_ops import attend_to_offset, get_prev_value
-from torchwright.ops.linear import sum_nodes
+from torchwright.ops.linear import bool_to_01, negate, sum_nodes
 from torchwright.ops.inout_nodes import create_literal_value
+from torchwright.ops.swiglu.arithmetic_ops import compare
 from torchwright.ops.swiglu.logic_ops import (
     bool_all_true,
     bool_not,
@@ -23,6 +24,7 @@ from torchwright.ops.swiglu.logic_ops import (
     equals_vector,
 )
 from torchwright.ops.swiglu.map_select import map_to_table, select
+from torchwright.ops.swiglu.marker_count import count_since_marker
 
 
 def check_is_digit(embedding: Embedding) -> Node:
@@ -108,14 +110,31 @@ def output_sequence(
     fires (at position P), outputs seq[0] at P, seq[1] at P+1, etc.  The
     losing cond_gates contribute exactly zero at clean conds on this
     machine, so the summed emission is the winning value alone.
+
+    The trigger must fire at most once per context.  See the relu twin for
+    why the slot gating rides the near-marker step counter rather than
+    per-slot ``attend_to_offset`` reads (out-of-range offset targets land
+    on an arbitrary key and would leak deep slots into the sum).
     """
     has_triggered = get_prev_value(rope, trigger_condition, trigger_condition)
 
+    steps_since = count_since_marker(
+        rope,
+        window_validity=has_triggered,
+        marker_onehot=bool_to_01(trigger_condition),
+        max_gap=len(seq) + 1,
+    )
+
     out_values = []
     for i, value in enumerate(seq):
-        delta = -i
-        trigger = attend_to_offset(rope, trigger_condition, delta_pos=delta)
-        out_values.append(cond_gate(trigger, value))
+        # Fires iff steps_since == i: a ±0.5 band around the integer.
+        at_slot_i = bool_all_true(
+            [
+                compare(steps_since, thresh=i - 0.5),
+                compare(negate(steps_since), thresh=-(i + 0.5)),
+            ]
+        )
+        out_values.append(cond_gate(at_slot_i, value))
 
     return select(
         cond=has_triggered,

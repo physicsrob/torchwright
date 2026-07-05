@@ -17,6 +17,7 @@ from torchwright.compiler.graph_identity import canonical_ids, unwrap_debug
 from torchwright.compiler.lower import _strip_debug_wrappers, lower
 from torchwright.compiler.utils import get_ancestor_nodes
 from torchwright.graph.affine_rules import refresh_node_caches
+from torchwright.graph.optimize import fuse_consecutive_linears
 from torchwright.graph.asserts import assert_in_range
 from torchwright.graph.ffn import FFN
 from torchwright.graph.linear import Linear
@@ -26,12 +27,16 @@ from torchwright.ops.inout_nodes import create_input
 def _old_pipeline_bounds(output_node):
     """Reproduce the pre-copy compile's bound state on a throwaway rebuild.
 
-    Refresh caches in topological order (the old ``lower()`` refresh
-    loop), then strip wrappers in place with claim transfer (the old
+    Pre-fuse the graph in place (pre-copy callers ran
+    ``fuse_consecutive_linears`` on their source graphs before compiling;
+    ``lower()`` now runs the same pass on its private copy), refresh
+    caches in topological order (the old ``lower()`` refresh loop), then
+    strip wrappers in place with claim transfer (the old
     ``GraphAnalyzer._strip_asserts``, which ``_strip_debug_wrappers`` is
     the verbatim relocation of).  Mutates its argument — callers pass a
     rebuild they own.
     """
+    fuse_consecutive_linears({output_node})
     for node in topological_order(output_node):
         refresh_node_caches(node)
     stripped = _strip_debug_wrappers(output_node)
