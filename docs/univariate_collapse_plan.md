@@ -237,10 +237,18 @@ lands.
    outputs identical on the existing example tests.
 4. **Doom gate**: `probe_compiled` parity on the lowres config, then
    the pixel-oracle gates (`test_flat_pixel_oracle`,
-   `test_forward_ar_rollout`).  Re-run
-   `scripts/measure_fusion_opportunities.py` to confirm the realized
-   critical path (expect ~54 from 64, plus whatever the post-collapse
-   fusion round finds) and re-measure compiled layer count on the doom
-   side.
-5. **Flip the default** (`collapse_univariate=True`) only after 1–4 are
+   `test_forward_ar_rollout`).
+5. **Depth report — REQUIRED before the default flips.**  The point of
+   the pass is fewer layers, so measure it directly, not by proxy: for
+   **every example graph and the production doom graph**, compile with
+   the flag off and on and report the **compiled layer count**
+   (`n_layers` on the artifact / `CompiledHeadless`) side by side —
+   before, after, delta — in the landing PR/commit message.  Also
+   re-run `scripts/measure_fusion_opportunities.py` on both settings so
+   the modeled critical path (expect ~54 from doom's 64, plus whatever
+   the post-collapse fusion round finds) can be checked against the
+   realized layer delta; a modeled saving that does not show up in real
+   layers means the schedule is not chain-bound where we thought, and
+   that discrepancy is a finding to explain (D4), not to skip.
+6. **Flip the default** (`collapse_univariate=True`) only after 1–5 are
    green; the flag stays as an escape hatch for one release.
