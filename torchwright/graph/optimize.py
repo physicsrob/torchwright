@@ -4,13 +4,50 @@ These passes transform the computation graph before compilation to reduce
 layer count and parameter overhead.
 """
 
-from typing import Dict, List, Set
+from dataclasses import dataclass, field
+from typing import Dict, List, Optional, Set
 
 import torch
 
 from torchwright.graph import Concatenate, LiteralValue, Node
 from torchwright.graph.ffn import FFN
 from torchwright.graph.linear import Linear
+
+
+@dataclass
+class FoldLog:
+    """Value-identity bookkeeping for a fusion run.
+
+    Folds mutate nodes in place, and two of them change which *value* a
+    surviving node computes.  A caller that keys per-node data by graph
+    node (the lowering boundary's source→copy ``node_map``) needs to
+    know, after fusion:
+
+    - ``moves``: orphaned node → survivor that now computes its value
+      (the FFN→Linear fold: the FFN's post-fold output IS what the
+      orphaned downstream Linear used to compute).
+    - ``value_changed``: nodes that survive in the graph but no longer
+      compute their pre-fusion value (the move survivors themselves,
+      and Concatenates whose leaves were absorbed).
+
+    Every other orphan's value simply ceases to exist; reachability
+    from the output identifies those without bookkeeping here.
+    """
+
+    moves: Dict[Node, Node] = field(default_factory=dict)
+    value_changed: Set[Node] = field(default_factory=set)
+
+    def record_move(self, orphan: Node, survivor: Node) -> None:
+        # A survivor absorbing a second downstream Linear stops holding
+        # the first orphan's value — that value is then simply lost.
+        for prev, holder in list(self.moves.items()):
+            if holder is survivor:
+                del self.moves[prev]
+        self.moves[orphan] = survivor
+        self.value_changed.add(survivor)
+
+    def record_value_changed(self, node: Node) -> None:
+        self.value_changed.add(node)
 
 
 def _consumer_map(all_nodes: Set[Node]) -> Dict[Node, List[Node]]:
@@ -66,7 +103,9 @@ def _fold_linear_into_ffn_gate(u: Linear, b: FFN) -> None:
         b.name = f"fused_{u.name}_{b.name}"
 
 
-def _fold_ffn_into_linear(b: FFN, consumers: Dict[Node, List[Node]]) -> None:
+def _fold_ffn_into_linear(
+    b: FFN, consumers: Dict[Node, List[Node]], fold_log: FoldLog
+) -> None:
     """Fold FFN ``b``'s output projection into its sole downstream Linear.
 
     ``b``'s only consumer is a Linear ``l``.  The fused node is still an FFN
@@ -79,6 +118,9 @@ def _fold_ffn_into_linear(b: FFN, consumers: Dict[Node, List[Node]]) -> None:
     """
     (l,) = consumers[b]
     assert isinstance(l, Linear)
+    # b's value becomes what l's was: l's value moves onto b, and b's
+    # own pre-fold value ceases to exist.
+    fold_log.record_move(orphan=l, survivor=b)
     b.out_bias = b.out_bias @ l.output_matrix + l.output_bias
     b.out_proj = b.out_proj @ l.output_matrix
     b.d_output = l.output_matrix.shape[1]
@@ -100,6 +142,7 @@ def _fold_through_concatenate(
     consumers: Dict[Node, List[Node]],
     touched: Set[Node],
     mutated: Set[Node],
+    fold_log: FoldLog,
 ) -> int:
     """Fold foldable leaves of single-consumer ``c`` into ``l``'s row blocks.
 
@@ -160,6 +203,7 @@ def _fold_through_concatenate(
     new_leaves: List[Node] = []
     bias = l.output_bias
     offset = 0
+    value_folds = 0  # leaf folds that change c's value (splices don't)
     for leaf in leaves:
         w = len(leaf)
         m = l.output_matrix[offset : offset + w]
@@ -168,6 +212,7 @@ def _fold_through_concatenate(
         if allow_value_folds and isinstance(leaf, LiteralValue) and has_non_literal:
             bias = bias + leaf.value @ m
             applied += 1
+            value_folds += 1
             continue
 
         if (
@@ -186,6 +231,7 @@ def _fold_through_concatenate(
                 new_leaves.append(leaf.inputs[0])
                 touched.add(leaf)
                 applied += 1
+                value_folds += 1
                 continue
 
         blocks.append(m)
@@ -203,13 +249,17 @@ def _fold_through_concatenate(
         c.inputs = new_leaves
         c.d_output = sum(len(x) for x in new_leaves)
         mutated.add(c)
+        if value_folds:
+            fold_log.record_value_changed(c)
     touched.add(c)
     touched.add(l)
     mutated.add(l)
     return applied
 
 
-def _fuse_one_pass(output_nodes: Set[Node], verbose: bool, mutated: Set[Node]) -> int:
+def _fuse_one_pass(
+    output_nodes: Set[Node], verbose: bool, mutated: Set[Node], fold_log: FoldLog
+) -> int:
     """One fusion round: apply a set of non-overlapping folds, return the count.
 
     Each node participates in at most one fold per pass (a node touched as a
@@ -244,7 +294,7 @@ def _fuse_one_pass(output_nodes: Set[Node], verbose: bool, mutated: Set[Node]) -
             if isinstance(inp, Concatenate):
                 if len(consumers.get(inp, [])) == 1:
                     applied += _fold_through_concatenate(
-                        node, inp, output_nodes, consumers, touched, mutated
+                        node, inp, output_nodes, consumers, touched, mutated, fold_log
                     )
                 continue
             if len(consumers.get(inp, [])) != 1:
@@ -279,7 +329,7 @@ def _fuse_one_pass(output_nodes: Set[Node], verbose: bool, mutated: Set[Node]) -
                 new = n_lanes * d_z + d_z
                 if not param_delta_ok(new, old):
                     continue
-                _fold_ffn_into_linear(b, consumers)
+                _fold_ffn_into_linear(b, consumers, fold_log)
                 touched.add(b)
                 touched.add(l)
                 mutated.add(b)
@@ -318,6 +368,7 @@ def _fuse_one_pass(output_nodes: Set[Node], verbose: bool, mutated: Set[Node]) -
 def fuse_consecutive_linears(
     output_nodes: Set[Node],
     verbose: bool = False,
+    fold_log: Optional[FoldLog] = None,
 ) -> int:
     """Fuse adjacent linear maps, FFN-aware, until no more folds apply.
 
@@ -364,14 +415,21 @@ def fuse_consecutive_linears(
         output_nodes: The graph's output nodes (used to find all ancestors and
             to protect caller-held output identity).
         verbose: Print per-pass fold counts.
+        fold_log: When given, records which nodes' values moved to a
+            different holder and which surviving nodes no longer compute
+            their pre-fusion value (see :class:`FoldLog`) — the lowering
+            boundary uses this to keep its source→copy node map
+            value-correct.
 
     Returns:
         Total number of folds performed.
     """
     total = 0
     mutated: Set[Node] = set()
+    if fold_log is None:
+        fold_log = FoldLog()
     while True:
-        n = _fuse_one_pass(output_nodes, verbose, mutated)
+        n = _fuse_one_pass(output_nodes, verbose, mutated, fold_log)
         total += n
         if n == 0:
             break

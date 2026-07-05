@@ -407,15 +407,19 @@ def test_floor_probe_infeasible_falls_back_to_descent():
 
     torch.manual_seed(0)
     x = create_input("x", 4)
-    # 8 independent chains x -> Li(12 cols) -> Mi(2 cols).  The critical
-    # path is short, but at d=48 the Li's cannot coexist, so any schedule
-    # is far deeper than critical_path + 1 — the probe horizon is
-    # infeasible by construction.
+    # 8 independent chains x -> Li(12 cols) -> two Mi(2 cols) each.  The
+    # critical path is short, but at d=48 the Li's cannot coexist, so any
+    # schedule is far deeper than critical_path + 1 — the probe horizon
+    # is infeasible by construction.  Each Li feeds TWO Ms so the
+    # lowering boundary's linear fusion can't absorb it (multi-consumer),
+    # and the Mi->out concat fold is declined by the parameter guard
+    # (12->2 bottleneck against a width-4 output).
     mids = []
     for i in range(8):
         li = Linear(x, torch.randn(4, 12), torch.zeros(12), name=f"L{i}")
-        mids.append(Linear(li, torch.randn(12, 2), torch.zeros(2), name=f"M{i}"))
-    out = Linear(Concatenate(mids), torch.randn(16, 4), torch.zeros(4), name="out")
+        mids.append(Linear(li, torch.randn(12, 2), torch.zeros(2), name=f"Ma{i}"))
+        mids.append(Linear(li, torch.randn(12, 2), torch.zeros(2), name=f"Mb{i}"))
+    out = Linear(Concatenate(mids), torch.randn(32, 4), torch.zeros(4), name="out")
     cp = critical_path_layers(out)
     net = forward_compile(
         d=48,

@@ -39,11 +39,12 @@ D_HEAD = 16
 
 
 def _idchain(x, depth, name):
-    """A chain of ``depth`` identity Linears — forces ``depth`` layers of
-    dependency without changing the value (each ``Linear(h, I, 0) == h``)."""
+    """A chain of ``depth`` self-Adds — forces ``depth`` layers of
+    dependency (each layer doubles the value; identity Linears would be
+    absorbed by the lowering boundary's fusion and force nothing)."""
     h = x
-    for i in range(depth):
-        h = Linear(h, torch.eye(len(x)), torch.zeros(len(x)), name=f"{name}{i}")
+    for _ in range(depth):
+        h = add(h, h)
     return h
 
 
@@ -85,9 +86,7 @@ def test_deep_literal_not_prefilled_and_materialized_in_interior():
     consumed = add(h, lit)  # the constant's only consumer — deep
     out = _idchain(consumed, 3, "post")  # downstream work after the consumer
 
-    net = forward_compile(
-        d=D, d_head=D_HEAD, output_node=out, verbose=False
-    )
+    net = forward_compile(d=D, d_head=D_HEAD, output_node=out, verbose=False)
     ra = net.residual_assignment
 
     # (1) The constant is not baked into the layer-0 input residual stream.
@@ -179,9 +178,7 @@ def test_shared_literal_two_consumers_correct():
     # materialized node (a bare Concatenate isn't keyed in compute()'s result).
     out = Linear(concat([shallow, deep]), torch.eye(4), torch.zeros(4), name="out")
 
-    net = forward_compile(
-        d=D, d_head=D_HEAD, output_node=out, verbose=False
-    )
+    net = forward_compile(d=D, d_head=D_HEAD, output_node=out, verbose=False)
     xv = torch.randn(3, 2)
     result = net.compute(3, {"x": xv})
     assert torch.allclose(result[out].cpu(), out.compute(3, {"x": xv}), atol=1e-3)
@@ -208,9 +205,7 @@ def test_deep_attention_fed_constant_matches_oracle():
     v = concat([h, lit])  # the constant is part of the attention value
     out = attend_to_offset(rope, v, delta_pos=-1)
 
-    net = forward_compile(
-        d=D, d_head=D_HEAD, output_node=out, verbose=False
-    )
+    net = forward_compile(d=D, d_head=D_HEAD, output_node=out, verbose=False)
     # Not prefilled — materialized as a schedulable node.
     assert lit not in net.residual_assignment.get_nodes(net.layers[0].attn.in_state)
     n_pos = 5
@@ -247,9 +242,7 @@ def test_literal_into_recycled_column_is_clean():
     lit = create_literal_value(torch.full((8,), 5.0))
     out = add(deep, lit)
 
-    net = forward_compile(
-        d=64, d_head=16, output_node=out, verbose=False
-    )
+    net = forward_compile(d=64, d_head=16, output_node=out, verbose=False)
     xv = torch.randn(5, 8)
     result = net.compute(5, {"x": xv})
     assert torch.allclose(result[out].cpu(), out.compute(5, {"x": xv}), atol=1e-3)
@@ -272,9 +265,7 @@ def _consumer_layer(other_kind):
     else:
         other = create_input("c", 2, value_range=(-5.0, 5.0))
     out = add(deep, other)
-    net = forward_compile(
-        d=D, d_head=D_HEAD, output_node=out, verbose=False
-    )
+    net = forward_compile(d=D, d_head=D_HEAD, output_node=out, verbose=False)
     return _first_layer(net, out)
 
 
@@ -310,9 +301,7 @@ def test_jit_graph_passes_end_of_layer_liveness(monkeypatch):
     lit = create_literal_value(torch.tensor([7.0, -3.0]))
     out = add(deep, lit)
 
-    net = forward_compile(
-        d=D, d_head=D_HEAD, output_node=out, verbose=False
-    )
+    net = forward_compile(d=D, d_head=D_HEAD, output_node=out, verbose=False)
     xv = torch.randn(3, 2)
     assert torch.allclose(
         net.compute(3, {"x": xv})[out].cpu(), out.compute(3, {"x": xv}), atol=1e-3

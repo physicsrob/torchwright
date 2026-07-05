@@ -3,7 +3,7 @@
 ``lower()`` is the single moment a graph transitions from "whatever the
 ops layer built" to "certified compilable vocabulary"
 (``docs/lowering_boundary_plan.md``, ``docs/lowering_copy_plan.md``).
-Constructing a :class:`LoweredGraph` does three things:
+Constructing a :class:`LoweredGraph` does four things:
 
 1. **Closed vocabulary** — every reachable node is one of the compilable
    types (FFN, Attn, Linear, Add), bookkeeping (InputNode, LiteralValue,
@@ -24,7 +24,16 @@ Constructing a :class:`LoweredGraph` does three things:
    touches.  The source keeps its Assert/DebugWatch wrappers and its
    bounds forever; recompiling is re-lowering the same pristine source.
 
-3. **The wrapper strip, on the copy** — Assert/DebugWatch wrappers are
+3. **Linear fusion, on the copy** — ``fuse_consecutive_linears`` runs on
+   the copy before the wrapper strip (wrappers block folds exactly as
+   they did when callers pre-fused their source graphs, and the bounds
+   refresh re-derives claims through the Assert rule).  Every compile
+   gets the fused schedule; no caller-side pre-pass is needed, and the
+   source graph stays unfused.  Fusion orphans some copy nodes and
+   changes what a few survivors compute, so ``node_map`` tracks values:
+   a source node whose value no longer exists in the copy has no entry.
+
+4. **The wrapper strip, on the copy** — Assert/DebugWatch wrappers are
    removed from the *copy* (their claimed ranges tightened onto the
    wrapped nodes' types first), so the scheduler, weight writer, and
    certifications see a wrapper-free graph with claim-tightened bounds.
@@ -45,6 +54,7 @@ from torchwright.compiler.realization import (
 )
 from torchwright.compiler.utils import get_ancestor_nodes
 from torchwright.graph import Node
+from torchwright.graph.optimize import FoldLog, fuse_consecutive_linears
 from torchwright.graph.attn import Attn
 from torchwright.graph.ffn import FFN
 from torchwright.graph.embedding import Embedding
@@ -104,9 +114,13 @@ class LoweredGraph:
     (the static policy at ``optimize=0``; the CP-SAT solve on the directed
     path) turns the table into the resolved artifact the layer walk reads.
 
-    ``node_map`` maps every reachable source node to its clone; source
-    Assert/DebugWatch wrappers map to the clone of the node they wrap
-    (the copy is stripped, so the wrappers' clones are not part of it).
+    ``node_map`` maps each reachable source node to the copy node that
+    computes its value; source Assert/DebugWatch wrappers map to the
+    clone of the node they wrap (the copy is stripped, so the wrappers'
+    clones are not part of it).  The map is **partial**: a source node
+    fused away during lowering (its value absorbed into a survivor's
+    weights) has no entry, and a source node whose value moved onto a
+    fold survivor maps to that survivor.
     The realization table — like everything the compile pipeline sees —
     is keyed by *copy* node ids; translate through :meth:`copy_of` when
     querying it with source nodes.
@@ -118,14 +132,17 @@ class LoweredGraph:
     node_map: Dict[Node, Node] = field(default_factory=dict)
 
     def copy_of(self, source_node: Node) -> Node:
-        """The compiler-private clone of ``source_node`` (wrappers resolve
-        to the clone of the node they wrap)."""
+        """The copy node computing ``source_node``'s value (wrappers
+        resolve to the clone of the node they wrap)."""
         try:
             return self.node_map[source_node]
         except KeyError:
             raise KeyError(
-                f"{source_node!r} is not reachable from the lowered graph's "
-                f"source output — no clone exists for it"
+                f"{source_node!r} has no counterpart in the lowered graph — "
+                f"either it is not reachable from the source output, or "
+                f"linear fusion at the lowering boundary absorbed its value "
+                f"into a survivor's weights (fused-away nodes are not "
+                f"probeable)"
             ) from None
 
     def cost_summary(
@@ -360,11 +377,13 @@ def lower(output_node: Node, *, verbose: bool = False) -> LoweredGraph:
 
     Compilation is a pure function of the source graph: this validates
     the closed vocabulary, builds the compiler-private copy (fresh
-    derived caches by construction), strips Assert/DebugWatch wrappers
-    from the copy with their claims tightened onto the wrapped nodes,
-    and returns the :class:`LoweredGraph` certificate the compile
-    pipeline consumes.  The source graph — nodes, wiring, wrappers,
-    cached bounds — is never touched.
+    derived caches by construction), runs linear fusion on the copy
+    (every compile gets the fused schedule — callers no longer pre-fuse),
+    strips Assert/DebugWatch wrappers from the copy with their claims
+    tightened onto the wrapped nodes, and returns the
+    :class:`LoweredGraph` certificate the compile pipeline consumes.
+    The source graph — nodes, wiring, wrappers, cached bounds — is never
+    touched.
 
     Args:
         output_node: The source graph's output node.
@@ -387,17 +406,54 @@ def lower(output_node: Node, *, verbose: bool = False) -> LoweredGraph:
     _check_vocabulary(all_nodes)
 
     copy = clone_graph(output_node, _CLONE_DISPATCH)
-    copy_output = _strip_debug_wrappers(copy.output_node)
-    # Wrapper sources resolve to the clone of the node they wrap — the
-    # stripped wrapper clones are no longer part of the copy.
-    node_map = {src: _unwrap(clone) for src, clone in copy.node_map.items()}
 
+    # Linear fusion, on the copy, BEFORE the wrapper strip: with the
+    # wrappers still present the folds fire exactly as they did when
+    # callers fused their source graphs (a wrapper on a value blocks the
+    # fold that would absorb it), and the post-fusion bounds refresh can
+    # re-derive claims through the Assert affine rule.  The source graph
+    # is never touched — fusing here is what lets it stay pristine.
+    fold_log = FoldLog()
+    n_fused = fuse_consecutive_linears({copy.output_node}, fold_log=fold_log)
+
+    copy_output = _strip_debug_wrappers(copy.output_node)
     copy_nodes = get_ancestor_nodes({copy_output})
+
+    if not n_fused:
+        # Wrapper sources resolve to the clone of the node they wrap —
+        # the stripped wrapper clones are no longer part of the copy.
+        node_map = {src: _unwrap(clone) for src, clone in copy.node_map.items()}
+    else:
+        # Fusion orphans copy nodes and changes what some survivors
+        # compute, so the map must track VALUES, not object identity: a
+        # source node maps to the copy node that computes its value, or
+        # to nothing if that value no longer exists in the copy.
+        # Wrapper sources are resolved through their SOURCE wrapped node
+        # (a wrapper's value is its wrapped node's value) — resolving
+        # through the clone would be wrong when a fold rewired the clone
+        # wrapper onto a survivor whose own mapping is dropped.
+        node_map: Dict[Node, Node] = {}
+        for src, clone in copy.node_map.items():
+            if isinstance(src, (Assert, DebugWatch)):
+                continue
+            survivor = fold_log.moves.get(clone)
+            if survivor is not None:
+                node_map[src] = survivor
+            elif clone in fold_log.value_changed or clone not in copy_nodes:
+                continue  # value gone (changed in place, or orphaned)
+            else:
+                node_map[src] = clone
+        for src in copy.node_map:
+            if isinstance(src, (Assert, DebugWatch)):
+                target = node_map.get(_unwrap(src))
+                if target is not None:
+                    node_map[src] = target
+
     table = RealizationTable.build(copy_nodes)
     if verbose:
         print(
             f"lower(): certified {len(all_nodes)} nodes "
-            f"(vocabulary + compiler-private copy)"
+            f"(vocabulary + compiler-private copy), fused {n_fused} pair(s)"
         )
     return LoweredGraph(
         output_node=copy_output,

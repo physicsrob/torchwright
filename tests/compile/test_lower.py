@@ -132,7 +132,10 @@ def test_lower_copy_has_fresh_bounds_source_keeps_stale():
     x = create_input("x", 4, value_range=(-1.0, 1.0))
     l1 = Linear(x, torch.randn(4, 6) * 0.2, torch.randn(6) * 0.1)
     blk = _block(l1, 6, 8, 5, seed=3)
-    sink = Concatenate([blk])
+    # l1 feeds both the FFN and the sink: two consumers, so boundary
+    # fusion declines the Linear->FFN gate fold and l1's clone survives
+    # (this test is about bound freshness, not fusion).
+    sink = Concatenate([blk, l1])
 
     stale = l1._affine_bound.to_scalar_range()
     l1.output_matrix = l1.output_matrix * 3.0  # stale-making mutation
@@ -255,3 +258,138 @@ def test_forward_compile_rejects_uncertified_graph():
     l2 = Linear(relu, torch.randn(6, 3), torch.randn(3))
     with pytest.raises(LoweringError, match="chain"):
         forward_compile(d=64, d_head=8, output_node=l2, verbose=False)
+
+
+# ---------------------------------------------------------------------------
+# Linear fusion at the boundary (runs on the copy; source stays unfused)
+# ---------------------------------------------------------------------------
+
+
+def test_lower_fuses_copy_and_leaves_source_unfused():
+    """lower() fuses the compiler-private copy; the source keeps its
+    Linear -> Linear chain, and the fused copy computes the same value."""
+    x = create_input("x", 4, value_range=(-2.0, 2.0))
+    l1 = Linear(x, torch.randn(4, 3) * 0.3, torch.randn(3) * 0.1, name="l1")
+    l2 = Linear(l1, torch.randn(3, 2) * 0.3, torch.randn(2) * 0.1, name="l2")
+    m2_before = l2.output_matrix.clone()
+
+    lowered = lower(l2)
+
+    # Source untouched.
+    assert l2.inputs[0] is l1
+    assert l1.inputs[0] is x
+    assert torch.equal(l2.output_matrix, m2_before)
+
+    # Copy fused: the output clone reads x's clone directly.
+    out = lowered.output_node
+    assert isinstance(out, Linear)
+    assert out.d_input == 4
+    assert out.output_matrix.shape == (4, 2)
+
+    n_pos = 5
+    xt = torch.randn(n_pos, 4)
+    assert torch.allclose(
+        out.compute(n_pos, {"x": xt}), l2.compute(n_pos, {"x": xt}), atol=1e-5
+    )
+
+
+def test_lower_node_map_drops_fused_away_nodes():
+    """A source node whose value was absorbed into a survivor's weights has
+    no counterpart; copy_of names fusion in the error."""
+    x = create_input("x", 4, value_range=(-2.0, 2.0))
+    l1 = Linear(x, torch.randn(4, 3), torch.randn(3), name="l1")
+    l2 = Linear(l1, torch.randn(3, 2), torch.randn(2), name="l2")
+
+    lowered = lower(l2)
+    assert lowered.copy_of(l2) is lowered.output_node
+    with pytest.raises(KeyError, match="fused-away"):
+        lowered.copy_of(l1)
+
+
+def test_lower_node_map_follows_value_move():
+    """The FFN->Linear fold moves the Linear's value onto the FFN: the source
+    Linear maps to the surviving copy FFN, and the source FFN (whose own
+    value no longer exists) has no counterpart."""
+    x = create_input("x", 6, value_range=(-2.0, 2.0))
+    blk = _block(x, 6, 8, 4, seed=11)
+    l = Linear(blk, torch.randn(4, 3) * 0.2, torch.randn(3) * 0.1, name="l")
+    sink = Concatenate([l])  # keep l off the output boundary
+
+    lowered = lower(sink)
+    moved = lowered.copy_of(l)
+    assert isinstance(moved, FFN)
+
+    n_pos = 5
+    xt = torch.randn(n_pos, 6)
+    assert torch.allclose(
+        moved.compute(n_pos, {"x": xt}), l.compute(n_pos, {"x": xt}), atol=1e-5
+    )
+    with pytest.raises(KeyError):
+        lowered.copy_of(blk)
+
+
+def test_lower_node_map_concat_fold():
+    """Concat-fold survivors keep their mapping; absorbed leaves and the
+    value-changed concat lose theirs."""
+    a = create_input("a", 4, value_range=(-2.0, 2.0))
+    b = create_input("b", 5, value_range=(-2.0, 2.0))
+    leaf1 = Linear(a, torch.randn(4, 3) * 0.3, torch.randn(3) * 0.1, name="leaf1")
+    leaf2 = Linear(b, torch.randn(5, 2) * 0.3, torch.randn(2) * 0.1, name="leaf2")
+    c = Concatenate([leaf1, leaf2])
+    top = Linear(c, torch.randn(5, 4) * 0.3, torch.randn(4) * 0.1, name="top")
+
+    lowered = lower(top)
+    out = lowered.output_node
+    assert lowered.copy_of(top) is out
+    assert out.d_input == 9  # reads the inputs' clones directly
+
+    for fused_away in (leaf1, leaf2, c):
+        with pytest.raises(KeyError):
+            lowered.copy_of(fused_away)
+
+    # Source untouched.
+    assert c.inputs == [leaf1, leaf2]
+    assert top.d_input == 5
+
+    n_pos = 5
+    vals = {"a": torch.randn(n_pos, 4), "b": torch.randn(n_pos, 5)}
+    assert torch.allclose(out.compute(n_pos, vals), top.compute(n_pos, vals), atol=1e-5)
+
+
+def test_lower_assert_on_moved_value_survives():
+    """An Assert wrapping the orphaned Linear of an FFN->Linear fold ends up
+    wrapping the survivor on the copy; the wrapper's node_map entry resolves
+    to the survivor (its value is the wrapped node's value)."""
+    x = create_input("x", 6, value_range=(-1.0, 1.0))
+    blk = _block(x, 6, 8, 4, seed=12)
+    l = Linear(blk, torch.randn(4, 3) * 0.1, torch.randn(3) * 0.05, name="l")
+    wrapped = assert_in_range(l, -1000.0, 1000.0)
+    sink = Concatenate([wrapped])
+
+    lowered = lower(sink)
+    moved = lowered.copy_of(l)
+    assert isinstance(moved, FFN)
+    assert lowered.copy_of(wrapped) is moved
+
+
+def test_compiled_debug_value_speaks_source_after_fusion():
+    """debug_value keys by source node: the fused-away Linear returns None,
+    the survivor returns the oracle value."""
+    from torchwright.compiler.export import compile_headless
+
+    x = create_input("x", 4, value_range=(-2.0, 2.0))
+    # The assert (on the input, so it blocks no fold) keeps the debug
+    # forward's snapshot capture active for debug_value.
+    xw = assert_in_range(x, -100.0, 100.0)
+    l1 = Linear(xw, torch.randn(4, 3) * 0.3, torch.randn(3) * 0.1, name="l1")
+    l2 = Linear(l1, torch.randn(3, 2) * 0.3, torch.randn(2) * 0.1, name="l2")
+
+    compiled = compile_headless(l2, d=64, d_head=8)
+    n_pos = 4
+    xt = torch.randn(n_pos, 4)
+    compiled(xt, debug=True)
+
+    assert compiled.debug_value(l1) is None  # fused away at lowering
+    val = compiled.debug_value(l2)
+    assert val is not None
+    assert torch.allclose(val, l2.compute(n_pos, {"x": xt}), atol=1e-3)

@@ -64,15 +64,20 @@ def test_probe_residual_reads_intermediate_node():
     """Compile a tiny chain and confirm ``probe_residual`` reports the
     intermediate node's value at the layer that materialises it.
 
-    Graph: y = 3*x, z = y + 1.  Compile with output z, probe y.  Every
-    layer that has y live must hold 3*x; empty per_layer would indicate
-    the probe failed to surface the node.
+    Graph: y = 3*x, z = y + 1.  Compile with output [z, y], probe y.
+    (y is also an output leaf so it has two consumers — otherwise the
+    lowering boundary's linear fusion would absorb it into z and there
+    would be no intermediate to probe.)  Every layer that has y live
+    must hold 3*x; empty per_layer would indicate the probe failed to
+    surface the node.
     """
+    from torchwright.graph.misc import Concatenate
+
     x = create_input(2)
     y = multiply_const(x, 3.0)
     z = add_const(y, 1.0)
     module = compile_headless(
-        z,
+        Concatenate([z, y]),
         d=64,
         verbose=False,
     )

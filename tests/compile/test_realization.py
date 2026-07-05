@@ -192,18 +192,21 @@ def _chain_graph():
     x = create_input("x", 4, value_range=(-1.0, 1.0))
     l1 = Linear(x, torch.randn(4, 4) * 0.2, torch.randn(4) * 0.1, name="l1")
     l2 = Linear(l1, torch.randn(4, 4) * 0.2, torch.randn(4) * 0.1, name="l2")
-    return l2, l1
+    # l1 is also an output leaf: two consumers, so the lowering boundary's
+    # fusion declines the Linear->Linear fold and both nodes get entries.
+    out = Concatenate([l2, l1])
+    return out, l1, l2
 
 
 def test_compile_records_resolved_table():
     from torchwright.compiler.forward.compile import forward_compile
 
-    out, l1 = _chain_graph()
+    out, l1, l2 = _chain_graph()
     net = forward_compile(d=64, d_head=8, output_node=out, verbose=False)
     table = net.realization_table
     # Default policy routes standalone Linears to the MLP bypass.
     assert table.resolved_class(l1) == MLP_BYPASS
-    assert table.resolved_class(out) == MLP_BYPASS
+    assert table.resolved_class(l2) == MLP_BYPASS
 
 
 def test_cost_summary_static_hand_computed():
@@ -263,7 +266,7 @@ def test_eager_and_directed_tables_agree_when_flex_pinned():
     the one-option-set property, exercised end to end."""
     from torchwright.compiler.forward.compile import forward_compile
 
-    out, l1 = _chain_graph()
+    out, _, _ = _chain_graph()
     net0 = forward_compile(d=64, d_head=8, output_node=out, verbose=False)
     net1 = forward_compile(
         d=64,
