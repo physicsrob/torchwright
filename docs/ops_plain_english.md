@@ -101,6 +101,7 @@ scalar_to_embedding, floor_int, table_lookup_2d.
 | bool_not, bool_any_true, bool_all_true | compare (+ sum_nodes) |
 | clamp, reciprocal, thermometer_floor_div, mod_const, global_position_from_bos | piecewise_linear |
 | ceil_int | floor_int |
+| radix_floor_int | floor_int ×3 (hi floor → integer snap → lo floor over [−1, D]) + Linears; ~8.5·√N lanes vs 3N flat, ~√N-wide intermediates — see the op docstring for the snap/compensation contract |
 | switch | cond_gate + sum_nodes |
 | dynamic_extract | in_range + broadcast_select |
 | digit_to_scaled_scalar, digits_to_number, number_to_digit_scalars | map_to_table, thermometer_floor_div |

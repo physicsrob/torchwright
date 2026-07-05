@@ -75,7 +75,7 @@ def abs(inp: Node) -> Node:
     .. noise-footer::
 
        Max error: 0 abs, 0 rel over 4096 samples;
-       measured at commit 2d6463c. See docs/numerical_noise.md.
+       measured at commit 2fb6bd6. See docs/numerical_noise.md.
     """
     return relu_add(inp, negate(inp))
 
@@ -121,7 +121,7 @@ def compare(
     .. noise-footer::
 
        Max error: 1.998 abs, 1.998 rel over 8192 samples;
-       measured at commit 2d6463c. See docs/numerical_noise.md.
+       measured at commit 2fb6bd6. See docs/numerical_noise.md.
     """
 
     assert len(inp) == 1, "Input must be a 1D scalar node"
@@ -181,7 +181,7 @@ def min(inp1: Node, inp2: Node) -> Node:
     .. noise-footer::
 
        Max error: 3.815e-06 abs, 1.953e-06 rel over 4096 samples;
-       measured at commit 2d6463c. See docs/numerical_noise.md.
+       measured at commit 2fb6bd6. See docs/numerical_noise.md.
     """
     assert len(inp1) == len(inp2)
     diff = subtract(inp1, inp2)
@@ -250,7 +250,7 @@ def piecewise_linear(
     .. noise-footer::
 
        Max error: 0.25 abs, 231.1 rel over 4096 samples;
-       measured at commit 2d6463c. See docs/numerical_noise.md.
+       measured at commit 2fb6bd6. See docs/numerical_noise.md.
     """
     assert len(inp) == 1, "Input must be a 1D scalar node"
     n = len(breakpoints)
@@ -523,7 +523,7 @@ def multiply_2d(
     .. noise-footer::
 
        Max error: 0.06249 abs, 2.15 rel over 4096 samples;
-       measured at commit 2d6463c. See docs/numerical_noise.md.
+       measured at commit 2fb6bd6. See docs/numerical_noise.md.
     """
     assert len(inp1) == 1, "inp1 must be a 1D scalar node"
     assert len(inp2) == 1, "inp2 must be a 1D scalar node"
@@ -668,7 +668,7 @@ def square(inp: Node, max_value: float, step: float = 1.0) -> Node:
     .. noise-footer::
 
        Max error: 0.25 abs, 231.1 rel over 4096 samples;
-       measured at commit 2d6463c. See docs/numerical_noise.md.
+       measured at commit 2fb6bd6. See docs/numerical_noise.md.
     """
     assert len(inp) == 1, "Input must be a 1D scalar node"
     assert max_value > 0, "max_value must be positive"
@@ -718,7 +718,7 @@ def thermometer_floor_div(inp: Node, divisor: int, max_value: int) -> Node:
     .. noise-footer::
 
        Max error: 0 abs, 0 rel over 4096 samples;
-       measured at commit 2d6463c. See docs/numerical_noise.md.
+       measured at commit 2fb6bd6. See docs/numerical_noise.md.
     """
     assert len(inp) == 1, "Input must be a 1D scalar node"
     n = max_value // divisor
@@ -768,7 +768,7 @@ def mod_const(inp: Node, divisor: int, max_value: int) -> Node:
     .. noise-footer::
 
        Max error: 0 abs, 0 rel over 4096 samples;
-       measured at commit 2d6463c. See docs/numerical_noise.md.
+       measured at commit 2fb6bd6. See docs/numerical_noise.md.
     """
     assert len(inp) == 1, "Input must be a 1D scalar node"
     assert divisor > 0, "divisor must be positive"
@@ -794,7 +794,7 @@ def clamp(inp: Node, lo: float, hi: float) -> Node:
     .. noise-footer::
 
        Max error: 1.907e-06 abs, 0.0002899 rel over 4096 samples;
-       measured at commit 2d6463c. See docs/numerical_noise.md.
+       measured at commit 2fb6bd6. See docs/numerical_noise.md.
     """
     assert len(inp) == 1, "Input must be a 1D scalar node"
     assert hi > lo, "hi must exceed lo"
@@ -838,7 +838,7 @@ def reciprocal(
     .. noise-footer::
 
        Max error: 0.0008245 abs, 0.1361 rel over 4096 samples;
-       measured at commit 2d6463c. See docs/numerical_noise.md.
+       measured at commit 2fb6bd6. See docs/numerical_noise.md.
     """
     assert len(inp) == 1, "Input must be a 1D scalar node"
     assert min_value > 0, "min_value must be positive"
@@ -895,7 +895,7 @@ def floor_int(
     .. noise-footer::
 
        Max error: 0.9993 abs, 0.953 rel over 8192 samples;
-       measured at commit 2d6463c. See docs/numerical_noise.md.
+       measured at commit 2fb6bd6. See docs/numerical_noise.md.
     """
     assert len(inp) == 1, "Input must be a 1D scalar node"
     assert max_value >= min_value
@@ -1008,7 +1008,7 @@ def ceil_int(
     .. noise-footer::
 
        Max error: 0 abs, 0 rel over 4096 samples;
-       measured at commit 2d6463c. See docs/numerical_noise.md.
+       measured at commit 2fb6bd6. See docs/numerical_noise.md.
     """
     assert len(inp) == 1, "Input must be a 1D scalar node"
     return negate(floor_int(negate(inp), -max_value, -min_value, sharpness=sharpness))
@@ -1052,7 +1052,7 @@ def multiply_integers(
     .. noise-footer::
 
        Max error: 0 abs, 0 rel over 4096 samples;
-       measured at commit 2d6463c. See docs/numerical_noise.md.
+       measured at commit 2fb6bd6. See docs/numerical_noise.md.
     """
     assert len(inp1) == 1, "Input must be a 1D scalar node"
     assert len(inp2) == 1, "Input must be a 1D scalar node"

@@ -288,6 +288,33 @@ def _near_threshold_1d(
     )
 
 
+def _below_multiples_1d(
+    name: str,
+    description: str,
+    multiple: float,
+    m_lo: int,
+    m_hi: int,
+    off_lo: float,
+    off_hi: float,
+    input_name: str = "x",
+    n_samples: int = 4096,
+    seed: int = 0,
+) -> InputDistribution:
+    """Samples at ``m·multiple − offset`` with the offset log-uniform in
+    ``[off_lo, off_hi]`` — stresses the sliver just below staircase
+    boundaries (``radix_floor_int``'s divisor boundaries, ramp zones)."""
+    gen = torch.Generator().manual_seed(seed)
+    m = torch.randint(m_lo, m_hi + 1, (n_samples, 1), generator=gen).to(torch.float32)
+    u = torch.rand((n_samples, 1), generator=gen)
+    off = off_lo * (off_hi / off_lo) ** u
+    return InputDistribution(
+        name=name,
+        description=description,
+        inputs={input_name: m * multiple - off},
+        n_samples=n_samples,
+    )
+
+
 def _bool_single_distribution(
     name: str, description: str, n_samples: int = 4096, seed: int = 0
 ) -> InputDistribution:
@@ -703,6 +730,38 @@ def _distributions() -> Dict[str, InputDistribution]:
             "ramp zone where `floor_int` interpolates.",
             5.0,
             0.2,
+        ),
+        "radix_floor_native_uniform": _uniform_1d(
+            "radix_floor_native_uniform",
+            "Uniform continuous samples on [-1023, 1023] — the DOOM native "
+            "texture-coordinate range (`render_ops.FLOOR_NATIVE`, the "
+            "production `radix_floor_int` call site, sharpness=10^4).",
+            -1023.0,
+            1023.0,
+        ),
+        "radix_floor_divisor_sliver": _below_multiples_1d(
+            "radix_floor_divisor_sliver",
+            "Samples just below multiples of the divisor D=64 (offsets "
+            "log-uniform in [1.2e-4, 6.3e-3]): inside the HI floor's ramp "
+            "but outside the LO floor's — the D-amplification hazard the "
+            "integer snap neutralizes. Expected ≈ exact.",
+            64.0,
+            -15,
+            15,
+            1.2e-4,
+            6.3e-3,
+        ),
+        "radix_floor_lo_ramp": _below_multiples_1d(
+            "radix_floor_lo_ramp",
+            "Samples within 1/sharpness below random integers in "
+            "[-1023, 1023] — inside the LO ramp, the same tolerated "
+            "interpolation window as flat `floor_int` (error up to 1 "
+            "step, never D-amplified).",
+            1.0,
+            -1022,
+            1023,
+            1e-6,
+            9.9e-5,
         ),
         "thermometer_integers_0_100_by10": _integer_1d(
             "thermometer_integers_0_100_by10",
@@ -1706,6 +1765,32 @@ def _target_ops() -> List[TargetOp]:
             ),
             distribution_names=("ceil_integers_neg5_10",),
             notes="−floor_int(−x); inherits floor_int's entry.",
+        ),
+        TargetOp(
+            name="radix_floor_int",
+            machine="swiglu",
+            module=_SWIGLU_ARITH,
+            source_file=_SWIGLU_ARITH_FILE,
+            input_specs={"x": 1},
+            build_graph=lambda nodes: swiglu_ops.radix_floor_int(
+                nodes["x"], min_value=-1023, max_value=1023, sharpness=10_000.0
+            ),
+            reference_fn=lambda inputs: _floor_ref(inputs["x"], -1023.0, 1023.0),
+            distribution_names=(
+                "radix_floor_native_uniform",
+                "radix_floor_divisor_sliver",
+                "radix_floor_lo_ramp",
+            ),
+            notes=(
+                "floor(x) as hi-floor -> integer snap -> lo-floor over "
+                "[-1, D] (D = power of two nearest sqrt(2N)); ~8.5*sqrt(N) "
+                "lanes vs 3N flat, intermediates ~sqrt(N) wide. The snapped "
+                "hi and the extended lo range make the divisor-boundary "
+                "sliver reconstruct exactly (no D-amplification); the LO "
+                "ramp keeps flat floor_int's tolerated ±1-step window. "
+                "Measured at the DOOM native-coordinate configuration "
+                "(N=2046, s=10^4, D=64)."
+            ),
         ),
         TargetOp(
             name="table_lookup_2d",

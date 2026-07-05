@@ -366,6 +366,35 @@ relu precedent in having no noise entry (embedding-space output); its
 unit tests pin exact digit reconstruction and the ±0.4 input headroom,
 and its spacing audit closes in closed form (scale > 34, cleared 3x).
 
+### swiglu radix_floor_int: the divisor-boundary sliver measures exactly 0
+
+The radix split (hi floor → integer snap → lo floor over the extended
+range [−1, D]) was built so the hi floor's boundary sliver — where a
+fractional hi would be amplified ×D by the recombine, the emit
+digit-quad's find-#3 hazard — cannot reach the output: the snap
+collapses hi to one of the two neighboring integers, and *either*
+reconstructs exactly because the lo floor's input is computed from x
+directly (it carries x's own fractional part) and its extended range
+absorbs both cases. The dedicated `radix_floor_divisor_sliver`
+distribution (4,096 samples just below multiples of D=64, inside the
+hi ramp / outside the lo ramp, at the production N=2046 s=10^4
+configuration) measures **exactly 0** — the derivation is not just
+within tolerance, it is exact where the flat form is exact.
+
+The other two distributions read as designed: `radix_floor_lo_ramp`
+maxes at 1.0 (inside the 1/sharpness window below an integer the
+output interpolates within ±1 step — flat `floor_int`'s identical
+tolerated artefact, never D-amplified), and
+`radix_floor_native_uniform` shows one 1.0-max sample which IS that
+same window: the worst input reports as “−341.0” only because the
+JSON rounds to 6 significant figures — the actual draw is
+−341.0000305, a 3e-5 gap below the integer. Exact integer inputs are
+exact (unit-pinned). The residual hazard — hi ramp *and* snap ramp hit
+together, where D-amplified error survives — is the product of two
+independent slivers (~`D/(hi_sharpness·N) × 1/step_sharpness` of the
+range); callers shrink it with `hi_sharpness`, as the emit digit-quad
+does.
+
 ### swiglu table_lookup_2d: exact 0 on the integer grid; the family's last offset dies
 
 The gated column stage — one gated lane per boundary whose up row reads

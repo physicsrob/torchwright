@@ -1,7 +1,7 @@
 {
   "schema_version": 2,
-  "commit": "2d6463c",
-  "measured_at": "2026-07-04",
+  "commit": "2fb6bd6",
+  "measured_at": "2026-07-05",
   "ops": [
     {
       "name": "abs",
@@ -986,6 +986,59 @@
           "rel_valid_samples": 4094,
           "worst_input": {
             "x": 6.49947
+          }
+        }
+      ]
+    },
+    {
+      "name": "radix_floor_int",
+      "machine": "swiglu",
+      "module": "torchwright.ops.swiglu.arithmetic_ops",
+      "notes": "floor(x) as hi-floor -> integer snap -> lo-floor over [-1, D] (D = power of two nearest sqrt(2N)); ~8.5*sqrt(N) lanes vs 3N flat, intermediates ~sqrt(N) wide. The snapped hi and the extended lo range make the divisor-boundary sliver reconstruct exactly (no D-amplification); the LO ramp keeps flat floor_int's tolerated ±1-step window. Measured at the DOOM native-coordinate configuration (N=2046, s=10^4, D=64).",
+      "distributions": [
+        {
+          "name": "radix_floor_divisor_sliver",
+          "description": "Samples just below multiples of the divisor D=64 (offsets log-uniform in [1.2e-4, 6.3e-3]): inside the HI floor's ramp but outside the LO floor's — the D-amplification hazard the integer snap neutralizes. Expected ≈ exact.",
+          "n_samples": 4096,
+          "max_abs_error": 0.0,
+          "mean_abs_error": 0.0,
+          "p99_abs_error": 0.0,
+          "max_rel_error": 0.0,
+          "mean_rel_error": 0.0,
+          "p99_rel_error": 0.0,
+          "rel_valid_samples": 4096,
+          "worst_input": {
+            "x": 191.996
+          }
+        },
+        {
+          "name": "radix_floor_lo_ramp",
+          "description": "Samples within 1/sharpness below random integers in [-1023, 1023] — inside the LO ramp, the same tolerated interpolation window as flat `floor_int` (error up to 1 step, never D-amplified).",
+          "n_samples": 4096,
+          "max_abs_error": 1.0,
+          "mean_abs_error": 0.266575,
+          "p99_abs_error": 1.0,
+          "max_rel_error": 1.0,
+          "mean_rel_error": 0.00500764,
+          "p99_rel_error": 0.0940628,
+          "rel_valid_samples": 4093,
+          "worst_input": {
+            "x": 217.0
+          }
+        },
+        {
+          "name": "radix_floor_native_uniform",
+          "description": "Uniform continuous samples on [-1023, 1023] — the DOOM native texture-coordinate range (`render_ops.FLOOR_NATIVE`, the production `radix_floor_int` call site, sharpness=10^4).",
+          "n_samples": 4096,
+          "max_abs_error": 1.0,
+          "mean_abs_error": 0.000244141,
+          "p99_abs_error": 0.0,
+          "max_rel_error": 0.00292398,
+          "mean_rel_error": 7.1421e-07,
+          "p99_rel_error": 0.0,
+          "rel_valid_samples": 4094,
+          "worst_input": {
+            "x": -341.0
           }
         }
       ]

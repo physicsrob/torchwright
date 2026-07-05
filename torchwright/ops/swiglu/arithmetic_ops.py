@@ -11,7 +11,7 @@ from typing import List, Optional
 
 import torch
 
-from torchwright.graph import Concatenate, Node
+from torchwright.graph import Concatenate, Linear, Node
 from torchwright.graph.asserts import assert_matches_value_type
 from torchwright.graph.value_type import NodeValueType, Range
 from torchwright.ops.const import min_d_hidden, scale, step_sharpness, swish_dip
@@ -71,7 +71,7 @@ def compare(
     .. noise-footer::
 
        Max error: 1.999 abs, 1.999 rel over 8192 samples;
-       measured at commit 2d6463c. See docs/numerical_noise.md.
+       measured at commit 2fb6bd6. See docs/numerical_noise.md.
     """
     assert len(inp) == 1, "Input must be a 1D scalar node"
 
@@ -138,7 +138,7 @@ def multiply(inp1: Node, inp2: Node) -> Node:
     .. noise-footer::
 
        Max error: 0.0009766 abs, 2.241e-07 rel over 8192 samples;
-       measured at commit 2d6463c. See docs/numerical_noise.md.
+       measured at commit 2fb6bd6. See docs/numerical_noise.md.
     """
     assert len(inp1) == 1, "Input must be a 1D scalar node"
     assert len(inp2) == 1, "Input must be a 1D scalar node"
@@ -184,7 +184,7 @@ def abs(inp: Node) -> Node:
     .. noise-footer::
 
        Max error: 0.004351 abs, 0.9954 rel over 8192 samples;
-       measured at commit 2d6463c. See docs/numerical_noise.md.
+       measured at commit 2fb6bd6. See docs/numerical_noise.md.
     """
     d = len(inp)
     eye = torch.eye(d)
@@ -229,7 +229,7 @@ def min(inp1: Node, inp2: Node) -> Node:
     .. noise-footer::
 
        Max error: 3.815e-06 abs, 1.953e-06 rel over 4096 samples;
-       measured at commit 2d6463c. See docs/numerical_noise.md.
+       measured at commit 2fb6bd6. See docs/numerical_noise.md.
     """
     assert len(inp1) == len(inp2)
     d = len(inp1)
@@ -278,7 +278,7 @@ def square(inp: Node) -> Node:
     .. noise-footer::
 
        Max error: 3.052e-05 abs, 2.266e-07 rel over 8192 samples;
-       measured at commit 2d6463c. See docs/numerical_noise.md.
+       measured at commit 2fb6bd6. See docs/numerical_noise.md.
     """
     assert len(inp) == 1, "Input must be a 1D scalar node"
 
@@ -357,7 +357,7 @@ def piecewise_linear(
     .. noise-footer::
 
        Max error: 0.25 abs, 146.3 rel over 4096 samples;
-       measured at commit 2d6463c. See docs/numerical_noise.md.
+       measured at commit 2fb6bd6. See docs/numerical_noise.md.
     """
     assert len(inp) == 1, "Input must be a 1D scalar node"
     n = len(breakpoints)
@@ -491,7 +491,7 @@ def clamp(inp: Node, lo: float, hi: float) -> Node:
     .. noise-footer::
 
        Max error: 1.907e-06 abs, 0.0002899 rel over 4096 samples;
-       measured at commit 2d6463c. See docs/numerical_noise.md.
+       measured at commit 2fb6bd6. See docs/numerical_noise.md.
     """
     assert len(inp) == 1, "Input must be a 1D scalar node"
     assert hi > lo, "hi must exceed lo"
@@ -535,7 +535,7 @@ def reciprocal(
     .. noise-footer::
 
        Max error: 0.0008245 abs, 0.1117 rel over 4096 samples;
-       measured at commit 2d6463c. See docs/numerical_noise.md.
+       measured at commit 2fb6bd6. See docs/numerical_noise.md.
     """
     assert len(inp) == 1, "Input must be a 1D scalar node"
     assert min_value > 0, "min_value must be positive"
@@ -592,7 +592,7 @@ def thermometer_floor_div(inp: Node, divisor: int, max_value: int) -> Node:
     .. noise-footer::
 
        Max error: 0 abs, 0 rel over 4096 samples;
-       measured at commit 2d6463c. See docs/numerical_noise.md.
+       measured at commit 2fb6bd6. See docs/numerical_noise.md.
     """
     assert len(inp) == 1, "Input must be a 1D scalar node"
     n = max_value // divisor
@@ -641,7 +641,7 @@ def mod_const(inp: Node, divisor: int, max_value: int) -> Node:
     .. noise-footer::
 
        Max error: 0 abs, 0 rel over 4096 samples;
-       measured at commit 2d6463c. See docs/numerical_noise.md.
+       measured at commit 2fb6bd6. See docs/numerical_noise.md.
     """
     assert len(inp) == 1, "Input must be a 1D scalar node"
     assert divisor > 0, "divisor must be positive"
@@ -698,7 +698,7 @@ def floor_int(
     .. noise-footer::
 
        Max error: 0.9996 abs, 0.9531 rel over 8192 samples;
-       measured at commit 2d6463c. See docs/numerical_noise.md.
+       measured at commit 2fb6bd6. See docs/numerical_noise.md.
     """
     assert len(inp) == 1, "Input must be a 1D scalar node"
     assert max_value >= min_value
@@ -782,9 +782,7 @@ def floor_int(
         neg_partials.append(
             assert_matches_value_type(
                 neg_partial,
-                NodeValueType(
-                    value_range=Range(-c * (1.0 + dip) - 1.0, c * dip + 1.0)
-                ),
+                NodeValueType(value_range=Range(-c * (1.0 + dip) - 1.0, c * dip + 1.0)),
                 atol=1e-5,
             )
         )
@@ -824,7 +822,150 @@ def ceil_int(
     .. noise-footer::
 
        Max error: 0 abs, 0 rel over 4096 samples;
-       measured at commit 2d6463c. See docs/numerical_noise.md.
+       measured at commit 2fb6bd6. See docs/numerical_noise.md.
     """
     assert len(inp) == 1, "Input must be a 1D scalar node"
     return negate(floor_int(negate(inp), -max_value, -min_value, sharpness=sharpness))
+
+
+def radix_floor_int(
+    inp: Node,
+    min_value: int,
+    max_value: int,
+    divisor: Optional[int] = None,
+    sharpness: Optional[float] = None,
+    hi_sharpness: Optional[float] = None,
+) -> Node:
+    """Compute floor(x) as a radix split of three small :func:`floor_int`\\ s.
+
+    A flat ``floor_int`` over ``N = max_value − min_value`` boundaries
+    costs ``3N`` hidden lanes in 2 sublayers and holds an up-to-512-wide
+    step vector live on the residual between its stages.  This form
+    splits with divisor ``D`` (default: the power of two nearest
+    ``√(2N)``)::
+
+        hi_raw = floor_int((x − min) / D)            # ⌈N/D⌉ boundaries
+        hi     = floor_int(hi_raw + 0.5)             # integer snap, ⌈N/D⌉+1
+        lo     = floor_int(x − min − D·hi)           # over [−1, D]: D+1
+        floor  = min + D·hi + lo
+
+    Cost: ``≈ 3·(2·⌈N/D⌉ + D + 2)`` lanes (≈ ``8.5·√N`` at the default
+    divisor, vs ``3N`` flat), 6 FFN sublayers plus 3 one-wide Linears
+    (vs 2 sublayers flat), and residual intermediates at most
+    ``2·max(⌈N/D⌉, D+1)`` wide (vs ``min(512, N)``).  Use it where the
+    lane/width saving matters and the chain has depth slack; ``floor_int``
+    remains the right op on zero-slack chains.
+
+    **Why the snap makes the split exact (the digit-quad argument,
+    extended).**  The hi floor's ramp sits just below each multiple of
+    D, where it emits a *fractional* ``hi_raw``; the low part would
+    amplify that fraction by D (the boundary-sliver hazard of the
+    two-digit emit split).  Rounding ``hi_raw`` to the nearest integer
+    (add 0.5, floor) collapses it to one of the two neighboring
+    integers — and *either* neighbor reconstructs ``floor(x)`` exactly,
+    because ``lo`` is floored over the extended range ``[−1, D]`` and its
+    input ``x − min − D·hi`` is computed from ``x`` directly, so it
+    carries x's own fractional part: with ``hi`` one too high, ``lo``
+    lands in ``[−1, 0)`` and compensates; one too low, in ``[D−1, D)``.
+    Unlike the emit digit-quad — whose low byte is recovered affinely
+    and therefore inherits a ±1-step truncation in the sliver — the
+    composed floors reconstruct *exactly* throughout the hi ramp.
+
+    Contract (matches ``floor_int``, no new legal-input restriction):
+
+    - Legal inputs stay out of the ``1/sharpness``-wide ramp just below
+      each **integer** — the LO floor's ramp, the same zone flat
+      ``floor_int`` excludes.  There, the result is exact to the folded
+      ulp class: hi is a snapped exact integer, ``D·hi`` is exact
+      (D a small power of two), the one-Linear ``x − min − D·hi``
+      rounds at ~ulp(D), well inside lo's flat zone.
+    - An input *inside* that ramp yields a fractional value within the
+      same ±1-step window as flat ``floor_int`` — no D-amplification.
+    - Residual hazard, by the digit-quad's product-of-slivers argument:
+      the snap's own half-integer ramp is hit only when the hi ramp
+      already produced a fraction within ``1/step_sharpness`` of 0.5 —
+      two independent slivers (~``D/(hi_sharpness·N) ×
+      1/step_sharpness`` of the range), where the D-amplified error
+      survives.  Callers who care push ``hi_sharpness`` up, exactly as
+      the emit digit-quad does (``_DQ_HI_SHARPNESS``).
+
+    Args:
+        inp: 1D scalar node with value in [min_value, max_value].
+        min_value: Lower bound (integer).
+        max_value: Upper bound (integer).
+        divisor: Radix divisor D ≥ 2.  Default: the power of two
+            nearest ``√(2N)`` in log space (a power of two keeps
+            ``x/D`` and ``D·hi`` exact in fp32).
+        sharpness: Ramp sharpness for the LO floor — the knob that sets
+            the op's precision window, same meaning as ``floor_int``'s.
+        hi_sharpness: Ramp sharpness for the HI and snap floors.
+            Defaults to ``sharpness``; raise it to shrink the
+            product-of-slivers hazard window.
+
+    Returns:
+        1D scalar node containing floor(x).
+
+    .. noise-footer::
+
+       Max error: 1 abs, 1 rel over 12288 samples;
+       measured at commit 2fb6bd6. See docs/numerical_noise.md.
+    """
+    assert len(inp) == 1, "Input must be a 1D scalar node"
+    assert max_value >= min_value
+    n = max_value - min_value
+    if divisor is None:
+        # Power of two nearest sqrt(2n) in log space: minimizes
+        # 2*ceil(n/D) + D over powers of two.
+        divisor = 2 ** builtins.max(1, round(0.5 * math.log2(2 * n))) if n >= 2 else 2
+    d = int(divisor)
+    assert d >= 2, "divisor must be >= 2"
+    if n <= d:
+        # Nothing to split: the flat form is already at or below the
+        # composed form's lo-floor cost.
+        return floor_int(inp, min_value, max_value, sharpness=sharpness)
+
+    hi_s = hi_sharpness if hi_sharpness is not None else sharpness
+    n_hi = -(-n // d)  # ceil(n/d): hi ∈ [0, n_hi]
+
+    # (x − min)/D — one 1-wide Linear; exact when D is a power of two.
+    hi_in = Linear(
+        inp,
+        torch.tensor([[1.0 / d]], dtype=torch.float32),
+        torch.tensor([-float(min_value) / d], dtype=torch.float32),
+        name="radix_floor_hi_div",
+    )
+    hi_raw = floor_int(hi_in, 0, n_hi, sharpness=hi_s)
+    # Integer snap: round-to-nearest via floor(hi_raw + 0.5).
+    hi_half = Linear(
+        hi_raw,
+        torch.tensor([[1.0]], dtype=torch.float32),
+        torch.tensor([0.5], dtype=torch.float32),
+        name="radix_floor_hi_snap_half",
+    )
+    hi = floor_int(hi_half, 0, n_hi + 1, sharpness=hi_s)
+    # lo input x − min − D·hi as ONE Linear over (x, hi) — the chained
+    # subtract/multiply_const form leaves extra unfusable Linears.
+    lo_in = Linear(
+        Concatenate([inp, hi]),
+        torch.tensor([[1.0], [-float(d)]], dtype=torch.float32),
+        torch.tensor([-float(min_value)], dtype=torch.float32),
+        name="radix_floor_lo_in",
+    )
+    # [−1, D]: the extended range that absorbs both snap outcomes.
+    lo = floor_int(lo_in, -1, d, sharpness=sharpness)
+    result = Linear(
+        Concatenate([hi, lo]),
+        torch.tensor([[float(d)], [1.0]], dtype=torch.float32),
+        torch.tensor([float(min_value)], dtype=torch.float32),
+        name="radix_floor_recombine",
+    )
+    # Same closing claim as floor_int, widened one step down: an
+    # in-ramp input can land just below its integer (lo = −1 against
+    # the true floor's min), exactly the flat form's ±1-step window.
+    slack = 2.0 * swish_dip / scale
+    return assert_matches_value_type(
+        result,
+        NodeValueType(
+            value_range=Range(float(min_value) - 1.0 - slack, float(max_value) + slack)
+        ),
+    )
