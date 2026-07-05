@@ -745,15 +745,47 @@ def floor_int(
             torch.zeros(c),
             name="floor_int_step",
         )
+        # Pin the stage's true range: hinge(z) <= relu(z) and hinge(z) >=
+        # relu(z) − swish_dip/scale pointwise, so step_k = hinge(t_k) −
+        # hinge(t_k − W) lies in [−dip, W + dip] for ANY input — garbage
+        # rows included, no ramp-zone assumption.  The computed fp32 value
+        # additionally carries folded-gate rounding of the ulp(s·n) class —
+        # the same class the W = max(2, 8·ulp) sizing absorbs — so the
+        # claim widens by W/4 per side (measured overshoot ~W/1000; W/4 is
+        # ~2x the sizing's own worst case).  Without the pin, the affine
+        # relaxation declares ~sharpness·range here (~1e16 on a production
+        # floor), and the rms_norm residual-energy certifier — which reads
+        # every residual-resident intermediate, not just the op's asserted
+        # output — blows its fp32-feasible budget.
+        dip = swish_dip / scale
+        fp_slack = step_cap / 4.0
+        step = assert_matches_value_type(
+            step,
+            NodeValueType(
+                value_range=Range(-dip - fp_slack, step_cap + dip + fp_slack)
+            ),
+            atol=1e-5,
+        )
         # stage 2: −Σ_k hinge(1 − step_k), single output column
+        neg_partial = swiglu_ffn(
+            step,
+            -scale * torch.eye(c),
+            scale * torch.ones(c),
+            -torch.ones((c, 1)) / scale,
+            torch.zeros(1),
+            name="floor_int_saturate",
+        )
+        # Same universal bound one level up: 1 − step_k ∈ [1−W−dip, 1+dip],
+        # so hinge(1 − step_k) ∈ [−dip, 1+dip] and the negated chunk sum
+        # lies in [−c·(1+dip), c·dip] — plus ±1 absolute for the summed
+        # per-lane fp32 rounding (c ≤ 512 lanes at ~1 magnitude).
         neg_partials.append(
-            swiglu_ffn(
-                step,
-                -scale * torch.eye(c),
-                scale * torch.ones(c),
-                -torch.ones((c, 1)) / scale,
-                torch.zeros(1),
-                name="floor_int_saturate",
+            assert_matches_value_type(
+                neg_partial,
+                NodeValueType(
+                    value_range=Range(-c * (1.0 + dip) - 1.0, c * dip + 1.0)
+                ),
+                atol=1e-5,
             )
         )
 

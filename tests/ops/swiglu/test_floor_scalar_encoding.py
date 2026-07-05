@@ -39,6 +39,53 @@ def test_floor_int_range_claim_carries_fillet_slack():
     assert r.hi == pytest.approx(10.0 + slack)
 
 
+def test_floor_int_intermediates_carry_tight_range_pins():
+    """The two residual-resident intermediates — the per-boundary step stage
+    and each chunk's saturate sum — are Assert-pinned to their universal
+    hinge bounds (step in [-dip, W+dip]; chunk sum in [-c(1+dip), c·dip],
+    which hold for ANY input since hinge(z) <= relu(z) and >= relu(z)-dip
+    pointwise).  Unpinned, the affine relaxation declares ~sharpness·range
+    on the step stage (~1e16 on a production-magnitude floor), and the
+    flagship's rms_norm residual-energy certifier — which reads every
+    residual-resident value's post-strip type, not just the op's asserted
+    output — blows its fp32-feasible budget.  Found by the doom D2 cutover
+    compile gate."""
+    from collections import deque
+
+    from torchwright.graph.misc import Assert
+
+    x = create_input("x", 1, value_range=(-1023.0, 1023.0))
+    out = floor_int(x, -1023, 1023, sharpness=10_000.0)
+
+    dip = swish_dip / scale
+    seen, q = set(), deque([out])
+    pins = {"floor_int_step": [], "floor_int_saturate": []}
+    while q:
+        n = q.popleft()
+        if id(n) in seen:
+            continue
+        seen.add(id(n))
+        if isinstance(n, Assert) and n.claimed_type is not None:
+            inner = n.inputs[0]
+            name = getattr(inner, "name", "")
+            if name in pins:
+                pins[name].append(n.claimed_type.value_range)
+        q.extend(getattr(n, "inputs", []))
+
+    # 2046 boundaries at _CHUNK = min_d_hidden//2 = 512 -> 4 chunks.
+    assert len(pins["floor_int_step"]) == 4, pins
+    assert len(pins["floor_int_saturate"]) == 4, pins
+    for r in pins["floor_int_step"]:
+        # W = max(2, 8·ulp(s·n)) is 16 here (plus the W/4 fp slack); the
+        # failure mode this guards against is the ~1e16 class, so assert
+        # the magnitude class only.
+        assert r.lo >= -dip - 16.0, r
+        assert r.hi <= 100.0, r
+    for r in pins["floor_int_saturate"]:
+        assert r.lo >= -512.0 * (1.0 + dip) - 1.0 - 1e-6, r
+        assert r.hi <= 3.0, r
+
+
 def test_floor_int_chunking_matches_unchunked():
     """A range wide enough to split into multiple 512-boundary chunks
     computes the same floor as exact math (the W-slack keeps saturated
