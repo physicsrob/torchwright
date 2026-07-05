@@ -8,12 +8,13 @@ before any of them is built.  Three candidate families are measured
    (through Concatenates) is an Attn could compose into that Attn's
    Q/K/V matrices; a Linear reading an Attn directly could compose into
    its output matrix.  Either removes the Linear from the chain.
-2. **Scalar piecewise-linear cones** — a subgraph of per-position ops
+2. **Univariate subgraphs** — a subgraph of per-position ops
    (FFN/Linear/Add/Concatenate, literals allowed) whose only non-literal
-   source is a single 1-D node computes a piecewise function of that one
-   scalar, so the whole cone could in principle be re-synthesized as a
-   single FFN (one MLP sublayer) of the source, whatever its internal
-   chain depth.  Attention breaks a cone (it mixes across positions).
+   source is a single 1-D node computes a piecewise-linear function of
+   that one scalar, so the whole subgraph could in principle be
+   re-synthesized as a single FFN (one MLP sublayer) of the source,
+   whatever its internal chain depth.  Attention ends a univariate
+   subgraph (it mixes across positions).
 3. **Add-of-Linears** — ``Add(Linear(x), Linear(y))`` could normalize to
    ``Linear(Concatenate(x, y))``, feeding family-1/concat folds.
 
@@ -55,8 +56,8 @@ from torchwright.graph.misc import LiteralValue
 
 # Node types that cost one sublayer on a dependency chain.
 _COSTLY = (Attn, FFN, Linear, Add)
-# Per-position ops a scalar cone may pass through (Attn mixes across
-# positions and is excluded; anything else unknown is excluded too).
+# Per-position ops a univariate subgraph may pass through (Attn mixes
+# across positions and is excluded; anything else unknown is excluded too).
 _POINTWISE = (FFN, Linear, Add, Concatenate)
 
 
@@ -123,7 +124,8 @@ def _scalar_sources(order: List[Node]) -> Dict[Node, Optional[Node]]:
             continue
         if not n.inputs or not isinstance(n, _POINTWISE):
             # A source candidate: any node computed "elsewhere" (input,
-            # embedding, attention, ...) starts a cone iff it is 1-D.
+            # embedding, attention, ...) starts a univariate subgraph iff
+            # it is 1-D.
             raw[n] = n if len(n) == 1 else _TOP
             continue
         acc: object = None
@@ -137,7 +139,8 @@ def _scalar_sources(order: List[Node]) -> Dict[Node, Optional[Node]]:
                 acc = _TOP
                 break
         if acc is _TOP:
-            # The cone dies here, but n itself can seed a new one.
+            # The univariate subgraph ends here, but n itself can seed a
+            # new one.
             raw[n] = n if len(n) == 1 else _TOP
         else:
             raw[n] = acc
@@ -146,8 +149,10 @@ def _scalar_sources(order: List[Node]) -> Dict[Node, Optional[Node]]:
     }
 
 
-def _cone_levels(order: List[Node], src: Dict[Node, Optional[Node]]) -> Dict[Node, int]:
-    """Levels under family 2: any member of a scalar cone lands one
+def _collapsed_levels(
+    order: List[Node], src: Dict[Node, Optional[Node]]
+) -> Dict[Node, int]:
+    """Levels under family 2: any member of a univariate subgraph lands one
     sublayer above its source (one FFN computes any function of it)."""
     lv: Dict[Node, int] = {}
     for n in order:
@@ -189,19 +194,21 @@ def _critical_edges(output: Node, lv: Dict[Node, int]) -> Tuple[set, Counter]:
     return critical, bigrams
 
 
-def _cone_details(
+def _subgraph_details(
     order: List[Node],
     src: Dict[Node, Optional[Node]],
     critical: set,
     top: int = 15,
 ) -> None:
-    """Per-source report for the cones that touch the critical path.
+    """Per-source report for the univariate subgraphs touching the
+    critical path.
 
-    ``chain`` is the cone's internal sublayer depth (what collapses to 1);
-    ``crit chain`` the same restricted to critical members — the depth the
-    collapse actually removes from the longest path through this cone.
-    ``lanes`` sums member FFNs' hidden lanes (max single FFN in parens):
-    the breakpoint-cost proxy for re-tabulating the composed function.
+    ``chain`` is the subgraph's internal sublayer depth (what collapses
+    to 1); ``crit chain`` the same restricted to critical members — the
+    depth the collapse actually removes from the longest path through
+    this subgraph.  ``lanes`` sums member FFNs' hidden lanes (max single
+    FFN in parens): the breakpoint-cost proxy for re-tabulating the
+    composed function.
     """
     by_src: Dict[Node, List[Node]] = {}
     for n in order:
@@ -212,7 +219,7 @@ def _cone_details(
     reports = []
     for s, members in by_src.items():
         mset = set(members)
-        # Longest chain inside the cone, overall and critical-only.
+        # Longest chain inside the subgraph, overall and critical-only.
         depth_in: Dict[Node, int] = {}
         depth_crit: Dict[Node, int] = {}
         for n in order:  # order is topological; members appear after s
@@ -245,7 +252,10 @@ def _cone_details(
         )
 
     reports.sort(key=lambda r: r["crit_chain"], reverse=True)
-    print(f"critical-path cones (top {top} of {len(reports)} by critical chain):")
+    print(
+        f"critical-path univariate subgraphs "
+        f"(top {top} of {len(reports)} by critical chain):"
+    )
     for r in reports[:top]:
         print(
             f"  {r['source']}: range {r['range']}, {r['members']} nodes "
@@ -257,7 +267,7 @@ def _cone_details(
         print(f"      ops: {top_ops}")
 
 
-def analyze(output: Node, name: str, detail_cones: bool = False) -> None:
+def analyze(output: Node, name: str, detail_subgraphs: bool = False) -> None:
     lowered = lower(output)
     out = lowered.output_node
     order = topological_order(out)
@@ -286,22 +296,23 @@ def analyze(output: Node, name: str, detail_cones: bool = False) -> None:
     fam1 = lin_into_attn | attn_into_lin
     depth1 = _levels(order, zero_cost=frozenset(fam1))[out]
 
-    # Family 2: scalar piecewise cones.
+    # Family 2: univariate subgraphs.
     src = _scalar_sources(order)
-    cone_members = [n for n in order if src[n] is not None and src[n] is not n]
-    lv2 = _cone_levels(order, src)
+    members = [n for n in order if src[n] is not None and src[n] is not n]
+    lv2 = _collapsed_levels(order, src)
     depth2 = lv2[out]
-    cone_sizes = Counter(src[n].name or type(src[n]).__name__ for n in cone_members)
+    subgraph_sizes = Counter(src[n].name or type(src[n]).__name__ for n in members)
 
-    # Feasibility-filtered variant: a collapsed cone is one FFN whose
-    # breakpoint grid must resolve the composed function over the source's
-    # range.  Integer-grained structure (floor steps, table rows) needs
-    # ~range-width breakpoints, so a source range wider than a generous
-    # lane budget (4096 — the largest single-FFN lane count in production)
-    # cannot be re-tabulated; its cone keeps its current chain.  This is a
-    # coarse proxy: it keeps a wide-range cone whose composed function
-    # happens to be simple (over-conservative) and keeps a narrow-range
-    # cone whose function needs sub-integer resolution (over-optimistic).
+    # Feasibility-filtered variant: a collapsed univariate subgraph is one
+    # FFN whose breakpoint grid must resolve the composed function over
+    # the source's range.  Integer-grained structure (floor steps, table
+    # rows) needs ~range-width breakpoints, so a source range wider than a
+    # generous lane budget (4096 — the largest single-FFN lane count in
+    # production) cannot be re-tabulated; its subgraph keeps its current
+    # chain.  This is a coarse proxy: it keeps a wide-range subgraph whose
+    # composed function happens to be simple (over-conservative) and keeps
+    # a narrow-range subgraph whose function needs sub-integer resolution
+    # (over-optimistic).
     _LANE_BUDGET = 4096.0
 
     def _feasible(s: Node) -> bool:
@@ -313,7 +324,7 @@ def analyze(output: Node, name: str, detail_cones: bool = False) -> None:
     src_feasible = {
         n: (s if s is not None and _feasible(s) else None) for n, s in src.items()
     }
-    depth2f = _cone_levels(order, src_feasible)[out]
+    depth2f = _collapsed_levels(order, src_feasible)[out]
 
     # Family 3: Add of two Linears.
     fam3 = [
@@ -346,13 +357,13 @@ def analyze(output: Node, name: str, detail_cones: bool = False) -> None:
         f" -> depth {depth1} ({depth0 - depth1} saved)"
     )
     print(
-        f"family 2 (scalar PWL cones): {len(cone_members)} cone nodes over "
-        f"{len(cone_sizes)} scalar sources, "
-        f"{sum(1 for n in cone_members if n in critical)} on critical path"
+        f"family 2 (univariate subgraphs): {len(members)} member nodes over "
+        f"{len(subgraph_sizes)} scalar sources, "
+        f"{sum(1 for n in members if n in critical)} on critical path"
         f" -> depth {depth2} ({depth0 - depth2} saved)"
     )
-    for s_name, k in cone_sizes.most_common(6):
-        print(f"    cone[{s_name}]: {k} nodes")
+    for s_name, k in subgraph_sizes.most_common(6):
+        print(f"    subgraph[{s_name}]: {k} nodes")
     print(
         f"family 2, feasible only (source range <= {_LANE_BUDGET:g})"
         f" -> depth {depth2f} ({depth0 - depth2f} saved)"
@@ -362,8 +373,8 @@ def analyze(output: Node, name: str, detail_cones: bool = False) -> None:
         f"({sum(1 for n in fam3 if n in critical)} on critical path)"
     )
     print(f"families 1+2 combined -> depth {depth12} ({depth0 - depth12} saved)")
-    if detail_cones:
-        _cone_details(order, src, critical)
+    if detail_subgraphs:
+        _subgraph_details(order, src, critical)
 
 
 _EXAMPLES = [
@@ -383,9 +394,9 @@ def main() -> None:
     ap.add_argument("--spec", help="module:callable building the graph")
     ap.add_argument("--kwargs", default="{}", help="JSON kwargs for the callable")
     ap.add_argument(
-        "--cones",
+        "--subgraphs",
         action="store_true",
-        help="per-cone detail for cones on the critical path",
+        help="per-subgraph detail for univariate subgraphs on the critical path",
     )
     args = ap.parse_args()
 
@@ -394,7 +405,7 @@ def main() -> None:
         fn = getattr(importlib.import_module(mod_name), fn_name)
         result = fn(**json.loads(args.kwargs))
         output = result[0] if isinstance(result, tuple) else result
-        analyze(output, args.spec, detail_cones=args.cones)
+        analyze(output, args.spec, detail_subgraphs=args.subgraphs)
         return
 
     for mod_name in _EXAMPLES:
@@ -403,7 +414,7 @@ def main() -> None:
             output, _embedding = mod.create_network_parts()
         else:
             output = mod.create_network().inp  # Unembedding wraps the node
-        analyze(output, mod_name, detail_cones=args.cones)
+        analyze(output, mod_name, detail_subgraphs=args.subgraphs)
 
 
 if __name__ == "__main__":
