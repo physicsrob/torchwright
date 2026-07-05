@@ -80,9 +80,19 @@ def test_lo_ramp_stays_within_one_step():
 
 def test_negative_range_and_default_divisor():
     x = create_input("x", 1, value_range=(-3.0, 3.0))
-    # n=6 <= default divisor -> falls back to flat floor_int semantics.
+    # n=6, default divisor=4 (n > d) -> radix path over a tiny range.
     f = radix_floor_int(x, -3, 3)
     for v, expected in [(-2.5, -3.0), (-1.0, -1.0), (0.0, 0.0), (1.5, 1.0)]:
+        assert abs(_eval(f, v) - expected) < 0.01
+
+
+def test_falls_back_to_flat_when_range_within_divisor():
+    """n <= divisor takes the flat-floor_int early return (nothing to
+    split); the op must still floor correctly on that branch."""
+    x = create_input("x", 1, value_range=(-2.0, 2.0))
+    # n=4 <= d=8 -> fallback branch.
+    f = radix_floor_int(x, -2, 2, divisor=8)
+    for v, expected in [(-1.5, -2.0), (-1.0, -1.0), (0.0, 0.0), (1.7, 1.0)]:
         assert abs(_eval(f, v) - expected) < 0.01
 
 
