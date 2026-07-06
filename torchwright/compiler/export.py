@@ -56,7 +56,7 @@ from torchwright.compiler.forward.compile import forward_compile
 from torchwright.graph import Concatenate, Embedding, LiteralValue, Node
 from torchwright.graph.attn import CAUSAL_MASK_SENTINEL
 from torchwright.graph.rope import ROPE_BASE
-from torchwright.graph.misc import Assert, DebugWatch, InputNode
+from torchwright.graph.misc import InputNode
 
 # v5: input-state constant seeds (the rotary Δ=0 self-match const-1 column)
 # are folded into ``embed_table`` rows — the mechanism the pinned RMSNorm
@@ -69,21 +69,6 @@ from torchwright.graph.misc import Assert, DebugWatch, InputNode
 # against this converter.
 TOKEN_META_FORMAT = "torchwright.token.v5"
 DEBUG_META_FORMAT = "torchwright.debug.v1"
-
-
-def _unwrap_output_node(node: Node) -> Node:
-    """Strip Assert/DebugWatch wrappers from an output node.
-
-    Wrappers never receive residual columns (compilation strips them
-    from the compiler-private copy), so the residual assignment only
-    carries indices for the *wrapped* node — looking the wrapper itself
-    up KeyErrors.  Ops like ``compare``/``select`` return Assert-wrapped
-    outputs, so every residual lookup keyed by an output node needs this
-    treatment.
-    """
-    while isinstance(node, (Assert, DebugWatch)):
-        node = node.inputs[0]
-    return node
 
 
 # ---------------------------------------------------------------------------
@@ -266,8 +251,6 @@ def _build_matrix_occupancy(compiled, canon, d: int, d_head: int):
     ``_<op_type>`` / ``_unreachable`` buckets — they occupy real matrix
     area, so completeness needs them, but they are not user-graph nodes.
     """
-    from torchwright.compiler.graph_identity import unwrap_debug
-
     n_heads = d // d_head
     head_dim = n_heads * d_head  # == d
 
@@ -304,7 +287,7 @@ def _build_matrix_occupancy(compiled, canon, d: int, d_head: int):
             if e.node is None:
                 key = f"_{e.op_type}"
             else:
-                cid = canon.get(unwrap_debug(e.node).node_id)
+                cid = canon.get(e.node.node_id)
                 key = str(cid) if cid is not None else "_unreachable"
             if e.mode == "diag":
                 rects = _diag_rects(matrix_id, e.rows, e.cols)
@@ -324,8 +307,7 @@ def _write_debug_sidecar(
     d_head: int,
     kind: str,
     input_specs: List[tuple],
-    asserts: List["Assert"],
-    watches: List["DebugWatch"],
+    checked_nodes: List[Node],
     cache_stride: int,
     verbose: bool,
     optimize: int = 0,
@@ -340,10 +322,11 @@ def _write_debug_sidecar(
     canonical id, one entry per reachable node, carrying op type,
     annotation path, output width, baked-weight parameter count/shapes,
     input ids, and the layer/sublayer the node is scheduled into — and
-    the Assert/DebugWatch coverage present at compile time (so the loader
+    the attached-check coverage present at compile time (so the loader
     can warn when a rebuilt graph carries fewer checks than the compiled
-    one did — the fingerprint is deliberately wrapper-transparent and
-    cannot see that).  ``optimize`` records the compile-optimization
+    one did — checks are node metadata outside the fingerprint, which
+    therefore cannot see that).  ``optimize`` records the
+    compile-optimization
     level the artifact was built at; ``extra`` is the caller's free-form
     ``extra_metadata`` dict passed straight through (torchwright does not
     interpret its keys), mirroring the meta sidecar's ``extra``.
@@ -355,19 +338,17 @@ def _write_debug_sidecar(
     dict object as an earlier state's (``duplicate_state`` sharing) are
     stored as ``{"same_as": <key>}`` to keep the file small.
 
-    ``asserts``/``watches`` come from the source graph, which keeps its
-    wrappers through compilation (the compiler strips only its private
-    copy).
+    ``checked_nodes`` come from the source graph (compilation never
+    mutates it, so its checks are always where they were attached).
     """
     from torchwright.compiler.graph_identity import (
         canonical_ids,
         debug_fingerprint,
         encode_cols,
         nodes_by_canonical_id,
-        unwrap_debug,
     )
 
-    out = unwrap_debug(output_node)
+    out = output_node
     canon = canonical_ids(out)
     ra = compiled.residual_assignment
     assert ra is not None
@@ -398,10 +379,7 @@ def _write_debug_sidecar(
         seen_tables[id(table)] = key
         nodes: Dict[str, list] = {}
         for node, cols in table.items():
-            # Alias keys may be Assert/DebugWatch wrappers
-            # (ResidualAssignment.add_alias) — fold onto the wrapped
-            # node; the loader unwraps before lookup anyway.
-            cid = canon.get(unwrap_debug(node).node_id)
+            cid = canon.get(node.node_id)
             if cid is None:
                 # Not reachable from the output via inputs (e.g. the
                 # PosEncoding leaf) — cannot be keyed canonically.
@@ -412,9 +390,9 @@ def _write_debug_sidecar(
 
     assert_targets = sorted(
         {
-            canon[unwrap_debug(a.inputs[0]).node_id]
-            for a in asserts
-            if unwrap_debug(a.inputs[0]).node_id in canon
+            canon[n.node_id]
+            for n in checked_nodes
+            if n.node_id in canon and any(c.kind == "assert" for c in n.checks)
         }
     )
     matrices, placements, n_heads, d_hidden_per_layer = _build_matrix_occupancy(
@@ -437,7 +415,7 @@ def _write_debug_sidecar(
         for e in recorder.entries:
             if e.node is None:
                 continue
-            cid = canon.get(unwrap_debug(e.node).node_id)
+            cid = canon.get(e.node.node_id)
             if cid is None:
                 continue
             cid_s = str(cid)
@@ -477,7 +455,7 @@ def _write_debug_sidecar(
             weight_shapes.append([attr, dims])
         input_cids: List[str] = []
         for inp in getattr(node, "inputs", None) or []:
-            icid = canon.get(unwrap_debug(inp).node_id)
+            icid = canon.get(inp.node_id)
             if icid is not None:
                 input_cids.append(str(icid))
         layer, sublayer = _layer_sublayer(cid_s, node)
@@ -518,8 +496,15 @@ def _write_debug_sidecar(
         "input_specs": [list(spec) for spec in input_specs],
         "cache_stride": int(cache_stride),
         "assert_coverage": {
-            "n_asserts": len(asserts),
-            "n_watches": len(watches),
+            # Check counts, not node counts: several checks can attach
+            # to one node, and the pre-metadata sidecars counted wrapper
+            # nodes — one check each — so the numbers stay comparable.
+            "n_asserts": sum(
+                1 for n in checked_nodes for c in n.checks if c.kind == "assert"
+            ),
+            "n_watches": sum(
+                1 for n in checked_nodes for c in n.checks if c.kind == "watch"
+            ),
             "assert_targets": assert_targets,
         },
         "states": state_entries,
@@ -1454,12 +1439,12 @@ def compile_to_onnx(
             f"without the norm."
         )
 
-    # Assert/DebugWatch coverage for the debug sidecar.  Collection
-    # order no longer matters: compilation strips wrappers only from its
-    # private copy, so the source graph keeps them.
+    # Attached-check coverage for the debug sidecar.  Collection order
+    # doesn't matter: compilation never mutates the source graph, so its
+    # checks are always where they were attached.
     from torchwright.graph.asserts import collect_debug_nodes
 
-    all_asserts, all_watches = collect_debug_nodes(output_node)
+    checked_nodes = collect_debug_nodes(output_node)
 
     dense_inits: list = []
     sparse_inits: list = []
@@ -1569,7 +1554,7 @@ def compile_to_onnx(
     )
 
     output_indices = compiled.residual_assignment.get_node_indices(
-        out_state, _unwrap_output_node(output_node)
+        out_state, output_node
     )
     assert len(output_indices) == d_embed, (
         f"output column count {len(output_indices)} != embedding width "
@@ -1781,8 +1766,7 @@ def compile_to_onnx(
             # input slot; one 1-wide column matches the convention
             # CompiledHeadless uses for the same graph.
             input_specs=[(embedding.input_name, 0, 1)],
-            asserts=all_asserts,
-            watches=all_watches,
+            checked_nodes=checked_nodes,
             cache_stride=cache_stride_resolved,
             optimize=optimize,
             extra=extra_metadata,
@@ -1881,8 +1865,7 @@ class CompiledHeadless:
         input_specs: List[tuple],
         output_indices: torch.Tensor,
         metadata: Optional[dict] = None,
-        asserts: Optional[List] = None,
-        watches: Optional[List] = None,
+        checked_nodes: Optional[List] = None,
     ) -> None:
         self._net = net
         # input_specs: list of (name, start_col, width) in input-tensor column order.
@@ -1890,8 +1873,9 @@ class CompiledHeadless:
         self._output_indices = output_indices
         self.input_names: List[str] = [name for name, _, _ in input_specs]
         self.metadata: dict = dict(metadata or {})
-        self._asserts = list(asserts) if asserts else []
-        self._watches = list(watches) if watches else []
+        # Source-graph nodes carrying attached checks (node.checks) —
+        # re-checked against compiled residual values on debug=True.
+        self._checked_nodes = list(checked_nodes) if checked_nodes else []
         self._debug_state: Optional[_DebugState] = None
 
         # KV cache shape metadata — discovered from the compiled transformer
@@ -1926,14 +1910,14 @@ class CompiledHeadless:
         """Stateless per-query inference — uses the non-cached ``forward()``.
 
         When ``debug=True``, captures per-layer residual-stream snapshots
-        and checks all Assert nodes (raises on failure) and DebugWatch
-        nodes (prints on trigger).  ``debug_atol`` is the maximum
+        and runs every attached check (assert-kind raises, watch-kind
+        prints).  ``debug_atol`` is the maximum
         per-column drift tolerated by the residual-stream self-consistency
         check; diffs at or below ``debug_atol`` are treated as fp-rounding
         noise.
         """
         res_stream = self._build_res_stream(inputs, past_len=0)
-        if debug and (self._asserts or self._watches):
+        if debug and self._checked_nodes:
             res, _ = self._run_debug_checks(res_stream, past_kvs=None, atol=debug_atol)
         else:
             res = self._net.forward(res_stream)
@@ -2013,8 +1997,8 @@ class CompiledHeadless:
                 slice uses this value while the attention mask uses the
                 cache's actual shape.
             debug: When True, capture residual-stream snapshots and
-                check all Assert nodes (raises) and DebugWatch nodes
-                (prints).
+                run every attached check (assert-kind raises,
+                watch-kind prints).
             debug_atol: Maximum per-column drift tolerated by the
                 residual-stream self-consistency check.  Diffs at or
                 below ``debug_atol`` are treated as fp-rounding noise.
@@ -2032,7 +2016,7 @@ class CompiledHeadless:
 
         res_stream = self._build_res_stream(inputs, past_len=past_len)
         past_kvs = [(past_K[i], past_V[i]) for i in range(self._n_layers)]
-        if debug and (self._asserts or self._watches):
+        if debug and self._checked_nodes:
             res, new_kvs = self._run_debug_checks(
                 res_stream, past_kvs=past_kvs, atol=debug_atol
             )
@@ -2075,10 +2059,6 @@ class CompiledHeadless:
             extract_compiled_value,
             first_state_with,
         )
-        from torchwright.graph.misc import Assert, DebugWatch
-
-        while isinstance(node, (Assert, DebugWatch)):
-            node = node.inputs[0]
 
         ds = self._debug_state
         state = first_state_with(node, ds.ra, ds.ordered_states)
@@ -2214,8 +2194,8 @@ class CompiledHeadless:
            exceeding ``atol`` means something overwrote the node's
            columns before all consumers read them — a compiler or
            scheduling bug.
-        3. Runs Assert predicates (raises on failure) and DebugWatch
-           predicates (prints on trigger).
+        3. Runs every attached check (assert-kind raises on failure,
+           watch-kind prints on trigger).
 
         The check logic itself lives in
         :mod:`torchwright.debug.extraction`, shared with the ONNX debug
@@ -2243,9 +2223,7 @@ class CompiledHeadless:
         )
 
         run_consistency_check(ordered_states, state_tensor, ra, atol)
-        check_debug_predicates(
-            self._asserts, self._watches, ra, ordered_states, state_tensor
-        )
+        check_debug_predicates(self._checked_nodes, ra, ordered_states, state_tensor)
 
         return res, new_kvs
 
@@ -2296,13 +2274,11 @@ def compile_headless(
             f"argument, got {type(graph).__name__}"
         )
 
-    # Unwrap Assert nodes at the output root — wrappers never receive
-    # residual columns, so downstream lookups must use the wrapped
-    # terminal node.  The collected asserts/watches are re-checked
-    # against compiled values on debug=True forwards (the source graph
-    # keeps its wrappers; compilation strips only its private copy).
-    all_asserts, all_watches = collect_debug_nodes(graph)
-    combined_output = _unwrap_output_node(graph)
+    # The collected checked nodes are re-checked against compiled values
+    # on debug=True forwards (compilation never mutates the source
+    # graph, so its checks are always where they were attached).
+    checked_nodes = collect_debug_nodes(graph)
+    combined_output = graph
 
     net = forward_compile(
         d=d,
@@ -2364,6 +2340,5 @@ def compile_headless(
         node_input_specs,
         node_output_indices,
         metadata=extra_metadata,
-        asserts=all_asserts,
-        watches=all_watches,
+        checked_nodes=checked_nodes,
     )

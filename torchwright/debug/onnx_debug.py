@@ -2,8 +2,8 @@
 
 :class:`OnnxDebugSession` gives the ONNX export the same debug surface
 as the in-process :class:`~torchwright.compiler.export.CompiledHeadless`
-— ``step(..., debug=True)`` (residual self-consistency + Assert/
-DebugWatch predicates), ``debug_value(node)``, and the probe suite in
+— ``step(..., debug=True)`` (residual self-consistency + attached-check
+predicates), ``debug_value(node)``, and the probe suite in
 :mod:`torchwright.debug.probe` — **without recompiling**.  It runs the
 real artifact: the per-layer residual streams already exist as named
 internal tensors in the emitted ONNX graph (``res_0``,
@@ -25,9 +25,9 @@ What it needs besides the ``.onnx`` file:
   The graph must be rebuilt by the same deterministic construction code
   that produced the compiled artifact (the same property the CP-SAT
   schedule cache already relies on); the fingerprint check turns a
-  mismatch into a loud error.  Assert/DebugWatch wrappers are exempt:
-  the fingerprint is wrapper-transparent, so the rebuild may carry
-  more, fewer, or different debug wrappers than the compiled graph —
+  mismatch into a loud error.  Attached checks are exempt: they are
+  node metadata outside the fingerprint, so the rebuild may carry
+  more, fewer, or different checks than the compiled graph —
   predicates always come from the rebuilt graph (they are Python
   callables and are never serialized).
 
@@ -60,7 +60,6 @@ from torchwright.compiler.graph_identity import (
     debug_fingerprint,
     decode_cols,
     nodes_by_canonical_id,
-    unwrap_debug,
 )
 from torchwright.compiler.residual_assignment import (
     ResidualAssignment,
@@ -116,8 +115,7 @@ class OnnxDebugSession:
     Args:
         onnx_path: the ``.onnx`` artifact; ``<stem>.debug.json`` (and
             ``<stem>.meta.json``) must sit alongside it.
-        output_node: the rebuilt graph's output node.  May be
-            Assert-wrapped; wrappers are handled transparently.
+        output_node: the rebuilt graph's output node.
         providers: onnxruntime execution providers (default CPU).
     """
 
@@ -142,7 +140,7 @@ class OnnxDebugSession:
         self.input_names: List[str] = [n for n, _, _ in self._input_specs]
 
         # --- Fingerprint: the rebuilt graph must be the compiled graph.
-        out = unwrap_debug(output_node)
+        out = output_node
         fp = debug_fingerprint(out, d=self._d, d_head=int(sidecar["d_head"]))
         if fp != sidecar["fingerprint"]:
             raise ValueError(
@@ -151,19 +149,22 @@ class OnnxDebugSession:
                 f"artifact was compiled from (sidecar "
                 f"{sidecar['fingerprint'][:12]}..., rebuilt {fp[:12]}...).  "
                 f"Rebuild with the same construction code/parameters as the "
-                f"compile.  (Assert/DebugWatch wrappers do NOT affect the "
+                f"compile.  (Attached checks do NOT affect the "
                 f"fingerprint; anything else does.)"
             )
 
-        # --- Assert/DebugWatch predicates come from the rebuilt graph.
+        # --- Check predicates come from the rebuilt graph.
         from torchwright.graph.asserts import collect_debug_nodes
 
-        self._asserts, self._watches = collect_debug_nodes(output_node)
+        self._checked_nodes = collect_debug_nodes(output_node)
+        n_asserts = sum(
+            1 for n in self._checked_nodes for c in n.checks if c.kind == "assert"
+        )
         cov = sidecar.get("assert_coverage") or {}
-        if len(self._asserts) < int(cov.get("n_asserts", 0)):
+        if n_asserts < int(cov.get("n_asserts", 0)):
             print(
                 f"OnnxDebugSession WARNING: rebuilt graph carries "
-                f"{len(self._asserts)} Assert node(s) but the compiled graph "
+                f"{n_asserts} assert check(s) but the compiled graph "
                 f"had {cov['n_asserts']} — debug=True is checking fewer "
                 f"invariants than the original compile would have."
             )
@@ -430,7 +431,7 @@ class OnnxDebugSession:
         fetches every per-layer residual snapshot from the same run and
         performs the same three checks as
         ``CompiledHeadless.step(debug=True)``: residual self-consistency,
-        Assert predicates (raise), DebugWatch predicates (print).
+        assert-kind checks (raise), watch-kind checks (print).
         """
         if inputs.ndim == 1:
             inputs = inputs.reshape(-1, 1) if self._kind == "token" else inputs
@@ -502,7 +503,7 @@ class OnnxDebugSession:
             extra_cause=_ONNX_CONSISTENCY_CAUSES,
         )
         check_debug_predicates(
-            self._asserts, self._watches, self._ra, ordered_states, state_tensor
+            self._checked_nodes, self._ra, ordered_states, state_tensor
         )
 
     def debug_value(self, node: Node) -> Optional[torch.Tensor]:
@@ -514,7 +515,6 @@ class OnnxDebugSession:
             first_state_with,
         )
 
-        node = unwrap_debug(node)
         ds = self._debug_state
         state = first_state_with(node, ds.ra, ds.ordered_states)
         if state is None:
@@ -531,9 +531,9 @@ class OnnxDebugSession:
         Looks the rebuilt ``node`` up against the annotations the sidecar
         captured (keyed by canonical id).  Returns ``None`` for nodes that
         carried no annotation when compiled, or that aren't reachable from
-        the output.  Assert/DebugWatch wrappers are unwrapped first.
+        the output.
         """
-        return self._annotation_by_node_id.get(unwrap_debug(node).node_id)
+        return self._annotation_by_node_id.get(node.node_id)
 
     # ---- DebugRuntime protocol surface (probe entry points) ----------------
 

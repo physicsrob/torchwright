@@ -98,11 +98,12 @@ def _wrap_hard_selection_output(
     those preconditions the output equals exactly one row of ``value``,
     inheriting its full static ``value_type``.
 
-    This helper wraps the Attn in an Assert that (a) promotes the
-    claim statically via ``claimed_type``, and (b) runs a runtime
-    predicate during reference_eval checking each claimed property to
-    within ``atol`` — the safety net that catches construction errors
-    (insufficient gain, score ties, non-identity V/O, etc.).
+    This helper attaches a check to the Attn's output that (a) promotes
+    the claim statically via the node's ``claimed_type``, and (b) runs a
+    runtime predicate during reference_eval checking each claimed
+    property to within ``atol`` — the safety net that catches
+    construction errors (insufficient gain, score ties, non-identity
+    V/O, etc.).
 
     If ``value.value_type`` is ``unknown``, skips wrapping (no claim to
     promote, no predicate to run).

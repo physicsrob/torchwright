@@ -21,12 +21,6 @@ from torchwright.ops.inout_nodes import create_input
 def _measure(x_min: float, x_max: float, n_bp: int, n_samples: int = 4096) -> dict:
     x = create_input("x", 1)
     f = log(x, min_value=x_min, max_value=x_max, n_breakpoints=n_bp)
-    # Strip the outer value-range Assert (if present) so we can *measure*
-    # the drift instead of having compute() raise on it. Sectioned log
-    # ends in an Assert; single-section log also ends in one. Both have
-    # a single input we can unwrap.
-    from torchwright.graph.misc import Assert as _Assert
-    f_unwrapped = f.inputs[0] if isinstance(f, _Assert) else f
 
     # Sample log-uniformly so we hit values across the whole range,
     # including the high-x tail where cancellation peaks.
@@ -35,13 +29,18 @@ def _measure(x_min: float, x_max: float, n_bp: int, n_samples: int = 4096) -> di
     gen = torch.Generator().manual_seed(0)
     u = torch.rand(n_samples, generator=gen)
     xs = torch.exp(log_lo + u * (log_hi - log_lo)).unsqueeze(1)
-    ys = f_unwrapped.compute(n_pos=n_samples, input_values={"x": xs})
+    # Suppress log's own value-range assert so we can *measure* the
+    # drift instead of having compute() raise on it.
+    from torchwright.graph.node import suppress_checks
+
+    with suppress_checks():
+        ys = f.compute(n_pos=n_samples, input_values={"x": xs})
 
     expected = torch.log(xs.squeeze(1))
     err = (ys.squeeze(1) - expected).abs()
     worst_idx = int(err.argmax().item())
 
-    predicted = (x_max / x_min) * 2 ** -23
+    predicted = (x_max / x_min) * 2**-23
     return {
         "x_min": x_min,
         "x_max": x_max,

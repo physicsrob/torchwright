@@ -486,7 +486,7 @@ def select(cond: Node, true_node: Node, false_node: Node) -> Node:
     d = len(true_node)
     M = _select_offset(true_node, false_node, "select")
 
-    from torchwright.graph.misc import Assert
+    from torchwright.graph.asserts import attach_assert
 
     def _cond_check(x: torch.Tensor) -> tuple:
         deviation = (x.abs() - 1.0).abs()
@@ -497,7 +497,7 @@ def select(cond: Node, true_node: Node, false_node: Node) -> Node:
 
         return False, (f"expected ||cond| - 1| <= {_GATE_C_TOL}; {_format_bad(x, bad)}")
 
-    cond = Assert(
+    cond = attach_assert(
         cond,
         _cond_check,
         message=f"cond near ±1 (c_tol={_GATE_C_TOL})",

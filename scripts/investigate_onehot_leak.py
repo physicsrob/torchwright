@@ -38,7 +38,7 @@ import torch
 
 import torchwright.ops.swiglu.map_select as _map_select
 import torchwright.ops.swiglu.onehot_table as _onehot_table
-from torchwright.graph.misc import Assert, DebugWatch
+from torchwright.graph.node import suppress_checks
 from torchwright.ops._math import _lookup_numeric_slack
 from torchwright.ops.inout_nodes import create_input
 from torchwright.ops.linear import add_const, bool_to_01, concat
@@ -51,12 +51,6 @@ N_SLOTS = 61  # max_total + 1 for the 3-digit multiply (20*n, n=3)
 # previous carry, each inside its own guard — |delta| stays well under 1e-2.
 COARSE_DELTAS = [0.0, 1e-5, -1e-5, 1e-4, -1e-4, 1e-3, -1e-3, 1e-2, -1e-2]
 DENSE_DELTAS = torch.linspace(-3e-3, 3e-3, 201).tolist()
-
-
-def _unwrap(node):
-    while isinstance(node, (Assert, DebugWatch)):
-        node = node.inputs[0]
-    return node
 
 
 def _f32(x: float) -> torch.Tensor:
@@ -108,11 +102,11 @@ def build_carry_chain(scale_override: Optional[float]) -> Dict[str, object]:
         d6 = onehot_lookup(onehot, d6_table, torch.tensor([0.0]))
         b01 = onehot_lookup(onehot, b01_table, torch.tensor([0.0]))
     return {
-        "ind": _unwrap(ind),
+        "ind": ind,
         "onehot": onehot,
-        "carry": _unwrap(carry),
-        "d6": _unwrap(d6),
-        "b01": _unwrap(b01),
+        "carry": carry,
+        "d6": d6,
+        "b01": b01,
     }
 
 
@@ -138,7 +132,7 @@ def build_times_table(scale_override: Optional[float]) -> Dict[str, object]:
                 k[10 + db] = 1.0
                 table[k] = torch.tensor([float(da * db // 10), float(da * db % 10)])
         product = onehot_lookup(key_node, table, torch.tensor([0.0, 0.0]))
-    return {"product": _unwrap(product)}
+    return {"product": product}
 
 
 # ---------------------------------------------------------------------------
@@ -159,10 +153,14 @@ def sweep_carry(
     ).unsqueeze(1)
     inp = {"total": x.to(device)}
     n = len(ts)
-    out = {
-        name: nodes[name].compute(n, inp).cpu()
-        for name in ("ind", "onehot", "carry", "d6", "b01")
-    }
+    # The sweep deliberately feeds out-of-tolerance deltas, so the ops'
+    # attached asserts would fire — suppress them; this script MEASURES
+    # the drift those asserts guard against.
+    with suppress_checks():
+        out = {
+            name: nodes[name].compute(n, inp).cpu()
+            for name in ("ind", "onehot", "carry", "d6", "b01")
+        }
     t_idx = torch.tensor(ts)
     ideal_ind = -torch.ones(n, N_SLOTS)
     ideal_ind[torch.arange(n), t_idx] = 1.0
@@ -192,7 +190,10 @@ def sweep_times_table(
     a = torch.tensor([r[0] + r[2] for r in rows], dtype=torch.float32).unsqueeze(1)
     b = torch.tensor([float(r[1]) for r in rows], dtype=torch.float32).unsqueeze(1)
     n = len(rows)
-    product = nodes["product"].compute(n, {"a": a.to(device), "b": b.to(device)}).cpu()
+    with suppress_checks():
+        product = (
+            nodes["product"].compute(n, {"a": a.to(device), "b": b.to(device)}).cpu()
+        )
     ideal = torch.tensor(
         [[float(r[0] * r[1] // 10), float(r[0] * r[1] % 10)] for r in rows]
     )

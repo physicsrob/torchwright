@@ -50,6 +50,33 @@ class FoldLog:
         self.value_changed.add(node)
 
 
+# --- Fold policy for checked values (docs/assert_metadata_plan.md) --------
+#
+# A node carrying checks (``node.checks``) stays materialized: a fold
+# that would absorb it — erase the value its predicates and range claim
+# describe — is DECLINED.  Rationale: the runtime checkability of an
+# asserted value (``debug=True`` re-checks it against the residual
+# stream) is worth more than the layer a fold would save; which folds
+# are worth deleting checkability for is a measurable policy question,
+# and until measured the answer is "none".  This reproduces exactly the
+# blocking the old Assert wrapper nodes caused by accident (an
+# interposed wrapper broke the ``producer's sole consumer`` pattern
+# match).  One deliberate widening: a check whose returned handle the
+# caller discarded used to detach from the graph (dead wrapper) and
+# blocked nothing; as metadata it stays live and declines folds like
+# any other check.
+#
+# The FFN->Linear fold is the one case where the orphaned node's VALUE
+# survives (it moves onto the FFN): there the orphan's checks and claim
+# MIGRATE to the survivor instead of blocking the fold — mirroring how
+# a wrapper above the orphaned Linear used to be rewired onto the FFN.
+
+
+def _blocks_absorb(node: Node) -> bool:
+    """True when *node*'s value may not be erased by a fold."""
+    return bool(node.checks)
+
+
 def _consumer_map(all_nodes: Set[Node]) -> Dict[Node, List[Node]]:
     consumers: Dict[Node, List[Node]] = {n: [] for n in all_nodes}
     for node in all_nodes:
@@ -124,6 +151,14 @@ def _fold_ffn_into_linear(
     b.out_bias = b.out_bias @ l.output_matrix + l.output_bias
     b.out_proj = b.out_proj @ l.output_matrix
     b.d_output = l.output_matrix.shape[1]
+    # l's checks and range claim describe l's value, which now lives on
+    # b — migrate them so the value stays runtime-checkable.  b's own
+    # metadata is guaranteed empty here (a checked b declines the fold),
+    # so this is a plain transfer, not a merge.
+    if l.checks:
+        b.checks = list(l.checks)
+        b.claimed_type = l.claimed_type
+        b.integer_claim = l.integer_claim
     # This fold inverts survivorship: b's VALUE becomes what l's was, so a
     # semantic affine override installed on b describes the pre-fold value
     # and must not be re-applied by the bounds refresh.  (The other two
@@ -177,6 +212,13 @@ def _fold_through_concatenate(
 
     Returns the number of leaf rewrites applied.
     """
+    # A checked concat stays whole: every fold below changes c's value
+    # or width, invalidating what its predicates read (the composite
+    # two-input asserts attach here).  Splices are value-identical but
+    # declined too — exact parity with the old interposed-wrapper block.
+    if _blocks_absorb(c):
+        return 0
+
     # Splice nested single-consumer concat leaves inline first, so the
     # folds below see a flat leaf list.
     applied = 0
@@ -184,6 +226,7 @@ def _fold_through_concatenate(
     for leaf in c.inputs:
         if (
             isinstance(leaf, Concatenate)
+            and not _blocks_absorb(leaf)
             and leaf not in touched
             and leaf not in output_nodes
             and len(consumers.get(leaf, [])) == 1
@@ -209,7 +252,12 @@ def _fold_through_concatenate(
         m = l.output_matrix[offset : offset + w]
         offset += w
 
-        if allow_value_folds and isinstance(leaf, LiteralValue) and has_non_literal:
+        if (
+            allow_value_folds
+            and isinstance(leaf, LiteralValue)
+            and not _blocks_absorb(leaf)
+            and has_non_literal
+        ):
             bias = bias + leaf.value @ m
             applied += 1
             value_folds += 1
@@ -218,6 +266,7 @@ def _fold_through_concatenate(
         if (
             allow_value_folds
             and isinstance(leaf, Linear)
+            and not _blocks_absorb(leaf)
             and leaf not in touched
             and leaf not in output_nodes
             and len(consumers.get(leaf, [])) == 1
@@ -323,6 +372,8 @@ def _fuse_one_pass(
 
             if isinstance(inp, Linear):
                 l1, l2 = inp, node
+                if _blocks_absorb(l1):  # l1's checked value would be erased
+                    continue
                 d_in = l1.output_matrix.shape[0]
                 d_mid = l1.output_matrix.shape[1]
                 d_out = l2.output_matrix.shape[1]
@@ -343,6 +394,8 @@ def _fuse_one_pass(
                 b, l = inp, node
                 if l in output_nodes:
                     continue
+                if _blocks_absorb(b):  # b's checked pre-fold value would be erased
+                    continue  # (l's checks migrate — see the fold)
                 n_lanes = b.n_lanes
                 d_b = b.d_output
                 d_z = l.output_matrix.shape[1]
@@ -363,6 +416,8 @@ def _fuse_one_pass(
             if len(consumers.get(inp, [])) != 1:
                 continue
             u, b = inp, node
+            if _blocks_absorb(u):  # u's checked value would be erased
+                continue
             d_x = u.output_matrix.shape[0]
             d_u = u.output_matrix.shape[1]
             n_lanes = b.n_lanes
@@ -417,20 +472,19 @@ def fuse_consecutive_linears(
 
     All folds mutate a surviving node in place; ``output_nodes`` stay valid
     references (an FFN-into-output-Linear fold is declined to preserve the
-    caller's output identity).
+    caller's output identity).  A fold that would erase a *checked* value
+    (``node.checks``) is declined — see the fold-policy note at the top
+    of this module.
 
     Because each fold rewrites a surviving node's weights and inputs in place,
     that node's eagerly-cached ``_affine_bound`` / ``_structural_type`` (and
-    every downstream node's, which was derived from it) go stale.  A stale
-    bound can be unsound once a downstream ``Assert``'s claim later tightens
-    a node's structural type (the lowering strip, applied to the compile's
-    private copy of this graph) — the affine and structural ranges then
-    disagree and the RMSNorm certification's soundness check fires.  So
-    after all folds settle, refresh the bounds of every mutated node and
-    everything downstream of one (see
-    :func:`_recompute_bounds_after_fusion`).  The refresh re-derives claims
-    through the Assert affine rule because this pass runs on *source*
-    graphs, which keep their wrappers.
+    every downstream node's, which was derived from it) go stale — the affine
+    and structural ranges can then disagree and the RMSNorm certification's
+    soundness check fires.  So after all folds settle, refresh the bounds of
+    every mutated node and everything downstream of one (see
+    :func:`_recompute_bounds_after_fusion`).  The refresh re-applies every
+    node's range claim at the ``refresh_node_caches`` choke point, so
+    claim-tightened bounds survive the recompute by construction.
 
     Args:
         output_nodes: The graph's output nodes (used to find all ancestors and

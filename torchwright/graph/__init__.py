@@ -5,9 +5,8 @@ from .embedding import Embedding
 from .linear import Linear
 from .misc import (
     Add,
-    Assert,
+    Check,
     Concatenate,
-    DebugWatch,
     InputNode,
     LiteralValue,
     Predicate,

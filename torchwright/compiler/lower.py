@@ -3,12 +3,12 @@
 ``lower()`` is the single moment a graph transitions from "whatever the
 ops layer built" to "certified compilable vocabulary"
 (``docs/lowering_boundary_plan.md``, ``docs/lowering_copy_plan.md``).
-Constructing a :class:`LoweredGraph` does four things:
+Constructing a :class:`LoweredGraph` does three things:
 
 1. **Closed vocabulary** — every reachable node is one of the compilable
-   types (FFN, Attn, Linear, Add), bookkeeping (InputNode, LiteralValue,
-   Embedding, Concatenate, Placeholder), or a debug wrapper (Assert,
-   DebugWatch, ValueLogger).  In particular no raw ``ReLU`` survives: since
+   types (FFN, Attn, Linear, Add) or bookkeeping (InputNode,
+   LiteralValue, Embedding, Concatenate, Placeholder, ValueLogger).  In
+   particular no raw ``ReLU`` survives: since
    Phase 2b the ops layer builds FFN nodes natively, so a ReLU in a graph
    is a construction bug (a hand-built ``Linear -> ReLU -> Linear`` chain,
    or a stray nonlinearity the scheduler has no write path for).  The chain
@@ -21,23 +21,19 @@ Constructing a :class:`LoweredGraph` does four things:
    fresh in topological order (subsuming the refresh loop that used to
    live here — the stale-bounds bug class of commit 0570af1 stays
    structurally impossible), and is the only graph any compile pass ever
-   touches.  The source keeps its Assert/DebugWatch wrappers and its
-   bounds forever; recompiling is re-lowering the same pristine source.
+   touches.  The source keeps its bounds forever; recompiling is
+   re-lowering the same pristine source.  Checks and range claims are
+   node metadata (docs/assert_metadata_plan.md) — they ride the copy
+   and are re-applied by every bounds recompute, so the copy's
+   ``value_type``s are claim-tightened by construction.
 
-3. **Linear fusion, on the copy** — ``fuse_consecutive_linears`` runs on
-   the copy before the wrapper strip (wrappers block folds exactly as
-   they did when callers pre-fused their source graphs, and the bounds
-   refresh re-derives claims through the Assert rule).  Every compile
-   gets the fused schedule; no caller-side pre-pass is needed, and the
-   source graph stays unfused.  Fusion orphans some copy nodes and
+3. **Linear fusion, on the copy** — every compile gets the fused
+   schedule; no caller-side pre-pass is needed, and the source graph
+   stays unfused.  Folds that would erase a checked value are declined
+   (the explicit policy in ``graph/optimize.py``).  Fusion orphans some
+   copy nodes and
    changes what a few survivors compute, so ``node_map`` tracks values:
    a source node whose value no longer exists in the copy has no entry.
-
-4. **The wrapper strip, on the copy** — Assert/DebugWatch wrappers are
-   removed from the *copy* (their claimed ranges tightened onto the
-   wrapped nodes' types first), so the scheduler, weight writer, and
-   certifications see a wrapper-free graph with claim-tightened bounds.
-   ``GraphAnalyzer`` is pure analysis and receives no wrappers.
 """
 
 from dataclasses import dataclass, field
@@ -64,9 +60,7 @@ from torchwright.graph.embedding import Embedding
 from torchwright.graph.linear import Linear
 from torchwright.graph.misc import (
     Add,
-    Assert,
     Concatenate,
-    DebugWatch,
     InputNode,
     LiteralValue,
     Placeholder,
@@ -88,8 +82,6 @@ VOCABULARY: Tuple[type, ...] = (
     Embedding,
     Concatenate,
     Placeholder,
-    Assert,
-    DebugWatch,
     ValueLogger,
 )
 
@@ -107,7 +99,7 @@ class LoweredGraph:
     """Certificate that a graph passed the lowering boundary.
 
     Holds the **compiler-private copy** of the graph (``output_node``, a
-    wrapper-free clone with claim-tightened fresh bounds), the untouched
+    clone with claim-tightened fresh bounds), the untouched
     source graph's output (``source_output_node``), the source→copy node
     map, and the **unresolved realization table** built from the copy —
     every schedulable node's candidate realization classes
@@ -118,9 +110,7 @@ class LoweredGraph:
     path) turns the table into the resolved artifact the layer walk reads.
 
     ``node_map`` maps each reachable source node to the copy node that
-    computes its value; source Assert/DebugWatch wrappers map to the
-    clone of the node they wrap (the copy is stripped, so the wrappers'
-    clones are not part of it).  The map is **partial**: a source node
+    computes its value.  The map is **partial**: a source node
     fused away during lowering (its value absorbed into a survivor's
     weights) has no entry, and a source node whose value moved onto a
     fold survivor maps to that survivor.
@@ -138,8 +128,7 @@ class LoweredGraph:
     collapse_report: Optional["CollapseReport"] = None
 
     def copy_of(self, source_node: Node) -> Node:
-        """The copy node computing ``source_node``'s value (wrappers
-        resolve to the clone of the node they wrap)."""
+        """The copy node computing ``source_node``'s value."""
         try:
             return self.node_map[source_node]
         except KeyError:
@@ -176,108 +165,14 @@ class LoweredGraph:
         return summarize_cost(nodes, realization_table, d_head)
 
 
-def _unwrap(node: Node) -> Node:
-    """Step through Assert/DebugWatch wrappers to the wrapped node."""
-    while isinstance(node, (Assert, DebugWatch)):
-        node = node.inputs[0]
-    return node
-
-
-def _strip_debug_wrappers(output_node: Node) -> Tuple[Node, Set[Node]]:
-    """Remove Assert/DebugWatch wrappers from the (compiler-private) graph.
-
-    Runs only on the copy ``lower()`` just built — never on a user's
-    graph.  Two steps, ported unchanged from the pre-copy
-    ``GraphAnalyzer._strip_asserts``:
-
-    1. Each Assert's claimed range is transferred onto the node it wraps
-       — the wrapped node's ``_structural_type`` is tightened with the
-       claim, and any input-range tightening the Assert's affine bound
-       carries (the leaf-claim channel of ``_assert_rule``) is
-       intersected into the wrapped node's bound.  This is what makes
-       the copy's ``value_type``s claim-tightened even though the
-       wrappers are gone.
-
-    2. Every consumer of a wrapper is rewired to the wrapped node, and
-       the unwrapped output is returned.
-
-    Returns ``(stripped_output, integer_claimed)`` where
-    ``integer_claimed`` is the set of copy nodes that carried an
-    ``assert_integer`` wrapper (``Assert.integer_claim``).  Integer-ness
-    has no home in the range-only ``NodeValueType``, so this set is how
-    the claim survives the strip — the univariate collapse pass gates on
-    it (docs/univariate_collapse_plan.md, feasibility gate condition 1).
-
-    Order note: asserts are processed in ``node_id`` order for
-    determinism, though the transfer itself commutes (range
-    intersections are min/max).
-    """
-    from torchwright.graph.value_type import tightened_with
-
-    all_nodes = get_ancestor_nodes({output_node})
-    asserts = sorted(
-        (n for n in all_nodes if isinstance(n, Assert)), key=lambda n: n.node_id
-    )
-    watches = [n for n in all_nodes if isinstance(n, DebugWatch)]
-    integer_claimed = {_unwrap(a) for a in asserts if a.integer_claim}
-    if not asserts and not watches:
-        return output_node, integer_claimed
-
-    for a in asserts:
-        if a.claimed_type is None:
-            continue
-        target = _unwrap(a)
-        target._structural_type = tightened_with(
-            target._structural_type, a.claimed_type
-        )
-
-        import torch
-
-        from torchwright.graph.affine_bound import AffineBound
-
-        a_ab = a._affine_bound
-        t_ab = target._affine_bound
-        new_ranges = dict(t_ab.input_ranges)
-        changed = False
-        for nid, (a_lo, a_hi) in a_ab.input_ranges.items():
-            if nid in new_ranges:
-                old_lo, old_hi = new_ranges[nid]
-                tighter_lo = torch.maximum(old_lo, a_lo)
-                tighter_hi = torch.minimum(old_hi, a_hi)
-                if not (
-                    torch.equal(tighter_lo, old_lo) and torch.equal(tighter_hi, old_hi)
-                ):
-                    new_ranges[nid] = (tighter_lo, tighter_hi)
-                    changed = True
-        if changed:
-            target._affine_bound = AffineBound(
-                A_lo=t_ab.A_lo,
-                A_hi=t_ab.A_hi,
-                b_lo=t_ab.b_lo,
-                b_hi=t_ab.b_hi,
-                columns=t_ab.columns,
-                input_ranges=new_ranges,
-            )
-
-    for node in all_nodes:
-        if isinstance(node, (Assert, DebugWatch)):
-            continue
-        for i, inp in enumerate(node.inputs):
-            if isinstance(inp, (Assert, DebugWatch)):
-                node.inputs[i] = _unwrap(inp)
-
-    return _unwrap(output_node), integer_claimed
-
-
 class _ChainMiner:
-    """Assert/Concatenate-transparent ``L1 -> ReLU -> L2`` chain detector.
+    """Concatenate-transparent ``L1 -> ReLU -> L2`` chain detector.
 
     Ported from the deleted ``graph/blockify.py``.  Used only to enrich the
     vocabulary error: when raw ReLU nodes are found, chains among them are
     reported as (L1, ReLU, L2) id triples so the fix ("build an FFN") is
     obvious.  Resolves effective consumers transparently through
-    ``Concatenate`` **and** ``Assert``/``DebugWatch`` so a hand-built chain
-    is detected even when a wrapper sits on an internal value.
+    ``Concatenate``.
     """
 
     def __init__(self, all_nodes: Set[Node]):
@@ -289,16 +184,16 @@ class _ChainMiner:
         self._eff_cache: Dict[Node, Set[Node]] = {}
 
     def effective_consumers(self, node: Node) -> Set[Node]:
-        """Consumers resolving through Concatenate/Assert/DebugWatch.
+        """Consumers resolving through Concatenate.
 
-        A terminal transparent wrapper (an output Concatenate/Assert with no
-        further consumers) is kept as the effective consumer so the node it
-        wraps is never treated as dead."""
+        A terminal Concatenate (an output concat with no further
+        consumers) is kept as the effective consumer so the node it
+        groups is never treated as dead."""
         if node in self._eff_cache:
             return self._eff_cache[node]
         result: Set[Node] = set()
         for consumer in self._direct_consumers.get(node, []):
-            if isinstance(consumer, (Concatenate, Assert, DebugWatch)):
+            if isinstance(consumer, Concatenate):
                 downstream = self.effective_consumers(consumer)
                 if downstream:
                     result |= downstream
@@ -333,7 +228,7 @@ class _ChainMiner:
             if len(relu_eff) != 1 or len(l2_candidates) != 1:
                 continue
             l2 = l2_candidates[0]
-            if _unwrap(l2.inputs[0]) is not relu:
+            if l2.inputs[0] is not relu:
                 continue
             if l2 in seen_linears:
                 continue
@@ -397,21 +292,20 @@ def lower(
 
     Compilation is a pure function of the source graph: this validates
     the closed vocabulary, builds the compiler-private copy (fresh
-    derived caches by construction), runs linear fusion on the copy
+    derived caches by construction; checks and range claims ride the
+    clones as node metadata), runs linear fusion on the copy
     (every compile gets the fused schedule — callers no longer pre-fuse),
-    strips Assert/DebugWatch wrappers from the copy with their claims
-    tightened onto the wrapped nodes, optionally runs the univariate
+    optionally runs the univariate
     collapse pass (:mod:`torchwright.compiler.collapse`), and returns
     the :class:`LoweredGraph` certificate the compile pipeline consumes.
-    The source graph — nodes, wiring, wrappers, cached bounds — is never
+    The source graph — nodes, wiring, checks, cached bounds — is never
     touched.
 
     Args:
         output_node: The source graph's output node.
         verbose: Print the certified node count.
         collapse_univariate: Run the univariate-subgraph collapse pass
-            on the copy after the wrapper strip
-            (docs/univariate_collapse_plan.md).
+            on the copy after fusion (docs/univariate_collapse_plan.md).
         collapse_lane_cap: Decline threshold on emitted lanes per
             synthesized FFN — ``d_hidden / 4`` of the target compile.
             Required when ``collapse_univariate`` is on.
@@ -439,16 +333,15 @@ def lower(
 
     copy = clone_graph(output_node, _CLONE_DISPATCH)
 
-    # Linear fusion, on the copy, BEFORE the wrapper strip: with the
-    # wrappers still present the folds fire exactly as they did when
-    # callers fused their source graphs (a wrapper on a value blocks the
-    # fold that would absorb it), and the post-fusion bounds refresh can
-    # re-derive claims through the Assert affine rule.  The source graph
-    # is never touched — fusing here is what lets it stay pristine.
+    # Linear fusion, on the copy.  The source graph is never touched —
+    # fusing here is what lets it stay pristine.  Checks/claims ride the
+    # clones as metadata; folds that would erase a checked value are
+    # declined by the explicit policy in graph/optimize.py, and the
+    # post-fusion bounds refresh re-applies claims at its choke point.
     fold_log = FoldLog()
     n_fused = fuse_consecutive_linears({copy.output_node}, fold_log=fold_log)
 
-    copy_output, integer_claimed = _strip_debug_wrappers(copy.output_node)
+    copy_output = copy.output_node
 
     collapse_report = None
     n_collapsed = 0
@@ -457,37 +350,23 @@ def lower(
 
         copy_output, collapse_report = collapse_univariate_subgraphs(
             copy_output,
-            integer_claimed=integer_claimed,
             lane_cap=collapse_lane_cap,
             fold_log=fold_log,
             verbose=verbose,
         )
         n_collapsed = collapse_report.n_collapsed
-        if n_collapsed:
-            # Synthesis wraps each new value in piecewise_linear's
-            # clamp-range Assert; re-run the strip so the claims land on
-            # the synthesized nodes and the copy stays wrapper-free.
-            copy_output, _ = _strip_debug_wrappers(copy_output)
 
     copy_nodes = get_ancestor_nodes({copy_output})
 
     if not n_fused and not n_collapsed:
-        # Wrapper sources resolve to the clone of the node they wrap —
-        # the stripped wrapper clones are no longer part of the copy.
-        node_map = {src: _unwrap(clone) for src, clone in copy.node_map.items()}
+        node_map = dict(copy.node_map)
     else:
         # Fusion orphans copy nodes and changes what some survivors
         # compute, so the map must track VALUES, not object identity: a
         # source node maps to the copy node that computes its value, or
         # to nothing if that value no longer exists in the copy.
-        # Wrapper sources are resolved through their SOURCE wrapped node
-        # (a wrapper's value is its wrapped node's value) — resolving
-        # through the clone would be wrong when a fold rewired the clone
-        # wrapper onto a survivor whose own mapping is dropped.
         node_map: Dict[Node, Node] = {}
         for src, clone in copy.node_map.items():
-            if isinstance(src, (Assert, DebugWatch)):
-                continue
             survivor = fold_log.moves.get(clone)
             if survivor is not None:
                 node_map[src] = survivor
@@ -495,11 +374,6 @@ def lower(
                 continue  # value gone (changed in place, or orphaned)
             else:
                 node_map[src] = clone
-        for src in copy.node_map:
-            if isinstance(src, (Assert, DebugWatch)):
-                target = node_map.get(_unwrap(src))
-                if target is not None:
-                    node_map[src] = target
 
     table = RealizationTable.build(copy_nodes)
     if verbose:

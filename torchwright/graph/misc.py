@@ -1,3 +1,4 @@
+from dataclasses import dataclass
 from typing import Callable, List, Dict, Optional, Tuple
 from torchwright.graph import Node
 from torchwright.graph.value_type import NodeValueType
@@ -11,6 +12,54 @@ import torch
 # responsibility — wrap the value in ``select(is_wall, ...)`` before
 # asserting so the predicate operates on the already-gated tensor.
 Predicate = Callable[[torch.Tensor], Tuple[bool, str]]
+
+
+@dataclass
+class Check:
+    """One runtime predicate attached to a node (``node.checks``).
+
+    A check is a *fact about the node's value*: the predicate runs on the
+    node's ``(n_pos, d_output)`` tensor during ``compute`` (reference
+    eval) and against the node's compiled value during ``debug=True``
+    forwards.  ``kind`` selects the failure behavior — ``"assert"``
+    raises ``AssertionError``, ``"watch"`` prints.  ``annotation`` is the
+    ambient ``annotate()`` path captured when the check was attached, so
+    failure messages pinpoint the attach site.
+
+    Checks hold no node references (the graph-clone stray-reference
+    guard relies on this); predicate closures are shared by reference,
+    like weight payloads.
+    """
+
+    predicate: Predicate
+    message: str = ""
+    kind: str = "assert"  # "assert" (raises) | "watch" (prints)
+    annotation: Optional[str] = None
+
+    def run(self, x: torch.Tensor, node: Node) -> None:
+        """Run the predicate on ``x``; raise (assert) or print (watch) on failure.
+
+        Shared by the reference-eval path (``Node.compute`` runs every
+        check on the freshly computed value) and the compiled path
+        (``debug/extraction.check_debug_predicates`` runs them on
+        residual-stream values) so both produce identical messages.
+        """
+        ok, detail = self.predicate(x)
+        if ok:
+            return
+        site = self.annotation or node.annotation or f"node_{node.node_id}"
+        if self.kind == "assert":
+            msg_parts = [f"Assert failed at {site}"]
+            if self.message:
+                msg_parts.append(self.message)
+            msg_parts.append(f"({detail})")
+            raise AssertionError(": ".join(msg_parts[:-1]) + " " + msg_parts[-1])
+        msg_parts = [f"DebugWatch at {site}"]
+        if self.message:
+            msg_parts.append(self.message)
+        if detail:
+            msg_parts.append(f"({detail})")
+        print(": ".join(msg_parts))
 
 
 class InputNode(Node):
@@ -167,109 +216,7 @@ class ValueLogger(Node):
         return self.inputs[0].value_type
 
 
-class Assert(Node):
-    """Pass-through node that validates its input's value against a predicate.
-
-    Invisible to the compiler — ``lower()`` strips wrappers from the
-    compiler-private copy (the source graph keeps them), so compiled
-    transformer weights are identical with or without Asserts.  During
-    reference evaluation (``reference_eval``) and compiled-graph probing
-    (``probe_compiled``), runs the predicate on the input value and
-    raises ``AssertionError`` on rejection.
-
-    The raised message incorporates this Assert's ``annotation`` (set by
-    the surrounding ``annotate()`` context manager) plus the predicate's
-    ``detail`` string, so failures pinpoint both the site and the value.
-
-    When ``claimed_type`` is supplied, the Assert also *promotes* the
-    wrapped node's static type: downstream graph analysis sees the
-    claimed ``NodeValueType`` on this Assert's output, and the lowering
-    strip tightens the copied wrapped node's ``value_type`` to the
-    intersection of its own inferred type and this claim.  The runtime
-    predicate is the safety net that keeps the claim honest.
-    """
-
-    def __init__(
-        self,
-        inp: Node,
-        predicate: Predicate,
-        message: str = "",
-        claimed_type: Optional[NodeValueType] = None,
-        integer_claim: bool = False,
-    ):
-        self.predicate = predicate
-        self.message = message
-        # Structured marker for "the wrapped value is integer-grained"
-        # (set by assert_integer).  NodeValueType stays range-only, so
-        # integer-ness travels on the wrapper; the lowering strip
-        # collects the wrapped nodes into the set the univariate
-        # collapse pass gates on (docs/univariate_collapse_plan.md,
-        # feasibility gate condition 1).
-        self.integer_claim = integer_claim
-        # Stashed for compute_value_type (runs inside super().__init__).
-        self._claimed_type = claimed_type
-        super().__init__(len(inp), [inp])
-
-    @property
-    def claimed_type(self) -> Optional[NodeValueType]:
-        return self._claimed_type
-
-    def compute_value_type(self) -> NodeValueType:
-        if self._claimed_type is not None:
-            return NodeValueType()
-        return self.inputs[0].value_type
-
-    def compute(self, n_pos: int, input_values: dict) -> torch.Tensor:
-        x = self.inputs[0].compute(n_pos, input_values)
-        self._check(x)
-        return x
-
-    def _check(self, x: torch.Tensor) -> None:
-        """Run the predicate; raise AssertionError with context on failure.
-
-        Shared by ``compute`` (reference-eval path) and ``probe_compiled``
-        (compiled-graph path) so both paths produce identical failure
-        messages.
-        """
-        ok, detail = self.predicate(x)
-        if not ok:
-            site = self.annotation or f"node_{self.node_id}"
-            msg_parts = [f"Assert failed at {site}"]
-            if self.message:
-                msg_parts.append(self.message)
-            msg_parts.append(f"({detail})")
-            raise AssertionError(": ".join(msg_parts[:-1]) + " " + msg_parts[-1])
-
-
-class DebugWatch(Node):
-    """Pass-through node that prints when a predicate fires.
-
-    Like Assert but observational: prints instead of raising.  Stripped
-    from the compiler-private copy alongside Assert nodes (the source
-    graph keeps both).  Exercised during both ``compute()`` (oracle
-    path) and compiled debug forward when ``debug=True``.
-    """
-
-    def __init__(self, inp: Node, predicate: Predicate, message: str = ""):
-        self.predicate = predicate
-        self.message = message
-        super().__init__(len(inp), [inp])
-
-    def compute_value_type(self) -> NodeValueType:
-        return self.inputs[0].value_type
-
-    def compute(self, n_pos: int, input_values: dict) -> torch.Tensor:
-        x = self.inputs[0].compute(n_pos, input_values)
-        self._check(x)
-        return x
-
-    def _check(self, x: torch.Tensor) -> None:
-        ok, detail = self.predicate(x)
-        if not ok:
-            site = self.annotation or f"node_{self.node_id}"
-            msg_parts = [f"DebugWatch at {site}"]
-            if self.message:
-                msg_parts.append(self.message)
-            if detail:
-                msg_parts.append(f"({detail})")
-            print(": ".join(msg_parts))
+# Assert and DebugWatch wrapper nodes used to live here.  A runtime
+# check is node *metadata* now — ``Node.checks`` / ``Node.claimed_type``
+# (docs/assert_metadata_plan.md); attach with the helpers in
+# ``torchwright.graph.asserts``.

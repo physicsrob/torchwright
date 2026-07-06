@@ -51,8 +51,6 @@ from torchwright.debug.extraction import (
 from torchwright.graph import Concatenate, Node
 from torchwright.graph.attn import Attn, CAUSAL_MASK_SENTINEL
 from torchwright.graph.misc import (
-    Assert,
-    DebugWatch,
     InputNode,
     LiteralValue,
     Placeholder,
@@ -142,8 +140,9 @@ def reference_eval(
     # Collect all node subclasses reachable from the output graph so we
     # only patch classes actually in use.  Walking by class lets us
     # restore every patch in a tight finally block even if compute()
-    # raises mid-run.  Assert/DebugWatch wrappers are part of the walk —
-    # the oracle pass runs their predicates.
+    # raises mid-run.  Attached checks run as part of each node's
+    # ``compute`` (once per node — the memoisation prevents recomputes),
+    # so the oracle pass exercises every assert and watch.
     all_nodes = get_ancestor_nodes({output_node})
     classes_in_graph = {type(n) for n in all_nodes}
 
@@ -345,11 +344,6 @@ def probe_compiled(
     report = ProbeReport(atol=atol)
 
     for node in topological_order(output_node):
-        if isinstance(node, (Assert, DebugWatch)):
-            # The source graph keeps its wrappers through compilation
-            # (the compiler strips only its private copy); each wrapped
-            # node is checked directly, so wrapper rows would be noise.
-            continue
         if isinstance(node, (InputNode, LiteralValue, Placeholder)):
             report.skipped[node] = "input/literal/placeholder"
             continue
@@ -923,26 +917,25 @@ def probe_layer_diff(
 
 def check_asserts_on_compiled(
     compiled: DebugRuntime,
-    asserts: List[Assert],
+    asserts: List[Node],
     input_values: Dict[str, torch.Tensor],
     n_pos: int,
 ) -> None:
-    """Run each Assert's predicate against the compiled transformer's residual stream.
+    """Run each checked node's assert predicates against the compiled residual stream.
 
-    Complements the reference-eval check (which runs predicates as
-    ``Assert.compute`` is called during the oracle walk).  Here we run
-    the same predicates against the *compiled* values of each Assert's
-    input node — catching invariants that reference math satisfies but
-    compiled approximations violate.
+    Complements the reference-eval check (which runs predicates as each
+    checked node's ``compute`` is called during the oracle walk).  Here
+    we run the same predicates against the node's *compiled* value —
+    catching invariants that reference math satisfies but compiled
+    approximations violate.
 
     Collect ``asserts`` via
     ``torchwright.graph.asserts.collect_asserts(output_node)`` — before
-    or after compiling; compilation strips only its private copy, so the
-    source graph keeps its wrappers.
+    or after compiling; compilation never mutates the source graph.
 
     Raises ``AssertionError`` on the first violation, with the same
-    annotation-tagged message format as ``Assert.compute``.  Asserts
-    whose input nodes have no residual assignment (e.g. pure-literal
+    annotation-tagged message format as the reference-eval path.  Nodes
+    with no residual assignment (e.g. pure-literal
     subgraphs) are silently skipped — they have no compiled value to
     check.
     """
@@ -956,24 +949,17 @@ def check_asserts_on_compiled(
     )
     ordered_states = [s for _, _, s in ordered]
 
-    for assert_node in asserts:
-        # If an assert wraps another assert (e.g. a user's outer
-        # ``assert_in_range(y, ...)`` wrapping an op that internally
-        # asserted its output range), the direct ``.inputs[0]`` is the
-        # inner Assert node — stripped at compile time with no residual
-        # state.  Unwrap the chain so we look up the innermost non-Assert
-        # target, which does have a state.
-        target = assert_node.inputs[0]
-        while isinstance(target, Assert):
-            target = target.inputs[0]
-        state = _first_state_with(target, ra, ordered_states)
+    for node in asserts:
+        state = _first_state_with(node, ra, ordered_states)
         if state is None:
             continue  # no residual assignment — can't check on compiled.
         tensor_pair = state_tensor.get(state)
         if tensor_pair is None:
             continue
         res_tensor, _ = tensor_pair
-        compiled_val = _extract_compiled_value(target, ra, state, res_tensor)
+        compiled_val = _extract_compiled_value(node, ra, state, res_tensor)
         if compiled_val is None:
             continue
-        assert_node._check(compiled_val)
+        for check in node.checks:
+            if check.kind == "assert":
+                check.run(compiled_val, node)

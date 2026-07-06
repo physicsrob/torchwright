@@ -5,9 +5,7 @@ from torchwright.compiler.residual_assignment import flatten_concat_nodes
 from torchwright.compiler.utils import get_ancestor_nodes
 from torchwright.graph import (
     Node,
-    Assert,
     Concatenate,
-    DebugWatch,
     InputNode,
     Embedding,
 )
@@ -16,26 +14,12 @@ from torchwright.graph import (
 class GraphAnalyzer:
     """Pre-computes graph metadata needed by the forward compiler scheduler.
 
-    Pure analysis — nothing here mutates the graph.  Expects a
-    wrapper-free graph: ``lower()`` strips Assert/DebugWatch from the
-    compiler-private copy before any pipeline stage runs, so a wrapper
-    reaching this class means the caller skipped the lowering boundary
-    (raises with that diagnosis).
+    Pure analysis — nothing here mutates the graph.
     """
 
     def __init__(self, output_node: Node):
         self._output_node = output_node
         self._all_nodes = get_ancestor_nodes({output_node})
-
-        wrappers = [n for n in self._all_nodes if isinstance(n, (Assert, DebugWatch))]
-        if wrappers:
-            raise ValueError(
-                f"GraphAnalyzer expects a wrapper-free graph but found "
-                f"{len(wrappers)} Assert/DebugWatch node(s) (e.g. "
-                f"{wrappers[0]!r}).  Pass the graph through lower() first — "
-                f"the lowering boundary strips wrappers from the "
-                f"compiler-private copy — and analyze lowered.output_node."
-            )
 
         # Build reverse dependency map: node -> set of nodes that consume it
         self._consumers: Dict[Node, Set[Node]] = defaultdict(set)

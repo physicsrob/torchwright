@@ -236,7 +236,7 @@ def cond_gate(cond: Node, inp: Node) -> Node:
     d = len(inp)
     M = _max_abs_or_raise(inp.value_type, "cond_gate")
 
-    from torchwright.graph.misc import Assert
+    from torchwright.graph.asserts import attach_assert
 
     def _cond_check(x: torch.Tensor) -> tuple:
         deviation = (x.abs() - 1.0).abs()
@@ -249,7 +249,7 @@ def cond_gate(cond: Node, inp: Node) -> Node:
             f"expected ||cond| - 1| <= {_COND_GATE_C_TOL}; {_format_bad(x, bad)}"
         )
 
-    cond = Assert(
+    cond = attach_assert(
         cond,
         _cond_check,
         message=f"cond near ±1 (c_tol={_COND_GATE_C_TOL})",

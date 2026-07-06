@@ -48,9 +48,7 @@ from torchwright.graph.ffn import FFN
 from torchwright.graph.linear import Linear
 from torchwright.graph.misc import (
     Add,
-    Assert,
     Concatenate,
-    DebugWatch,
     InputNode,
     LiteralValue,
     Placeholder,
@@ -91,11 +89,20 @@ def topological_order(output_node: Node) -> List[Node]:
 # ``__dict__`` is carried by reference.  A new semantic field added to any
 # node type is therefore carried automatically; a new field holding *node
 # references* is caught by the stray-reference walk below.
+#
+# ``checks`` is rebuilt as a shallow list copy: the Check entries (and
+# their predicate closures) are shared like weight payloads, but the
+# list object must be the clone's own — a check attached to the source
+# after cloning must not appear on the compiler-private copy.
+# ``claimed_type`` / ``integer_claim`` are immutable values and ride
+# the generic copy; refresh_node_caches re-applies the claim on the
+# clone's fresh bounds.
 _REBUILT_FIELDS = frozenset(
     {
         "inputs",
         "node_id",
         "scheduling_predecessors",
+        "checks",
         "_structural_type",
         "_affine_bound",
         "_semantic_affine_override",
@@ -169,6 +176,7 @@ def _clone_default(
 
     clone.node_id = new_ids[src]
     clone.inputs = [clone_map[inp] for inp in src.inputs]
+    clone.checks = list(src.checks)
     # Remapped in clone_graph's second pass: a scheduling predecessor is
     # a scheduling-only edge, so it may be a *sibling* (not an ancestor
     # via ``inputs``) that the data-topological clone order has not
@@ -205,12 +213,9 @@ def _clone_default(
 #
 # * ``InputNode`` — clones do NOT register with the graph session (the
 #   copy is compiler-private; input binding is name-keyed).
-# * ``Assert`` / ``DebugWatch`` — predicate closures shared by
-#   reference, like weight payloads (decision 2a: wrappers are cloned,
-#   then the lowering strip runs on the copy).
-# * ``ValueLogger`` — cloned, not rejected: it is vocabulary, it is not
-#   stripped, and the canonical walk does not skip it, so dropping it
-#   would break the copy's canonical-id equality with the source.
+# * ``ValueLogger`` — cloned, not rejected: it is vocabulary and the
+#   canonical walk does not skip it, so dropping it would break the
+#   copy's canonical-id equality with the source.
 # * ``Embedding`` — tokenizer object and table tensor shared by
 #   reference (``__init__`` cannot reconstruct a caller-supplied
 #   special-token split from stored fields).
@@ -224,8 +229,6 @@ _CLONE_IMPLS: Dict[type, Callable] = {
     Embedding: _clone_default,
     Concatenate: _clone_default,
     Placeholder: _clone_default,
-    Assert: _clone_default,
-    DebugWatch: _clone_default,
     ValueLogger: _clone_default,
 }
 

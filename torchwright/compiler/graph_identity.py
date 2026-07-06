@@ -8,14 +8,14 @@ keys nodes by a **canonical id** instead: preorder-DFS numbering from
 the output node following each node's ordered ``inputs`` list, which
 depends only on the topology.
 
-Assert and DebugWatch wrappers are **transparent** to every function in
-this module: the traversal steps through them to the wrapped node and
-never assigns them an id.  This matches the compiled graph exactly —
-``lower()`` strips both wrapper kinds from the compiler-private copy
-before any pipeline stage runs — so the source graph (which keeps its
-wrappers forever) canonicalizes and fingerprints identically to the
-stripped copy the compiler actually processed, and so does any fresh
-deterministic rebuild of it.  Nothing here mutates the graph.
+Runtime checks and range claims are node *metadata* (``node.checks`` /
+``node.claimed_type``) and do not participate in the encoding, so
+attaching or removing them never changes a canonical id or fingerprint.
+(Historically they were Assert/DebugWatch wrapper nodes that this
+module's traversals stepped through transparently — the encoding is
+byte-identical across that representation change; the pinned goldens in
+``tests/compile/test_topology_golden.py`` enforce it.)  Nothing here
+mutates the graph.
 """
 
 from __future__ import annotations
@@ -26,30 +26,19 @@ from dataclasses import asdict
 from typing import Dict, List, Optional, Tuple
 
 from torchwright.graph import Node
-from torchwright.graph.misc import Assert, DebugWatch
-
-
-def unwrap_debug(node: Node) -> Node:
-    """Step through Assert/DebugWatch wrapper chains to the wrapped node."""
-    while isinstance(node, (Assert, DebugWatch)):
-        node = node.inputs[0]
-    return node
 
 
 def _canonical_walk(output_node: Node) -> List[Node]:
-    """Nodes in canonical (preorder-DFS) order, wrappers skipped.
+    """Nodes in canonical (preorder-DFS) order.
 
     Preorder DFS from the output following each node's ORDERED
     ``inputs`` list; first visit assigns the next canonical number.
-    Assert/DebugWatch wrappers are stepped through transparently — the
-    wrapped node is visited at the wrapper's position — so the order is
-    identical to walking the stripped compiler-private copy.
     """
     seen: set = set()
     ordered: List[Node] = []
     stack: List[Node] = [output_node]
     while stack:
-        n = unwrap_debug(stack.pop())
+        n = stack.pop()
         if n.node_id in seen:
             continue
         seen.add(n.node_id)
@@ -73,18 +62,16 @@ def topology_entries(output_node: Node) -> List[tuple]:
     """Per-node ``(canon_id, type_name, width, input_canon_ids)`` tuples.
 
     The hashable topology encoding shared by the schedule-cache
-    fingerprint and the debug-sidecar fingerprint.  Inputs are unwrapped
-    before lookup, so an Assert between producer and consumer does not
-    change the encoding.
+    fingerprint and the debug-sidecar fingerprint.
     """
     ordered = _canonical_walk(output_node)
     canon = {n.node_id: i for i, n in enumerate(ordered)}
     topo = []
     for i, n in enumerate(ordered):
         ins = tuple(
-            canon[unwrap_debug(inp).node_id]
+            canon[inp.node_id]
             for inp in (getattr(n, "inputs", None) or [])
-            if unwrap_debug(inp).node_id in canon
+            if inp.node_id in canon
         )
         topo.append((i, type(n).__name__, len(n), ins))
     return topo
@@ -163,10 +150,10 @@ def debug_fingerprint(
     know them, and they don't change which node lives where in a way
     the sidecar doesn't already record explicitly.
 
-    Because the topology encoding is wrapper-transparent, a rebuilt
-    graph with more or fewer Assert/DebugWatch wrappers than the
-    compiled one still matches — by design, so debug instrumentation
-    can be added to the rebuild without invalidating the sidecar.
+    Checks are node metadata outside the encoding, so a rebuilt graph
+    with more or fewer attached checks than the compiled one still
+    matches — by design, so debug instrumentation can be added to the
+    rebuild without invalidating the sidecar.
     """
     payload = {
         "format": "torchwright.debug.v1",

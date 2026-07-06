@@ -105,9 +105,9 @@ def tightened_with(a: NodeValueType, b: NodeValueType) -> NodeValueType:
 
     Ranges are intersected.
 
-    Used by the compiler's Assert-strip pass to transfer an Assert's
-    ``claimed_type`` onto the node it wrapped, so downstream analysis
-    that runs after stripping still sees the strengthened type.
+    Used by ``refresh_node_caches`` to fold a node's ``claimed_type``
+    into its structural type, and by the attach helpers to intersect a
+    new claim into a node's running claim (claims commute).
     """
     r = a.value_range.intersect(b.value_range)
     return NodeValueType(value_range=r)

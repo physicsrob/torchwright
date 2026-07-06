@@ -33,8 +33,6 @@ def compute_affine_bound(node: "Node") -> AffineBound:
         LiteralValue,
         Add,
         Concatenate,
-        Assert,
-        DebugWatch,
         ValueLogger,
     )
     from torchwright.graph.linear import Linear
@@ -53,7 +51,7 @@ def compute_affine_bound(node: "Node") -> AffineBound:
 
         return AffineBound.constant(node.value.to(dtype=torch.float64))
 
-    if isinstance(node, (ValueLogger, DebugWatch)):
+    if isinstance(node, ValueLogger):
         return node.inputs[0]._affine_bound
 
     if isinstance(node, Linear):
@@ -70,9 +68,6 @@ def compute_affine_bound(node: "Node") -> AffineBound:
 
     if isinstance(node, FFN):
         return _ffn_rule(node)
-
-    if isinstance(node, Assert):
-        return _assert_rule(node)
 
     if isinstance(node, Attn):
         return _attn_rule(node)
@@ -387,12 +382,8 @@ def _gated_lane_affine(
     # dtype=torch.bool: an empty comparison list would otherwise default to
     # float32, which torch.where rejects as a condition (a zero-lane FFN's
     # bound is legitimately empty and must flow through well-typed).
-    lo2 = torch.tensor(
-        [r2.lo > r1.lo for r1, r2 in zip(iv1, iv2)], dtype=torch.bool
-    )
-    hi2 = torch.tensor(
-        [r2.hi < r1.hi for r1, r2 in zip(iv1, iv2)], dtype=torch.bool
-    )
+    lo2 = torch.tensor([r2.lo > r1.lo for r1, r2 in zip(iv1, iv2)], dtype=torch.bool)
+    hi2 = torch.tensor([r2.hi < r1.hi for r1, r2 in zip(iv1, iv2)], dtype=torch.bool)
     return bound(
         torch.where(lo2.unsqueeze(1), A_L2, A_L1),
         torch.where(lo2, b_L2, b_L1),
@@ -443,59 +434,69 @@ def _ffn_rule(node) -> AffineBound:
     return _linear_affine(lane_ab, out_W, out_c)
 
 
-def _assert_rule(node) -> AffineBound:
-    """Assert: pass through coefficients, optionally tighten input_ranges."""
-    from torchwright.graph.misc import Assert, InputNode
+def _apply_claim_to_bound(node: "Node") -> None:
+    """Fold ``node.claimed_type`` into ``node._affine_bound`` in place.
+
+    The two channels that used to live in the Assert wrapper's affine
+    rule, applied to the claimed node itself:
+
+    * **Leaf channel** — a claim on an ``InputNode``/``Embedding``
+      tightens that leaf's own ``input_ranges`` entry, so every
+      downstream bound inherits it through normal topological
+      recomputation.
+    * **General channel** — a finite claim degenerates the bound to the
+      claim-intersected constant box (identical math to the old wrapper
+      rule, one node earlier — the wrapper was a pass-through directly
+      above the node).
+
+    A non-finite claim on a non-leaf changes nothing here (it still
+    tightens ``_structural_type`` in :func:`refresh_node_caches`).
+    Idempotent: intersecting the same claim twice is a no-op.
+    """
+    if node.claimed_type is None:
+        return
+    from torchwright.graph.misc import InputNode
     from torchwright.graph.embedding import Embedding
 
-    inp_ab = node.inputs[0]._affine_bound
-    if node.claimed_type is not None:
-        claimed_range = node.claimed_type.value_range
+    claimed_range = node.claimed_type.value_range
+    ab = node._affine_bound
 
-        target = node.inputs[0]
-        while isinstance(target, Assert):
-            target = target.inputs[0]
+    if isinstance(node, (InputNode, Embedding)) and node.node_id in ab.input_ranges:
+        old_lo, old_hi = ab.input_ranges[node.node_id]
+        new_ranges = dict(ab.input_ranges)
+        new_ranges[node.node_id] = (
+            torch.maximum(old_lo, torch.full_like(old_lo, claimed_range.lo)),
+            torch.minimum(old_hi, torch.full_like(old_hi, claimed_range.hi)),
+        )
+        node._affine_bound = AffineBound(
+            A_lo=ab.A_lo,
+            A_hi=ab.A_hi,
+            b_lo=ab.b_lo,
+            b_hi=ab.b_hi,
+            columns=ab.columns,
+            input_ranges=new_ranges,
+        )
+        return
 
-        if isinstance(target, (InputNode, Embedding)):
-            new_ranges = dict(inp_ab.input_ranges)
-            if target.node_id in new_ranges:
-                old_lo, old_hi = new_ranges[target.node_id]
-                new_lo = torch.maximum(
-                    old_lo, torch.full_like(old_lo, claimed_range.lo)
-                )
-                new_hi = torch.minimum(
-                    old_hi, torch.full_like(old_hi, claimed_range.hi)
-                )
-                new_ranges[target.node_id] = (new_lo, new_hi)
-                return AffineBound(
-                    A_lo=inp_ab.A_lo,
-                    A_hi=inp_ab.A_hi,
-                    b_lo=inp_ab.b_lo,
-                    b_hi=inp_ab.b_hi,
-                    columns=inp_ab.columns,
-                    input_ranges=new_ranges,
-                )
-
-        if claimed_range.is_finite():
-            intervals = inp_ab.to_interval()
-            d = node.d_output
-            b_lo = torch.tensor(
-                [max(iv.lo, claimed_range.lo) for iv in intervals],
-                dtype=torch.float64,
-            )
-            b_hi = torch.tensor(
-                [min(iv.hi, claimed_range.hi) for iv in intervals],
-                dtype=torch.float64,
-            )
-            return AffineBound(
-                A_lo=torch.zeros(d, 0, dtype=torch.float64),
-                A_hi=torch.zeros(d, 0, dtype=torch.float64),
-                b_lo=b_lo,
-                b_hi=b_hi,
-                columns={},
-                input_ranges={},
-            )
-    return inp_ab
+    if claimed_range.is_finite():
+        intervals = ab.to_interval()
+        d = node.d_output
+        b_lo = torch.tensor(
+            [max(iv.lo, claimed_range.lo) for iv in intervals],
+            dtype=torch.float64,
+        )
+        b_hi = torch.tensor(
+            [min(iv.hi, claimed_range.hi) for iv in intervals],
+            dtype=torch.float64,
+        )
+        node._affine_bound = AffineBound(
+            A_lo=torch.zeros(d, 0, dtype=torch.float64),
+            A_hi=torch.zeros(d, 0, dtype=torch.float64),
+            b_lo=b_lo,
+            b_hi=b_hi,
+            columns={},
+            input_ranges={},
+        )
 
 
 def _attn_rule(node) -> AffineBound:
@@ -569,6 +570,10 @@ def _apply_semantic_override(node: "Node", semantic_ab: Optional[AffineBound]) -
     re-apply it after recomputing the propagated bound — otherwise any
     post-construction recompute would silently drop the semantic
     tightening and loosen every downstream bound derived from it.
+
+    Ends by re-folding the node's claim (if any) into the new bound:
+    ops install overrides *after* attaching their range claims, and the
+    claim must stay applied whichever of the two lands last.
     """
     if semantic_ab is None:
         return
@@ -580,6 +585,7 @@ def _apply_semantic_override(node: "Node", semantic_ab: Optional[AffineBound]) -
     )
     node._semantic_affine_override = semantic_ab
     node._affine_bound = semantic_ab
+    _apply_claim_to_bound(node)
 
 
 def refresh_node_caches(node: "Node") -> None:
@@ -588,15 +594,26 @@ def refresh_node_caches(node: "Node") -> None:
     Recomputes ``_structural_type`` and ``_affine_bound`` (both computed
     eagerly in ``Node.__init__`` and therefore stale after any in-place
     mutation of the node or an ancestor), then re-applies the node's
-    semantic affine override if an op installed one.  Callers must invoke
+    semantic affine override if an op installed one, and finally its
+    range claim (``claimed_type``) on both the structural and affine
+    channels.  This is the single choke point for claim application —
+    there is no code path that recomputes bounds without re-applying
+    claims, so claims are refresh-proof by construction
+    (docs/assert_metadata_plan.md).  Callers must invoke
     this in an order where a node's inputs are refreshed before the node
     itself (any topological order works; the fusion pass uses node-id
     order, which its folds keep topological).
     """
     node._structural_type = node.compute_value_type()
+    if node.claimed_type is not None:
+        from torchwright.graph.value_type import tightened_with
+
+        node._structural_type = tightened_with(node._structural_type, node.claimed_type)
     node._affine_bound = compute_affine_bound(node)
     if node._semantic_affine_override is not None:
         _apply_semantic_override(node, node._semantic_affine_override)
+    else:
+        _apply_claim_to_bound(node)
 
 
 def _cond_gate_semantic_bound(

@@ -15,7 +15,6 @@ from typing import Callable, Optional, Set, Tuple
 import torch
 
 from torchwright.compiler.device import get_device
-from torchwright.compiler.graph_identity import unwrap_debug
 from torchwright.compiler.realization import RealizationTable
 from torchwright.compiler.residual_assignment import ResidualAssignment
 from torchwright.compiler.forward.cpsat_scheduler import (
@@ -51,7 +50,7 @@ from torchwright.compiler.transformer import HeadlessTransformer
 from torchwright.compiler.residual_assignment import flatten_concat_nodes
 from torchwright.graph import Node, Linear, Concatenate
 from torchwright.graph.node import reserve_node_id_above
-from torchwright.graph.misc import Assert, DebugWatch, LiteralValue
+from torchwright.graph.misc import LiteralValue
 
 # Default constant magnitude exponent q for the pinned-RMS norm: each reserved
 # column holds 2^q.  Bit-exactness of the identity requires the data energy to
@@ -709,9 +708,8 @@ def forward_compile(
     # a pure function of the source graph: from here on every pass —
     # analysis, scheduling, weight writing, certification — operates on
     # the copy; the caller's nodes are never touched.  The copy arrives
-    # wrapper-free (Assert/DebugWatch stripped by lower(), claims
-    # tightened onto the wrapped nodes) with fresh derived caches by
-    # construction.
+    # with fresh, claim-tightened derived caches by construction (checks
+    # and range claims are node metadata and ride the clones).
     from torchwright.compiler.lower import lower
 
     lowered = lower(
@@ -722,7 +720,7 @@ def forward_compile(
     )
     output_node = lowered.output_node
 
-    # 1. Analyze graph (pure analysis; the copy carries no wrappers)
+    # 1. Analyze graph (pure analysis)
     graph = GraphAnalyzer(output_node)
     # node_id order: these are allocated into the residual stream below,
     # so their iteration order fixes column assignment — set order keyed
@@ -1443,9 +1441,8 @@ def forward_compile(
     # reduction half-ULP, and that is graph-dependent.  Do it now that the full
     # residual assignment exists, so a graph whose energy exceeds the budget
     # fails loudly here instead of silently shipping a non-identity norm.
-    # Runs BEFORE the source re-key below: the certification must read the
-    # copy's assert-tightened bounds — the source keeps its claims on the
-    # wrappers, not on the wrapped nodes themselves.
+    # Runs BEFORE the source re-key below so the certification reads the
+    # copy's claim-tightened bounds (fresh by construction).
     if net.rms_norm_spec is not None:
         _certify_rms_norm_energy(ra, net.rms_norm_spec)
 
@@ -1457,11 +1454,7 @@ def forward_compile(
     # speaking the graph the caller actually holds.  Compile-internal
     # nodes with no source counterpart (the rope self-match constant)
     # stay as they are.
-    copy_to_source = {
-        copy: src
-        for src, copy in lowered.node_map.items()
-        if not isinstance(src, (Assert, DebugWatch))
-    }
+    copy_to_source = {copy: src for src, copy in lowered.node_map.items()}
     for state in ra.mapping:
         ra.mapping[state] = {
             copy_to_source.get(n, n): cols for n, cols in ra.mapping[state].items()
@@ -1476,13 +1469,6 @@ def forward_compile(
             for nid, entry in net.realization_table.entries.items()
         }
     )
-    # Wrapper aliasing for HeadlessTransformer.compute()'s result dict:
-    # callers hold the Assert-wrapped node the asserts.py helpers
-    # returned; alias it to the node it wraps (both are source nodes —
-    # the source keeps its wrappers forever).
-    net.assert_aliases = {
-        src: unwrap_debug(src) for src in lowered.node_map if isinstance(src, Assert)
-    }
 
     # This post-loop trim is the in-process (no-callback) path's trim.  The ONNX
     # streaming path trims each layer *inside* ``on_layer_compiled`` (see

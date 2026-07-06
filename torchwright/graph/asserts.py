@@ -1,18 +1,30 @@
-"""Predicate helpers that wrap :class:`torchwright.graph.Assert`.
+"""Predicate helpers that attach runtime checks to graph nodes.
 
-Each helper returns the :class:`Assert`-wrapped node so graph
-construction reads naturally::
+A check is *node metadata* (``node.checks`` /
+``node.claimed_type`` — see ``torchwright.graph.node.Node``), not a
+wrapper node: attaching never changes the graph's topology, costs
+nothing in the compiled transformer, and the claim survives every
+bounds recompute (``refresh_node_caches`` re-applies it — the choke
+point of docs/assert_metadata_plan.md).  Each helper attaches and
+returns the same node, so graph construction reads naturally::
 
     from torchwright.graph.asserts import assert_01, assert_strictly_less
 
     position_onehot = assert_onehot(position_onehot)
     sentinel = assert_strictly_less(real_score, sentinel)
 
-Wrappers are stripped from the compiler-private copy during
-compilation (the source graph keeps them), so Asserts cost nothing in
-the compiled transformer's weights or schedule.  They run during
-reference evaluation (``reference_eval``) and, when available, during
-compiled-graph probing (``probe_compiled``).
+Checks run during reference evaluation (every ``compute`` of a checked
+node runs its predicates) and against compiled values during
+``debug=True`` forwards and ``probe_compiled``.
+
+Attach-before-consumers convention
+----------------------------------
+Ops bake gating offsets from input ranges at graph-build time, so a
+claim tightens only what is built *after* it is attached.  Every helper
+here is meant to be called immediately after the node is constructed,
+before anything consumes it (all existing call sites do).  Compile-time
+bounds are always right regardless — ``lower()`` recomputes fresh in
+topological order.
 
 Naming convention (matches the rest of the codebase)
 ----------------------------------------------------
@@ -29,93 +41,103 @@ layer; invariants that hold on aggregated values (``{0, 1}`` bools
 after broadcast) take a tolerance large enough to absorb that fuzz.
 """
 
-from typing import List, Optional, Set, Tuple
+from typing import List, Optional, Set
 
 import torch
 
 from torchwright.graph import Node, Concatenate
-from torchwright.graph.misc import Assert, DebugWatch, Predicate
-from torchwright.graph.value_type import NodeValueType, Range
-
-# ---------------------------------------------------------------------
-# Static contract helpers — the dual of assert_*.
-#
-# ``require_*`` checks a node's inferred ``NodeValueType`` at graph-
-# construction time and raises ``TypeError`` if the claim is missing.
-# Primitives use these to enforce input contracts; the error message
-# points the caller at the matching ``assert_*`` helper that would
-# satisfy it.
-# ---------------------------------------------------------------------
+from torchwright.graph.misc import Check, Predicate
+from torchwright.graph.node import _current_annotation
+from torchwright.graph.value_type import NodeValueType, Range, tightened_with
 
 
-def collect_asserts(output_node: Node) -> List[Assert]:
-    """Walk the graph from ``output_node`` and collect every reachable Assert.
+def attach_assert(
+    node: Node,
+    predicate: Predicate,
+    message: str = "",
+    *,
+    claimed_type: Optional[NodeValueType] = None,
+    integer_claim: bool = False,
+) -> Node:
+    """Attach an assert-kind check (and optional range claim) to ``node``.
 
-    Safe before or after compiling: compilation strips wrappers only
-    from its private copy (``lower()`` clones the graph), so the source
-    graph keeps its Asserts forever.
+    The predicate is appended to ``node.checks``; ``claimed_type`` is
+    intersected into the node's running claim and folded into its
+    derived caches immediately (claims commute, so attach order is
+    irrelevant).  Returns ``node`` for fluent construction.
     """
-    seen: Set[int] = set()
-    asserts: List[Assert] = []
-    stack: List[Node] = [output_node]
-    while stack:
-        node = stack.pop()
-        if node.node_id in seen:
-            continue
-        seen.add(node.node_id)
-        if isinstance(node, Assert):
-            asserts.append(node)
-        for inp in node.inputs:
-            stack.append(inp)
-    return asserts
+    node.checks.append(
+        Check(
+            predicate=predicate,
+            message=message,
+            kind="assert",
+            annotation=_current_annotation.get(),
+        )
+    )
+    changed = False
+    if claimed_type is not None:
+        node.claimed_type = (
+            claimed_type
+            if node.claimed_type is None
+            else tightened_with(node.claimed_type, claimed_type)
+        )
+        changed = True
+    if integer_claim and not node.integer_claim:
+        node.integer_claim = True
+        changed = True
+    if changed:
+        from torchwright.graph.affine_rules import refresh_node_caches
 
-
-def collect_watches(output_node: Node) -> List[DebugWatch]:
-    """Walk the graph from ``output_node`` and collect every reachable DebugWatch.
-
-    Safe before or after compiling — the source graph keeps its wrappers
-    (compilation strips only its private copy).
-    """
-    seen: Set[int] = set()
-    watches: List[DebugWatch] = []
-    stack: List[Node] = [output_node]
-    while stack:
-        node = stack.pop()
-        if node.node_id in seen:
-            continue
-        seen.add(node.node_id)
-        if isinstance(node, DebugWatch):
-            watches.append(node)
-        for inp in node.inputs:
-            stack.append(inp)
-    return watches
-
-
-def collect_debug_nodes(
-    output_node: Node,
-) -> Tuple[List[Assert], List[DebugWatch]]:
-    """Walk the graph once, collecting both Assert and DebugWatch nodes."""
-    seen: Set[int] = set()
-    asserts: List[Assert] = []
-    watches: List[DebugWatch] = []
-    stack: List[Node] = [output_node]
-    while stack:
-        node = stack.pop()
-        if node.node_id in seen:
-            continue
-        seen.add(node.node_id)
-        if isinstance(node, Assert):
-            asserts.append(node)
-        elif isinstance(node, DebugWatch):
-            watches.append(node)
-        for inp in node.inputs:
-            stack.append(inp)
-    return asserts, watches
+        refresh_node_caches(node)
+    return node
 
 
 def debug_watch(node: Node, predicate: Predicate, message: str = "") -> Node:
-    """Wrap ``node`` with a DebugWatch that prints when ``predicate`` fires."""
-    return DebugWatch(node, predicate, message)
+    """Attach a watch-kind check to ``node``: prints when ``predicate`` fires."""
+    node.checks.append(
+        Check(
+            predicate=predicate,
+            message=message,
+            kind="watch",
+            annotation=_current_annotation.get(),
+        )
+    )
+    return node
+
+
+def collect_asserts(output_node: Node) -> List[Node]:
+    """Nodes reachable from ``output_node`` carrying assert-kind checks.
+
+    Safe before or after compiling: compilation never mutates the
+    source graph, and checks are node metadata, so they are always
+    where they were attached.
+    """
+    return [n for n in _walk(output_node) if any(c.kind == "assert" for c in n.checks)]
+
+
+def collect_watches(output_node: Node) -> List[Node]:
+    """Nodes reachable from ``output_node`` carrying watch-kind checks."""
+    return [n for n in _walk(output_node) if any(c.kind == "watch" for c in n.checks)]
+
+
+def collect_debug_nodes(output_node: Node) -> List[Node]:
+    """Nodes reachable from ``output_node`` carrying any checks."""
+    return [n for n in _walk(output_node) if n.checks]
+
+
+def _walk(output_node: Node) -> List[Node]:
+    seen: Set[int] = set()
+    ordered: List[Node] = []
+    stack: List[Node] = [output_node]
+    while stack:
+        node = stack.pop()
+        if node.node_id in seen:
+            continue
+        seen.add(node.node_id)
+        ordered.append(node)
+        for inp in node.inputs:
+            stack.append(inp)
+    return ordered
 
 
 def _format_bad(x: torch.Tensor, mask: torch.Tensor, *, max_show: int = 3) -> str:
@@ -161,7 +183,7 @@ def assert_in_range(
             return True, ""
         return False, f"expected [{lo}, {hi}] (atol={atol}); {_format_bad(x, bad)}"
 
-    return Assert(
+    return attach_assert(
         node,
         predicate,
         message=f"values in [{lo}, {hi}]",
@@ -173,7 +195,9 @@ def assert_integer(node: Node, *, atol: float = 1e-3) -> Node:
     """Assert every element rounds to an integer within ``atol``.
 
     Tightens the ``value_range`` to integer-rounded endpoints of the
-    input's existing range (or leaves it unbounded if unknown).
+    input's existing range (or leaves it unbounded if unknown), and
+    marks the node integer-grained (``node.integer_claim`` — the
+    univariate collapse pass gates on it).
 
     **Safe placement**: at any point where the caller can guarantee the
     tensor is numerically integer.
@@ -194,7 +218,7 @@ def assert_integer(node: Node, *, atol: float = 1e-3) -> Node:
         claimed = NodeValueType(value_range=Range(math.floor(r.lo), math.ceil(r.hi)))
     else:
         claimed = NodeValueType()
-    return Assert(
+    return attach_assert(
         node,
         predicate,
         message="integer-valued",
@@ -219,7 +243,7 @@ def assert_bool(node: Node, *, atol: float = 1e-3) -> Node:
             return True, ""
         return False, f"expected ±1 (atol={atol}); {_format_bad(x, bad)}"
 
-    return Assert(
+    return attach_assert(
         node,
         predicate,
         message="bool (±1)",
@@ -245,7 +269,7 @@ def assert_01(node: Node, *, atol: float = 1e-3) -> Node:
             return True, ""
         return False, f"expected {{0,1}} (atol={atol}); {_format_bad(x, bad)}"
 
-    return Assert(
+    return attach_assert(
         node,
         predicate,
         message="binary (0/1)",
@@ -282,7 +306,7 @@ def assert_onehot(node: Node, *, atol: float = 1e-3) -> Node:
         summary = ", ".join(f"row {i} sum={row_sums[i].item():.3f}" for i in head)
         return False, f"not one-hot (atol={atol}); {summary}{more}"
 
-    return Assert(
+    return attach_assert(
         node,
         predicate,
         message="one-hot",
@@ -300,8 +324,8 @@ def assert_matches_value_type(
 
     Checks that no element lies outside [lo - atol, hi + atol].
 
-    The returned Assert carries ``vt`` as its ``claimed_type`` so
-    downstream static analysis sees the promoted type.
+    ``vt`` becomes the node's range claim, so downstream static
+    analysis sees the promoted type.
     """
     import math
 
@@ -318,7 +342,7 @@ def assert_matches_value_type(
                 return False, f"range {r} (atol={atol}); {_format_bad(x, bad)}"
         return True, ""
 
-    return Assert(
+    return attach_assert(
         node,
         predicate,
         message=f"matches {vt}",
@@ -334,13 +358,15 @@ def assert_strictly_less(
 ) -> Node:
     """Assert every element of ``a`` is strictly less than the matching element of ``b``.
 
-    Both nodes must have the same width.  Returns a wrapped version of
-    ``b`` (the upper bound) — the natural thing to thread into
+    Both nodes must have the same width.  Returns a checked projection
+    of ``b`` (the upper bound) — the natural thing to thread into
     downstream graph construction when the point is to guarantee the
     sentinel stays above the real values.
 
-    Implemented as an Assert over ``Concatenate([a, b])`` so the
-    predicate can split the value without a new two-input node shape.
+    The predicate needs both values at once, so the check attaches to a
+    ``Concatenate([a, b])`` composite; a trailing ``Linear`` projects
+    ``b``'s slice back out for downstream use (value-preserving, so the
+    projection inherits ``b``'s static type as its own claim).
 
     **Safe placement**: anywhere.  Used for sentinel ordering (e.g.
     ``bsp_sentinel`` < ``nonwall_sentinel``, or real ranks <
@@ -367,22 +393,17 @@ def assert_strictly_less(
             f"b={b_val[i, j].item():.4f}"
         )
 
-    wrapped = Assert(
+    composite = attach_assert(
         Concatenate([a, b]),
         predicate,
         message=f"strictly_less (margin={margin})",
     )
-    # The wrapped node is the concat of both; callers want ``b`` back so
-    # the subgraph that *used* ``b`` for sentinel ordering still reads
-    # natural.  Extract ``b``'s slice via a Linear projection so the
-    # returned node has ``b``'s width and value.  The projection is
-    # value-preserving, so the output inherits ``b``'s static type.
     from torchwright.graph import Linear
 
     proj = torch.zeros(len(a) + len(b), len(b))
     for i in range(len(b)):
         proj[len(a) + i, i] = 1.0
-    projected = Linear(wrapped, proj, name="strictly_less_b")
+    projected = Linear(composite, proj, name="strictly_less_b")
     if b.value_type != NodeValueType.unknown():
         return assert_matches_value_type(projected, b.value_type)
     return projected
@@ -426,7 +447,7 @@ def assert_unique_values(
             f"≈ [{j}]={x[row_idx, j].item():.4f}"
         )
 
-    return Assert(node, predicate, message=f"unique values (margin={margin})")
+    return attach_assert(node, predicate, message=f"unique values (margin={margin})")
 
 
 def assert_distinct_across(
@@ -457,10 +478,10 @@ def assert_distinct_across(
     attention that consumes ``value`` so a tie is caught before it
     can blend.
 
-    Implementation mirrors :func:`assert_strictly_less` — composes the
-    two inputs via ``Concatenate`` so no new two-input Assert shape is
-    required; a trailing ``Linear`` projects the asserted composite
-    back to ``value``'s width for downstream use.
+    Implementation mirrors :func:`assert_strictly_less` — the check
+    attaches to a ``Concatenate`` composite of the two inputs; a
+    trailing ``Linear`` projects the checked composite back to
+    ``value``'s width for downstream use.
     """
     d_value = len(value)
     d_where = len(where)
@@ -487,9 +508,8 @@ def assert_distinct_across(
             f"{rows[i].tolist()} vs {rows[j].tolist()}"
         )
 
-    composite = Concatenate([value, where])
-    wrapped = Assert(
-        composite,
+    composite = attach_assert(
+        Concatenate([value, where]),
         predicate,
         message=f"distinct_across (margin={margin})",
     )
@@ -498,7 +518,7 @@ def assert_distinct_across(
     proj = torch.zeros(d_value + d_where, d_value)
     for i in range(d_value):
         proj[i, i] = 1.0
-    projected = Linear(wrapped, proj, name="distinct_across_value")
+    projected = Linear(composite, proj, name="distinct_across_value")
     if value.value_type != NodeValueType.unknown():
         return assert_matches_value_type(projected, value.value_type)
     return projected
@@ -557,9 +577,8 @@ def assert_score_gap_at_least(
             f"rank-2 row [{j}]={sorted_scores[1].item():.5f}"
         )
 
-    composite = Concatenate([score, where])
-    wrapped = Assert(
-        composite,
+    composite = attach_assert(
+        Concatenate([score, where]),
         predicate,
         message=f"score_gap_at_least (margin={margin})",
     )
@@ -568,7 +587,7 @@ def assert_score_gap_at_least(
     proj = torch.zeros(d_value + d_where, d_value)
     for i in range(d_value):
         proj[i, i] = 1.0
-    projected = Linear(wrapped, proj, name="score_gap_value")
+    projected = Linear(composite, proj, name="score_gap_value")
     if score.value_type != NodeValueType.unknown():
         return assert_matches_value_type(projected, score.value_type)
     return projected
@@ -669,9 +688,8 @@ def assert_picked_from(
             f"at L∞ distance {min_dists[int(q)].item():.4f}"
         )
 
-    composite = Concatenate([result, values, keys])
-    wrapped = Assert(
-        composite,
+    composite = attach_assert(
+        Concatenate([result, values, keys]),
         predicate,
         message=f"attention picked one (atol={atol})",
     )
@@ -680,7 +698,7 @@ def assert_picked_from(
     proj = torch.zeros(d_r + d_v + d_k, d_r)
     for i in range(d_r):
         proj[i, i] = 1.0
-    projected = Linear(wrapped, proj, name="picked_from_result")
+    projected = Linear(composite, proj, name="picked_from_result")
     if result.value_type != NodeValueType.unknown():
         return assert_matches_value_type(projected, result.value_type)
     return projected
@@ -693,10 +711,9 @@ def assert_softmax_hardness(
     """Assert the attention's softmax concentrates at least ``threshold``
     mass on the winning key at every query position.
 
-    Wraps the Attn node's output in an Assert whose predicate
-    re-derives the softmax weights from the Attn's Q/K matrices and
-    input values, then checks ``max(weights, dim=keys) >= threshold``
-    per query.
+    Attaches a check whose predicate re-derives the softmax weights
+    from the Attn node's Q/K matrices and input values, then checks
+    ``max(weights, dim=keys) >= threshold`` per query.
 
     ``threshold=0.99`` means 99% of the attention mass must land on a
     single key.  This directly catches the blending failure mode where
@@ -710,19 +727,11 @@ def assert_softmax_hardness(
     from torchwright.graph.attn import Attn, CAUSAL_MASK_SENTINEL
 
     if not isinstance(attn_node, Attn):
-        from torchwright.graph.misc import Assert as AssertNode
-
-        inner = attn_node
-        while isinstance(inner, AssertNode):
-            inner = inner.inputs[0]
-        if not isinstance(inner, Attn):
-            raise TypeError(
-                f"assert_softmax_hardness expects an Attn node (possibly "
-                f"wrapped in Assert), got {type(inner).__name__}"
-            )
-        attn = inner
-    else:
-        attn = attn_node
+        raise TypeError(
+            f"assert_softmax_hardness expects an Attn node, got "
+            f"{type(attn_node).__name__}"
+        )
+    attn = attn_node
 
     query_in_node = attn.inputs[0]
     key_in_node = attn.inputs[1]
@@ -801,9 +810,8 @@ def assert_softmax_hardness(
             f"top-3 weights: {weights[q].topk(min(3, n_pos)).values.tolist()}"
         )
 
-    composite = Concatenate([query_in_node, key_in_node, attn_node])
-    wrapped = Assert(
-        composite,
+    composite = attach_assert(
+        Concatenate([query_in_node, key_in_node, attn_node]),
         predicate,
         message=f"softmax_hardness >= {threshold}",
     )
@@ -812,7 +820,7 @@ def assert_softmax_hardness(
     proj = torch.zeros(d_qi + d_ki + d_out, d_out)
     for i in range(d_out):
         proj[d_qi + d_ki + i, i] = 1.0
-    projected = Linear(wrapped, proj, name="hardness_checked")
+    projected = Linear(composite, proj, name="hardness_checked")
     if attn_node.value_type != NodeValueType.unknown():
         return assert_matches_value_type(projected, attn_node.value_type)
     return projected

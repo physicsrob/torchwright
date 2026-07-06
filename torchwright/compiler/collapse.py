@@ -8,7 +8,7 @@ function of that one scalar, so each externally-consumed member is one
 univariate piecewise-linear function of the source — computable by a
 single staircase ``piecewise_linear`` FFN in one MLP sublayer.  This
 pass finds those subgraphs on the compiler-private copy inside
-``lower()`` (after the wrapper strip), re-synthesizes each boundary
+``lower()`` (after linear fusion), re-synthesizes each boundary
 member that sits at depth >= 2 above the source, rewires its external
 consumers, and orphans the interior.  Depth drops from the subgraph's
 chain length to 1.
@@ -23,9 +23,9 @@ cache keys on the lowered copy's topology.
 
 Feasibility gate (v1, the plateau contract — all four must hold):
 
-1. **Integer contract**: the source carried an ``assert_integer``
-   wrapper in the user graph (the strip hands this pass the set of
-   integer-claimed copy nodes).  Constancy near integers alone cannot
+1. **Integer contract**: the source carries an ``assert_integer``
+   claim (``node.integer_claim`` — metadata attached in the user graph
+   rides the copy).  Constancy near integers alone cannot
    rule out a half-integer-grained source, for which the synthesized
    staircase would return mid-ramp values at inputs the source
    actually takes.
@@ -47,7 +47,7 @@ the decline is recorded with its reason in the :class:`CollapseReport`.
 """
 
 from dataclasses import dataclass
-from typing import Dict, List, Optional, Set, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import torch
 
@@ -56,7 +56,7 @@ from torchwright.compiler.utils import get_ancestor_nodes
 from torchwright.graph import Node
 from torchwright.graph.ffn import FFN
 from torchwright.graph.linear import Linear
-from torchwright.graph.misc import Add, Assert, Concatenate, LiteralValue
+from torchwright.graph.misc import Add, Concatenate, LiteralValue
 from torchwright.graph.optimize import FoldLog
 from torchwright.ops.const import step_sharpness
 
@@ -84,11 +84,9 @@ def scalar_sources(order: List[Node]) -> Dict[Node, Optional[Node]]:
     ``s``).  ``None`` means literal-only ancestry or no single scalar
     source.
 
-    Expects a **wrapper-free** graph (post ``_strip_debug_wrappers``):
-    an Assert/DebugWatch in the walk is not a pointwise op and would end
-    a subgraph at every claim.  Both callers comply — the collapse pass
-    runs after the strip, and the measurement script walks ``lower()``
-    output.
+    Checks and range claims are node metadata, so an asserted value no
+    longer interrupts the walk — a subgraph extends straight through a
+    claim (the wrapper-node representation used to end it there).
     """
     raw: Dict[Node, object] = {}
     for n in order:
@@ -175,11 +173,19 @@ def _seeded_oracle(
     definition the compiler trusts), the recursion short-circuits at the
     source, and one batched call covers the whole grid — nothing
     upstream of the source is ever evaluated.
+
+    Attached checks are suppressed for the walk: the grid's "positions"
+    are synthetic samples (every plateau × offset), so cross-position
+    predicates (distinct-across, score gaps) would fire spuriously.
+    The same predicates still run on real data through the source
+    graph's checks.
     """
     from torchwright.debug.probe import reference_eval
+    from torchwright.graph.node import suppress_checks
 
     root = members[0] if len(members) == 1 else Concatenate(list(members))
-    cache = reference_eval(root, {}, grid.shape[0], seed={source: grid})
+    with suppress_checks():
+        cache = reference_eval(root, {}, grid.shape[0], seed={source: grid})
     return {m: cache[m] for m in members}
 
 
@@ -269,17 +275,14 @@ def _synthesize_member(
 def collapse_univariate_subgraphs(
     output_node: Node,
     *,
-    integer_claimed: Set[Node],
     lane_cap: int,
     fold_log: FoldLog,
     verbose: bool = False,
 ) -> Tuple[Node, CollapseReport]:
-    """Run the collapse pass on the (stripped) compiler-private copy.
+    """Run the collapse pass on the compiler-private copy.
 
     Args:
-        output_node: the copy's output after ``_strip_debug_wrappers``.
-        integer_claimed: copy nodes that carried ``assert_integer`` in
-            the user graph (the strip collects these) — gate condition 1.
+        output_node: the copy's output after linear fusion.
         lane_cap: decline threshold on emitted lanes per synthesized
             FFN (``d_hidden / 4`` of the target compile).
         fold_log: the lowering run's fold log; boundary-member value
@@ -289,10 +292,9 @@ def collapse_univariate_subgraphs(
 
     Returns:
         ``(output_node, report)`` — the (possibly replaced) output and
-        the per-subgraph collapse/decline log.  Synthesized values may
-        carry Assert wrappers (``piecewise_linear``'s clamp-range
-        claim); the caller re-runs the wrapper strip when any collapse
-        happened.
+        the per-subgraph collapse/decline log.  Synthesized values
+        carry ``piecewise_linear``'s clamp-range claim as node
+        metadata.
     """
     order = topological_order(output_node)
     src = scalar_sources(order)
@@ -345,8 +347,8 @@ def collapse_univariate_subgraphs(
             outcomes.append(declined("graph mixes relu and swish FFNs"))
             continue
 
-        # Gate 1 — integer contract on the source.
-        if source not in integer_claimed:
+        # Gate 1 — integer contract on the source (metadata rode the copy).
+        if not source.integer_claim:
             outcomes.append(declined("source carries no assert_integer"))
             continue
 
@@ -446,14 +448,9 @@ def collapse_univariate_subgraphs(
             if m is output_node:
                 output_node = new
             # The synthesized value IS m's value: record the move so the
-            # source->copy node_map follows it.  piecewise_linear wraps
-            # its result in a clamp-range Assert; the map wants the real
-            # node underneath (the caller's re-strip removes the
-            # wrapper from the graph).
-            survivor = new
-            while isinstance(survivor, Assert):
-                survivor = survivor.inputs[0]
-            fold_log.record_move(orphan=m, survivor=survivor)
+            # source->copy node_map follows it.  (piecewise_linear's
+            # clamp-range claim is metadata on ``new`` itself.)
+            fold_log.record_move(orphan=m, survivor=new)
 
         outcomes.append(
             SubgraphOutcome(

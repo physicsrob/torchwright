@@ -12,7 +12,7 @@ to outputs).  Both reduce a debug run to the same three things:
 * ``state_tensor``: ``{state: (residual_tensor, label)}`` snapshots.
 
 Everything in this module operates on that triple only, so the
-self-consistency walk, Assert/DebugWatch evaluation, and per-node value
+self-consistency walk, attached-check evaluation, and per-node value
 extraction are guaranteed to behave identically on both backends.
 
 This module must stay import-light (graph + residual_assignment only):
@@ -31,7 +31,6 @@ from torchwright.compiler.residual_assignment import (
     ResidualStreamState,
 )
 from torchwright.graph import Concatenate, Node
-from torchwright.graph.misc import Assert, DebugWatch
 
 #: ``{state: (residual_tensor, label)}`` — the label embeds the layer
 #: index (e.g. ``"layer_5_mlp_out_state"``) because ``state.name`` alone
@@ -49,13 +48,8 @@ def extract_compiled_value(
 
     Returns ``None`` if the node is not materialised at ``state``.
     Concatenate nodes resolve to the concatenation of their children's
-    columns via ``ResidualAssignment.get_node_indices``;
-    Assert/DebugWatch wrappers resolve to the node they wrap (the
-    source graph keeps its wrappers — only the compiler's private copy
-    is stripped).
+    columns via ``ResidualAssignment.get_node_indices``.
     """
-    while isinstance(node, (Assert, DebugWatch)):
-        node = node.inputs[0]
     nodes_here = ra.get_nodes(state)
     if node not in nodes_here and not isinstance(node, Concatenate):
         return None
@@ -73,11 +67,7 @@ def first_state_with(
     ra: ResidualAssignment,
     ordered_states: List[ResidualStreamState],
 ) -> Optional[ResidualStreamState]:
-    """Earliest sublayer state in which ``node`` is materialised.
-
-    Assert/DebugWatch wrappers resolve to the node they wrap."""
-    while isinstance(node, (Assert, DebugWatch)):
-        node = node.inputs[0]
+    """Earliest sublayer state in which ``node`` is materialised."""
     if isinstance(node, Concatenate):
         # Concatenate is resolved transparently — pick the earliest
         # state where *all* of its leaves are present.
@@ -221,47 +211,28 @@ def run_consistency_check(
 
 
 def check_debug_predicates(
-    asserts: List[Assert],
-    watches: List[DebugWatch],
+    checked_nodes: List[Node],
     ra: ResidualAssignment,
     ordered_states: List[ResidualStreamState],
     state_tensor: StateTensors,
 ) -> None:
-    """Run Assert (raises) and DebugWatch (prints) predicates on captured values.
+    """Run every checked node's attached checks on its captured compiled value.
 
-    Each wrapper's innermost non-wrapper target is looked up at the
-    earliest state where it is materialised; wrappers whose targets have
-    no residual assignment are silently skipped — there is no compiled
-    value to check.
+    Assert-kind checks raise, watch-kind checks print (``Check.run``).
+    Each node is looked up at the earliest state where it is
+    materialised; nodes with no residual assignment are silently
+    skipped — there is no compiled value to check.
     """
-    for assert_node in asserts:
-        target = assert_node.inputs[0]
-        while isinstance(target, (Assert, DebugWatch)):
-            target = target.inputs[0]
-        state = first_state_with(target, ra, ordered_states)
+    for node in checked_nodes:
+        state = first_state_with(node, ra, ordered_states)
         if state is None:
             continue
         tensor_pair = state_tensor.get(state)
         if tensor_pair is None:
             continue
         res_tensor, _ = tensor_pair
-        compiled_val = extract_compiled_value(target, ra, state, res_tensor)
+        compiled_val = extract_compiled_value(node, ra, state, res_tensor)
         if compiled_val is None:
             continue
-        assert_node._check(compiled_val)
-
-    for watch_node in watches:
-        target = watch_node.inputs[0]
-        while isinstance(target, (Assert, DebugWatch)):
-            target = target.inputs[0]
-        state = first_state_with(target, ra, ordered_states)
-        if state is None:
-            continue
-        tensor_pair = state_tensor.get(state)
-        if tensor_pair is None:
-            continue
-        res_tensor, _ = tensor_pair
-        compiled_val = extract_compiled_value(target, ra, state, res_tensor)
-        if compiled_val is None:
-            continue
-        watch_node._check(compiled_val)
+        for check in node.checks:
+            check.run(compiled_val, node)

@@ -29,8 +29,8 @@ noise and clears compare's fillet dip (0.0022 at scale=128) with margin."""
 
 
 def _assert_cond_pm1(cond: Node, c_tol: float = _GATE_C_TOL) -> Node:
-    """Wrap ``cond`` in the gated ops' shared ±1 assert."""
-    from torchwright.graph.misc import Assert
+    """Attach the gated ops' shared ±1 assert to ``cond``."""
+    from torchwright.graph.asserts import attach_assert
 
     def _cond_check(x: torch.Tensor) -> tuple:
         deviation = (x.abs() - 1.0).abs()
@@ -41,7 +41,7 @@ def _assert_cond_pm1(cond: Node, c_tol: float = _GATE_C_TOL) -> Node:
 
         return False, (f"expected ||cond| - 1| <= {c_tol}; {_format_bad(x, bad)}")
 
-    return Assert(
+    return attach_assert(
         cond,
         _cond_check,
         message=f"cond near ±1 (c_tol={c_tol})",

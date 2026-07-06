@@ -8,7 +8,6 @@ from torchwright.compiler.groups.mlp_sublayer import MLPSubLayer
 from torchwright.compiler.groups.transformer_layer import TransformerLayer
 from torchwright.graph import (
     Node,
-    Assert,
     LiteralValue,
     InputNode,
     Concatenate,
@@ -28,7 +27,6 @@ class HeadlessTransformer:
     d_hidden: int
     d_head: int
     residual_assignment: Optional[ResidualAssignment]
-    assert_aliases: Optional[Dict[Assert, Node]]
     # 2-D weight-matrix occupancy recorded during weight writing (see
     # forward.weight_writer.PlacementRecorder).  ``None`` until compile sets it.
     placements: Optional[Any]
@@ -55,7 +53,6 @@ class HeadlessTransformer:
         self.activation = activation
         self.layers = []
         self.residual_assignment = None
-        self.assert_aliases = None
         self.placements = None
 
     @property
@@ -185,8 +182,4 @@ class HeadlessTransformer:
         for node in self.residual_assignment.get_nodes(out_state):
             indices = self.residual_assignment.get_node_indices(out_state, node)
             result[node] = res[:, indices]
-        if self.assert_aliases is not None:
-            for assert_node, target in self.assert_aliases.items():
-                if target in result and assert_node not in result:
-                    result[assert_node] = result[target]
         return result

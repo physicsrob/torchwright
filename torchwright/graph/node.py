@@ -66,6 +66,28 @@ _current_annotation: ContextVar[Optional[str]] = ContextVar(
     default=None,
 )
 
+# When True, ``compute`` skips running attached checks (``node.checks``).
+# Used by callers that evaluate a graph on synthetic values — e.g. the
+# univariate collapse pass seeds a subgraph's source with an offset grid
+# whose "positions" are samples, not real data, so cross-position
+# predicates (distinct-across, score gaps) would fire spuriously.
+_checks_suppressed: ContextVar[bool] = ContextVar("checks_suppressed", default=False)
+
+
+@contextmanager
+def suppress_checks():
+    """Disable attached-check execution (``node.checks``) inside the block.
+
+    Claims and bounds are unaffected — only the runtime predicates are
+    skipped.  For evaluating graphs on synthetic inputs where the
+    predicates' preconditions don't hold.
+    """
+    token = _checks_suppressed.set(True)
+    try:
+        yield
+    finally:
+        _checks_suppressed.reset(token)
+
 
 @contextmanager
 def annotate(label: str):
@@ -138,6 +160,18 @@ class Node:
         node_id: Auto-incremented unique identifier.
         name: Optional human-readable label (for debugging / repr).
         annotation: Hierarchical label set by the ``annotate`` context manager.
+        checks: Runtime predicates attached to this node's value
+            (``torchwright.graph.misc.Check``); run during ``compute``
+            and against compiled values on ``debug=True`` forwards.
+            Attach via the helpers in ``torchwright.graph.asserts``.
+        claimed_type: Running intersection of every range claim attached
+            to this node (claims commute).  Applied to the derived
+            caches by ``refresh_node_caches`` — the single choke point —
+            so claims survive any bounds recompute by construction.
+        integer_claim: True when an ``assert_integer`` claim is attached
+            (the value is integer-grained).  ``NodeValueType`` stays
+            range-only, so integer-ness travels here; the univariate
+            collapse pass gates on it.
     """
 
     inputs: List["Node"]
@@ -146,6 +180,9 @@ class Node:
     name: str
     annotation: Optional[str]
     scheduling_predecessors: Set["Node"]
+    checks: List
+    claimed_type: Optional[NodeValueType]
+    integer_claim: bool
 
     def __init_subclass__(cls, **kwargs):
         super().__init_subclass__(**kwargs)
@@ -159,6 +196,17 @@ class Node:
                 result, torch.Tensor
             ):
                 _verify_tensor_against_value_type(self, result)
+            # Attached checks run on every compute of the node's value —
+            # this is what makes reference eval exercise every assert
+            # (memoised evaluators call compute once per node, so each
+            # check runs once per eval).
+            if (
+                self.checks
+                and not _checks_suppressed.get()
+                and isinstance(result, torch.Tensor)
+            ):
+                for check in self.checks:
+                    check.run(result, self)
             return result
 
         wrapped.__name__ = original.__name__
@@ -187,10 +235,17 @@ class Node:
         # after recomputing the propagated bound — a recompute that dropped
         # it would silently loosen every downstream bound.
         self._semantic_affine_override = None
-        self._structural_type = self.compute_value_type()
-        from torchwright.graph.affine_rules import compute_affine_bound
+        # Check/claim metadata (see class docstring).  Empty at birth;
+        # the asserts.py helpers attach after construction.
+        self.checks = []
+        self.claimed_type = None
+        self.integer_claim = False
+        # Derived caches (_structural_type / _affine_bound) go through
+        # refresh_node_caches — the same choke point every later
+        # recompute uses, so claim application can never be skipped.
+        from torchwright.graph.affine_rules import refresh_node_caches
 
-        self._affine_bound = compute_affine_bound(self)
+        refresh_node_caches(self)
 
     @property
     def value_type(self) -> NodeValueType:
