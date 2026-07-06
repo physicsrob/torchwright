@@ -1,12 +1,15 @@
 # Univariate-subgraph collapse — design
 
-Status: DESIGN (no implementation yet).
+Status: IMPLEMENTED, DEFAULT ON (flipped 2026-07-06; rollout results
+recorded per item under *Verification and rollout* below).
 Measurement basis: `scripts/measure_fusion_opportunities.py` at commits
 `4e4b59c`..`f482c2d`, run on all eight examples and the production doom
 graph (2026-07-05).  Revised 2026-07-05 after design review: integer
 contract added to the gate, lane budget restated in emitted lanes,
 lane-budget tiers collapsed to one rule, noise measurement required
-before the default flips.
+before the default flips.  Revised 2026-07-06 (with Rob): gate 4 is a
+composite error budget, not bit-identity; no post-collapse fusion
+round (both recorded in place below).
 
 ## The idea in one paragraph
 
@@ -423,3 +426,61 @@ pass lands.
    are green.  The flag stays as an escape hatch until the doom
    pixel-oracle gates have run green with the default on; then it is
    deleted — no dormant knobs.
+
+### Rollout results (2026-07-06)
+
+1. **Unit layer**: 18 tests green (`tests/compile/test_collapse.py`),
+   including the composite-budget pins (sub-budget deviation admitted;
+   each-term-fits-sum-does-not declined; the saturating-min false
+   decline of the bit-identity era now collapses).
+2. **Invariants sweep**: full torchwright suite with the flag forced
+   on at all three entry points — 988 passed; the single failure
+   (`test_numerical_noise_drift`, staircase entries) reproduces at
+   `80f9382` with the flag off and isolated: pre-existing
+   architecture-sensitivity of the committed staircase measurements
+   (committed numbers match local CPU arithmetic; Modal EPYC computes
+   the ~1e6-magnitude lane sums 2–4× differently — past the drift
+   test's 0.40 rtol), unrelated to the pass.
+3. **Example parity + realized depth** (`scripts/collapse_depth_report.py`,
+   optimize=2 = production CP-SAT):
+   - sort_digits_v1 **42 → 24 (−18)** — nine prev_digit threshold
+     chains, unlocked by latching prev_digit on trigger-or-bos and
+     integer claims (examples/sort_digits_v1.py);
+   - calculator_scratchpad **14 → 13 (−1)** — 12 collapses, unlocked
+     by the composite budget (its emit chains carry a measured 3.8e-6
+     swish fillet residue at the band edge) and T[k]/this_count/
+     _digit_scalar claims.  At optimize=0 greedy packing shows +1: the
+     collapsed subgraphs sit off the modeled critical path (16
+     sublayers both ways) — the win is CP-SAT exploiting the reshaped
+     population, not path shortening;
+   - other six examples: 0 collapses, delta 0.  Token batteries green.
+4. **Doom gate**: suite green flag-on and flag-off; lowres COMPARE
+   cert **100.0% coverage / 100.0% within-option** (91.6% exact),
+   17,336-token rollout to terminal.  4 collapses (span_start
+   tex_id chain 6→1 ×2 with 8 boundary members each, cmap_row 2→2×1)
+   from integer claims at torchwright_doom's span_start_values /
+   span_values / cursor-x pick (atol 0.05 = the plateau band,
+   covering the documented ~0.02 pick leak).
+5. **Noise**: staircase entries landed at `80f9382` (but see item 2's
+   architecture-sensitivity finding — resolution owned by Rob).
+6. **Depth report, doom**: **37 → 37 (delta 0), explained**: CP-SAT
+   status OPTIMAL at 37 both ways, and the zero-slack set
+   (`scripts/critical_chain.py`, lowres env) is 84/122 nodes of
+   `pix/R_DrawColumn` `table_lookup_2d` interpolation machinery — the
+   continuous chain v1 defers by design.  The plan-era modeled ~54-
+   from-64 predates tier 1 (51 → 37), which restructured exactly the
+   R_DrawColumn machinery and pre-harvested the staircase winners.
+   The plan's pinned `sub [−160,324]` instance no longer exists
+   post-tier-1; `table_lookup` stays declined by design (v2); the
+   cursor-x chain declines at gate 4 because SCREEN_X_CLAMP's kink
+   sits ON integer 0 (measured deviation 0.025 — the predicted
+   threshold-at-an-integer catch).  **The doom depth prize is now v2:
+   continuous-source collapse of the table_lookup chains.**
+   Side effect: a collapsed subgraph materializes all boundary members
+   at source-depth+1, raising residual liveness — doom's structural
+   compile gate re-bracketed d 4096 → 4608 (its greedy optimize=0
+   schedule deadlocked at the old cramming point; production CP-SAT
+   unaffected).
+7. **Flipped 2026-07-06.**  Retirement (the flag off the public entry
+   points, kept on `lower()` for the tests that need the off-path)
+   follows as the next change.

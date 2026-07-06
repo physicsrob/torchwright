@@ -120,9 +120,9 @@ def test_artifact_records_collapse_provenance(artifacts):
     flag, so this also pins the current default."""
     artifact, onnx_path = artifacts["biased"]
     with open(meta_path_for(onnx_path)) as f:
-        assert json.load(f)["collapse_univariate"] is False
+        assert json.load(f)["collapse_univariate"] is True
     with open(artifact.debug_path) as f:
-        assert json.load(f)["collapse_univariate"] is False
+        assert json.load(f)["collapse_univariate"] is True
 
 
 def test_no_bias_emission_has_no_bias_tensors(artifacts):

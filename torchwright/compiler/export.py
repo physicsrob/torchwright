@@ -1342,7 +1342,7 @@ def compile_to_onnx(
     rms_norm_eps: float = 1e-5,
     rms_norm_const_exp: Optional[int] = None,
     bias: bool = True,
-    collapse_univariate: bool = False,
+    collapse_univariate: bool = True,
 ) -> OnnxArtifact:
     """Compile a token-I/O graph to a KV-cached ONNX model.
 
@@ -2252,7 +2252,7 @@ def compile_headless(
     optimize: int = 0,
     assume_zero_init: bool = False,
     bias: bool = True,
-    collapse_univariate: bool = False,
+    collapse_univariate: bool = True,
 ) -> CompiledHeadless:
     """Compile a graph to an in-process callable.
 

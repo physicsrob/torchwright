@@ -609,7 +609,7 @@ def forward_compile(
     rms_norm_eps: float = 1e-5,
     rms_norm_const_exp: int = _RMS_NORM_CONST_EXP,
     bias: bool = True,
-    collapse_univariate: bool = False,
+    collapse_univariate: bool = True,
 ) -> HeadlessTransformer:
     """Compile a computation graph into a HeadlessTransformer.
 
