@@ -116,20 +116,22 @@ Inside `lower()`, **after** linear fusion.  (2026-07, post
 assert-metadata migration: checks and range claims are node metadata —
 docs/assert_metadata_plan.md — so there is no wrapper strip; claims are
 refresh-proof at the `refresh_node_caches` choke point and a claim
-never ends a subgraph.)  A follow-up **second `fuse_consecutive_linears`
-round** after the collapse remains desirable: a collapse
-produces `FFN(source)`, and when the source is a Linear whose only
-remaining consumers are the synthesized FFNs, the existing
-linear-into-gate fold absorbs it — a free extra sublayer (doom's
-`split_7` source is exactly this shape).
+never ends a subgraph.)
 
-With claims refresh-proof by construction, that second round is
-bounds-safe unconditionally — the strip bookkeeping this section used
-to describe (and the claim-loss trap that made an unconditional
-post-strip round unsafe) no longer exists.  The remaining question —
-which folds may delete runtime checkability — is the explicit
-fold-decline policy in `graph/optimize.py`, revisitable on
-measurement.
+**No post-collapse fusion round** (decided 2026-07-06).  Earlier drafts
+called for a second `fuse_consecutive_linears` round after the
+collapse, hoping the linear-into-gate fold would absorb a Linear source
+whose only remaining consumers are the synthesized FFNs (doom's
+`split_7` source is exactly this shape — a free extra sublayer).  But
+the collapse gate *requires* every source to carry `assert_integer`
+(gate condition 1), and the fold-decline policy in `graph/optimize.py`
+declines any fold that would erase a checked node — so on collapse
+output the round can absorb nothing without a policy exception.  Rather
+than carve that exception now, the source-Linear fold is **deferred to
+v2** (tracked; revisit with depth-report data showing what it would
+actually buy).  Claims being refresh-proof means such a round would be
+bounds-safe whenever the policy allows it — the blocker is check
+preservation, not bounds.
 
 Gated by a `collapse_univariate: bool = False` keyword threaded from
 the compile entry points (`compile_headless`, `compile_to_onnx`).
@@ -371,12 +373,13 @@ pass lands.
    without `assert_integer` declined; half-integer-grained source
    declined (the gate-condition-1 counterexample); wrapper/override
    handling; depth-1 boundary member kept as-is.
-2. **Pass-level invariants**: the unconditional post-collapse fusion
-   round lands as its own change with `test_lowering_parity`'s
-   in-place twin updated; the twin then gains the collapse pass (same
-   round order).  Compiler invariants I1–I4 are untouched (the pass
-   runs before scheduling) but the full suite runs with the flag
-   forced on in a one-off sweep before the default flips.
+2. **Pass-level invariants**: no post-collapse fusion round ships in
+   this rollout — the fold-decline policy makes it a no-op on collapse
+   output (every source is integer-checked; see *Placement*), and the
+   source-Linear fold is deferred to v2 with a policy exception.
+   Compiler invariants I1–I4 are untouched (the pass runs before
+   scheduling) but the full suite runs with the flag forced on in a
+   one-off sweep before the default flips.
 3. **Example parity**: every example compiles with the flag on; token
    outputs identical on the existing example tests.
 4. **Doom gate**: `probe_compiled` parity on the lowres config, then
@@ -396,9 +399,8 @@ pass lands.
    with the pass's own collapse/decline log (per subgraph: source,
    members, chain → 1, emitted lanes; or the decline reason).  Also
    re-run `scripts/measure_fusion_opportunities.py` on both settings so
-   the modeled critical path (expect ~54 from doom's 64, plus whatever
-   the post-collapse fusion round finds) can be checked against the
-   realized layer delta; a modeled saving that does not show up in real
+   the modeled critical path (expect ~54 from doom's 64) can be checked
+   against the realized layer delta; a modeled saving that does not show up in real
    layers means the schedule is not chain-bound where we thought, and
    that discrepancy is a finding to explain (D4), not to skip.
 7. **Flip the default** (`collapse_univariate=True`) only after 1–6
