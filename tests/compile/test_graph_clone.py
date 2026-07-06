@@ -28,9 +28,7 @@ from torchwright.graph.ffn import FFN
 from torchwright.graph.linear import Linear
 from torchwright.graph.misc import (
     Add,
-    Assert,
     Concatenate,
-    DebugWatch,
     LiteralValue,
     Placeholder,
     ValueLogger,
@@ -131,6 +129,11 @@ def _node_field_matches(key, sval, cval, node_map):
         return cval == {node_map[s] for s in sval} and all(
             c is not s for s in sval for c in cval
         )
+    if key == "checks":
+        # Fresh list object per clone; Check entries shared by reference.
+        return (
+            cval is not sval or not sval
+        ) and all(c is s for c, s in zip(cval, sval)) and len(cval) == len(sval)
     if key == "_structural_type":
         return cval.value_range == sval.value_range
     if key == "_affine_bound":
@@ -153,7 +156,7 @@ def test_clone_completeness_every_vocabulary_variant():
     out, inputs = _variant_graph()
     copy = clone_graph(out, DISPATCH)
 
-    # (i) Structural equality under the wrapper-transparent canonical walk.
+    # (i) Structural equality under the canonical walk.
     assert topology_entries(out) == topology_entries(copy.output_node)
 
     # Every vocabulary type is actually exercised (guards test rot).
@@ -219,8 +222,8 @@ def test_clone_shares_weight_tensors_by_reference():
                 checked += 1
         if isinstance(src, Embedding):
             assert clone.tokenizer is src.tokenizer
-        if isinstance(src, (Assert, DebugWatch)):
-            assert clone.predicate is src.predicate
+        for c_check, s_check in zip(clone.checks, src.checks):
+            assert c_check is s_check  # Check entries shared by reference
     assert checked > 10
 
 

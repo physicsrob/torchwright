@@ -47,12 +47,10 @@ def test_floor_int_intermediates_carry_tight_range_pins():
     pointwise).  Unpinned, the affine relaxation declares ~sharpness·range
     on the step stage (~1e16 on a production-magnitude floor), and the
     flagship's rms_norm residual-energy certifier — which reads every
-    residual-resident value's post-strip type, not just the op's asserted
-    output — blows its fp32-feasible budget.  Found by the doom D2 cutover
-    compile gate."""
+    residual-resident value's claim-tightened type, not just the op's
+    asserted output — blows its fp32-feasible budget.  Found by the doom
+    D2 cutover compile gate."""
     from collections import deque
-
-    from torchwright.graph.misc import Assert
 
     x = create_input("x", 1, value_range=(-1023.0, 1023.0))
     out = floor_int(x, -1023, 1023, sharpness=10_000.0)
@@ -65,9 +63,8 @@ def test_floor_int_intermediates_carry_tight_range_pins():
         if id(n) in seen:
             continue
         seen.add(id(n))
-        if isinstance(n, Assert) and n.claimed_type is not None:
-            inner = n.inputs[0]
-            name = getattr(inner, "name", "")
+        if n.claimed_type is not None:
+            name = getattr(n, "name", "")
             if name in pins:
                 pins[name].append(n.claimed_type.value_range)
         q.extend(getattr(n, "inputs", []))

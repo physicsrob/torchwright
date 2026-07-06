@@ -1,4 +1,4 @@
-"""Tests for the graph-level Assert node and predicate helpers.
+"""Tests for the attached-check predicate helpers (graph/asserts.py).
 
 Covers:
 
@@ -6,9 +6,8 @@ Covers:
   (at reference-eval time via ``node.compute``).
 * Failure messages include the site's annotation and the helper's
   detail string.
-* Asserts are stripped during compilation — a graph that compiles
-  without Asserts produces the same forward output as the same graph
-  *with* Asserts.
+* Checks cost nothing compiled — a graph compiles to the same forward
+  output with or without them.
 * ``check_asserts_on_compiled`` fires a predicate when the compiled
   transformer's value violates an invariant that reference math
   satisfies (synthetically constructed, to prove the probe path
@@ -22,7 +21,7 @@ import torch
 
 from torchwright.compiler.export import compile_headless
 from torchwright.debug.probe import check_asserts_on_compiled, reference_eval
-from torchwright.graph import Assert, Concatenate, LiteralValue, NodeValueType, annotate
+from torchwright.graph import Concatenate, NodeValueType, annotate
 from torchwright.graph.asserts import (
     assert_01,
     assert_bool,
@@ -246,8 +245,7 @@ def test_collect_asserts_finds_reachable():
     b = assert_bool(y)
     root = Concatenate([a, b])
     asserts = collect_asserts(root)
-    assert len(asserts) == 2
-    assert all(isinstance(n, Assert) for n in asserts)
+    assert set(asserts) == {x, y}  # the checks live on the nodes themselves
 
 
 def test_collect_asserts_returns_empty_for_no_asserts():
@@ -256,7 +254,7 @@ def test_collect_asserts_returns_empty_for_no_asserts():
 
 
 # ---------------------------------------------------------------------------
-# Strip transparency — compiled forward is identical with or without Asserts
+# Checks cost nothing compiled — forward identical with or without
 # ---------------------------------------------------------------------------
 
 
@@ -271,7 +269,7 @@ def _build_simple_graph(with_assert: bool):
     return x, clamped
 
 
-def test_compile_strips_asserts_and_preserves_output():
+def test_checks_cost_nothing_compiled():
     _, out_a = _build_simple_graph(with_assert=False)
     mod_a = compile_headless(
         out_a,
@@ -290,7 +288,7 @@ def test_compile_strips_asserts_and_preserves_output():
         verbose=False,
     )
 
-    # Same layer count (Asserts don't compile into layers).
+    # Same layer count (checks don't compile into layers).
     assert mod_a._n_layers == mod_b._n_layers
 
     # Same output on matching inputs.  ``_build_simple_graph`` uses a
@@ -377,8 +375,8 @@ def test_check_asserts_on_compiled_raises_when_compiled_violates():
     inp_val = torch.tensor([[0.8]])
 
     # Skip reference eval (it'd raise first); just compile and check
-    # the compiled side.  GraphAnalyzer strips Asserts at compile time,
-    # so compile succeeds without running the predicate.
+    # the compiled side.  Compilation never runs predicates, so the
+    # compile succeeds.
     mod = compile_headless(
         out,
         d=256,
@@ -707,10 +705,21 @@ def test_score_gap_ignores_non_wall_ties():
 
 
 def test_range_violation_raises():
-    inp = LiteralValue(torch.tensor([15.0]))  # outside [0, 9]
+    inp = create_input("v", 1)
     node = assert_matches_value_type(inp, NodeValueType.bounded(0, 9))
     with pytest.raises(AssertionError, match="range"):
-        node.compute(1, {})
+        node.compute(1, {"v": torch.tensor([[15.0]])})  # outside [0, 9]
+
+
+def test_contradictory_claim_rejected_at_attach():
+    """A claim disjoint from the node's structural type is a bug in one
+    of the two; it fails loudly at attach time (the old wrapper design
+    only caught it at the compile-time strip)."""
+    from torchwright.graph import LiteralValue
+
+    lit = LiteralValue(torch.tensor([15.0]))  # structural type [15, 15]
+    with pytest.raises(ValueError, match="intersection"):
+        assert_matches_value_type(lit, NodeValueType.bounded(0, 9))
 
 
 def test_format_bad_multidim_reports_true_positions():

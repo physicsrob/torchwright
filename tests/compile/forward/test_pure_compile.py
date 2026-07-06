@@ -82,6 +82,6 @@ def test_double_compile_same_graph_object_identical_sidecars():
     assert first == second, "debug sidecars differ across a recompile"
 
     # The source graph is untouched by both compiles: same node set, same
-    # wiring, bit-identical value ranges, wrappers intact.
+    # wiring, bit-identical value ranges, checks intact.
     assert _graph_snapshot(output_node) == before
     assert len(collect_asserts(output_node)) == n_asserts

@@ -26,7 +26,7 @@ from torchwright.compiler.export import (
     debug_meta_path_for,
 )
 from torchwright.compiler.forward.compile import forward_compile
-from torchwright.compiler.graph_identity import canonical_ids, unwrap_debug
+from torchwright.compiler.graph_identity import canonical_ids
 from torchwright.ops.relu.arithmetic_ops import multiply_2d
 from torchwright.ops.linear import add
 from torchwright.ops.inout_nodes import create_input
@@ -49,7 +49,7 @@ def _build_graph():
 def _compile():
     out = _build_graph()
     net = forward_compile(D, D_HEAD, out, verbose=False, device="cpu")
-    canon = canonical_ids(unwrap_debug(out))
+    canon = canonical_ids(out)
     return net, canon, out
 
 
@@ -169,7 +169,7 @@ def test_placements_cover_all_nonzero_weights():
     # layout matches the sidecar's full-matrix description.
     out = _build_graph()
     net = forward_compile(D, D_HEAD, out, verbose=False, device="cpu", trim_heads=False)
-    canon = canonical_ids(unwrap_debug(out))
+    canon = canonical_ids(out)
     matrices, placements, _, _ = _build_matrix_occupancy(net, canon, D, D_HEAD)
 
     # Gather every rectangle per matrix id (across node keys AND reserved

@@ -39,7 +39,6 @@ from torchwright.ops.attention_ops import (
     _ABOVE_BONUS,
 )
 from torchwright.graph.attn import Attn
-from torchwright.graph.misc import Assert
 from torchwright.ops.inout_nodes import create_rope_config
 
 # Uniform rotary substrate for these oracle (``node.compute``) tests.  Under
@@ -542,9 +541,7 @@ def _above_table(scores, thresholds):
 
 
 def _unwrap_attn(node):
-    """Peel any Assert wrappers off a hard-selection output to reach the Attn."""
-    while isinstance(node, Assert):
-        node = node.inputs[0]
+    """Hard-selection outputs are the Attn itself (claims are metadata)."""
     assert isinstance(node, Attn), f"expected Attn, got {type(node).__name__}"
     return node
 

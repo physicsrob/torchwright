@@ -330,11 +330,14 @@ def test_probe_attention_fetches_artifact_weights(token_artifact):
 # ---------------------------------------------------------------------------
 
 
-def test_assert_wrappers_are_fingerprint_transparent_and_fire(token_artifact):
+def test_attached_checks_are_fingerprint_transparent_and_fire(token_artifact):
     out, emb = _build_adder()
-    wrapped = assert_in_range(out, lo=1e6, hi=2e6)  # impossible claim
-    # Wrapping must NOT change the fingerprint — the session loads fine...
-    session = OnnxDebugSession(token_artifact, wrapped)
+    # A claim the artifact's actual values violate (kept inside the
+    # output's existing op-tail claim so the attach-time intersection is
+    # non-empty — a fully disjoint claim raises at attach, by design).
+    checked = assert_in_range(out, lo=1000.0, hi=2000.0)
+    # Attaching must NOT change the fingerprint — the session loads fine...
+    session = OnnxDebugSession(token_artifact, checked)
     # ...and the rebuilt graph's assert fires on the artifact's values.
     with pytest.raises(AssertionError):
         session(_token_ids(emb), debug=True)

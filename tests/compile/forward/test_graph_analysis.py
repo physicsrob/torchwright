@@ -2,7 +2,7 @@ import torch
 
 from torchwright.compiler.forward.graph_analysis import GraphAnalyzer
 from torchwright.graph import Linear, ReLU, Add, Concatenate
-from torchwright.graph.misc import InputNode, LiteralValue
+from torchwright.graph.misc import InputNode
 from examples.adder import create_network_parts
 
 
@@ -92,8 +92,8 @@ def test_concatenate_transparency():
 def test_adder_graph():
     """Load the 3-digit adder graph, verify topo order valid and all nodes reachable.
 
-    Analyzes the lowered copy: GraphAnalyzer is pure analysis and expects
-    the wrapper-free graph the lowering boundary produces."""
+    Analyzes the lowered copy: GraphAnalyzer is pure analysis of the
+    graph the lowering boundary produces."""
     from torchwright.compiler.lower import lower
 
     source_output, embedding = create_network_parts()
@@ -154,14 +154,3 @@ def test_ready_nodes_progression():
 
     assert out in available
 
-
-def test_analyzer_rejects_wrapper_carrying_graph():
-    """Pure-analysis contract: wrappers mean the caller skipped lower()."""
-    import pytest
-
-    from torchwright.graph.asserts import assert_in_range
-
-    x = InputNode("x", 4, value_range=(-1.0, 1.0))
-    wrapped = assert_in_range(_make_linear(x, 4), -100.0, 100.0)
-    with pytest.raises(ValueError, match="wrapper-free"):
-        GraphAnalyzer(wrapped)

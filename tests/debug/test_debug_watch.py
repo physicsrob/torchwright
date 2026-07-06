@@ -1,14 +1,14 @@
-"""Tests for DebugWatch nodes and debug=True compiled forward.
+"""Tests for watch-kind checks and debug=True compiled forward.
 
 Covers:
 
-* DebugWatch.compute() prints when the predicate fires, does not raise.
-* DebugWatch.compute() is silent when the predicate passes.
-* DebugWatch nodes are stripped during compilation — output is identical.
-* collect_watches / collect_debug_nodes find reachable nodes.
-* compiled(inputs, debug=True) checks asserts (raises) and watches (prints).
+* A watch prints during compute when its predicate fires, does not raise.
+* A watch is silent when the predicate passes.
+* Watches cost nothing compiled — output is identical with or without.
+* collect_watches / collect_debug_nodes find reachable checked nodes.
+* compiled(inputs, debug=True) runs asserts (raise) and watches (print).
 * compiled.step(inputs, past, debug=True) exercises both.
-* compile_headless auto-collects asserts and watches onto the module.
+* compile_headless auto-collects checked nodes onto the module.
 """
 
 import pytest
@@ -16,7 +16,6 @@ import torch
 
 from torchwright.compiler.export import compile_headless
 from torchwright.debug.probe import reference_eval
-from torchwright.graph import Assert, DebugWatch, Concatenate
 from torchwright.graph.asserts import (
     assert_in_range,
     collect_asserts,
@@ -106,7 +105,7 @@ def test_collect_watches_finds_reachable():
     x, y = _build_graph(with_watch=True)
     watches = collect_watches(y)
     assert len(watches) == 1
-    assert isinstance(watches[0], DebugWatch)
+    assert watches[0] is y  # the watch lives on the node itself
 
 
 def test_collect_watches_returns_empty():
@@ -114,19 +113,19 @@ def test_collect_watches_returns_empty():
     assert collect_watches(x) == []
 
 
-def test_collect_debug_nodes_finds_both():
+def test_collect_debug_nodes_finds_both_kinds():
     x, y = _build_graph(with_watch=True, with_assert=True)
-    asserts, watches = collect_debug_nodes(y)
-    assert len(asserts) >= 1
-    assert len(watches) == 1
+    checked = collect_debug_nodes(y)
+    kinds = {c.kind for n in checked for c in n.checks}
+    assert kinds == {"assert", "watch"}
 
 
 # ---------------------------------------------------------------------------
-# Compile stripping — output identical with or without DebugWatch
+# Watches cost nothing compiled — output identical with or without
 # ---------------------------------------------------------------------------
 
 
-def test_compile_strips_watches_and_preserves_output():
+def test_watches_cost_nothing_compiled():
     _, out_a = _build_graph(with_watch=False)
     mod_a = _compile(out_a)
 
@@ -151,22 +150,25 @@ def test_compile_strips_watches_and_preserves_output():
 def test_auto_collection_asserts():
     _, out = _build_graph(with_assert=True)
     mod = _compile(out)
-    assert len(mod._asserts) >= 1
-    assert all(isinstance(a, Assert) for a in mod._asserts)
+    assert any(
+        c.kind == "assert" for n in mod._checked_nodes for c in n.checks
+    )
 
 
 def test_auto_collection_watches():
     _, out = _build_graph(with_watch=True)
     mod = _compile(out)
-    assert len(mod._watches) == 1
-    assert all(isinstance(w, DebugWatch) for w in mod._watches)
+    assert (
+        sum(1 for n in mod._checked_nodes for c in n.checks if c.kind == "watch")
+        == 1
+    )
 
 
 def test_auto_collection_both():
     _, out = _build_graph(with_watch=True, with_assert=True)
     mod = _compile(out)
-    assert len(mod._asserts) >= 1
-    assert len(mod._watches) == 1
+    kinds = {c.kind for n in mod._checked_nodes for c in n.checks}
+    assert kinds == {"assert", "watch"}
 
 
 # ---------------------------------------------------------------------------
@@ -371,8 +373,8 @@ def test_debug_value_on_intermediate():
     assert abs(val_z[0, 0].item() - 1.7) < 0.05
 
 
-def test_debug_value_unwraps_assert():
-    """debug_value unwraps Assert/DebugWatch wrappers to find the target."""
+def test_debug_value_on_checked_node():
+    """debug_value works on a node carrying checks (checks are metadata)."""
     _, out = _build_graph(with_assert=True)
     mod = _compile(out)
     inp = _make_input(mod, 0.5)

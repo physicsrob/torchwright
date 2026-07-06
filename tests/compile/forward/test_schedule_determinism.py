@@ -15,7 +15,7 @@ import torch
 import torchwright.graph.node as _node_module
 from torchwright.compiler.export import _build_matrix_occupancy
 from torchwright.compiler.forward.compile import forward_compile
-from torchwright.compiler.graph_identity import canonical_ids, unwrap_debug
+from torchwright.compiler.graph_identity import canonical_ids
 from torchwright.graph import Linear
 from torchwright.graph.misc import Add, Concatenate, LiteralValue
 from torchwright.ops.inout_nodes import create_input
@@ -58,7 +58,7 @@ def _compile_fingerprint(out):
     net = forward_compile(
         d=D, d_head=D_HEAD, output_node=out, verbose=False, device="cpu"
     )
-    canon = canonical_ids(unwrap_debug(out))
+    canon = canonical_ids(out)
 
     matrices, placements, n_heads, d_hidden = _build_matrix_occupancy(
         net, canon, D, D_HEAD
@@ -75,9 +75,9 @@ def _compile_fingerprint(out):
         if table is None:
             continue
         ra_by_canon[key] = {
-            canon[unwrap_debug(n).node_id]: list(cols)
+            canon[n.node_id]: list(cols)
             for n, cols in table.items()
-            if unwrap_debug(n).node_id in canon
+            if n.node_id in canon
         }
 
     return {

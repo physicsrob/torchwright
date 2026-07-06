@@ -135,7 +135,7 @@ def test_value_logger_passes_through():
     assert vl.value_type == inp.value_type
 
 
-# --- Attn default is unknown (claims come via Assert wrappers) -----
+# --- Attn default is unknown (claims come via attached asserts) -----
 
 
 def test_attn_propagates_value_range_from_value_input():

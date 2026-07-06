@@ -114,7 +114,7 @@ def test_no_bias_literal_bit_exact_end_to_end(build, xt):
 
     _, lit, out = build()
     # debug=True's snapshot capture (what debug_value reads) only engages
-    # when the graph carries Assert/DebugWatch nodes — wrap the output.
+    # when the graph carries checked nodes — attach a check to the output.
     wrapped = assert_in_range(out, -1000.0, 1000.0)
     compiled = compile_headless(wrapped, d=D, d_head=D_HEAD, bias=False)
     compiled(xt, debug=True)

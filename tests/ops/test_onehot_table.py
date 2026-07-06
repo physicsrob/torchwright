@@ -10,7 +10,6 @@ matrix").
 import torch
 
 from torchwright.graph import FFN, Linear
-from torchwright.graph.misc import Assert
 from torchwright.ops.linear import concat
 from torchwright.ops.inout_nodes import create_input, create_onehot_embedding
 from torchwright.ops.relu.onehot_table import onehot_lookup
@@ -23,8 +22,8 @@ def _onehot(index, width):
 
 
 def _unwrap(node):
-    """Strip the trailing value-range Assert that onehot_lookup adds."""
-    return node.inputs[0] if isinstance(node, Assert) else node
+    """onehot_lookup's value-range claim is metadata — the node is the op."""
+    return node
 
 
 # ---------------------------------------------------------------------------

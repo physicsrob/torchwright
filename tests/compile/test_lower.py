@@ -4,7 +4,7 @@
 ``ReLU`` / hand-built ``Linear -> ReLU -> Linear`` chain — the check that
 used to live in the deleted ``graph/blockify.py``) — and returns a
 compiler-private *copy* with fresh derived caches computed at clone time
-(semantic overrides re-applied) and wrappers stripped.  The source graph
+(semantic overrides and range claims re-applied).  The source graph
 is never touched.  ``forward_compile`` runs it as step 0, so an
 uncertified graph cannot reach the scheduler.
 """
@@ -74,9 +74,9 @@ def test_lower_raises_on_raw_chain():
         lower(l2)
 
 
-def test_lower_detects_raw_chain_through_internal_wrapper():
-    # A wrapper on a chain-internal value does not hide the chain from the
-    # detector (Assert/DebugWatch-transparent mining).
+def test_lower_detects_raw_chain_with_checked_internal_value():
+    # A check attached to a chain-internal value does not hide the chain
+    # from the detector (checks are metadata, not topology).
     x = create_input("x", 4, value_range=(-2.0, 2.0))
     l1 = Linear(x, torch.randn(4, 6), torch.randn(6))
     relu = ReLU(l1)
@@ -166,12 +166,9 @@ def test_lower_preserves_semantic_overrides_on_copy():
     re-apply them, not wipe them — a wipe would silently loosen every
     downstream bound.
 
-    ``compare()`` installs its override on the Assert *wrapper* it
-    returns.  The wrapper is stripped from the copy (as it always was
-    from the compiled graph), so the override's compiled effect lives in
-    the bounds of consumers built on the wrapper — the clone computes
-    those through the cloned wrapper before the strip rewires it, so
-    they must match the source's bit-identically."""
+    ``compare()`` installs its override on the node it returns (which
+    also carries compare's range claim); the copy must re-apply both,
+    and consumers' bounds must match the source's bit-identically."""
     from torchwright.ops.relu.arithmetic_ops import compare
 
     x = create_input("x", 1, value_range=(-10.0, 10.0))
@@ -196,24 +193,14 @@ def test_lower_preserves_semantic_overrides_on_copy():
         f"override-derived consumer bound lost on the copy: "
         f"source={r_src} copy={r_copy}"
     )
-    # Overrides carried on non-wrapper nodes survive on their clones
-    # (covered exhaustively in test_graph_clone); wrapper-carried
-    # overrides vanish with the stripped wrapper, whose map entry
-    # resolves to the wrapped node's clone.
     for n in overridden:
-        from torchwright.graph.misc import Assert, DebugWatch
-
-        copy = lowered.copy_of(n)
-        if isinstance(n, (Assert, DebugWatch)):
-            assert not isinstance(copy, (Assert, DebugWatch))
-        else:
-            assert copy._semantic_affine_override is not None
+        assert lowered.copy_of(n)._semantic_affine_override is not None
 
 
 def test_lower_twice_is_bit_identical_and_source_untouched():
     """D6 for L1: lowering the same source twice yields per-node
     value_types that are bit-identical across the two copies, and the
-    source — node set, wrappers, bounds — is untouched by both."""
+    source — node set, checks, bounds — is untouched by both."""
     from torchwright.compiler.utils import get_ancestor_nodes
     from torchwright.graph.asserts import assert_in_range, collect_asserts
 
@@ -356,20 +343,24 @@ def test_lower_node_map_concat_fold():
     assert torch.allclose(out.compute(n_pos, vals), top.compute(n_pos, vals), atol=1e-5)
 
 
-def test_lower_assert_on_moved_value_survives():
-    """An Assert wrapping the orphaned Linear of an FFN->Linear fold ends up
-    wrapping the survivor on the copy; the wrapper's node_map entry resolves
-    to the survivor (its value is the wrapped node's value)."""
+def test_lower_checks_on_moved_value_migrate_to_survivor():
+    """The FFN->Linear fold moves the orphaned Linear's value onto the
+    FFN — and its checks and claim move with it, so the value stays
+    runtime-checkable on the copy (the old wrapper used to be rewired
+    onto the survivor; metadata migrates instead)."""
     x = create_input("x", 6, value_range=(-1.0, 1.0))
     blk = _block(x, 6, 8, 4, seed=12)
     l = Linear(blk, torch.randn(4, 3) * 0.1, torch.randn(3) * 0.05, name="l")
-    wrapped = assert_in_range(l, -1000.0, 1000.0)
-    sink = Concatenate([wrapped])
+    assert_in_range(l, -1000.0, 1000.0)
+    sink = Concatenate([l])
 
     lowered = lower(sink)
     moved = lowered.copy_of(l)
     assert isinstance(moved, FFN)
-    assert lowered.copy_of(wrapped) is moved
+    assert len(moved.checks) == 1  # migrated with the value
+    assert moved.claimed_type is not None
+    # The source Linear keeps its own metadata untouched.
+    assert len(l.checks) == 1
 
 
 def test_compiled_debug_value_speaks_source_after_fusion():

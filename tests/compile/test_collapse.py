@@ -84,9 +84,14 @@ def test_collapse_matches_oracle_on_plateaus(machine):
     torch.testing.assert_close(got, want, atol=1e-5, rtol=0.0)
 
     # Constant across the whole plateau slack band by construction.
+    # The band deliberately violates the source's integer contract
+    # (x = k ± slack), so suppress its attached checks for the sweep.
+    from torchwright.graph.node import suppress_checks
+
     offs = torch.tensor([-_PLATEAU_SLACK, _PLATEAU_SLACK])
     grid = (ks.unsqueeze(1) + offs.view(1, -1, 1)).reshape(-1, 1)
-    banded = reference_eval(new_out, {"x": grid}, 20)[new_out].reshape(10, 2, -1)
+    with suppress_checks():
+        banded = reference_eval(new_out, {"x": grid}, 20)[new_out].reshape(10, 2, -1)
     torch.testing.assert_close(
         banded, want.unsqueeze(1).expand_as(banded), atol=1e-5, rtol=0.0
     )
@@ -255,10 +260,8 @@ def test_compile_headless_collapse_saves_layers_and_matches():
 
 
 def test_scalar_sources_reseeds_at_two_source_meet():
-    """The finder's contract is a wrapper-free (post-strip) graph, so
-    strip the ops-layer claim wrappers before walking."""
-    from torchwright.compiler.lower import _strip_debug_wrappers
-
+    """Checks are node metadata, so the finder walks the ops-layer
+    graph directly — a claim never interrupts a subgraph."""
     ops = _ops("relu")
     x = create_input("x", 1, value_range=(0.0, 9.0))
     y = create_input("y", 1, value_range=(0.0, 9.0))
@@ -267,10 +270,8 @@ def test_scalar_sources_reseeds_at_two_source_meet():
     mix = add(fx, gy)  # two sources meet: ends both subgraphs, reseeds
     deeper = ops.compare(mix, 0.0)
 
-    stripped, _ = _strip_debug_wrappers(deeper)
-    fx_u, gy_u, deeper_u = fx.inputs[0], gy.inputs[0], deeper.inputs[0]
-    src = scalar_sources(topological_order(stripped))
-    assert src[fx_u] is x
-    assert src[gy_u] is y
+    src = scalar_sources(topological_order(deeper))
+    assert src[fx] is x
+    assert src[gy] is y
     assert src[mix] is mix  # 1-D reseed
-    assert src[deeper_u] is mix
+    assert src[deeper] is mix

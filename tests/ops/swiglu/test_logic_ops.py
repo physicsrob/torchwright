@@ -29,7 +29,7 @@ D_HEAD = 8
 
 
 def _unwrap(node):
-    """Peel Assert/DebugWatch wrappers to reach the FFN."""
+    """Walk down to the underlying FFN (op tails may project/concat)."""
     while not isinstance(node, FFN):
         node = node.inputs[0]
     return node

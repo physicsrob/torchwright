@@ -1,15 +1,19 @@
-"""Claim transfer at the lowering boundary: an Assert's ``claimed_type``
-must survive the wrapper strip and appear on the *copy* of the wrapped
-node's ``value_type`` — while the source graph (wrappers, bounds, types)
-stays untouched.  Compilation is a pure function of the source
-(``docs/lowering_copy_plan.md``); the strip runs on the compiler-private
-copy inside ``lower()``.
+"""Claim application on node metadata (docs/assert_metadata_plan.md).
+
+An attached range claim (``node.claimed_type``) tightens the node's
+``value_type`` immediately, composes with further claims by
+intersection, and survives the lowering copy — the clone's fresh
+bounds recompute re-applies it at the ``refresh_node_caches`` choke
+point, so a post-copy recompute can never silently widen a
+claim-tightened bound (the bug class the old strip-time one-shot
+transfer allowed).
 """
 
 import torch
 
 from torchwright.compiler.lower import lower
 from torchwright.graph import InputNode, LiteralValue, NodeValueType, Range
+from torchwright.graph.affine_rules import refresh_node_caches
 from torchwright.graph.asserts import (
     assert_01,
     assert_in_range,
@@ -34,88 +38,92 @@ def test_tightened_with_bounded_and_01():
     assert m.value_range == Range(0.0, 1.0)
 
 
-def test_claim_transfers_integer_range_to_copied_node():
+def test_integer_claim_lands_on_node_and_copy():
     inp = InputNode("x", 3, value_range=(-100.0, 100.0))
-    wrapped = assert_integer(inp)
-    lowered = lower(wrapped)
-    # The copy's output is the (stripped) clone of the wrapped node.
-    assert lowered.output_node is lowered.copy_of(inp)
-    assert lowered.copy_of(inp).value_type.value_range == Range(-100.0, 100.0)
-    # Source untouched — wrapper intact, type unchanged.
-    assert wrapped.inputs[0] is inp
+    out = assert_integer(inp)
+    assert out is inp  # attach-and-return, no wrapper node
+    assert inp.integer_claim
     assert inp.value_type.value_range == Range(-100.0, 100.0)
 
+    lowered = lower(inp)
+    copy = lowered.copy_of(inp)
+    assert lowered.output_node is copy
+    assert copy.value_type.value_range == Range(-100.0, 100.0)
+    assert copy.integer_claim  # rides the clone
 
-def test_claim_transfers_binary_range():
+
+def test_binary_claim_tightens_node_and_copy():
     inp = InputNode("x", 4, value_range=(-100.0, 100.0))
-    wrapped = assert_01(inp)
-    lowered = lower(wrapped)
+    assert_01(inp)
+    assert inp.value_type.value_range == Range(0.0, 1.0)
+    lowered = lower(inp)
     assert lowered.copy_of(inp).value_type.value_range == Range(0.0, 1.0)
-    assert inp.value_type.value_range == Range(-100.0, 100.0)
 
 
-def test_claim_transfers_onehot_range():
+def test_onehot_claim_tightens_node_and_copy():
     inp = InputNode("x", 5, value_range=(-100.0, 100.0))
-    wrapped = assert_onehot(inp)
-    lowered = lower(wrapped)
+    assert_onehot(inp)
+    assert inp.value_type.value_range == Range(0.0, 1.0)
+    lowered = lower(inp)
     assert lowered.copy_of(inp).value_type.value_range == Range(0.0, 1.0)
-    assert inp.value_type.value_range == Range(-100.0, 100.0)
 
 
-def test_chained_assert_claims_compose():
+def test_chained_claims_compose_by_intersection():
     inp = InputNode("x", 2, value_range=(-100.0, 100.0))
-    inner = assert_integer(inp)
-    outer = assert_01(inner)
-    lowered = lower(outer)
+    assert_01(assert_integer(inp))
+    assert len(inp.checks) == 2  # both predicates on the one node
+    assert inp.value_type.value_range == Range(0.0, 1.0)
+    assert inp.integer_claim
+    lowered = lower(inp)
     assert lowered.copy_of(inp).value_type.value_range == Range(0.0, 1.0)
-    # Both wrapper entries in the map resolve to the same stripped clone.
-    assert lowered.copy_of(inner) is lowered.copy_of(inp)
-    assert lowered.copy_of(outer) is lowered.copy_of(inp)
-    assert inp.value_type.value_range == Range(-100.0, 100.0)
 
 
 def test_claim_does_not_regress_existing_inferred_type():
     lit = LiteralValue(torch.tensor([1.0, 2.0, 3.0]))
     before = lit.value_type
-    wrapped = assert_integer(lit)
-    lowered = lower(wrapped)
-    assert lowered.copy_of(lit).value_type.value_range == before.value_range
+    assert_integer(lit)
     assert lit.value_type.value_range == before.value_range
+    lowered = lower(lit)
+    assert lowered.copy_of(lit).value_type.value_range == before.value_range
 
 
-def test_general_target_claim_with_wrapper_consumer():
-    """The case the old suite always lacked: a general (non-leaf) target
-    whose finite claim is strictly tighter than its propagated bound,
-    with a consumer built on the wrapper.
-
-    The claim reaches bounds through two channels (decision 2 of the
-    lowering-copy plan): the wrapper's affine rule collapses the
-    *wrapper's* bound to a constant box (claim ∩ propagated), which the
-    consumer's construction-time bound derives through; and the strip
-    tightens the *wrapped node's* structural type.  The copy must
-    reproduce both bit-identically — the consumer clone's bound is
-    computed through the cloned wrapper before the strip rewires it.
-    """
+def test_claim_survives_cache_refresh():
+    """The refresh-proof property itself: recomputing a claimed node's
+    caches (any pass may do this at any time) re-applies the claim
+    instead of widening back to the propagated bound."""
     x = InputNode("x", 2, value_range=(-10.0, 10.0))
     lin = Linear(x, torch.ones(2, 2) * 3.0)  # propagated range [-60, 60]
-    propagated = lin.value_type.value_range
-    assert propagated == Range(-60.0, 60.0)
+    assert_in_range(lin, -1.0, 1.0)
+    assert lin.value_type.value_range == Range(-1.0, 1.0)
 
-    wrapped = assert_in_range(lin, -1.0, 1.0)  # strictly tighter claim
-    consumer = Linear(wrapped, torch.ones(2, 2))  # built on the wrapper
+    refresh_node_caches(lin)  # the recompute that used to lose claims
+
+    assert lin.value_type.value_range == Range(-1.0, 1.0)
+
+
+def test_general_target_claim_reaches_consumer_bounds():
+    """A general (non-leaf) target whose finite claim is strictly tighter
+    than its propagated bound: the claim degenerates the node's affine
+    bound to the claim-intersected constant box, and a consumer built
+    after the attach derives through that box — on the source and
+    bit-identically on the lowering copy."""
+    x = InputNode("x", 2, value_range=(-10.0, 10.0))
+    lin = Linear(x, torch.ones(2, 2) * 3.0)  # propagated range [-60, 60]
+    assert lin.value_type.value_range == Range(-60.0, 60.0)
+
+    assert_in_range(lin, -1.0, 1.0)  # strictly tighter claim
+    assert lin.value_type.value_range == Range(-1.0, 1.0)
+
+    consumer = Linear(lin, torch.ones(2, 2))  # built after the attach
     consumer_range_at_construction = consumer.value_type.value_range
-    # The consumer's bound derives through the wrapper's constant box:
-    # each output sums two components of the box [-1, 1] -> [-2, 2].
+    # Each output sums two components of the box [-1, 1] -> [-2, 2].
     assert consumer_range_at_construction == Range(-2.0, 2.0)
 
     lowered = lower(consumer)
 
-    # Copy of the target: structural type tightened by the claim.
     lin_copy = lowered.copy_of(lin)
     assert lin_copy.value_type.value_range == Range(-1.0, 1.0)
 
-    # Copy of the consumer: bound bit-identical to the source's
-    # (derived through the wrapper box, exactly as at construction).
     consumer_copy = lowered.copy_of(consumer)
     cr = consumer_copy.value_type.value_range
     assert (cr.lo, cr.hi) == (
@@ -123,7 +131,22 @@ def test_general_target_claim_with_wrapper_consumer():
         consumer_range_at_construction.hi,
     )
 
-    # Source untouched: consumer still wired through the wrapper, and
-    # the target's own type still claim-free.
-    assert consumer.inputs[0] is wrapped
-    assert lin.value_type.value_range == propagated
+
+def test_leaf_claim_tightens_input_ranges_channel():
+    """A claim on an InputNode tightens the leaf's own input_ranges entry
+    (the leaf channel), so downstream bounds inherit it through normal
+    affine propagation — with coefficients intact, not a constant box."""
+    x = InputNode("x", 2, value_range=(-10.0, 10.0))
+    assert_in_range(x, -2.0, 2.0)
+
+    lo, hi = x._affine_bound.input_ranges[x.node_id]
+    assert lo.tolist() == [-2.0, -2.0]
+    assert hi.tolist() == [2.0, 2.0]
+
+    consumer = Linear(x, torch.ones(2, 2))
+    r = consumer.value_type.value_range
+    assert (r.lo, r.hi) == (-4.0, 4.0)  # 2 components of [-2, 2] summed
+
+    lowered = lower(consumer)
+    cr = lowered.copy_of(consumer).value_type.value_range
+    assert (cr.lo, cr.hi) == (-4.0, 4.0)

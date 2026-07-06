@@ -431,18 +431,22 @@ class TestReluRule:
                 assert yv <= intervals[0].hi + 1e-5
 
 
-# --- Assert pass-through --------------------------------------------------
+# --- Claim channels (leaf + general) ---------------------------------------
 
 
-class TestAssertRule:
-    def test_assert_preserves_coefficients(self):
+class TestClaimChannels:
+    def test_leaf_claim_preserves_coefficients(self):
+        """A claim on an InputNode tightens its input_ranges entry, not
+        its coefficients (the leaf channel keeps the affine structure)."""
         with fresh_graph_session():
             x = InputNode(1, name="x", value_range=(-5.0, 5.0))
             from torchwright.graph.asserts import assert_in_range
 
+            before_A = x.affine_bound.A_lo.clone()
             a = assert_in_range(x, -3.0, 3.0)
-            assert torch.equal(a.affine_bound.A_lo, x.affine_bound.A_lo)
-            assert torch.equal(a.affine_bound.A_hi, x.affine_bound.A_hi)
+            assert a is x
+            assert torch.equal(a.affine_bound.A_lo, before_A)
+            assert torch.equal(a.affine_bound.A_hi, before_A)
             assert a.value_type.value_range.lo == pytest.approx(-3.0)
             assert a.value_type.value_range.hi == pytest.approx(3.0)
 
@@ -460,7 +464,7 @@ class TestAssertRule:
             assert intervals[0].hi == pytest.approx(6.0)
 
     def test_assert_chain_tightens(self):
-        """Chained Asserts (assert_01(assert_integer(x))) tighten downstream."""
+        """Chained claims (assert_01(assert_integer(x))) intersect."""
         with fresh_graph_session():
             x = InputNode(1, name="x", value_range=(-10.0, 10.0))
             from torchwright.graph.asserts import assert_01, assert_integer
@@ -471,19 +475,23 @@ class TestAssertRule:
             assert intervals[0].lo == pytest.approx(0.0)
             assert intervals[0].hi == pytest.approx(1.0)
 
-    def test_assert_does_not_tighten_input_node(self):
-        """Assert does NOT mutate the InputNode's own affine bound."""
+    def test_claim_tightens_the_node_itself(self):
+        """The claim is a fact about the node's value: the node's own
+        bound tightens, and every consumer — including ones reading the
+        node through another handle — sees it (sound: the claim is
+        runtime-checked)."""
         with fresh_graph_session():
             x = InputNode(1, name="x", value_range=(-10.0, 10.0))
             from torchwright.graph.asserts import assert_in_range
 
             assert_in_range(x, -2.0, 3.0)
             x_intervals = x.affine_bound.to_interval()
-            assert x_intervals[0].lo == pytest.approx(-10.0)
-            assert x_intervals[0].hi == pytest.approx(10.0)
+            assert x_intervals[0].lo == pytest.approx(-2.0)
+            assert x_intervals[0].hi == pytest.approx(3.0)
 
-    def test_parallel_paths_independent(self):
-        """Parallel paths from the same input don't interfere."""
+    def test_parallel_claims_intersect_for_all_consumers(self):
+        """Two claims on the same node intersect; every consumer sees
+        the intersection (claims commute — attach order irrelevant)."""
         with fresh_graph_session():
             x = InputNode(1, name="x", value_range=(-10.0, 10.0))
             from torchwright.graph import Linear
@@ -491,17 +499,15 @@ class TestAssertRule:
 
             a1 = assert_in_range(x, -2.0, 3.0)
             a2 = assert_in_range(x, -5.0, 5.0)
+            assert a1 is x and a2 is x
             lin1 = Linear(a1, torch.tensor([[1.0]]))
             lin2 = Linear(a2, torch.tensor([[1.0]]))
-            # lin1 sees tighter range from a1
-            assert lin1.affine_bound.to_interval()[0].lo == pytest.approx(-2.0)
-            assert lin1.affine_bound.to_interval()[0].hi == pytest.approx(3.0)
-            # lin2 sees wider range from a2
-            assert lin2.affine_bound.to_interval()[0].lo == pytest.approx(-5.0)
-            assert lin2.affine_bound.to_interval()[0].hi == pytest.approx(5.0)
+            for lin in (lin1, lin2):
+                assert lin.affine_bound.to_interval()[0].lo == pytest.approx(-2.0)
+                assert lin.affine_bound.to_interval()[0].hi == pytest.approx(3.0)
 
     def test_multiple_asserts_intersect_in_add(self):
-        """Multiple Asserts on the same InputNode intersect when added."""
+        """Multiple claims on the same InputNode intersect when added."""
         with fresh_graph_session():
             x = InputNode(1, name="x", value_range=(-100.0, 100.0))
             from torchwright.graph import Add
@@ -843,14 +849,15 @@ class TestReluChord:
             assert iv.hi == pytest.approx(4.0)
 
 
-# --- Assert coefficient passthrough ------------------------------------------
+# --- General claim channel: degenerate box ---------------------------------
 
 
-class TestAssertDegenerate:
-    """Assert on non-InputNode collapses to degenerate with per-component intervals."""
+class TestClaimDegenerate:
+    """A finite claim on a non-leaf collapses its bound to the
+    claim-intersected constant box (the general channel)."""
 
     def test_degenerate_tight_range(self):
-        """Assert on Linear gives per-component intersected intervals."""
+        """Claim on a Linear gives per-component intersected intervals."""
         with fresh_graph_session():
             x = InputNode(1, name="x", value_range=(-10.0, 10.0))
             from torchwright.graph import Linear
@@ -863,7 +870,7 @@ class TestAssertDegenerate:
             assert iv.hi == pytest.approx(5.0)
 
     def test_degenerate_zero_coefficients(self):
-        """Assert on non-InputNode produces zero A matrices."""
+        """Claim on a non-leaf produces zero A matrices."""
         with fresh_graph_session():
             x = InputNode(1, name="x", value_range=(-10.0, 10.0))
             from torchwright.graph import Linear
@@ -875,7 +882,7 @@ class TestAssertDegenerate:
             assert ab.n_cols == 0
 
     def test_value_type_reflects_claimed_range(self):
-        """Assert's value_type.value_range should reflect the claimed range."""
+        """The claimed node's value_type.value_range reflects the claim."""
         with fresh_graph_session():
             x = InputNode(1, name="x", value_range=(-10.0, 10.0))
             from torchwright.graph import Linear

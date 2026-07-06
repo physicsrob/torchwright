@@ -3,7 +3,8 @@ lowering passes and ``lower()``'s private-copy run agree bit-for-bit.
 
 Two fresh rebuilds of the same graph: one gets the passes applied
 **in place** (fuse consecutive Linears, refresh every node's derived
-caches, strip wrappers with claim transfer), the other goes through
+caches — which re-applies attached range claims at the choke point),
+the other goes through
 ``lower()`` (clone, then the same passes on the copy).  Comparing
 per-node ``value_type`` through canonical ids pins three living
 invariants at once:
@@ -11,8 +12,8 @@ invariants at once:
 1. **Clone fidelity** — the copy carries every piece of state that
    feeds bound computation (a ``graph_clone`` edit that drops a cached
    field diverges here).
-2. **Wrapper-strip equivalence** — stripping Assert wrappers before vs
-   after the bounds refresh yields the same bounds.
+2. **Claim-application equivalence** — bounds recomputed in place and
+   on the copy fold the same claims in and agree bit-for-bit.
 3. **Canonical-id stability** — two independent rebuilds of the same
    construction code map node-for-node (the property the schedule
    cache and the debug sidecar rely on).
@@ -29,8 +30,8 @@ longer exists, so the twin now tracks ``lower()``'s own pass list.)
 import torch
 
 from torchwright.compiler.graph_clone import topological_order
-from torchwright.compiler.graph_identity import canonical_ids, unwrap_debug
-from torchwright.compiler.lower import _strip_debug_wrappers, lower
+from torchwright.compiler.graph_identity import canonical_ids
+from torchwright.compiler.lower import lower
 from torchwright.compiler.utils import get_ancestor_nodes
 from torchwright.graph.affine_rules import refresh_node_caches
 from torchwright.graph.optimize import fuse_consecutive_linears
@@ -43,20 +44,19 @@ from torchwright.ops.inout_nodes import create_input
 def _inplace_pipeline_bounds(output_node):
     """Apply ``lower()``'s passes in place on a throwaway rebuild.
 
-    Fuse consecutive Linears, refresh caches in topological order, then
-    strip wrappers in place with claim transfer — the same passes
-    ``lower()`` runs on its private copy, minus the clone.  Must be kept
+    Fuse consecutive Linears, then refresh caches in topological order
+    (claim re-application included) — the same passes ``lower()`` runs
+    on its private copy, minus the clone.  Must be kept
     in step with ``lower()``'s pass list (see module docstring).
     Mutates its argument — callers pass a rebuild they own.
     """
     fuse_consecutive_linears({output_node})
     for node in topological_order(output_node):
         refresh_node_caches(node)
-    stripped, _integer_claimed = _strip_debug_wrappers(output_node)
-    canon = canonical_ids(stripped)
+    canon = canonical_ids(output_node)
     return {
         canon[n.node_id]: n.value_type.value_range
-        for n in get_ancestor_nodes({stripped})
+        for n in get_ancestor_nodes({output_node})
     }
 
 
@@ -102,8 +102,8 @@ def test_bounds_transparent_adder_1digit():
 
 
 def _swish_graph():
-    """A small swish-machine graph with assert wrappers on both a leaf and
-    a general (FFN) target — the two claim channels."""
+    """A small swish-machine graph with claims on both a leaf and a
+    general (FFN) target — the two claim channels."""
 
     def w(*shape, seed):
         g = torch.Generator().manual_seed(seed)
@@ -148,26 +148,23 @@ def _collapsible_graph():
 
 def _inplace_pipeline_bounds_collapsed(output_node):
     """The in-place twin with the collapse pass in lower()'s round
-    order: fuse, refresh, strip, collapse, re-strip."""
+    order: fuse, refresh, collapse."""
     from torchwright.compiler.collapse import collapse_univariate_subgraphs
     from torchwright.graph.optimize import FoldLog
 
     fuse_consecutive_linears({output_node})
     for node in topological_order(output_node):
         refresh_node_caches(node)
-    stripped, integer_claimed = _strip_debug_wrappers(output_node)
-    stripped, report = collapse_univariate_subgraphs(
-        stripped,
-        integer_claimed=integer_claimed,
+    collapsed, report = collapse_univariate_subgraphs(
+        output_node,
         lane_cap=_COLLAPSE_LANE_CAP,
         fold_log=FoldLog(),
     )
     assert report.n_collapsed, report.format()
-    stripped, _ = _strip_debug_wrappers(stripped)
-    canon = canonical_ids(stripped)
+    canon = canonical_ids(collapsed)
     return {
         canon[n.node_id]: n.value_type.value_range
-        for n in get_ancestor_nodes({stripped})
+        for n in get_ancestor_nodes({collapsed})
     }
 
 
