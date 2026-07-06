@@ -68,6 +68,7 @@ from torchwright.ops.inout_nodes import (
 )
 from torchwright.ops.swiglu.logic_ops import (
     bool_all_true,
+    bool_any_true,
     bool_not,
     equals_vector,
 )
@@ -152,6 +153,7 @@ def create_network_parts(
     embed = embedding.get_embedding
 
     is_trigger = equals_vector(embedding, embed("\n"))
+    is_bos = equals_vector(embedding, embed("<bos>"))
 
     # --- Per-position input features ---
     # Integer by construction: table values 0..9, default 0.0 at
@@ -163,6 +165,17 @@ def create_network_parts(
     has_triggered = get_prev_value(rope, is_trigger, is_trigger)
     is_pre_trigger = bool_not(has_triggered)
     is_input_digit = bool_all_true([is_digit_pos, is_pre_trigger])
+
+    # The prev_digit latch condition: the trigger, with <bos> as the
+    # pre-trigger anchor.  get_prev_value blends (returns a softmax
+    # average, genuinely non-integer) when its window holds no true
+    # key; with <bos> always true, every query position has one, so the
+    # latch always reads a real key's value.  Recency ranks the trigger
+    # above <bos> wherever both are visible, so post-trigger reads are
+    # unchanged.  This keeps prev_digit integer at every position —
+    # the contract the assert_integer below (and the univariate
+    # collapse pass gating on it) needs.
+    latch_cond = bool_any_true([is_trigger, is_bos])
 
     # --- Shared key-side indicator basis (computed once per position) ---
     indicators_above = _build_indicators_above(digit_scalar, is_input_digit)
@@ -206,22 +219,31 @@ def create_network_parts(
         seq.append(selected_embed)
 
         # Same argmin-above attention but with value=digit_scalar so
-        # the scalar threads cleanly through the chain.
-        #
-        # No ``assert_integer`` on this or the latched prev_digit: before
-        # the trigger fires, ``get_prev_value`` has no valid key and
-        # returns a softmax blend of the digit scalars (e.g. 7.45 on
-        # "953\n") — genuinely non-integer, not tolerance-level leakage,
-        # so no atol bounds it.  Downstream consumers gate those
-        # positions away, but the assert machinery checks every position.
-        selected_digit_scalar = attend_argmin_above_integer(
-            rope,
-            score=digit_scalar,
-            indicators_above=indicators_above,
-            threshold_onehot=threshold_onehot,
-            value=digit_scalar,
+        # the scalar threads cleanly through the chain.  Integer at
+        # *every* position (the widened atol absorbs softmax leakage):
+        # with a valid threshold one-hot the head picks one key exactly;
+        # with an all-zero or garbage one-hot (pre-trigger rows, and
+        # exhausted iterations where nothing exceeds the threshold) no
+        # key gets the "above" bonus and the head degrades to plain
+        # min-score — still a single real key's integer value, or a
+        # blend of equal values (score ties are value ties here).
+        selected_digit_scalar = assert_integer(
+            attend_argmin_above_integer(
+                rope,
+                score=digit_scalar,
+                indicators_above=indicators_above,
+                threshold_onehot=threshold_onehot,
+                value=digit_scalar,
+            ),
+            atol=5e-3,
         )
-        prev_digit = get_prev_value(rope, selected_digit_scalar, is_trigger)
+        # Latched on latch_cond (trigger OR <bos>) so the read never
+        # blends — see the latch_cond comment above.  The integer claim
+        # here is what lets the univariate collapse pass rebuild each
+        # iteration's threshold_onehot chain as a single staircase FFN.
+        prev_digit = assert_integer(
+            get_prev_value(rope, selected_digit_scalar, latch_cond), atol=5e-3
+        )
 
     output_node = output_sequence(
         rope,

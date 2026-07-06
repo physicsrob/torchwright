@@ -94,7 +94,7 @@ def _print_collapse_report(output: Node, lane_cap: int) -> None:
 
 
 def _compile_layers(
-    output: Node, *, d: int, d_head: int, device: str, collapse: bool
+    output: Node, *, d: int, d_head: int, device: str, collapse: bool, optimize: int
 ) -> int:
     t0 = time.perf_counter()
     compiled = compile_headless(
@@ -103,11 +103,12 @@ def _compile_layers(
         d_head=d_head,
         device=device,
         collapse_univariate=collapse,
+        optimize=optimize,
     )
     dt = time.perf_counter() - t0
     print(
-        f"  compile collapse={'on ' if collapse else 'off'}: "
-        f"{compiled.n_layers} layers ({dt:.1f}s)"
+        f"  compile collapse={'on ' if collapse else 'off'} "
+        f"optimize={optimize}: {compiled.n_layers} layers ({dt:.1f}s)"
     )
     return compiled.n_layers
 
@@ -121,6 +122,7 @@ def report_graph(
     device: str,
     lane_cap: Optional[int] = None,
     lower_only: bool = False,
+    optimize: int = 0,
 ) -> None:
     # forward_compile's own cap formula (d_hidden defaults to d) unless
     # overridden — so the report matches what a compile would do.
@@ -130,8 +132,12 @@ def report_graph(
     _print_collapse_report(output, cap)
     if lower_only:
         return
-    n_off = _compile_layers(output, d=d, d_head=d_head, device=device, collapse=False)
-    n_on = _compile_layers(output, d=d, d_head=d_head, device=device, collapse=True)
+    n_off = _compile_layers(
+        output, d=d, d_head=d_head, device=device, collapse=False, optimize=optimize
+    )
+    n_on = _compile_layers(
+        output, d=d, d_head=d_head, device=device, collapse=True, optimize=optimize
+    )
     print(f"n_layers: off={n_off} on={n_on} delta={n_on - n_off:+d}")
 
 
@@ -161,6 +167,13 @@ def main() -> None:
         default=None,
         help="substring filter on the example module names",
     )
+    ap.add_argument(
+        "--optimize",
+        type=int,
+        default=0,
+        help="forward_compile optimize level for the off/on compiles "
+        "(0 greedy; 2 = the production CP-SAT schedule)",
+    )
     args = ap.parse_args()
 
     if args.spec:
@@ -185,6 +198,7 @@ def main() -> None:
             d_head=args.d_head,
             device=args.device,
             lane_cap=args.lane_cap,
+            optimize=args.optimize,
         )
         return
 
@@ -200,6 +214,7 @@ def main() -> None:
             device=args.device,
             lane_cap=args.lane_cap,
             lower_only=args.lower_only,
+            optimize=args.optimize,
         )
 
 
