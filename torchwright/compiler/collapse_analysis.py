@@ -169,6 +169,9 @@ class V2Report:
     floor_strict: Optional[int] = None
     floor_banded: Optional[int] = None
     machine: Optional[str] = None
+    # One deepest dependency chain of the banded-grafted graph — what
+    # still holds the floor after v2 takes everything it can.
+    witness_banded: List[str] = field(default_factory=list)
 
     @property
     def total_stage1_cols(self) -> int:
@@ -210,6 +213,9 @@ class V2Report:
             f"{self.total_stage1_cols_banded} banded (adds to the existing "
             f"residual peak — the reverted-36-layer liveness trap check)"
         )
+        if self.witness_banded:
+            lines.append("post-graft witness chain (what still holds the floor):")
+            lines.extend(f"  {w}" for w in self.witness_banded)
         return "\n".join(lines)
 
 
@@ -443,10 +449,45 @@ def analyze_collapse_v2(
         report.floor_strict = critical_path_layers(output_node)
         output_node = _graft_standins(output_node, rewiring_banded, consumers, by_src)
         report.floor_banded = critical_path_layers(output_node)
+        report.witness_banded = _witness_chain(output_node)
 
     if verbose:
         print(report.format())
     return report
+
+
+def _witness_chain(output_node: Node) -> List[str]:
+    """One deepest dependency chain of the graph (the critical_chain.py
+    pattern): per node, its earliest feasible layer, annotation, name."""
+    from torchwright.compiler.forward.cpsat_scheduler import (
+        LEGACY_POLICY,
+        _compute_layer_bounds,
+        build_graph_model,
+    )
+
+    gm = build_graph_model(output_node, None)
+    es, _ = _compute_layer_bounds(gm, LEGACY_POLICY, True, max_layers=1 << 20)
+    preds: Dict[int, List[int]] = {}
+    for u, v in gm.edges:
+        preds.setdefault(v.node_id, []).append(u.node_id)
+    id2node = {n.node_id: n for n in gm.schedulable}
+    cur = max(es, key=lambda i: es[i])
+    chain = [cur]
+    while preds.get(cur):
+        ps = [p for p in preds[cur] if p in es]
+        if not ps:
+            break
+        cur = max(ps, key=lambda p: es[p])
+        chain.append(cur)
+    chain.reverse()
+    out: List[str] = []
+    for i in chain:
+        n = id2node.get(i)
+        if n is None:
+            continue
+        ann = "/".join(((getattr(n, "annotation", "") or "-").split("/"))[:3])
+        out.append(f"L{es[i]:>2} {ann:<34} {n.name or type(n).__name__}")
+    return out
 
 
 def _standin_ffn(inp: Node, d_out: int, name: str) -> FFN:
