@@ -94,7 +94,29 @@ def _print_collapse_report(output: Node, lane_cap: int) -> None:
     )
 
 
-def _compile_layers(output: Node, *, d: int, d_head: int, device: str, optimize: int) -> int:
+def _print_v2_report(output: Node, lane_cap: int) -> None:
+    """Phase A analysis (docs/univariate_collapse_plan.md v2): certify
+    the composed PL of every subgraph v1 leaves, model the S1/S2
+    emission shapes, and model the layer floor via stand-in nodes.
+    Report-only — a fresh throwaway lowering, no compile-path change."""
+    from torchwright.compiler.collapse_analysis import analyze_collapse_v2
+
+    lowered = lower(output, collapse_univariate=True, collapse_lane_cap=lane_cap)
+    report = analyze_collapse_v2(lowered.output_node, lane_cap=lane_cap)
+    print(f"v2 analysis (lane cap {lane_cap}):")
+    for line in report.format().splitlines():
+        print(f"  {line}")
+    detailed = [s for s in report.subgraphs if s.members]
+    if detailed:
+        print("  --- member detail (subgraphs with synthesized members) ---")
+        for s in detailed:
+            for line in s.format_detail().splitlines():
+                print(f"  {line}")
+
+
+def _compile_layers(
+    output: Node, *, d: int, d_head: int, device: str, optimize: int
+) -> int:
     t0 = time.perf_counter()
     compiled = compile_headless(
         output,
@@ -118,6 +140,7 @@ def report_graph(
     lane_cap: Optional[int] = None,
     lower_only: bool = False,
     optimize: int = 0,
+    v2: bool = False,
 ) -> None:
     # forward_compile's own cap formula (d_hidden defaults to d) unless
     # overridden — so the report matches what a compile would do.
@@ -125,6 +148,8 @@ def report_graph(
     dims = "" if lower_only else f" (d={d}, d_head={d_head})"
     print(f"\n=== {name}{dims} ===")
     _print_collapse_report(output, cap)
+    if v2:
+        _print_v2_report(output, cap)
     if lower_only:
         return
     _compile_layers(output, d=d, d_head=d_head, device=device, optimize=optimize)
@@ -138,6 +163,12 @@ def main() -> None:
         "--lower-only",
         action="store_true",
         help="skip the off/on compiles; print only the collapse report",
+    )
+    ap.add_argument(
+        "--v2",
+        action="store_true",
+        help="run the v2 continuous-source analysis (report-only): "
+        "composed-PL certificates, S1/S2 shape models, modeled floor",
     )
     ap.add_argument(
         "--lane-cap",
@@ -176,6 +207,7 @@ def main() -> None:
                 device=args.device,
                 lane_cap=args.lane_cap if args.lane_cap is not None else 4096,
                 lower_only=True,
+                v2=args.v2,
             )
             return
         if args.d is None:
@@ -188,6 +220,7 @@ def main() -> None:
             device=args.device,
             lane_cap=args.lane_cap,
             optimize=args.optimize,
+            v2=args.v2,
         )
         return
 
@@ -204,6 +237,7 @@ def main() -> None:
             lane_cap=args.lane_cap,
             lower_only=args.lower_only,
             optimize=args.optimize,
+            v2=args.v2,
         )
 
 
