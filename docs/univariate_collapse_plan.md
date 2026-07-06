@@ -74,12 +74,15 @@ utilization**.  Width is not the constraint; depth is.
   swiglu `piecewise_linear` is the exact PL function with each corner
   rounded in a fillet; the collapsed FFN has *one* fillet set where the
   original chain had one per stage.  At in-contract inputs (the plateau
-  contract below) outputs are bit-exact — which holds because the
-  sharpened gate rows put the fillet's exponential tail ≈ K·0.45 input
-  units from every plateau center (K = scale·input_scale), far below
-  fp32 resolution; the unit sweep in the rollout verifies this rather
-  than assuming it.  Between plateaus values move within the documented
-  fillet magnitudes.  The relu machine composes exactly everywhere.
+  contract below) outputs match to within the composite error budget:
+  the sharpened gate rows put the fillet's exponential tail ≈ K·0.45
+  input units from every plateau center (K = scale·input_scale), which
+  for most compositions underflows below fp32 resolution — but not for
+  all (calculator_scratchpad's emit chains measure a 3.8e-6 residue at
+  the band edge), which is why condition 4 *measures* the deviation
+  and budgets it instead of assuming bit-exactness.  Between plateaus
+  values move within the documented fillet magnitudes.  The relu
+  machine composes exactly everywhere.
 - **v1 only collapses staircase subgraphs** (composed function constant
   on plateaus around integers — see *Feasibility gate*), and only for
   sources carrying an explicit integer contract (`assert_integer` on
@@ -185,29 +188,42 @@ plateau slack (default 0.05 — justified below):
    — past `d_max` the op would chunk into parallel FFNs plus an Add,
    re-adding exactly the depth the pass exists to remove.  `d_max` is
    set at the cap, so a collapse that passes this gate never chunks.
-4. **Staircase check**: for every integer `k` in `[round(lo),
-   round(hi)]` and every boundary member `m`, the exact oracle
-   satisfies `f_m(k + δ) == f_m(k)` for sampled offsets `δ` spanning
-   `[−w, +w]` (half a dozen offsets per plateau; the whole sweep is
-   still one batched `compute` call) — the composed function is
-   constant on plateaus around integers, i.e. a function of
-   `round(source)`.
+4. **Staircase check — composite error budget** (2026-07-06, decided
+   with Rob; v1 originally required bit-identity): for every integer
+   `k` in `[round(lo), round(hi)]` and every boundary member `m`, the
+   exact oracle is sampled at offsets `δ` spanning `[−w, +w]` (half a
+   dozen offsets per plateau; the whole sweep is still one batched
+   `compute` call), and the member's **measured max deviation** from
+   its plateau-center value, plus the error model's predicted fp32
+   lane accumulation (condition 3's model), must fit inside the
+   tolerance the synthesized staircase's own range claim carries
+   (1e-3).  Relu compositions compose exactly — deviation 0, so for
+   them this is still the bit-identical check.  Swish compositions may
+   leave an ulp-scale fillet-tail residue at the band edge (measured
+   3.8e-6 on calculator_scratchpad's emit chains — the finding that
+   motivated the change); that residue is real, measured, and charged
+   against the budget instead of declining outright.
 
 The certificate, stated honestly: the synthesized staircase passes
 through every knot exactly by construction, so at tabulated integers
 the collapse is bit-exact against the oracle — no sampled curve-fit
-risk there.  Plateau *constancy* of the original composed function,
-however, is a sampled check: a function could in principle match at
-every sampled offset and still wiggle between them (two canceling
-transitions inside the band; interior gain stages can compress feature
-widths in source coordinates below any fixed sampling density).  No
-graph shape we build produces that — step constructions put their
-transitions at half-integers — but what the gate certifies is
-equality at the sampled offsets, no more.  The realistic near-miss (a
-compare threshold sitting exactly at an integer) lands inside the
-sampled band and is caught.  A subgraph that fails any condition is
-declined, never approximated — with condition 1 in place the worst
-case is a lost opportunity, not a wrong compile (D2).
+risk there.  Off-center within the band, the collapse replaces the
+member's value with its plateau-center value, so the collapse
+introduces at most the measured band deviation — which condition 4
+bounds, together with the accumulation model, at the synthesized
+claim's 1e-3.  Plateau *constancy* is still a sampled check: a
+function could in principle match at every sampled offset and wiggle
+between them (two canceling transitions inside the band; interior
+gain stages can compress feature widths below any fixed sampling
+density).  No graph shape we build produces that — step constructions
+put their transitions at half-integers — but what the gate certifies
+is deviation at the sampled offsets, no more.  The realistic near-miss
+(a compare threshold sitting exactly at an integer) lands inside the
+sampled band and is caught (a full step inside the band is far past
+the budget).  A subgraph that fails any condition is declined — the
+collapse never introduces more error than the synthesized claim
+tolerates; with condition 1 in place the worst case is a lost
+opportunity, not a wrong compile (D2).
 
 **Why w = 0.05.**  Not arbitrary: it is `1/(2·step_sharpness)` — half
 the transition-band width of the machine's own step constructions

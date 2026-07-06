@@ -36,14 +36,24 @@ Feasibility gate (v1, the plateau contract — all four must hold):
    ``lanes = 2 x #(adjacent plateau pairs whose values differ in any
    output dimension)``.  Decline past ``lane_cap``; ``d_max`` is the
    cap, so a passing member never chunks.
-4. **Staircase check**: the exact oracle (each member's own
-   ``compute``, seeded with the grid at the source) is bit-identical
-   across sampled offsets spanning ``[-w, +w]`` around every integer,
-   ``w = 1/(2*step_sharpness)`` — half the transition band of the
-   machine's own step constructions.
+4. **Staircase check, composite error budget** (2026-07-06, decided
+   with Rob): the exact oracle (each member's own ``compute``, seeded
+   with the grid at the source) is evaluated at sampled offsets
+   spanning ``[-w, +w]`` around every integer, ``w =
+   1/(2*step_sharpness)`` — half the transition band of the machine's
+   own step constructions.  The member's max deviation from its
+   plateau-center value, **plus** the modeled fp32 lane-accumulation
+   error of the synthesized staircase, must fit inside the tolerance
+   the synthesized node's own range claim carries
+   (``_SYNTH_CLAIM_ATOL``).  Relu compositions measure deviation
+   exactly 0 (they compose exactly), so for them this is still the
+   bit-identical check; swish compositions may carry an ulp-scale
+   fillet-tail residue at the band edge, which is measured and charged
+   against the budget rather than declined outright.
 
-A subgraph failing any condition is declined, never approximated, and
-the decline is recorded with its reason in the :class:`CollapseReport`.
+A subgraph failing any condition is declined — the collapse never
+introduces more error than the synthesized claim tolerates — and the
+decline is recorded with its reason in the :class:`CollapseReport`.
 """
 
 from dataclasses import dataclass
@@ -76,9 +86,11 @@ _PLATEAU_SLACK = 1.0 / (2.0 * step_sharpness)
 _OFFSET_FRACTIONS = (0.0, -1.0, 1.0, -2.0 / 3.0, 2.0 / 3.0, -1.0 / 3.0, 1.0 / 3.0)
 
 # The synthesized staircase carries piecewise_linear's clamp-range claim
-# at assert_matches_value_type's default tolerance.  v1 declines any
-# collapse whose predicted fp32 accumulation exceeds it (the error-model
-# gate) instead of widening the claim.
+# at assert_matches_value_type's default tolerance.  This is the whole
+# error budget of a collapse: the member's measured plateau-band
+# deviation plus the predicted fp32 lane accumulation must fit inside
+# it (the composite gate below) — decline instead of widening the
+# claim.
 _SYNTH_CLAIM_ATOL = 1e-3
 
 
@@ -396,12 +408,20 @@ def collapse_univariate_subgraphs(
         grid = (ks.unsqueeze(1) + offsets.unsqueeze(0)).reshape(-1, 1)
         values = _seeded_oracle(synthesized, source, grid)
 
-        # Gate 4 — staircase check: bit-identical across the slack band.
+        # Gate 4 — plateau constancy, measured: each member's max
+        # deviation from its plateau-center value across the sampled
+        # band.  Relu compositions compose exactly (deviation 0); swish
+        # fillet tails may leave an ulp-scale residue at the band edge.
+        # A deviation past the whole budget means "not a staircase" —
+        # decline with the location; a sub-budget deviation is charged
+        # against the composite budget in gate 3 below.
+        member_dev: Dict[Node, float] = {}
         stair_fail = None
         for m in synthesized:
             v = values[m].reshape(n_plateaus, n_offsets, -1)
-            if not bool((v == v[:, :1, :]).all()):
-                dev = (v - v[:, :1, :]).abs().max().item()
+            dev = float((v - v[:, :1, :]).abs().max())
+            member_dev[m] = dev
+            if dev > _SYNTH_CLAIM_ATOL:
                 bad_k = (
                     int(torch.nonzero((v != v[:, :1, :]).any(dim=2).any(dim=1))[0])
                     + lo_int
@@ -409,7 +429,8 @@ def collapse_univariate_subgraphs(
                 m_name = m.name or f"{type(m).__name__}#{topo_index[m]}"
                 stair_fail = (
                     f"not constant on the plateau at k={bad_k} "
-                    f"(member {m_name}, max deviation {dev:.3g})"
+                    f"(member {m_name}, max deviation {dev:.3g} > "
+                    f"budget {_SYNTH_CLAIM_ATOL:g})"
                 )
                 break
         if stair_fail is not None:
@@ -418,12 +439,14 @@ def collapse_univariate_subgraphs(
 
         # Gate 3 — emitted lanes per synthesized member (2 per
         # value-changing step; equal-value steps are free), and the
-        # accumulation-error model: a staircase's saturated ramp lanes
+        # composite error budget: a staircase's saturated ramp lanes
         # carry intermediates of magnitude ~ step_sharpness · R ·
         # max|adjacent value change|, and the fp32 lane sum quantizes
         # the recovered plateau to ulps of that magnitude (measured at
         # 1-4 ulps — the staircase entries in docs/op_noise_data.json).
-        # Decline rather than exceed the synthesized claim's tolerance.
+        # The measured band deviation plus this predicted accumulation
+        # must fit the synthesized claim's tolerance — decline rather
+        # than exceed it.
         tables = {
             m: values[m].reshape(n_plateaus, n_offsets, -1)[:, 0, :]
             for m in synthesized
@@ -439,17 +462,18 @@ def collapse_univariate_subgraphs(
             if lanes > lane_cap:
                 gate_fail = f"member {m_name} needs {lanes} lanes (cap {lane_cap})"
                 break
+            err_bound = 0.0
             if lanes:
                 max_dv = float((t[1:] - t[:-1]).abs().max())
                 err_bound = 4.0 * _ulp32(step_sharpness * range_width * max_dv)
-                if err_bound > _SYNTH_CLAIM_ATOL:
-                    gate_fail = (
-                        f"member {m_name}: predicted fp32 accumulation "
-                        f"{err_bound:.2e} exceeds the synthesized claim "
-                        f"tolerance {_SYNTH_CLAIM_ATOL:g} "
-                        f"(range {range_width:g}, max step {max_dv:g})"
-                    )
-                    break
+            if member_dev[m] + err_bound > _SYNTH_CLAIM_ATOL:
+                gate_fail = (
+                    f"member {m_name}: band deviation {member_dev[m]:.2e} "
+                    f"+ predicted fp32 accumulation {err_bound:.2e} "
+                    f"exceeds the synthesized claim tolerance "
+                    f"{_SYNTH_CLAIM_ATOL:g}"
+                )
+                break
         if gate_fail is not None:
             outcomes.append(declined(gate_fail))
             continue

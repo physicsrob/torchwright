@@ -221,17 +221,80 @@ def test_declines_predicted_accumulation_error():
 
 
 def test_declines_non_staircase_member():
-    """|x - 4.5| varies inside every plateau — not a function of
-    round(x); the sampled staircase check must decline it."""
+    """|x - 4.5| varies inside every plateau by the full band offset
+    (0.05, far past the 1e-3 budget) — not a function of round(x); the
+    measured-deviation check must decline it."""
+    ops = _ops("relu")
+    x = create_input("x", 1, value_range=(0.0, 9.0))
+    xi = assert_integer(x)
+    shifted = Linear(xi, torch.tensor([[1.0]]), torch.tensor([-4.5]))
+    out = ops.abs(shifted)
+
+    lowered = _collapse(out)
+    assert lowered.collapse_report.n_collapsed == 0
+    assert any("not constant on the plateau" in r for r in _decline_reasons(lowered))
+
+
+def test_collapses_saturating_min_over_interior_variation():
+    """min(|x - 4.5|, cmp(x, 5.5)) saturates: the interior |x - 4.5|
+    varies in-band, but the *boundary* member is constant on every
+    plateau up to fp32 associativity residue (ulp-scale), which the
+    composite budget measures and admits.  Under the pre-composite
+    bit-identical contract this was declined — the pin for the 2026-07-06
+    contract change."""
     ops = _ops("relu")
     x = create_input("x", 1, value_range=(0.0, 9.0))
     xi = assert_integer(x)
     shifted = Linear(xi, torch.tensor([[1.0]]), torch.tensor([-4.5]))
     out = ops.min(ops.abs(shifted), ops.compare(xi, 5.5))
 
+    ks = torch.arange(0.0, 10.0).unsqueeze(1)
+    want = reference_eval(out, {"x": ks}, 10)[out]
+
+    lowered = _collapse(out)
+    assert _only_outcome(lowered).collapsed, lowered.collapse_report.format()
+    got = reference_eval(lowered.output_node, {"x": ks}, 10)[lowered.output_node]
+    torch.testing.assert_close(got, want, atol=1e-4, rtol=0.0)
+
+
+def test_collapses_sub_budget_band_deviation():
+    """A staircase plus a tiny linear leak (1e-5·x) deviates from
+    plateau-constancy by 1e-5·slack = 5e-7 — measured and charged
+    against the composite budget (band deviation + modeled accumulation
+    <= the synthesized claim's 1e-3), and admitted.  This is the swish
+    fillet-tail shape (ulp-scale band residue) in a machine-independent
+    construction; the collapse replaces the leak with its
+    plateau-center value."""
+    xi, chain = _staircase_chain("relu")
+    out = add(chain, Linear(xi, torch.tensor([[1e-5]])))
+
+    ks = torch.arange(0.0, 10.0).unsqueeze(1)
+    want = reference_eval(out, {"x": ks}, 10)[out]
+
+    lowered = _collapse(out)
+    assert _only_outcome(lowered).collapsed, lowered.collapse_report.format()
+    got = reference_eval(lowered.output_node, {"x": ks}, 10)[lowered.output_node]
+    torch.testing.assert_close(got, want, atol=1e-4, rtol=0.0)
+
+
+def test_declines_composite_budget_overflow():
+    """Each error term fits the budget alone; their sum does not.
+    Plateau steps of ±15 over range 9 put the modeled fp32 accumulation
+    at 4·ulp32(10·9·30) = 2^-10 ≈ 9.8e-4 (< 1e-3), and a 1e-3·x leak
+    adds a measured band deviation of 1e-3·slack = 5e-5 (< 1e-3);
+    together they exceed the synthesized claim's tolerance and the
+    composite gate declines."""
+    xi, chain = _staircase_chain("relu")
+    out = add(
+        Linear(chain, torch.tensor([[15.0]])),
+        Linear(xi, torch.tensor([[1e-3]])),
+    )
+
     lowered = _collapse(out)
     assert lowered.collapse_report.n_collapsed == 0
-    assert any("not constant on the plateau" in r for r in _decline_reasons(lowered))
+    assert any(
+        "band deviation" in r for r in _decline_reasons(lowered)
+    ), lowered.collapse_report.format()
 
 
 def test_declines_no_depth_gain():
@@ -258,7 +321,11 @@ def test_compile_headless_collapse_saves_layers_and_matches():
 
     _, out_a = _staircase_chain("relu")
     oracle = reference_eval(out_a, {"x": inputs}, 10)[out_a]
-    baseline = compile_headless(out_a, d=64, d_head=8, verbose=False)
+    # Explicit False: the baseline must stay the off-path even after the
+    # default flips (and during flag-forced-on sweeps).
+    baseline = compile_headless(
+        out_a, d=64, d_head=8, verbose=False, collapse_univariate=False
+    )
     _, out_b = _staircase_chain("relu")
     collapsed = compile_headless(
         out_b, d=64, d_head=8, verbose=False, collapse_univariate=True
