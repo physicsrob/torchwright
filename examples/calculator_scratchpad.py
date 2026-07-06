@@ -72,6 +72,7 @@ from typing import Callable, Dict, List, Tuple
 import torch
 
 from torchwright.graph import Embedding, Node, RopeConfig
+from torchwright.graph.asserts import assert_integer
 from torchwright.ops.swiglu.arithmetic_ops import compare
 from torchwright.ops.linear import (
     add,
@@ -235,11 +236,20 @@ def _scalar(x: float) -> Node:
 
 
 def _digit_scalar(embedding: Embedding, digit_onehot: Node) -> Node:
-    """One-hot digit embedding → its numeric value (a scalar ``0..9``)."""
-    return onehot_lookup(
-        digit_onehot,
-        {embedding.get_embedding(str(d)): torch.tensor([float(d)]) for d in range(10)},
-        torch.tensor([0.0]),
+    """One-hot digit embedding → its numeric value (a scalar ``0..9``).
+
+    Integer by construction (table values 0..9, default 0.0), so the
+    result carries the integer claim.
+    """
+    return assert_integer(
+        onehot_lookup(
+            digit_onehot,
+            {
+                embedding.get_embedding(str(d)): torch.tensor([float(d)])
+                for d in range(10)
+            },
+            torch.tensor([0.0]),
+        )
     )
 
 
@@ -488,7 +498,9 @@ def _stream_normalize(
         is_zero = equals_vector(inp=scratch_token, vector=embed("0"))
         in_run = compare(prev, thresh=m - 0.5)  # prev == m (count never exceeds m)
         still_zero = bool_all_true([in_run, is_zero])
-        this_count = add(prev, bool_to_01(still_zero))
+        # A count of leading zeros — genuinely integer (the ±1 bools and
+        # the count table are exact up to op noise).
+        this_count = assert_integer(add(prev, bool_to_01(still_zero)))
         glyphs.append(
             _emit_from_total(embedding, this_count, count_table, count_default, n_state)
         )
@@ -529,6 +541,12 @@ def _col_onehot(steps_since: Node, layout: _SeqLayout, N: int) -> Node:
     and scratch digit ``i`` is the input at ``newline_pos + scratch_start + i +
     1`` (list element ``k`` is emitted at ``newline_pos + k`` and re-read one
     position later), so ``col = steps_since − (scratch_start + 1)``.
+
+    Deliberately **no** ``assert_integer`` on ``steps_since``/``col_scalar``:
+    ``count_since_marker`` is a reciprocal approximation, accurate only to
+    well under ±0.5 (not 1e-3), and pre-newline positions carry bounded
+    non-integer garbage.  The subgraph sourced here therefore stays out of
+    the univariate collapse — by design, not by omission.
     """
     col_scalar = add_const(steps_since, -float(layout.scratch_start + 1))
     return bool_to_01(in_range(col_scalar, add_const(col_scalar, 1.0), N))
@@ -603,6 +621,8 @@ def _build_carry_op(
     normalization sweep, pointer-gathered answer.  Returns ``(thinking, answer)``
     where ``thinking`` is ``carry ++ scratch ++ norm``."""
     N = len(T)
+    # Column totals are sums of digit-table lookups — genuinely integer.
+    T = [assert_integer(t) for t in T]
     carry = _carry_sweep(embedding, T, W, n)
     layout = _SeqLayout(
         n_carry=len(carry), n_scratch=N, n_norm=N, n_answer=N, n_state=_n_thinking(n)

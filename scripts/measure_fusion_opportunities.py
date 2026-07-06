@@ -221,8 +221,24 @@ def _subgraph_details(
         print(f"      ops: {top_ops}")
 
 
-def analyze(output: Node, name: str, detail_subgraphs: bool = False) -> None:
-    lowered = lower(output)
+def analyze(
+    output: Node,
+    name: str,
+    detail_subgraphs: bool = False,
+    collapse: bool = False,
+) -> None:
+    # With ``collapse=True`` the univariate collapse pass runs in the
+    # lowering (lane cap 4096, the modeled feasibility budget below), so
+    # every number measures the *post-collapse* graph — the modeled
+    # remaining opportunity after the pass took what it could.
+    lowered = lower(
+        output,
+        collapse_univariate=collapse,
+        collapse_lane_cap=4096 if collapse else None,
+    )
+    if collapse and lowered.collapse_report is not None:
+        print(f"\n=== {name}: collapse pass log ===")
+        print(lowered.collapse_report.format())
     out = lowered.output_node
     order = topological_order(out)
     eff_consumers = _effective_consumers(order)
@@ -352,6 +368,12 @@ def main() -> None:
         action="store_true",
         help="per-subgraph detail for univariate subgraphs on the critical path",
     )
+    ap.add_argument(
+        "--collapse",
+        action="store_true",
+        help="run the univariate collapse pass (lane cap 4096) in the "
+        "lowering, so the analysis measures the post-collapse graph",
+    )
     args = ap.parse_args()
 
     if args.spec:
@@ -359,7 +381,9 @@ def main() -> None:
         fn = getattr(importlib.import_module(mod_name), fn_name)
         result = fn(**json.loads(args.kwargs))
         output = result[0] if isinstance(result, tuple) else result
-        analyze(output, args.spec, detail_subgraphs=args.subgraphs)
+        analyze(
+            output, args.spec, detail_subgraphs=args.subgraphs, collapse=args.collapse
+        )
         return
 
     for mod_name in _EXAMPLES:
@@ -368,7 +392,9 @@ def main() -> None:
             output, _embedding = mod.create_network_parts()
         else:
             output = mod.create_network().inp  # Unembedding wraps the node
-        analyze(output, mod_name, detail_subgraphs=args.subgraphs)
+        analyze(
+            output, mod_name, detail_subgraphs=args.subgraphs, collapse=args.collapse
+        )
 
 
 if __name__ == "__main__":

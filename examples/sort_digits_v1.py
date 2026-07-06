@@ -55,6 +55,7 @@ from typing import List, Tuple
 import torch
 
 from torchwright.graph import Concatenate, Node, Embedding
+from torchwright.graph.asserts import assert_integer
 from torchwright.graph.embedding import Unembedding
 from torchwright.ops.swiglu.arithmetic_ops import compare
 from torchwright.ops.linear import add_scaled_nodes
@@ -153,7 +154,11 @@ def create_network_parts(
     is_trigger = equals_vector(embedding, embed("\n"))
 
     # --- Per-position input features ---
-    digit_scalar = digit_to_scaled_scalar(embedding, embedding, place_value=1.0)
+    # Integer by construction: table values 0..9, default 0.0 at
+    # non-digit positions.
+    digit_scalar = assert_integer(
+        digit_to_scaled_scalar(embedding, embedding, place_value=1.0)
+    )
     is_digit_pos = check_is_digit(embedding)
     has_triggered = get_prev_value(rope, is_trigger, is_trigger)
     is_pre_trigger = bool_not(has_triggered)
@@ -202,6 +207,13 @@ def create_network_parts(
 
         # Same argmin-above attention but with value=digit_scalar so
         # the scalar threads cleanly through the chain.
+        #
+        # No ``assert_integer`` on this or the latched prev_digit: before
+        # the trigger fires, ``get_prev_value`` has no valid key and
+        # returns a softmax blend of the digit scalars (e.g. 7.45 on
+        # "953\n") — genuinely non-integer, not tolerance-level leakage,
+        # so no atol bounds it.  Downstream consumers gate those
+        # positions away, but the assert machinery checks every position.
         selected_digit_scalar = attend_argmin_above_integer(
             rope,
             score=digit_scalar,
