@@ -111,6 +111,20 @@ def test_no_bias_artifact_records_mode(artifacts):
         assert json.load(f)["bias"] is True
 
 
+def test_artifact_records_collapse_provenance(artifacts):
+    """Meta and debug sidecar both record whether the univariate-collapse
+    lowering ran (docs/univariate_collapse_plan.md) — provenance for depth
+    comparisons across artifacts.  Lives here to reuse this module's
+    exported artifacts; the fixture doesn't pass the flag, so this also
+    pins the current default."""
+    _, onnx_path = artifacts["biased"]
+    with open(meta_path_for(onnx_path)) as f:
+        assert json.load(f)["collapse_univariate"] is False
+    artifact, _ = artifacts["biased"]
+    with open(artifact.debug_path) as f:
+        assert json.load(f)["extra"]["collapse_univariate"] is False
+
+
 def test_no_bias_emission_has_no_bias_tensors(artifacts):
     """No bias initializers exist and no node reads one — each projection
     is its bare MatMul."""

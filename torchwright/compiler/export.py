@@ -1744,6 +1744,10 @@ def compile_to_onnx(
         # anywhere (docs/no_bias_plan.md; biases folded into the matrices
         # against the pinned constant-1 column).
         "bias": bool(bias),
+        # Whether the univariate-collapse lowering ran on this graph
+        # (docs/univariate_collapse_plan.md) — provenance for depth
+        # comparisons across artifacts.
+        "collapse_univariate": bool(collapse_univariate),
         # Solver provenance: distinguishes a real CP-SAT schedule (status
         # OPTIMAL/FEASIBLE/CACHED) from the heuristic fallback (UNKNOWN/
         # INFEASIBLE with optimize>0) — a fallback artifact is value-correct
@@ -1769,7 +1773,10 @@ def compile_to_onnx(
             checked_nodes=checked_nodes,
             cache_stride=cache_stride_resolved,
             optimize=optimize,
-            extra=extra_metadata,
+            extra={
+                **(dict(extra_metadata) if extra_metadata else {}),
+                "collapse_univariate": bool(collapse_univariate),
+            },
             verbose=verbose,
         )
 
