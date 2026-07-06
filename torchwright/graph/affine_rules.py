@@ -571,9 +571,11 @@ def _apply_semantic_override(node: "Node", semantic_ab: Optional[AffineBound]) -
     post-construction recompute would silently drop the semantic
     tightening and loosen every downstream bound derived from it.
 
-    Ends by re-folding the node's claim (if any) into the new bound:
-    ops install overrides *after* attaching their range claims, and the
-    claim must stay applied whichever of the two lands last.
+    An override WINS over the node's range claim on the affine channel:
+    ops install overrides after attaching their claims, and the
+    override's correlation structure (input columns) is worth more
+    downstream than the claim's constant box.  The claim still tightens
+    ``_structural_type``, so ``value_type`` stays claim-tight.
     """
     if semantic_ab is None:
         return
@@ -585,7 +587,6 @@ def _apply_semantic_override(node: "Node", semantic_ab: Optional[AffineBound]) -
     )
     node._semantic_affine_override = semantic_ab
     node._affine_bound = semantic_ab
-    _apply_claim_to_bound(node)
 
 
 def refresh_node_caches(node: "Node") -> None:
@@ -611,6 +612,8 @@ def refresh_node_caches(node: "Node") -> None:
         node._structural_type = tightened_with(node._structural_type, node.claimed_type)
     node._affine_bound = compute_affine_bound(node)
     if node._semantic_affine_override is not None:
+        # Override wins on the affine channel (see _apply_semantic_override);
+        # the claim reached _structural_type above, keeping value_type tight.
         _apply_semantic_override(node, node._semantic_affine_override)
     else:
         _apply_claim_to_bound(node)
