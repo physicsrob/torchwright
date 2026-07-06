@@ -133,7 +133,15 @@ def measure_op_isolated(
                 f"expected {input_specs[name]}"
             )
 
-    with torch.no_grad():
+    # Checks attached to the op's own nodes (range claims and friends)
+    # are suppressed for the forward: this harness exists to *quantify*
+    # deviation, so an op whose noise exceeds its own claimed tolerance
+    # must yield a measurement — a finding for
+    # docs/numerical_noise_findings.md — not an AssertionError that
+    # aborts the run before the number exists.
+    from torchwright.graph.node import suppress_checks
+
+    with torch.no_grad(), suppress_checks():
         compiled = output_node.compute(
             n_pos=distribution.n_samples,
             input_values={

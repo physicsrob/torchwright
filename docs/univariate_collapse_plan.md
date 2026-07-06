@@ -269,20 +269,33 @@ to the synthesized node.
 
 ### Lane cap
 
-One decline rule and one assertion, both on **emitted lanes** (gate
-condition 3's count, not plateau count):
+Two decline rules and one assertion, on **emitted lanes** (gate
+condition 3's count, not plateau count) and on the **predicted
+accumulation error**:
 
 - **Decline** when emitted lanes exceed **`d_hidden / 4`** of the
   target compile (production: 4,096 of 16,384).  Expressed as a
   fraction, not an absolute, so a `d=4096`-class compile shrinks it in
-  step.  The rationale is the noise axis: fp32 accumulation across a
-  PWL's lane sum grows with lane count, and the cap marks the edge of
-  what the noise plan below measures — anything wider is unmeasured
-  territory.  It also keeps a single FFN from monopolizing a layer's
-  MLP pool.  (An earlier draft had a second threshold — decline above
+  step.  This keeps a single FFN from monopolizing a layer's MLP pool.
+  (An earlier draft had a second threshold — decline above
   `d_hidden / 2` when saving a single sublayer — which is unreachable
-  behind this cap and is dropped.  If a multi-sublayer win ever wants
-  more than `d_hidden / 4`, revisit with measured noise data in hand.)
+  behind this cap and is dropped.)
+- **Decline on the error model** (2026-07-05 measurement — the
+  staircase entries in `docs/op_noise_data.json` and their finding in
+  `docs/numerical_noise_findings.md`): a staircase's fp32 error is
+  governed by `ulp_fp32(step_sharpness · R · max|Δv|)` — R the source
+  range width, |Δv| the largest adjacent-plateau value change — **not
+  by lane count**; saturated ramp lanes carry intermediates of that
+  magnitude and the lane sum quantizes to its ulps (measured maxima
+  are 1–4 ulps, bit-identical on both machines).  Decline when
+  `4 × ulp_fp32(step_sharpness · R · max|Δv|)` exceeds the synthesized
+  claim's tolerance (the `assert_matches_value_type` default atol,
+  1e-3 — v1 declines rather than widen it; sizing the claim from the
+  bound is a v2 refinement).  Both R and max|Δv| are known exactly at
+  tabulation time, and the measured maxima sit at or under the bound
+  at every scale (exactly at it for the 2048-lane point).  A v2
+  mitigation if a real collapse declines here: re-center the source
+  (breakpoints relative to the range midpoint), halving R.
 - **Assert** emitted lanes ≤ `d_hidden − 1` (`bias=False` reserves
   hidden slot 0; `scheduler.py` packs to `d_hidden`).  Unreachable
   given the decline rule; it stays as a structural guard.

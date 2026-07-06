@@ -13,6 +13,57 @@ observations and removing findings a fix has invalidated. See the
 
 ## Findings
 
+### Staircase `piecewise_linear` error is ulp(s·R·|Δv|), not a lane count (2026-07-05)
+
+Measured for the univariate collapse pass (rollout item 5 of
+`docs/univariate_collapse_plan.md`): the exact configuration the pass
+synthesizes — step pairs at half-integers, `input_scale =
+step_sharpness`, in-contract inputs (integer ± the plateau band),
+adversarial plateau table with |Δv| up to 100 — at 64 / 512 / 2048
+lanes (ranges 32 / 256 / 1024):
+
+| lanes | range R | max abs      | p99 abs   |
+|-------|---------|--------------|-----------|
+| 64    | 32      | 9.8e-4       | 2.4e-4    |
+| 512   | 256     | **0.03125**  | 7.8e-3    |
+| 2048  | 1024    | **0.25**     | 3.1e-2    |
+
+Root cause in one sentence: a saturated ramp lane's output grows
+linearly with distance from its breakpoint, so the lane sum cancels
+intermediates of magnitude ≈ `s·R·|Δv|` and the recovered plateau is
+quantized to fp32 ulps of that magnitude.  The dyadic maxima confirm
+it exactly: at R=256, `s·R·|Δv|` ≈ 2.6e5 whose ulp is 0.03125 — the
+measured max to the digit; at R=1024 the max is 4 ulps of 1e6.  Two
+corollaries the numbers pin:
+
+- **relu and swiglu are bit-identical** across all three scales — the
+  swish fillet tails underflow at in-contract distances (≥ 0.4 from
+  every hinge at K = 1280), exactly as the collapse plan claims; the
+  only surviving axis is fp32 lane-sum accumulation, shared by both
+  machines.
+- **The collapse plan's flat lane cap does not bound error.**  Error
+  is governed by `s · R · max|Δv|`, not lane count: a 4096-lane
+  collapse of a small-|Δv| table (doom's index staircases, Δv ~ 1) is
+  *fine* while a 512-lane collapse of a |Δv|=100 table already
+  exceeds the synthesized node's claim tolerance (the
+  `assert_matches_value_type` default atol=1e-3).  Doom's thermometer
+  collapse (R=322, Δv~1) predicts ~4e-4–1.6e-3 — at the claim
+  boundary.  The gate needs an error-model condition: decline (or
+  widen the synthesized claim's atol) when
+  `~4 × ulp_fp32(s · R · max|Δv|)` exceeds the tolerance the
+  consumers assume.  Cheap mitigation for v2: re-center the source
+  (breakpoints relative to the range midpoint) to halve R.
+
+Two pipeline notes.  The measurement only exists because the noise
+harness now runs the op forward under `suppress_checks()`
+(`torchwright/debug/noise.py`) — the op's own attached range claim
+fired at 0.19 past the clamp bound and aborted the run, which is the
+finding announcing itself.  And the 2048-lane max is an extremum of a
+kernel-sensitive quantity (ulps at ~1e6 magnitude): if the drift gate
+ever flakes on a staircase entry across Modal/CPU kernels, that is the
+`reciprocal_03_200` bistability class — handle per that finding's
+pattern, not by re-measuring until it passes.
+
 ### The committed numbers cannot depend on the `bias` compile flag
 
 The `bias=False` compile option (docs/no_bias_plan.md) folds every bias

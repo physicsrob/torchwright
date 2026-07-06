@@ -62,7 +62,7 @@ def bool_any_true(inp_list: List[Node]) -> Node:
     .. noise-footer::
 
        Max error: 0 abs, 0 rel over 4096 samples;
-       measured at commit eb4a0f8. See docs/numerical_noise.md.
+       measured at commit e4fd771. See docs/numerical_noise.md.
     """
     # Convert all the values to 1.0 if they're > 0.0 and 0.0 otherwise
     # then sum them, and if the sum is > 0.5, return 1.0, otherwise -1.0.
@@ -92,7 +92,7 @@ def bool_all_true(inp_list: List[Node]) -> Node:
     .. noise-footer::
 
        Max error: 0 abs, 0 rel over 4096 samples;
-       measured at commit eb4a0f8. See docs/numerical_noise.md.
+       measured at commit e4fd771. See docs/numerical_noise.md.
     """
     return compare(
         sum_nodes(inp_list),
@@ -115,7 +115,7 @@ def bool_not(inp: Node) -> Node:
     .. noise-footer::
 
        Max error: 0 abs, 0 rel over 4096 samples;
-       measured at commit eb4a0f8. See docs/numerical_noise.md.
+       measured at commit e4fd771. See docs/numerical_noise.md.
     """
     return compare(inp, thresh=0.0, true_level=-1.0, false_level=1.0)
 
@@ -153,7 +153,7 @@ def equals_vector(inp: Node, vector: torch.Tensor) -> Node:
     .. noise-footer::
 
        Max error: 0 abs, 0 rel over 4096 samples;
-       measured at commit eb4a0f8. See docs/numerical_noise.md.
+       measured at commit e4fd771. See docs/numerical_noise.md.
     """
     speed = embedding_step_sharpness
     gate_proj = scale * vector.unsqueeze(0)
@@ -208,7 +208,7 @@ def cond_gate(cond: Node, inp: Node) -> Node:
     .. noise-footer::
 
        Max error: 0 abs, 0 rel over 4096 samples;
-       measured at commit eb4a0f8. See docs/numerical_noise.md.
+       measured at commit e4fd771. See docs/numerical_noise.md.
     """
     assert len(cond) == 1
     d = len(inp)

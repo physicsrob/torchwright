@@ -1,7 +1,7 @@
 {
   "schema_version": 2,
-  "commit": "eb4a0f8",
-  "measured_at": "2026-07-05",
+  "commit": "e4fd771",
+  "measured_at": "2026-07-06",
   "ops": [
     {
       "name": "abs",
@@ -369,7 +369,7 @@
       "name": "piecewise_linear",
       "machine": "relu",
       "module": "torchwright.ops.relu.arithmetic_ops",
-      "notes": "Foundation 1D piecewise-linear primitive; measured on the canonical x² test function with 11 integer breakpoints. Error is zero at breakpoints and bounded by the interpolation error of the reference function over each segment.",
+      "notes": "Foundation 1D piecewise-linear primitive. The parabola distribution measures the interpolation configuration (11 integer breakpoints, x²): error is zero at breakpoints and bounded by per-segment interpolation error. The staircase distributions measure the univariate-collapse configuration (docs/univariate_collapse_plan.md): step pairs at half-integers, input_scale = step_sharpness, in-contract inputs — the axis that grows with lane count is fp32 accumulation across the lane sum.",
       "distributions": [
         {
           "name": "parabola_0_10_step1",
@@ -384,6 +384,51 @@
           "rel_valid_samples": 4094,
           "worst_input": {
             "x": 6.49947
+          }
+        },
+        {
+          "name": "staircase_2048_lanes",
+          "description": "Integers in [0, 1024] ± the plateau contract band — a 2048-lane staircase (1025 plateaus), past the largest single FFN in production (1,024 lanes) and half the collapse pass's d_hidden/4 decline cap.",
+          "n_samples": 4096,
+          "max_abs_error": 0.25,
+          "mean_abs_error": 0.00113332,
+          "p99_abs_error": 0.03125,
+          "max_rel_error": 0.125,
+          "mean_rel_error": 0.000152688,
+          "p99_rel_error": 0.00131123,
+          "rel_valid_samples": 4068,
+          "worst_input": {
+            "x": 1006.02
+          }
+        },
+        {
+          "name": "staircase_512_lanes",
+          "description": "Integers in [0, 256] ± the plateau contract band — a 512-lane staircase (257 plateaus), the thermometer-Attn collapse scale.",
+          "n_samples": 4096,
+          "max_abs_error": 0.03125,
+          "mean_abs_error": 0.000218272,
+          "p99_abs_error": 0.0078125,
+          "max_rel_error": 0.015625,
+          "mean_rel_error": 1.62246e-05,
+          "p99_rel_error": 0.000590724,
+          "rel_valid_samples": 4047,
+          "worst_input": {
+            "x": 253.978
+          }
+        },
+        {
+          "name": "staircase_64_lanes",
+          "description": "Integers in [0, 32] ± the plateau contract band (±1/(2·step_sharpness)) — in-contract inputs of a 64-lane collapse-synthesized staircase (33 plateaus, every step value-changing).",
+          "n_samples": 4096,
+          "max_abs_error": 0.000976562,
+          "mean_abs_error": 1.3262e-05,
+          "p99_abs_error": 0.000244141,
+          "max_rel_error": 0.000325521,
+          "mean_rel_error": 1.17795e-06,
+          "p99_rel_error": 1.74386e-05,
+          "rel_valid_samples": 3967,
+          "worst_input": {
+            "x": 26.021
           }
         }
       ]
@@ -986,7 +1031,7 @@
       "name": "piecewise_linear",
       "machine": "swiglu",
       "module": "torchwright.ops.swiglu.arithmetic_ops",
-      "notes": "The relu construction with sharpened hinges (K = scale·input_scale in the gate rows). Chord error between breakpoints is untouched and dominates, exactly as on relu; each corner adds a radius-17/K fillet whose dip (≤ swish_dip·|Δm|/K) bends toward the curve — grids with spacing under 34/K must raise input_scale (the spacing audit; reciprocal and the BOS inversion table do).",
+      "notes": "The relu construction with sharpened hinges (K = scale·input_scale in the gate rows). Chord error between breakpoints is untouched and dominates, exactly as on relu; each corner adds a radius-17/K fillet whose dip (≤ swish_dip·|Δm|/K) bends toward the curve — grids with spacing under 34/K must raise input_scale (the spacing audit; reciprocal and the BOS inversion table do). The staircase distributions measure the univariate-collapse configuration (step pairs 1/step_sharpness apart at input_scale = step_sharpness, which clears the spacing audit; in-contract inputs sit ≥ 0.4 from every hinge, so fillet tails underflow and the measured axis is fp32 lane-sum accumulation, as on relu).",
       "distributions": [
         {
           "name": "parabola_0_10_step1",
@@ -1001,6 +1046,51 @@
           "rel_valid_samples": 4094,
           "worst_input": {
             "x": 6.49947
+          }
+        },
+        {
+          "name": "staircase_2048_lanes",
+          "description": "Integers in [0, 1024] ± the plateau contract band — a 2048-lane staircase (1025 plateaus), past the largest single FFN in production (1,024 lanes) and half the collapse pass's d_hidden/4 decline cap.",
+          "n_samples": 4096,
+          "max_abs_error": 0.25,
+          "mean_abs_error": 0.00113332,
+          "p99_abs_error": 0.03125,
+          "max_rel_error": 0.125,
+          "mean_rel_error": 0.000152688,
+          "p99_rel_error": 0.00131123,
+          "rel_valid_samples": 4068,
+          "worst_input": {
+            "x": 1006.02
+          }
+        },
+        {
+          "name": "staircase_512_lanes",
+          "description": "Integers in [0, 256] ± the plateau contract band — a 512-lane staircase (257 plateaus), the thermometer-Attn collapse scale.",
+          "n_samples": 4096,
+          "max_abs_error": 0.03125,
+          "mean_abs_error": 0.000218272,
+          "p99_abs_error": 0.0078125,
+          "max_rel_error": 0.015625,
+          "mean_rel_error": 1.62246e-05,
+          "p99_rel_error": 0.000590724,
+          "rel_valid_samples": 4047,
+          "worst_input": {
+            "x": 253.978
+          }
+        },
+        {
+          "name": "staircase_64_lanes",
+          "description": "Integers in [0, 32] ± the plateau contract band (±1/(2·step_sharpness)) — in-contract inputs of a 64-lane collapse-synthesized staircase (33 plateaus, every step value-changing).",
+          "n_samples": 4096,
+          "max_abs_error": 0.000976562,
+          "mean_abs_error": 1.3262e-05,
+          "p99_abs_error": 0.000244141,
+          "max_rel_error": 0.000325521,
+          "mean_rel_error": 1.17795e-06,
+          "p99_rel_error": 1.74386e-05,
+          "rel_valid_samples": 3967,
+          "worst_input": {
+            "x": 26.021
           }
         }
       ]

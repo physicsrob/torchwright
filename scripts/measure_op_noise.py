@@ -40,6 +40,7 @@ from torchwright.debug.noise import (
     update_docstring_footer,
 )
 from torchwright.graph import Node
+from torchwright.ops.const import step_sharpness
 from torchwright.ops.relu.arithmetic_ops import (
     abs as abs_op,
     ceil_int,
@@ -250,6 +251,85 @@ def _integer_1d(
         inputs={input_name: data},
         n_samples=n_samples,
     )
+
+
+def _integer_with_plateau_jitter_1d(
+    name: str,
+    description: str,
+    lo: int,
+    hi: int,
+    input_name: str = "x",
+    n_samples: int = 4096,
+    seed: int = 0,
+) -> InputDistribution:
+    """Integer samples in [lo, hi] with uniform jitter inside the plateau
+    contract band ±1/(2·step_sharpness) — the in-contract inputs of a
+    collapse-synthesized staircase (integer ± tolerated noise), plus the
+    exact-integer grid so every plateau center is covered."""
+    gen = torch.Generator().manual_seed(seed)
+    n_grid = min(hi - lo + 1, 1024)
+    n_random = n_samples - n_grid
+    ints = torch.randint(lo, hi + 1, (n_random, 1), generator=gen).to(torch.float32)
+    w = 1.0 / (2.0 * step_sharpness)
+    jitter = (torch.rand((n_random, 1), generator=gen) * 2.0 - 1.0) * w
+    grid_part = torch.linspace(float(lo), float(hi), n_grid).round().unsqueeze(1)
+    data = torch.cat([ints + jitter, grid_part], dim=0)
+    return InputDistribution(
+        name=name,
+        description=description,
+        inputs={input_name: data},
+        n_samples=n_samples,
+    )
+
+
+# --- Collapse-synthesized staircase configuration -------------------------
+# The exact shape the univariate collapse pass emits
+# (torchwright/compiler/collapse.py, docs/univariate_collapse_plan.md):
+# step pairs at half-integers, 1/step_sharpness apart, input_scale =
+# step_sharpness, one plateau per integer, tabulated values.  Plateau
+# values are a deterministic pseudo-random integer table in [-50, 50]
+# whose every adjacent pair differs (37 and 101 are coprime), so the
+# staircase emits the full 2·(n_plateaus − 1) lanes — the pass's
+# worst-case lane shape at a given plateau count.
+
+
+def _staircase_table(n_plateaus: int) -> torch.Tensor:
+    ks = torch.arange(n_plateaus, dtype=torch.int64)
+    return ((ks * 37) % 101 - 50).to(torch.float32)
+
+
+def _staircase_build(pl_fn, n_lanes: int):
+    n_plateaus = n_lanes // 2 + 1
+    values = _staircase_table(n_plateaus).tolist()
+    h = 1.0 / (2.0 * step_sharpness)
+    breakpoints: list = []
+    for k in range(n_plateaus - 1):
+        breakpoints.extend((k + 0.5 - h, k + 0.5 + h))
+
+    def fn(x: float) -> float:
+        return values[min(max(round(x), 0), n_plateaus - 1)]
+
+    def build(nodes):
+        return pl_fn(
+            nodes["x"],
+            breakpoints=breakpoints,
+            fn=fn,
+            d_max=n_lanes,
+            input_scale=step_sharpness,
+        )
+
+    return build
+
+
+def _staircase_reference(n_lanes: int):
+    n_plateaus = n_lanes // 2 + 1
+    table = _staircase_table(n_plateaus)
+
+    def ref(inputs):
+        idx = inputs["x"].round().long().clamp(0, n_plateaus - 1)
+        return table[idx]
+
+    return ref
 
 
 def _integer_pair(
@@ -626,6 +706,32 @@ def _distributions() -> Dict[str, InputDistribution]:
             "`piecewise_linear` precision between grid points.",
             0.0,
             10.0,
+        ),
+        "staircase_64_lanes": _integer_with_plateau_jitter_1d(
+            "staircase_64_lanes",
+            "Integers in [0, 32] ± the plateau contract band "
+            "(±1/(2·step_sharpness)) — in-contract inputs of a 64-lane "
+            "collapse-synthesized staircase (33 plateaus, every step "
+            "value-changing).",
+            0,
+            32,
+        ),
+        "staircase_512_lanes": _integer_with_plateau_jitter_1d(
+            "staircase_512_lanes",
+            "Integers in [0, 256] ± the plateau contract band — a "
+            "512-lane staircase (257 plateaus), the thermometer-Attn "
+            "collapse scale.",
+            0,
+            256,
+        ),
+        "staircase_2048_lanes": _integer_with_plateau_jitter_1d(
+            "staircase_2048_lanes",
+            "Integers in [0, 1024] ± the plateau contract band — a "
+            "2048-lane staircase (1025 plateaus), past the largest "
+            "single FFN in production (1,024 lanes) and half the "
+            "collapse pass's d_hidden/4 decline cap.",
+            0,
+            1024,
         ),
         "square_unsigned_0_10": _uniform_1d(
             "square_unsigned_0_10",
@@ -1017,12 +1123,32 @@ def _target_ops() -> List[TargetOp]:
                 fn=lambda v: v * v,
             ),
             reference_fn=lambda inputs: inputs["x"] ** 2,
-            distribution_names=("parabola_0_10_step1",),
+            distribution_names=(
+                "parabola_0_10_step1",
+                "staircase_64_lanes",
+                "staircase_512_lanes",
+                "staircase_2048_lanes",
+            ),
+            build_graphs_per_distribution={
+                "staircase_64_lanes": _staircase_build(piecewise_linear, 64),
+                "staircase_512_lanes": _staircase_build(piecewise_linear, 512),
+                "staircase_2048_lanes": _staircase_build(piecewise_linear, 2048),
+            },
+            reference_fns_per_distribution={
+                "staircase_64_lanes": _staircase_reference(64),
+                "staircase_512_lanes": _staircase_reference(512),
+                "staircase_2048_lanes": _staircase_reference(2048),
+            },
             notes=(
-                "Foundation 1D piecewise-linear primitive; measured on the "
-                "canonical x² test function with 11 integer breakpoints. Error "
-                "is zero at breakpoints and bounded by the interpolation "
-                "error of the reference function over each segment."
+                "Foundation 1D piecewise-linear primitive. The parabola "
+                "distribution measures the interpolation configuration (11 "
+                "integer breakpoints, x²): error is zero at breakpoints and "
+                "bounded by per-segment interpolation error. The staircase "
+                "distributions measure the univariate-collapse "
+                "configuration (docs/univariate_collapse_plan.md): step "
+                "pairs at half-integers, input_scale = step_sharpness, "
+                "in-contract inputs — the axis that grows with lane count "
+                "is fp32 accumulation across the lane sum."
             ),
         ),
         TargetOp(
@@ -1670,7 +1796,26 @@ def _target_ops() -> List[TargetOp]:
                 fn=lambda v: v * v,
             ),
             reference_fn=lambda inputs: inputs["x"] ** 2,
-            distribution_names=("parabola_0_10_step1",),
+            distribution_names=(
+                "parabola_0_10_step1",
+                "staircase_64_lanes",
+                "staircase_512_lanes",
+                "staircase_2048_lanes",
+            ),
+            build_graphs_per_distribution={
+                "staircase_64_lanes": _staircase_build(swiglu_ops.piecewise_linear, 64),
+                "staircase_512_lanes": _staircase_build(
+                    swiglu_ops.piecewise_linear, 512
+                ),
+                "staircase_2048_lanes": _staircase_build(
+                    swiglu_ops.piecewise_linear, 2048
+                ),
+            },
+            reference_fns_per_distribution={
+                "staircase_64_lanes": _staircase_reference(64),
+                "staircase_512_lanes": _staircase_reference(512),
+                "staircase_2048_lanes": _staircase_reference(2048),
+            },
             notes=(
                 "The relu construction with sharpened hinges "
                 "(K = scale·input_scale in the gate rows). Chord error "
@@ -1678,7 +1823,14 @@ def _target_ops() -> List[TargetOp]:
                 "as on relu; each corner adds a radius-17/K fillet whose "
                 "dip (≤ swish_dip·|Δm|/K) bends toward the curve — grids "
                 "with spacing under 34/K must raise input_scale (the "
-                "spacing audit; reciprocal and the BOS inversion table do)."
+                "spacing audit; reciprocal and the BOS inversion table do). "
+                "The staircase distributions measure the "
+                "univariate-collapse configuration (step pairs "
+                "1/step_sharpness apart at input_scale = step_sharpness, "
+                "which clears the spacing audit; in-contract inputs sit "
+                "≥ 0.4 from every hinge, so fillet tails underflow and "
+                "the measured axis is fp32 lane-sum accumulation, as on "
+                "relu)."
             ),
         ),
         TargetOp(

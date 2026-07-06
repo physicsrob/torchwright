@@ -75,6 +75,22 @@ _PLATEAU_SLACK = 1.0 / (2.0 * step_sharpness)
 # the tabulation reads those rows.
 _OFFSET_FRACTIONS = (0.0, -1.0, 1.0, -2.0 / 3.0, 2.0 / 3.0, -1.0 / 3.0, 1.0 / 3.0)
 
+# The synthesized staircase carries piecewise_linear's clamp-range claim
+# at assert_matches_value_type's default tolerance.  v1 declines any
+# collapse whose predicted fp32 accumulation exceeds it (the error-model
+# gate) instead of widening the claim.
+_SYNTH_CLAIM_ATOL = 1e-3
+
+
+def _ulp32(magnitude: float) -> float:
+    """fp32 ulp at ``magnitude`` — the accumulation-error quantum of a
+    lane sum whose intermediates reach that magnitude."""
+    import math
+
+    if magnitude <= 0.0:
+        return 0.0
+    return 2.0 ** (math.floor(math.log2(magnitude)) - 23)
+
 
 def scalar_sources(order: List[Node]) -> Dict[Node, Optional[Node]]:
     """For each node, the single 1-D node it is a pointwise function of.
@@ -401,23 +417,41 @@ def collapse_univariate_subgraphs(
             continue
 
         # Gate 3 — emitted lanes per synthesized member (2 per
-        # value-changing step; equal-value steps are free).
+        # value-changing step; equal-value steps are free), and the
+        # accumulation-error model: a staircase's saturated ramp lanes
+        # carry intermediates of magnitude ~ step_sharpness · R ·
+        # max|adjacent value change|, and the fp32 lane sum quantizes
+        # the recovered plateau to ulps of that magnitude (measured at
+        # 1-4 ulps — the staircase entries in docs/op_noise_data.json).
+        # Decline rather than exceed the synthesized claim's tolerance.
         tables = {
             m: values[m].reshape(n_plateaus, n_offsets, -1)[:, 0, :]
             for m in synthesized
         }
-        lane_fail = None
+        range_width = float(hi_int - lo_int)
+        gate_fail = None
         member_lanes: Dict[Node, int] = {}
         for m in synthesized:
             t = tables[m]
             lanes = 2 * int((t[1:] != t[:-1]).any(dim=1).sum())
             member_lanes[m] = lanes
+            m_name = m.name or f"{type(m).__name__}#{topo_index[m]}"
             if lanes > lane_cap:
-                m_name = m.name or f"{type(m).__name__}#{topo_index[m]}"
-                lane_fail = f"member {m_name} needs {lanes} lanes " f"(cap {lane_cap})"
+                gate_fail = f"member {m_name} needs {lanes} lanes (cap {lane_cap})"
                 break
-        if lane_fail is not None:
-            outcomes.append(declined(lane_fail))
+            if lanes:
+                max_dv = float((t[1:] - t[:-1]).abs().max())
+                err_bound = 4.0 * _ulp32(step_sharpness * range_width * max_dv)
+                if err_bound > _SYNTH_CLAIM_ATOL:
+                    gate_fail = (
+                        f"member {m_name}: predicted fp32 accumulation "
+                        f"{err_bound:.2e} exceeds the synthesized claim "
+                        f"tolerance {_SYNTH_CLAIM_ATOL:g} "
+                        f"(range {range_width:g}, max step {max_dv:g})"
+                    )
+                    break
+        if gate_fail is not None:
+            outcomes.append(declined(gate_fail))
             continue
 
         # --- All gates passed: synthesize, rewire, orphan. -------------

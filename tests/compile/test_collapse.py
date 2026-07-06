@@ -202,6 +202,24 @@ def test_declines_emitted_lane_overflow_past_prescreen():
     assert any("18 lanes" in r for r in _decline_reasons(lowered))
 
 
+def test_declines_predicted_accumulation_error():
+    """Large plateau steps break the error model's budget: the staircase's
+    fp32 lane-sum error is ~ulp(step_sharpness * R * max_step), and a
+    +-100 plateau step over range 9 puts the 4-ulp bound (~7.8e-3) past
+    the synthesized claim's 1e-3 tolerance — declined, per the measured
+    staircase entries in docs/op_noise_data.json.  The +-1 chain is
+    bit-constant on plateaus and the x100 Linear is exact in fp32, so
+    this reaches the error-model gate rather than the staircase check."""
+    _, chain = _staircase_chain("relu")  # bit-exact +-1 staircase of x
+    out = Linear(chain, torch.tensor([[100.0]]))
+
+    lowered = _collapse(out, lane_cap=64)
+    assert lowered.collapse_report.n_collapsed == 0
+    assert any(
+        "predicted fp32 accumulation" in r for r in _decline_reasons(lowered)
+    ), lowered.collapse_report.format()
+
+
 def test_declines_non_staircase_member():
     """|x - 4.5| varies inside every plateau — not a function of
     round(x); the sampled staircase check must decline it."""
