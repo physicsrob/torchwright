@@ -1352,6 +1352,7 @@ def compile_to_onnx(
     rms_norm_eps: float = 1e-5,
     rms_norm_const_exp: Optional[int] = None,
     bias: bool = True,
+    collapse_univariate: bool = False,
 ) -> OnnxArtifact:
     """Compile a token-I/O graph to a KV-cached ONNX model.
 
@@ -1490,6 +1491,7 @@ def compile_to_onnx(
         optimize=optimize,
         assume_zero_init=assume_zero_init,
         bias=bias,
+        collapse_univariate=collapse_univariate,
         d_hidden=d_hidden,
         rms_norm=rms_norm_on,
         rms_norm_eps=rms_norm_eps,
@@ -1899,6 +1901,12 @@ class CompiledHeadless:
         self._d_head = net.layers[0].attn.attn.d_head
         self._n_layers = len(net.layers)
 
+    @property
+    def n_layers(self) -> int:
+        """Compiled layer count — the number the depth-oriented passes
+        (and their before/after reports) are measured by."""
+        return self._n_layers
+
     def _build_res_stream(self, inputs: torch.Tensor, past_len: int) -> torch.Tensor:
         n_new = inputs.shape[0]
         input_values = {
@@ -2256,6 +2264,7 @@ def compile_headless(
     optimize: int = 0,
     assume_zero_init: bool = False,
     bias: bool = True,
+    collapse_univariate: bool = False,
 ) -> CompiledHeadless:
     """Compile a graph to an in-process callable.
 
@@ -2307,6 +2316,7 @@ def compile_headless(
         optimize=optimize,
         assume_zero_init=assume_zero_init,
         bias=bias,
+        collapse_univariate=collapse_univariate,
     )
 
     assert net.residual_assignment is not None

@@ -194,7 +194,13 @@ def assert_integer(node: Node, *, atol: float = 1e-3) -> Node:
         claimed = NodeValueType(value_range=Range(math.floor(r.lo), math.ceil(r.hi)))
     else:
         claimed = NodeValueType()
-    return Assert(node, predicate, message="integer-valued", claimed_type=claimed)
+    return Assert(
+        node,
+        predicate,
+        message="integer-valued",
+        claimed_type=claimed,
+        integer_claim=True,
+    )
 
 
 def assert_bool(node: Node, *, atol: float = 1e-3) -> Node:

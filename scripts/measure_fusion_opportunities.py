@@ -48,17 +48,14 @@ import json
 from collections import Counter
 from typing import Dict, List, Optional, Tuple
 
+from torchwright.compiler.collapse import scalar_sources
 from torchwright.compiler.graph_clone import topological_order
 from torchwright.compiler.lower import lower
 from torchwright.graph import Add, Attn, Concatenate, Linear, Node
 from torchwright.graph.ffn import FFN
-from torchwright.graph.misc import LiteralValue
 
 # Node types that cost one sublayer on a dependency chain.
 _COSTLY = (Attn, FFN, Linear, Add)
-# Per-position ops a univariate subgraph may pass through (Attn mixes
-# across positions and is excluded; anything else unknown is excluded too).
-_POINTWISE = (FFN, Linear, Add, Concatenate)
 
 
 def _cost(n: Node) -> int:
@@ -104,49 +101,6 @@ def _levels(order: List[Node], zero_cost: frozenset = frozenset()) -> Dict[Node,
         base = max((lv[u] for u in n.inputs), default=0)
         lv[n] = base + (0 if n in zero_cost else _cost(n))
     return lv
-
-
-_TOP = object()  # "not a function of a single scalar"
-
-
-def _scalar_sources(order: List[Node]) -> Dict[Node, Optional[Node]]:
-    """For each node, the single 1-D node it is a pointwise function of.
-
-    Returns ``src[n] = s`` when n's only non-literal ancestry, walked
-    through pointwise ops, is the 1-D node ``s`` (``s`` itself maps to
-    ``s``).  ``None`` means literal-only ancestry; ``_TOP`` (filtered to
-    ``None`` in the result) means no single scalar source.
-    """
-    raw: Dict[Node, object] = {}
-    for n in order:
-        if isinstance(n, LiteralValue):
-            raw[n] = None
-            continue
-        if not n.inputs or not isinstance(n, _POINTWISE):
-            # A source candidate: any node computed "elsewhere" (input,
-            # embedding, attention, ...) starts a univariate subgraph iff
-            # it is 1-D.
-            raw[n] = n if len(n) == 1 else _TOP
-            continue
-        acc: object = None
-        for u in n.inputs:
-            s = raw[u]
-            if s is None:
-                continue
-            if acc is None:
-                acc = s
-            elif acc is not s:
-                acc = _TOP
-                break
-        if acc is _TOP:
-            # The univariate subgraph ends here, but n itself can seed a
-            # new one.
-            raw[n] = n if len(n) == 1 else _TOP
-        else:
-            raw[n] = acc
-    return {
-        n: (s if (s is not None and s is not _TOP) else None) for n, s in raw.items()
-    }
 
 
 def _collapsed_levels(
@@ -297,7 +251,7 @@ def analyze(output: Node, name: str, detail_subgraphs: bool = False) -> None:
     depth1 = _levels(order, zero_cost=frozenset(fam1))[out]
 
     # Family 2: univariate subgraphs.
-    src = _scalar_sources(order)
+    src = scalar_sources(order)
     members = [n for n in order if src[n] is not None and src[n] is not n]
     lv2 = _collapsed_levels(order, src)
     depth2 = lv2[out]

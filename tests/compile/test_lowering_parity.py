@@ -52,7 +52,7 @@ def _inplace_pipeline_bounds(output_node):
     fuse_consecutive_linears({output_node})
     for node in topological_order(output_node):
         refresh_node_caches(node)
-    stripped = _strip_debug_wrappers(output_node)
+    stripped, _integer_claimed = _strip_debug_wrappers(output_node)
     canon = canonical_ids(stripped)
     return {
         canon[n.node_id]: n.value_type.value_range
@@ -128,4 +128,59 @@ def _swish_graph():
 def test_bounds_transparent_swish_graph():
     inplace = _inplace_pipeline_bounds(_swish_graph())
     lowered = _lowered_pipeline_bounds(_swish_graph())
+    _assert_bit_identical(inplace, lowered)
+
+
+# --- Univariate collapse variant (same twin rule, flag on) ----------------
+
+_COLLAPSE_LANE_CAP = 64
+
+
+def _collapsible_graph():
+    """An integer-asserted scalar chain the collapse pass rewrites."""
+    from torchwright.graph.asserts import assert_integer
+    from torchwright.ops.relu.arithmetic_ops import compare, min as ops_min
+
+    x = create_input("x", 1, value_range=(0.0, 9.0))
+    xi = assert_integer(x)
+    return ops_min(compare(xi, 2.5), compare(xi, 5.5))
+
+
+def _inplace_pipeline_bounds_collapsed(output_node):
+    """The in-place twin with the collapse pass in lower()'s round
+    order: fuse, refresh, strip, collapse, re-strip."""
+    from torchwright.compiler.collapse import collapse_univariate_subgraphs
+    from torchwright.graph.optimize import FoldLog
+
+    fuse_consecutive_linears({output_node})
+    for node in topological_order(output_node):
+        refresh_node_caches(node)
+    stripped, integer_claimed = _strip_debug_wrappers(output_node)
+    stripped, report = collapse_univariate_subgraphs(
+        stripped,
+        integer_claimed=integer_claimed,
+        lane_cap=_COLLAPSE_LANE_CAP,
+        fold_log=FoldLog(),
+    )
+    assert report.n_collapsed, report.format()
+    stripped, _ = _strip_debug_wrappers(stripped)
+    canon = canonical_ids(stripped)
+    return {
+        canon[n.node_id]: n.value_type.value_range
+        for n in get_ancestor_nodes({stripped})
+    }
+
+
+def test_bounds_transparent_collapsed_graph():
+    inplace = _inplace_pipeline_bounds_collapsed(_collapsible_graph())
+    lowered_graph = lower(
+        _collapsible_graph(),
+        collapse_univariate=True,
+        collapse_lane_cap=_COLLAPSE_LANE_CAP,
+    )
+    canon = canonical_ids(lowered_graph.output_node)
+    lowered = {
+        canon[n.node_id]: n.value_type.value_range
+        for n in get_ancestor_nodes({lowered_graph.output_node})
+    }
     _assert_bit_identical(inplace, lowered)

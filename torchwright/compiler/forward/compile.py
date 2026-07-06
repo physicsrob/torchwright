@@ -610,6 +610,7 @@ def forward_compile(
     rms_norm_eps: float = 1e-5,
     rms_norm_const_exp: int = _RMS_NORM_CONST_EXP,
     bias: bool = True,
+    collapse_univariate: bool = False,
 ) -> HeadlessTransformer:
     """Compile a computation graph into a HeadlessTransformer.
 
@@ -713,7 +714,12 @@ def forward_compile(
     # construction.
     from torchwright.compiler.lower import lower
 
-    lowered = lower(output_node, verbose=verbose)
+    lowered = lower(
+        output_node,
+        verbose=verbose,
+        collapse_univariate=collapse_univariate,
+        collapse_lane_cap=(d_hidden if d_hidden else d) // 4,
+    )
     output_node = lowered.output_node
 
     # 1. Analyze graph (pure analysis; the copy carries no wrappers)

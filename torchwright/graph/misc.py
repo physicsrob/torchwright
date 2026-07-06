@@ -195,9 +195,17 @@ class Assert(Node):
         predicate: Predicate,
         message: str = "",
         claimed_type: Optional[NodeValueType] = None,
+        integer_claim: bool = False,
     ):
         self.predicate = predicate
         self.message = message
+        # Structured marker for "the wrapped value is integer-grained"
+        # (set by assert_integer).  NodeValueType stays range-only, so
+        # integer-ness travels on the wrapper; the lowering strip
+        # collects the wrapped nodes into the set the univariate
+        # collapse pass gates on (docs/univariate_collapse_plan.md,
+        # feasibility gate condition 1).
+        self.integer_claim = integer_claim
         # Stashed for compute_value_type (runs inside super().__init__).
         self._claimed_type = claimed_type
         super().__init__(len(inp), [inp])

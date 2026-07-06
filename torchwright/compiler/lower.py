@@ -41,7 +41,10 @@ Constructing a :class:`LoweredGraph` does four things:
 """
 
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Set, Tuple
+from typing import TYPE_CHECKING, Dict, List, Optional, Set, Tuple
+
+if TYPE_CHECKING:
+    from torchwright.compiler.collapse import CollapseReport
 
 from torchwright.compiler.graph_clone import (
     build_clone_dispatch,
@@ -130,6 +133,9 @@ class LoweredGraph:
     realization_table: RealizationTable
     source_output_node: Optional[Node] = None
     node_map: Dict[Node, Node] = field(default_factory=dict)
+    # Per-subgraph collapse/decline log when the univariate collapse
+    # pass ran (None when it didn't) — see torchwright.compiler.collapse.
+    collapse_report: Optional["CollapseReport"] = None
 
     def copy_of(self, source_node: Node) -> Node:
         """The copy node computing ``source_node``'s value (wrappers
@@ -177,7 +183,7 @@ def _unwrap(node: Node) -> Node:
     return node
 
 
-def _strip_debug_wrappers(output_node: Node) -> Node:
+def _strip_debug_wrappers(output_node: Node) -> Tuple[Node, Set[Node]]:
     """Remove Assert/DebugWatch wrappers from the (compiler-private) graph.
 
     Runs only on the copy ``lower()`` just built — never on a user's
@@ -195,6 +201,13 @@ def _strip_debug_wrappers(output_node: Node) -> Node:
     2. Every consumer of a wrapper is rewired to the wrapped node, and
        the unwrapped output is returned.
 
+    Returns ``(stripped_output, integer_claimed)`` where
+    ``integer_claimed`` is the set of copy nodes that carried an
+    ``assert_integer`` wrapper (``Assert.integer_claim``).  Integer-ness
+    has no home in the range-only ``NodeValueType``, so this set is how
+    the claim survives the strip — the univariate collapse pass gates on
+    it (docs/univariate_collapse_plan.md, feasibility gate condition 1).
+
     Order note: asserts are processed in ``node_id`` order for
     determinism, though the transfer itself commutes (range
     intersections are min/max).
@@ -206,8 +219,9 @@ def _strip_debug_wrappers(output_node: Node) -> Node:
         (n for n in all_nodes if isinstance(n, Assert)), key=lambda n: n.node_id
     )
     watches = [n for n in all_nodes if isinstance(n, DebugWatch)]
+    integer_claimed = {_unwrap(a) for a in asserts if a.integer_claim}
     if not asserts and not watches:
-        return output_node
+        return output_node, integer_claimed
 
     for a in asserts:
         if a.claimed_type is None:
@@ -252,7 +266,7 @@ def _strip_debug_wrappers(output_node: Node) -> Node:
             if isinstance(inp, (Assert, DebugWatch)):
                 node.inputs[i] = _unwrap(inp)
 
-    return _unwrap(output_node)
+    return _unwrap(output_node), integer_claimed
 
 
 class _ChainMiner:
@@ -372,7 +386,13 @@ def _check_vocabulary(all_nodes: Set[Node]) -> None:
     )
 
 
-def lower(output_node: Node, *, verbose: bool = False) -> LoweredGraph:
+def lower(
+    output_node: Node,
+    *,
+    verbose: bool = False,
+    collapse_univariate: bool = False,
+    collapse_lane_cap: Optional[int] = None,
+) -> LoweredGraph:
     """Certify the graph reachable from ``output_node`` and return its copy.
 
     Compilation is a pure function of the source graph: this validates
@@ -380,14 +400,21 @@ def lower(output_node: Node, *, verbose: bool = False) -> LoweredGraph:
     derived caches by construction), runs linear fusion on the copy
     (every compile gets the fused schedule — callers no longer pre-fuse),
     strips Assert/DebugWatch wrappers from the copy with their claims
-    tightened onto the wrapped nodes, and returns the
-    :class:`LoweredGraph` certificate the compile pipeline consumes.
+    tightened onto the wrapped nodes, optionally runs the univariate
+    collapse pass (:mod:`torchwright.compiler.collapse`), and returns
+    the :class:`LoweredGraph` certificate the compile pipeline consumes.
     The source graph — nodes, wiring, wrappers, cached bounds — is never
     touched.
 
     Args:
         output_node: The source graph's output node.
         verbose: Print the certified node count.
+        collapse_univariate: Run the univariate-subgraph collapse pass
+            on the copy after the wrapper strip
+            (docs/univariate_collapse_plan.md).
+        collapse_lane_cap: Decline threshold on emitted lanes per
+            synthesized FFN — ``d_hidden / 4`` of the target compile.
+            Required when ``collapse_univariate`` is on.
 
     Returns:
         A :class:`LoweredGraph` holding the copy's output node, the
@@ -401,6 +428,11 @@ def lower(output_node: Node, *, verbose: bool = False) -> LoweredGraph:
         raise TypeError(
             f"lower() expects the graph's output Node, got "
             f"{type(output_node).__name__}"
+        )
+    if collapse_univariate and collapse_lane_cap is None:
+        raise ValueError(
+            "collapse_univariate=True requires collapse_lane_cap "
+            "(d_hidden // 4 of the target compile)"
         )
     all_nodes = get_ancestor_nodes({output_node})
     _check_vocabulary(all_nodes)
@@ -416,10 +448,30 @@ def lower(output_node: Node, *, verbose: bool = False) -> LoweredGraph:
     fold_log = FoldLog()
     n_fused = fuse_consecutive_linears({copy.output_node}, fold_log=fold_log)
 
-    copy_output = _strip_debug_wrappers(copy.output_node)
+    copy_output, integer_claimed = _strip_debug_wrappers(copy.output_node)
+
+    collapse_report = None
+    n_collapsed = 0
+    if collapse_univariate:
+        from torchwright.compiler.collapse import collapse_univariate_subgraphs
+
+        copy_output, collapse_report = collapse_univariate_subgraphs(
+            copy_output,
+            integer_claimed=integer_claimed,
+            lane_cap=collapse_lane_cap,
+            fold_log=fold_log,
+            verbose=verbose,
+        )
+        n_collapsed = collapse_report.n_collapsed
+        if n_collapsed:
+            # Synthesis wraps each new value in piecewise_linear's
+            # clamp-range Assert; re-run the strip so the claims land on
+            # the synthesized nodes and the copy stays wrapper-free.
+            copy_output, _ = _strip_debug_wrappers(copy_output)
+
     copy_nodes = get_ancestor_nodes({copy_output})
 
-    if not n_fused:
+    if not n_fused and not n_collapsed:
         # Wrapper sources resolve to the clone of the node they wrap —
         # the stripped wrapper clones are no longer part of the copy.
         node_map = {src: _unwrap(clone) for src, clone in copy.node_map.items()}
@@ -460,4 +512,5 @@ def lower(output_node: Node, *, verbose: bool = False) -> LoweredGraph:
         realization_table=table,
         source_output_node=output_node,
         node_map=node_map,
+        collapse_report=collapse_report,
     )

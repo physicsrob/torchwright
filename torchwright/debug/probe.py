@@ -109,6 +109,7 @@ def reference_eval(
     output_node: Node,
     input_values: Dict[str, torch.Tensor],
     n_pos: int,
+    seed: Optional[Dict[Node, torch.Tensor]] = None,
 ) -> Dict[Node, torch.Tensor]:
     """Recursively evaluate the graph and return ``{Node: tensor}``.
 
@@ -125,13 +126,18 @@ def reference_eval(
         input_values: ``{input_name: (n_pos, d_input) tensor}`` — one
             entry per :class:`InputNode` reachable from ``output_node``.
         n_pos: number of positions to evaluate at.
+        seed: optional ``{node: (n_pos, d) tensor}`` values to pin
+            mid-graph — a seeded node's ``compute`` never runs and
+            nothing upstream of it is evaluated (its inputs are only
+            reached through it).  This is how the univariate collapse
+            pass re-roots a subgraph's oracle at its scalar source.
 
     Returns:
         A dict mapping every reachable node (including ``output_node``
         itself) to its oracle value as an ``(n_pos, node.d_output)``
-        tensor.
+        tensor.  Seeded entries are included verbatim.
     """
-    cache: Dict[Node, torch.Tensor] = {}
+    cache: Dict[Node, torch.Tensor] = dict(seed) if seed else {}
 
     # Collect all node subclasses reachable from the output graph so we
     # only patch classes actually in use.  Walking by class lets us
