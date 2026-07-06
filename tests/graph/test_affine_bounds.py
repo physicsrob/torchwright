@@ -681,7 +681,15 @@ class TestSemanticBounds:
                 assert actual <= iv.hi + 1e-5
 
     def test_cond_gate_preserves_correlation(self):
-        """Semantic bound preserves inp correlation through the gate."""
+        """Semantic bound preserves inp correlation through the gate.
+
+        Also pins the override-vs-claim precedence on the affine channel
+        (see ``_apply_semantic_override``): cond_gate's result carries both
+        a finite range claim and a semantic override, and if the claim box
+        were applied on top of the override it would degenerate the bound
+        to a constant box with no input columns — the ``columns`` assertion
+        below fails under exactly that regression.
+        """
         with fresh_graph_session():
             cond = InputNode(1, name="cond", value_range=(-1.0, 1.0))
             inp = InputNode(1, name="inp", value_range=(2.0, 5.0))

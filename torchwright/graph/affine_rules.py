@@ -576,6 +576,8 @@ def _apply_semantic_override(node: "Node", semantic_ab: Optional[AffineBound]) -
     override's correlation structure (input columns) is worth more
     downstream than the claim's constant box.  The claim still tightens
     ``_structural_type``, so ``value_type`` stays claim-tight.
+    Pinned by ``test_cond_gate_preserves_correlation``
+    (tests/graph/test_affine_bounds.py).
     """
     if semantic_ab is None:
         return
