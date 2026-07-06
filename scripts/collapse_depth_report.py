@@ -1,13 +1,14 @@
-"""Realized layer-count report for the univariate collapse pass.
+"""Layer-count report for the univariate collapse pass.
 
 Rollout item 6 of docs/univariate_collapse_plan.md: the point of the
 pass is fewer layers, so measure it directly.  For each example graph
 (the same list :mod:`scripts.measure_fusion_opportunities` measures),
-compile with ``collapse_univariate`` off and on at the same ``d`` /
-``d_head`` the token tests use and report the compiled layer count
-before / after / delta, together with the pass's own collapse/decline
-log (per subgraph: source, members, chain depth, emitted lanes — or the
-decline reason).
+report the pass's own collapse/decline log (per subgraph: source,
+members, chain depth, emitted lanes — or the decline reason) and the
+compiled layer count.  The pass is always on since the 2026-07-06 flip
+(escape hatch retired from the compile entry points; ``lower()`` keeps
+the kwarg as the off-path seam for tests).  The rollout-era off/on
+realized deltas are recorded in the plan doc.
 
 The modeled counterpart (critical-path sublayers under the idealized
 "any univariate subgraph collapses to one FFN" cost model) is
@@ -93,23 +94,17 @@ def _print_collapse_report(output: Node, lane_cap: int) -> None:
     )
 
 
-def _compile_layers(
-    output: Node, *, d: int, d_head: int, device: str, collapse: bool, optimize: int
-) -> int:
+def _compile_layers(output: Node, *, d: int, d_head: int, device: str, optimize: int) -> int:
     t0 = time.perf_counter()
     compiled = compile_headless(
         output,
         d=d,
         d_head=d_head,
         device=device,
-        collapse_univariate=collapse,
         optimize=optimize,
     )
     dt = time.perf_counter() - t0
-    print(
-        f"  compile collapse={'on ' if collapse else 'off'} "
-        f"optimize={optimize}: {compiled.n_layers} layers ({dt:.1f}s)"
-    )
+    print(f"  compile optimize={optimize}: {compiled.n_layers} layers ({dt:.1f}s)")
     return compiled.n_layers
 
 
@@ -132,13 +127,7 @@ def report_graph(
     _print_collapse_report(output, cap)
     if lower_only:
         return
-    n_off = _compile_layers(
-        output, d=d, d_head=d_head, device=device, collapse=False, optimize=optimize
-    )
-    n_on = _compile_layers(
-        output, d=d, d_head=d_head, device=device, collapse=True, optimize=optimize
-    )
-    print(f"n_layers: off={n_off} on={n_on} delta={n_on - n_off:+d}")
+    _compile_layers(output, d=d, d_head=d_head, device=device, optimize=optimize)
 
 
 def main() -> None:

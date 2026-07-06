@@ -139,9 +139,13 @@ actually buy).  Claims being refresh-proof means such a round would be
 bounds-safe whenever the policy allows it — the blocker is check
 preservation, not bounds.
 
-Gated by a `collapse_univariate: bool = False` keyword threaded from
-the compile entry points (`compile_headless`, `compile_to_onnx`).
-Default flips to on after the doom parity gate passes (rollout below).
+Always on (2026-07-06: the default flipped after the rollout gates and
+the `collapse_univariate` keyword was retired from the compile entry
+points — `compile_headless`, `compile_to_onnx`, `forward_compile`).
+The kwarg survives on `lower()` only: an internal, exercised seam for
+the tests that legitimately need the off-path
+(`test_flag_off_is_a_noop`, the parity-twin baselines, off-path chain
+depth in the layer-savings test) — not a dormant knob.
 
 ### Finding subgraphs
 
@@ -481,6 +485,7 @@ pass lands.
    compile gate re-bracketed d 4096 → 4608 (its greedy optimize=0
    schedule deadlocked at the old cramming point; production CP-SAT
    unaffected).
-7. **Flipped 2026-07-06.**  Retirement (the flag off the public entry
-   points, kept on `lower()` for the tests that need the off-path)
-   follows as the next change.
+7. **Flipped 2026-07-06, escape hatch retired the same day** — the
+   flag removed from `compile_to_onnx` / `compile_headless` /
+   `forward_compile`; `lower()` keeps the kwarg as the internal
+   off-path seam (see *Placement*).

@@ -311,7 +311,6 @@ def _write_debug_sidecar(
     cache_stride: int,
     verbose: bool,
     optimize: int = 0,
-    collapse_univariate: bool = False,
     extra: Optional[dict] = None,
 ) -> str:
     """Write ``<stem>.debug.json`` — everything OnnxDebugSession needs.
@@ -484,10 +483,10 @@ def _write_debug_sidecar(
         # not a graph property); the debug session cross-checks it against
         # the artifact's own initializer set.
         "bias": bool(getattr(compiled, "bias", True)),
-        # Whether the univariate-collapse lowering ran — a compile option
-        # like "bias"/"optimize", recorded top-level (never inside "extra",
-        # which is the caller's verbatim metadata).
-        "collapse_univariate": bool(collapse_univariate),
+        # The univariate-collapse lowering always runs (retired escape
+        # hatch, 2026-07-06); recorded top-level like "bias" (never inside
+        # "extra") so pre-flip sidecars (False) stay distinguishable.
+        "collapse_univariate": True,
         "d": d,
         "d_head": d_head,
         "n_heads": n_heads,
@@ -1342,7 +1341,6 @@ def compile_to_onnx(
     rms_norm_eps: float = 1e-5,
     rms_norm_const_exp: Optional[int] = None,
     bias: bool = True,
-    collapse_univariate: bool = True,
 ) -> OnnxArtifact:
     """Compile a token-I/O graph to a KV-cached ONNX model.
 
@@ -1481,7 +1479,6 @@ def compile_to_onnx(
         optimize=optimize,
         assume_zero_init=assume_zero_init,
         bias=bias,
-        collapse_univariate=collapse_univariate,
         d_hidden=d_hidden,
         rms_norm=rms_norm_on,
         rms_norm_eps=rms_norm_eps,
@@ -1749,10 +1746,11 @@ def compile_to_onnx(
         # anywhere (docs/no_bias_plan.md; biases folded into the matrices
         # against the pinned constant-1 column).
         "bias": bool(bias),
-        # Whether the univariate-collapse lowering ran on this graph
-        # (docs/univariate_collapse_plan.md) — provenance for depth
-        # comparisons across artifacts.
-        "collapse_univariate": bool(collapse_univariate),
+        # The univariate-collapse lowering always runs (default flipped
+        # and the escape hatch retired 2026-07-06 —
+        # docs/univariate_collapse_plan.md); False identifies pre-flip
+        # artifacts.
+        "collapse_univariate": True,
         # Solver provenance: distinguishes a real CP-SAT schedule (status
         # OPTIMAL/FEASIBLE/CACHED) from the heuristic fallback (UNKNOWN/
         # INFEASIBLE with optimize>0) — a fallback artifact is value-correct
@@ -1778,7 +1776,6 @@ def compile_to_onnx(
             checked_nodes=checked_nodes,
             cache_stride=cache_stride_resolved,
             optimize=optimize,
-            collapse_univariate=bool(collapse_univariate),
             extra=extra_metadata,
             verbose=verbose,
         )
@@ -2252,7 +2249,6 @@ def compile_headless(
     optimize: int = 0,
     assume_zero_init: bool = False,
     bias: bool = True,
-    collapse_univariate: bool = True,
 ) -> CompiledHeadless:
     """Compile a graph to an in-process callable.
 
@@ -2302,7 +2298,6 @@ def compile_headless(
         optimize=optimize,
         assume_zero_init=assume_zero_init,
         bias=bias,
-        collapse_univariate=collapse_univariate,
     )
 
     assert net.residual_assignment is not None

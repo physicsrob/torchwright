@@ -310,33 +310,45 @@ def test_declines_no_depth_gain():
 
 
 # ---------------------------------------------------------------------------
-# End to end: the flag threads through compile_headless and saves layers
+# End to end: the always-on pass reaches compile_headless and saves layers
 # ---------------------------------------------------------------------------
 
 
 def test_compile_headless_collapse_saves_layers_and_matches():
+    """The pass is unconditional in the compile pipeline (the escape hatch
+    was retired 2026-07-06; ``lower()`` keeps the kwarg as the off-path
+    seam these tests use directly).  The multi-sublayer staircase chain
+    must compile to a single layer — fewer than its off-path lowered
+    chain depth — and match the exact oracle."""
     from torchwright.compiler.export import compile_headless
 
     inputs = torch.arange(0.0, 10.0).unsqueeze(1)  # the single "x" column
 
     _, out_a = _staircase_chain("relu")
     oracle = reference_eval(out_a, {"x": inputs}, 10)[out_a]
-    # Explicit False: the baseline must stay the off-path even after the
-    # default flips (and during flag-forced-on sweeps).
-    baseline = compile_headless(
-        out_a, d=64, d_head=8, verbose=False, collapse_univariate=False
-    )
-    _, out_b = _staircase_chain("relu")
-    collapsed = compile_headless(
-        out_b, d=64, d_head=8, verbose=False, collapse_univariate=True
-    )
+    compiled = compile_headless(out_a, d=64, d_head=8, verbose=False)
 
-    assert collapsed.n_layers < baseline.n_layers
-    # Each backend within compiled-path noise of the exact oracle (the
-    # residual-stream matmul writes cost ~1e-5 on top of per-op noise;
-    # values here are +-1, steps of size 2).
-    torch.testing.assert_close(baseline(inputs).cpu(), oracle, atol=1e-4, rtol=0.0)
-    torch.testing.assert_close(collapsed(inputs).cpu(), oracle, atol=1e-4, rtol=0.0)
+    # Off-path chain depth in costly nodes (what the pass removed),
+    # measured on the lower() seam — the compile above must land below it.
+    off = lower(out_a)
+    order = topological_order(off.output_node)
+    from torchwright.graph.misc import Add
+    from torchwright.graph.linear import Linear as _Linear
+
+    costly = (FFN, _Linear, Add)
+    depth: dict = {}
+    for n in order:
+        base = max((depth.get(u, 0) for u in n.inputs), default=0)
+        depth[n] = base + (1 if isinstance(n, costly) else 0)
+    off_chain = depth[off.output_node]
+    assert off_chain >= 2, "fixture must be a multi-sublayer chain"
+
+    assert compiled.n_layers == 1
+    assert compiled.n_layers < off_chain
+    # Within compiled-path noise of the exact oracle (the residual-stream
+    # matmul writes cost ~1e-5 on top of per-op noise; values here are
+    # +-1, steps of size 2).
+    torch.testing.assert_close(compiled(inputs).cpu(), oracle, atol=1e-4, rtol=0.0)
 
 
 # ---------------------------------------------------------------------------

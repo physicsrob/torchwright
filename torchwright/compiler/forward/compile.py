@@ -609,7 +609,6 @@ def forward_compile(
     rms_norm_eps: float = 1e-5,
     rms_norm_const_exp: int = _RMS_NORM_CONST_EXP,
     bias: bool = True,
-    collapse_univariate: bool = True,
 ) -> HeadlessTransformer:
     """Compile a computation graph into a HeadlessTransformer.
 
@@ -712,10 +711,13 @@ def forward_compile(
     # and range claims are node metadata and ride the clones).
     from torchwright.compiler.lower import lower
 
+    # The univariate collapse always runs (docs/univariate_collapse_plan.md
+    # — default flipped and the escape hatch retired 2026-07-06; lower()
+    # keeps the kwarg as the internal seam the off-path tests exercise).
     lowered = lower(
         output_node,
         verbose=verbose,
-        collapse_univariate=collapse_univariate,
+        collapse_univariate=True,
         collapse_lane_cap=(d_hidden if d_hidden else d) // 4,
     )
     output_node = lowered.output_node
