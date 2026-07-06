@@ -165,9 +165,11 @@ def test_saturation_tails_keep_kinks_finite():
     m = cert.members[out]
     assert m.n_kinks == 4  # clamp corners ±100, compare hinges 3.0/3.1
     assert m.deviation < 1e-4
+    # Flat to within the resolution class: the corner positions are
+    # fp32-quantized, so the tail chords may tilt by ~slope·eps32(100).
     v = m.fn.eval(torch.tensor([-9e8, -101.0, 101.0, 9e8]))
-    torch.testing.assert_close(v[0], v[1])
-    torch.testing.assert_close(v[2], v[3])
+    torch.testing.assert_close(v[0], v[1], atol=1e-4, rtol=0.0)
+    torch.testing.assert_close(v[2], v[3], atol=1e-4, rtol=0.0)
 
 
 def test_add_and_concat_union_kinks():
@@ -304,15 +306,57 @@ def test_keystone_random_chains_match_reference(machine):
 
 
 def test_same_source_multiply_declines_midpoint_linearity():
-    """x·x is piecewise-quadratic: measured, located decline."""
+    """x·x is piecewise-quadratic: measured, located decline — under
+    BOTH policies (its curvature spans the whole domain, so the banded
+    policy's narrow-run excusal never applies)."""
     ops = _ops("swish")
     x = create_input("x", 1, value_range=(0.0, 9.0))
     m = ops.multiply(x, x)
     cert = _certify(m, x)
     c = cert.members[m]
     assert not c.linear()
+    assert not c.linear_banded()
     assert c.deviation > 1.0  # chord vs x² mid-domain
+    assert c.banded_deviation > 1.0
     assert 0.0 < c.deviation_at < 9.0
+
+
+def test_resolution_floor_excuses_position_quantization():
+    """A sharp compare at |x| ~ 1400: transition position is only
+    representable to one fp32 spacing (1.2e-4), so mid-ramp chord
+    deviation up to ~slope·eps32(x) is the machine's own quantization
+    — excused, not charged (the doom is_type guard class)."""
+    ops = _ops("swish")
+    x = create_input("x", 1, value_range=(0.0, 3000.0))
+    c = ops.compare(x, 1400.05, sharpness=100.0)
+    cert = _certify(c, x)
+    assert cert.members[c].deviation < 1e-3
+
+
+def test_banded_policy_excuses_shifted_band_strict_declines():
+    """Simulated upstream position error: the oracle's transition sits
+    0.03 right of the weight-derived candidates.  Inside the narrow
+    candidate-bracketed band the chord reads full-scale deviation —
+    strict charges it, the banded policy (inherited-ramp clause) bins
+    it as in-band."""
+    from torchwright.compiler.collapse import _seeded_oracle
+
+    ops = _ops("relu")
+    x = create_input("x", 1, value_range=(0.0, 10.0))
+    p = ops.piecewise_linear(x, [4.9, 7.0], lambda t: t)  # kinks 4.9, 7.0
+    c = ops.compare(p, 5.0)  # candidates 5.0, 5.1
+    order = topological_order(c)
+    src = scalar_sources(order)
+    members = [n for n in order if src[n] is x and n is not x]
+
+    def shifted(xs):
+        grid = (xs + 0.03).to(torch.float32).reshape(-1, 1)
+        return _seeded_oracle(members, x, grid)
+
+    cert = certify_subgraph(x, members, oracle=shifted)
+    m = cert.members[c]
+    assert m.deviation > 1e-2, (m.deviation, m.deviation_at)
+    assert m.banded_deviation < 1e-3, (m.banded_deviation, m.banded_deviation_at)
 
 
 def test_relu_square_is_pl_and_certifies():
@@ -410,7 +454,7 @@ def test_analysis_takes_v1_declined_continuous_chain():
     report = analyze_collapse_v2(lowered.output_node, lane_cap=64)
     (sg,) = [s for s in report.subgraphs if s.source == "x"]
     assert sg.verdict == "S1", sg.format_line()
-    assert report.floor_on < report.floor_off
+    assert report.floor_strict < report.floor_off
 
 
 def test_analysis_picks_s2_for_sharp_wide_staircase_chain():
@@ -430,8 +474,8 @@ def test_analysis_picks_s2_for_sharp_wide_staircase_chain():
     m = sg.members[0]
     assert not m.s1_ok and m.s2_ok  # fp32 kills S1; S2 fits
     assert sg.stage1_cols == 1  # one composed value transition
-    assert report.floor_on == 2
-    assert report.floor_on < report.floor_off
+    assert report.floor_strict == 2
+    assert report.floor_strict < report.floor_off
 
 
 def test_s2_swish_fillet_is_reported_not_charged():

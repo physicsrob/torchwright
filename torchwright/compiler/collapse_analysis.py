@@ -42,6 +42,7 @@ from torchwright.compiler.collapse import (
 )
 from torchwright.compiler.graph_clone import topological_order
 from torchwright.compiler.pl_function import (
+    SIMPLIFY_TOL,
     MemberCertificate,
     S1Model,
     S2Model,
@@ -57,7 +58,14 @@ from torchwright.graph.ffn import FFN
 
 @dataclass(frozen=True)
 class MemberAnalysis:
-    """One synthesized-boundary member's certificate + shape models."""
+    """One synthesized-boundary member's certificate + shape models.
+
+    Two admissibility columns per shape: **strict** charges every
+    non-band sample; **banded** additionally excuses samples inside
+    narrow transition runs (the inherited-ramp clause — see
+    ``pl_function._BAND_PLATEAU_RATIO``).  Both are measured; which one
+    ships is the Phase-A checkpoint's policy call.
+    """
 
     name: str
     d_output: int
@@ -65,17 +73,22 @@ class MemberAnalysis:
     n_kinks: int
     deviation: float
     deviation_at: float
+    banded_deviation: float
+    banded_deviation_at: float
     fillet_deviation: float
     s1: S1Model
     s2: S2Model
     linear_ok: bool
     s1_ok: bool
     s2_ok: bool
+    linear_banded: bool
+    s1_banded_ok: bool
+    s2_banded_ok: bool
 
 
 @dataclass
 class SubgraphAnalysis:
-    """One univariate subgraph's v2 verdict."""
+    """One univariate subgraph's v2 verdicts (strict and banded)."""
 
     source: str
     annotation: str
@@ -85,14 +98,25 @@ class SubgraphAnalysis:
     n_boundary: int
     n_synthesized: int
     verdict: str  # 'S1' | 'S2' | 'no depth gain' | 'declined: <reason>'
-    depth_after: Optional[int] = None  # modeled chain depth if taken
+    verdict_banded: str = ""
+    depth_after: Optional[int] = None  # modeled chain depth if taken (strict)
+    depth_after_banded: Optional[int] = None
     members: List[MemberAnalysis] = field(default_factory=list)
-    stage1_cols: int = 0  # union bounded-step residual columns (S2 shape)
+    stage1_cols: int = 0  # union bounded-step residual columns (strict S2)
+    stage1_cols_banded: int = 0
     n_oracle_points: int = 0
+
+    def __post_init__(self):
+        if not self.verdict_banded:
+            self.verdict_banded = self.verdict
 
     @property
     def taken(self) -> bool:
         return self.verdict in ("S1", "S2")
+
+    @property
+    def taken_banded(self) -> bool:
+        return self.verdict_banded in ("S1", "S2")
 
     def format_line(self) -> str:
         head = (
@@ -100,17 +124,19 @@ class SubgraphAnalysis:
             f"{self.n_members} members, {self.n_synthesized} synth"
         )
         if self.taken:
-            worst = max(
-                (m.s1.total_bound if self.verdict == "S1" else m.s2.total_bound)
-                for m in self.members
-            )
             kinks = max(m.n_kinks for m in self.members)
-            line = (
-                f"{self.verdict:8s}{head} -> {self.depth_after}: "
-                f"kinks {kinks}, bound {worst:.2e}"
-            )
+            line = f"{self.verdict:8s}{head} -> {self.depth_after}: kinks {kinks}"
             if self.verdict == "S2":
                 line += f", stage-1 cols {self.stage1_cols}"
+            return line
+        if self.taken_banded:
+            line = (
+                f"{'banded':8s}{head} -> {self.depth_after_banded} "
+                f"({self.verdict_banded} under the banded policy only; "
+                f"strict: {self.verdict})"
+            )
+            if self.verdict_banded == "S2":
+                line += f", stage-1 cols {self.stage1_cols_banded}"
             return line
         return f"{'--':8s}{head} — {self.verdict}"
 
@@ -121,50 +147,68 @@ class SubgraphAnalysis:
             lines.append(
                 f"    {m.name} (d={m.d_output}, depth {m.depth}): "
                 f"kinks {m.n_kinks}, dev {m.deviation:.2e} "
-                f"(in-band {m.fillet_deviation:.2e}); "
+                f"(banded {m.banded_deviation:.2e}, "
+                f"in-band {m.fillet_deviation:.2e}); "
                 f"S1 {m.s1.lanes} lanes, bound {m.s1.total_bound:.2e} "
-                f"[{'ok' if m.s1_ok else 'no'}]; "
+                f"[{'ok' if m.s1_ok else 'no'}"
+                f"/{'ok' if m.s1_banded_ok else 'no'}]; "
                 f"S2 {m.s2.n_steps} steps, bound {m.s2.total_bound:.2e}, "
                 f"fillet class {m.s2.fillet_bound:.2e} "
-                f"[{'ok' if m.s2_ok else 'no'}]"
+                f"[{'ok' if m.s2_ok else 'no'}"
+                f"/{'ok' if m.s2_banded_ok else 'no'}]"
             )
         return "\n".join(lines)
 
 
 @dataclass
 class V2Report:
-    """All subgraph verdicts + the modeled floor and liveness totals."""
+    """All subgraph verdicts + the modeled floors and liveness totals."""
 
     subgraphs: List[SubgraphAnalysis]
     floor_off: Optional[int] = None
-    floor_on: Optional[int] = None
+    floor_strict: Optional[int] = None
+    floor_banded: Optional[int] = None
     machine: Optional[str] = None
 
     @property
     def total_stage1_cols(self) -> int:
-        """Simultaneous S2 residual columns, summed across taken
-        subgraphs — the conservative liveness estimate (all chains
-        live at once)."""
+        """Simultaneous S2 residual columns under the strict policy."""
         return sum(s.stage1_cols for s in self.subgraphs if s.verdict == "S2")
+
+    @property
+    def total_stage1_cols_banded(self) -> int:
+        return sum(
+            s.stage1_cols_banded if s.verdict != "S2" else s.stage1_cols
+            for s in self.subgraphs
+            if s.verdict_banded == "S2"
+        )
 
     def format(self) -> str:
         lines = [s.format_line() for s in self.subgraphs]
         taken = [s for s in self.subgraphs if s.taken]
+        banded = [s for s in self.subgraphs if s.taken_banded]
         lines.append(
-            f"-> {len(taken)} taken "
+            f"-> strict: {len(taken)} taken "
             f"(S1: {sum(1 for s in taken if s.verdict == 'S1')}, "
-            f"S2: {sum(1 for s in taken if s.verdict == 'S2')}), "
-            f"{len(self.subgraphs) - len(taken)} not taken"
+            f"S2: {sum(1 for s in taken if s.verdict == 'S2')}); "
+            f"banded: {len(banded)} taken "
+            f"(S1: {sum(1 for s in banded if s.verdict_banded == 'S1')}, "
+            f"S2: {sum(1 for s in banded if s.verdict_banded == 'S2')}); "
+            f"{len(self.subgraphs)} subgraphs total"
         )
         if self.floor_off is not None:
             lines.append(
-                f"modeled layer floor: {self.floor_off} -> {self.floor_on} "
-                f"(delta {self.floor_on - self.floor_off:+d})"
+                f"modeled layer floor: {self.floor_off} off, "
+                f"{self.floor_strict} strict "
+                f"(delta {self.floor_strict - self.floor_off:+d}), "
+                f"{self.floor_banded} banded "
+                f"(delta {self.floor_banded - self.floor_off:+d})"
             )
         lines.append(
             f"S2 stage-1 residual columns, simultaneous: "
-            f"{self.total_stage1_cols} (adds to the existing residual "
-            f"peak — the reverted-36-layer liveness trap check)"
+            f"{self.total_stage1_cols} strict / "
+            f"{self.total_stage1_cols_banded} banded (adds to the existing "
+            f"residual peak — the reverted-36-layer liveness trap check)"
         )
         return "\n".join(lines)
 
@@ -224,9 +268,13 @@ def analyze_collapse_v2(
 
     topo_index = {n: i for i, n in enumerate(order)}
     subgraphs: List[SubgraphAnalysis] = []
-    # (source, synthesized member, its shape, its certificate) for the
-    # floor model's rewiring pass.
+    # (source, synthesized member, shape) for the floor model's
+    # rewiring passes — subgraphs taken under strict, and the extra
+    # ones only the banded policy admits (strict takes are a subset of
+    # banded takes, so the banded floor grafts on top of the strict
+    # one).
     rewiring: List[Tuple[Node, Node, str]] = []
+    rewiring_banded: List[Tuple[Node, Node, str]] = []
 
     for source in sorted(by_src, key=topo_index.__getitem__):
         members = by_src[source]
@@ -271,8 +319,15 @@ def analyze_collapse_v2(
         analyses: List[MemberAnalysis] = []
         for m in synthesized:
             c: MemberCertificate = cert.members[m]
-            s1 = model_s1(c.fn, c.deviation)
-            s2 = model_s2(c.fn, c.deviation, machine=machine, plateau_tol=budget)
+            # Strict-policy models (the sleeve tolerance of the
+            # reported function rides the bound); banded rebudgets the
+            # same fp/drift terms with the smaller banded deviation.
+            s1 = model_s1(c.fn, c.deviation + SIMPLIFY_TOL)
+            s2 = model_s2(
+                c.fn, c.deviation + SIMPLIFY_TOL, machine=machine, plateau_tol=budget
+            )
+            s1_banded = s1.total_bound - c.deviation + c.banded_deviation
+            s2_banded = s2.total_bound - c.deviation + c.banded_deviation
             analyses.append(
                 MemberAnalysis(
                     name=m.name or f"{type(m).__name__}#{topo_index[m]}",
@@ -281,77 +336,100 @@ def analyze_collapse_v2(
                     n_kinks=c.n_kinks,
                     deviation=c.deviation,
                     deviation_at=c.deviation_at,
+                    banded_deviation=c.banded_deviation,
+                    banded_deviation_at=c.banded_deviation_at,
                     fillet_deviation=c.fillet_deviation,
                     s1=s1,
                     s2=s2,
                     linear_ok=c.linear(budget),
                     s1_ok=c.linear(budget) and s1.admissible(lane_cap, budget),
                     s2_ok=c.linear(budget) and s2.admissible(lane_cap, budget),
+                    linear_banded=c.linear_banded(budget),
+                    s1_banded_ok=c.linear_banded(budget)
+                    and s1.lanes <= lane_cap
+                    and s1_banded <= budget,
+                    s2_banded_ok=c.linear_banded(budget)
+                    and s2.n_steps > 0
+                    and s2.stage1_lanes <= lane_cap
+                    and s2.stage2_lanes <= lane_cap
+                    and s2_banded <= budget,
                 )
             )
 
-        not_linear = [a for a in analyses if not a.linear_ok]
-        if not_linear:
-            a = max(not_linear, key=lambda a: a.deviation)
-            subgraphs.append(
-                outcome(
+        def policy_verdict(banded: bool) -> Tuple[str, Optional[int]]:
+            lin = [a.linear_banded if banded else a.linear_ok for a in analyses]
+            s1s = [a.s1_banded_ok if banded else a.s1_ok for a in analyses]
+            s2s = [a.s2_banded_ok if banded else a.s2_ok for a in analyses]
+            if not all(lin):
+                worst_i = max(
+                    (i for i in range(len(analyses)) if not lin[i]),
+                    key=lambda i: (
+                        analyses[i].banded_deviation
+                        if banded
+                        else analyses[i].deviation
+                    ),
+                )
+                a = analyses[worst_i]
+                d = a.banded_deviation if banded else a.deviation
+                at = a.banded_deviation_at if banded else a.deviation_at
+                return (
                     f"declined: not PL within budget (member {a.name} "
-                    f"deviates {a.deviation:.2e} at x={a.deviation_at:.6g})",
-                    domain=cert.domain,
-                    members=analyses,
-                    n_oracle_points=cert.n_oracle_points,
+                    f"deviates {d:.2e} at x={at:.6g})",
+                    None,
                 )
-            )
-            continue
-
-        if all(a.s1_ok for a in analyses):
-            verdict, depth_after = "S1", 1
-        elif all(a.s1_ok or a.s2_ok for a in analyses):
-            verdict, depth_after = "S2", 2
-        else:
-            bad = next(a for a in analyses if not (a.s1_ok or a.s2_ok))
-            subgraphs.append(
-                outcome(
+            if all(s1s):
+                verdict, depth_after = "S1", 1
+            elif all(a or b for a, b in zip(s1s, s2s)):
+                verdict, depth_after = "S2", 2
+            else:
+                bad_i = next(i for i in range(len(analyses)) if not (s1s[i] or s2s[i]))
+                bad = analyses[bad_i]
+                return (
                     f"declined: member {bad.name} fits neither shape "
                     f"(S1: {bad.s1.lanes} lanes, bound {bad.s1.total_bound:.2e}; "
                     f"S2: {bad.s2.stage1_lanes} stage-1 lanes, "
                     f"bound {bad.s2.total_bound:.2e}; cap {lane_cap}, "
                     f"budget {budget:g})",
-                    domain=cert.domain,
-                    members=analyses,
-                    n_oracle_points=cert.n_oracle_points,
+                    None,
                 )
-            )
-            continue
-
-        if depth_after >= chain_depth:
-            subgraphs.append(
-                outcome(
+            if depth_after >= chain_depth:
+                return (
                     f"no depth gain ({verdict} shape needs {depth_after} "
                     f"sublayers, chain is {chain_depth})",
-                    domain=cert.domain,
-                    members=analyses,
-                    n_oracle_points=cert.n_oracle_points,
+                    None,
                 )
-            )
-            continue
+            return verdict, depth_after
 
-        stage1_cols = 0
-        if verdict == "S2":
-            stage1_cols = _stage1_col_union(
-                analyses, [cert.members[m] for m in synthesized], budget
-            )
+        verdict, depth_after = policy_verdict(banded=False)
+        verdict_banded, depth_after_banded = policy_verdict(banded=True)
+
+        member_certs = [cert.members[m] for m in synthesized]
+        stage1_cols = (
+            _stage1_col_union(analyses, member_certs, budget) if verdict == "S2" else 0
+        )
+        stage1_cols_banded = (
+            _stage1_col_union(analyses, member_certs, budget)
+            if verdict_banded == "S2"
+            else 0
+        )
         sg = outcome(
             verdict,
+            verdict_banded=verdict_banded,
             domain=cert.domain,
             depth_after=depth_after,
+            depth_after_banded=depth_after_banded,
             members=analyses,
             stage1_cols=stage1_cols,
+            stage1_cols_banded=stage1_cols_banded,
             n_oracle_points=cert.n_oracle_points,
         )
         subgraphs.append(sg)
-        for m in synthesized:
-            rewiring.append((source, m, verdict))
+        if sg.taken:
+            for m in synthesized:
+                rewiring.append((source, m, verdict))
+        elif sg.taken_banded:
+            for m in synthesized:
+                rewiring_banded.append((source, m, verdict_banded))
         if verbose:
             print(f"  {sg.format_line()}")
 
@@ -362,7 +440,9 @@ def analyze_collapse_v2(
 
         report.floor_off = critical_path_layers(output_node)
         output_node = _graft_standins(output_node, rewiring, consumers, by_src)
-        report.floor_on = critical_path_layers(output_node)
+        report.floor_strict = critical_path_layers(output_node)
+        output_node = _graft_standins(output_node, rewiring_banded, consumers, by_src)
+        report.floor_banded = critical_path_layers(output_node)
 
     if verbose:
         print(report.format())
