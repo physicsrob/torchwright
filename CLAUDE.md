@@ -338,11 +338,11 @@ capture, then performs three checks:
    ONNX artifact* below; the error message lists all three.  Raises
    `RuntimeError` on failure.
 
-2. **Assert predicates**: every `Assert` node in the graph has its
-   predicate run against the compiled value.  Raises `AssertionError`
-   with annotation context on failure.
+2. **Assert checks**: every assert-kind check attached to a graph
+   node (`node.checks`) has its predicate run against the compiled
+   value.  Raises `AssertionError` with annotation context on failure.
 
-3. **DebugWatch predicates**: every `DebugWatch` node in the graph
+3. **Watch checks**: every watch-kind check attached to a graph node
    has its predicate run against the compiled value.  Prints on
    trigger, does not raise.
 
@@ -361,9 +361,8 @@ value:
     val = compiled.debug_value(some_intermediate_node)
 
 Returns an `(n_pos, node.d_output)` tensor, or `None` if the node
-has no residual assignment.  Unwraps Assert/DebugWatch wrappers
-automatically.  Useful for spot-checking a specific node without
-setting up the full probe machinery.
+has no residual assignment.  Useful for spot-checking a specific node
+without setting up the full probe machinery.
 
 Raises `RuntimeError` if no `debug=True` forward has been run.
 
@@ -373,7 +372,7 @@ The ONNX exporter (`compile_to_onnx`)
 writes a `<stem>.debug.json` sidecar next to the model (disable with
 `debug_sidecar=False`): the residual assignment keyed by canonical
 node id, a structural fingerprint, and the compile-time
-Assert/DebugWatch coverage.  `OnnxDebugSession` combines that sidecar,
+attached-check coverage.  `OnnxDebugSession` combines that sidecar,
 the artifact, and a freshly **rebuilt** graph into the same debug
 surface as `CompiledHeadless` — **no recompile** (graph rebuild is
 seconds; the compile it replaces is minutes):
@@ -403,7 +402,7 @@ Requirements and caveats:
 - The graph must be rebuilt by the same deterministic construction
   code the compile used (the same property the CP-SAT schedule cache
   relies on).  A fingerprint check raises loudly on mismatch.
-  Assert/DebugWatch wrappers are exempt from the fingerprint — add or
+  Attached checks are node metadata outside the fingerprint — add or
   remove them freely on the rebuild; predicates always come from the
   rebuilt graph (the session warns when the rebuild carries fewer
   asserts than the compile did).
@@ -503,14 +502,18 @@ known reference:
 Can also detect sentinel values (e.g. `sentinel=-1000.0`) that
 should never appear in a healthy forward pass.
 
-## Assert and DebugWatch nodes
+## Assert and watch checks
 
-Graph-level invariants are encoded as `Assert` and `DebugWatch`
-nodes that wrap intermediate values.  Both are stripped from the
-compiler-private copy `lower()` builds (the compiled transformer is
-identical with or without them); the source graph keeps its wrappers
-forever — compilation never mutates it — and their predicates are
-re-checked during `debug=True` forward passes.
+Graph-level invariants are encoded as *checks attached to nodes* —
+`node.checks`, with range claims in `node.claimed_type`
+(docs/assert_metadata_plan.md).  A check is metadata, not topology:
+attaching costs nothing in the compiled transformer, claims survive
+every bounds recompute (`refresh_node_caches` re-applies them), and
+the source graph keeps its checks forever — compilation never mutates
+it.  Predicates run during every `compute` (reference eval) and are
+re-checked against compiled values during `debug=True` forward
+passes.  `suppress_checks()` (graph/node.py) disables them for
+evaluation on synthetic inputs.
 
 Helpers in `torchwright/graph/asserts.py`:
 
@@ -533,6 +536,10 @@ compiled values during `debug=True`.  An assert that passes in
 reference eval but fails in the compiled forward pinpoints a node
 where piecewise-linear approximation error exceeds the tolerance —
 that's a noise-budget problem in the graph, not a compiler bug.
+A fold that would erase a checked value is declined by
+`fuse_consecutive_linears` (the explicit policy in
+`graph/optimize.py`), so asserted values stay materialized and
+runtime-checkable.
 
 ## FP nondeterminism at tolerance boundaries
 

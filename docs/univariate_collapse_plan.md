@@ -112,24 +112,24 @@ utilization**.  Width is not the constraint; depth is.
 
 ### Placement
 
-Inside `lower()`, **after** `_strip_debug_wrappers` (wrappers are not
-per-position ops and would end every subgraph at each assert; the
-strip has already tightened their claims onto the wrapped nodes), and
-followed by a **second `fuse_consecutive_linears` round**: a collapse
+Inside `lower()`, **after** linear fusion.  (2026-07, post
+assert-metadata migration: checks and range claims are node metadata —
+docs/assert_metadata_plan.md — so there is no wrapper strip; claims are
+refresh-proof at the `refresh_node_caches` choke point and a claim
+never ends a subgraph.)  A follow-up **second `fuse_consecutive_linears`
+round** after the collapse remains desirable: a collapse
 produces `FFN(source)`, and when the source is a Linear whose only
 remaining consumers are the synthesized FFNs, the existing
 linear-into-gate fold absorbs it — a free extra sublayer (doom's
 `split_7` source is exactly this shape).
 
-The second fusion round must land **first, unconditionally, as its own
-change**.  Today fusion runs before the strip and wrappers block folds,
-so a post-strip round also picks up every fold a wrapper previously
-blocked — wins that have nothing to do with the collapse.  If that
-round only ran with the collapse flag on, those unrelated folds would
-pollute the flag-on/flag-off layer-count comparison the rollout depends
-on.  Landing the unconditional post-strip round as a precursor commit
-(parity twin updated, example parity re-checked) keeps the depth
-report's delta attributable to the collapse alone.
+With claims refresh-proof by construction, that second round is
+bounds-safe unconditionally — the strip bookkeeping this section used
+to describe (and the claim-loss trap that made an unconditional
+post-strip round unsafe) no longer exists.  The remaining question —
+which folds may delete runtime checkability — is the explicit
+fold-decline policy in `graph/optimize.py`, revisitable on
+measurement.
 
 Gated by a `collapse_univariate: bool = False` keyword threaded from
 the compile entry points (`compile_headless`, `compile_to_onnx`).
@@ -156,9 +156,9 @@ Collapse a subgraph only when all four conditions hold, for `w` the
 plateau slack (default 0.05 — justified below):
 
 1. **Integer contract on the source**: the source carries an
-   `assert_integer` wrapper in the user graph.  The strip records
-   which copy nodes carried one and hands that set to the pass
-   (`NodeValueType` stays range-only; no type-system change).  This
+   `assert_integer` claim in the user graph (`node.integer_claim` —
+   metadata that rides the compiler-private copy; `NodeValueType`
+   stays range-only; no type-system change).  This
    is the half of the certificate the composed-function check cannot
    supply: a source whose legitimate values land on half-integers has
    a composed function that is constant near every *integer* — the
@@ -358,8 +358,8 @@ pass lands.
    without `assert_integer` declined; half-integer-grained source
    declined (the gate-condition-1 counterexample); wrapper/override
    handling; depth-1 boundary member kept as-is.
-2. **Pass-level invariants**: the unconditional post-strip fusion
-   round lands first as its own change with `test_lowering_parity`'s
+2. **Pass-level invariants**: the unconditional post-collapse fusion
+   round lands as its own change with `test_lowering_parity`'s
    in-place twin updated; the twin then gains the collapse pass (same
    round order).  Compiler invariants I1–I4 are untouched (the pass
    runs before scheduling) but the full suite runs with the flag

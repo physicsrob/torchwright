@@ -1,6 +1,17 @@
 # Asserts as node metadata — migration design
 
-Status: DESIGN (no implementation yet).
+Status: IMPLEMENTED (2026-07-05).  All four migration-plan gates
+passed: full suite green; the pinned topology goldens
+(`tests/compile/test_topology_golden.py`) byte-identical across the
+cutover; a pre-migration debug sidecar loads and checks cleanly
+against a post-migration rebuild; a pre-migration CP-SAT
+schedule-cache entry HITs on a post-migration recompile.  One design
+correction discovered during implementation: for nodes carrying a
+semantic affine override (cond_gate/select/compare), the override —
+not the claim's constant box — is what wrapper consumers saw
+pre-migration, so the override wins on the affine channel and the
+claim tightens only the structural type (value_type stays
+claim-tight either way).
 Motivation: the univariate-collapse work (2026-07-05) exposed that
 Assert claims have no durable home — see *Why*, below.  Study basis:
 `_assert_rule` (affine_rules.py), `_canonical_walk` /
