@@ -311,6 +311,7 @@ def _write_debug_sidecar(
     cache_stride: int,
     verbose: bool,
     optimize: int = 0,
+    collapse_univariate: bool = False,
     extra: Optional[dict] = None,
 ) -> str:
     """Write ``<stem>.debug.json`` — everything OnnxDebugSession needs.
@@ -483,6 +484,10 @@ def _write_debug_sidecar(
         # not a graph property); the debug session cross-checks it against
         # the artifact's own initializer set.
         "bias": bool(getattr(compiled, "bias", True)),
+        # Whether the univariate-collapse lowering ran — a compile option
+        # like "bias"/"optimize", recorded top-level (never inside "extra",
+        # which is the caller's verbatim metadata).
+        "collapse_univariate": bool(collapse_univariate),
         "d": d,
         "d_head": d_head,
         "n_heads": n_heads,
@@ -1773,10 +1778,8 @@ def compile_to_onnx(
             checked_nodes=checked_nodes,
             cache_stride=cache_stride_resolved,
             optimize=optimize,
-            extra={
-                **(dict(extra_metadata) if extra_metadata else {}),
-                "collapse_univariate": bool(collapse_univariate),
-            },
+            collapse_univariate=bool(collapse_univariate),
+            extra=extra_metadata,
             verbose=verbose,
         )
 
