@@ -81,15 +81,36 @@ def test_same_source_multiply_declines():
 
 
 def test_lane_cap_declines_s1():
+    # Candidates (19 knots) stay under the kink pre-screen (4 x cap =
+    # 32) so the decline exercises the true S1 lane gate, not the
+    # pre-screen in front of it; quadratic knot values give every
+    # segment a distinct slope, so nothing simplifies below the cap.
     ops = _ops("relu")
     x = create_input("x", 1, value_range=(0.0, 100.0))
-    knots = [float(k) for k in range(1, 99)]
-    p = ops.piecewise_linear(x, knots, lambda t: (t % 7.0) - 3.0, d_max=4096)
+    knots = [float(k) for k in range(1, 20)]
+    p = ops.piecewise_linear(x, knots, lambda t: t * t / 10.0, d_max=4096)
     out = ops.add_const(p, 1.0)
     lowered = lower(out, collapse_pl=True, collapse_lane_cap=8)
     (o,) = [o for o in lowered.collapse_pl_report.outcomes if o.chain_depth >= 2]
     assert not o.collapsed
     assert "S1 inadmissible" in o.reason, o.reason
+
+
+def test_kink_prescreen_declines_before_the_sweep():
+    """A member whose candidate-kink population exceeds 4 x lane_cap
+    declines at the pre-screen (the kink-explosion seam, before the
+    member's oracle sweep) — the suite-cost mitigation for the
+    default flip.  ~98 candidates (quadratic values: one gate lane
+    per knot) against cap 8 (screen 32)."""
+    ops = _ops("relu")
+    x = create_input("x", 1, value_range=(0.0, 100.0))
+    knots = [float(k) for k in range(1, 99)]
+    p = ops.piecewise_linear(x, knots, lambda t: t * t / 10.0, d_max=4096)
+    out = ops.add_const(p, 1.0)
+    lowered = lower(out, collapse_pl=True, collapse_lane_cap=8)
+    (o,) = [o for o in lowered.collapse_pl_report.outcomes if o.chain_depth >= 2]
+    assert not o.collapsed
+    assert "kink explosion" in o.reason, o.reason
 
 
 def test_no_depth_gain_declines():

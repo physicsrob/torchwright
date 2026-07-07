@@ -81,6 +81,19 @@ _F64 = torch.float64
 # range for any certified knot position.
 _MAX_INPUT_SCALE = 2.0**20
 
+# Kink pre-screen (2026-07-06, the default-flip cost gate): a member
+# whose candidate-kink population exceeds this multiple of the lane
+# cap declines before its oracle sweep — the sweep is what made the
+# certify walk double suite wall time.  S1 lanes track skeleton knots
+# (bounded by candidates), so a population far past the cap cannot
+# emit admissibly; the factor is set from the measured margins — every
+# realized take peaks at 0.4x its lane cap (scratchpad, 306 @ cap
+# 768) while the expensive declines run 45x-800x over (adder_v2
+# 29,609 @ cap 256; calculator_v2 213,918 @ cap 256).  A subgraph
+# whose candidates exceed the screen but would simplify below the cap
+# is a lost take by construction; nothing measured is in that class.
+_KINK_PRESCREEN_FACTOR = 4
+
 
 def _emit_s1(
     source: Node,
@@ -172,7 +185,11 @@ def collapse_pl_subgraphs(
             value-correct.
         budget: the synthesized claim's tolerance (the production
             1e-3 — Rob's descope pins it; the knob exists for tests).
-        max_kinks: candidate-kink backstop per member.
+        max_kinks: candidate-kink backstop per member.  The effective
+            per-member ceiling is ``min(max_kinks,
+            _KINK_PRESCREEN_FACTOR * lane_cap)`` — the pre-screen that
+            keeps the certify walk off graphs that could never emit
+            within the cap.
         verbose: print one line per subgraph outcome.
 
     Returns:
@@ -232,7 +249,10 @@ def collapse_pl_subgraphs(
         cert = certify_subgraph(
             source,
             members,
-            max_kinks=max_kinks,
+            # The pre-screen: the lane-cap-derived candidate ceiling
+            # (see _KINK_PRESCREEN_FACTOR); max_kinks stays the
+            # absolute backstop.
+            max_kinks=min(max_kinks, _KINK_PRESCREEN_FACTOR * lane_cap),
             hinge_exact=_HINGE_EXACT_Z if machine == "swish" else 0.0,
         )
         if cert.declined is not None:
