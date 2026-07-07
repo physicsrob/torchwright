@@ -115,7 +115,13 @@ def _print_v2_report(output: Node, lane_cap: int) -> None:
 
 
 def _compile_layers(
-    output: Node, *, d: int, d_head: int, device: str, optimize: int
+    output: Node,
+    *,
+    d: int,
+    d_head: int,
+    device: str,
+    optimize: int,
+    collapse_pl: bool = False,
 ) -> int:
     t0 = time.perf_counter()
     compiled = compile_headless(
@@ -124,9 +130,11 @@ def _compile_layers(
         d_head=d_head,
         device=device,
         optimize=optimize,
+        collapse_pl=collapse_pl,
     )
     dt = time.perf_counter() - t0
-    print(f"  compile optimize={optimize}: {compiled.n_layers} layers ({dt:.1f}s)")
+    tag = " collapse_pl" if collapse_pl else ""
+    print(f"  compile optimize={optimize}{tag}: {compiled.n_layers} layers ({dt:.1f}s)")
     return compiled.n_layers
 
 
@@ -141,6 +149,7 @@ def report_graph(
     lower_only: bool = False,
     optimize: int = 0,
     v2: bool = False,
+    pl: bool = False,
 ) -> None:
     # forward_compile's own cap formula (d_hidden defaults to d) unless
     # overridden — so the report matches what a compile would do.
@@ -152,7 +161,18 @@ def report_graph(
         _print_v2_report(output, cap)
     if lower_only:
         return
-    _compile_layers(output, d=d, d_head=d_head, device=device, optimize=optimize)
+    off = _compile_layers(output, d=d, d_head=d_head, device=device, optimize=optimize)
+    if pl:
+        # Phase C realization: the same compile with the v2 S1 pass on.
+        on = _compile_layers(
+            output,
+            d=d,
+            d_head=d_head,
+            device=device,
+            optimize=optimize,
+            collapse_pl=True,
+        )
+        print(f"  realized delta (collapse_pl): {on - off:+d} layers")
 
 
 def main() -> None:
@@ -194,6 +214,12 @@ def main() -> None:
         help="forward_compile optimize level for the off/on compiles "
         "(0 greedy; 2 = the production CP-SAT schedule)",
     )
+    ap.add_argument(
+        "--pl",
+        action="store_true",
+        help="also compile with the v2 S1 pass on (collapse_pl) and "
+        "print the realized layer delta — Phase C realization",
+    )
     args = ap.parse_args()
 
     if args.spec:
@@ -221,6 +247,7 @@ def main() -> None:
             lane_cap=args.lane_cap,
             optimize=args.optimize,
             v2=args.v2,
+            pl=args.pl,
         )
         return
 
@@ -238,6 +265,7 @@ def main() -> None:
             lower_only=args.lower_only,
             optimize=args.optimize,
             v2=args.v2,
+            pl=args.pl,
         )
 
 
