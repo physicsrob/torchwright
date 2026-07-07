@@ -432,6 +432,9 @@ class MemberCertificate:
     fillet_deviation: float  # in-band / quantization-class deviation (reported)
     fillet_deviation_at: float
     n_samples: int
+    # Merged analytic hinge-band intervals ((k, 2), see _HINGE_EXACT_Z)
+    # over the member's ancestry — band_skeleton() consumes these.
+    bands: Optional[torch.Tensor] = None
     # Forensics (populated only under ``certify_subgraph(keep_raw=True)``):
     # the candidate kink set and the measurement-frame function (every
     # candidate and ±1-ulp bracket kept, before the sleeve simplify).
@@ -472,12 +475,37 @@ def _merge_intervals(iv: torch.Tensor) -> torch.Tensor:
     return torch.stack(merged)
 
 
-def _in_intervals(iv: torch.Tensor, xs: torch.Tensor) -> torch.Tensor:
-    """Boolean mask: which ``xs`` lie inside the merged intervals."""
+def _in_intervals(
+    iv: torch.Tensor, xs: torch.Tensor, strict: bool = False
+) -> torch.Tensor:
+    """Boolean mask: which ``xs`` lie inside the merged intervals.
+    ``strict`` excludes the interval endpoints."""
     if iv.numel() == 0:
         return torch.zeros(xs.shape[0], dtype=torch.bool)
     idx = torch.searchsorted(iv[:, 0].contiguous(), xs, right=True) - 1
-    return (idx >= 0) & (xs <= iv[:, 1][idx.clamp(min=0)])
+    safe = idx.clamp(min=0)
+    inside = (idx >= 0) & (xs <= iv[:, 1][safe])
+    if strict:
+        inside &= (xs > iv[:, 0][safe]) & (xs < iv[:, 1][safe])
+    return inside
+
+
+def band_skeleton(fn: PLFunction, bands: Optional[torch.Tensor]) -> PLFunction:
+    """The plateau-to-plateau skeleton of a certified function: knots
+    strictly inside an analytic hinge band are dropped (they trace the
+    machine's own dip/tail, which an emission recreates with its own
+    hinges — the inherited-ramp clause), the band-edge knots stay, so
+    each band spans exactly one segment carrying the full step delta.
+    The emission-shape models (S1 lanes, S2 steps) run on this
+    skeleton; the chord certificate keeps measuring the full frame."""
+    if bands is None or bands.numel() == 0 or fn.n_knots <= 2:
+        return fn
+    keep = ~_in_intervals(bands, fn.x, strict=True)
+    keep[0] = keep[-1] = True
+    if bool(keep.all()):
+        return fn
+    idx = torch.nonzero(keep).reshape(-1)
+    return PLFunction(fn.x[idx], fn.y[idx], fn.slope_lo, fn.slope_hi)
 
 
 class _OracleCache:
@@ -703,6 +731,7 @@ def certify_subgraph(
                 fillet_deviation=fdev,
                 fillet_deviation_at=fdev_at,
                 n_samples=0,
+                bands=bands[m],
                 kinks_raw=kset if keep_raw else None,
                 fn_raw=plmap[m] if keep_raw else None,
             )
@@ -866,6 +895,7 @@ def certify_subgraph(
             fillet_deviation=fdev,
             fillet_deviation_at=fdev_at,
             n_samples=int(samples.numel()),
+            bands=bands[m],
             kinks_raw=kset if keep_raw else None,
             fn_raw=fn_raw if keep_raw else None,
         )

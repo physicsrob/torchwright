@@ -48,6 +48,7 @@ from torchwright.compiler.pl_function import (
     S1Model,
     S2Model,
     _snap_f32,
+    band_skeleton,
     certify_subgraph,
     model_s1,
     model_s2,
@@ -225,9 +226,10 @@ def _stage1_col_union(members: List[MemberAnalysis], certs, plateau_tol) -> int:
     steps shared across members where their transitions coincide."""
     mids: List[float] = []
     for cert in certs:
-        _, runs = transition_runs(cert.fn, plateau_tol)
+        fn = band_skeleton(cert.fn, cert.bands)
+        _, runs = transition_runs(fn, plateau_tol)
         for i, j in runs:
-            mids.append(float((cert.fn.x[i] + cert.fn.x[j]) / 2.0))
+            mids.append(float((fn.x[i] + fn.x[j]) / 2.0))
     if not mids:
         return 0
     return int(torch.unique(_snap_f32(torch.tensor(mids))).numel())
@@ -336,9 +338,14 @@ def analyze_collapse_v2(
             # Strict-policy models (the sleeve tolerance of the
             # reported function rides the bound); banded rebudgets the
             # same fp/drift terms with the smaller banded deviation.
-            s1 = model_s1(c.fn, c.deviation + SIMPLIFY_TOL)
+            # The shape models see the plateau-to-plateau skeleton —
+            # in-band knots trace the machine's own dip/tail, which
+            # the emission recreates with its own hinges; counting
+            # them as steps/lanes double-charges the band.
+            skel = band_skeleton(c.fn, c.bands)
+            s1 = model_s1(skel, c.deviation + SIMPLIFY_TOL)
             s2 = model_s2(
-                c.fn, c.deviation + SIMPLIFY_TOL, machine=machine, plateau_tol=budget
+                skel, c.deviation + SIMPLIFY_TOL, machine=machine, plateau_tol=budget
             )
             s1_banded = s1.total_bound - c.deviation + c.banded_deviation
             s2_banded = s2.total_bound - c.deviation + c.banded_deviation
