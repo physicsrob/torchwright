@@ -159,6 +159,20 @@ def test_const_exp_overflow_raises():
         _reserve_rms_norm_columns(rmap, 1024, 1e-5, 64)  # 2^128 -> inf
 
 
+def test_overflow_boundary_is_inclusive_doom_q63_at_8192():
+    """The fp32 ceiling admits a pinned energy whose top bit is exactly 2^127
+    (representable; fp32 max is ~2^128).  The DOOM production config —
+    d=8192, rms_norm_const_exp=63, forced energy 2^127 — sits exactly on
+    this boundary and must be accepted; q=64 must overflow.  Regression for
+    the off-by-one guard that rejected the boundary and blocked the
+    production compile."""
+    spec = _reserve_rms_norm_columns(ResidualStreamMap(8192), 8192, 1e-5, 63)
+    assert spec.const_values == (2.0**63, 2.0**63)  # 2·2^126 = 2^127
+    assert spec.gain == 2.0**57
+    with pytest.raises(ValueError, match="overflows fp32"):
+        _reserve_rms_norm_columns(ResidualStreamMap(8192), 8192, 1e-5, 64)
+
+
 def test_eps_above_rms_lsb_raises_but_zero_is_fine():
     """eps large enough to perturb the forced mean-square breaks the identity and
     must raise; eps=0.0 (falsy but valid, below the LSB) must be accepted."""

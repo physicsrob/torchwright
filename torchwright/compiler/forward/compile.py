@@ -173,15 +173,19 @@ def _reserve_rms_norm_columns(
 
     # Guard the exposed q / eps knobs so a bad value fails loudly here rather
     # than silently producing a non-identity norm or fp32 overflow downstream.
-    # Check the energy exponent arithmetically (2^128 is +inf in fp32, so the
-    # total pinned energy E = d·2^(2m) must have log2(E) <= 127).
+    # The pinned energy E = d·2^(2m) has its top set bit at exactly
+    # bitlen(d)-1 + 2m (E's mantissa is d's odd factor), and fp32 holds any
+    # such E up to a top bit of 2^127 — the mantissa-width side is certified
+    # by the representability check below.  The boundary is inclusive: the
+    # DOOM production config (d=8192, q=63) lands exactly on a 2^127 top bit
+    # and must be accepted.
     import numpy as _np
 
-    e_exp_max = d.bit_length() - 1 + 2 * m  # ceil-ish log2 of total energy
-    if e_exp_max + 1 > 127:
+    e_exp_top = d.bit_length() - 1 + 2 * m  # exponent of E's top set bit
+    if e_exp_top > 127:
         raise ValueError(
             f"rms_norm_const_exp={q} overflows fp32: the pinned energy "
-            f"d·2^(2m) ~ 2^{e_exp_max} exceeds the float32 range at d={d}. "
+            f"d·2^(2m) ~ 2^{e_exp_top} exceeds the float32 range at d={d}. "
             f"Pick a smaller q."
         )
 
