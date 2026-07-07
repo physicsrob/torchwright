@@ -50,6 +50,13 @@ class ResidualAssignment:
         if isinstance(node, Placeholder):
             return []
         elif isinstance(node, Concatenate):
+            # A collapse pass can synthesize a whole Concatenate member as
+            # one node; the source re-key then gives the source Concatenate
+            # a direct entry (full row, children in order) while its leaves
+            # are orphaned — so a direct entry wins over flattening.
+            direct = self.mapping[state].get(node)
+            if direct is not None:
+                return direct
             # Concatenate is a logical grouping — gather children's indices in order.
             indices = []
             for child in flatten_concat_nodes([node]):

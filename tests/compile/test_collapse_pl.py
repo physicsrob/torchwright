@@ -7,9 +7,11 @@ strict policy, production budget, S1 shape only (the Phase B descope).
 
 import torch
 
+from torchwright.compiler.export import compile_headless
 from torchwright.compiler.lower import lower
 from torchwright.debug.probe import reference_eval
 from torchwright.graph.asserts import debug_watch
+from torchwright.graph.misc import Concatenate, LiteralValue
 from torchwright.graph.node import suppress_checks
 from torchwright.ops.inout_nodes import create_input
 
@@ -156,3 +158,31 @@ def test_emitted_step_survives_shallow_crossing_bands():
     # budget there.
     outside = (xs - 4.0).abs() > 0.05
     assert float(err[outside].max()) < 2.5e-3, float(err[outside].max())
+
+
+def test_output_concat_with_literal_field_compiles():
+    """The doom emit-row shape (flag-on sweep regression, 2026-07-06):
+    the OUTPUT node is a Concatenate whose whole row is univariate in
+    one source — constant fields are literal leaves — so the pass
+    synthesizes the Concatenate as a unit and the leaves orphan with
+    the interior.  The source-facing output gather must then use the
+    synthesized member's direct residual entry; flattening the source
+    Concatenate into its (now orphaned) leaves was a KeyError."""
+    x = create_input("x", 1, value_range=(0.0, 10.0))
+    ops = _ops("relu")
+    chain = ops.add_const(ops.compare(ops.add_const(x, 1.0), 5.0, sharpness=50.0), 2.0)
+    lit = LiteralValue(torch.tensor([3.0, -1.0]), name="const_field")
+    out = Concatenate([lit, chain])
+
+    # Pin the shape: the pass takes the concat as one synthesized unit
+    # (a future decline here would make the compile check vacuous).
+    lowered = lower(out, collapse_pl=True, collapse_lane_cap=64)
+    assert lowered.collapse_pl_report.n_collapsed == 1
+    assert (lowered.output_node.name or "").startswith("collapse_pl_")
+
+    compiled = compile_headless(out, d=64, d_head=8, device="cpu", collapse_pl=True)
+    inp = torch.tensor([[0.0], [7.0]], dtype=torch.float32)
+    res = compiled(inp)
+    with suppress_checks():
+        want = reference_eval(out, {"x": inp}, 2)[out]
+    assert float((res.cpu() - want).abs().max()) < 1e-3
