@@ -242,6 +242,7 @@ def analyze_collapse_v2(
     budget: float = _SYNTH_CLAIM_ATOL,
     max_kinks: int = 100_000,
     model_floor: bool = True,
+    s1_only: bool = False,
     verbose: bool = False,
 ) -> V2Report:
     """Analyze every univariate subgraph of a lowered copy for v2.
@@ -257,6 +258,9 @@ def analyze_collapse_v2(
         max_kinks: candidate-kink backstop per member.
         model_floor: model the layer floor off/on via stand-in nodes +
             ``critical_path_layers``.
+        s1_only: restrict verdicts to the S1 shape (the descoped
+            Phase B emitter) — what the floor looks like before any
+            S2 emission exists.
         verbose: print one line per subgraph as verdicts land.
     """
     order = topological_order(output_node)
@@ -380,7 +384,10 @@ def analyze_collapse_v2(
         def policy_verdict(banded: bool) -> Tuple[str, Optional[int]]:
             lin = [a.linear_banded if banded else a.linear_ok for a in analyses]
             s1s = [a.s1_banded_ok if banded else a.s1_ok for a in analyses]
-            s2s = [a.s2_banded_ok if banded else a.s2_ok for a in analyses]
+            s2s = [
+                False if s1_only else (a.s2_banded_ok if banded else a.s2_ok)
+                for a in analyses
+            ]
             if not all(lin):
                 worst_i = max(
                     (i for i in range(len(analyses)) if not lin[i]),
