@@ -1,7 +1,10 @@
 # Univariate-subgraph collapse — design
 
-Status: IMPLEMENTED, DEFAULT ON (flipped 2026-07-06; rollout results
-recorded per item under *Verification and rollout* below).
+Status: IMPLEMENTED, DEFAULT ON — v1 (staircase) flipped 2026-07-06
+with rollout results recorded per item under *Verification and
+rollout* below; v2 (general PL synthesis, S1) flipped the same day
+with design and honest results under *v2: general PL synthesis* at
+the end of this file.
 Measurement basis: `scripts/measure_fusion_opportunities.py` at commits
 `4e4b59c`..`f482c2d`, run on all eight examples and the production doom
 graph (2026-07-05).  Revised 2026-07-05 after design review: integer
@@ -489,3 +492,128 @@ pass lands.
    flag removed from `compile_to_onnx` / `compile_headless` /
    `forward_compile`; `lower()` keeps the kwarg as the internal
    off-path seam (see *Placement*).
+
+## v2: general PL synthesis (2026-07-06)
+
+v1 collapses staircase subgraphs: the source carries an integer
+claim, members are sampled at plateau offsets, and the synthesized
+FFN reproduces exact integer-grid values.  v2 generalizes to
+**continuous sources**: any univariate subgraph whose composed
+function can be *certified* piecewise-linear within the production
+error budget (1e-3) collapses to one interpolating `piecewise_linear`
+FFN per externally-consumed member.  Built, flipped default-on, and
+its public kwarg retired 2026-07-06 — same closing day as v1, same
+end state.  The S2 emission shape (two sublayers for bounded-step
+functions too wide for one) is **deferred indefinitely** on the
+measured numbers below.
+
+### Design in brief
+
+- **Composed-PL certificate** (`torchwright/compiler/pl_function.py`):
+  candidate kink locations are harvested from member weights (every
+  gate crossing of the pre-activation, pulled back through the affine
+  chain and unioned downstream), values come from the seeded exact
+  oracle, and each segment is admitted only if a midpoint sample is
+  linear within budget — the certificate measures the function, it
+  never assumes the chord.
+- **Analytic hinge bands**: each swish gate crossing contributes a
+  band `crossing ± z/|dφ/dx|` — the machine's own fillet zone.
+  Band-edge knots anchor chords on clean values; in-band samples are
+  classified as fillet (reported, not charged).  Two soundness rules
+  the emitter's value sweep forced into the certificate: bands must
+  be **local** (a shallow-slope crossing's band can span the whole
+  domain, and excusing it would certify a step function as its flat
+  chord — domain-scale curvature is measured, not excused), and
+  band-edge knots are re-inserted before interior knots are dropped.
+  The result is the **band skeleton** the emission-shape models and
+  the emitter run on.
+- **S1 emitter** (`torchwright/compiler/collapse_pl.py`): one
+  interpolating `piecewise_linear` FFN per certified boundary member
+  at depth ≥ 2, knots from the skeleton, strict policy at 1e-3 (no
+  banded excusals — Rob's descope).  Every emission is verified
+  against the **original member's oracle** (not the skeleton — that
+  would be circular) at every knot and segment midpoint outside the
+  bands, *before* any rewiring touches the graph.  Checks on
+  replaced members are orphaned-and-counted, never silently dropped.
+- **Kink pre-screen** (the flip's cost gate): a member whose
+  candidate-kink population exceeds `4 × lane_cap` declines before
+  its oracle sweep.  Set from measured margins — every realized take
+  peaks at 0.4× its lane cap (scratchpad, 306 candidates @ cap 768)
+  while the expensive declines run 45×–800× over (adder_v2 29,609 @
+  cap 256; calculator_v2 213,918 @ cap 256).  Without it the certify
+  walk doubled suite wall time (torchwright 314s → 653s); with it the
+  flag-on suite runs at baseline (252s / doom 302s).
+- Runs inside `lower()` after the v1 pass, v1's rewiring skeleton
+  verbatim, same lane cap (`d_hidden / 4`).  Deterministic float64
+  walk — safe next to the CP-SAT schedule-cache key.
+
+### Honest results ledger
+
+All numbers post-soundness-fix unless marked RETRACTED.  (The
+emitter's unit sweep caught a Phase A certificate hole — a
+shallow-slope crossing's band spanning the domain could certify
+trivially; see the locality rule above.  Numbers measured through
+the hole are retracted, not adjusted.)
+
+- **Doom floor: +0 at 1e-3 (production) and at 2e-3.**  The pre-fix
+  "−1 (37 → 36)" and the entire 0.1-tier budget/cap sweep passed
+  only through the hole (near-miss takes at 1.2–2e-3 bounds) —
+  RETRACTED as measurements.  The sweep remains recorded in task #21
+  as the decision basis for the cut list below.  Doom's univariate-v2
+  prize at any budget Rob would accept is honestly **zero floor
+  movement**; the remaining holders (col_gate, broadcast_select,
+  pick_by_one_hot_sum, the multiply meets, attention hops) are
+  structurally outside univariate-PL scope.
+- **Examples, modeled**: scratchpad −2 (12 → 10), caesar −1; new
+  takes on adder, adder_v2, fibonacci, sort_digits_v1.  Unaffected
+  by the soundness fix (revalidated identical).
+- **Examples, realized**: scratchpad is the only graph with realized
+  takes — **43/43 synthesized members, zero verification declines**.
+  Greedy (optimize=0): 18 → 17 (**−1**).  Production CP-SAT
+  (optimize=2): 12 → 11 (**−1**, cold solve; see #23 below — the
+  Phase B-era "12 (+0)" was a worse draw of the same time-limited
+  search).  caesar's modeled −1 does not realize: its compare member
+  declines S1-inadmissible under the emitter's honest frame.
+- **#23, the realization gap (12-vs-10), root cause**: the emitted
+  graph's 43 FFNs harden the CP-SAT packing past the production time
+  budgets — the solve ends time-limited (FEASIBLE) with the incumbent
+  at 11–12 depending on the draw and the proven lower bound pinned at
+  the dependency floor 10; optimize=3 (300s) neither finds a 10-layer
+  schedule nor proves 11 optimal, and the horizon-11 floor probe is
+  UNKNOWN at 150s, so width-bind is not proven either.  Longer solver
+  budgets are the re-measurement path; no default budget change.
+- **Flag-on integration bug, fixed**: doom's emit row is a
+  Concatenate wholly univariate in one scalar (constant fields are
+  literal leaves), so the pass synthesizes the *output Concatenate as
+  a unit* and the leaves orphan.  The source-facing output gather
+  flattened the source Concatenate into those orphaned leaves —
+  KeyError.  A synthesized direct entry now wins over flattening in
+  `ResidualAssignment.get_node_indices`; smallest-layer reproducer
+  pinned in the unit set.
+- **Cut list (Rob, 2026-07-06, task #21, on the pre-fix sweep)**:
+  budget stays 1e-3 (moderate budget bought takes, not floor); the
+  texel width/liveness pursuit CUT (its floor tier needed banded +
+  cap 8192 at ~15k stage-1 liveness columns — the reverted-36-layer
+  trap); the exact-integer contract class for split_5 CUT; the
+  budget-policy work CUT.  The modeled curve saturated at 34
+  regardless — the two-source machinery holds that line
+  structurally.
+- **Flip + retirement (2026-07-06)**: default on regardless of #23's
+  outcome (Rob's call — v1-parity close, no dormant knob).  Suite
+  gates: torchwright flag-on 1027 passed with the known
+  noise-drift red (#15) as the only failure, 252s vs the 314s
+  flag-off baseline (the pre-screen erased an initial +108%
+  balloon); doom flag-on all green, 302s (baseline 235–301s),
+  exercising the 124 walkthrough takes end-to-end with checks on.
+  Kwarg removed from `forward_compile` / `compile_headless`
+  (`compile_to_onnx` never had it); `lower()` keeps `collapse_pl`
+  (default False) as the internal off-path seam — the
+  `collapse_univariate` pattern exactly.  Provenance:
+  `"collapse_pl": True` top-level in both meta dicts, pinned by
+  `tests/debug/test_no_bias_onnx.py`; absence identifies pre-v2
+  artifacts.
+- **Where this leaves the doom depth prize**: closed for univariate
+  machinery.  v1 banked the staircase tier; v2's honest continuous
+  tier is +0 at any acceptable budget; below 34 modeled is held by
+  cross-source structure no 1-D synthesis can reach.  Further doom
+  depth work means multi-source machinery — a different project.
