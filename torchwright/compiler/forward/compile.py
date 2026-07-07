@@ -608,7 +608,6 @@ def forward_compile(
     rms_norm: bool = False,
     rms_norm_eps: float = 1e-5,
     rms_norm_const_exp: int = _RMS_NORM_CONST_EXP,
-    collapse_pl: bool = False,
     bias: bool = True,
 ) -> HeadlessTransformer:
     """Compile a computation graph into a HeadlessTransformer.
@@ -712,17 +711,17 @@ def forward_compile(
     # and range claims are node metadata and ride the clones).
     from torchwright.compiler.lower import lower
 
-    # The univariate collapse always runs (docs/univariate_collapse_plan.md
-    # — default flipped and the escape hatch retired 2026-07-06; lower()
-    # keeps the kwarg as the internal seam the off-path tests exercise).
-    # collapse_pl is the v2 S1 pass's Phase B rollout flag (default off);
-    # it changes the lowered graph, so the schedule-cache fingerprint
-    # follows automatically.
+    # Both collapse passes always run (docs/univariate_collapse_plan.md
+    # — v1 flipped and its escape hatch retired 2026-07-06; the v2
+    # general-PL S1 pass likewise, same day; lower() keeps both kwargs
+    # as the internal seams the off-path tests exercise).  They change
+    # the lowered graph, so the schedule-cache fingerprint follows
+    # automatically.
     lowered = lower(
         output_node,
         verbose=verbose,
         collapse_univariate=True,
-        collapse_pl=collapse_pl,
+        collapse_pl=True,
         collapse_lane_cap=(d_hidden if d_hidden else d) // 4,
     )
     output_node = lowered.output_node

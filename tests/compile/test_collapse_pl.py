@@ -201,7 +201,7 @@ def test_output_concat_with_literal_field_compiles():
     assert lowered.collapse_pl_report.n_collapsed == 1
     assert (lowered.output_node.name or "").startswith("collapse_pl_")
 
-    compiled = compile_headless(out, d=64, d_head=8, device="cpu", collapse_pl=True)
+    compiled = compile_headless(out, d=64, d_head=8, device="cpu")
     inp = torch.tensor([[0.0], [7.0]], dtype=torch.float32)
     res = compiled(inp)
     with suppress_checks():

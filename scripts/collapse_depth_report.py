@@ -5,10 +5,11 @@ pass is fewer layers, so measure it directly.  For each example graph
 (the same list :mod:`scripts.measure_fusion_opportunities` measures),
 report the pass's own collapse/decline log (per subgraph: source,
 members, chain depth, emitted lanes — or the decline reason) and the
-compiled layer count.  The pass is always on since the 2026-07-06 flip
-(escape hatch retired from the compile entry points; ``lower()`` keeps
-the kwarg as the off-path seam for tests).  The rollout-era off/on
-realized deltas are recorded in the plan doc.
+compiled layer count.  Both passes (v1 staircase and the v2 general-PL
+S1 emitter) are always on since the 2026-07-06 flips (escape hatches
+retired from the compile entry points; ``lower()`` keeps the kwargs as
+the off-path seams for tests).  The rollout-era off/on realized deltas
+are recorded in the plan doc.
 
 The modeled counterpart (critical-path sublayers under the idealized
 "any univariate subgraph collapses to one FFN" cost model) is
@@ -17,7 +18,7 @@ measures the realized quantity on the actual compile.
 
 Usage::
 
-    # all examples: collapse report + off/on compile each
+    # all examples: collapse report + compile each
     uv run python -m scripts.collapse_depth_report
 
     # a subset, by substring match on the module name
@@ -121,7 +122,6 @@ def _compile_layers(
     d_head: int,
     device: str,
     optimize: int,
-    collapse_pl: bool = False,
 ) -> int:
     t0 = time.perf_counter()
     compiled = compile_headless(
@@ -130,11 +130,9 @@ def _compile_layers(
         d_head=d_head,
         device=device,
         optimize=optimize,
-        collapse_pl=collapse_pl,
     )
     dt = time.perf_counter() - t0
-    tag = " collapse_pl" if collapse_pl else ""
-    print(f"  compile optimize={optimize}{tag}: {compiled.n_layers} layers ({dt:.1f}s)")
+    print(f"  compile optimize={optimize}: {compiled.n_layers} layers ({dt:.1f}s)")
     return compiled.n_layers
 
 
@@ -149,7 +147,6 @@ def report_graph(
     lower_only: bool = False,
     optimize: int = 0,
     v2: bool = False,
-    pl: bool = False,
 ) -> None:
     # forward_compile's own cap formula (d_hidden defaults to d) unless
     # overridden — so the report matches what a compile would do.
@@ -161,18 +158,7 @@ def report_graph(
         _print_v2_report(output, cap)
     if lower_only:
         return
-    off = _compile_layers(output, d=d, d_head=d_head, device=device, optimize=optimize)
-    if pl:
-        # Phase C realization: the same compile with the v2 S1 pass on.
-        on = _compile_layers(
-            output,
-            d=d,
-            d_head=d_head,
-            device=device,
-            optimize=optimize,
-            collapse_pl=True,
-        )
-        print(f"  realized delta (collapse_pl): {on - off:+d} layers")
+    _compile_layers(output, d=d, d_head=d_head, device=device, optimize=optimize)
 
 
 def main() -> None:
@@ -182,7 +168,7 @@ def main() -> None:
     ap.add_argument(
         "--lower-only",
         action="store_true",
-        help="skip the off/on compiles; print only the collapse report",
+        help="skip the compile; print only the collapse report",
     )
     ap.add_argument(
         "--v2",
@@ -211,14 +197,8 @@ def main() -> None:
         "--optimize",
         type=int,
         default=0,
-        help="forward_compile optimize level for the off/on compiles "
+        help="forward_compile optimize level for the compile "
         "(0 greedy; 2 = the production CP-SAT schedule)",
-    )
-    ap.add_argument(
-        "--pl",
-        action="store_true",
-        help="also compile with the v2 S1 pass on (collapse_pl) and "
-        "print the realized layer delta — Phase C realization",
     )
     args = ap.parse_args()
 
@@ -247,7 +227,6 @@ def main() -> None:
             lane_cap=args.lane_cap,
             optimize=args.optimize,
             v2=args.v2,
-            pl=args.pl,
         )
         return
 
@@ -265,7 +244,6 @@ def main() -> None:
             lower_only=args.lower_only,
             optimize=args.optimize,
             v2=args.v2,
-            pl=args.pl,
         )
 
 

@@ -487,6 +487,9 @@ def _write_debug_sidecar(
         # hatch, 2026-07-06); recorded top-level like "bias" (never inside
         # "extra") so pre-flip sidecars (False) stay distinguishable.
         "collapse_univariate": True,
+        # Same for the v2 general-PL S1 pass (retired the same day);
+        # absence identifies pre-v2 sidecars.
+        "collapse_pl": True,
         "d": d,
         "d_head": d_head,
         "n_heads": n_heads,
@@ -1751,6 +1754,9 @@ def compile_to_onnx(
         # docs/univariate_collapse_plan.md); False identifies pre-flip
         # artifacts.
         "collapse_univariate": True,
+        # Same for the v2 general-PL S1 pass (retired the same day);
+        # absence identifies pre-v2 artifacts.
+        "collapse_pl": True,
         # Solver provenance: distinguishes a real CP-SAT schedule (status
         # OPTIMAL/FEASIBLE/CACHED) from the heuristic fallback (UNKNOWN/
         # INFEASIBLE with optimize>0) — a fallback artifact is value-correct
@@ -2249,7 +2255,6 @@ def compile_headless(
     optimize: int = 0,
     assume_zero_init: bool = False,
     bias: bool = True,
-    collapse_pl: bool = False,
 ) -> CompiledHeadless:
     """Compile a graph to an in-process callable.
 
@@ -2266,8 +2271,7 @@ def compile_headless(
     when omitted; pass an explicit value to decouple the MLP intermediate
     width from the residual stream width.
 
-    ``optimize``, ``assume_zero_init``, ``bias``, and ``collapse_pl``
-    thread straight to
+    ``optimize``, ``assume_zero_init``, and ``bias`` thread straight to
     ``forward_compile`` (same meaning as on :func:`compile_to_onnx`) — so
     this in-process debug backend can reproduce a production
     ``optimize=2`` / ``assume_zero_init=True`` / ``bias=False`` schedule
@@ -2300,7 +2304,6 @@ def compile_headless(
         optimize=optimize,
         assume_zero_init=assume_zero_init,
         bias=bias,
-        collapse_pl=collapse_pl,
     )
 
     assert net.residual_assignment is not None

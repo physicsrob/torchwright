@@ -313,8 +313,11 @@ def lower(
         collapse_pl: Run the v2 general-PL S1 pass after the v1 pass
             (:mod:`torchwright.compiler.collapse_pl`) — synthesizes
             one interpolating FFN per certified boundary member of
-            the univariate subgraphs v1 leaves.  Default off (Phase B
-            rollout flag).
+            the univariate subgraphs v1 leaves.  The compile entry
+            points always pass True (default flipped and the public
+            kwarg retired 2026-07-06, same end state as
+            ``collapse_univariate``); the default-False seam here is
+            the off-path the unit tests exercise.
         collapse_lane_cap: Decline threshold on emitted lanes per
             synthesized FFN — ``d_hidden / 4`` of the target compile.
             Required when ``collapse_univariate`` or ``collapse_pl``
