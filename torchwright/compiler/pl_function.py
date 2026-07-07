@@ -491,15 +491,24 @@ def _in_intervals(
 
 
 def band_skeleton(fn: PLFunction, bands: Optional[torch.Tensor]) -> PLFunction:
-    """The plateau-to-plateau skeleton of a certified function: knots
-    strictly inside an analytic hinge band are dropped (they trace the
-    machine's own dip/tail, which an emission recreates with its own
-    hinges — the inherited-ramp clause), the band-edge knots stay, so
-    each band spans exactly one segment carrying the full step delta.
-    The emission-shape models (S1 lanes, S2 steps) run on this
-    skeleton; the chord certificate keeps measuring the full frame."""
+    """The skeleton of a certified function with each analytic hinge
+    band reduced to one segment: the band-edge positions are refined
+    IN first (values interpolated on the certified function — the
+    sleeve simplify legitimately sheds edge knots that sit
+    chord-consistent on plateaus, and without re-inserting them a band
+    can swallow the only knots carrying a step, collapsing the
+    skeleton to a chord), then knots strictly inside a band are
+    dropped (they trace the machine's own dip/tail, which an emission
+    recreates with its own hinges — the inherited-ramp clause).
+    The emission-shape models (S1 lanes, S2 steps) and the S1 emitter
+    consume this skeleton; the chord certificate keeps measuring the
+    full frame."""
     if bands is None or bands.numel() == 0 or fn.n_knots <= 2:
         return fn
+    edges = bands.reshape(-1)
+    edges = edges[(edges > fn.x[0]) & (edges < fn.x[-1])]
+    if edges.numel():
+        fn = fn.refined(edges)
     keep = ~_in_intervals(bands, fn.x, strict=True)
     keep[0] = keep[-1] = True
     if bool(keep.all()):
@@ -678,12 +687,22 @@ def certify_subgraph(
                     dxs = (phi.x[1:] - phi.x[:-1]).unsqueeze(1)
                     m_phi = ((y1 - y0) / dxs).abs().clamp(min=1e-30)
                     pos = phi.x[:-1].unsqueeze(1) + (y0 / (y0 - y1)) * dxs
-                    half = (hinge_exact / m_phi).clamp(max=float(hi - lo))
-                    edge_lo = _snap_f32((pos - half)[strad])
-                    edge_hi = _snap_f32((pos + half)[strad])
-                    edges = torch.cat([edge_lo, edge_hi])
-                    ks.append(edges[(edges > lo) & (edges < hi)])
-                    bnd.append(torch.stack([edge_lo, edge_hi], dim=1))
+                    half = hinge_exact / m_phi
+                    # A band is excusable only when it is LOCAL — a
+                    # shallow-slope crossing's ±hinge_exact region can
+                    # span the whole domain, and excusing it would
+                    # certify anything (a domain-wide fillet zone ate a
+                    # step function whole before this bound existed).
+                    # Domain-scale curvature is exactly what the chord
+                    # certificate must MEASURE; only narrow transition
+                    # machinery inherits the in-band clause.
+                    local = strad & (half <= (hi - lo) / 16.0)
+                    if bool(local.any()):
+                        edge_lo = _snap_f32((pos - half)[local])
+                        edge_hi = _snap_f32((pos + half)[local])
+                        edges = torch.cat([edge_lo, edge_hi])
+                        ks.append(edges[(edges > lo) & (edges < hi)])
+                        bnd.append(torch.stack([edge_lo, edge_hi], dim=1))
             # A bend can coincide with a domain endpoint: a crossing
             # snapped onto it, or a gate argument exactly zero there
             # (zero_crossings records only strict straddles).

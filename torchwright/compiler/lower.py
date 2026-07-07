@@ -126,6 +126,9 @@ class LoweredGraph:
     # Per-subgraph collapse/decline log when the univariate collapse
     # pass ran (None when it didn't) — see torchwright.compiler.collapse.
     collapse_report: Optional["CollapseReport"] = None
+    # Same, for the v2 general-PL S1 pass (collapse_pl) — see
+    # torchwright.compiler.collapse_pl.
+    collapse_pl_report: Optional["CollapseReport"] = None
 
     def copy_of(self, source_node: Node) -> Node:
         """The copy node computing ``source_node``'s value."""
@@ -286,6 +289,7 @@ def lower(
     *,
     verbose: bool = False,
     collapse_univariate: bool = False,
+    collapse_pl: bool = False,
     collapse_lane_cap: Optional[int] = None,
 ) -> LoweredGraph:
     """Certify the graph reachable from ``output_node`` and return its copy.
@@ -306,9 +310,15 @@ def lower(
         verbose: Print the certified node count.
         collapse_univariate: Run the univariate-subgraph collapse pass
             on the copy after fusion (docs/univariate_collapse_plan.md).
+        collapse_pl: Run the v2 general-PL S1 pass after the v1 pass
+            (:mod:`torchwright.compiler.collapse_pl`) — synthesizes
+            one interpolating FFN per certified boundary member of
+            the univariate subgraphs v1 leaves.  Default off (Phase B
+            rollout flag).
         collapse_lane_cap: Decline threshold on emitted lanes per
             synthesized FFN — ``d_hidden / 4`` of the target compile.
-            Required when ``collapse_univariate`` is on.
+            Required when ``collapse_univariate`` or ``collapse_pl``
+            is on.
 
     Returns:
         A :class:`LoweredGraph` holding the copy's output node, the
@@ -323,9 +333,9 @@ def lower(
             f"lower() expects the graph's output Node, got "
             f"{type(output_node).__name__}"
         )
-    if collapse_univariate and collapse_lane_cap is None:
+    if (collapse_univariate or collapse_pl) and collapse_lane_cap is None:
         raise ValueError(
-            "collapse_univariate=True requires collapse_lane_cap "
+            "collapse_univariate/collapse_pl require collapse_lane_cap "
             "(d_hidden // 4 of the target compile)"
         )
     all_nodes = get_ancestor_nodes({output_node})
@@ -344,6 +354,7 @@ def lower(
     copy_output = copy.output_node
 
     collapse_report = None
+    collapse_pl_report = None
     n_collapsed = 0
     if collapse_univariate:
         from torchwright.compiler.collapse import collapse_univariate_subgraphs
@@ -355,6 +366,16 @@ def lower(
             verbose=verbose,
         )
         n_collapsed = collapse_report.n_collapsed
+    if collapse_pl:
+        from torchwright.compiler.collapse_pl import collapse_pl_subgraphs
+
+        copy_output, collapse_pl_report = collapse_pl_subgraphs(
+            copy_output,
+            lane_cap=collapse_lane_cap,
+            fold_log=fold_log,
+            verbose=verbose,
+        )
+        n_collapsed += collapse_pl_report.n_collapsed
 
     copy_nodes = get_ancestor_nodes({copy_output})
 
@@ -387,4 +408,5 @@ def lower(
         source_output_node=output_node,
         node_map=node_map,
         collapse_report=collapse_report,
+        collapse_pl_report=collapse_pl_report,
     )

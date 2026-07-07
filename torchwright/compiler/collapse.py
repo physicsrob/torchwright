@@ -161,14 +161,25 @@ class SubgraphOutcome:
     n_kept: int = 0
     emitted_lanes: int = 0
     freed_lanes: int = 0
+    # Checks on members orphaned by the rewiring (predicates are opaque
+    # closures — they cannot be re-targeted at the synthesized value
+    # with a widened tolerance, so they die with the subgraph and the
+    # count keeps the coverage loss visible).  v1 orphaned silently;
+    # the v2 pass fills this in.
+    n_checks_orphaned: int = 0
 
     def format_line(self) -> str:
         if self.collapsed:
+            orphaned = (
+                f", {self.n_checks_orphaned} checks orphaned"
+                if self.n_checks_orphaned
+                else ""
+            )
             return (
                 f"collapsed [{self.source}]: {self.n_members} members, "
                 f"chain {self.chain_depth} -> 1, "
                 f"{self.n_synthesized} synthesized (+{self.emitted_lanes} lanes), "
-                f"{self.n_kept} kept, {self.freed_lanes} lanes freed"
+                f"{self.n_kept} kept, {self.freed_lanes} lanes freed{orphaned}"
             )
         return (
             f"declined  [{self.source}]: {self.n_members} members, "
