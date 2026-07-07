@@ -1,8 +1,13 @@
 # Plan: RMSNorm as a compiled-transformer identity
 
 **Status: IMPLEMENTED** on branch `worktree-rmsnorm-prototype` (commits
-`ee78b5f` constant_values cleanup, `f0bf50f` the norm). The design below is what
-shipped, with two corrections recorded inline and in *Open questions*:
+`ee78b5f` constant_values cleanup, `f0bf50f` the norm). **Width contract
+generalized 2026-07-06**: the power-of-two-`d` restriction described below was
+lifted to "any multiple of 1024 up to 16384, or any power of two" by pinning
+one or two columns per set bit of `d`'s odd factor — the user-facing contract,
+table, and mechanism live in `rms_norm_dmodel.md`; this file remains the
+original design study. The design below is what shipped, with two corrections
+recorded inline and in *Open questions*:
 
 - **The constant exponent is `q=44` by default, not 30.** The `q=30`
   prototypes were validated only on `calculator_simple` (data energy ~1e8). The

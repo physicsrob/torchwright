@@ -22,6 +22,8 @@ from torchwright.compiler.forward.compile import (
     RmsNormSpec,
     _certify_rms_norm_energy,
     _reserve_rms_norm_columns,
+    _rms_norm_pinned_layout,
+    rms_norm_width_supported,
 )
 from torchwright.compiler.forward.cpsat_scheduler import (
     build_cpsat_model,
@@ -56,40 +58,58 @@ def _spec(q=_RMS_NORM_CONST_EXP, reserved=(1023,)):
     b = 10
     m = (2 * q - b) // 2
     return RmsNormSpec(
-        reserved_cols=reserved, const_value=float(2**q), gain=float(2**m), eps=1e-5
+        reserved_cols=reserved,
+        const_values=tuple(float(2**q) for _ in reserved),
+        gain=float(2**m),
+        eps=1e-5,
     )
 
 
 @pytest.mark.parametrize(
     "d, n_const_expected",
     [
-        (256, 1),  # b=8 even  -> one column
-        (1024, 1),  # b=10 even -> one column (calculator)
-        (2048, 2),  # b=11 odd  -> two columns
-        (8192, 2),  # b=13 odd  -> two columns (DOOM)
+        (256, 1),  # 2^8, even exponent  -> one column
+        (1024, 1),  # 2^10, even          -> one column (calculator)
+        (2048, 2),  # 2^11, odd           -> two columns
+        (8192, 2),  # 2^13, odd           -> two columns (DOOM)
+        (384, 3),  # 3·2^7               -> three columns
+        (3072, 3),  # 3·2^10              -> three columns
+        (5120, 2),  # 5·2^10              -> two columns (2^q and 2^(q+1))
+        (7168, 4),  # 7·2^10              -> four columns
+        (15360, 6),  # 15·2^10             -> six columns (contract worst case)
     ],
 )
 def test_column_count_from_width_parity(d, n_const_expected):
     rmap = ResidualStreamMap(d)
     spec = _reserve_rms_norm_columns(rmap, d, 1e-5, _RMS_NORM_CONST_EXP)
     assert len(spec.reserved_cols) == n_const_expected
+    assert len(spec.const_values) == n_const_expected
 
 
-@pytest.mark.parametrize("d", [256, 1024, 2048, 8192])
+@pytest.mark.parametrize("d", [256, 1024, 2048, 8192, 3072, 5120, 15360])
 def test_gain_exactly_cancels_forced_rms(d):
     """gain == forced rms == 2^m, so x/rms*gain == x — the identity."""
     rmap = ResidualStreamMap(d)
     spec = _reserve_rms_norm_columns(rmap, d, 0.0, _RMS_NORM_CONST_EXP)
     import math
 
-    energy = len(spec.reserved_cols) * spec.const_value**2
+    energy = sum(v * v for v in spec.const_values)
     forced_rms = (energy / d) ** 0.5
     assert forced_rms == spec.gain
     # gain is an exact power of two (what makes ÷rms and ×gain bit-exact shifts)
     assert math.log2(spec.gain) == int(math.log2(spec.gain))
 
 
-@pytest.mark.parametrize("d", [256, 1024, 2048, 8192])
+def test_distinct_column_values_at_5120():
+    """d=5120 = 5·2^10 pins two *different* constants (2^q and 2^(q+1)):
+    5·2^(2q) = 2^(2q) + 2^(2q+2).  Guards the per-column value plumbing that
+    equal-constant widths cannot distinguish from a single shared value."""
+    q = _RMS_NORM_CONST_EXP
+    spec = _reserve_rms_norm_columns(ResidualStreamMap(5120), 5120, 1e-5, q)
+    assert spec.const_values == (2.0**q, 2.0 ** (q + 1))
+
+
+@pytest.mark.parametrize("d", [256, 1024, 2048, 8192, 5120])
 def test_reserved_columns_are_freed_from_pool_and_not_allocated(d):
     rmap = ResidualStreamMap(d)
     spec = _reserve_rms_norm_columns(rmap, d, 1e-5, _RMS_NORM_CONST_EXP)
@@ -100,10 +120,35 @@ def test_reserved_columns_are_freed_from_pool_and_not_allocated(d):
     rmap._check_invariants("post-reserve test")
 
 
-def test_non_power_of_two_width_raises():
-    rmap = ResidualStreamMap(384)  # not a power of two
-    with pytest.raises(ValueError, match="power-of-two"):
-        _reserve_rms_norm_columns(rmap, 384, 1e-5, _RMS_NORM_CONST_EXP)
+def test_unbuildable_width_raises():
+    """Odd factor 41 is the smallest whose fp32 mean arithmetic cannot land
+    exactly on a power of two (the reciprocal-multiply path rounds off it) —
+    the reservation must refuse rather than ship a near-identity norm."""
+    d = 41 * 32
+    rmap = ResidualStreamMap(d)
+    with pytest.raises(ValueError, match="no bit-exact pinned layout"):
+        _reserve_rms_norm_columns(rmap, d, 1e-5, _RMS_NORM_CONST_EXP)
+
+
+def test_width_contract_predicate():
+    """The public promise: any multiple of 1024 up to 16384, or any power of
+    two.  17408 (a multiple of 1024 past the cap) and 1280 (odd·2^8 —
+    buildable by the mechanism, but unpromised) are outside the contract."""
+    assert all(rms_norm_width_supported(n * 1024) for n in range(1, 17))
+    assert all(rms_norm_width_supported(2**k) for k in range(6, 16))
+    for bad in (0, -1024, 1000, 1280, 17408):
+        assert not rms_norm_width_supported(bad)
+
+
+def test_compile_to_onnx_rejects_unsupported_width_before_compiling():
+    """The front door fails fast: with the norm on (the default), an
+    unsupported d raises at entry — before the graph is even touched
+    (graph=None is never dereferenced), so a bad width can't waste a long
+    streaming compile."""
+    from torchwright.compiler.export import compile_to_onnx
+
+    with pytest.raises(ValueError, match="supported width"):
+        compile_to_onnx(None, None, "/nonexistent/never_written.onnx", d=1000)
 
 
 def test_const_exp_overflow_raises():
@@ -125,6 +170,60 @@ def test_eps_above_rms_lsb_raises_but_zero_is_fine():
         ResidualStreamMap(1024), 1024, 0.0, _RMS_NORM_CONST_EXP
     )
     assert spec.eps == 0.0
+
+
+@pytest.mark.parametrize("d", [n * 1024 for n in range(1, 17)] + [64, 128, 256, 512])
+def test_contract_width_fp32_mean_exactness(d):
+    """Every width in the compile_to_onnx contract (multiples of 1024 up to
+    16384, plus small powers of two) has a pinned layout whose forced
+    mean-of-squares lands exactly on 2^(2m) under BOTH mean strategies a
+    runtime may use (sum/d, or sum·(1/d)) — the property the reservation
+    guard enforces, swept explicitly over the whole promised set."""
+    import numpy as np
+
+    assert rms_norm_width_supported(d)
+    col_exps, m = _rms_norm_pinned_layout(d, _RMS_NORM_CONST_EXP)
+    energy = np.float32(0.0)
+    for ce in sorted(col_exps):  # worst order: smallest pinned values first
+        energy = energy + np.float32(2.0**ce) * np.float32(2.0**ce)
+    assert float(energy) == d * 2.0 ** (2 * m), "pinned fp32 sum must be exact"
+    target = np.float32(2.0 ** (2 * m))
+    assert energy / np.float32(d) == target
+    assert energy * (np.float32(1.0) / np.float32(d)) == target
+    assert np.sqrt(target) == np.float32(2.0**m)
+
+
+def _rmsnorm_identity_holds_general(d, const_values, gain, data_energy, eps=1e-5):
+    """Like :func:`_rmsnorm_identity_holds` but takes the per-column pinned
+    values directly, so it covers layouts with unequal constants."""
+    n_const = len(const_values)
+    d_data = d - n_const
+    torch.manual_seed(0)
+    data = torch.randn(8, d_data, dtype=torch.float32)
+    cur = (data * data).sum(-1, keepdim=True).clamp_min(1e-30)
+    data = data * (data_energy / cur).sqrt()
+    const = torch.tensor(const_values, dtype=torch.float32).expand(8, n_const)
+    res = torch.cat([data, const], dim=1)
+    ms = (res * res).mean(-1, keepdim=True)
+    normed = res / torch.sqrt(ms + eps) * gain
+    return bool((normed[:, :d_data] == data).all())
+
+
+@pytest.mark.parametrize("d", [3072, 5120, 15360])
+def test_identity_holds_at_non_power_of_two_widths(d):
+    """Torch-level RMSNorm identity at odd-factor widths: data under the
+    certified budget comes back bit-for-bit; far over it, the mean drifts
+    off the power of two and the identity breaks.  (The certified budget
+    2^(2q-24) is deliberately conservative — sound in every fp32 summation
+    order — so the observable break point sits above it, never below.)"""
+    q = _RMS_NORM_CONST_EXP
+    spec = _reserve_rms_norm_columns(ResidualStreamMap(d), d, 1e-5, q)
+    assert _rmsnorm_identity_holds_general(
+        d, spec.const_values, spec.gain, data_energy=2.6e13
+    )
+    assert not _rmsnorm_identity_holds_general(
+        d, spec.const_values, spec.gain, data_energy=1e21
+    )
 
 
 def _rmsnorm_identity_holds(d, n_const, q, data_energy, eps=1e-5):

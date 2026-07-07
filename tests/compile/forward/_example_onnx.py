@@ -35,9 +35,9 @@ def load_example(
 
     ``rms_norm`` threads to :func:`compile_to_onnx` (default ``None`` = on, the
     production default).  Pass ``rms_norm=False`` for an example whose ``d`` is
-    not a power of two — the pinned-constant identity RMSNorm requires a
-    power-of-two ``d`` and these examples use an odd width for residual reasons,
-    not to exercise the norm.
+    outside the norm's supported-width contract (any multiple of 1024 up to
+    16384, or any power of two — ``docs/rms_norm_dmodel.md``); such examples
+    use an odd width for residual reasons, not to exercise the norm.
     """
     output_node, embedding = build_fn()
     onnx_path = os.path.join(str(out_dir), f"{name}.onnx")

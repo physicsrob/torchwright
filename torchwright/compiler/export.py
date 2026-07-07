@@ -52,7 +52,10 @@ import onnx
 import torch
 from onnx import TensorProto, helper
 
-from torchwright.compiler.forward.compile import forward_compile
+from torchwright.compiler.forward.compile import (
+    forward_compile,
+    rms_norm_width_supported,
+)
 from torchwright.graph import Concatenate, Embedding, LiteralValue, Node
 from torchwright.graph.attn import CAUSAL_MASK_SENTINEL
 from torchwright.graph.rope import ROPE_BASE
@@ -1410,39 +1413,40 @@ def compile_to_onnx(
     ``True`` is always sound for this entry point.
 
     ``rms_norm`` emits a real RMSNorm — pre-norm on each sublayer input plus a
-    final norm — that acts as the bit-exact identity: a reserved column holds a
-    pinned constant so the forced RMS is an exact power of two and the uniform
-    gain cancels it.  This makes the artifact a stock Llama-style decoder (a
-    skeptic can't say "no normalization"); it adds the gain weights as
-    initializers (mapped by ``convert.py``) and folds the constant into
+    final norm — that acts as the bit-exact identity: a few reserved columns
+    hold pinned constants so the forced RMS is an exact power of two and the
+    uniform gain cancels it.  This makes the artifact a stock Llama-style
+    decoder (a skeptic can't say "no normalization"); it adds the gain weights
+    as initializers (mapped by ``convert.py``) and folds the constants into
     ``embed_table`` (no new buffer).  The norm is **on by default**: ``None``
-    enables it.  The pinned-constant RMS is exact only at a power-of-two ``d``,
-    so the default (and an explicit ``True``) **raises** on a non-power-of-two
-    ``d`` rather than silently shipping an un-normalized artifact — pass
-    ``rms_norm=False`` to opt out deliberately.  ``rms_norm_eps`` (Llama
-    default ``1e-5``) is recorded in the meta; it sits below the forced RMS's
-    LSB, so it does not affect bit-exactness.  ``rms_norm_const_exp`` (``q``)
-    overrides the pinned-constant exponent for a graph whose deepest-layer
-    energy needs more margin (see ``forward_compile``).
+    enables it.  With the norm on, ``d`` must be a **supported width: any
+    multiple of 1024 up to 16384, or any power of two** (the full table and
+    the mechanism are in ``docs/rms_norm_dmodel.md``); the default (and an
+    explicit ``True``) **raises** on an unsupported ``d`` rather than
+    silently shipping an un-normalized artifact — pass ``rms_norm=False`` to
+    opt out deliberately.  ``rms_norm_eps`` (Llama default ``1e-5``) is
+    recorded in the meta; it sits below the forced RMS's LSB, so it does not
+    affect bit-exactness.  ``rms_norm_const_exp`` (``q``) overrides the
+    pinned-constant exponent for a graph whose deepest-layer energy needs
+    more margin (see ``forward_compile``).
     """
     # Validate the cache config up front — a ValueError after the
     # (potentially very long) streaming compile would waste the whole run.
     cache_stride_resolved = _resolve_cache_stride(cache_stride, max_seq_len)
 
     # Resolve the norm policy.  RMSNorm is on by default (None -> True): every
-    # shipped artifact should carry the real norm.  The pinned-constant RMS is
-    # exact only at a power-of-two ``d``, so refuse a non-power-of-two ``d``
-    # with the norm on — fail fast and loudly here (before the long streaming
-    # compile) rather than silently dropping it.  ``rms_norm=False`` is the
-    # explicit opt-out.
+    # shipped artifact should carry the real norm.  Refuse an unsupported
+    # width with the norm on — fail fast and loudly here (before the long
+    # streaming compile) rather than silently dropping it.  ``rms_norm=False``
+    # is the explicit opt-out.
     rms_norm_on = True if rms_norm is None else bool(rms_norm)
-    d_is_pow2 = d > 0 and (d & (d - 1)) == 0
-    if rms_norm_on and not d_is_pow2:
+    if rms_norm_on and not rms_norm_width_supported(d):
         raise ValueError(
-            f"rms_norm is on (the default) but d={d} is not a power of two; the "
-            f"pinned-constant RMS is an exact identity only when E/d is a power "
-            f"of two. Use a power-of-two d, or pass rms_norm=False to export "
-            f"without the norm."
+            f"rms_norm is on (the default) but d={d} is not a supported "
+            f"width. Supported: any multiple of 1024 up to 16384, or any "
+            f"power of two (docs/rms_norm_dmodel.md has the full table). "
+            f"Use a supported d, or pass rms_norm=False to export without "
+            f"the norm."
         )
 
     # Attached-check coverage for the debug sidecar.  Collection order
@@ -1576,15 +1580,16 @@ def compile_to_onnx(
     embed_table = np.zeros((vocab_size, d), dtype=np.float32)
     embed_table[:, embedding_indices] = embed_table_compact
 
-    # Pinned-constant RMSNorm seed: write 2^q into the reserved column(s) for
-    # EVERY vocab row, so the per-token gather reproduces the constant at every
-    # position.  The reserved columns are allocated to no node, so every weight
-    # row that reads them is zero — the constant contributes nothing to any
-    # matmul or to lm_head, yet it dominates mean(x^2) so the forced RMS is an
-    # exact power of two.  This is the only genuine new seed constant.
+    # Pinned-constant RMSNorm seeds: write each reserved column's constant for
+    # EVERY vocab row, so the per-token gather reproduces the constants at
+    # every position.  The reserved columns are allocated to no node, so every
+    # weight row that reads them is zero — the constants contribute nothing to
+    # any matmul or to lm_head, yet their energy dominates mean(x^2) so the
+    # forced RMS is an exact power of two.  These are the only genuine new
+    # seed constants.
     if rms_spec is not None:
-        for j in rms_spec.reserved_cols:
-            embed_table[:, j] = rms_spec.const_value
+        for j, v in zip(rms_spec.reserved_cols, rms_spec.const_values):
+            embed_table[:, j] = v
 
     # Input-state literal seeds (the const-1 self-match column): folded into
     # every vocab row exactly like the RMSNorm constant above, so the

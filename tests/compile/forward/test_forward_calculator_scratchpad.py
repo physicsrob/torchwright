@@ -31,8 +31,8 @@ def calc3(tmp_path_factory):
         name="scratch3",
         d=D_MODEL,
         d_head=D_HEAD,
-        # D_MODEL is not a power of two; the identity RMSNorm (on by default)
-        # needs a power-of-two d and isn't what this example exercises.
+        # D_MODEL is outside the norm's supported-width contract
+        # (docs/rms_norm_dmodel.md), and the norm isn't what this exercises.
         rms_norm=False,
     )
 

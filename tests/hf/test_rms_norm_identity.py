@@ -12,6 +12,10 @@ both with the RMSNorm forced on and with it off, and asserts:
   uniform power-of-two gain, while the norm-off model carries none.
 
 CPU-only and deterministic, so the bar is exact-bit (see ``_hf_parity``).
+
+A second section repeats the ONNX bit-exactness bar at d=5120 (= 5·2^10),
+the first supported non-power-of-two width, whose pinned layout carries two
+unequal constants (see ``docs/rms_norm_dmodel.md``).
 """
 
 from __future__ import annotations
@@ -101,3 +105,58 @@ def test_norm_off_model_has_no_norm_params(path_off):
     assert not [
         k for k in sd if "layernorm" in k or k == "model.norm.weight"
     ], "norm-off model unexpectedly carries norm weights"
+
+
+# ===========================================================================
+# Non-power-of-two width: d=5120 = 5·2^10, the first contract width whose
+# pinned layout uses two UNEQUAL constants (2^q and 2^(q+1)).  A tiny token
+# graph keeps the artifact small (d_hidden bounds the fat matrices); the bar
+# is the same as above — norm-on and norm-off artifacts produce bit-identical
+# logits through real onnxruntime execution.
+# ===========================================================================
+
+_TINY_VOCAB = list("0123456789+") + ["\n", _BOS, _EOS, "default"]
+_TINY_TOKENS = [_BOS, "1", "+", "2", "\n"]
+
+
+def _compile_tiny_5120(rms_norm: bool) -> str:
+    import torch
+
+    from torchwright.ops.inout_nodes import create_embedding
+    from torchwright.ops.relu.linear_relu_linear import linear_relu_linear
+
+    emb = create_embedding(vocab=_TINY_VOCAB)
+    d_e = len(emb)
+    g = torch.Generator().manual_seed(3)
+    out = linear_relu_linear(
+        emb,
+        torch.randn(24, d_e, generator=g) * 0.2,
+        torch.randn(24, generator=g) * 0.1,
+        torch.randn(24, d_e, generator=g) * 0.2,
+        torch.randn(d_e, generator=g) * 0.1,
+        name="ffn",
+    )
+    d_dir = tempfile.mkdtemp(prefix=f"tw_rmsnorm5120_{rms_norm}_")
+    art = compile_to_onnx(
+        out,
+        emb,
+        os.path.join(d_dir, "m.onnx"),
+        d=5120,
+        d_hidden=64,
+        max_seq_len=16,
+        rms_norm=rms_norm,
+    )
+    return art.path
+
+
+def test_norm_is_bit_exact_identity_at_5120():
+    path_on = _compile_tiny_5120(rms_norm=True)
+    path_off = _compile_tiny_5120(rms_norm=False)
+    on, off = load_onnx(path_on), load_onnx(path_off)
+    t2i = {t: i for i, t in enumerate(read_vocab(path_on))}
+    import torch
+
+    ids = torch.tensor([t2i[t] for t in _TINY_TOKENS], dtype=torch.int64)
+    lo_on = on(ids)[-1]
+    lo_off = off(ids)[-1]
+    assert (lo_on - lo_off).abs().max().item() == 0.0

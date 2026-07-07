@@ -52,9 +52,10 @@ from torchwright.graph import Node, Linear, Concatenate
 from torchwright.graph.node import reserve_node_id_above
 from torchwright.graph.misc import LiteralValue
 
-# Default constant magnitude exponent q for the pinned-RMS norm: each reserved
-# column holds 2^q.  Bit-exactness of the identity requires the data energy to
-# stay below the constant's reduction half-ULP: roughly Sigma data^2 <
+# Default constant magnitude exponent q for the pinned-RMS norm: the smallest
+# reserved column holds 2^q (at a power-of-two width every reserved column
+# does).  Bit-exactness of the identity requires the data energy to stay below
+# the smallest pinned column's reduction half-ULP: roughly Sigma data^2 <
 # 2^(2q - 24) (the tighter, partial-sum bound; see docs/plan_rmsnorm.md,
 # Constraints).  This bound is GRAPH-DEPENDENT, so q is a tunable knob
 # (rms_norm_const_exp); this is only the default.
@@ -72,28 +73,83 @@ _RMS_NORM_CONST_EXP = 44
 class RmsNormSpec:
     """The pinned-constant RMSNorm layout chosen at compile time.
 
-    The norm is the identity.  A reserved residual column (two at odd
-    power-of-two widths) holds a large constant ``2^q`` whose energy forces
-    ``rms == 2^m`` exactly; the uniform gain ``2^m`` cancels it
-    (``x / rms * gain == x``), so ``÷rms`` and ``×gain`` are pure fp32 exponent
-    shifts and the identity is bit-exact for every float at or above
-    ``~2^(m-126)`` (a channel value below that underflows to a denormal under
-    ``÷2^m`` and is not recovered by the ``×gain`` — the documented near-zero
-    floor, far below any real data).  See ``docs/plan_rmsnorm.md``.
+    The norm is the identity.  A few reserved residual columns hold large
+    power-of-two constants whose combined energy forces ``rms == 2^m``
+    exactly; the uniform gain ``2^m`` cancels it (``x / rms * gain == x``),
+    so ``÷rms`` and ``×gain`` are pure fp32 exponent shifts and the identity
+    is bit-exact for every float at or above ``~2^(m-126)`` (a channel value
+    below that underflows to a denormal under ``÷2^m`` and is not recovered
+    by the ``×gain`` — the documented near-zero floor, far below any real
+    data).  At a power-of-two width this is one column (two at odd
+    ``log2(d)``); the general ``odd·2^k`` layout is derived in
+    :func:`_rms_norm_pinned_layout`.  See ``docs/plan_rmsnorm.md`` and
+    ``docs/rms_norm_dmodel.md``.
 
     Attributes:
         reserved_cols: the never-allocated residual columns holding the
-            constant; seeded into ``embed_table`` at export time.
-        const_value: ``2^q``, the per-column constant.
+            constants; seeded into ``embed_table`` at export time.
+        const_values: the per-column constants, one per reserved column
+            (each a power of two; the smallest is ``2^q``).
         gain: ``2^m``, the uniform RMSNorm weight (every channel, every norm).
         eps: ``rms_norm_eps`` (below the forced RMS's LSB, so bit-exactness is
             eps-independent in the pinned regime).
     """
 
     reserved_cols: Tuple[int, ...]
-    const_value: float
+    const_values: Tuple[float, ...]
     gain: float
     eps: float
+
+
+def rms_norm_width_supported(d: int) -> bool:
+    """The ``compile_to_onnx`` width contract for RMSNorm-on exports.
+
+    Supported: any multiple of 1024 up to 16384, or any power of two.
+    Every width in the contract has a certified bit-exact pinned layout
+    (``docs/rms_norm_dmodel.md`` has the full table); the powers of two
+    outside it exist mainly for small test artifacts.  The mechanism
+    underneath (:func:`_rms_norm_pinned_layout`) is more general — this
+    predicate is the deliberately small public promise.
+    """
+    if d <= 0:
+        return False
+    if d % 1024 == 0 and d <= 16384:
+        return True
+    return (d & (d - 1)) == 0
+
+
+def _rms_norm_pinned_layout(d: int, const_exp: int) -> Tuple[Tuple[int, ...], int]:
+    """Pinned-column value exponents and forced-rms exponent for width ``d``.
+
+    Factor ``d = c·2^k`` with ``c`` odd.  The norm is the bit-exact identity
+    when the reduction's mean-of-squares lands exactly on an even power of
+    two ``2^(2m)``, which needs total pinned energy ``E = d·2^(2m) =
+    c·2^(k+2m)``.  Build ``E`` from the binary expansion of ``c``: bit ``p``
+    contributes ``2^(p+k+2m)`` — one column holding ``2^((p+k)/2+m)`` when
+    ``p+k`` is even, two equal columns holding ``2^((p+k-1)/2+m)`` when odd.
+    ``c`` is odd, so bit 0 is always set and the smallest column is anchored
+    at ``2^q`` (``const_exp``), i.e. ``m = q - k//2``.  For ``d = 2^k`` this
+    reproduces the original layout exactly: one column ``2^q`` for even
+    ``k``, two for odd.
+
+    Returns ``(col_exps, m)`` with ``col_exps`` ascending; the reserved
+    column count is ``len(col_exps)`` (at most ``2·popcount(c)``).
+    """
+    c, k = d, 0
+    while c % 2 == 0:
+        c //= 2
+        k += 1
+    m = const_exp - k // 2
+    col_exps = []
+    for p in range(c.bit_length()):
+        if not (c >> p) & 1:
+            continue
+        e = p + k + 2 * m
+        if e % 2 == 0:
+            col_exps.append(e // 2)
+        else:
+            col_exps.extend([(e - 1) // 2] * 2)
+    return tuple(sorted(col_exps)), m
 
 
 def _reserve_rms_norm_columns(
@@ -103,39 +159,49 @@ def _reserve_rms_norm_columns(
 
     Reserves from the free pool *before* the layer loop, so the columns are
     protected from allocation for the whole compile — never written, hence
-    holding the constant at every layer.  ``d`` must be a power of two (so the
-    forced ``rms = sqrt(E/d)`` is an exact power of two): one column for even
-    ``b = log2(d)``, two equal columns for odd ``b``.  ``const_exp`` is ``q``
-    (each reserved column holds ``2^q``); pick it with margin over the
-    deepest-layer data energy (see :data:`_RMS_NORM_CONST_EXP`).
+    holding their constants at every layer.  The layout (how many columns,
+    holding which powers of two) comes from :func:`_rms_norm_pinned_layout`;
+    ``const_exp`` is ``q`` (the smallest reserved column holds ``2^q``); pick
+    it with margin over the deepest-layer data energy (see
+    :data:`_RMS_NORM_CONST_EXP`).  Raises ``ValueError`` when no bit-exact
+    layout exists for ``d`` under fp32 arithmetic.
     """
-    b = d.bit_length() - 1
-    if (1 << b) != d:
-        raise ValueError(
-            f"rms_norm requires a power-of-two residual width; got d={d}. "
-            f"The pinned-constant RMS is exact only when E/d is a power of two. "
-            f"Use a power-of-two d, or pass rms_norm=False to disable the norm."
-        )
-    # One column's energy 2^(2q) is an even power of two: rms = 2^(q-b/2) is a
-    # power of two only when b is even.  For odd b, two equal columns give
-    # combined energy 2^(2q+1) (odd power), restoring an exact power-of-two rms.
-    n_const = 1 if b % 2 == 0 else 2
+    if d <= 0:
+        raise ValueError(f"rms_norm requires a positive residual width; got d={d}.")
+    col_exps, m = _rms_norm_pinned_layout(d, const_exp)
     q = const_exp
-    e_exp = 2 * q + (0 if n_const == 1 else 1)  # log2 of total pinned energy E
-    assert (e_exp - b) % 2 == 0, "rms exponent not integer — pinned-RMS layout bug"
-    m = (e_exp - b) // 2  # forced rms = 2^m
 
     # Guard the exposed q / eps knobs so a bad value fails loudly here rather
     # than silently producing a non-identity norm or fp32 overflow downstream.
     # Check the energy exponent arithmetically (2^128 is +inf in fp32, so the
-    # total pinned energy 2^e_exp must have e_exp <= 127).
+    # total pinned energy E = d·2^(2m) must have log2(E) <= 127).
     import numpy as _np
 
-    if e_exp > 127:
+    e_exp_max = d.bit_length() - 1 + 2 * m  # ceil-ish log2 of total energy
+    if e_exp_max + 1 > 127:
         raise ValueError(
-            f"rms_norm_const_exp={q} overflows fp32: the pinned energy 2^{e_exp} "
-            f"(2^(2q{'+1' if n_const == 2 else ''})) exceeds the float32 range. "
+            f"rms_norm_const_exp={q} overflows fp32: the pinned energy "
+            f"d·2^(2m) ~ 2^{e_exp_max} exceeds the float32 range at d={d}. "
             f"Pick a smaller q."
+        )
+
+    # Certify the fp32 mean arithmetic for this exact layout: the pinned
+    # energy must be fp32-representable, and BOTH ways a runtime may compute
+    # the mean — true division by d, or multiplication by a rounded
+    # reciprocal 1/d — must land exactly on 2^(2m).  (ReduceMean's internal
+    # strategy is not contractual across ONNX execution providers.)
+    energy_exact = float(d) * 2.0 ** (2 * m)  # exact in float64 for any sane q
+    energy32 = _np.float32(energy_exact)
+    target_ms = _np.float32(2.0 ** (2 * m))
+    ms_div = energy32 / _np.float32(d)
+    ms_recip = energy32 * (_np.float32(1.0) / _np.float32(d))
+    if float(energy32) != energy_exact or ms_div != target_ms or ms_recip != target_ms:
+        raise ValueError(
+            f"rms_norm has no bit-exact pinned layout at d={d}: the forced "
+            f"mean-of-squares does not land exactly on a power of two under "
+            f"fp32 arithmetic (odd factor {d // (d & -d)}). Use a supported "
+            f"width (docs/rms_norm_dmodel.md), or pass rms_norm=False to "
+            f"disable the norm."
         )
     # The forced mean-of-squares is exactly 2^(2m); eps must sit below its fp32
     # LSB or it shifts ms+eps off the power of two and breaks the identity.
@@ -147,6 +213,7 @@ def _reserve_rms_norm_columns(
             f"smaller eps or a larger rms_norm_const_exp."
         )
 
+    n_const = len(col_exps)
     free_sorted = sorted(residual_map._free)
     if len(free_sorted) < n_const:
         raise RuntimeError(
@@ -155,11 +222,14 @@ def _reserve_rms_norm_columns(
         )
     # The top free columns are highest-indexed; pos/input nodes allocate low, so
     # these are reliably unused.  reserve() asserts they are in the free pool.
+    # Values pair with columns in ascending order on both sides — the pairing
+    # must be deterministic so a rebuild (OnnxDebugSession) reproduces the
+    # exported embed-table seeds.
     reserved = tuple(free_sorted[-n_const:])
     residual_map.reserve(reserved)
     return RmsNormSpec(
         reserved_cols=reserved,
-        const_value=float(2**q),
+        const_values=tuple(float(2**ce) for ce in col_exps),
         gain=float(2**m),
         eps=float(eps),
     )
@@ -169,12 +239,16 @@ def _certify_rms_norm_energy(ra, spec: RmsNormSpec) -> None:
     """Prove the pinned-constant RMSNorm is the bit-exact identity for this graph.
 
     The norm is an identity only while the data energy the reduction sees stays
-    under the pinned constant's reduction half-ULP: ``Σ data² < const_value²·2⁻²⁴``
-    (the constant column contributes ``const_value²`` to ``mean(x²)``; once data
-    energy reaches its half-ULP the fp32 sum no longer rounds to the exact power
-    of two, the forced RMS drifts off ``2^m``, and the identity breaks).  This
-    bound is graph-dependent, so certify it here from the compiler's static value
-    ranges rather than trusting the ``q`` default.
+    under the *smallest* pinned column's reduction half-ULP:
+    ``Σ data² < min(const_values)²·2⁻²⁴``.  Once data energy reaches that
+    half-ULP, some summation order (data accumulating before the smallest
+    pinned column joins) no longer rounds the fp32 sum to the exact pinned
+    energy, the forced RMS drifts off ``2^m``, and the identity breaks.  The
+    smallest column is the binding one: any partial sum already containing a
+    pinned column is at least as large, so its absorption threshold is at
+    least as forgiving.  This bound is graph-dependent, so certify it here
+    from the compiler's static value ranges rather than trusting the ``q``
+    default.
 
     Bound (sound, cancel-agnostic): for each residual column, take the largest
     ``max(lo², hi²)`` of any node ever assigned to it across all sublayer
@@ -198,7 +272,8 @@ def _certify_rms_norm_energy(ra, spec: RmsNormSpec) -> None:
     exactly zero — and the per-column max bounds it.
     """
     reserved = set(spec.reserved_cols)
-    budget = spec.const_value * spec.const_value * 2.0**-24  # const²·2⁻²⁴
+    const_min = min(spec.const_values)
+    budget = const_min * const_min * 2.0**-24  # min(const)²·2⁻²⁴
 
     col_max: dict = {}
     for state, mapping in ra.mapping.items():
@@ -674,16 +749,21 @@ def forward_compile(
         rms_norm: When True, reserve the pinned-constant column(s) and record
             an :class:`RmsNormSpec` on the returned net (``net.rms_norm_spec``)
             so the ONNX exporter can emit a real RMSNorm that acts as the
-            identity.  ``d`` must be a power of two.  Default False — the
-            in-process forward never applies the norm (it is a no-op), so this
-            only changes the column reservation and the recorded spec.
+            identity.  ``d`` must factor as ``odd·2^k`` with a bit-exact
+            pinned layout (any power of two, and every multiple of 1024 up
+            to 16384, qualifies — see ``docs/rms_norm_dmodel.md``); the
+            reservation raises ``ValueError`` otherwise.  Default False —
+            the in-process forward never applies the norm (it is a no-op),
+            so this only changes the column reservation and the recorded
+            spec.
         rms_norm_eps: The RMSNorm epsilon recorded on the spec (Llama default
             ``1e-5``).  Below the forced RMS's LSB, so it does not affect
             bit-exactness.  Ignored when ``rms_norm`` is False.
-        rms_norm_const_exp: ``q`` — each reserved column holds ``2^q``.  Must
-            give the deepest-layer data energy margin under ``2^(2q-24)`` or the
-            identity silently breaks (see :data:`_RMS_NORM_CONST_EXP`).  Ignored
-            when ``rms_norm`` is False.
+        rms_norm_const_exp: ``q`` — the smallest reserved column holds
+            ``2^q``.  Must give the deepest-layer data energy margin under
+            ``2^(2q-24)`` or the identity silently breaks (see
+            :data:`_RMS_NORM_CONST_EXP`).  Ignored when ``rms_norm`` is
+            False.
         bias: When True (default), MLP biases are physical bias vectors —
             today's behavior, unchanged.  When False, no bias parameters
             exist anywhere in the compiled transformer: every bias write
