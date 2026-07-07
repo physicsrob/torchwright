@@ -43,6 +43,7 @@ from torchwright.compiler.collapse import (
 from torchwright.compiler.graph_clone import topological_order
 from torchwright.compiler.pl_function import (
     SIMPLIFY_TOL,
+    _HINGE_EXACT_Z,
     MemberCertificate,
     S1Model,
     S2Model,
@@ -317,7 +318,14 @@ def analyze_collapse_v2(
             subgraphs.append(outcome("declined: graph mixes relu and swish FFNs"))
             continue
 
-        cert = certify_subgraph(source, members, max_kinks=max_kinks)
+        # Band-edge knots only exist on the swish machine (relu hinges
+        # are exact — no tail zone to anchor outside of).
+        cert = certify_subgraph(
+            source,
+            members,
+            max_kinks=max_kinks,
+            hinge_exact=_HINGE_EXACT_Z if machine == "swish" else 0.0,
+        )
         if cert.declined is not None:
             subgraphs.append(outcome(f"declined: {cert.declined}", domain=cert.domain))
             continue

@@ -19,6 +19,7 @@ import torch
 from torchwright.compiler.collapse import scalar_sources
 from torchwright.compiler.graph_clone import topological_order
 from torchwright.compiler.pl_function import (
+    _HINGE_EXACT_Z,
     PLFunction,
     certify_subgraph,
     model_s1,
@@ -379,6 +380,49 @@ def test_swish_abs_curvature_lands_in_fillet_split():
     c = cert.members[a]
     assert c.deviation < 1e-3  # mid-segment: the V is linear
     assert c.fillet_deviation > 1e-3  # the near-zero dip is real and visible
+
+
+def test_hinge_band_zones_classify_dip_as_fillet():
+    """A soft compare picking between ±4096-magnitude branches carries
+    the machine's own dip (~swish_dip·|Δ|/scale ≈ 7 here) in its
+    approach zone.  With analytic hinge bands on (the default), the
+    zone samples classify as fillet — reported, never chargeable — the
+    band-edge knots appear in the candidate set, and the composed
+    select member (whose ancestry inherits the compare's band) stays
+    chord-certifiable."""
+    from torchwright.ops.swiglu.map_select import select
+
+    x = create_input("x", 1, value_range=(-8192.0, 8192.0))
+    ops = _ops("swish")
+    c = ops.compare(x, 4095.55, true_level=1.0, false_level=0.0, sharpness=10.0)
+    s = select(c, ops.add_const(x, -8191.0), x)
+    cert_off = _certify(s, x, hinge_exact=0.0)
+    cert_on = _certify(s, x, hinge_exact=_HINGE_EXACT_Z)
+    m = cert_on.members[s]
+    assert m.deviation < 1e-3, (m.deviation, m.deviation_at)
+    assert m.fillet_deviation > 1.0  # the dip, reported in-band
+    # crossings plus their band-edge knots
+    assert m.n_kinks > cert_off.members[s].n_kinks >= 2
+
+
+def test_hinge_bands_expose_saturated_lane_fp_wander():
+    """A piecewise_linear step with |Δm|·span ≈ 3.4e8 wanders ±16 on
+    its own plateau (fp32 lane-sum accumulation — the S1 fp_bound
+    story).  Without band knots the ±1-segment resolution floor
+    accidentally excused it (the steep candidate bracket was the
+    plateau chord's direct neighbor); the band-edge knot buffers the
+    plateau from the bracket, so the wander is now honestly charged
+    while the dip itself stays in the reported fillet bucket."""
+    ops = _ops("swish")
+    x = create_input("x", 1, value_range=(0.0, 8192.0))
+    p = ops.piecewise_linear(
+        x, [4000.0, 4000.1], lambda t: 0.0 if t < 4000.05 else -8000.0
+    )
+    off = _certify(p, x, hinge_exact=0.0).members[p]
+    on = _certify(p, x, hinge_exact=_HINGE_EXACT_Z).members[p]
+    assert off.deviation == 0.0  # the accidental excusal this fix removes
+    assert on.deviation > 1.0, (on.deviation, on.deviation_at)
+    assert on.fillet_deviation > 100.0  # the 0.278·|Δm|/scale dip, reported
 
 
 def test_kink_explosion_declines():

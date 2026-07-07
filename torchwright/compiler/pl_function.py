@@ -379,6 +379,33 @@ _RES_FLOOR_K = 8.0
 # of the measured one.
 SIMPLIFY_TOL = _SYNTH_CLAIM_ATOL / 8.0
 
+# A swish hinge is exactly linear only once its pre-activation clears
+# ±_HINGE_EXACT_Z (|z·σ(−z)| at z=25 is 3.5e-10 — even a 1e6-scale
+# output weight keeps the tail below any claim budget).  Inside that
+# band the composed value rides the machine's own dip and tail — the
+# documented in-band class, up to ``swish_dip·|Δm|/scale`` at the dip
+# (169 measured on an 8e4 slope change), and still ~0.5 twelve z-units
+# out on an 8191-unit swing (the doom sub-chain decline).  Two
+# consequences the walk implements, both keyed on the analytic
+# interval ``crossing ± _HINGE_EXACT_Z/|dφ/dx|``:
+#
+# 1. **Band-edge knots** at the interval ends give neighboring chords
+#    clean anchors — a knot at a crossing's ±1-ulp bracket samples a
+#    value visibly off its plateau and tilts a chord across its whole,
+#    possibly wide, segment.
+# 2. **Analytic band zones**: samples inside any ancestor hinge's
+#    interval classify as fillet (reported, not chargeable).  The
+#    fractional near-knot rule cannot do this job — it scales with
+#    segment width, so it over-excuses next to wide segments and
+#    under-excuses next to narrow ones; the zone is a property of the
+#    hinge, not of the knot spacing.  Zones propagate through the
+#    member walk like candidate kinks (a downstream chord can anchor
+#    inside an upstream hinge's tail).
+#
+# The relu machine's hinges are exact — callers pass hinge_exact=0 to
+# skip both.
+_HINGE_EXACT_Z = 25.0
+
 # Banded policy: a transition run is a *band* when it is narrow
 # relative to the plateaus on both sides.  Samples strictly inside a
 # band measure where the emission re-creates the original's own
@@ -405,6 +432,11 @@ class MemberCertificate:
     fillet_deviation: float  # in-band / quantization-class deviation (reported)
     fillet_deviation_at: float
     n_samples: int
+    # Forensics (populated only under ``certify_subgraph(keep_raw=True)``):
+    # the candidate kink set and the measurement-frame function (every
+    # candidate and ±1-ulp bracket kept, before the sleeve simplify).
+    kinks_raw: Optional[torch.Tensor] = None
+    fn_raw: Optional["PLFunction"] = None
 
     def linear(self, budget: float = _SYNTH_CLAIM_ATOL) -> bool:
         return self.deviation <= budget
@@ -423,6 +455,29 @@ class SubgraphCertificate:
     members: Dict[Node, MemberCertificate]
     declined: Optional[str] = None
     n_oracle_points: int = 0
+
+
+def _merge_intervals(iv: torch.Tensor) -> torch.Tensor:
+    """Merge overlapping ``(k, 2)`` intervals; returns sorted disjoint rows."""
+    if iv.numel() == 0:
+        return iv.reshape(0, 2)
+    iv = iv[torch.argsort(iv[:, 0])]
+    merged = [iv[0].clone()]
+    for row in iv[1:]:
+        if float(row[0]) <= float(merged[-1][1]):
+            if float(row[1]) > float(merged[-1][1]):
+                merged[-1][1] = row[1]
+        else:
+            merged.append(row.clone())
+    return torch.stack(merged)
+
+
+def _in_intervals(iv: torch.Tensor, xs: torch.Tensor) -> torch.Tensor:
+    """Boolean mask: which ``xs`` lie inside the merged intervals."""
+    if iv.numel() == 0:
+        return torch.zeros(xs.shape[0], dtype=torch.bool)
+    idx = torch.searchsorted(iv[:, 0].contiguous(), xs, right=True) - 1
+    return (idx >= 0) & (xs <= iv[:, 1][idx.clamp(min=0)])
 
 
 class _OracleCache:
@@ -463,6 +518,8 @@ def certify_subgraph(
     domain: Optional[Tuple[float, float]] = None,
     max_kinks: int = 100_000,
     oracle: Optional[Callable[[torch.Tensor], Dict[Node, torch.Tensor]]] = None,
+    keep_raw: bool = False,
+    hinge_exact: float = 0.0,
 ) -> SubgraphCertificate:
     """Walk a univariate subgraph and certify each member's composed PL.
 
@@ -476,6 +533,18 @@ def certify_subgraph(
             count (a runaway-pullback backstop).
         oracle: ``f(positions_float64) -> {member: (n, d) values}``;
             defaults to the seeded exact oracle (``_seeded_oracle``).
+        keep_raw: retain each member's candidate kink set and
+            measurement-frame function on its certificate
+            (``kinks_raw`` / ``fn_raw``) — forensic use only, memory
+            scales with kinks × d.
+        hinge_exact: pre-activation level beyond which the machine's
+            gate is exactly linear (see ``_HINGE_EXACT_Z``); each FFN
+            crossing contributes band-edge knots and an analytic
+            fillet zone at ``crossing ± hinge_exact/|dφ/dx|``.  The
+            neutral default (0) keeps the candidate set the pure
+            weight-crossing algebra; the analysis layer passes
+            ``_HINGE_EXACT_Z`` on the swish machine and 0 on relu
+            (exact hinges, no band).
 
     Returns:
         A :class:`SubgraphCertificate`.  ``declined`` is set (and the
@@ -510,6 +579,9 @@ def certify_subgraph(
     cache = _OracleCache(oracle)
     plmap: Dict[Node, PLFunction] = {}
     kinks: Dict[Node, torch.Tensor] = {}
+    # Per-member analytic hinge-band intervals (merged (k, 2) rows),
+    # unioned through inputs like the kink sets — see _HINGE_EXACT_Z.
+    bands: Dict[Node, torch.Tensor] = {}
     certs: Dict[Node, MemberCertificate] = {}
     # Whether a hinge bend coincides with a domain endpoint — the
     # endpoint knot is then band-bearing for the fillet-zone split.
@@ -546,11 +618,17 @@ def certify_subgraph(
             return torch.zeros(0, dtype=_F64)
         return kinks[u]
 
+    def input_bands(u: Node) -> torch.Tensor:
+        if u is source or u not in bands:
+            return torch.zeros(0, 2, dtype=_F64)
+        return bands[u]
+
     ladder = torch.tensor(_LADDER, dtype=_F64)
     declined: Optional[str] = None
 
     for m in members:
         ks = [input_kinks(u) for u in m.inputs]
+        bnd = [input_bands(u) for u in m.inputs]
         bend_lo = any(edge_bends.get(u, (False, False))[0] for u in m.inputs)
         bend_hi = any(edge_bends.get(u, (False, False))[1] for u in m.inputs)
         if isinstance(m, FFN):
@@ -559,6 +637,25 @@ def certify_subgraph(
             )
             cross = _snap_f32(phi.zero_crossings())
             ks.append(cross[(cross > lo) & (cross < hi)])
+            if hinge_exact > 0.0 and phi.n_knots >= 2:
+                # Analytic hinge bands (see _HINGE_EXACT_Z): the
+                # interval where each crossing's pre-activation is
+                # within ±hinge_exact along its local slope.  The
+                # interval ends become knots (clean chord anchors);
+                # the intervals themselves become fillet zones and
+                # propagate downstream with the kink union.
+                y0, y1 = phi.y[:-1], phi.y[1:]
+                strad = (y0 * y1) < 0
+                if bool(strad.any()):
+                    dxs = (phi.x[1:] - phi.x[:-1]).unsqueeze(1)
+                    m_phi = ((y1 - y0) / dxs).abs().clamp(min=1e-30)
+                    pos = phi.x[:-1].unsqueeze(1) + (y0 / (y0 - y1)) * dxs
+                    half = (hinge_exact / m_phi).clamp(max=float(hi - lo))
+                    edge_lo = _snap_f32((pos - half)[strad])
+                    edge_hi = _snap_f32((pos + half)[strad])
+                    edges = torch.cat([edge_lo, edge_hi])
+                    ks.append(edges[(edges > lo) & (edges < hi)])
+                    bnd.append(torch.stack([edge_lo, edge_hi], dim=1))
             # A bend can coincide with a domain endpoint: a crossing
             # snapped onto it, or a gate argument exactly zero there
             # (zero_crossings records only strict straddles).
@@ -568,6 +665,9 @@ def certify_subgraph(
             bend_hi = (
                 bend_hi or bool((cross == hi).any()) or bool((phi.y[-1] == 0).any())
             )
+        bands[m] = (
+            _merge_intervals(torch.cat(bnd)) if bnd else torch.zeros(0, 2, dtype=_F64)
+        )
         edge_bends[m] = (bend_lo, bend_hi)
         kset = torch.unique(torch.cat(ks)) if ks else torch.zeros(0, dtype=_F64)
         m_name = m.name or type(m).__name__
@@ -603,6 +703,8 @@ def certify_subgraph(
                 fillet_deviation=fdev,
                 fillet_deviation_at=fdev_at,
                 n_samples=0,
+                kinks_raw=kset if keep_raw else None,
+                fn_raw=plmap[m] if keep_raw else None,
             )
             continue
 
@@ -685,6 +787,11 @@ def certify_subgraph(
         next_s = seg_slopes[(seg + 1).clamp(0, n_seg - 1)]
         local_slope = torch.maximum(seg_slopes[seg], torch.maximum(prev_s, next_s))
         fillet_zone |= err <= _RES_FLOOR_K * local_slope * eps32
+        # Analytic hinge bands (see _HINGE_EXACT_Z): a sample inside
+        # any ancestor hinge's ±hinge_exact interval rides the
+        # machine's own dip/tail — the documented in-band class,
+        # independent of how wide the surrounding knot spacing is.
+        fillet_zone |= _in_intervals(bands[m], samples)
 
         # Banded policy (see _BAND_PLATEAU_RATIO): samples strictly
         # inside a transition run that is narrow relative to both
@@ -745,6 +852,7 @@ def certify_subgraph(
         # ±1-ulp brackets on straight stretches, oracle-noise wiggles)
         # shed, real bends and mid-step anchors kept.  The sleeve
         # tolerance is charged by the analysis layer (SIMPLIFY_TOL).
+        fn_raw = fn
         fn = fn.simplified(SIMPLIFY_TOL)
         plmap[m] = fn
         certs[m] = MemberCertificate(
@@ -758,6 +866,8 @@ def certify_subgraph(
             fillet_deviation=fdev,
             fillet_deviation_at=fdev_at,
             n_samples=int(samples.numel()),
+            kinks_raw=kset if keep_raw else None,
+            fn_raw=fn_raw if keep_raw else None,
         )
 
     return SubgraphCertificate(
