@@ -347,6 +347,12 @@ class _TrackingResidualStreamMap(ResidualStreamMap):
         self._free = set(base._free)
         self._node_to_indices = dict(base._node_to_indices)
         self._reserved = set(getattr(base, "_reserved", set()))
+        # Carry the base map's dirty-state forward.  Without this copy,
+        # ``super().__init__`` leaves every column marked dirty, so the
+        # warm-start probe pays phantom cancel heads on columns the base
+        # map already cleaned (via ``mark_clean``) and emits a hint
+        # deeper than the eager fallback it is meant to improve on.
+        self._dirty = set(base._dirty)
         self.current_layer: int = 0
         self.cancel_layer: dict[int, int] = {}
 
