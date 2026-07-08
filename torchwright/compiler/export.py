@@ -2258,7 +2258,7 @@ def compile_headless(
     d_hidden: Optional[int] = None,
     trim_heads: bool = True,
     optimize: int = 0,
-    assume_zero_init: bool = False,
+    assume_zero_init: bool = True,
     bias: bool = True,
 ) -> CompiledHeadless:
     """Compile a graph to an in-process callable.
@@ -2280,8 +2280,9 @@ def compile_headless(
     ``forward_compile`` (same meaning as on :func:`compile_to_onnx`) — so
     this in-process debug backend can reproduce a production
     ``optimize=2`` / ``assume_zero_init=True`` / ``bias=False`` schedule
-    exactly.  The defaults reproduce ``forward_compile``'s own defaults
-    (today's behavior).
+    exactly.  ``assume_zero_init`` now defaults ``True`` on every entry
+    point (the runtime always zero-initialises the residual stream); pass
+    ``False`` only to exercise the legacy defensive path.
     """
     from torchwright.graph.asserts import collect_debug_nodes
 

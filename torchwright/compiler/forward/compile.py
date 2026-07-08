@@ -688,7 +688,7 @@ def forward_compile(
     optimize: int = 0,
     cpsat_costs: Costs = Costs(),
     cpsat_flex_routing: bool = True,
-    assume_zero_init: bool = False,
+    assume_zero_init: bool = True,
     require_solver: bool = False,
     rms_norm: bool = False,
     rms_norm_eps: float = 1e-5,
@@ -739,14 +739,16 @@ def forward_compile(
             Ignored when ``optimize=0``.
         assume_zero_init: When True, the compile assumes the runtime
             zero-initialises the residual stream (the contract met by
-            ``HeadlessTransformer.get_input_res_stream``) and skips
-            BIRTH-layer dirty-column cancels for fresh allocations on
-            the initially-free pool.  Compiles produced this way are
-            ~D/d_head fewer attention heads but break under callers
-            that pass a non-zero residual stream to ``forward()``
-            directly.  Defaults to False — the conservative behaviour
-            that runs BIRTH-layer dirty cancels on every fresh
-            allocation regardless of the runtime contract.
+            ``HeadlessTransformer.get_input_res_stream`` and by the ONNX
+            embed-table's zero-scatter into non-allocated columns) and
+            skips BIRTH-layer dirty-column cancels for fresh allocations
+            on the initially-free pool.  Compiles produced this way are
+            ~D/d_head fewer attention heads but break under callers that
+            pass a non-zero residual stream to ``forward()`` directly.
+            Defaults to True — every production runtime surface honours
+            the zero-init contract.  Pass False only to exercise the
+            legacy defensive path that runs BIRTH-layer dirty cancels on
+            every fresh allocation regardless of the runtime contract.
         require_solver: When True and ``optimize>0``, raise
             ``RuntimeError`` if CP-SAT returns no usable assignment
             instead of silently falling back to the heuristic.  Use it

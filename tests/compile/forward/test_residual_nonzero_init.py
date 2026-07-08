@@ -1,9 +1,14 @@
-"""Tests for the compiler's zero-init assumption on the residual stream.
+"""Tests for the compiler's legacy defensive (non-zero-init) path.
 
 These tests corrupt the initial residual stream by injecting noise into
 columns that the compiler expects to be zero on entry (everything except
-input / literal / pos-encoding / embedding assignments).  They should
-fail until the compiler is changed to not rely on that assumption.
+input / literal / pos-encoding / embedding assignments), and assert the
+output is unchanged.  They exercise the ``assume_zero_init=False``
+defensive path, which runs BIRTH-layer dirty cancels on every fresh
+allocation.  ``assume_zero_init`` now defaults to ``True`` (the runtime
+always zero-initialises), so these compiles must opt into ``False``
+explicitly.  This whole path — and this file — is retired when the flag
+is deleted.
 """
 
 import pytest
@@ -73,7 +78,7 @@ def test_nonzero_init_intermediate_col(monkeypatch):
     x = create_input(4)
     y = multiply_const(x, 2.0)
 
-    module = compile_headless(y, d=64, verbose=False)
+    module = compile_headless(y, d=64, verbose=False, assume_zero_init=False)
     inp = torch.tensor([[1.0, 2.0, 3.0, 4.0]])
     expected = torch.tensor([[2.0, 4.0, 6.0, 8.0]])
 
@@ -96,7 +101,7 @@ def test_nonzero_init_mlp_path(monkeypatch):
     x = create_input(4)
     y = relu_add(x, multiply_const(x, -1.0))  # ReLU(x) + ReLU(-x) = |x|
 
-    module = compile_headless(y, d=128, verbose=False)
+    module = compile_headless(y, d=128, verbose=False, assume_zero_init=False)
     inp = torch.tensor([[1.0, -2.0, 3.0, -4.0]])
     expected = torch.tensor([[1.0, 2.0, 3.0, 4.0]])
 
