@@ -134,13 +134,20 @@ def test_plain_costs_keep_scale_one():
 
 
 # ---------------------------------------------------------------------------
-# Floor-probe ladder (optimize >= 2 in forward_compile)
+# Single-phase warm-start descent (optimize >= 2 in forward_compile)
+#
+# The floor-probe phase was removed 2026-07-08; optimize>=2 now runs a single
+# warm-started descent whose time budget absorbs the retired probe's budget
+# (cpsat_time_budget_s + min(150, cpsat_time_budget_s)).  These tests pin the
+# two regimes the probe used to straddle: with width slack the descent reaches
+# the dependency floor with a real solve; when width binds it still produces a
+# valid, deeper compile.
 # ---------------------------------------------------------------------------
 
 
-def test_floor_probe_succeeds_at_slack_width():
-    """With width slack, optimize=2 cold-probes at critical_path+1 and the
-    compile lands at (or below) the heuristic's depth with a real solve."""
+def test_descent_reaches_floor_at_slack_width():
+    """With width slack, optimize=2's single warm-start descent lands at (or
+    below) critical_path+1 with a real solve (no floor probe)."""
     from torchwright.compiler.forward.compile import forward_compile
     from torchwright.compiler.forward.cpsat_scheduler import (
         critical_path_layers,
@@ -395,10 +402,10 @@ def test_strict_hint_validation_raises_on_keep_forever_cancel():
         )
 
 
-def test_floor_probe_infeasible_falls_back_to_descent():
-    """Width-starved graph: the floor horizon cannot fit (parallel wide
-    chains must serialize), so optimize=2 must fall through the probe and
-    still produce a valid compile via the descent/heuristic path."""
+def test_descent_valid_compile_on_width_starved_graph():
+    """Width-starved graph: the dependency floor cannot fit (parallel wide
+    chains must serialize), so optimize=2's warm-start descent produces a
+    valid compile necessarily deeper than critical_path+1."""
     from torchwright.compiler.forward.compile import forward_compile
     from torchwright.compiler.forward.cpsat_scheduler import (
         critical_path_layers,

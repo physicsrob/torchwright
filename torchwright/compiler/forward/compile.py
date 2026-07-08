@@ -20,7 +20,6 @@ from torchwright.compiler.residual_assignment import ResidualAssignment
 from torchwright.compiler.forward.cpsat_scheduler import (
     Costs,
     SolveStats,
-    critical_path_layers,
     solve_schedule,
 )
 from torchwright.compiler.forward.schedule_cache import (
@@ -1069,6 +1068,22 @@ def forward_compile(
                     bias=bias,
                 )
             )
+            # ---- Warm-start descent (the sole CP-SAT solve) ----
+            # 2026-07-08: the floor-probe phase was removed.  It formerly ran
+            # a COLD solve at horizon critical_path+1 (budget
+            # min(150s, cpsat_time_budget_s)) to try to find and prove the
+            # dependency-floor schedule before this descent.  On the DOOM
+            # production graph it never succeeded — it burned its 150s,
+            # returned UNKNOWN, and fell through to the descent anyway — so it
+            # was removed and its budget folded into the descent (the
+            # ``descent_budget_s`` below) so total CP-SAT wall time is
+            # unchanged.  (It also served as a fast
+            # INFEASIBLE classifier for width-bound geometries, measured at
+            # d=4096; that classification is lost.)
+            descent_budget_s = cpsat_time_budget_s
+            if optimize >= 2:
+                descent_budget_s = cpsat_time_budget_s + min(150.0, cpsat_time_budget_s)
+
             if verbose:
                 hint_time = time.perf_counter() - t_hint_start
                 print(
@@ -1078,7 +1093,7 @@ def forward_compile(
                 print(
                     f"  CP-SAT solver: costs={cpsat_costs}, "
                     f"flex_routing={cpsat_flex_routing}, "
-                    f"time_budget_s={cpsat_time_budget_s}"
+                    f"time_budget_s={descent_budget_s}"
                 )
 
             # Use the heuristic's layer count as the search horizon (with
@@ -1089,97 +1104,36 @@ def forward_compile(
             if hint_n_layers > 0:
                 solver_max_layers = min(max_layers, hint_n_layers + 1)
 
-            # ---- Floor probe (optimize >= 2) ----
-            # The schedule optimum equals the dependency critical path
-            # whenever the residual stream has slack (measured: d=8192
-            # optimum 50 = critical path).  A COLD solve at horizon cp+1
-            # with tightened domains finds and proves that optimum in
-            # ~2 minutes, where warm-start descent is a 50-64 lottery (the
-            # hint anchors the search ~20 layers above the floor; exactly
-            # the floor leaves no construction slack — the +1 is
-            # load-bearing).  When width binds instead (measured: d=4096),
-            # the probe is proven INFEASIBLE in seconds, so it doubles as
-            # a free regime classifier; a timeout falls through the same
-            # way at bounded cost.
-            if optimize >= 2:
-                cp_layers = critical_path_layers(
-                    output_node,
-                    pos_encoding,
-                    policy=policy,
-                    flex_routing=cpsat_flex_routing,
-                )
-                if cp_layers + 1 < solver_max_layers:
-                    probe_budget = min(150.0, cpsat_time_budget_s)
-                    if verbose:
-                        print(
-                            f"  CP-SAT floor probe: horizon {cp_layers + 1} "
-                            f"(critical path {cp_layers}), budget "
-                            f"{probe_budget:.0f}s"
-                        )
-                    t_probe = time.perf_counter()
-                    assignment, _stats = solve_schedule(
-                        output_node,
-                        pos_encoding,
-                        d=d,
-                        d_head=d_head,
-                        d_hidden=solver_d_hidden,
-                        costs=cpsat_costs,
-                        flex_routing=cpsat_flex_routing,
-                        time_budget_s=probe_budget,
-                        max_layers=cp_layers + 1,
-                        policy=policy,
-                        reserve_residual=n_reserved_residual,
-                        tighten_domains=True,
-                        log_search_progress=verbose,
-                    )
-                    probe_elapsed = time.perf_counter() - t_probe
-                    if assignment is not None:
-                        net.cpsat_solve_stats = _stats
-                        if verbose:
-                            print(
-                                f"  CP-SAT floor probe SUCCEEDED in "
-                                f"{probe_elapsed:.1f}s: "
-                                f"n_layers={assignment.n_layers} "
-                                f"(status={_stats.status_name})"
-                            )
-                    elif verbose:
-                        print(
-                            f"  CP-SAT floor probe {_stats.status_name} in "
-                            f"{probe_elapsed:.1f}s — falling back to "
-                            f"warm-start descent"
-                        )
-
-            if assignment is None:
-                t_solve_start = time.perf_counter()
-                assignment, _stats = solve_schedule(
-                    output_node,
-                    pos_encoding,
-                    d=d,
-                    d_head=d_head,
-                    d_hidden=solver_d_hidden,
-                    costs=cpsat_costs,
-                    flex_routing=cpsat_flex_routing,
-                    time_budget_s=cpsat_time_budget_s,
-                    max_layers=solver_max_layers,
-                    policy=policy,
-                    reserve_residual=n_reserved_residual,
-                    # Sound by construction: the warm-start hint is
-                    # feasible, so it always satisfies the tightened
-                    # domains (verified: zero violations at both measured
-                    # geometries).  Saves ~7s presolve + ~9s to first
-                    # incumbent on the DOOM graph.
-                    tighten_domains=True,
-                    hint_layers=hint_layers if hint_layers else None,
-                    hint_routing=hint_routing if hint_routing else None,
-                    hint_cancel=hint_cancel if hint_cancel else None,
-                    hint_cancel_mech=hint_cancel_mech if hint_cancel_mech else None,
-                    log_search_progress=verbose,
-                )
-                # Surface the solver provenance on the returned net so
-                # callers can distinguish a real solve from a fallback
-                # without re-deriving it (``stats.status_name``,
-                # ``is_optimal``, the LB/objective gap).
-                net.cpsat_solve_stats = _stats
+            t_solve_start = time.perf_counter()
+            assignment, _stats = solve_schedule(
+                output_node,
+                pos_encoding,
+                d=d,
+                d_head=d_head,
+                d_hidden=solver_d_hidden,
+                costs=cpsat_costs,
+                flex_routing=cpsat_flex_routing,
+                time_budget_s=descent_budget_s,
+                max_layers=solver_max_layers,
+                policy=policy,
+                reserve_residual=n_reserved_residual,
+                # Sound by construction: the warm-start hint is
+                # feasible, so it always satisfies the tightened
+                # domains (verified: zero violations at both measured
+                # geometries).  Saves ~7s presolve + ~9s to first
+                # incumbent on the DOOM graph.
+                tighten_domains=True,
+                hint_layers=hint_layers if hint_layers else None,
+                hint_routing=hint_routing if hint_routing else None,
+                hint_cancel=hint_cancel if hint_cancel else None,
+                hint_cancel_mech=hint_cancel_mech if hint_cancel_mech else None,
+                log_search_progress=verbose,
+            )
+            # Surface the solver provenance on the returned net so
+            # callers can distinguish a real solve from a fallback
+            # without re-deriving it (``stats.status_name``,
+            # ``is_optimal``, the LB/objective gap).
+            net.cpsat_solve_stats = _stats
 
             if assignment is not None:
                 if (
