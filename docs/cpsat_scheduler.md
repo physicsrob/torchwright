@@ -182,6 +182,14 @@ Per schedulable node `n`:
 - `cancel_layer[n]` ∈ [layer_var[n]+1, max_layers] — the layer
   where `n`'s residual columns are reclaimed. The value `max_layers`
   is the sentinel for "never freed."
+- `cancel_in_mlp[n]` — boolean, per non-keep-forever schedulable node
+  (never freeable inputs — they stay attention-cancelled for the
+  snapshot-based value lookup). 1 routes `n`'s death cancel through the
+  MLP sublayer (a `cancel_bypass` op, cost on the MLP-slot budget) with
+  the uniform gap-0 consumer bound; 0 uses a batched attention cancel
+  head with the routing-aware bound. See *Resource cumulatives →
+  Within-layer reuse* for the mechanism and the `[layer, cancel + 1)`
+  occupancy it implies.
 - `is_attn[n]` — boolean. Pinned to 1 for `Attn` and `Add`. Pinned to
   0 for standalone `ReLU`, `LiteralValue`, chain `R`, chain `L2`, and
   exclusive chain `L1`. For standalone `Linear` nodes (Linears outside
@@ -329,7 +337,14 @@ sublayer reads it at nearly every layer); every other input node is
 *freeable*.
 
 - For each residual-using scheduled node `n`: a regular interval
-  `[layer_var[n], cancel_layer[n])`, demand `len(n)`.
+  `[layer_var[n], cancel_layer[n] + cancel_in_mlp[n])`, demand `len(n)`.
+  The `+ cancel_in_mlp[n]` extends the occupancy one layer for an
+  MLP-cancelled node (freed at the end of its cancel layer, so live
+  through it); an attention-cancelled node (`cancel_in_mlp = 0`) ends at
+  `cancel_layer` exactly (freed mid-attention-sublayer).  See the
+  mechanism section above — leaving MLP-cancel at `[layer, cancel)`
+  would let the model free columns during the cancel layer's attention
+  sublayer where the replay still holds them (an unreplayable schedule).
 - For each freeable input node `n` (every input except `pos_encoding`):
   a regular interval `[0, input_cancel_layer[n])`, demand `len(n)`.
   Inputs are pre-allocated at layer 0, so their birth is fixed at 0;
@@ -353,18 +368,62 @@ MLP hidden slots, not residual) and exclusive chain L1 (computed
 inline inside `linear1` from its input's residual columns, never
 written back to the stream). True for everything else.
 
-**Limit — within-layer (eager) freeing is not modelled.** The
-cumulative is layer-granular, so a node read by a consumer at layer
-`K` is held through `K` (`cancel ≥ K+1`).  The heuristic frees such a
-node *within* layer `K` (after the consuming attention op) and reuses
-its columns in the same layer's MLP sublayer — a density the model
-cannot represent without a sublayer-resolution residual axis.  The
-consequence shows only at the residual floor: where the heuristic runs
-at ~100% residual occupancy (e.g. the DOOM forward at `d≈2560`), the
-model needs strictly more layers than the heuristic and CP-SAT cannot
-find an incumbent in budget, so it falls back.  With any residual
-slack (the DOOM forward at `d ≥ 6400`) CP-SAT solves and beats the
-heuristic (e.g. 32 vs 40 layers).
+**Within-layer (intra-layer) reuse IS modelled — the two cancel
+mechanisms (Units 1–2).**  Freeing a dead node's columns and reusing
+them in the *same* layer a consumer read the node (gap-0 reuse) is a
+density the model now represents, via a per-node choice of *which
+sublayer the cancel runs in*:
+
+- **attention-cancel** — a batched attention head (`AttnHeadOp("cancel")`)
+  that reads the column's pre-sublayer value and adds its negation.
+  Every attention head reads the same layer-entry residual, so a reader
+  of X, the cancel of X, and a new writer into X's columns all compose
+  within one attention sublayer (`x − x + new = new`).  The cancel may
+  therefore fire at the consumer's *own* layer when that consumer reads
+  in attention (gap 0); an MLP-routed consumer reads post-attention
+  state, so its cancel keeps the layer-after bound (gap 1).  Encoded by
+  the routing-aware bound `cancel ≥ layer[c] + 1 − is_attn[c]`.
+- **MLP-cancel** — a `cancel_bypass` MLP op (the activation bypass
+  lane-pair with `W = −I`, 2 hidden slots per column).  It fires in the
+  MLP sublayer, *after both sublayers' reads*, so it permits the uniform
+  gap-0 bound `cancel ≥ layer[c]` for **every** consumer (attention or
+  MLP).  Its cost lands on the MLP-slot budget instead of the
+  attention-head budget — head-budget decoupling, which lets a cancel
+  fire on a head-saturated layer instead of deferring.  The per-node
+  boolean `cancel_in_mlp[n]` selects the mechanism (`node_to_cancel_mech`
+  in the assignment).
+
+**The sublayer-resolution axis: half-disproven, half-resurrected.**  The
+older claim that this density "needs a sublayer-resolution residual
+axis" is wrong for cancel-*timing* legality — cancels fire per-layer in
+a batch, and only the *consumer's read-sublayer* matters, which the
+routing-aware / uniform bounds above capture at layer granularity.  But
+it is exactly right for *occupancy*: because the MLP-cancel frees at the
+END of its layer, an MLP-cancelled node stays live through the whole
+cancel layer, so its residual interval is `[layer, cancel + 1)`, not
+`[layer, cancel)` (encoded as `end = cancel_layer + cancel_in_mlp`, in
+both the free-add and normal residual branches).  That is sound but
+conservative: it forbids a physically-realizable *same-layer MLP→MLP
+column handoff* (an MLP-born successor taking the cancelled columns in
+the same MLP sublayer — composition `x + (−x) + new = new`).  Closing
+that would need the sublayer-resolution axis in the model **plus** an
+MLP-phase capture→cancel→free→allocate executor in the directed replay
+— both or neither.  This is recorded as **known optimality gap #1** in
+the derisk doc's 2026-07-08 correction (with a bindingness-measurement
+recipe: re-solve with the diagnostic-only
+`_disabled_families={"mlp_cancel_occupancy"}` relaxation, which reverts
+the end to `[layer, cancel)` for a lower bound, and compare layer
+counts); `scripts/intralayer_example_sweep.py` runs that measurement.
+
+**Self-consumer subtlety (trap #2).**  The `[layer, cancel)` accounting
+for attention-cancel is exact when a *distinct* node takes the dying
+node's columns in that attention sublayer.  It is silent on a
+width-starved graph forcing a node's own last consumer to be the only
+reuser (`Ma0 = Linear(L0)` reusing L0's columns).  The model stays
+exact; the `DirectedLayerScheduler` gains **self-consumer reuse**
+(capture→cancel→free→allocate, preserving I1/I4) to realize it, scoped
+to the directed replay only — the eager heuristic never learns it (that
+would shift every golden layer count with no production need).
 
 ### Objective
 
@@ -547,27 +606,32 @@ node:
   subclass that records the current layer when `free()` is called;
   nodes consumed via `reassign` (the free-add path) don't go
   through `free` and are correctly omitted.
+- `hint_cancel_mech[n]` — `"attn"` or `"mlp"`, which sublayer the
+  heuristic's cancel ran in (the same tracking-map `free(node, mech)`
+  records it).  Hinted to `cancel_in_mlp[n]`.
 
-All three are passed to `solve_schedule` as `AddHint` calls.  The
+All four are passed to `solve_schedule` as `AddHint` calls.  The
 heuristic's layer count also tightens the search horizon
 (`max_layers = min(user_max, hint_n_layers + 1)`), which shrinks
 each `layer_var`'s domain.
 
-**The warm-start runs with eager freeing disabled (`eager_free=False`).**
-The default heuristic frees a node's columns *within* its consumer's
-layer and reuses them the same layer (within-layer reuse).  The
-layer-granular CP-SAT model — where a node occupies the residual
-stream for the half-open layer interval `[birth, cancel)` — cannot
-express that density, so the *eager* schedule is an **infeasible**
-hint: CP-SAT discards it, cold-searches, and times out into the
-silent heuristic fallback (the post-J DOOM symptom at d=4096/d_head=32:
-`optimize=2` returned 85 via fallback).  The no-eager schedule is one
-or two layers deeper (87 vs 85 at d=4096) but model-representable, so
-CP-SAT gets a *real feasible incumbent* to verify and improve — it
-walks 87 → 86 → … → 81–82 within the `optimize=2` budget (the exact
-floor varies run-to-run with CP-SAT's parallel workers).  The heuristic
-**fallback** (used only when CP-SAT finds nothing) keeps the default
-eager behavior, so a timeout never regresses below the eager depth.
+**The warm start emits the eager schedule (the only mode).**  The
+heuristic frees a node's columns *within* its consumer's layer and
+reuses them the same layer (within-layer reuse).  Historically this
+eager density was not model-representable, so the warm start ran with
+freeing disabled (`eager_free=False`) and handed CP-SAT the deeper but
+feasible no-eager schedule.  Units 1–2 taught the model that density —
+the gap-0 attention cancels and the MLP-cancel mechanism (see *Resource
+cumulatives → Within-layer reuse*) — so the eager schedule is now a
+**feasible** hint, and `eager_free` has been removed entirely
+(`LayerScheduler` is always eager).  CP-SAT receives the shallower eager
+incumbent directly and improves from it.  The heuristic **fallback**
+(used only when CP-SAT finds nothing within budget) is the same eager
+schedule, so a timeout never regresses below the eager depth.  Because
+the eager schedule now exercises MLP-cancel, `hint_cancel_mech[n]`
+(`"attn"`/`"mlp"`) is captured alongside `hint_cancel[n]` and hinted to
+`cancel_in_mlp` — without it CP-SAT would cold-choose the mechanism and
+could reject an otherwise-feasible incumbent.
 
 **The deferred-cancel infeasibility (2026-07).**  The eager-free fix
 above was the first time a silently-infeasible hint caused the
@@ -659,7 +723,10 @@ to the pre-widening model.  The widening is a pure relaxation — the
 cancel still pays its attention-head charge at whatever layer it
 lands and the residual interval still spans `[birth, cancel)` — so no
 invalid schedule becomes expressible; the window keeps its moving
-near-last-consumer shape instead of being anchored to a constant.
+near-last-consumer shape instead of being anchored to a constant.  (The
+residual interval it charges is still `[birth, cancel + cancel_in_mlp)`
+— the window relaxes only the cancel-layer upper bound, never the
+mechanism-dependent occupancy.)
 
 ### Determinism
 
@@ -724,14 +791,17 @@ the flat pass roughly doubled depth).  Each row records the
 | d=4096, d_h=4096               | -O 1 (60s)  | 59        | 46     | -22% | ~17s            | ~31s       |
 | post-J d=4096, d_h=4096, dh=32 | -O 2 (180s) | 85        | 81–82  | -4%  | ~70–80s         | never (LB 50) |
 
-At d=2048 the residual cumulative is the binding constraint and
-CP-SAT struggles to close the LB gap within budget.  At d=3072+
-CP-SAT converges optimally inside the budget.  On the much larger
-post-J graph CP-SAT no longer proves optimality (the lower bound
-sticks at 50) but still beats the heuristic — and only once the
-warm-start feeds a *feasible* (no-eager) hint; with the eager hint it
-finds no incumbent and falls back.  The heuristic-
-fallback behavior (when CP-SAT can't find an incumbent) is the
+These rows predate Units 1–2 and the eager warm start; the
+"feasible (no-eager) hint vs eager hint" distinction below is
+historical — the eager schedule is now the feasible hint (see *Warm-start
+hints*), and the current expected DOOM d=4096 figure is re-measured by
+the step-9 acceptance run.  At d=2048 the residual cumulative is the
+binding constraint and CP-SAT struggles to close the LB gap within
+budget.  At d=3072+ CP-SAT converges optimally inside the budget.  On
+the much larger post-J graph CP-SAT no longer proves optimality (the
+lower bound sticks at 50) but still beats the heuristic — historically
+only once the warm-start fed a *feasible* (then no-eager) hint.  The
+heuristic-fallback behavior (when CP-SAT can't find an incumbent) is the
 right answer for d=2048 — users always get a schedule, just not
 the CP-SAT one.
 
@@ -770,5 +840,6 @@ the CP-SAT one.
   the soft `AddHint` silently drops the infeasible values either way —
   so the cancel artifacts were a correctness curiosity, not the
   performance lever.  The lever is feeding a *feasible* hint at all
-  (the no-eager schedule, see *Warm-start hints*) plus an `optimize≥2`
-  budget; CP-SAT then improves 87 → 81.
+  (historically the no-eager schedule; now the eager schedule, which
+  Units 1–2 made feasible — see *Warm-start hints*) plus an `optimize≥2`
+  budget; CP-SAT then improves from it.

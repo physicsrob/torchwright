@@ -194,6 +194,16 @@ CONSTRAINT_FAMILIES = frozenset(
         "attn_cumulative",  # per-layer attention-head + cancel + dirty capacity
         "mlp_cumulative",  # per-layer MLP hidden-slot capacity
         "residual_cumulative",  # residual-stream column capacity
+        # DIAGNOSTIC-ONLY relaxation (never disabled by the production solve, and
+        # a schedule solved with it disabled must NEVER be compiled/replayed):
+        # reverts the MLP-cancel residual occupancy from the sound
+        # `[layer, cancel + 1)` to the unsound `[layer, cancel)`.  The resulting
+        # layer count is a valid LOWER BOUND on the sound optimum, so
+        # sound-minus-relaxed measures how much the `[layer, cancel + 1)`
+        # conservatism (known optimality gap #1 — the forgone same-layer MLP->MLP
+        # column handoff) actually costs on a given graph.  See the derisk doc's
+        # 2026-07-08 second correction.
+        "mlp_cancel_occupancy",
     }
 )
 
@@ -1220,10 +1230,12 @@ def build_cpsat_model(
         # node's columns as free during the cancel layer's attention sublayer,
         # where the replay still holds them — an unreplayable (I4) schedule.
         cim = cancel_in_mlp.get(n.node_id)
-        if cim is not None:
+        if cim is not None and "mlp_cancel_occupancy" not in _disabled_families:
             rend = model.NewIntVar(1, max_layers + 1, f"rend_n{n.node_id}")
             model.Add(rend == cancel_layer[n.node_id] + cim)
         else:
+            # Either a keep-forever node (no cim) or the diagnostic relaxation:
+            # occupy only `[layer, cancel)` (unsound to execute — lower bound).
             rend = cancel_layer[n.node_id]
         if isinstance(n, Add) and n.node_id in is_free:
             # Free-add reuses a dead addend's already-allocated residual
@@ -1634,6 +1646,7 @@ def solve_schedule(
     solver_params: Optional[Dict[str, object]] = None,
     solution_trace: Optional[List[dict]] = None,
     strict_hint: bool = False,
+    _disabled_families: frozenset = frozenset(),
 ) -> Tuple[Optional[ScheduleAssignment], SolveStats]:
     """Build and solve the CP-SAT scheduling model.
 
@@ -1725,6 +1738,7 @@ def solve_schedule(
         tighten_domains=tighten_domains,
         hint_layers=hint_layers,
         hint_cancel=hint_cancel,
+        _disabled_families=_disabled_families,
     )
     if log_search_progress and built.cancel_window_delta:
         print(
