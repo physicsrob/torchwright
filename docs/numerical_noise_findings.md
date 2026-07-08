@@ -13,6 +13,51 @@ observations and removing findings a fix has invalidated. See the
 
 ## Findings
 
+### MLP-side cancel on the swish machine: worst residue 1.5e-8, gate passes (2026-07-07)
+
+An MLP-side cancel (CP-SAT intra-layer reuse, step 3) reuses the activation
+bypass pair with `W = -I`: it feeds `-x` through `Swish(s·z)/s -
+Swish(-s·z)/s` and adds the result to the column already holding `x`, so
+`x + cancel` should be 0. On the ReLU machine the pair is bit-exact (one
+lane is always exactly 0), but on the swish machine the two lanes round
+separately in fp32, so a residue survives. DOOM is swiglu, so this gated
+whether DOOM gets MLP-cancel at all.
+
+Because IEEE-754 round-to-nearest is symmetric about zero, fp32 subtraction
+is exactly anti-symmetric, so the bypass pair is exactly odd
+(`bypass(-x) == -bypass(x)` bit-for-bit) and the cancel residue reduces to
+`x - bypass(x)` — the fp32 error of the identity `bypass(x) == x`.
+
+Measured on A100 fp32 with the production `scale = 128`
+(`scripts/measure_mlp_cancel_residue.py`, run via `make modal-run`), over
+`x ~ Uniform[-mag, mag]` for mag in `[0.01 .. 1e4]`:
+
+- **Worst per-cancel residue: 1.49e-8**, at `|x| <= 0.3` (the swish
+  transition region). It *falls* toward larger `|x|`: once `|s·x|` clears
+  ~88, `σ(-s·x)` underflows to exactly 0, the negative lane is exactly 0,
+  and the pair is bit-exact — so at DOOM's order-1-to-1e4 residual values
+  the p99 residue is already 0 and only the near-zero tail carries any.
+- **ReLU pair: exactly 0** everywhere (confirms the lane-exactness claim).
+- **Attention-cancel baseline: ~0** (max 4.4e-28) — the self-match softmax
+  weight is 1.0 to fp32, so its transport is exact and off-diagonal leakage
+  is ~1e-26. The MLP-cancel is thus *worse* than the attention-cancel it
+  would replace, but both are far under budget.
+
+**Compounding.** A column can be cancelled/reused once per layer, so the
+worst reuse chain is DOOM's ~85 layers. Worst-case (every reuse the
+worst-magnitude residue, same sign — a strict upper bound):
+`85 × 1.49e-8 = 1.27e-6`. Random-walk estimate: `sqrt(85) × 1.49e-8 =
+1.4e-7`.
+
+**Gate: PASS.** Against a 1e-3-class `c_tol`, the ship criterion is
+worst-chain at least one order of magnitude below, i.e. `< 1e-4`. The
+linear upper bound `1.27e-6` clears by ~80×. The per-cancel comparison
+against the attention baseline is *not* the criterion (MLP > attention
+here), but the compounded number is decisive and it passes, so **MLP-side
+cancel ships for the swish machine** — DOOM gets it, and steps 4-6 leave
+`cancel_in_mlp` unconstrained rather than pinning it to 0 on swish
+compiles.
+
 ### Staircase `piecewise_linear` error is ulp(s·R·|Δv|), not a lane count (2026-07-05)
 
 Measured for the univariate collapse pass (rollout item 5 of
