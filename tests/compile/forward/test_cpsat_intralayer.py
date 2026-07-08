@@ -309,6 +309,121 @@ def test_solver_mlp_cancel_replays_correctly():
     )
 
 
+def _eager_warm_start_hint(out, d, d_head, d_hidden, max_layers):
+    """Run the eager heuristic in schedule-only mode (mirroring
+    ``_run_heuristic_warm_start``) and return the layer / routing / cancel /
+    cancel-mechanism hints plus the hint layer count.  Now that the warm start
+    is eager, this is the schedule the production compile hands CP-SAT."""
+    import copy
+
+    from torchwright.compiler.forward.compile import _TrackingResidualStreamMap
+    from torchwright.compiler.forward.graph_analysis import GraphAnalyzer
+    from torchwright.compiler.forward.residual_map import ResidualStreamMap
+    from torchwright.compiler.forward.scheduler import LayerScheduler
+    from torchwright.compiler.residual_assignment import flatten_concat_nodes
+
+    graph = GraphAnalyzer(out)
+    rmap = _TrackingResidualStreamMap(copy.deepcopy(ResidualStreamMap(d)))
+    inputs = [n for n in graph.get_all_nodes() if graph.is_input_node(n)]
+    for n in inputs:
+        rmap.allocate(n)
+    computed = set(inputs)
+    sched = LayerScheduler(graph, d, d_head, None, d_hidden=d_hidden)
+    hint_layers, hint_routing = {}, {}
+    for hi in range(max_layers):
+        if out in computed:
+            break
+        rmap.current_layer = hi
+        prev = set(computed)
+        attn_ops, mlp_ops, _ = sched.schedule_layer(rmap, computed)
+        for op in attn_ops:
+            if op.op_type == "compute_linear" and op.node is not None:
+                hint_routing[op.node.node_id] = ATTN
+        for op in mlp_ops:
+            if op.op_type == "compute_linear_bypass":
+                hint_routing[op.node.node_id] = MLP
+        for n in graph.get_all_nodes():
+            if isinstance(n, Concatenate) and n not in computed:
+                if all(leaf in computed for leaf in flatten_concat_nodes([n])):
+                    computed.add(n)
+        for n in computed - prev:
+            hint_layers[n.node_id] = hi
+        if not attn_ops and not mlp_ops:
+            break
+    hint_n = max(hint_layers.values()) + 1 if hint_layers else 0
+    return (
+        hint_layers,
+        hint_routing,
+        dict(rmap.cancel_layer),
+        dict(rmap.cancel_mech),
+        hint_n,
+    )
+
+
+def test_eager_warm_start_hint_is_accepted_not_dropped():
+    """Incident-class regression (the June 2026 eager-free and July 2026
+    deferred-cancel silently-dropped-hint incidents named in the
+    ``_validate_hint`` docstring).  On a width-pressure graph the eager
+    warm-start schedule must be a schedule CP-SAT can USE: (a) ``_validate_hint``
+    finds zero violations, and (b) the solver's returned ``n_layers`` is no
+    worse than the hint's — i.e. the incumbent was accepted, not silently
+    dropped into a cold search.  Uses a one-head-per-layer geometry so the
+    eager schedule leans on the MLP-cancel mechanism (15 MLP-cancels), the exact
+    density that was previously an infeasible hint."""
+    from torchwright.compiler.forward.cpsat_scheduler import _validate_hint
+
+    torch.manual_seed(0)
+    x = create_input("x", 4)
+    mids = []
+    for i in range(6):
+        li = Linear(x, torch.randn(4, 12), torch.zeros(12), name=f"L{i}")
+        mids.append(Linear(li, torch.randn(12, 2), torch.zeros(2), name=f"Ma{i}"))
+        mids.append(Linear(li, torch.randn(12, 2), torch.zeros(2), name=f"Mb{i}"))
+    out = Linear(Concatenate(mids), torch.randn(24, 4), torch.zeros(4), name="out")
+
+    d = d_head = d_hidden = 80
+    max_layers = 40
+    hint_layers, hint_routing, hint_cancel, hint_mech, hint_n = _eager_warm_start_hint(
+        out, d, d_head, d_hidden, max_layers
+    )
+    assert hint_n > 0, "eager warm start deadlocked"
+    assert any(v == MLP for v in hint_mech.values()), "expected MLP-cancels in the hint"
+
+    built = build_cpsat_model(
+        out,
+        d=d,
+        d_head=d_head,
+        d_hidden=d_hidden,
+        max_layers=max_layers,
+        hint_layers=hint_layers,
+        hint_cancel=hint_cancel,
+    )
+    violations = _validate_hint(
+        built, hint_layers, hint_routing, hint_cancel, hint_mech, max_layers=max_layers
+    )
+    assert violations == [], f"eager warm-start hint has violations: {violations}"
+
+    # strict_hint=True raises if the model would drop the hint; the solve must
+    # accept the incumbent and return a schedule no deeper than the hint.
+    asg, stats = solve_schedule(
+        out,
+        d=d,
+        d_head=d_head,
+        d_hidden=d_hidden,
+        max_layers=max_layers,
+        hint_layers=hint_layers,
+        hint_routing=hint_routing,
+        hint_cancel=hint_cancel,
+        hint_cancel_mech=hint_mech,
+        strict_hint=True,
+    )
+    assert asg is not None, f"solver found no schedule ({stats.status_name})"
+    assert asg.n_layers <= hint_n, (
+        f"solver returned {asg.n_layers} layers, worse than the accepted "
+        f"hint's {hint_n} — the incumbent was silently dropped"
+    )
+
+
 def test_parked_escape_leaves_node_unfreed_and_charges_no_head():
     """A schedule that never frees a dead node (cancel == max_layers) is
     feasible via the parked escape, even though its last consumer ran much

@@ -48,7 +48,6 @@ class LayerScheduler:
         clusters: Optional[SiblingClusters] = None,
         admission_budget_fraction: float = 0.4,
         policy: Optional[SchedulingPolicy] = None,
-        eager_free: bool = True,
         realization_table: Optional[RealizationTable] = None,
         bias: bool = True,
     ):
@@ -76,16 +75,13 @@ class LayerScheduler:
                 graph.get_all_nodes()
             ).resolve_static(self.policy)
         self.realization_table = realization_table
-        # Eager (within-layer) freeing: when a node is placed, free any of its
-        # inputs that just became dead so their columns can be reused *in the
-        # same layer*.  This is what lets the heuristic exploit within-layer
-        # column reuse — a density the layer-granular CP-SAT model cannot
-        # represent, which makes the eager schedule an infeasible CP-SAT hint.
-        # Set ``eager_free=False`` to produce a model-representable (deeper but
-        # feasible) schedule; the CP-SAT warm-start uses this so the solver gets
-        # a real incumbent to improve, while the heuristic *fallback* keeps the
-        # default eager behavior (shallower).  See ``_freshly_dead_inputs``.
-        self._eager_free = eager_free
+        # Eager (within-layer) freeing is always on: when a node is placed, free
+        # any of its inputs that just became dead so their columns can be reused
+        # *in the same layer*.  This is the within-layer column-reuse density
+        # that Units 1 and 2 taught the CP-SAT model to represent (gap-0
+        # attention cancels + MLP cancels), so the eager schedule is both the
+        # production heuristic and the CP-SAT warm-start incumbent.  See
+        # ``_freshly_dead_inputs``.
         # Within-layer retry of deferred attention compute candidates.  False
         # for the heuristic (single order-preserving pass, historical
         # behavior); DirectedLayerScheduler sets it True so a same-layer
@@ -1036,15 +1032,10 @@ class LayerScheduler:
 
         Walks through ``Concatenate`` inputs since Concatenate nodes aren't
         residual-stream-allocated.  Returns only leaves currently allocated
-        whose effective consumers are all in ``computed_nodes``.
-
-        Returns an empty list when ``eager_free`` is disabled (the CP-SAT
-        warm-start path), so the resulting schedule never frees and reuses a
-        column within a consumer's layer — keeping it representable by the
-        layer-granular CP-SAT model.
+        whose effective consumers are all in ``computed_nodes``.  Within-layer
+        eager freeing is always on (the warm start and the production heuristic
+        share it); the density it produces is now CP-SAT-representable.
         """
-        if not self._eager_free:
-            return []
         result: List[Node] = []
         seen: Set[Node] = set()
         stack: List[Node] = list(node.inputs)

@@ -412,15 +412,14 @@ def _run_heuristic_warm_start(
         clusters=clusters,
         admission_budget_fraction=admission_budget_fraction,
         policy=policy,
-        # The warm-start must hand CP-SAT a *model-representable* schedule.
-        # Eager (within-layer) freeing produces a shallower schedule that frees
-        # and reuses a column inside a consumer's layer — a density the
-        # layer-granular CP-SAT model cannot express, so the eager schedule is
-        # an infeasible hint and CP-SAT cold-searches and times out.  The
-        # no-eager schedule is deeper but feasible, giving the solver a real
-        # incumbent to improve from (d=4096/d_head=32: 87 -> ~81 vs the eager
-        # heuristic's 85).  The heuristic *fallback* below stays eager.
-        eager_free=False,
+        # The warm start emits the eager (within-layer freeing) schedule — the
+        # shallower one that frees and reuses a column inside a consumer's
+        # layer.  Units 1 and 2 taught the CP-SAT model to represent exactly
+        # that density (gap-0 attention cancels + MLP cancels), so the eager
+        # schedule is now a FEASIBLE hint the solver accepts as an incumbent
+        # and improves from, rather than the deeper no-eager schedule the
+        # solver used to need.  (The no-eager mode has been removed;
+        # ``LayerScheduler`` is always eager.)
         bias=bias,
     )
     hint_layers: dict = {}
@@ -1243,9 +1242,9 @@ def forward_compile(
                 for line in _stats.solver_log.splitlines()[-40:]:
                     print(f"  {line}")
                 print("--- end CP-SAT solver log ---")
-            # Eager heuristic fallback (default eager_free=True): a timeout
-            # never regresses below the eager heuristic's depth, even though
-            # the CP-SAT hint was the deeper no-eager schedule.
+            # Eager heuristic fallback: on a CP-SAT timeout the compile runs the
+            # same eager schedule the warm start emitted, so a fallback never
+            # regresses below the heuristic's depth.
             scheduler = LayerScheduler(
                 graph,
                 d,

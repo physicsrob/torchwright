@@ -825,13 +825,12 @@ def test_output_already_computed():
     attn_ops, mlp_ops, _biased = scheduler.schedule_layer(rmap, computed)
 
 
-def test_eager_free_flag_gates_within_layer_freeing():
-    """``eager_free=False`` makes ``_freshly_dead_inputs`` a no-op, so the
-    CP-SAT warm-start schedule never frees+reuses a column within a consumer's
-    layer — keeping it representable by the layer-granular CP-SAT model.  The
-    default ``eager_free=True`` (used by the heuristic fallback) surfaces the
-    freshly-dead intermediate so its column can be reclaimed in the same layer.
-    """
+def test_within_layer_freeing_surfaces_freshly_dead_intermediate():
+    """Within-layer (eager) freeing is always on: placing ``b`` makes its input
+    ``a`` freshly dead, and ``_freshly_dead_inputs`` surfaces it so ``a``'s
+    column can be reclaimed in the same layer.  Units 1 and 2 made this density
+    CP-SAT-representable, so the warm start and the production heuristic share
+    it (the ``eager_free=False`` mode that used to gate this off is gone)."""
     pos = _make_reserved_block()
     x = InputNode("x", D, value_range=(-100.0, 100.0))
     a = _make_linear(x, D, "a")  # intermediate: a's only consumer is b
@@ -842,8 +841,6 @@ def test_eager_free_flag_gates_within_layer_freeing():
     rmap.allocate(a)  # a is live; b has just been placed -> a is now dead
 
     computed = {x, a, b}
-    eager = LayerScheduler(graph, D, D_HEAD, pos, eager_free=True)
-    noeager = LayerScheduler(graph, D, D_HEAD, pos, eager_free=False)
+    scheduler = LayerScheduler(graph, D, D_HEAD, pos)
 
-    assert a in eager._freshly_dead_inputs(b, computed, rmap)
-    assert noeager._freshly_dead_inputs(b, computed, rmap) == []
+    assert a in scheduler._freshly_dead_inputs(b, computed, rmap)
