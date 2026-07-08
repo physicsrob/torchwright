@@ -758,6 +758,7 @@ def forward_compile(
     _disabled_families: frozenset = frozenset(),
     _solver_seed: Optional[int] = None,
     _force_resolve: bool = False,
+    _solve_only: bool = False,
 ) -> HeadlessTransformer:
     """Compile a computation graph into a HeadlessTransformer.
 
@@ -860,6 +861,13 @@ def forward_compile(
         _force_resolve: MEASUREMENT-ONLY.  Skip the schedule-cache lookup so
             a measured solve always re-solves instead of replaying a cached
             draw (a cached hit would silently replace the measurement).
+        _solve_only: MEASUREMENT-ONLY.  Return after the solve (before the
+            replay), same as a non-empty ``_disabled_families``, but for the
+            SOUND model — the G0 attribution reads the sound n_layers / bound
+            through the same real solve path as the relaxed cells, without
+            paying the full replay + weight-writing (which at production width
+            is the ~30-minute, ~28 GB compile).  The sound schedule IS
+            replayable; this only skips the replay for the measurement.
 
     Returns:
         A HeadlessTransformer whose compute() method reproduces
@@ -1098,6 +1106,12 @@ def forward_compile(
             reserve_residual=n_reserved_residual,
             bias=bias,
         )
+        if verbose:
+            # Print the schedule fingerprint unconditionally (not only on a
+            # cache hit/store) so a solve-only measurement emits the graph's
+            # identity for the §0 graph-identity gate (compare to `make
+            # compile`'s fingerprint).
+            print(f"  CP-SAT schedule fingerprint: {schedule_fp}")
         # Measurement modes bypass the cache: _force_resolve forces a fresh
         # solve, and a relaxed (_disabled_families) solve must never read a
         # cached SOUND schedule (same fingerprint) as if it were the relaxed
@@ -1255,20 +1269,28 @@ def forward_compile(
                         f"n_layers={assignment.n_layers}"
                     )
 
-        # Solve-only diagnostic (§0 gap attribution).  A relaxed schedule is a
-        # valid lower bound on the sound optimum but is unsound to replay, so
-        # return the solve outputs now — before building the directed replay —
-        # and never compile it.  ``cpsat_solve_stats`` (set above) carries the
-        # proven bound / optimality; ``cpsat_assignment`` carries n_layers.
-        if _disabled_families:
+        # Solve-only measurement (§0 gap attribution).  Return the solve
+        # outputs now — before building the directed replay — for either a
+        # relaxed model (``_disabled_families``: a valid lower bound on the
+        # sound optimum, unsound to replay) or the sound model
+        # (``_solve_only``: replayable, but the replay is skipped so the
+        # attribution reads the sound n_layers without the full compile).
+        # ``cpsat_solve_stats`` (set above) carries the proven bound /
+        # optimality; ``cpsat_assignment`` carries n_layers.
+        if _disabled_families or _solve_only:
             net.cpsat_assignment = assignment
             if verbose:
                 claim = "no feasible incumbent" if assignment is None else (
                     f"n_layers={assignment.n_layers}"
                 )
+                mode = (
+                    f"disabled={sorted(_disabled_families)}"
+                    if _disabled_families
+                    else "sound"
+                )
                 print(
-                    f"  solve-only diagnostic (disabled={sorted(_disabled_families)}): "
-                    f"{claim}, bound={net.cpsat_solve_stats.best_objective_bound}"
+                    f"  solve-only measurement ({mode}): {claim}, "
+                    f"bound={net.cpsat_solve_stats.best_objective_bound}"
                 )
             return net
 

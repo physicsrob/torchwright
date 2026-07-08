@@ -89,6 +89,17 @@ def test_force_resolve_bypasses_a_cached_schedule(tmp_path, monkeypatch):
     assert len(fresh.layers) == len(cached.layers)
 
 
+def test_solve_only_returns_sound_depth_without_replaying():
+    """``_solve_only`` returns the SOUND solve's assignment/stats before the
+    replay — the G0 attribution reads the sound n_layers through the same
+    real path as the relaxed cells, and it matches the full compile's depth."""
+    full = _compile(_width_graph())
+    solve_only = _compile(_width_graph(), _solve_only=True, _force_resolve=True)
+    assert len(solve_only.layers) == 0  # replay skipped
+    assert solve_only.cpsat_assignment is not None
+    assert solve_only.cpsat_assignment.n_layers == len(full.layers)
+
+
 def test_solver_seed_is_accepted_and_replays():
     """A seeded solve still produces a sound, replayable schedule (the seed
     only perturbs the search, never soundness)."""
