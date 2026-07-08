@@ -688,7 +688,6 @@ def forward_compile(
     optimize: int = 0,
     cpsat_costs: Costs = Costs(),
     cpsat_flex_routing: bool = True,
-    assume_zero_init: bool = True,
     require_solver: bool = False,
     rms_norm: bool = False,
     rms_norm_eps: float = 1e-5,
@@ -737,18 +736,6 @@ def forward_compile(
             attention vs MLP-bypass for each standalone ``Linear``.
             When False, ``policy.local_in_attention`` pins routing.
             Ignored when ``optimize=0``.
-        assume_zero_init: When True, the compile assumes the runtime
-            zero-initialises the residual stream (the contract met by
-            ``HeadlessTransformer.get_input_res_stream`` and by the ONNX
-            embed-table's zero-scatter into non-allocated columns) and
-            skips BIRTH-layer dirty-column cancels for fresh allocations
-            on the initially-free pool.  Compiles produced this way are
-            ~D/d_head fewer attention heads but break under callers that
-            pass a non-zero residual stream to ``forward()`` directly.
-            Defaults to True — every production runtime surface honours
-            the zero-init contract.  Pass False only to exercise the
-            legacy defensive path that runs BIRTH-layer dirty cancels on
-            every fresh allocation regardless of the runtime contract.
         require_solver: When True and ``optimize>0``, raise
             ``RuntimeError`` if CP-SAT returns no usable assignment
             instead of silently falling back to the heuristic.  Use it
@@ -927,18 +914,14 @@ def forward_compile(
     for node in input_nodes:
         residual_map.allocate(node)
         residual_map.mark_clean(residual_map.get_indices(node))
-    # When the caller asserts the runtime zero-initialises the residual
-    # stream (the contract `HeadlessTransformer.get_input_res_stream`
-    # already provides), the initially-free pool holds zero on entry —
-    # not garbage — so mark it clean and the heuristic skips the
-    # BIRTH-layer dirty cancel that would otherwise zero each column
-    # before its first additive write.  Subsequent recycled columns
-    # return to the clean pool via the cancel ops the heuristic already
-    # emits at node death.  Default-off because the compiler is
-    # defensive against non-zero callers and we don't reverse that
-    # without an explicit opt-in.
-    if assume_zero_init:
-        residual_map.mark_clean(set(residual_map._free))
+    # The runtime always zero-initialises the residual stream (the contract
+    # `HeadlessTransformer.get_input_res_stream` provides, and the ONNX
+    # embed-table's zero-scatter into non-allocated columns), so the
+    # initially-free pool holds zero on entry — not garbage — and its columns
+    # are clean: a fresh allocation's first additive write needs no BIRTH-layer
+    # dirty cancel.  Recycled columns return to the clean pool via the cancel
+    # ops the heuristic emits at node death.
+    residual_map.mark_clean(set(residual_map._free))
     computed = set(input_nodes)
 
     # Pinned-constant RMSNorm: reserve the constant column(s) NOW, before the
@@ -1028,7 +1011,6 @@ def forward_compile(
             d_head=d_head,
             d_hidden=d_hidden if d_hidden else d,
             flex_routing=cpsat_flex_routing,
-            assume_zero_init=assume_zero_init,
             cancel_slack=2,
             policy=policy,
             reserve_residual=n_reserved_residual,
@@ -1141,7 +1123,6 @@ def forward_compile(
                         max_layers=cp_layers + 1,
                         policy=policy,
                         reserve_residual=n_reserved_residual,
-                        assume_zero_init=assume_zero_init,
                         tighten_domains=True,
                         log_search_progress=verbose,
                     )
@@ -1176,7 +1157,6 @@ def forward_compile(
                     max_layers=solver_max_layers,
                     policy=policy,
                     reserve_residual=n_reserved_residual,
-                    assume_zero_init=assume_zero_init,
                     # Sound by construction: the warm-start hint is
                     # feasible, so it always satisfies the tightened
                     # domains (verified: zero violations at both measured

@@ -84,7 +84,6 @@ def graph_fingerprint(
     d_head: int,
     d_hidden: int,
     flex_routing: bool,
-    assume_zero_init: bool,
     cancel_slack: Optional[int],
     policy,
     reserve_residual: int = 0,
@@ -112,6 +111,14 @@ def graph_fingerprint(
     generation is the point.  Sound as a pure function of the payload
     because the warm-start hint is a deterministic function of the same
     topology+geometry this fingerprint already hashes.
+
+    ``assume_zero_init`` was an unconditional payload key until the flag was
+    retired (2026-07, universal zero-init).  Dropping it changes the payload
+    layout for every graph, so every pre-retirement entry — including the
+    ``assume_zero_init=False`` (defensive-model) schedules — misses once and
+    re-solves against the now-universal zero-init model.  That miss is the
+    intended invalidation: a defensive-model schedule is unsound for the
+    zero-init model, so it must not be replayed.
     """
     payload = {
         "topology": topology_entries(output_node),
@@ -119,7 +126,6 @@ def graph_fingerprint(
         "d_head": d_head,
         "d_hidden": d_hidden,
         "flex_routing": flex_routing,
-        "assume_zero_init": assume_zero_init,
         "cancel_slack": cancel_slack,
         "policy": asdict(policy) if policy is not None else None,
         "cancel_window": "hint-aware-v1",

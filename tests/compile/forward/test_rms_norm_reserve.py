@@ -381,7 +381,6 @@ def test_schedule_fingerprint_keys_on_reserved_residual():
         d_head=8,
         d_hidden=64,
         flex_routing=True,
-        assume_zero_init=True,
         cancel_slack=2,
         policy=None,
     )

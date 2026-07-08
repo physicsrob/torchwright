@@ -111,11 +111,12 @@ class EquivalenceReport:
         return "\n".join(lines)
 
 
-def _seed_residual_map(graph: GraphAnalyzer, d: int, assume_zero_init: bool):
+def _seed_residual_map(graph: GraphAnalyzer, d: int):
     """Replicate forward_compile's residual-stream seed for schedule-only runs:
     the const-1 self-match column and every input node (no RMSNorm reservation
     — off by default, and irrelevant to the chain-vs-FFN comparison as long as
-    both paths use the same seed)."""
+    both paths use the same seed).  The runtime always zero-initialises, so the
+    whole free pool starts clean."""
     input_nodes = [n for n in graph.get_all_nodes() if graph.is_input_node(n)]
     rmap = ResidualStreamMap(d)
     reserve_node_id_above(graph.get_all_nodes())
@@ -125,8 +126,7 @@ def _seed_residual_map(graph: GraphAnalyzer, d: int, assume_zero_init: bool):
     for n in input_nodes:
         rmap.allocate(n)
         rmap.mark_clean(rmap.get_indices(n))
-    if assume_zero_init:
-        rmap.mark_clean(set(rmap._free))
+    rmap.mark_clean(set(rmap._free))
     return rmap, set(input_nodes)
 
 
@@ -136,7 +136,6 @@ def schedule_metrics(
     d: int,
     d_head: int,
     d_hidden: Optional[int] = None,
-    assume_zero_init: bool = False,
     max_layers: int = 800,
 ) -> ScheduleMetrics:
     """Run the heuristic scheduler schedule-only (no weight tensors) and capture
@@ -144,7 +143,7 @@ def schedule_metrics(
     d_hidden = d if d_hidden is None else d_hidden
     graph = GraphAnalyzer(output_node)
     output_node = graph.get_output_node()
-    rmap, computed = _seed_residual_map(graph, d, assume_zero_init)
+    rmap, computed = _seed_residual_map(graph, d)
     sched = LayerScheduler(graph, d, d_head, pos_encoding=None, d_hidden=d_hidden)
 
     per_layer_heads: List[int] = []
@@ -183,7 +182,6 @@ def schedule_trace(
     d: int,
     d_head: int,
     d_hidden: Optional[int] = None,
-    assume_zero_init: bool = False,
     max_layers: int = 800,
 ) -> List[dict]:
     """Schedule-only, but return per-layer detail for tracing occupancy diffs.
@@ -196,7 +194,7 @@ def schedule_trace(
     d_hidden = d if d_hidden is None else d_hidden
     graph = GraphAnalyzer(output_node)
     output_node = graph.get_output_node()
-    rmap, computed = _seed_residual_map(graph, d, assume_zero_init)
+    rmap, computed = _seed_residual_map(graph, d)
     sched = LayerScheduler(graph, d, d_head, pos_encoding=None, d_hidden=d_hidden)
 
     trace: List[dict] = []
@@ -234,7 +232,6 @@ def equivalence_report(
     d: int,
     d_head: int,
     d_hidden: Optional[int] = None,
-    assume_zero_init: bool = False,
     run_output: bool = False,
     input_tensor: Optional[torch.Tensor] = None,
     n_pos: int = 4,
@@ -252,7 +249,6 @@ def equivalence_report(
         d=d,
         d_head=d_head,
         d_hidden=d_hidden,
-        assume_zero_init=assume_zero_init,
     )
 
     # FFN path (certified at the lowering boundary; blockify's successor).
@@ -262,7 +258,6 @@ def equivalence_report(
         d=d,
         d_head=d_head,
         d_hidden=d_hidden,
-        assume_zero_init=assume_zero_init,
     )
 
     report = EquivalenceReport(chain_metrics=chain_metrics, ffn_metrics=ffn_metrics)
@@ -275,14 +270,12 @@ def equivalence_report(
             d=d,
             d_head=d_head,
             d_hidden=d_hidden,
-            assume_zero_init=assume_zero_init,
         )
         c_block = compile_headless(
             lower(build_fn()).output_node,
             d=d,
             d_head=d_head,
             d_hidden=d_hidden,
-            assume_zero_init=assume_zero_init,
         )
         n_in = sum(w for _, _, w in c_chain._input_specs)
         if input_tensor is None:

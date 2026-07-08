@@ -561,7 +561,6 @@ def build_cpsat_model(
     policy: Optional[SchedulingPolicy] = None,
     reserve_heads: int = 0,
     reserve_residual: int = 0,
-    assume_zero_init: bool = False,
     tighten_domains: bool = False,
     hint_layers: Optional[Dict[int, int]] = None,
     hint_cancel: Optional[Dict[int, int]] = None,
@@ -961,8 +960,6 @@ def build_cpsat_model(
 
     cancel_intervals: List = []
     cancel_demands: List[int] = []
-    dirty_intervals: List = []
-    dirty_demands: List[int] = []
     for n in gm.schedulable:
         if n in gm.pinned_nodes:
             continue
@@ -978,37 +975,12 @@ def build_cpsat_model(
         )
         cancel_intervals.append(iv)
         cancel_demands.append(len(n))
-
-        # Birth-layer dirty-column cancel.  When `assume_zero_init` is
-        # False (the default, mirroring the heuristic's defensive
-        # behaviour), every fresh allocation pays a cancel head to
-        # clear the column's prior value before its additive write.
-        # When True, the runtime is contracted to zero-initialise the
-        # residual stream and the heuristic skips these cancels — so
-        # we skip them in the model too.
-        #
-        # `Add` is conditional: free-add reuses the dead addend's
-        # already-clean cols (no dirty bits), so no cancel.  Compute-
-        # add allocates fresh cols and pays the dirty cancel.  Gate
-        # the dirty interval by `is_free[A].Not()`.
-        if assume_zero_init:
-            continue
-        d_end = model.NewIntVar(1, max_layers, f"dend_n{n.node_id}")
-        model.Add(d_end == layer_var[n.node_id] + 1)
-        if isinstance(n, Add):
-            d_iv = model.NewOptionalIntervalVar(
-                layer_var[n.node_id],
-                1,
-                d_end,
-                is_free[n.node_id].Not(),
-                f"div_n{n.node_id}",
-            )
-        else:
-            d_iv = model.NewIntervalVar(
-                layer_var[n.node_id], 1, d_end, f"div_n{n.node_id}"
-            )
-        dirty_intervals.append(d_iv)
-        dirty_demands.append(len(n))
+        # No BIRTH-layer dirty-column cancel: the runtime always
+        # zero-initialises the residual stream (the ONNX embed-table
+        # zero-scatter + get_input_res_stream contract), so a fresh
+        # allocation's columns start clean and its first additive write
+        # needs no prior cancel.  Recycled columns are cleaned by the
+        # death-cancel that freed them.
 
     # Freeable inputs pay a DEATH-layer cancel head (their columns hold the
     # input value and must be zeroed before any downstream additive write
@@ -1029,11 +1001,11 @@ def build_cpsat_model(
     # folded into deferred Linears); default 0.
     effective_capacity = max(0, n_heads_per_layer - reserve_heads) * d_head
     if "attn_cumulative" not in _disabled_families and (
-        attn_intervals or cancel_intervals or dirty_intervals
+        attn_intervals or cancel_intervals
     ):
         model.AddCumulative(
-            attn_intervals + cancel_intervals + dirty_intervals,
-            attn_demands + cancel_demands + dirty_demands,
+            attn_intervals + cancel_intervals,
+            attn_demands + cancel_demands,
             effective_capacity,
         )
 
@@ -1446,7 +1418,6 @@ def solve_schedule(
     log_search_progress: bool = False,
     reserve_heads: int = 0,
     reserve_residual: int = 0,
-    assume_zero_init: bool = False,
     tighten_domains: bool = False,
     solver_params: Optional[Dict[str, object]] = None,
     solution_trace: Optional[List[dict]] = None,
@@ -1516,14 +1487,6 @@ def solve_schedule(
             ``forward_compile``).  Subtracted from the residual budget so
             the modeled capacity matches the reservation-reduced replay
             pool.  Defaults to 0.
-        assume_zero_init: if True, the model assumes the runtime
-            zero-initialises the residual stream (so the heuristic
-            emits no BIRTH-layer dirty-column cancels for fresh
-            allocations on the initially-free pool).  Pair this with
-            ``forward_compile(assume_zero_init=True)`` so the heuristic
-            and CP-SAT model agree.  Defaults to False — the
-            conservative model that mirrors the heuristic's defensive
-            BIRTH-layer cancellation of fresh allocations.
         strict_hint: if True, a hint the model would drop or reject
             raises ``ValueError`` (see :func:`_validate_hint`).  Default
             False emits one ``RuntimeWarning`` instead — production
@@ -1547,7 +1510,6 @@ def solve_schedule(
         policy=policy,
         reserve_heads=reserve_heads,
         reserve_residual=reserve_residual,
-        assume_zero_init=assume_zero_init,
         tighten_domains=tighten_domains,
         hint_layers=hint_layers,
         hint_cancel=hint_cancel,

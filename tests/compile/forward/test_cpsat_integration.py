@@ -229,11 +229,12 @@ def test_cpsat_costs_beta_routes_more_to_mlp():
     torch.testing.assert_close(out_beta, expected, atol=1e-4, rtol=1e-4)
 
 
-def test_cpsat_assume_zero_init_compiles():
-    """``assume_zero_init=True`` lets the model and heuristic skip
-    BIRTH-layer dirty cancels.  The compiled module must still produce
-    correct output when the runtime zero-initialises the residual
-    stream — which ``HeadlessTransformer.compute()`` always does.
+def test_cpsat_compiles_under_zero_init():
+    """The model and heuristic skip BIRTH-layer dirty cancels because the
+    runtime always zero-initialises the residual stream (universal since
+    the ``assume_zero_init`` flag was retired).  The CP-SAT-scheduled module
+    must still produce correct output — which ``HeadlessTransformer.compute()``
+    verifies by zero-initialising the stream.
     """
     out, inputs = _build_branchy()
     net = forward_compile(
@@ -242,7 +243,6 @@ def test_cpsat_assume_zero_init_compiles():
         output_node=out,
         verbose=False,
         optimize=1,
-        assume_zero_init=True,
     )
     actual = net.compute(2, inputs)[out].cpu()
     expected = out.compute(2, inputs)

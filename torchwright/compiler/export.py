@@ -1338,7 +1338,6 @@ def compile_to_onnx(
     verbose: bool = False,
     trim_heads: bool = True,
     optimize: int = 0,
-    assume_zero_init: bool = True,
     d_hidden: Optional[int] = None,
     extra_metadata: Optional[dict] = None,
     cache_stride: Optional[int] = None,
@@ -1398,19 +1397,15 @@ def compile_to_onnx(
     layout.  The emission mode is recorded in the artifact, the token meta,
     and the debug sidecar (``"bias"``).
 
-    ``assume_zero_init`` defaults to ``True`` here (unlike ``forward_compile``,
-    which defaults ``False``): the ONNX runtime always constructs the residual
-    stream from zeros plus the input projections (see
-    ``HeadlessTransformer.get_input_res_stream`` /
-    ``_OnnxRuntime._build_res_stream``), so the initially-free residual columns
-    are guaranteed clean on entry.  The compiler can therefore skip the
-    BIRTH-layer dirty-column cancels that defend against a non-zero residual
-    stream — those cancels are pure overhead the ONNX runtime never needs, and
-    modelling them per-allocation makes the CP-SAT attention-head cumulative
-    over-tight under width pressure (it charges every fresh allocation a
-    full-width dirty cancel, while the replay only clears the genuinely-dirty
-    initial-pool subset).  No ONNX caller can supply a non-zero stream, so
-    ``True`` is always sound for this entry point.
+    The compiler assumes the runtime zero-initialises the residual stream:
+    the ONNX runtime always constructs it from zeros plus the input
+    projections (see ``HeadlessTransformer.get_input_res_stream`` /
+    ``_OnnxRuntime._build_res_stream``, and the embed-table zero-scatter into
+    non-allocated columns), so the initially-free residual columns are clean
+    on entry and a fresh allocation's first additive write needs no prior
+    cancel.  This is now universal across every entry point (the
+    ``assume_zero_init`` flag was retired 2026-07); no runtime surface can
+    supply a non-zero stream.
 
     ``rms_norm`` emits a real RMSNorm — pre-norm on each sublayer input plus a
     final norm — that acts as the bit-exact identity: a few reserved columns
@@ -1484,7 +1479,6 @@ def compile_to_onnx(
         on_layer_compiled=on_layer_compiled,
         trim_heads=trim_heads,
         optimize=optimize,
-        assume_zero_init=assume_zero_init,
         bias=bias,
         d_hidden=d_hidden,
         rms_norm=rms_norm_on,
@@ -1577,6 +1571,16 @@ def compile_to_onnx(
     # column gather.  Each folded table is mostly zeros (only d_embed / d_pos of
     # the d columns are populated), so _add_float_init stores them COO-sparse:
     # the ONNX file stays compact even though the dense HF weights are (vocab, d).
+    # ZERO-INIT CONTRACT.  The table starts as all-zeros and only the
+    # embedding, pinned-RMSNorm, and literal-seed columns below are written;
+    # every column allocated to a graph node stays zero.  A per-token
+    # ``Gather("embed_table", ...)`` therefore hands the transformer a residual
+    # stream that is exactly zero in every non-allocated column — which is the
+    # zero-init the scheduler assumes when it skips BIRTH-layer dirty cancels
+    # for fresh allocations (compile.py; the ``assume_zero_init`` flag was
+    # retired in favour of this being universal).  This zeros-scatter IS that
+    # contract; ``test_token_onnx_embed_table_zeroes_unallocated_columns`` pins
+    # it.  Do not seed non-allocated columns here.
     embed_table = np.zeros((vocab_size, d), dtype=np.float32)
     embed_table[:, embedding_indices] = embed_table_compact
 
@@ -2258,7 +2262,6 @@ def compile_headless(
     d_hidden: Optional[int] = None,
     trim_heads: bool = True,
     optimize: int = 0,
-    assume_zero_init: bool = True,
     bias: bool = True,
 ) -> CompiledHeadless:
     """Compile a graph to an in-process callable.
@@ -2276,13 +2279,11 @@ def compile_headless(
     when omitted; pass an explicit value to decouple the MLP intermediate
     width from the residual stream width.
 
-    ``optimize``, ``assume_zero_init``, and ``bias`` thread straight to
-    ``forward_compile`` (same meaning as on :func:`compile_to_onnx`) — so
-    this in-process debug backend can reproduce a production
-    ``optimize=2`` / ``assume_zero_init=True`` / ``bias=False`` schedule
-    exactly.  ``assume_zero_init`` now defaults ``True`` on every entry
-    point (the runtime always zero-initialises the residual stream); pass
-    ``False`` only to exercise the legacy defensive path.
+    ``optimize`` and ``bias`` thread straight to ``forward_compile`` (same
+    meaning as on :func:`compile_to_onnx`) — so this in-process debug backend
+    can reproduce a production ``optimize=2`` / ``bias=False`` schedule
+    exactly.  The residual stream is always zero-initialised (the
+    ``assume_zero_init`` flag was retired 2026-07).
     """
     from torchwright.graph.asserts import collect_debug_nodes
 
@@ -2308,7 +2309,6 @@ def compile_headless(
         d_hidden=d_hidden,
         trim_heads=trim_heads,
         optimize=optimize,
-        assume_zero_init=assume_zero_init,
         bias=bias,
     )
 

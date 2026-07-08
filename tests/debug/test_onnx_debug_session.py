@@ -444,13 +444,13 @@ def test_fingerprints_are_pinned():
             d_head=16,
             d_hidden=256,
             flex_routing=True,
-            assume_zero_init=True,
             cancel_slack=2,
             policy=None,
         )
-        # Pin updated 2026-07: deliberate generation bump ("cancel_window":
-        # "hint-aware-v1") so pre-widening schedule-cache entries re-solve.
-        == "1a0cd1db3d17369b525eaa9fdc0b833973899e446dafa10975138a5e2e46532b"
+        # Pin updated 2026-07: the ``assume_zero_init`` payload key was removed
+        # when the flag was retired (universal zero-init), changing the payload
+        # layout so every pre-retirement schedule-cache entry re-solves once.
+        == "49c216e533460b7c82155a490d15bfce0fe6bd2f6c5715fb4345d2002e5a97d0"
     )
 
 

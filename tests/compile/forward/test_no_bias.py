@@ -191,7 +191,6 @@ def test_schedule_fingerprint_keys_on_bias():
         d_head=D_HEAD,
         d_hidden=D,
         flex_routing=True,
-        assume_zero_init=False,
         cancel_slack=2,
         policy=None,
     )
