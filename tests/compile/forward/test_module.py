@@ -405,6 +405,7 @@ def test_token_onnx_meta_has_no_extra_key_when_omitted():
             "activation",
             "bias",
             "collapse_univariate",
+            "collapse_pl",
             "schedule",
         }
         # The adder builds the swish machine (Phase C examples cutover) —
