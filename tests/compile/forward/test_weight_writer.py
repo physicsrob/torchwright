@@ -525,6 +525,55 @@ def test_cancel_multiple():
     assert torch.allclose(out[:, b_cols].cpu(), torch.zeros(N_POS, 5), atol=1e-4)
 
 
+def test_compute_linear_reuses_dying_input_columns():
+    """Self-consumer reuse: a compute_linear whose OUTPUT columns overlap its
+    INPUT columns, emitted alongside a cancel of that input in the same
+    attention batch, composes correctly via head summation.
+
+    This is the weight-level D6 pin for the directed replay's intra-layer
+    self-consumer reuse — a node's last consumer reusing its dying input's own
+    columns.  Every head reads the shared pre-sublayer input and the head
+    outputs sum into one delta, so target ⊆ source is just another instance of
+    the already-verified ``x − x + new = new``: the compute_linear head reads
+    x's entry values and adds W·x into a subset of x's columns, the cancel head
+    adds −x across all of x's columns, and the residual comes out holding W·x in
+    the reused columns and zero in the freed ones.
+    """
+    pos = _make_reserved_block()
+    x = InputNode("x", 12, value_range=(-10.0, 10.0))
+    W = torch.randn(12, 2)
+    y = Linear(x, W, torch.zeros(2), name="y")
+
+    rmap = ResidualStreamMap(D)
+    rmap.allocate(pos)
+    x_cols = rmap.allocate(x)  # 12 columns hold x's value
+    target = x_cols[:2]  # y reuses 2 of x's OWN columns (target ⊆ source)
+
+    layer = TransformerLayer(D, D_HEAD)
+    const_one = _const_one(rmap)
+    # compute_linear reads all 12 x columns (source), writes W·x into 2 of them;
+    # cancel zeroes all 12.  Net after the summed attention sublayer: the 2
+    # reused columns hold y, the other 10 hold 0.
+    linear_op = _make_op(rmap, "compute_linear", y, target)  # source_cols = x_cols
+    cancel_op = AttnHeadOp(op_type="cancel", node=x, target_cols=x_cols)
+    write_attn_sublayer(layer, [linear_op, cancel_op], rmap, const_one=const_one)
+    layer.to(device_mod.get_device(verbose=False))
+
+    x_values = torch.randn(N_POS, 12)
+    pe_values = torch.randn(N_POS, len(pos))
+    res = _build_residual_stream(rmap, {pos: pe_values, x: x_values})
+    out = layer.attn.forward(res).cpu()
+
+    expected_y = y.compute(N_POS, {"x": x_values})
+    assert torch.allclose(
+        out[:, target], expected_y, atol=1e-3
+    ), f"reused columns should hold W·x: got {out[:, target]}, want {expected_y}"
+    freed = [c for c in x_cols if c not in target]
+    assert torch.allclose(
+        out[:, freed], torch.zeros(N_POS, len(freed)), atol=1e-3
+    ), "non-reused input columns should be freed to zero"
+
+
 # ---------------------------------------------------------------------------
 # Attention — add_into
 # ---------------------------------------------------------------------------

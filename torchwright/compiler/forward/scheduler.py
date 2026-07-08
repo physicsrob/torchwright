@@ -86,6 +86,12 @@ class LayerScheduler:
         # a real incumbent to improve, while the heuristic *fallback* keeps the
         # default eager behavior (shallower).  See ``_freshly_dead_inputs``.
         self._eager_free = eager_free
+        # Within-layer retry of deferred attention compute candidates.  False
+        # for the heuristic (single order-preserving pass, historical
+        # behavior); DirectedLayerScheduler sets it True so a same-layer
+        # column handoff resolves regardless of candidate order — see the
+        # retry loop in ``_schedule_attn_sublayer``.
+        self._retry_within_layer = False
 
         # Admission control state (see _is_admissible).  When clusters
         # is None or empty, admission is disabled and the scheduler
@@ -405,12 +411,46 @@ class LayerScheduler:
         cancel_candidates.sort(key=lambda n: (-len(n), n.node_id))  # largest first
 
         # 2b-2d. Schedule compute ops with cancellation promotion
-        for op_type, node, n_heads_needed in compute_candidates:
+        def _try_place(op_type, node, n_heads_needed) -> bool:
+            """Place one compute candidate; return True if placed, False if
+            deferred (over budget, inadmissible, or no columns available)."""
+            nonlocal heads_used
             if heads_used + n_heads_needed > self.n_heads:
-                continue
+                return False
             if not self._is_admissible(node):
                 self._admission_deferred = True
-                continue
+                return False
+
+            # Capture source columns at schedule time, BEFORE allocating this
+            # op's target.  The weight-writer reads sources from the op
+            # directly, so later free()s (eager freeing, or the self-consumer
+            # reuse below) don't orphan the lookups.  ``_require_live`` runs
+            # here while every input is still allocated (I4), so the capture
+            # also holds when a dying input is freed and its own columns are
+            # reused for this op's output.
+            sources: dict = {}
+            if op_type == "compute_linear":
+                self._require_live(
+                    node.inputs[0],
+                    residual_map,
+                    f"compute_linear input for {node!r}",
+                )
+                sources["source_cols"] = residual_map.resolve_indices(node.inputs[0])
+            elif op_type == "compute_attn":
+                q_in, k_in, v_in = node.inputs
+                self._require_live(q_in, residual_map, f"compute_attn Q for {node!r}")
+                self._require_live(k_in, residual_map, f"compute_attn K for {node!r}")
+                self._require_live(v_in, residual_map, f"compute_attn V for {node!r}")
+                sources["q_source_cols"] = residual_map.resolve_indices(q_in)
+                sources["k_source_cols"] = residual_map.resolve_indices(k_in)
+                sources["source_cols"] = residual_map.resolve_indices(v_in)
+            elif op_type == "compute_add":
+                a0, a1 = node.inputs
+                self._require_live(a0, residual_map, f"compute_add a0 for {node!r}")
+                self._require_live(a1, residual_map, f"compute_add a1 for {node!r}")
+                sources["source_cols"] = residual_map.resolve_indices(a0)
+                sources["source_cols_b"] = residual_map.resolve_indices(a1)
+
             target_cols = self._try_allocate(node, residual_map)
 
             # Promotion: cancel dead nodes to free space.  The dead
@@ -433,39 +473,32 @@ class LayerScheduler:
                 residual_map.free(cn)
                 target_cols = self._try_allocate(node, residual_map)
 
+            # Self-consumer reuse (directed replay only): placing ``node`` may
+            # make one of its OWN inputs dead (node is that input's last
+            # consumer).  The solver schedules that input's cancel at this layer
+            # (gap-0 intra-layer reuse), but it is not dead until node places —
+            # the chicken-and-egg the promotion path above cannot break.  Cancel
+            # and free the dying input now (its value was captured for node's
+            # source above), then allocate node's target from the freed pool.
+            # Order — capture, cancel, free, allocate — keeps I1 (free precedes
+            # allocate) and I4 (require_live ran while the input was live).
             if target_cols is None:
-                continue
+                reuse = self._dying_input_to_reuse(node, residual_map, computed_nodes)
+                if reuse is not None:
+                    result = try_add_cancel(residual_map.get_indices(reuse))
+                    if result is not None:
+                        additions, delta = result
+                        if heads_used + n_heads_needed + delta <= self.n_heads:
+                            commit_cancel(additions, delta)
+                            residual_map.free(reuse)
+                            target_cols = self._try_allocate(node, residual_map)
 
-            # No BIRTH-dirty cancel: the runtime zero-initialises the residual
-            # stream, so a fresh allocation's columns start clean and its first
-            # additive write needs no prior cancel.
+            if target_cols is None:
+                return False
 
-            # Capture source columns at schedule time.  This lets the
-            # weight-writer read sources from the op directly, so later
-            # free() mutations of residual_map don't orphan this op's
-            # lookups — a precondition for same-layer eager-freeing.
             op = AttnHeadOp(op_type, node, target_cols)
-            if op_type == "compute_linear":
-                self._require_live(
-                    node.inputs[0],
-                    residual_map,
-                    f"compute_linear input for {node!r}",
-                )
-                op.source_cols = residual_map.resolve_indices(node.inputs[0])
-            elif op_type == "compute_attn":
-                q_in, k_in, v_in = node.inputs
-                self._require_live(q_in, residual_map, f"compute_attn Q for {node!r}")
-                self._require_live(k_in, residual_map, f"compute_attn K for {node!r}")
-                self._require_live(v_in, residual_map, f"compute_attn V for {node!r}")
-                op.q_source_cols = residual_map.resolve_indices(q_in)
-                op.k_source_cols = residual_map.resolve_indices(k_in)
-                op.source_cols = residual_map.resolve_indices(v_in)
-            elif op_type == "compute_add":
-                a0, a1 = node.inputs
-                self._require_live(a0, residual_map, f"compute_add a0 for {node!r}")
-                self._require_live(a1, residual_map, f"compute_add a1 for {node!r}")
-                op.source_cols = residual_map.resolve_indices(a0)
-                op.source_cols_b = residual_map.resolve_indices(a1)
+            for attr, cols in sources.items():
+                setattr(op, attr, cols)
             attn_ops.append(op)
             heads_used += n_heads_needed
             computed_nodes.add(node)
@@ -493,6 +526,28 @@ class LayerScheduler:
                 and not self._has_zero_bias(node)
             ):
                 biased_linears.append(node)
+            return True
+
+        # Single pass for the heuristic (order-preserving, identical to the
+        # historical loop).  The directed replay retries deferred candidates
+        # within the layer: a same-layer column handoff means candidate W's
+        # allocation can depend on candidate R's placement (R's placement
+        # surfaces the dying node whose columns W reuses via
+        # ``_freshly_dead_inputs``), and the sorted candidate order does not
+        # guarantee R comes before W.  The retry loop reaches a fixpoint —
+        # each pass either places a candidate or terminates.
+        pending = list(compute_candidates)
+        while pending:
+            deferred = []
+            progress = False
+            for cand in pending:
+                if _try_place(*cand):
+                    progress = True
+                else:
+                    deferred.append(cand)
+            if not progress or not self._retry_within_layer:
+                break
+            pending = deferred
 
         # 2e. Remaining cancellations — try to fold remaining dead cols
         # into the same batch.
@@ -778,6 +833,20 @@ class LayerScheduler:
         if node not in self.graph.get_all_nodes():
             return False
         return self._get_effective_consumers(node).issubset(computed_nodes)
+
+    def _dying_input_to_reuse(
+        self, node: Node, residual_map: ResidualStreamMap, computed_nodes: Set[Node]
+    ) -> Optional[Node]:
+        """An input leaf of ``node`` that placing ``node`` makes dead, whose
+        columns may be cancelled+freed to allocate ``node``'s own output
+        (self-consumer intra-layer reuse).
+
+        The eager heuristic never self-consumer-reuses — it would change
+        heuristic schedules and every golden layer count — so the base class
+        returns ``None``.  ``DirectedLayerScheduler`` overrides this to replay
+        the solver's gap-0 intra-layer schedules.
+        """
+        return None
 
     def _is_dead_for_add(
         self, addend: Node, add_node: Add, computed_nodes: Set[Node]
@@ -1110,6 +1179,10 @@ class DirectedLayerScheduler(LayerScheduler):
         )
         self._assignment = assignment
         self._current_layer: int = -1
+        # Same-layer column handoffs (a cancel at the last attention
+        # consumer's own layer) make within-layer placement order matter;
+        # the retry pass in ``_schedule_attn_sublayer`` resolves it.
+        self._retry_within_layer = True
 
     def set_current_layer(self, layer: int) -> None:
         """Tell the subclass which transformer layer is being built next.
@@ -1151,7 +1224,16 @@ class DirectedLayerScheduler(LayerScheduler):
                 continue
             if node not in computed_nodes:
                 continue
-            if n2cl.get(node.node_id) != self._current_layer:
+            cl = n2cl.get(node.node_id)
+            if cl is None or cl > self._current_layer:
+                continue
+            # A directed cancel at this layer whose last consumer ALSO runs
+            # this layer (an attention-sublayer read — the intra-layer-reuse
+            # regime) is not dead at layer start; it surfaces through
+            # ``_freshly_dead_inputs`` right after that consumer is placed.
+            # The ``<=`` above (rather than ``==``) re-surfaces a directed
+            # cancel that a full head budget deferred past its assigned layer.
+            if not self._is_dead(node, computed_nodes):
                 continue
             dead.append(node)
         return dead
@@ -1162,6 +1244,47 @@ class DirectedLayerScheduler(LayerScheduler):
         computed_nodes: Set[Node],
         residual_map: ResidualStreamMap,
     ) -> List[Node]:
-        # Suppress mid-layer eager freeing: the assignment specifies the
-        # canonical cancel timing, surfaced by ``_find_dead_nodes``.
-        return []
+        # Mid-layer freeing restricted to the assignment's cancel timing:
+        # surface a freshly-dead input only when the solver scheduled its
+        # cancel at (or before) the current layer.  This is how a directed
+        # same-layer free-after-read (cancel == the last attention-sublayer
+        # consumer's layer) executes — the parent's walk fires right after
+        # that consumer is placed, exactly like the eager heuristic.
+        n2cl = self._assignment.node_to_cancel_layer
+        return [
+            n
+            for n in super()._freshly_dead_inputs(node, computed_nodes, residual_map)
+            if n2cl.get(n.node_id) is not None
+            and n2cl[n.node_id] <= self._current_layer
+        ]
+
+    def _dying_input_to_reuse(
+        self, node: Node, residual_map: ResidualStreamMap, computed_nodes: Set[Node]
+    ) -> Optional[Node]:
+        # Directed replay of a gap-0 self-consumer handoff: return an input
+        # leaf of ``node`` whose solver-assigned cancel is at (or before) this
+        # layer and whose only uncomputed consumer is ``node`` itself, so
+        # placing ``node`` makes it dead and its columns can be cancelled+freed
+        # for ``node``'s own output.  Graph-source leaves are excluded — they
+        # stay in the residual stream for the snapshot-based value lookup, the
+        # same invariant ``_freshly_dead_inputs`` respects.
+        n2cl = self._assignment.node_to_cancel_layer
+        leaves: List[Node] = []
+        for inp in node.inputs:
+            if isinstance(inp, Concatenate):
+                leaves.extend(flatten_concat_nodes([inp]))
+            else:
+                leaves.append(inp)
+        for leaf in leaves:
+            if leaf is self.pos_encoding:
+                continue
+            if not residual_map.is_allocated(leaf):
+                continue
+            if self.graph.is_input_node(leaf):
+                continue
+            cl = n2cl.get(leaf.node_id)
+            if cl is None or cl > self._current_layer:
+                continue
+            if (self._get_effective_consumers(leaf) - {node}).issubset(computed_nodes):
+                return leaf
+        return None

@@ -241,6 +241,10 @@ class BuiltModel:
     # The cancel-window slack K the model actually posted (None when the
     # window family is disabled or `cancel_slack=None`).
     eff_cancel_slack: Optional[int] = None
+    # Per-node routing as the model sees it: "attn"/"mlp" for pinned nodes,
+    # "flex" when routing is a free decision variable.  Used by hint
+    # validation to mirror the routing-aware cancel bounds.
+    static_routing: Optional[Dict[int, str]] = None
 
 
 # ---------------------------------------------------------------------------
@@ -674,9 +678,11 @@ def build_cpsat_model(
     # is_attn[n] == 1 means the node runs in the attention sublayer
     # at its layer; is_attn[n] == 0 means it runs in MLP.
     is_attn: Dict[int, cp_model.IntVar] = {}
+    static_routing: Dict[int, str] = {}
     for n in gm.schedulable:
         if flex_routing and is_flex(n, gm):
             v = model.NewBoolVar(f"is_attn_n{n.node_id}")
+            static_routing[n.node_id] = "flex"
         else:
             r = routing(n, gm, policy)
             v = model.NewBoolVar(f"is_attn_n{n.node_id}_pinned")
@@ -684,6 +690,7 @@ def build_cpsat_model(
                 model.Add(v == 1)
             else:
                 model.Add(v == 0)
+            static_routing[n.node_id] = r
         is_attn[n.node_id] = v
 
     # ---- Dependency constraints ----
@@ -760,6 +767,14 @@ def build_cpsat_model(
 
     cancel_layer: Dict[int, cp_model.IntVar] = {}
     keep_forever_ids: Set[int] = set()
+    # Nodes whose cancel window carries a `parked` escape (cl == max_layers
+    # allowed instead of the near-last-consumer window).  Their cancel-head
+    # interval is gated absent when parked (below), so parking charges no head.
+    parked_by_id: Dict[int, cp_model.IntVar] = {}
+    # Add-consumer cancel lower bounds are posted AFTER the `is_free` booleans
+    # exist (below): the gap between an addend's cancel and the Add's layer
+    # depends on whether the Add runs in the free (reassign) regime.
+    deferred_add_consumer_lbs: List[Tuple[cp_model.IntVar, int]] = []
     for n in gm.schedulable:
         cl = model.NewIntVar(0, max_layers, f"cl_n{n.node_id}")
         cancel_layer[n.node_id] = cl
@@ -778,7 +793,20 @@ def build_cpsat_model(
                 break
             if c.node_id in layer_var:
                 if "cancel_consumer_lb" not in _disabled_families:
-                    model.Add(cl >= layer_var[c.node_id] + 1)
+                    # Intra-layer reuse: an attention-sublayer consumer reads
+                    # the residual as it entered the layer, and the cancel is
+                    # itself an additive delta in that same attention output,
+                    # so the consumer's OWN layer may reclaim the columns
+                    # (gap 0).  An MLP-routed consumer reads post-attention
+                    # state and keeps the layer-after bound (gap 1).
+                    # `1 - is_attn[c]` is exactly that gap; presolve folds it
+                    # to a constant for pinned-routing consumers.  Add
+                    # consumers depend on the free/compute regime and are
+                    # posted after `is_free`.
+                    if isinstance(c, Add):
+                        deferred_add_consumer_lbs.append((cl, c.node_id))
+                    else:
+                        model.Add(cl >= layer_var[c.node_id] + 1 - is_attn[c.node_id])
                 consumer_layer_vars.append(layer_var[c.node_id])
                 consumer_ids.append(c.node_id)
         if keep_forever:
@@ -788,7 +816,19 @@ def build_cpsat_model(
             delta = _widen_delta(n.node_id, _hinted_last_consumer(consumer_ids))
             last_cons = model.NewIntVar(0, max_layers - 1, f"last_cons_n{n.node_id}")
             model.AddMaxEquality(last_cons, consumer_layer_vars)
-            model.Add(cl <= last_cons + 1 + eff_cancel_slack + delta)
+            # Parked escape: the machine may leave a dead value's columns
+            # allocated forever when every layer's head budget is too full
+            # to pay the cancel.  cl == max_layers models exactly that; the
+            # cancel-head interval is gated absent when parked so no head is
+            # charged in-horizon.  Without it the window would FORCE a paid
+            # cancel near the last consumer, rejecting machine schedules whose
+            # pinch layers have no head slack.
+            parked = model.NewBoolVar(f"parked_n{n.node_id}")
+            parked_by_id[n.node_id] = parked
+            model.Add(cl <= last_cons + 1 + eff_cancel_slack + delta).OnlyEnforceIf(
+                parked.Not()
+            )
+            model.Add(cl == max_layers).OnlyEnforceIf(parked)
         elif eff_cancel_slack is not None and not consumer_layer_vars:
             # No layer-bound consumers — cancel can fire right after
             # the node's own birth layer.
@@ -796,7 +836,12 @@ def build_cpsat_model(
                 n.node_id,
                 hint_layers.get(n.node_id) if hint_layers is not None else None,
             )
-            model.Add(cl <= layer_var[n.node_id] + 1 + eff_cancel_slack + delta)
+            parked = model.NewBoolVar(f"parked_n{n.node_id}")
+            parked_by_id[n.node_id] = parked
+            model.Add(
+                cl <= layer_var[n.node_id] + 1 + eff_cancel_slack + delta
+            ).OnlyEnforceIf(parked.Not())
+            model.Add(cl == max_layers).OnlyEnforceIf(parked)
 
     # ---- Freeable input cancel layers ----
     # Freeable inputs are born at layer 0 (pre-allocated by the compiler
@@ -805,6 +850,7 @@ def build_cpsat_model(
     # terminal `Concatenate` (output cone) is kept forever.
     input_cancel_layer: Dict[int, cp_model.IntVar] = {}
     input_keep_ids: Set[int] = set()
+    parked_input_by_id: Dict[int, cp_model.IntVar] = {}
     for n in freeable_inputs:
         cl = model.NewIntVar(0, max_layers, f"cl_in{n.node_id}")
         input_cancel_layer[n.node_id] = cl
@@ -829,11 +875,20 @@ def build_cpsat_model(
             delta = _widen_delta(n.node_id, _hinted_last_consumer(consumer_ids))
             last_cons = model.NewIntVar(0, max_layers - 1, f"last_cons_in{n.node_id}")
             model.AddMaxEquality(last_cons, consumer_layer_vars)
-            model.Add(cl <= last_cons + 1 + eff_cancel_slack + delta)
+            # Parked escape — see the schedulable-node cancel window above.
+            parked = model.NewBoolVar(f"parked_in{n.node_id}")
+            parked_input_by_id[n.node_id] = parked
+            model.Add(cl <= last_cons + 1 + eff_cancel_slack + delta).OnlyEnforceIf(
+                parked.Not()
+            )
+            model.Add(cl == max_layers).OnlyEnforceIf(parked)
         elif eff_cancel_slack is not None and not consumer_layer_vars:
             # Born at layer 0, so the hinted base is the fixed birth layer 0.
             delta = _widen_delta(n.node_id, 0)
-            model.Add(cl <= 1 + eff_cancel_slack + delta)
+            parked = model.NewBoolVar(f"parked_in{n.node_id}")
+            parked_input_by_id[n.node_id] = parked
+            model.Add(cl <= 1 + eff_cancel_slack + delta).OnlyEnforceIf(parked.Not())
+            model.Add(cl == max_layers).OnlyEnforceIf(parked)
 
     # ---- Add free/compute classification ----
     # The heuristic schedules an `Add` via `add_into` (free regime)
@@ -908,6 +963,19 @@ def build_cpsat_model(
             model.Add(is_free_A == 0)
         is_free[A.node_id] = is_free_A
 
+    # ---- Deferred Add-consumer cancel lower bounds ----
+    # (See the cancel-layer section.)  The gap is `is_free[A]`: 1 for a
+    # free-add — the reused addend rebirths into its dead addend's columns
+    # via `reassign`, so the addend's interval must run through the Add's
+    # layer for the residual handoff to stay contiguous (the live addend is
+    # conservatively held to the same bound, matching the scheduler's
+    # exclusion of add_into live addends from same-layer cancels); 0 for a
+    # compute-add — fresh columns, pre-sublayer reads, so a same-layer cancel
+    # is legal and the eager heuristic exploits it via `_freshly_dead_inputs`.
+    if "cancel_consumer_lb" not in _disabled_families:
+        for cl, add_id in deferred_add_consumer_lbs:
+            model.Add(cl >= layer_var[add_id] + is_free[add_id])
+
     # ---- Combined attn-heads + cancel-cols cumulative ----
     # Per-node attn interval is OPTIONAL (gated by is_attn[n]) when
     # the node could run in either sublayer; for pinned nodes, the
@@ -970,9 +1038,21 @@ def build_cpsat_model(
             continue
         c_end = model.NewIntVar(1, max_layers + 1, f"cend_n{n.node_id}")
         model.Add(c_end == cancel_layer[n.node_id] + 1)
-        iv = model.NewIntervalVar(
-            cancel_layer[n.node_id], 1, c_end, f"civ_n{n.node_id}"
-        )
+        parked = parked_by_id.get(n.node_id)
+        if parked is not None:
+            # Parked (cl == max_layers): the columns stay allocated to the end
+            # but no cancel head is ever charged, so the head interval is
+            # absent.  Gating it — rather than letting it pile demand at the
+            # virtual layer max_layers like keep-forever nodes do — keeps the
+            # attention-head cumulative from over-tightening when many nodes
+            # park at a width pinch.
+            iv = model.NewOptionalIntervalVar(
+                cancel_layer[n.node_id], 1, c_end, parked.Not(), f"civ_n{n.node_id}"
+            )
+        else:
+            iv = model.NewIntervalVar(
+                cancel_layer[n.node_id], 1, c_end, f"civ_n{n.node_id}"
+            )
         cancel_intervals.append(iv)
         cancel_demands.append(len(n))
         # No BIRTH-layer dirty-column cancel: the runtime always
@@ -992,7 +1072,13 @@ def build_cpsat_model(
         cl_in = input_cancel_layer[n.node_id]
         c_end = model.NewIntVar(1, max_layers + 2, f"cend_in{n.node_id}")
         model.Add(c_end == cl_in + 1)
-        iv = model.NewIntervalVar(cl_in, 1, c_end, f"civ_in{n.node_id}")
+        parked = parked_input_by_id.get(n.node_id)
+        if parked is not None:
+            iv = model.NewOptionalIntervalVar(
+                cl_in, 1, c_end, parked.Not(), f"civ_in{n.node_id}"
+            )
+        else:
+            iv = model.NewIntervalVar(cl_in, 1, c_end, f"civ_in{n.node_id}")
         cancel_intervals.append(iv)
         cancel_demands.append(len(n))
 
@@ -1203,6 +1289,7 @@ def build_cpsat_model(
             else None
         ),
         eff_cancel_slack=eff_cancel_slack,
+        static_routing=static_routing,
     )
 
 
@@ -1367,9 +1454,24 @@ def _validate_hint(
                 all_cons_hinted = False
                 continue
             hinted_cons.append(c_hint)
-            if L < c_hint + 1:
+            # Mirror the routing-aware cancel bound: an attention-routed
+            # consumer permits a same-layer cancel (gap 0); an MLP-routed
+            # consumer keeps the layer-after bound (gap 1).  Routing comes
+            # from the hint when present, else the model's pinned routing;
+            # flex consumers without a routing hint are checked leniently
+            # (gap 0).  Add consumers are also checked leniently — their true
+            # bound is `layer + is_free`, which the model enforces but a
+            # hint-only check cannot see (a deliberate validator blind spot).
+            if isinstance(c, Add):
+                gap = 0
+            else:
+                route = (hint_routing or {}).get(c.node_id)
+                if route is None and built.static_routing is not None:
+                    route = built.static_routing.get(c.node_id)
+                gap = 1 if route == MLP else 0
+            if L < c_hint + gap:
                 violations.append(
-                    f"cancel hint before consumer's layer+1: {_desc(nid)} "
+                    f"cancel hint before consumer's layer+{gap}: {_desc(nid)} "
                     f"cancel={L}, consumer {_desc(c.node_id)} layer={c_hint}"
                 )
         if K is not None and all_cons_hinted:
