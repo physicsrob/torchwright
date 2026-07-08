@@ -125,12 +125,17 @@ class MLPOp:
         "compute_literal_value",
         "compute_bias",
         "compute_linear_bypass",
+        "cancel_bypass",
     ]
-    node: Node
+    # None for ``cancel_bypass`` — the op zeroes a dying node's columns but is
+    # not itself a graph node (like the attention ``cancel``, which is outside
+    # invariant I2's literal/bias scope).
+    node: Optional[Node]
     target_cols: List[int]
     mlp_slots: List[int] = field(default_factory=list)
-    # Input columns captured at schedule time.  Used by compute_ffn (the
-    # FFN's input) and compute_linear_bypass (the Linear's input).
+    # Input columns captured at schedule time.  Used by compute_ffn (the FFN's
+    # input), compute_linear_bypass (the Linear's input), and cancel_bypass
+    # (the dying node's own columns — it reads what it negates).
     source_cols: Optional[List[int]] = None
 
 
@@ -213,6 +218,8 @@ def write_mlp_sublayer(
             _write_compute_linear_bypass(
                 layer.mlp, op, residual_map, biased_linears, recorder, bias_fold
             )
+        elif op.op_type == "cancel_bypass":
+            _write_cancel_bypass(layer.mlp, op, recorder, bias_fold)
         else:
             raise ValueError(f"Unknown mlp op_type: {op.op_type}")
 
@@ -1098,6 +1105,124 @@ def _write_compute_bias(mlp, op: MLPOp, bias_fold: Optional[BiasFold] = None):
     out_lin.output_bias[cols_t] += node.output_bias.to(target_dtype)
 
 
+def _write_bypass_lane_pair(
+    mlp,
+    in_idx: List[int],
+    out_idx: List[int],
+    mlp_slots: List[int],
+    W: torch.Tensor,
+    *,
+    node: Optional[Node],
+    op_type: str,
+    bias_fold: Optional[BiasFold] = None,
+    recorder: Optional[PlacementRecorder] = None,
+):
+    """Emit the activation bypass lane-pair computing ``W.T @ x`` from
+    ``in_idx`` into ``out_idx`` over ``mlp_slots`` (== ``2 * len(out_idx)``).
+
+    Shared by :func:`_write_compute_linear_bypass` (``W = node.output_matrix``)
+    and :func:`_write_cancel_bypass` (``W = -I``, so the pair emits ``-x`` and
+    the skip connection turns ``x`` into ``x + (-x) = 0``).  Value path only:
+    ±in_gain·W on the two slot halves, the degenerate up-lanes (up ≡ 1 on the
+    swish machine), ±out_gain on the output side, and placement records.  Bias
+    folds are the caller's.
+
+    ReLU machine: ``ReLU(z) - ReLU(-z) = z``.  Swish machine:
+    ``Swish(scale·z)/scale - Swish(-scale·z)/scale = z`` — the ``scale`` fold is
+    self-normalizing (gate rows carry ``scale·W``, output side ``1/scale``), so
+    no value path is amplified.  1.0 on the ReLU machine (no sharpening needed).
+    """
+    d_output = len(out_idx)
+    assert len(mlp_slots) == 2 * d_output, (
+        f"bypass lane-pair needs 2*d_output={2 * d_output} slots, "
+        f"got {len(mlp_slots)}"
+    )
+    pos_slots = mlp_slots[:d_output]
+    neg_slots = mlp_slots[d_output:]
+    out_idx_t = torch.as_tensor(out_idx, dtype=torch.long)
+    pos_slots_t = torch.as_tensor(pos_slots, dtype=torch.long)
+    neg_slots_t = torch.as_tensor(neg_slots, dtype=torch.long)
+
+    in_lin, out_lin = _mlp_in_out(mlp)
+    swish = mlp.activation == "swish"
+    in_gain = _SWISH_SCALE if swish else 1.0
+    out_gain = 1.0 / _SWISH_SCALE if swish else 1.0
+
+    target_dtype = in_lin.output_matrix.dtype
+    W = W.to(target_dtype)
+    # Input side: positive slots get +in_gain·W columns, negative -in_gain·W.
+    # Duplicate source columns (same Concatenate leaf twice) coalesce by
+    # row-summing — the vectorized assignment is last-write-wins.
+    w_idx, W_rows = _coalesce_source_rows(in_idx, W)
+    w_idx_t = torch.as_tensor(w_idx, dtype=torch.long)
+    in_lin.output_matrix[w_idx_t.unsqueeze(1), pos_slots_t.unsqueeze(0)] = (
+        in_gain * W_rows
+    )
+    in_lin.output_matrix[w_idx_t.unsqueeze(1), neg_slots_t.unsqueeze(0)] = (
+        -in_gain * W_rows
+    )
+
+    # Swish machine: both slot halves are degenerate lanes (up ≡ 1).
+    if swish:
+        if bias_fold is None:
+            mlp.up_proj.output_bias[pos_slots_t] = 1.0
+            mlp.up_proj.output_bias[neg_slots_t] = 1.0
+        else:
+            bias_fold.hidden_bias(
+                mlp.up_proj,
+                "mlp.W_up",
+                mlp_slots,
+                torch.ones(len(mlp_slots)),
+                node=node,
+                op_type=op_type,
+            )
+
+    # Output side: +out_gain on the positive slots, -out_gain on the negative;
+    # combined they recover W[:,j]^T @ x exactly.
+    out_lin.output_matrix[pos_slots_t, out_idx_t] = out_gain
+    out_lin.output_matrix[neg_slots_t, out_idx_t] = -out_gain
+
+    if recorder is not None:
+        recorder.add("mlp.W_in", node, op_type, in_idx, pos_slots, "dense")
+        recorder.add("mlp.W_in", node, op_type, in_idx, neg_slots, "dense")
+        recorder.add("mlp.W_out", node, op_type, pos_slots, out_idx, "diag")
+        recorder.add("mlp.W_out", node, op_type, neg_slots, out_idx, "diag")
+
+
+def _write_cancel_bypass(
+    mlp,
+    op: MLPOp,
+    recorder: Optional[PlacementRecorder] = None,
+    bias_fold: Optional[BiasFold] = None,
+):
+    """Zero a dying node's columns from the MLP sublayer via the bypass pair
+    with ``W = -I``: the lane-pair emits ``-x`` and the skip connection turns
+    the column's ``x`` into ``x + (-x) = 0`` (up to the swish two-lane fp32
+    residue measured in ``scripts/measure_mlp_cancel_residue.py``; the ReLU
+    pair is bit-exact).  ``source_cols == target_cols`` — it reads what it
+    negates — and there is no graph node (``op.node is None``).
+    """
+    assert op.source_cols is not None, "cancel_bypass requires source_cols"
+    cols = op.target_cols
+    assert op.source_cols == cols, (
+        "cancel_bypass reads and writes the same columns: "
+        f"source={op.source_cols} target={cols}"
+    )
+    in_lin, _ = _mlp_in_out(mlp)
+    neg_I = -torch.eye(len(cols), dtype=in_lin.output_matrix.dtype)
+    _write_bypass_lane_pair(
+        mlp,
+        cols,
+        cols,
+        op.mlp_slots,
+        neg_I,
+        node=None,
+        op_type=op.op_type,
+        bias_fold=bias_fold,
+        recorder=recorder,
+    )
+
+
 def _write_compute_linear_bypass(
     mlp,
     op: MLPOp,
@@ -1135,21 +1260,7 @@ def _write_compute_linear_bypass(
         f"got {len(mlp_slots)}"
     )
 
-    pos_slots = mlp_slots[:d_output]
-    neg_slots = mlp_slots[d_output:]
-
-    out_idx_t = torch.as_tensor(out_idx, dtype=torch.long)
-    pos_slots_t = torch.as_tensor(pos_slots, dtype=torch.long)
-    neg_slots_t = torch.as_tensor(neg_slots, dtype=torch.long)
-
     in_lin, out_lin = _mlp_in_out(mlp)
-    swish = mlp.activation == "swish"
-    # The self-normalizing fold: gate rows carry scale·W, the output side
-    # carries 1/scale, so no value path is amplified.  1.0 on the ReLU
-    # machine (no sharpening — ReLU needs none).
-    in_gain = _SWISH_SCALE if swish else 1.0
-    out_gain = 1.0 / _SWISH_SCALE if swish else 1.0
-
     # See the matching assert in _write_compute_ffn: the const-column rows
     # are the bias-fold destination and must never alias a real input row.
     if bias_fold is not None:
@@ -1162,35 +1273,27 @@ def _write_compute_linear_bypass(
     target_dtype = in_lin.output_matrix.dtype
     W = node.output_matrix.to(target_dtype)  # (d_input, d_output)
 
-    # Input side: positive slots get +in_gain·W columns, negative slots get
-    # -in_gain·W columns.  Each positive slot j computes act(in_gain·W[:,j]^T @ x),
-    # each negative slot act(-in_gain·W[:,j]^T @ x); the output side's ±out_gain
-    # recombines them to W[:,j]^T @ x exactly.
-    # Duplicate source columns (same Concatenate leaf twice) coalesce by
-    # row-summing — the vectorized assignment is last-write-wins.
-    w_idx, W_rows = _coalesce_source_rows(in_idx, W)
-    w_idx_t = torch.as_tensor(w_idx, dtype=torch.long)
-    in_lin.output_matrix[w_idx_t.unsqueeze(1), pos_slots_t.unsqueeze(0)] = (
-        in_gain * W_rows
-    )
-    in_lin.output_matrix[w_idx_t.unsqueeze(1), neg_slots_t.unsqueeze(0)] = (
-        -in_gain * W_rows
+    # Value path — the activation bypass lane-pair (shared with cancel_bypass).
+    _write_bypass_lane_pair(
+        mlp,
+        in_idx,
+        out_idx,
+        mlp_slots,
+        W,
+        node=node,
+        op_type=op.op_type,
+        bias_fold=bias_fold,
+        recorder=recorder,
     )
 
-    # Swish machine: both slot halves are degenerate lanes (up ≡ 1).
-    if swish:
-        if bias_fold is None:
-            mlp.up_proj.output_bias[pos_slots_t] = 1.0
-            mlp.up_proj.output_bias[neg_slots_t] = 1.0
-        else:
-            bias_fold.hidden_bias(
-                mlp.up_proj,
-                "mlp.W_up",
-                mlp_slots,
-                torch.ones(len(mlp_slots)),
-                node=node,
-                op_type=op.op_type,
-            )
+    # Bias path (compute_linear-specific — cancel_bypass has no bias).
+    swish = mlp.activation == "swish"
+    in_gain = _SWISH_SCALE if swish else 1.0
+    pos_slots = mlp_slots[:d_output]
+    neg_slots = mlp_slots[d_output:]
+    pos_slots_t = torch.as_tensor(pos_slots, dtype=torch.long)
+    neg_slots_t = torch.as_tensor(neg_slots, dtype=torch.long)
+    out_idx_t = torch.as_tensor(out_idx, dtype=torch.long)
 
     # Fold deferred biased-Linear inputs into the input-side slot biases
     # (scaled with the gate rows; the up rows are zero, so no up-side fold).
@@ -1234,13 +1337,9 @@ def _write_compute_linear_bypass(
                     )
             offset += len(leaf)
 
-    # Output side: positive slots write +out_gain to output columns,
-    # negative write -out_gain.  Combined (ReLU machine, out_gain=1):
-    # max(0, W[:,j]^T @ x) - max(0, -W[:,j]^T @ x) = W[:,j]^T @ x.
-    out_lin.output_matrix[pos_slots_t, out_idx_t] = out_gain
-    out_lin.output_matrix[neg_slots_t, out_idx_t] = -out_gain
-
     # Output bias via the output-side projection's bias (or the constant lane).
+    # The output-side value rows (±out_gain) and the placement records are
+    # emitted by _write_bypass_lane_pair above.
     if bias_fold is None:
         out_lin.output_bias[out_idx_t] += node.output_bias.to(target_dtype)
     else:
@@ -1252,11 +1351,3 @@ def _write_compute_linear_bypass(
             op_type=op.op_type,
             accumulate=True,
         )
-
-    if recorder is not None:
-        # W_in: dense ±W blocks into the positive and negative slot halves.
-        # W_out: paired ±1 identity from each slot half back to out_idx.
-        recorder.add("mlp.W_in", node, op.op_type, in_idx, pos_slots, "dense")
-        recorder.add("mlp.W_in", node, op.op_type, in_idx, neg_slots, "dense")
-        recorder.add("mlp.W_out", node, op.op_type, pos_slots, out_idx, "diag")
-        recorder.add("mlp.W_out", node, op.op_type, neg_slots, out_idx, "diag")

@@ -1173,6 +1173,36 @@ def test_mlp_linear_bypass_zero_bias():
     assert torch.allclose(result.cpu(), expected, atol=1e-4)
 
 
+def test_mlp_cancel_bypass_zeroes_columns():
+    """cancel_bypass (W = -I) zeroes a dying node's columns from the MLP
+    sublayer: the bypass pair emits -x and the skip turns x into x + (-x) = 0.
+    ReLU machine is bit-exact; the swish machine leaves only the tiny two-lane
+    fp32 residue (step 3).  ``node is None`` — it is not a graph node."""
+    for activation, atol in (("relu", 1e-6), ("swish", 1e-4)):
+        x = InputNode("x", 5, value_range=(-100.0, 100.0))
+        rmap = ResidualStreamMap(D)
+        x_cols = rmap.allocate(x)
+        mlp_slots = list(range(0, 2 * 5))  # 2 slots per column
+
+        layer = TransformerLayer(D, D_HEAD, activation=activation)
+        op = MLPOp(
+            op_type="cancel_bypass",
+            node=None,
+            target_cols=x_cols,
+            source_cols=x_cols,
+            mlp_slots=mlp_slots,
+        )
+        write_mlp_sublayer(layer, [op], rmap)
+        layer.to(device_mod.get_device(verbose=False))
+
+        x_values = torch.randn(N_POS, 5)
+        res = _build_residual_stream(rmap, {x: x_values})
+        out = layer.mlp.forward(res)
+        assert torch.allclose(
+            out[:, x_cols].cpu(), torch.zeros(N_POS, 5), atol=atol
+        ), f"{activation}: cancel_bypass left residue {out[:, x_cols].abs().max()}"
+
+
 def test_mlp_linear_bypass_with_bias():
     """Linear with non-zero bias compiled via MLP bypass."""
     x = InputNode("x", 4, value_range=(-100.0, 100.0))
