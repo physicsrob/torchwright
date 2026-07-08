@@ -28,14 +28,6 @@ class ResidualStreamMap:
         # read but never written.  (The primitive was first built for an
         # end-of-compile delta-transfer layer, since removed.)
         self._reserved: Set[int] = set()
-        # Cols whose current value is unknown (may contain garbage from a
-        # caller-provided residual stream).  A write op whose target lands on
-        # a dirty col must first cancel the prior value, or the additive
-        # sublayer write produces `garbage + value` instead of `value`.
-        # Cols become clean when they are explicitly written by
-        # get_input_res_stream (pos encoding + input nodes) or cancelled
-        # inline in the forward pass.
-        self._dirty: Set[int] = set(range(d))
 
     def allocate(self, node: Node) -> List[int]:
         n = len(node)
@@ -101,15 +93,6 @@ class ResidualStreamMap:
 
     def get_free_count(self) -> int:
         return len(self._free)
-
-    def mark_clean(self, cols) -> None:
-        """Record that ``cols`` now hold a known value and no longer need
-        cancellation before the next additive write."""
-        self._dirty.difference_update(cols)
-
-    def dirty_subset(self, cols: List[int]) -> List[int]:
-        """Return the subset of ``cols`` still marked dirty, preserving order."""
-        return [c for c in cols if c in self._dirty]
 
     def get_allocated_nodes(self) -> Set[Node]:
         return set(self._node_to_indices.keys())

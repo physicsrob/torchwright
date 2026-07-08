@@ -196,10 +196,7 @@ class LayerScheduler:
             attn_ops,
             biased_linears,
             bypass_linears,
-            heads_used,
             cancel_cols,
-            cancel_cols_set,
-            cancel_heads,
         ) = self._schedule_attn_sublayer(
             ready,
             dead,
@@ -240,27 +237,18 @@ class LayerScheduler:
                 bypass_set.add(node)
 
         # --- 3. MLP sublayer ---
-        # Dirty target cols for MLP writes are folded into the same
-        # batched cancel op that lives in the attention sublayer.  We
-        # thread the shared batch state through.
-        mlp_ops, cancel_cols, cancel_cols_set, cancel_heads, heads_used = (
-            self._schedule_mlp_sublayer(
-                ready,
-                bypass_linears,
-                biased_linears,
-                residual_map,
-                computed_nodes,
-                cancel_cols,
-                cancel_cols_set,
-                cancel_heads,
-                heads_used,
-            )
+        mlp_ops = self._schedule_mlp_sublayer(
+            ready,
+            bypass_linears,
+            biased_linears,
+            residual_map,
+            computed_nodes,
         )
 
-        # Emit the single batched cancel op at the end of the attention
-        # sublayer.  Order within the sublayer is irrelevant (all heads
-        # run in parallel and sum into the residual stream), so it's
-        # fine to append after compute ops.
+        # Emit the single batched death-cancel op (built in the attention
+        # sublayer) at the end of the layer.  Order within the sublayer is
+        # irrelevant (all heads run in parallel and sum into the residual
+        # stream), so it's fine to append after compute ops.
         if cancel_cols:
             attn_ops.append(AttnHeadOp("cancel", None, cancel_cols))
 
@@ -285,8 +273,8 @@ class LayerScheduler:
         biased_linears = []
         heads_used = 0
 
-        # All cancellations in this layer (dead-node cancels + dirty-col
-        # cancels from fresh allocations) are batched into a single
+        # The dead-node cancels in this layer (zeroing a dying node's columns
+        # so they can be reused) are batched into a single
         # AttnHeadOp("cancel", None, cancel_cols) emitted at the end.
         # Coalescing matters: one cancel head can zero d_head cols, so
         # scattering one cancel op per write-site burns heads that would
@@ -442,25 +430,15 @@ class LayerScheduler:
                     break
                 cancel_candidates.pop(0)
                 commit_cancel(additions, delta)
-                residual_map.mark_clean(cn_cols)
                 residual_map.free(cn)
                 target_cols = self._try_allocate(node, residual_map)
 
             if target_cols is None:
                 continue
 
-            # Dirty-col cancel budget: fresh cols from the initial pool
-            # are dirty until cleared; cols recycled from a previously
-            # cancelled node are already clean.
-            dirty = residual_map.dirty_subset(target_cols)
-            add_result = try_add_cancel(dirty) if dirty else ([], 0)
-            if add_result is None:
-                residual_map.free(node)
-                continue
-            additions, delta = add_result
-            if heads_used + n_heads_needed + delta > self.n_heads:
-                residual_map.free(node)
-                continue
+            # No BIRTH-dirty cancel: the runtime zero-initialises the residual
+            # stream, so a fresh allocation's columns start clean and its first
+            # additive write needs no prior cancel.
 
             # Capture source columns at schedule time.  This lets the
             # weight-writer read sources from the op directly, so later
@@ -490,9 +468,6 @@ class LayerScheduler:
                 op.source_cols_b = residual_map.resolve_indices(a1)
             attn_ops.append(op)
             heads_used += n_heads_needed
-            commit_cancel(additions, delta)
-            if dirty:
-                residual_map.mark_clean(dirty)
             computed_nodes.add(node)
             ready.discard(node)
             self._mark_scheduled(node)
@@ -528,19 +503,16 @@ class LayerScheduler:
                 continue
             additions, delta = result
             commit_cancel(additions, delta)
-            residual_map.mark_clean(cn_cols)
             residual_map.free(cn)
 
-        # Expose the batched cancel state to the MLP sublayer so it can
-        # extend the same batch with dirty MLP target cols.
+        # The batched death-cancel op is emitted by the caller.  The MLP
+        # sublayer does not extend it (fresh MLP allocations need no cancel
+        # under universal zero-init), so only the column list is returned.
         return (
             attn_ops,
             biased_linears,
             bypass_linears,
-            heads_used,
             cancel_cols,
-            cancel_cols_set,
-            cancel_heads,
         )
 
     # ------------------------------------------------------------------
@@ -554,48 +526,15 @@ class LayerScheduler:
         biased_linears,
         residual_map,
         computed_nodes,
-        cancel_cols,
-        cancel_cols_set,
-        cancel_heads,
-        heads_used,
     ):
         mlp_ops = []
         # Slot 0 is the constant lane under bias=False — see LayerScheduler
         # __init__ and weight_writer.BiasFold.
         next_slot = 0 if self.bias else 1
 
-        def try_add_cancel(new_cols):
-            """Try to fold ``new_cols`` into the shared batched cancel.
-            Returns (additions, delta_heads) or None if over budget."""
-            additions = [c for c in new_cols if c not in cancel_cols_set]
-            if not additions:
-                return [], 0
-            new_total = len(cancel_cols) + len(additions)
-            new_heads = (new_total + self.d_head - 1) // self.d_head
-            delta = new_heads - cancel_heads
-            if heads_used + delta > self.n_heads:
-                return None
-            return additions, delta
-
-        def commit_cancel(additions, delta):
-            nonlocal heads_used, cancel_heads
-            if additions:
-                cancel_cols.extend(additions)
-                cancel_cols_set.update(additions)
-                cancel_heads += delta
-                heads_used += delta
-
-        def fits_cancel(target_cols):
-            """Return (ok, additions, delta) for cancelling target_cols'
-            dirty subset.  Does NOT commit."""
-            dirty = residual_map.dirty_subset(target_cols)
-            if not dirty:
-                return True, [], 0
-            result = try_add_cancel(dirty)
-            if result is None:
-                return False, [], 0
-            additions, delta = result
-            return True, additions, delta
+        # No cancels are emitted from the MLP sublayer: fresh MLP allocations
+        # land on clean columns (universal zero-init), so their first additive
+        # write needs no prior cancel.
 
         # Residual-pressure flag shared by the FFN and bypass-Linear passes:
         # under pressure they sort by net column cost (free columns first) to
@@ -629,10 +568,6 @@ class LayerScheduler:
             target_cols = self._try_allocate(ffn, residual_map)
             if target_cols is None:
                 continue
-            ok, additions, delta = fits_cancel(target_cols)
-            if not ok:
-                residual_map.free(ffn)
-                continue
             mlp_slots = list(range(next_slot, next_slot + n_lanes))
             next_slot += n_lanes
             self._require_live(
@@ -650,10 +585,6 @@ class LayerScheduler:
                     source_cols=input_cols,
                 )
             )
-            commit_cancel(additions, delta)
-            dirty = residual_map.dirty_subset(target_cols)
-            if dirty:
-                residual_map.mark_clean(dirty)
             computed_nodes.add(ffn)
             ready.discard(ffn)
             self._mark_scheduled(ffn)
@@ -688,10 +619,6 @@ class LayerScheduler:
                 target_cols = self._try_allocate(node, residual_map)
                 if target_cols is None:
                     continue
-                ok, additions, delta = fits_cancel(target_cols)
-                if not ok:
-                    residual_map.free(node)
-                    continue
                 mlp_slots = list(range(next_slot, next_slot + n_slots))
                 next_slot += n_slots
                 self._require_live(
@@ -709,10 +636,6 @@ class LayerScheduler:
                         source_cols=input_cols,
                     )
                 )
-                commit_cancel(additions, delta)
-                dirty = residual_map.dirty_subset(target_cols)
-                if dirty:
-                    residual_map.mark_clean(dirty)
                 computed_nodes.add(node)
                 ready.discard(node)
                 self._mark_scheduled(node)
@@ -735,20 +658,12 @@ class LayerScheduler:
             target_cols = self._try_allocate(node, residual_map)
             if target_cols is None:
                 continue
-            ok, additions, delta = fits_cancel(target_cols)
-            if not ok:
-                residual_map.free(node)
-                continue
             assert len(target_cols) == len(node) == node.value.numel(), (
                 f"Literal allocation width mismatch for {node!r}: "
                 f"target_cols={len(target_cols)}, len(node)={len(node)}, "
                 f"value.numel()={node.value.numel()}."
             )
             mlp_ops.append(MLPOp("compute_literal_value", node, target_cols, []))
-            commit_cancel(additions, delta)
-            dirty = residual_map.dirty_subset(target_cols)
-            if dirty:
-                residual_map.mark_clean(dirty)
             computed_nodes.add(node)
             self._mark_scheduled(node)
 
@@ -759,7 +674,7 @@ class LayerScheduler:
             target_cols = residual_map.get_indices(node)
             mlp_ops.append(MLPOp("compute_bias", node, target_cols, []))
 
-        return mlp_ops, cancel_cols, cancel_cols_set, cancel_heads, heads_used
+        return mlp_ops
 
     # ------------------------------------------------------------------
     # Helpers
@@ -1151,10 +1066,9 @@ class DirectedLayerScheduler(LayerScheduler):
 
     What it preserves (by inheriting the parent's per-layer code path):
     cancel coalescing into a single batched ``AttnHeadOp("cancel")``,
-    dirty-bit tracking, source-column capture via ``_require_live``,
-    and the four allocator invariants I1–I4 (which run inside
-    ``ResidualStreamMap`` and the weight-writer that this subclass
-    doesn't touch).
+    source-column capture via ``_require_live``, and the four allocator
+    invariants I1–I4 (which run inside ``ResidualStreamMap`` and the
+    weight-writer that this subclass doesn't touch).
 
     The caller must invoke :meth:`set_current_layer` with the layer
     index *before* each :meth:`schedule_layer` call — the subclass has

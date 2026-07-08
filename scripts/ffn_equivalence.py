@@ -116,17 +116,14 @@ def _seed_residual_map(graph: GraphAnalyzer, d: int):
     the const-1 self-match column and every input node (no RMSNorm reservation
     — off by default, and irrelevant to the chain-vs-FFN comparison as long as
     both paths use the same seed).  The runtime always zero-initialises, so the
-    whole free pool starts clean."""
+    whole free pool starts clean and no cancel bookkeeping is needed."""
     input_nodes = [n for n in graph.get_all_nodes() if graph.is_input_node(n)]
     rmap = ResidualStreamMap(d)
     reserve_node_id_above(graph.get_all_nodes())
     const_one = LiteralValue(torch.ones(1), name="rope_self_match_const_one")
     rmap.allocate(const_one)
-    rmap.mark_clean(rmap.get_indices(const_one))
     for n in input_nodes:
         rmap.allocate(n)
-        rmap.mark_clean(rmap.get_indices(n))
-    rmap.mark_clean(set(rmap._free))
     return rmap, set(input_nodes)
 
 

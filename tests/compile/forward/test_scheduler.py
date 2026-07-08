@@ -363,9 +363,6 @@ def test_schedule_deferred_add_via_compute():
     rmap.allocate(pos)
     rmap.allocate(a)
     rmap.allocate(b)
-    rmap.mark_clean(rmap.get_indices(pos))
-    rmap.mark_clean(rmap.get_indices(a))
-    rmap.mark_clean(rmap.get_indices(b))
     computed = {pos, a, b}
 
     scheduler = LayerScheduler(graph, d_test, D_HEAD, pos)

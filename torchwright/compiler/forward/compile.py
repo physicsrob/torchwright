@@ -347,12 +347,6 @@ class _TrackingResidualStreamMap(ResidualStreamMap):
         self._free = set(base._free)
         self._node_to_indices = dict(base._node_to_indices)
         self._reserved = set(getattr(base, "_reserved", set()))
-        # Carry the base map's dirty-state forward.  Without this copy,
-        # ``super().__init__`` leaves every column marked dirty, so the
-        # warm-start probe pays phantom cancel heads on columns the base
-        # map already cleaned (via ``mark_clean``) and emits a hint
-        # deeper than the eager fallback it is meant to improve on.
-        self._dirty = set(base._dirty)
         self.current_layer: int = 0
         self.cancel_layer: dict[int, int] = {}
 
@@ -910,18 +904,14 @@ def forward_compile(
     reserve_node_id_above(graph.get_all_nodes())
     const_one: Node = LiteralValue(torch.ones(1), name="rope_self_match_const_one")
     residual_map.allocate(const_one)
-    residual_map.mark_clean(residual_map.get_indices(const_one))
     for node in input_nodes:
         residual_map.allocate(node)
-        residual_map.mark_clean(residual_map.get_indices(node))
     # The runtime always zero-initialises the residual stream (the contract
     # `HeadlessTransformer.get_input_res_stream` provides, and the ONNX
-    # embed-table's zero-scatter into non-allocated columns), so the
-    # initially-free pool holds zero on entry — not garbage — and its columns
-    # are clean: a fresh allocation's first additive write needs no BIRTH-layer
-    # dirty cancel.  Recycled columns return to the clean pool via the cancel
-    # ops the heuristic emits at node death.
-    residual_map.mark_clean(set(residual_map._free))
+    # embed-table's zero-scatter into non-allocated columns), so every
+    # initially-free column holds zero on entry — not garbage — and a fresh
+    # allocation's first additive write needs no BIRTH-layer cancel.  Recycled
+    # columns are zeroed by the death-cancel the scheduler emits at node death.
     computed = set(input_nodes)
 
     # Pinned-constant RMSNorm: reserve the constant column(s) NOW, before the
