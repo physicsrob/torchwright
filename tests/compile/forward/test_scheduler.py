@@ -198,6 +198,51 @@ def test_schedule_zero_bias_linear_bypass():
     assert linear in computed
 
 
+def test_saturated_head_death_layer_frees_via_mlp_slots():
+    """When the attention head budget is full at a dead node's death layer, the
+    eager heuristic frees it via an MLP ``cancel_bypass`` the same layer instead
+    of deferring the cancel to a later attention batch.
+
+    Geometry: d_head == d gives one attention head per layer.  A single Attn op
+    consumes it, so the dead node ``D`` cannot join an attention cancel batch;
+    the MLP sublayer zeroes it via ``cancel_bypass`` (2 hidden slots per
+    column) and frees its columns."""
+    d = 64
+    d_head = 64  # one attention head per layer
+    pos = InputNode("reserved", 1, value_range=(-1.0, 1.0))
+    x = InputNode("x", 4, value_range=(-1.0, 1.0))
+    attn = _make_attn(x)  # d_v == 4, one head — saturates the layer's budget
+    dead = _make_linear(x, 8, "D")
+    dead_consumer = _make_linear(dead, 4, "Dc")  # already computed → D is dead
+    out = _make_linear(Concatenate([attn, dead_consumer]), 4, "out")
+
+    graph = GraphAnalyzer(out)
+    rmap = ResidualStreamMap(d)
+    for n in (pos, x, dead, dead_consumer):
+        rmap.allocate(n)
+    dead_cols = set(rmap.get_indices(dead))
+    computed = {pos, x, dead, dead_consumer}
+
+    scheduler = LayerScheduler(graph, d, d_head, pos, d_hidden=d)
+    attn_ops, mlp_ops, _biased = scheduler.schedule_layer(rmap, computed)
+
+    # The Attn op took the single head; the dead node was cancelled in the MLP
+    # sublayer rather than the attention batch.
+    assert any(op.op_type == "compute_attn" for op in attn_ops)
+    assert not any(op.op_type == "cancel" for op in attn_ops), (
+        "the dead node should not have been attention-cancelled — the head "
+        "budget was full"
+    )
+    cancel_bypass = [op for op in mlp_ops if op.op_type == "cancel_bypass"]
+    d_cancel = [op for op in cancel_bypass if set(op.target_cols) == dead_cols]
+    assert d_cancel, f"expected a cancel_bypass zeroing D's columns {dead_cols}"
+    op = d_cancel[0]
+    assert op.node is None
+    assert op.source_cols == op.target_cols
+    assert len(op.mlp_slots) == 2 * len(op.target_cols)
+    assert not rmap.is_allocated(dead), "D's columns should be freed"
+
+
 def test_schedule_large_input_linear():
     """Zero-bias Linear with input dim > d_head: legacy uses attention, default uses bypass."""
     pos = _make_reserved_block()

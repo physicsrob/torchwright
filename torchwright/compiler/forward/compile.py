@@ -349,6 +349,10 @@ class _TrackingResidualStreamMap(ResidualStreamMap):
         self._reserved = set(getattr(base, "_reserved", set()))
         self.current_layer: int = 0
         self.cancel_layer: dict[int, int] = {}
+        # Which sublayer each free ran in ("attn"/"mlp"), captured alongside
+        # ``cancel_layer`` so the warm start hints CP-SAT the mechanism the
+        # heuristic actually chose.
+        self.cancel_mech: dict[int, str] = {}
 
     def allocate(self, node: Node):  # type: ignore[override]
         # A node reaching allocate after a recorded free was rolled back
@@ -356,16 +360,19 @@ class _TrackingResidualStreamMap(ResidualStreamMap):
         # genuine death — a later free, or omission if it dies by
         # reassign — is what the hint reflects.
         self.cancel_layer.pop(node.node_id, None)
+        self.cancel_mech.pop(node.node_id, None)
         return super().allocate(node)
 
-    def free(self, node: Node) -> None:  # type: ignore[override]
+    def free(self, node: Node, mech: str = "attn") -> None:  # type: ignore[override]
         self.cancel_layer[node.node_id] = self.current_layer
-        super().free(node)
+        self.cancel_mech[node.node_id] = mech
+        super().free(node, mech)
 
     def reassign(self, old_node: Node, new_node: Node) -> None:  # type: ignore[override]
         # The new node is born here (free-add reuse), so any stale cancel
         # recorded for it by an earlier rolled-back allocation is wrong.
         self.cancel_layer.pop(new_node.node_id, None)
+        self.cancel_mech.pop(new_node.node_id, None)
         super().reassign(old_node, new_node)
 
 
@@ -384,15 +391,15 @@ def _run_heuristic_warm_start(
     policy: Optional[SchedulingPolicy],
     output_node: Node,
     max_layers: int,
-) -> tuple[dict, dict, dict, int]:
+) -> tuple[dict, dict, dict, dict, int]:
     """Run the heuristic LayerScheduler in schedule-only mode and
-    capture per-node layer, routing, and cancel-layer hints for
-    CP-SAT.  Mutates a *clone* of ``residual_map`` and ``computed``;
-    the caller's state is untouched.
+    capture per-node layer, routing, cancel-layer, and cancel-mechanism
+    hints for CP-SAT.  Mutates a *clone* of ``residual_map`` and
+    ``computed``; the caller's state is untouched.
 
-    Returns ``(hint_layers, hint_routing, hint_cancel, hint_n_layers)``.
-    On heuristic deadlock, all dicts are empty and n_layers is 0 — the
-    CP-SAT solve will then cold-start without a hint.
+    Returns ``(hint_layers, hint_routing, hint_cancel, hint_cancel_mech,
+    hint_n_layers)``.  On heuristic deadlock, all dicts are empty and
+    n_layers is 0 — the CP-SAT solve will then cold-start without a hint.
     """
     hint_rmap = _TrackingResidualStreamMap(copy.deepcopy(residual_map))
     hint_computed = set(computed)
@@ -430,7 +437,7 @@ def _run_heuristic_warm_start(
         except RuntimeError:
             # Heuristic deadlocked / no progress.  Drop the hint
             # and let CP-SAT cold-start.
-            return {}, {}, {}, 0
+            return {}, {}, {}, {}, 0
         # Routing decisions for standalone Linears: heuristic placed
         # compute_linear in attention or compute_linear_bypass in
         # MLP.  FFNs are non-flex (always the MLP composite) so we
@@ -450,7 +457,13 @@ def _run_heuristic_warm_start(
         if not attn_ops and not mlp_ops:
             break
     hint_n_layers = max(hint_layers.values()) + 1 if hint_layers else 0
-    return hint_layers, hint_routing, dict(hint_rmap.cancel_layer), hint_n_layers
+    return (
+        hint_layers,
+        hint_routing,
+        dict(hint_rmap.cancel_layer),
+        dict(hint_rmap.cancel_mech),
+        hint_n_layers,
+    )
 
 
 def _effective_consumers(graph: GraphAnalyzer, node: Node) -> Set[Node]:
@@ -537,6 +550,10 @@ def _verify_end_of_layer_writes(
         if op.node is not None:
             written_nodes.add(op.node)
     for op in mlp_ops:
+        if op.op_type == "cancel_bypass":
+            # Zeroes an already-freed node's columns (node=None); not a fresh
+            # write, exactly like the attention "cancel" carve-out above.
+            continue
         if op.node is not None:
             written_nodes.add(op.node)
 
@@ -1036,7 +1053,7 @@ def forward_compile(
             # known-feasible incumbent dramatically shrinks the time the
             # solver needs to find any feasible schedule.
             t_hint_start = time.perf_counter()
-            hint_layers, hint_routing, hint_cancel, hint_n_layers = (
+            hint_layers, hint_routing, hint_cancel, hint_cancel_mech, hint_n_layers = (
                 _run_heuristic_warm_start(
                     graph=graph,
                     d=d,
@@ -1156,6 +1173,7 @@ def forward_compile(
                     hint_layers=hint_layers if hint_layers else None,
                     hint_routing=hint_routing if hint_routing else None,
                     hint_cancel=hint_cancel if hint_cancel else None,
+                    hint_cancel_mech=hint_cancel_mech if hint_cancel_mech else None,
                     log_search_progress=verbose,
                 )
                 # Surface the solver provenance on the returned net so

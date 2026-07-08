@@ -165,6 +165,15 @@ class LayerScheduler:
     def _schedule_layer_inner(
         self, residual_map: ResidualStreamMap, computed_nodes: Set[Node]
     ) -> Tuple[List[AttnHeadOp], List[MLPOp], List[Node], bool]:
+        # Nodes already computed before this layer.  A node born THIS layer must
+        # not be MLP-cancelled this layer even if a same-layer MLP consumer
+        # makes it dead: the model requires every cancel at birth+1 or later
+        # (`cancel_layer >= layer + 1`), so freeing at birth would emit a hint
+        # the model cannot represent and a degenerate zero-length residual
+        # liveness window.  The directed replay is already protected by its
+        # `cancel_layer <= current` gate (the model never assigns cancel ==
+        # birth); this guards the eager heuristic's own choice.
+        computed_before_layer = set(computed_nodes)
         # --- 1. Classify ready nodes ---
         all_ready = self._get_ready_nodes(computed_nodes)
 
@@ -203,6 +212,7 @@ class LayerScheduler:
             biased_linears,
             bypass_linears,
             cancel_cols,
+            add_into_live_addends,
         ) = self._schedule_attn_sublayer(
             ready,
             dead,
@@ -242,6 +252,32 @@ class LayerScheduler:
                 bypass_linears.append(node)
                 bypass_set.add(node)
 
+        # Dead nodes the attention sublayer did not cancel (its head budget was
+        # full, or the directed replay routed them to the MLP mechanism) are
+        # offered to the MLP sublayer, which zeroes them via `cancel_bypass`
+        # while hidden slots remain — the fall-back-to-MLP half of the
+        # mechanism-choice policy.  Recomputed against the CURRENT computed set
+        # (not the layer-start `dead`) so a node that died during THIS layer's
+        # attention sublayer — its last consumer an attention op here — is
+        # MLP-cancelled this layer rather than a layer late, which the directed
+        # replay's `[layer, cancel + 1)` residual budget would otherwise
+        # overflow.  `_find_dead_nodes` returns allocated, dead nodes (and, on
+        # the directed replay, only those whose assigned cancel layer has
+        # arrived); the mechanism filter keeps a directed attn-mech leftover
+        # deferred rather than silently MLP-cancelling it.
+        defer_live = self._mlp_cancel_defers_live_addends()
+        mlp_cancel_candidates = [
+            n
+            for n in self._find_dead_nodes(residual_map, computed_nodes)
+            if self._mlp_cancel_eligible(n)
+            and not self._is_keep_forever(n)
+            and not self.graph.is_input_node(n)  # decision #3: inputs stay
+            # resident for snapshot-based value lookup — never MLP-cancelled
+            # (the directed replay agrees: inputs carry no cancel-mech entry).
+            and n in computed_before_layer  # never cancel at birth (>= birth+1)
+            and not (defer_live and n in add_into_live_addends)
+        ]
+
         # --- 3. MLP sublayer ---
         mlp_ops = self._schedule_mlp_sublayer(
             ready,
@@ -249,6 +285,8 @@ class LayerScheduler:
             biased_linears,
             residual_map,
             computed_nodes,
+            mlp_cancel_candidates,
+            computed_before_layer,
         )
 
         # Emit the single batched death-cancel op (built in the attention
@@ -402,11 +440,15 @@ class LayerScheduler:
                 )
             )
 
-        # Cancellation candidates (exclude live addends of add_into ops)
+        # Cancellation candidates (exclude live addends of add_into ops, and
+        # dead nodes the directed replay routed to the MLP mechanism — those
+        # are cancelled in the MLP sublayer, never here).
         cancel_candidates = [
             n
             for n in dead
-            if n is not self.pos_encoding and n not in add_into_live_addends
+            if n is not self.pos_encoding
+            and n not in add_into_live_addends
+            and self._attn_cancel_eligible(n)
         ]
         cancel_candidates.sort(key=lambda n: (-len(n), n.node_id))  # largest first
 
@@ -516,6 +558,10 @@ class LayerScheduler:
             for fresh in self._freshly_dead_inputs(node, computed_nodes, residual_map):
                 if fresh in add_into_live_addends or fresh in already_pending:
                     continue
+                if not self._attn_cancel_eligible(fresh):
+                    # Routed to the MLP mechanism (directed replay) — the MLP
+                    # sublayer picks it up from `dead`; never attention-cancel.
+                    continue
                 cancel_candidates.append(fresh)
                 already_pending.add(fresh)
             cancel_candidates.sort(key=lambda n: (-len(n), n.node_id))
@@ -563,11 +609,14 @@ class LayerScheduler:
         # The batched death-cancel op is emitted by the caller.  The MLP
         # sublayer does not extend it (fresh MLP allocations need no cancel
         # under universal zero-init), so only the column list is returned.
+        # ``add_into_live_addends`` is returned so the MLP-cancel pass can
+        # leave this layer's live addends alone (they die next layer).
         return (
             attn_ops,
             biased_linears,
             bypass_linears,
             cancel_cols,
+            add_into_live_addends,
         )
 
     # ------------------------------------------------------------------
@@ -581,15 +630,48 @@ class LayerScheduler:
         biased_linears,
         residual_map,
         computed_nodes,
+        mlp_cancel_candidates=None,
+        computed_before_layer=None,
     ):
         mlp_ops = []
         # Slot 0 is the constant lane under bias=False — see LayerScheduler
         # __init__ and weight_writer.BiasFold.
         next_slot = 0 if self.bias else 1
 
-        # No cancels are emitted from the MLP sublayer: fresh MLP allocations
-        # land on clean columns (universal zero-init), so their first additive
-        # write needs no prior cancel.
+        # Dead nodes to zero via `cancel_bypass` this layer (attention batch was
+        # full, or the directed replay routed them here).  MLP-phase placements
+        # below may make more inputs freshly dead; those are appended and share
+        # the same slot budget.  The batch is emitted AFTER the compute ops so
+        # the freed columns are not reused within this layer — matching the
+        # `[layer, cancel + 1)` residual accounting the MLP-cancel model uses
+        # (the columns stay live through the whole cancel layer, freed at its
+        # end).  Fresh MLP compute allocations still need no BIRTH cancel:
+        # universal zero-init leaves them clean.
+        mlp_cancel_candidates = list(mlp_cancel_candidates or [])
+        mlp_cancel_pending = set(mlp_cancel_candidates)
+        computed_before_layer = (
+            computed_before_layer if computed_before_layer is not None else set()
+        )
+
+        def _surface_mlp_freshly_dead(placed_node):
+            # After placing an MLP compute op, its operands may be freshly dead.
+            # Offer the MLP-eligible ones to the cancel_bypass batch (their
+            # values were captured on the op above, so freeing them is safe).
+            # ``_freshly_dead_inputs`` returns [] when eager freeing is off (the
+            # no-eager warm-start), so this is inert there.  A node born THIS
+            # layer is skipped — no cancel may fire at its own birth layer (the
+            # model's `cancel_layer >= layer + 1`); it frees next layer.
+            for fresh in self._freshly_dead_inputs(
+                placed_node, computed_nodes, residual_map
+            ):
+                if fresh in mlp_cancel_pending:
+                    continue
+                if fresh not in computed_before_layer:
+                    continue
+                if not self._mlp_cancel_eligible(fresh):
+                    continue
+                mlp_cancel_candidates.append(fresh)
+                mlp_cancel_pending.add(fresh)
 
         # Residual-pressure flag shared by the FFN and bypass-Linear passes:
         # under pressure they sort by net column cost (free columns first) to
@@ -643,6 +725,7 @@ class LayerScheduler:
             computed_nodes.add(ffn)
             ready.discard(ffn)
             self._mark_scheduled(ffn)
+            _surface_mlp_freshly_dead(ffn)
 
         # 3b. Standalone Linears via MLP bypass (ReLU bypass trick).
         # These were skipped in the attention phase because the policy
@@ -694,6 +777,7 @@ class LayerScheduler:
                 computed_nodes.add(node)
                 ready.discard(node)
                 self._mark_scheduled(node)
+                _surface_mlp_freshly_dead(node)
 
         # 3c. LiteralValues (no slot cost)
         constants = sorted(
@@ -728,6 +812,31 @@ class LayerScheduler:
         for node in biased_linears:
             target_cols = residual_map.get_indices(node)
             mlp_ops.append(MLPOp("compute_bias", node, target_cols, []))
+
+        # 3e. MLP-cancel: zero dead nodes' columns via `cancel_bypass` while
+        # hidden slots remain.  Emitted last so the freed columns are not reused
+        # this layer (the `[layer, cancel + 1)` residual accounting).  Each
+        # column costs two hidden slots (the bypass lane-pair with W = -I).
+        # Larger nodes first, matching the attention cancel batch's ordering.
+        for node in sorted(mlp_cancel_candidates, key=lambda n: (-len(n), n.node_id)):
+            if not residual_map.is_allocated(node):
+                continue
+            cols = list(residual_map.get_indices(node))
+            n_slots = 2 * len(cols)
+            if next_slot + n_slots > self.d_hidden:
+                continue  # no slots left — defer the free to a later layer
+            mlp_slots = list(range(next_slot, next_slot + n_slots))
+            next_slot += n_slots
+            mlp_ops.append(
+                MLPOp(
+                    "cancel_bypass",
+                    None,
+                    cols,
+                    mlp_slots,
+                    source_cols=cols,
+                )
+            )
+            residual_map.free(node, mech="mlp")
 
         return mlp_ops
 
@@ -833,6 +942,60 @@ class LayerScheduler:
         if node not in self.graph.get_all_nodes():
             return False
         return self._get_effective_consumers(node).issubset(computed_nodes)
+
+    def _is_keep_forever(self, node: Node) -> bool:
+        """The node's residual columns must never be reclaimed within the
+        schedule: the output node (no effective consumers) and every
+        output-cone leaf feeding a terminal ``Concatenate`` (kept, not
+        resolved, by ``_get_effective_consumers``).  Such a node reads as
+        vacuously "dead" the moment it is computed, but freeing it would drop
+        the value the compile is about to gather — so it is excluded from the
+        MLP-cancel batch.  The attention cancel path never hits this because it
+        frees only nodes dead at layer start (the output/leaf is computed later)
+        and the compile stops once the output is done; the MLP-cancel recompute
+        runs within the output's own layer, so it needs the guard.  Mirrors the
+        directed replay's own protection (keep-forever nodes carry
+        ``cancel_layer == max_layers``)."""
+        cons = self._get_effective_consumers(node)
+        return (not cons) or any(isinstance(c, Concatenate) for c in cons)
+
+    def _attn_cancel_eligible(self, node: Node) -> bool:
+        """May this dead node be zeroed by a batched attention cancel head?
+
+        The eager heuristic tries the attention batch for every dead node (the
+        MLP path is the fall-back), so the base returns True.
+        ``DirectedLayerScheduler`` overrides this to honour the solver's
+        per-node mechanism assignment: an MLP-mech node is never
+        attention-cancelled.
+        """
+        return True
+
+    def _mlp_cancel_eligible(self, node: Node) -> bool:
+        """May this dead node be zeroed by an MLP ``cancel_bypass`` op?
+
+        The eager heuristic MLP-cancels any dead node the attention batch could
+        not fit (fall-back), so the base returns True.
+        ``DirectedLayerScheduler`` overrides this to MLP-cancel only the nodes
+        the solver assigned to the MLP mechanism.
+        """
+        return True
+
+    def _mlp_cancel_defers_live_addends(self) -> bool:
+        """Should a node used as an ``add_into`` live addend THIS layer be left
+        for a later layer's MLP-cancel rather than freed now?
+
+        The eager heuristic defers it (True): the value was just copied into a
+        dead addend's columns, and keeping the live addend resident one more
+        layer is the historical, conservative behaviour a bug reproducer pins
+        (the calculator ``switch()`` shared-addend case).  The captured
+        cancel-layer hint reflects the deferral, so the model stays consistent.
+        ``DirectedLayerScheduler`` overrides this to False: it must honour the
+        solver's assignment, which may cancel a live addend at the add's own
+        layer (freeing it later would overflow the `[layer, cancel + 1)`
+        residual budget); reading the live addend in the attention sublayer
+        happens before the MLP-sublayer `cancel_bypass` zeroes it, so it is
+        safe."""
+        return True
 
     def _dying_input_to_reuse(
         self, node: Node, residual_map: ResidualStreamMap, computed_nodes: Set[Node]
@@ -1201,6 +1364,25 @@ class DirectedLayerScheduler(LayerScheduler):
         all_ready = self.graph.get_ready_nodes(computed_nodes)
         n2l = self._assignment.node_to_layer
         return {n for n in all_ready if n2l.get(n.node_id) == self._current_layer}
+
+    def _attn_cancel_eligible(self, node: Node) -> bool:
+        # Honour the solver's mechanism assignment: only attention-mech (and
+        # unassigned — freeable inputs, always attention-cancelled) nodes may
+        # enter the attention cancel batch.  A default of "attn" for absent
+        # nodes matches the assignment (freeable inputs carry no mech entry).
+        return self._assignment.node_to_cancel_mech.get(node.node_id, "attn") != "mlp"
+
+    def _mlp_cancel_eligible(self, node: Node) -> bool:
+        # Only the nodes the solver routed to the MLP mechanism get a
+        # `cancel_bypass`; an attention-mech leftover that a full head budget
+        # deferred stays deferred (re-surfaced next layer by _find_dead_nodes).
+        return self._assignment.node_to_cancel_mech.get(node.node_id, "attn") == "mlp"
+
+    def _mlp_cancel_defers_live_addends(self) -> bool:
+        # Honour the solver's assignment: a live addend the solver routed to an
+        # MLP cancel at the add's own layer must free this layer, or the
+        # `[layer, cancel + 1)` residual budget the model reserved overflows.
+        return False
 
     def _literal_needed_now(self, node: Node, computed_nodes: Set[Node]) -> bool:
         # Assignment-driven: the CP-SAT layer assignment already places each

@@ -57,7 +57,11 @@ class ResidualStreamMap:
         self._check_invariants(f"allocate({node!r}, {n} cols)")
         return indices
 
-    def free(self, node: Node):
+    def free(self, node: Node, mech: str = "attn"):
+        # ``mech`` ("attn"/"mlp") records which sublayer the freeing cancel ran
+        # in; the base map ignores it (the free is identical either way).  The
+        # warm-start tracking subclass records it so the CP-SAT mechanism hint
+        # reflects the heuristic's choice.
         if node not in self._node_to_indices:
             raise KeyError(f"Node {node} is not allocated")
         self._free |= set(self._node_to_indices[node])

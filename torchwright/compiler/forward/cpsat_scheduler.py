@@ -145,6 +145,13 @@ class ScheduleAssignment:
     node_to_cancel_layer: Dict[int, int]
     node_to_routing: Dict[int, str]
     n_layers: int
+    # Which sublayer each node's cancel runs in: "attn" (a batched attention
+    # cancel head) or "mlp" (a ``cancel_bypass`` MLP op).  Keyed by the same
+    # schedulable node ids as ``node_to_cancel_layer``; freeable inputs are
+    # always attention-cancelled and are omitted (the replay defaults absent
+    # nodes to "attn").  ``DirectedLayerScheduler`` routes each directed cancel
+    # to its assigned mechanism.
+    node_to_cancel_mech: Dict[int, str] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -207,6 +214,12 @@ class BuiltModel:
     cancel_layer: Dict[int, cp_model.IntVar]
     is_attn: Dict[int, cp_model.IntVar]
     is_free: Dict[int, cp_model.IntVar]
+    # Per non-keep-forever schedulable node: 1 when its cancel runs as a
+    # ``cancel_bypass`` MLP op (cost on the MLP hidden-slot budget), 0 when it
+    # runs as a batched attention cancel head (cost on the attention-head
+    # budget).  Absent for keep-forever nodes (they never cancel in-horizon)
+    # and freeable inputs (always attention-cancelled — decision #3).
+    cancel_in_mlp: Dict[int, cp_model.IntVar]
     n_layers_var: cp_model.IntVar
     total_attn_heads: cp_model.IntVar
     total_mlp_bypass: cp_model.IntVar
@@ -551,6 +564,21 @@ def critical_path_layers(
     return max(es.values()) + 1
 
 
+def _and_presence(model, parked, other, *, name):
+    """Presence literal for AND(parked.Not(), ``other``).
+
+    ``other`` is the desired literal already (e.g. ``cim`` or ``cim.Not()``).
+    With no parked var the presence is just ``other``; otherwise a fresh aux
+    bool is reified to ``parked.Not() AND other`` and returned.
+    """
+    if parked is None:
+        return other
+    aux = model.NewBoolVar(name)
+    model.AddBoolAnd([parked.Not(), other]).OnlyEnforceIf(aux)
+    model.AddBoolOr([parked, other.Not()]).OnlyEnforceIf(aux.Not())
+    return aux
+
+
 def build_cpsat_model(
     output_node: Node,
     pos_encoding=None,
@@ -771,6 +799,14 @@ def build_cpsat_model(
     # allowed instead of the near-last-consumer window).  Their cancel-head
     # interval is gated absent when parked (below), so parking charges no head.
     parked_by_id: Dict[int, cp_model.IntVar] = {}
+    # `cancel_in_mlp[n]` == 1 routes n's death cancel to the MLP sublayer (a
+    # `cancel_bypass` op charged 2·len(n) hidden slots) instead of a batched
+    # attention cancel head.  Built only for non-keep-forever schedulable nodes;
+    # freeable inputs never get it (decision #3).  It relaxes the cancel bound
+    # to the uniform gap-0 `cl >= layer[c]` for every consumer (an MLP cancel
+    # fires after both sublayers' reads) and moves the cancel cost from the
+    # attention-head cumulative to the MLP-slot cumulative.
+    cancel_in_mlp: Dict[int, cp_model.IntVar] = {}
     # Add-consumer cancel lower bounds are posted AFTER the `is_free` booleans
     # exist (below): the gap between an addend's cancel and the Add's layer
     # depends on whether the Add runs in the free (reassign) regime.
@@ -783,14 +819,18 @@ def build_cpsat_model(
             model.Add(cl == max_layers)
             keep_forever_ids.add(n.node_id)
             continue
-        keep_forever = False
+        consumers = gm.consumers_eff.get(n, set())
+        if any(isinstance(c, Concatenate) for c in consumers):
+            # Consumed by a terminal Concatenate (output cone) — keep forever.
+            model.Add(cl == max_layers)
+            keep_forever_ids.add(n.node_id)
+            continue
+        # Non-keep-forever: this node gets a mechanism choice.
+        cim = model.NewBoolVar(f"cancel_in_mlp_n{n.node_id}")
+        cancel_in_mlp[n.node_id] = cim
         consumer_layer_vars: List[cp_model.IntVar] = []
         consumer_ids: List[int] = []
-        for c in gm.consumers_eff.get(n, set()):
-            if isinstance(c, Concatenate):
-                model.Add(cl == max_layers)
-                keep_forever = True
-                break
+        for c in consumers:
             if c.node_id in layer_var:
                 if "cancel_consumer_lb" not in _disabled_families:
                     # Intra-layer reuse: an attention-sublayer consumer reads
@@ -800,18 +840,22 @@ def build_cpsat_model(
                     # (gap 0).  An MLP-routed consumer reads post-attention
                     # state and keeps the layer-after bound (gap 1).
                     # `1 - is_attn[c]` is exactly that gap; presolve folds it
-                    # to a constant for pinned-routing consumers.  Add
-                    # consumers depend on the free/compute regime and are
-                    # posted after `is_free`.
+                    # to a constant for pinned-routing consumers.  Under an MLP
+                    # cancel the bound relaxes to the uniform gap-0 `cl >=
+                    # layer[c]` for every consumer — the MLP cancel fires after
+                    # both sublayers' reads (decision #1).  Add consumers depend
+                    # on the free/compute regime and are posted after `is_free`;
+                    # their `cl >= layer[A] + is_free[A]` stays unconditional
+                    # (decision #2) and already dominates the uniform MLP bound.
                     if isinstance(c, Add):
                         deferred_add_consumer_lbs.append((cl, c.node_id))
                     else:
-                        model.Add(cl >= layer_var[c.node_id] + 1 - is_attn[c.node_id])
+                        model.Add(
+                            cl >= layer_var[c.node_id] + 1 - is_attn[c.node_id]
+                        ).OnlyEnforceIf(cim.Not())
+                        model.Add(cl >= layer_var[c.node_id]).OnlyEnforceIf(cim)
                 consumer_layer_vars.append(layer_var[c.node_id])
                 consumer_ids.append(c.node_id)
-        if keep_forever:
-            keep_forever_ids.add(n.node_id)
-            continue
         if eff_cancel_slack is not None and consumer_layer_vars:
             delta = _widen_delta(n.node_id, _hinted_last_consumer(consumer_ids))
             last_cons = model.NewIntVar(0, max_layers - 1, f"last_cons_n{n.node_id}")
@@ -1028,6 +1072,11 @@ def build_cpsat_model(
 
     cancel_intervals: List = []
     cancel_demands: List[int] = []
+    # MLP-cancel cost intervals accumulate here and join the MLP-slot cumulative
+    # below (demand 2·len — the bypass lane-pair costs two hidden slots per
+    # column), positioned at the cancel layer rather than the compute layer.
+    mlp_cancel_intervals: List = []
+    mlp_cancel_demands: List[int] = []
     for n in gm.schedulable:
         if n in gm.pinned_nodes:
             continue
@@ -1039,22 +1088,54 @@ def build_cpsat_model(
         c_end = model.NewIntVar(1, max_layers + 1, f"cend_n{n.node_id}")
         model.Add(c_end == cancel_layer[n.node_id] + 1)
         parked = parked_by_id.get(n.node_id)
-        if parked is not None:
-            # Parked (cl == max_layers): the columns stay allocated to the end
-            # but no cancel head is ever charged, so the head interval is
-            # absent.  Gating it — rather than letting it pile demand at the
-            # virtual layer max_layers like keep-forever nodes do — keeps the
-            # attention-head cumulative from over-tightening when many nodes
-            # park at a width pinch.
+        cim = cancel_in_mlp.get(n.node_id)
+        if cim is not None:
+            # Non-keep-forever node: parked / attention-cancel / MLP-cancel are
+            # three mutually exclusive presences.  A dead value is either never
+            # freed in-horizon (parked, no cancel op runs), or its columns are
+            # zeroed by a batched attention cancel head (attention pool), or by
+            # a `cancel_bypass` MLP op (MLP-slot pool) — never two at once.  The
+            # gated intervals are pure COSTS; the boolean only moves the charge
+            # between pools, so even for a node whose death is actually a
+            # free-add `reassign` (no cancel op executes — a pre-existing
+            # phantom charge, see the residual-cumulative free-add note and
+            # plan §4b) the mechanism can never harvest an unreal saving.
+            attn_present = _and_presence(
+                model, parked, cim.Not(), name=f"cpres_attn_n{n.node_id}"
+            )
+            iv_attn = model.NewOptionalIntervalVar(
+                cancel_layer[n.node_id], 1, c_end, attn_present, f"civ_n{n.node_id}"
+            )
+            cancel_intervals.append(iv_attn)
+            cancel_demands.append(len(n))
+
+            mlp_present = _and_presence(
+                model, parked, cim, name=f"cpres_mlp_n{n.node_id}"
+            )
+            iv_mlp = model.NewOptionalIntervalVar(
+                cancel_layer[n.node_id], 1, c_end, mlp_present, f"civ_mlp_n{n.node_id}"
+            )
+            mlp_cancel_intervals.append(iv_mlp)
+            mlp_cancel_demands.append(2 * len(n))
+        elif parked is not None:
+            # Keep-forever-via-Concatenate nodes reach here only with no parked
+            # var; a parked var without a cancel_in_mlp var cannot occur (both
+            # are built for exactly the non-keep-forever set), but keep the
+            # branch structurally for safety.
             iv = model.NewOptionalIntervalVar(
                 cancel_layer[n.node_id], 1, c_end, parked.Not(), f"civ_n{n.node_id}"
             )
+            cancel_intervals.append(iv)
+            cancel_demands.append(len(n))
         else:
+            # Keep-forever-via-Concatenate (cl == max_layers): no mechanism
+            # choice; its cancel-head interval piles at the virtual layer
+            # max_layers like the pinned keep-forever nodes always have.
             iv = model.NewIntervalVar(
                 cancel_layer[n.node_id], 1, c_end, f"civ_n{n.node_id}"
             )
-        cancel_intervals.append(iv)
-        cancel_demands.append(len(n))
+            cancel_intervals.append(iv)
+            cancel_demands.append(len(n))
         # No BIRTH-layer dirty-column cancel: the runtime always
         # zero-initialises the residual stream (the ONNX embed-table
         # zero-scatter + get_input_res_stream contract), so a fresh
@@ -1112,14 +1193,38 @@ def build_cpsat_model(
         )
         mlp_intervals.append(iv)
         mlp_demands.append(s)
-    if "mlp_cumulative" not in _disabled_families and mlp_intervals:
-        model.AddCumulative(mlp_intervals, mlp_demands, d_hidden)
+    # MLP-cancel cost intervals (built in the cancel-interval loop above) share
+    # the same hidden-slot budget: a `cancel_bypass` at a node's cancel layer
+    # competes with FFN lanes and bypass Linears for the layer's d_hidden slots.
+    if "mlp_cumulative" not in _disabled_families and (
+        mlp_intervals or mlp_cancel_intervals
+    ):
+        model.AddCumulative(
+            mlp_intervals + mlp_cancel_intervals,
+            mlp_demands + mlp_cancel_demands,
+            d_hidden,
+        )
 
     # ---- Residual cumulative ----
     residual_nodes = [n for n in gm.schedulable if uses_residual(n, gm)]
     resid_intervals: List = []
     resid_demands: List[int] = []
     for n in residual_nodes:
+        # Residual-occupancy end.  An attention cancel frees the columns mid-
+        # attention-sublayer, so the node stops occupying at `cancel_layer`
+        # (`[layer, cancel)`).  An MLP cancel (`cancel_in_mlp == 1`) fires in the
+        # MLP sublayer — AFTER both sublayers' reads (decision #1) — so the
+        # columns stay live through the whole cancel layer and free only at its
+        # end: the node occupies `[layer, cancel + 1)`.  `end = cancel + cim`
+        # captures both.  Without the +1 the model would count an MLP-cancelled
+        # node's columns as free during the cancel layer's attention sublayer,
+        # where the replay still holds them — an unreplayable (I4) schedule.
+        cim = cancel_in_mlp.get(n.node_id)
+        if cim is not None:
+            rend = model.NewIntVar(1, max_layers + 1, f"rend_n{n.node_id}")
+            model.Add(rend == cancel_layer[n.node_id] + cim)
+        else:
+            rend = cancel_layer[n.node_id]
         if isinstance(n, Add) and n.node_id in is_free:
             # Free-add reuses a dead addend's already-allocated residual
             # columns (`reassign` in both `LayerScheduler._schedule_attn_
@@ -1140,17 +1245,15 @@ def build_cpsat_model(
             start = model.NewIntVar(0, max_layers, f"rstart_n{n.node_id}")
             model.Add(start == layer_var[n.node_id] + is_free[n.node_id])
             size = model.NewIntVar(0, max_layers + 1, f"rsz_n{n.node_id}")
-            model.Add(size == cancel_layer[n.node_id] - start)
-            iv = model.NewIntervalVar(
-                start, size, cancel_layer[n.node_id], f"riv_n{n.node_id}"
-            )
+            model.Add(size == rend - start)
+            iv = model.NewIntervalVar(start, size, rend, f"riv_n{n.node_id}")
         else:
             size = model.NewIntVar(1, max_layers + 1, f"rsz_n{n.node_id}")
-            model.Add(size == cancel_layer[n.node_id] - layer_var[n.node_id])
+            model.Add(size == rend - layer_var[n.node_id])
             iv = model.NewIntervalVar(
                 layer_var[n.node_id],
                 size,
-                cancel_layer[n.node_id],
+                rend,
                 f"riv_n{n.node_id}",
             )
         resid_intervals.append(iv)
@@ -1273,6 +1376,7 @@ def build_cpsat_model(
         cancel_layer=cancel_layer,
         is_attn=is_attn,
         is_free=is_free,
+        cancel_in_mlp=cancel_in_mlp,
         n_layers_var=n_layers_var,
         total_attn_heads=total_attn_heads,
         total_mlp_bypass=total_mlp_bypass,
@@ -1336,6 +1440,7 @@ def _validate_hint(
     hint_layers: Optional[Dict[int, int]],
     hint_routing: Optional[Dict[int, str]],
     hint_cancel: Optional[Dict[int, int]],
+    hint_cancel_mech: Optional[Dict[int, str]] = None,
     *,
     max_layers: int,
     strict: bool = False,
@@ -1444,6 +1549,7 @@ def _validate_hint(
                 f"cancel hint before birth+1: {_desc(nid)} cancel={L} " f"birth={birth}"
             )
         node = all_nodes.get(nid)
+        mech = (hint_cancel_mech or {}).get(nid, ATTN)
         hinted_cons: List[int] = []
         all_cons_hinted = True
         for c in gm.consumers_eff.get(node, set()):
@@ -1454,15 +1560,18 @@ def _validate_hint(
                 all_cons_hinted = False
                 continue
             hinted_cons.append(c_hint)
-            # Mirror the routing-aware cancel bound: an attention-routed
-            # consumer permits a same-layer cancel (gap 0); an MLP-routed
-            # consumer keeps the layer-after bound (gap 1).  Routing comes
-            # from the hint when present, else the model's pinned routing;
-            # flex consumers without a routing hint are checked leniently
-            # (gap 0).  Add consumers are also checked leniently — their true
-            # bound is `layer + is_free`, which the model enforces but a
-            # hint-only check cannot see (a deliberate validator blind spot).
-            if isinstance(c, Add):
+            # Mirror the mechanism-conditional cancel bound.  An MLP cancel
+            # fires after both sublayers' reads, so it permits gap 0 for EVERY
+            # consumer (attn or mlp).  An attention cancel keeps the routing-
+            # aware gap: an attention-routed consumer permits a same-layer
+            # cancel (gap 0); an MLP-routed consumer keeps the layer-after bound
+            # (gap 1).  Routing comes from the hint when present, else the
+            # model's pinned routing; flex consumers without a routing hint are
+            # checked leniently (gap 0).  Add consumers are also checked
+            # leniently — their true bound is `layer + is_free`, which the model
+            # enforces but a hint-only check cannot see (a deliberate blind
+            # spot).
+            if mech == MLP or isinstance(c, Add):
                 gap = 0
             else:
                 route = (hint_routing or {}).get(c.node_id)
@@ -1515,6 +1624,7 @@ def solve_schedule(
     hint_layers: Optional[Dict[int, int]] = None,
     hint_routing: Optional[Dict[int, str]] = None,
     hint_cancel: Optional[Dict[int, int]] = None,
+    hint_cancel_mech: Optional[Dict[int, str]] = None,
     cancel_slack: Optional[int] = 2,
     policy: Optional[SchedulingPolicy] = None,
     log_search_progress: bool = False,
@@ -1626,6 +1736,7 @@ def solve_schedule(
     layer_var = built.layer_var
     cancel_layer = built.cancel_layer
     is_attn = built.is_attn
+    cancel_in_mlp = built.cancel_in_mlp
     n_layers_var = built.n_layers_var
     total_attn_heads = built.total_attn_heads
     total_mlp_bypass = built.total_mlp_bypass
@@ -1639,12 +1750,16 @@ def solve_schedule(
     # discard them and explore alternatives — which is exactly why a
     # bad hint is validated loudly here instead of vanishing behind
     # the `if nid in ...` guards below.
-    if any(h is not None for h in (hint_layers, hint_routing, hint_cancel)):
+    if any(
+        h is not None
+        for h in (hint_layers, hint_routing, hint_cancel, hint_cancel_mech)
+    ):
         _validate_hint(
             built,
             hint_layers,
             hint_routing,
             hint_cancel,
+            hint_cancel_mech,
             max_layers=max_layers,
             strict=strict_hint,
         )
@@ -1656,6 +1771,10 @@ def solve_schedule(
         for nid, route in hint_routing.items():
             if nid in is_attn:
                 model.AddHint(is_attn[nid], 1 if route == ATTN else 0)
+    if hint_cancel_mech is not None:
+        for nid, mech in hint_cancel_mech.items():
+            if nid in cancel_in_mlp:
+                model.AddHint(cancel_in_mlp[nid], 1 if mech == MLP else 0)
     if hint_cancel is not None:
         for nid, L in hint_cancel.items():
             if nid in cancel_layer and 0 <= L <= max_layers:
@@ -1727,12 +1846,16 @@ def solve_schedule(
         node_to_layer: Dict[int, int] = {}
         node_to_cancel_layer: Dict[int, int] = {}
         node_to_routing: Dict[int, str] = {}
+        node_to_cancel_mech: Dict[int, str] = {}
         for n in gm.schedulable:
             node_to_layer[n.node_id] = solver.Value(layer_var[n.node_id])
             node_to_cancel_layer[n.node_id] = solver.Value(cancel_layer[n.node_id])
             node_to_routing[n.node_id] = (
                 ATTN if solver.Value(is_attn[n.node_id]) else MLP
             )
+            cim = cancel_in_mlp.get(n.node_id)
+            if cim is not None:
+                node_to_cancel_mech[n.node_id] = MLP if solver.Value(cim) else ATTN
         # Freeable inputs get a cancel layer (but no layer/routing — they are
         # pre-computed at layer 0).  ``DirectedLayerScheduler._find_dead_nodes``
         # frees any allocated node whose cancel layer matches the current
@@ -1748,6 +1871,7 @@ def solve_schedule(
             node_to_cancel_layer=node_to_cancel_layer,
             node_to_routing=node_to_routing,
             n_layers=n_layers,
+            node_to_cancel_mech=node_to_cancel_mech,
         )
     else:
         total_heads = -1

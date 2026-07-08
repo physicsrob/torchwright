@@ -81,6 +81,10 @@ def load_assignment(
             node_to_cancel_layer=_remap(data["node_to_cancel_layer"]),
             node_to_routing=_remap(data["node_to_routing"]),
             n_layers=data["n_layers"],
+            # Bare indexing (NOT .get): a pre-mechanism cache file lacks this
+            # key and must miss cleanly here, not fabricate a mechanism-less
+            # assignment that fails later inside the directed replay.
+            node_to_cancel_mech=_remap(data["node_to_cancel_mech"]),
         )
     except KeyError:
         # Canonical id absent from the current graph: the entry predates a
@@ -123,6 +127,9 @@ def store_assignment(
             if k in canon
         },
         "node_to_routing": {canon[k]: v for k, v in assignment.node_to_routing.items()},
+        "node_to_cancel_mech": {
+            canon[k]: v for k, v in assignment.node_to_cancel_mech.items() if k in canon
+        },
         "n_layers": assignment.n_layers,
         "meta": meta,
     }
