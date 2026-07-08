@@ -19,6 +19,7 @@ from torchwright.compiler.realization import RealizationTable
 from torchwright.compiler.residual_assignment import ResidualAssignment
 from torchwright.compiler.forward.cpsat_scheduler import (
     Costs,
+    ScheduleAssignment,
     SolveStats,
     solve_schedule,
 )
@@ -514,6 +515,58 @@ def _verify_end_of_layer_liveness(
             f"{len(uncomputed)} uncomputed consumer(s) "
             f"(e.g. {sample}) but is not allocated in residual_map. "
             f"free_count={residual_map.get_free_count()}."
+        )
+
+
+def _check_replay_depth(
+    assignment: ScheduleAssignment,
+    replay_birth_layer: dict[int, int],
+    emitted_layers: int,
+) -> None:
+    """Replay-depth tripwire (optimality gap #5).
+
+    A faithful ``DirectedLayerScheduler`` replay computes every schedulable
+    node at exactly ``assignment.node_to_layer[n]`` and therefore emits
+    exactly ``assignment.n_layers`` transformer layers.  A divergence means
+    the machine ran a schedule the model never proved optimal — an executor
+    gap (a model degree of freedom with no replay executor) or a cost-model
+    under-charge that forced a deferral — shipping a valid-but-deeper
+    transformer that, absent this check, only the global ``max_layers``
+    convergence guard would ever notice.
+
+    Raises ``RuntimeError`` naming the first divergent layer.
+    """
+    n2l = assignment.node_to_layer
+    # Placement divergence: the earliest schedulable node whose replayed
+    # birth layer differs from its assigned layer (the executor-slip case).
+    first_bad: Optional[tuple[int, int, int, int]] = None
+    for node_id, assigned in n2l.items():
+        actual = replay_birth_layer.get(node_id)
+        if actual is not None and actual != assigned:
+            layer = min(assigned, actual)
+            if first_bad is None or layer < first_bad[0]:
+                first_bad = (layer, node_id, assigned, actual)
+    if first_bad is not None:
+        layer, node_id, assigned, actual = first_bad
+        raise RuntimeError(
+            f"Replay-depth tripwire (gap #5): node {node_id} was assigned to "
+            f"layer {assigned} but the replay computed it at layer {actual} "
+            f"(first divergence at layer {layer}).  The machine ran a schedule "
+            f"the CP-SAT model never proved: emitted {emitted_layers} layers, "
+            f"assignment claims {assignment.n_layers}."
+        )
+    if emitted_layers != assignment.n_layers:
+        # Placements all matched node_to_layer, yet the emitted depth
+        # disagrees with the claimed n_layers: the assignment's own makespan
+        # is internally inconsistent (a node assigned at or beyond n_layers).
+        makespan = max(n2l.values()) + 1 if n2l else 0
+        first_over = min(assignment.n_layers, makespan)
+        raise RuntimeError(
+            f"Replay-depth tripwire (gap #5): replay emitted {emitted_layers} "
+            f"layers but the assignment claims n_layers={assignment.n_layers} "
+            f"(node_to_layer makespan {makespan}); first layer beyond the "
+            f"claimed depth is {first_over}.  The machine shipped a "
+            f"valid-but-deeper transformer than the model proved optimal."
         )
 
 
@@ -1313,13 +1366,20 @@ def forward_compile(
     total_params = sum(n.num_params() for n in input_nodes)
     total_layer_time = 0.0
     per_layer_head_counts: list[dict[str, int]] = []
+    # Replay-depth tripwire (gap #5): on the directed replay, record the
+    # layer each schedulable node was actually computed at, so the
+    # post-loop check can compare it against ``assignment.node_to_layer``.
+    directed_replay = isinstance(scheduler, DirectedLayerScheduler)
+    replay_birth_layer: dict[int, int] = {}
     for i in range(max_layers):
         if output_node in computed:
             break
 
         verify_compiler = bool(os.environ.get("TW_COMPILER_VERIFY"))
         prev_computed = (
-            set(computed) if (on_node_scheduled or verify_compiler) else None
+            set(computed)
+            if (on_node_scheduled or verify_compiler or directed_replay)
+            else None
         )
         prev_allocated = (
             set(residual_map.get_allocated_nodes()) if verify_compiler else None
@@ -1381,9 +1441,14 @@ def forward_compile(
             )
             _verify_end_of_layer_liveness(graph, residual_map, computed, i)
 
-        if on_node_scheduled is not None and prev_computed is not None:
-            for node in computed - prev_computed:
-                on_node_scheduled(node, i)
+        if prev_computed is not None:
+            newly_computed = computed - prev_computed
+            if directed_replay:
+                for node in newly_computed:
+                    replay_birth_layer[node.node_id] = i
+            if on_node_scheduled is not None:
+                for node in newly_computed:
+                    on_node_scheduled(node, i)
 
         layer_params = _count_layer_params(
             attn_ops, mlp_ops, d, d_head, activation, bias
@@ -1428,6 +1493,13 @@ def forward_compile(
             f"Compilation did not converge in {max_layers} layers. "
             f"{len(graph.get_all_nodes() - computed)} nodes remaining."
         )
+
+    # Replay-depth tripwire (gap #5): the directed replay must emit exactly
+    # the depth the CP-SAT assignment claims.  Runs on the solved and the
+    # cache-replayed directed paths alike (both set `assignment`); the eager
+    # fallback (`assignment is None`) has no claimed depth to check.
+    if directed_replay and assignment is not None:
+        _check_replay_depth(assignment, replay_birth_layer, len(net.layers))
 
     # layer_capacity is constant per layer; avoids touching layer tensors,
     # which may have been freed by on_layer_compiled.
