@@ -755,6 +755,9 @@ def forward_compile(
     rms_norm_eps: float = 1e-5,
     rms_norm_const_exp: int = _RMS_NORM_CONST_EXP,
     bias: bool = True,
+    _disabled_families: frozenset = frozenset(),
+    _solver_seed: Optional[int] = None,
+    _force_resolve: bool = False,
 ) -> HeadlessTransformer:
     """Compile a computation graph into a HeadlessTransformer.
 
@@ -838,10 +841,31 @@ def forward_compile(
             ``d_hidden >= 2``.  In-process bias tensors remain as zeros so
             probes and debug work unchanged; the ONNX exporter emits no
             bias initializers.  See docs/no_bias_plan.md.
+        _disabled_families: MEASUREMENT-ONLY (CP-SAT expressiveness plan §0
+            gap attribution); never set in production configs.  A non-empty
+            set of :data:`cpsat_scheduler.CONSTRAINT_FAMILIES` names puts the
+            compile into *solve-only diagnostic* mode: the production solve
+            runs with those constraint families disabled and forward_compile
+            returns immediately after the solve — before the replay — with
+            the assignment on ``net.cpsat_assignment`` and the solve metadata
+            on ``net.cpsat_solve_stats``.  A relaxed feasible set is a
+            superset of the sound one, so the returned schedule is a valid
+            LOWER BOUND on the sound optimum but is NOT sound to replay (it
+            can require more residual columns / heads than exist); it is
+            never replayed, exported, or written to the schedule cache.  The
+            returned net therefore has no compiled layers.
+        _solver_seed: MEASUREMENT-ONLY.  When set (and ``optimize>0``), seeds
+            the CP-SAT solver's ``random_seed`` so the multi-seed draw
+            protocol (§0) can sample the descent lottery reproducibly.
+        _force_resolve: MEASUREMENT-ONLY.  Skip the schedule-cache lookup so
+            a measured solve always re-solves instead of replaying a cached
+            draw (a cached hit would silently replace the measurement).
 
     Returns:
         A HeadlessTransformer whose compute() method reproduces
-        output_node.compute() for the same inputs.
+        output_node.compute() for the same inputs.  In ``_disabled_families``
+        solve-only mode the returned net carries only the solve outputs
+        (``cpsat_assignment`` / ``cpsat_solve_stats``) and cannot compute.
     """
     # 0. Lowering boundary: certify vocabulary and build the
     # compiler-private copy (docs/lowering_copy_plan.md).  Compilation is
@@ -1074,7 +1098,15 @@ def forward_compile(
             reserve_residual=n_reserved_residual,
             bias=bias,
         )
-        cached = load_assignment(schedule_fp, output_node)
+        # Measurement modes bypass the cache: _force_resolve forces a fresh
+        # solve, and a relaxed (_disabled_families) solve must never read a
+        # cached SOUND schedule (same fingerprint) as if it were the relaxed
+        # answer.
+        cached = (
+            None
+            if (_force_resolve or _disabled_families)
+            else load_assignment(schedule_fp, output_node)
+        )
         if cached is not None:
             assignment, _cached_meta = cached
             if verbose:
@@ -1181,6 +1213,14 @@ def forward_compile(
                 hint_cancel=hint_cancel if hint_cancel else None,
                 hint_cancel_mech=hint_cancel_mech if hint_cancel_mech else None,
                 log_search_progress=verbose,
+                # Measurement-only knobs (§0 gap attribution); empty / None
+                # in production.
+                _disabled_families=_disabled_families,
+                solver_params=(
+                    {"random_seed": _solver_seed}
+                    if _solver_seed is not None
+                    else None
+                ),
             )
             # Surface the solver provenance on the returned net so
             # callers can distinguish a real solve from a fallback
@@ -1188,7 +1228,10 @@ def forward_compile(
             # ``is_optimal``, the LB/objective gap).
             net.cpsat_solve_stats = _stats
 
-            if assignment is not None:
+            # A relaxed (_disabled_families) schedule is unsound to replay, so
+            # it must never poison the fingerprint-keyed cache that production
+            # compiles replay from.
+            if assignment is not None and not _disabled_families:
                 if (
                     store_assignment(
                         schedule_fp,
@@ -1211,6 +1254,24 @@ def forward_compile(
                         f"  CP-SAT schedule cached ({schedule_fp[:12]}...): "
                         f"n_layers={assignment.n_layers}"
                     )
+
+        # Solve-only diagnostic (§0 gap attribution).  A relaxed schedule is a
+        # valid lower bound on the sound optimum but is unsound to replay, so
+        # return the solve outputs now — before building the directed replay —
+        # and never compile it.  ``cpsat_solve_stats`` (set above) carries the
+        # proven bound / optimality; ``cpsat_assignment`` carries n_layers.
+        if _disabled_families:
+            net.cpsat_assignment = assignment
+            if verbose:
+                claim = "no feasible incumbent" if assignment is None else (
+                    f"n_layers={assignment.n_layers}"
+                )
+                print(
+                    f"  solve-only diagnostic (disabled={sorted(_disabled_families)}): "
+                    f"{claim}, bound={net.cpsat_solve_stats.best_objective_bound}"
+                )
+            return net
+
         if assignment is None:
             # CP-SAT found no feasible incumbent within budget — fall
             # back to the heuristic schedule.  The warm-start was a

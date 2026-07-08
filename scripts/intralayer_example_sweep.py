@@ -50,6 +50,24 @@ from torchwright.compiler.lower import lower
 
 _RELAX = frozenset({"mlp_cancel_occupancy"})
 
+# Full per-family relaxation set for the CP-SAT expressiveness plan §0 gap
+# attribution.  Each is disabled ALONE (never combined) in a solve-only
+# re-solve; ``sound - relaxed`` attributes that family's bindingness on this
+# graph.  ``cancel_consumer_lb`` and ``dependency`` are sanity-only (unsound,
+# expected to drop far — the LB collapses / the schedule lands below the
+# critical-path floor); they confirm the harness reacts, they are not gaps to
+# close.  Example graphs solve to proven-optimal, so their family drops are
+# authoritative (DOOM's are directional — plan §0 bound-directions rule).
+_FAMILY_SWEEP = [
+    "residual_cumulative",
+    "attn_cumulative",
+    "mlp_cumulative",
+    "cancel_slack",
+    "mlp_cancel_occupancy",
+    "cancel_consumer_lb",
+    "dependency",
+]
+
 
 def _build_bucketed_argmin():
     from torchwright.graph import InputNode
@@ -145,14 +163,20 @@ def _compile_layers(out, d, d_head, optimize) -> Tuple[Optional[int], str]:
     return n, ("solver" if solved else "fallback")
 
 
-def _solve_layers(low_out, d, d_head, budget, disabled) -> Tuple[Optional[int], bool]:
-    """Solve-only (never compiled): (n_layers, is_optimal) or (None, False).
+def _solve_layers(
+    low_out, d, d_head, budget, disabled
+) -> Tuple[Optional[int], bool, Optional[float]]:
+    """Solve-only (never compiled): (n_layers, is_optimal, proven_bound).
+
+    Returns ``(None, False, None)`` on no-solution / raise.  The proven bound
+    (``SolveStats.best_objective_bound``) is a certified lower bound on the
+    sound optimum — recorded per family per the plan §0 honest-ledger rule.
 
     ``low_out`` is the LOWERED output node — forward_compile schedules the
     lowered graph (collapse passes), so a raw-graph solve would over-count.
     Uses ``SchedulingPolicy()`` and ``tighten_domains`` to match the compile;
-    the only intended difference between the sound and relaxed calls is
-    ``disabled`` (the MLP-cancel occupancy relaxation)."""
+    the only intended difference between calls is ``disabled`` (the relaxed
+    constraint family)."""
     try:
         asg, stats = solve_schedule(
             low_out,
@@ -166,10 +190,10 @@ def _solve_layers(low_out, d, d_head, budget, disabled) -> Tuple[Optional[int], 
             _disabled_families=disabled,
         )
     except Exception:  # noqa: BLE001
-        return None, False
+        return None, False, None
     if asg is None:
-        return None, False
-    return asg.n_layers, stats.is_optimal
+        return None, False, stats.best_objective_bound
+    return asg.n_layers, stats.is_optimal, stats.best_objective_bound
 
 
 def _lower(out, d):
@@ -225,36 +249,55 @@ def sweep(graphs: List[str], budget: float, n_points: int):
             except Exception:  # noqa: BLE001
                 low_out = None
             if low_out is not None:
-                sound_n, sound_opt = _solve_layers(
+                sound_n, sound_opt, sound_bound = _solve_layers(
                     low_out, d, d_head, budget, frozenset()
                 )
-                relax_n, relax_opt = _solve_layers(low_out, d, d_head, budget, _RELAX)
+                # Full per-family sweep: each family disabled alone (§0).
+                fam: Dict[str, dict] = {}
+                for family in _FAMILY_SWEEP:
+                    fn, fopt, fbound = _solve_layers(
+                        low_out, d, d_head, budget, frozenset({family})
+                    )
+                    fam[family] = dict(n=fn, opt=fopt, bound=fbound)
             else:
-                sound_n, sound_opt, relax_n, relax_opt = None, False, None, False
+                sound_n, sound_opt, sound_bound = None, False, None
+                fam = {f: dict(n=None, opt=False, bound=None) for f in _FAMILY_SWEEP}
             dt = time.perf_counter() - t0
             row = dict(
                 d=d,
+                floor=cp_lb,
                 opt0=n0,
                 opt0_status=s0,
                 opt1=n1,
                 opt1_status=s1,
                 sound=sound_n,
                 sound_opt=sound_opt,
-                relaxed=relax_n,
-                relaxed_opt=relax_opt,
+                sound_bound=sound_bound,
+                families=fam,
+                # ``relaxed`` kept for the legacy phase-gate verdict (gap #1).
+                relaxed=fam["mlp_cancel_occupancy"]["n"],
+                relaxed_opt=fam["mlp_cancel_occupancy"]["opt"],
                 secs=round(dt, 1),
             )
             rows.append(row)
-            gap = (
-                (sound_n - relax_n)
-                if (sound_n is not None and relax_n is not None)
-                else None
-            )
+
+            def _drop(family: str) -> str:
+                fn = fam[family]["n"]
+                if fn is None or sound_n is None:
+                    return "  -"
+                return f"{sound_n - fn:>3}"
+
             print(
-                f"  d={d:>5}  opt0={_fmt(n0)}({s0:<9})  opt1={_fmt(n1)}({s1:<8})  "
-                f"sound={_fmt(sound_n)}{'*' if sound_opt else '~'}  "
-                f"relaxed={_fmt(relax_n)}{'*' if relax_opt else '~'}  "
-                f"gap#1={_fmt(gap)}  [{dt:.0f}s]",
+                f"  d={d:>5} floor={cp_lb:>2}  opt0={_fmt(n0)}({s0:<9}) "
+                f"opt1={_fmt(n1)}({s1:<8}) sound={_fmt(sound_n)}"
+                f"{'*' if sound_opt else '~'}  drop: "
+                f"resid={_drop('residual_cumulative')} "
+                f"attn={_drop('attn_cumulative')} "
+                f"mlp={_drop('mlp_cumulative')} "
+                f"cslack={_drop('cancel_slack')} "
+                f"mlpcanc={_drop('mlp_cancel_occupancy')} "
+                f"[clb={_drop('cancel_consumer_lb')} "
+                f"dep={_drop('dependency')}]  [{dt:.0f}s]",
                 flush=True,
             )
         results[name] = rows
@@ -319,6 +362,9 @@ def main():
     ap.add_argument("--graphs", nargs="*", default=None)
     ap.add_argument("--budget", type=float, default=15.0)
     ap.add_argument("--points", type=int, default=3)
+    ap.add_argument(
+        "--json", default=None, help="write the full per-family results as JSON"
+    )
     args = ap.parse_args()
     all_names = list(_example_specs().keys())
     graphs = args.graphs or all_names
@@ -326,7 +372,13 @@ def main():
     if unknown:
         raise SystemExit(f"unknown graphs {sorted(unknown)}; valid: {all_names}")
     torch.manual_seed(0)
-    sweep(graphs, args.budget, args.points)
+    results = sweep(graphs, args.budget, args.points)
+    if args.json:
+        import json
+
+        with open(args.json, "w", encoding="utf-8") as fh:
+            json.dump(results, fh, indent=2)
+        print(f"\nwrote {args.json}")
 
 
 if __name__ == "__main__":

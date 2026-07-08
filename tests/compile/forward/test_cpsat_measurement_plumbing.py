@@ -1,0 +1,101 @@
+"""Measurement-only plumbing for CP-SAT gap attribution (Unit 0, plan §0).
+
+``forward_compile`` threads three measurement knobs down to
+``solve_schedule`` so the gap-attribution sweep can run *through the real
+compile path* (plan decision #2) rather than a standalone replica:
+
+* ``_disabled_families`` — a solve-only diagnostic: solve with the named
+  constraint families relaxed, return the assignment/stats before the
+  replay, never compile or cache the (unsound) relaxed schedule;
+* ``_solver_seed`` — seed the descent lottery reproducibly;
+* ``_force_resolve`` — skip the schedule cache so a measured solve
+  re-solves instead of replaying a cached draw.
+"""
+
+import pytest
+import torch
+
+from torchwright.compiler.forward.compile import forward_compile
+from torchwright.compiler.forward.schedule_cache import graph_fingerprint
+from torchwright.graph import Concatenate, Linear
+from torchwright.ops.inout_nodes import create_input
+
+
+def _width_graph():
+    torch.manual_seed(1)
+    x = create_input("x", 4)
+    mids = []
+    for i in range(6):
+        li = Linear(x, torch.randn(4, 12), torch.zeros(12), name=f"L{i}")
+        mids.append(Linear(li, torch.randn(12, 2), torch.zeros(2), name=f"Ma{i}"))
+        mids.append(Linear(li, torch.randn(12, 2), torch.zeros(2), name=f"Mb{i}"))
+    return Linear(Concatenate(mids), torch.randn(24, 4), torch.zeros(4), name="out")
+
+
+def _compile(out, **kw):
+    return forward_compile(
+        d=80, d_head=80, output_node=out, device="cpu", verbose=False,
+        optimize=1, **kw,
+    )
+
+
+def test_disabled_families_is_solve_only():
+    """A relaxed solve returns the assignment + stats without replaying: zero
+    compiled layers, and the relaxed depth is a lower bound on the sound one
+    (``dependency`` relaxed lands strictly below, the §0 sanity family)."""
+    sound = _compile(_width_graph())
+    assert len(sound.layers) > 0  # sound path compiles + replays
+    sound_n = sound.cpsat_solve_stats.objective_value
+
+    relaxed = _compile(_width_graph(), _disabled_families=frozenset({"dependency"}))
+    assert len(relaxed.layers) == 0  # never replayed
+    assert relaxed.cpsat_assignment is not None
+    assert relaxed.cpsat_assignment.n_layers <= sound_n
+    # best_objective_bound is a certified lower bound on the sound optimum.
+    assert relaxed.cpsat_solve_stats.best_objective_bound <= sound_n
+
+
+def test_relaxed_solve_never_touches_the_cache(tmp_path, monkeypatch):
+    """A relaxed solve must neither read a cached sound schedule nor write its
+    own (unsound) schedule into the fingerprint-keyed cache the production
+    compile replays from."""
+    monkeypatch.setenv("TW_SCHEDULE_CACHE_DIR", str(tmp_path))
+
+    # A sound compile populates the cache.
+    _compile(_width_graph())
+    entries = list(tmp_path.glob("*.json"))
+    assert len(entries) == 1, "sound compile should cache its schedule"
+
+    # A relaxed solve writes nothing new (and does not overwrite the sound one).
+    before = entries[0].read_text()
+    _compile(_width_graph(), _disabled_families=frozenset({"mlp_cancel_occupancy"}))
+    assert list(tmp_path.glob("*.json")) == entries
+    assert entries[0].read_text() == before
+
+
+def test_force_resolve_bypasses_a_cached_schedule(tmp_path, monkeypatch):
+    """``_force_resolve`` re-solves even when a cache entry exists (a cached
+    hit would otherwise silently stand in for the measurement)."""
+    monkeypatch.setenv("TW_SCHEDULE_CACHE_DIR", str(tmp_path))
+
+    cached = _compile(_width_graph())
+    assert cached.cpsat_solve_stats.status_name in ("OPTIMAL", "FEASIBLE")
+
+    hit = _compile(_width_graph())
+    assert hit.cpsat_solve_stats.status_name == "CACHED"
+
+    fresh = _compile(_width_graph(), _force_resolve=True)
+    assert fresh.cpsat_solve_stats.status_name != "CACHED"
+    assert len(fresh.layers) == len(cached.layers)
+
+
+def test_solver_seed_is_accepted_and_replays():
+    """A seeded solve still produces a sound, replayable schedule (the seed
+    only perturbs the search, never soundness)."""
+    graph = _width_graph()
+    net = _compile(graph, _solver_seed=12345)
+    assert len(net.layers) > 0
+    inp = torch.randn(3, 4)
+    ref = graph.compute(3, {"x": inp})
+    got = net.compute(3, {"x": inp})[graph]
+    assert torch.allclose(got.cpu(), ref, atol=1e-3)

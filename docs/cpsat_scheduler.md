@@ -126,16 +126,24 @@ The solver guarantees:
 - `node_to_routing[n]` is either `"attn"` or `"mlp"` — which sublayer
   of `node_to_layer[n]` runs the op.
 
-A **chain** is a triple `(L1, R, L2)` where `L1` is a `Linear`, `R` is
-a `ReLU` reading from `L1`, and `L2` is a `Linear` reading from `R`,
-with each link being the unique consumer/producer at that point. Chain
-detection runs once at the start of `solve_schedule`; once detected, a
-chain is **atomic** — the solver always schedules its three nodes into
-one MLP sublayer at the same layer (`L1`'s compute happens inline
-inside the MLP's `linear1`, `R` is the chain's hidden activation living
-in `linear1`'s slots, and `L2` is the chain's residual-stream output).
-**Chain-internal** nodes (any of `L1`, `R`, `L2` of a detected chain)
-share a `node_to_layer` value and all carry routing `"mlp"`.
+The MLP composite is a single **`FFN`** node (`torchwright/graph/ffn.py`)
+— a feed-forward unit with `n_lanes` hidden lanes: a gate projection, an
+optional up projection, and an output projection, with `act` either
+`"relu"` or `"swish"`. Graph lowering builds the `FFN` before scheduling,
+so the solver sees one schedulable node, not a triple. It always runs in
+the MLP sublayer (`is_attn` pinned to `0`) and carries routing `"mlp"`;
+its `n_lanes` hidden lanes live in the MLP hidden-slot pool
+(`demand_hidden_slots(FFN) == n_lanes`) while its output uses residual
+columns like any other node.
+
+> **Historical note.** Earlier revisions detected a `(L1, R, L2)` chain
+> triple (`Linear → ReLU → Linear`) and scheduled it atomically, with
+> "chain-internal" nodes and an "exclusive `L1`" that got no residual
+> columns. That model is gone: the composite is now the single `FFN`
+> node above, `uses_residual` is unconditionally `True` for every
+> schedulable node (`cpsat_scheduler.py:uses_residual`), and the word
+> "chain" no longer appears in the scheduler. Passages below that still
+> say "chain" are describing the retired model.
 
 ### `DirectedLayerScheduler`
 
@@ -191,17 +199,12 @@ Per schedulable node `n`:
   Within-layer reuse* for the mechanism and the `[layer, cancel + 1)`
   occupancy it implies.
 - `is_attn[n]` — boolean. Pinned to 1 for `Attn` and `Add`. Pinned to
-  0 for standalone `ReLU`, `LiteralValue`, chain `R`, chain `L2`, and
-  exclusive chain `L1`. For standalone `Linear` nodes (Linears outside
-  any chain) and non-exclusive chain `L1` the value is free under
-  `flex_routing=True` and pinned per `policy` under
-  `flex_routing=False`. Non-exclusive `L1` is the chain `L1` whose
-  standalone realization (writing `L1`'s value to its own residual
-  cols for the non-chain consumers) runs as a separate op alongside
-  the chain composite — it consumes attention heads when
-  `is_attn[L1]=1` or MLP-bypass slots when `is_attn[L1]=0`, additive
-  on top of the chain composite's `len(R)` MLP slots at the same
-  layer.
+  0 for `LiteralValue` and `FFN` (the `FFN` composite always runs in the
+  MLP sublayer). For standalone `Linear` nodes the value is free under
+  `flex_routing=True` and pinned per `policy` under `flex_routing=False`
+  — the standalone `Linear` is the only flex-routed node. (The retired
+  chain model also had a flex "non-exclusive `L1`"; see the §2 historical
+  note.)
 
 For each `Add` node `A`:
 
@@ -214,16 +217,11 @@ For each `Add` node `A`:
   (terminal `Concatenate`) is forced not-dead, matching
   `LayerScheduler._is_dead_for_add`.
 
-Per chain (defined in §2) the three nodes' `layer_var` are constrained
-equal — the chain runs as a single composite in the MLP sublayer of
-its layer.
-
-A chain's `L1` is **exclusive** if its only graph consumer is the
-chain's `R`. An exclusive `L1` has no residual position of its own —
-its value is computed inline inside `linear1` from its input's
-residual columns and only ever lives in the MLP hidden slots. A
-non-exclusive `L1` has additional consumers and so needs a residual
-position alongside the chain.
+The `FFN` composite (defined in §2) is a single node with one
+`layer_var`, scheduled in the MLP sublayer of its layer; there is no
+multi-node atomicity constraint to impose (the retired chain model
+constrained the three `(L1, R, L2)` `layer_var`s equal — see the §2
+historical note).
 
 ### Dependency constraints
 
@@ -293,9 +291,11 @@ Forward: from `H_a · d_head + (cancel_cols + dirty_cols) ≤ n_heads
 `d_head` and use `cancel_cols + dirty_cols ≤
 ⌈(cancel_cols + dirty_cols)/d_head⌉ · d_head`.
 
-The DEATH and BIRTH terms only run for residual-using nodes —
-chain-internal exclusive `L1` and chain-internal `ReLU` live in MLP
-hidden slots, not residual, so they have no columns to cancel.
+The DEATH and BIRTH terms run for every residual-using node — which,
+since `uses_residual` is now unconditionally `True`, is every
+schedulable node. (Under the retired chain model an exclusive `L1` and
+the chain-internal `ReLU` lived only in MLP hidden slots and had no
+residual columns to cancel; those node kinds no longer exist.)
 
 **BIRTH-dirty is over-conservative under `assume_zero_init=False`.**
 The model charges a full-width BIRTH-dirty cancel to *every* fresh
@@ -320,16 +320,11 @@ non-zero residual stream to `forward()` directly.
 - For each MLP-routed standalone `Linear` `n`: an optional unit-width
   interval at `layer_var[n]` gated by `¬is_attn[n]`. Demand
   `2 · n.d_output` (MLP bypass slots).
-- For each non-exclusive chain `L1`: an optional unit-width interval
-  at `layer_var[L1]` gated by `¬is_attn[L1]`. Demand
-  `2 · L1.d_output` for the standalone realization in MLP-bypass.
-  Additive on top of the chain composite's slot demand at the same
-  layer.
-- For each standalone `ReLU` `n`: an optional unit-width interval
-  gated by `¬is_attn[n]`. Demand `len(n)`.
-- For each L1→ReLU→L2 chain: a regular unit-width interval at
-  `layer_var[chain.relu]`, demand `len(chain.relu)` (the chain's
-  hidden width).
+- For each `FFN` `n`: a unit-width interval at `layer_var[n]`, demand
+  `n.n_lanes` (its hidden lanes). The `FFN` is pinned to MLP
+  (`is_attn = 0`), so the interval is unconditional. Its per-node hidden
+  demand is `demand_hidden_slots(FFN) = n_lanes`
+  (`cpsat_scheduler.py`).
 
 **Residual column budget.** Capacity `d − len(pos_encoding)`.  Only
 `pos_encoding` is reserved for the whole schedule (the attention
@@ -363,10 +358,15 @@ sublayer reads it at nearly every layer); every other input node is
   DEATH-layer cancel interval to the attention-head cumulative (its
   columns must be zeroed before reuse).
 
-`uses_residual(n)` is `False` for chain-internal `ReLU` (lives in
-MLP hidden slots, not residual) and exclusive chain L1 (computed
-inline inside `linear1` from its input's residual columns, never
-written back to the stream). True for everything else.
+`uses_residual(n)` is now unconditionally `True`
+(`cpsat_scheduler.py:uses_residual`): every schedulable node — `FFN`,
+`Linear`, `Add`, `Attn`, `LiteralValue` — writes its output to the
+residual stream and gets its own column allocation. (The `FFN`'s
+internal hidden lanes live in MLP hidden slots, not the residual, but
+that is the slot budget above, not a residual allocation.) The retired
+chain model returned `False` here for chain-internal `ReLU` and
+exclusive `L1`; those node kinds no longer exist as separate
+schedulable nodes.
 
 **Within-layer (intra-layer) reuse IS modelled — the two cancel
 mechanisms (Units 1–2).**  Freeing a dead node's columns and reusing
@@ -465,15 +465,13 @@ The model is sound for graphs and configurations satisfying:
   control on, the solver may produce schedules the replay cannot
   honor; `forward_compile` raises if you combine `optimize > 0`
   with `admission_control=True`.
-- Chains are atomic. A chain `(L1, R, L2)` (defined in §2) is always
-  scheduled as one MLP composite; the model does not consider
-  splitting a chain into separate ops. Chain `L1` may have a
-  separate standalone realization (when non-exclusive), modeled
-  separately via `is_attn[L1]`.
-- Standalone Linears and non-exclusive chain `L1` are the only
-  flex-routing-eligible node types. `Attn`, `Add`, standalone
-  `ReLU`, `LiteralValue`, chain `R`, chain `L2`, and exclusive chain
-  `L1` have routing fixed by their type.
+- The `FFN` composite (defined in §2) is a single MLP-sublayer node;
+  the model does not consider splitting it. (The retired chain model
+  scheduled a `(L1, R, L2)` triple atomically — see the §2 historical
+  note.)
+- Standalone `Linear` is the only flex-routing-eligible node type.
+  `Attn`, `Add`, `FFN`, and `LiteralValue` have routing fixed by their
+  type (`FFN` and `LiteralValue` to MLP, `Attn`/`Add` to attention).
 
 ## 4. API
 

@@ -1346,6 +1346,8 @@ def compile_to_onnx(
     rms_norm_eps: float = 1e-5,
     rms_norm_const_exp: Optional[int] = None,
     bias: bool = True,
+    _solver_seed: Optional[int] = None,
+    _force_resolve: bool = False,
 ) -> OnnxArtifact:
     """Compile a token-I/O graph to a KV-cached ONNX model.
 
@@ -1424,6 +1426,14 @@ def compile_to_onnx(
     affect bit-exactness.  ``rms_norm_const_exp`` (``q``) overrides the
     pinned-constant exponent for a graph whose deepest-layer energy needs
     more margin (see ``forward_compile``).
+
+    ``_solver_seed`` / ``_force_resolve`` are MEASUREMENT-ONLY (CP-SAT
+    expressiveness plan §0) and never set in production configs: they thread
+    a reproducible descent seed and a schedule-cache bypass to
+    ``forward_compile`` so the sound production draw can be sampled across
+    seeds through this real export path.  The relaxed (``_disabled_families``)
+    solve-only diagnostic is deliberately NOT exposed here — a relaxed
+    schedule is never exported; use ``forward_compile`` directly for it.
     """
     # Validate the cache config up front — a ValueError after the
     # (potentially very long) streaming compile would waste the whole run.
@@ -1481,6 +1491,10 @@ def compile_to_onnx(
         optimize=optimize,
         bias=bias,
         d_hidden=d_hidden,
+        # Measurement-only (§0): reproducible descent seed + fresh-solve for
+        # the sound production draw.  Never set in production configs.
+        _solver_seed=_solver_seed,
+        _force_resolve=_force_resolve,
         rms_norm=rms_norm_on,
         rms_norm_eps=rms_norm_eps,
         # None -> forward_compile's default q; an explicit value tunes the
