@@ -409,12 +409,20 @@ class SchedulingProblem:
         reserve_heads: int = 0,
         max_layers: int = 60,
         bias: bool = True,
+        fingerprint_d_hidden: Optional[int] = None,
     ) -> "SchedulingProblem":
         """Attach identity metadata (fingerprint + critical path + geometry).
 
         Kept separate from structural capture so the production build path (via
         :func:`snapshot_from_graph_model`) pays no fingerprint-hashing cost;
         only the fixture generator calls this.
+
+        ``d_hidden`` is the value the model is *built* with (stored in
+        ``geometry`` and passed to :func:`build_model_from_snapshot`).
+        ``fingerprint_d_hidden`` overrides only the fingerprint's ``d_hidden``
+        so the stored identity matches the production schedule-cache key —
+        ``forward_compile`` keys the cache on the raw ``d_hidden`` but solves
+        with ``d_hidden - 1`` when ``bias=False`` (the reserved constant lane).
         """
         from dataclasses import asdict as _asdict
 
@@ -422,7 +430,7 @@ class SchedulingProblem:
             output_node,
             d=d,
             d_head=d_head,
-            d_hidden=d_hidden,
+            d_hidden=d_hidden if fingerprint_d_hidden is None else fingerprint_d_hidden,
             flex_routing=flex_routing,
             cancel_slack=cancel_slack,
             policy=policy,
