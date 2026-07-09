@@ -432,13 +432,16 @@ def test_descent_valid_compile_on_width_starved_graph():
     # is infeasible by construction.  Each Li feeds TWO Ms so the
     # lowering boundary's linear fusion can't absorb it (multi-consumer),
     # and the Mi->out concat fold is declined by the parameter guard
-    # (12->2 bottleneck against a width-4 output).
-    mids = []
+    # (12->2 bottleneck against a width-4 output).  The concat groups all
+    # Ma's before all Mb's so no two adjacent leaves share an Li — adjacent
+    # same-input leaves are collapsed by the sibling fold, which would leave
+    # each Li single-consumer and unravel the starvation entirely.
+    mas, mbs = [], []
     for i in range(8):
         li = Linear(x, torch.randn(4, 12), torch.zeros(12), name=f"L{i}")
-        mids.append(Linear(li, torch.randn(12, 2), torch.zeros(2), name=f"Ma{i}"))
-        mids.append(Linear(li, torch.randn(12, 2), torch.zeros(2), name=f"Mb{i}"))
-    out = Linear(Concatenate(mids), torch.randn(32, 4), torch.zeros(4), name="out")
+        mas.append(Linear(li, torch.randn(12, 2), torch.zeros(2), name=f"Ma{i}"))
+        mbs.append(Linear(li, torch.randn(12, 2), torch.zeros(2), name=f"Mb{i}"))
+    out = Linear(Concatenate(mas + mbs), torch.randn(32, 4), torch.zeros(4), name="out")
     cp = critical_path_layers(out)
     net = forward_compile(
         d=48,

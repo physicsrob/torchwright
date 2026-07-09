@@ -552,7 +552,15 @@ def test_concat_fold_merges_duplicate_leaves():
     """Two absorbed selector Linears over the SAME input leave the same node
     in two concat slots; the fold must merge their blocks (x reads through
     B1 + B2) instead of leaving duplicates — duplicated source columns broke
-    the weight-writer scatter (the doom instance-index regression)."""
+    the weight-writer scatter (the doom instance-index regression).
+
+    Since the sibling fold landed, ``p`` and ``vp`` are contiguous same-input
+    leaves and merge into one wide Linear *before* the absorb, so the duplicate
+    the coalesce step exists to clean up is never created here.  Same final
+    matrix, one fewer fold.  ``test_concat_fold_merges_hand_built_duplicate_leaves``
+    (leaves are InputNodes, which the sibling fold never touches) still covers
+    the coalesce itself.
+    """
     occ = InputNode("occ", 4, value_range=(0.0, 300.0))
     p = Linear(occ, torch.tensor([[0.0], [1.0], [0.0], [0.0]]), name="p")
     vp = Linear(occ, torch.tensor([[0.0], [0.0], [1.0], [0.0]]), name="vp")
@@ -563,13 +571,11 @@ def test_concat_fold_merges_duplicate_leaves():
     before = idx.compute(n_pos, vals)
 
     fused = fuse_consecutive_linears({idx})
-    assert fused == 3  # two leaf folds + one duplicate merge
+    assert fused == 2  # sibling merge of p+vp, then one leaf fold
     assert idx.inputs[0] is occ  # merged to one leaf -> concat bypassed
     assert idx.output_matrix.shape == (4, 1)
     # merged block = 8·p_selector + vp_selector
-    assert torch.equal(
-        idx.output_matrix, torch.tensor([[0.0], [8.0], [1.0], [0.0]])
-    )
+    assert torch.equal(idx.output_matrix, torch.tensor([[0.0], [8.0], [1.0], [0.0]]))
 
     after = idx.compute(n_pos, vals)
     assert torch.allclose(before, after, atol=1e-5)

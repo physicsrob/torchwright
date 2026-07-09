@@ -327,6 +327,233 @@ def _fold_through_concatenate(
     return applied
 
 
+def _scheduling_hint_targets(all_nodes: Set[Node]) -> Set[Node]:
+    """Every node some other node names as a scheduling predecessor.
+
+    Orphaning one of these leaves a dangling hint: ``GraphAnalyzer.is_ready``
+    waits on a node that never enters ``computed_nodes``, and the scheduler
+    dies with ``No progress``.
+    """
+    targets: Set[Node] = set()
+    for node in all_nodes:
+        targets |= node.scheduling_predecessors
+    return targets
+
+
+def _blocks_merge(node: Node, hint_targets: Set[Node]) -> bool:
+    """True when *node* may not be folded into a sibling merge.
+
+    Wider than :func:`_blocks_absorb` on two counts.
+
+    *Metadata*: a merged leaf's value survives inside the wide node's column
+    block, but nothing can re-attach a predicate, a range claim, or a semantic
+    affine override to a *slice* of a node, so all three decline the merge.
+
+    *Scheduling hints*: the merge orphans every leaf but one.  A leaf carrying
+    ``scheduling_predecessors`` would have its ordering constraint silently
+    dropped (the survivor keeps only its own), and a leaf that another node
+    names as a predecessor would leave that node waiting forever.
+    ``sequential_scope`` builds exactly this shape — sibling Linears over one
+    input, serialized to bound residual pressure — so an ungated merge would
+    quietly undo the pressure limit the caller asked for.
+    """
+    return (
+        bool(node.checks)
+        or node.claimed_type is not None
+        or node.integer_claim
+        or node._semantic_affine_override is not None
+        or bool(node.scheduling_predecessors)
+        or node in hint_targets
+    )
+
+
+def _merge_run(run: List[Linear], fold_log: FoldLog) -> Linear:
+    """Widen ``run[0]`` in place to span the whole run; orphan the rest.
+
+    ``concat(Linear(x, W_0), ..., Linear(x, W_k))`` holds exactly the columns
+    of ``Linear(x, cat(W_i, dim=1))``, so the merge is exact.  It is also
+    parameter-neutral — ``sum_i (d_x * w_i + w_i) == d_x * sum_i w_i + sum_i
+    w_i`` — hence no ``param_delta_ok`` gate.
+
+    The survivor is mutated rather than replaced by a fresh node so its
+    ``node_id`` (smaller than the consuming concat's) is preserved, keeping
+    the id-order topological sweep in :func:`_recompute_bounds_after_fusion`
+    valid.  Weights are captured before the mutation, so a run that repeats
+    the survivor (``concat([l, l])``) duplicates its column deliberately.
+    """
+    survivor = run[0]
+    matrices = [leaf.output_matrix for leaf in run]
+    biases = [leaf.output_bias for leaf in run]
+    survivor.output_matrix = torch.cat(matrices, dim=1)
+    survivor.output_bias = torch.cat(biases, dim=0)
+    survivor.d_output = survivor.output_matrix.shape[1]
+    names = [leaf.name for leaf in run if leaf.name]
+    if len(names) == len(run):
+        survivor.name = f"merged_{names[0]}__{names[-1]}"
+    # The survivor is wider than it was: it no longer computes its pre-fusion
+    # value.  The concat's value and width are unchanged, so it is NOT
+    # value-changed — that distinction is what lets this fold run under a
+    # checked or overridden concat.
+    fold_log.record_value_changed(survivor)
+    return survivor
+
+
+def _merge_sibling_linear_leaves(
+    c: Concatenate,
+    output_nodes: Set[Node],
+    consumers: Dict[Node, List[Node]],
+    hint_targets: Set[Node],
+    touched: Set[Node],
+    mutated: Set[Node],
+    fold_log: FoldLog,
+) -> int:
+    """Merge maximal contiguous runs of same-input Linear leaves of ``c``.
+
+    Consumer-agnostic: the concat's value and width are untouched, so no
+    consumer needs rewiring and ``c``'s own checks/override stay valid.  This
+    is the fold ``_fold_through_concatenate`` cannot perform — that one takes
+    the downstream Linear as an argument and so never fires under an ``FFN``
+    or ``Attn`` consumer.
+
+    Five preconditions, each guarding a different thing.  A leaf may merge iff:
+
+    1. it is a ``Linear`` on the same input node *object* as the rest of its
+       run (guards the merged Linear's value);
+    2. it is contiguous with the rest of the run (guards the *concat's* value:
+       ``Concatenate`` is column-wise in input-list order, so merging
+       non-adjacent leaves would permute its output columns);
+    3. its only distinct consumer is ``c``, and every one of its occurrences
+       in ``c.inputs`` falls inside this run (guards deletability — an outside
+       reader has no way to address a sub-range of the merged node, and an
+       occurrence outside the run would silently re-read the widened value);
+    4. it carries no checks, range claim, or semantic affine override (guards
+       metadata: none of the three can re-attach to a column slice);
+    5. it neither carries nor is named by a scheduling hint (guards
+       caller-declared ordering).
+
+    4 and 5 are both enforced by :func:`_blocks_merge`.
+
+    Note precondition 3 counts *distinct* consumer objects.  ``_consumer_map``
+    appends once per occurrence, so ``concat([l, l])`` records two entries for
+    one consumer; a ``len(consumers[l]) == 1`` test would wrongly decline it.
+
+    Returns the number of runs merged.
+    """
+    occurrences: Dict[int, int] = {}
+    for leaf in c.inputs:
+        occurrences[id(leaf)] = occurrences.get(id(leaf), 0) + 1
+
+    def mergeable(leaf: Node) -> bool:
+        return (
+            isinstance(leaf, Linear)
+            and leaf not in touched
+            and leaf not in output_nodes
+            and not _blocks_merge(leaf, hint_targets)
+            # Distinct consumers, not occurrences: see the docstring.
+            and {id(x) for x in consumers.get(leaf, [])} == {id(c)}
+        )
+
+    inputs = c.inputs
+    new_inputs: List[Node] = []
+    applied = 0
+    i = 0
+    while i < len(inputs):
+        leaf = inputs[i]
+        if not mergeable(leaf):
+            new_inputs.append(leaf)
+            i += 1
+            continue
+
+        shared_input = leaf.inputs[0]
+        j = i + 1
+        while (
+            j < len(inputs)
+            and mergeable(inputs[j])
+            and inputs[j].inputs[0] is shared_input
+        ):
+            j += 1
+        run: List[Linear] = inputs[i:j]
+
+        # A leaf occurring both inside and outside the run cannot merge: the
+        # outside slot would read the widened survivor.
+        run_counts: Dict[int, int] = {}
+        for leaf_in_run in run:
+            run_counts[id(leaf_in_run)] = run_counts.get(id(leaf_in_run), 0) + 1
+        escapes = any(occurrences[k] != v for k, v in run_counts.items())
+
+        if len(run) < 2 or escapes:
+            new_inputs.extend(run)
+            i = j
+            continue
+
+        survivor = _merge_run(run, fold_log)
+        touched.update(run)
+        mutated.add(survivor)
+        new_inputs.append(survivor)
+        applied += 1
+        i = j
+
+    if applied == 0:
+        return 0
+
+    c.inputs = new_inputs
+    c.d_output = sum(len(x) for x in new_inputs)
+    touched.add(c)
+    mutated.add(c)
+    return applied
+
+
+def _bypass_trivial_concatenate(
+    c: Concatenate,
+    output_nodes: Set[Node],
+    consumers: Dict[Node, List[Node]],
+    hint_targets: Set[Node],
+    touched: Set[Node],
+    mutated: Set[Node],
+) -> int:
+    """A one-leaf ``Concatenate`` *is* its leaf: rewire consumers, orphan it.
+
+    ``_fold_through_concatenate`` has this bypass too, but only reachable from
+    a downstream ``Linear`` (it rewrites that Linear's input).  A concat left
+    holding one leaf under an ``FFN`` or ``Attn`` consumer would otherwise sit
+    between them forever, blocking the ``Linear -> FFN`` gate fold — which is
+    exactly what :func:`_merge_sibling_linear_leaves` leaves behind when it
+    collapses every leaf into one.
+
+    Declined when:
+
+    - the concat is a caller-held output (its identity must survive);
+    - it is checked or carries a semantic affine override (it stays
+      materialized so its predicates keep reading a real residual value);
+    - it is the target of a scheduling hint (orphaning it dangles the hint);
+    - its one distinct consumer is a ``Linear``, in which case
+      :func:`_fold_through_concatenate` owns this concat and does the bypass
+      itself as part of absorbing the leaf.  Racing it here would just split
+      one fold into two.
+
+    Returns 1 if the concat was bypassed.
+    """
+    if len(c.inputs) != 1 or c in output_nodes or c in hint_targets:
+        return 0
+    if _blocks_absorb(c) or c._semantic_affine_override is not None:
+        return 0
+    reading = consumers.get(c, [])
+    if not reading:
+        return 0
+    distinct = {id(x): x for x in reading}
+    if len(distinct) == 1 and isinstance(reading[0], Linear):
+        return 0
+
+    leaf = c.inputs[0]
+    for consumer in distinct.values():
+        # replace_input rewrites every matching slot, so a consumer holding the
+        # concat twice is fully repaired by one call.
+        consumer.replace_input(c, leaf)
+        mutated.add(consumer)
+    touched.add(c)
+    return 1
+
+
 def _fuse_one_pass(
     output_nodes: Set[Node], verbose: bool, mutated: Set[Node], fold_log: FoldLog
 ) -> int:
@@ -343,6 +570,7 @@ def _fuse_one_pass(
 
     all_nodes = get_ancestor_nodes(output_nodes)
     consumers = _consumer_map(all_nodes)
+    hint_targets = _scheduling_hint_targets(all_nodes)
 
     touched: Set[Node] = set()
     applied = 0
@@ -436,6 +664,19 @@ def _fuse_one_pass(
             mutated.add(b)
             applied += 1
 
+        elif isinstance(node, Concatenate):
+            # Keyed on the concat, so it fires whatever the consumer is.  A
+            # concat has a smaller node_id than its consumer, so a merge here
+            # defers that consumer's own fold to the next pass — which then
+            # sees the wide leaf, and whose parameter gate is strictly more
+            # likely to admit it.
+            applied += _merge_sibling_linear_leaves(
+                node, output_nodes, consumers, hint_targets, touched, mutated, fold_log
+            )
+            applied += _bypass_trivial_concatenate(
+                node, output_nodes, consumers, hint_targets, touched, mutated
+            )
+
     if verbose and applied:
         print(f"  fused {applied} pair(s) this pass")
     return applied
@@ -448,8 +689,8 @@ def fuse_consecutive_linears(
 ) -> int:
     """Fuse adjacent linear maps, FFN-aware, until no more folds apply.
 
-    Four folds, each width-safe and gated so it never grows the parameter
-    count:
+    Five folds, each width-safe and gated so it never grows the parameter
+    count (the sibling merge needs no gate — it is parameter-neutral):
 
     - **Linear -> Linear** (``l1``'s sole consumer is ``l2``): ``l2`` absorbs
       ``l1`` (``M1 @ M2``, ``b1 @ M2 + b2``).  Saves one compiled layer.
@@ -469,6 +710,17 @@ def fuse_consecutive_linears(
       one compiled layer per absorbed leaf stage; collapses the
       fanout-limited accumulator chains ``sum_nodes`` builds.  See
       :func:`_fold_through_concatenate`.
+    - **Sibling Linear leaves of a Concatenate** (whatever the concat's
+      consumer): a maximal contiguous run of same-input, sole-consumer Linear
+      leaves collapses into one wide Linear holding their weights side by
+      side.  ``Concatenate`` never occupies the residual stream, so the run
+      *was* that wide Linear; merging is exact, parameter-neutral, and leaves
+      the concat's value and width untouched.  Deletes redundant schedulable
+      nodes, and lets the survivor take an attention route the split form
+      cannot afford (head demand scales with input width, not output width).
+      A concat left holding one leaf is then bypassed outright, so the folds
+      above see through it.  See :func:`_merge_sibling_linear_leaves` and
+      :func:`_bypass_trivial_concatenate`.
 
     All folds mutate a surviving node in place; ``output_nodes`` stay valid
     references (an FFN-into-output-Linear fold is declined to preserve the

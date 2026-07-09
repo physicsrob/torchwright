@@ -30,15 +30,21 @@ def _width_starved_graph():
     each Li's columns within its consumers' layer — intra-layer reuse, and in
     particular self-consumer reuse (Ma_i is Li's last attention consumer and
     reuses Li's own columns).  The solver finds this on its own.
+
+    The concat groups all Ma's before all Mb's so that no two *adjacent* leaves
+    share an input.  Adjacent same-input Linear leaves are merged by
+    ``fuse_consecutive_linears``' sibling fold; merging Ma_i with Mb_i would
+    leave Li single-consumer, unravel the chain into ``x -> M_i``, and compile
+    the whole graph in one layer — the starvation this fixture exists to create.
     """
     torch.manual_seed(0)
     x = create_input("x", 4)
-    mids = []
+    mas, mbs = [], []
     for i in range(8):
         li = Linear(x, torch.randn(4, 12), torch.zeros(12), name=f"L{i}")
-        mids.append(Linear(li, torch.randn(12, 2), torch.zeros(2), name=f"Ma{i}"))
-        mids.append(Linear(li, torch.randn(12, 2), torch.zeros(2), name=f"Mb{i}"))
-    out = Linear(Concatenate(mids), torch.randn(32, 4), torch.zeros(4), name="out")
+        mas.append(Linear(li, torch.randn(12, 2), torch.zeros(2), name=f"Ma{i}"))
+        mbs.append(Linear(li, torch.randn(12, 2), torch.zeros(2), name=f"Mb{i}"))
+    out = Linear(Concatenate(mas + mbs), torch.randn(32, 4), torch.zeros(4), name="out")
     return x, out
 
 
