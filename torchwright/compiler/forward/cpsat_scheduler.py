@@ -60,6 +60,10 @@ from torchwright.graph import (
 )
 from torchwright.graph.misc import LiteralValue
 from torchwright.graph.ffn import FFN
+from torchwright.compiler.forward.cpsat_snapshot import (
+    SchedulingProblem,
+    snapshot_from_graph_model,
+)
 
 # ---------------------------------------------------------------------------
 # Public dataclasses
@@ -629,6 +633,53 @@ def build_cpsat_model(
     by disabling one family at a time over a hard-fixed schedule.  See
     ``torchwright_doom/scripts/cpsat_diagnose.py``.
     """
+    gm = build_graph_model(output_node, pos_encoding)
+    return build_cpsat_model_from_gm(
+        gm,
+        d=d,
+        d_head=d_head,
+        d_hidden=d_hidden,
+        costs=costs,
+        flex_routing=flex_routing,
+        max_layers=max_layers,
+        cancel_slack=cancel_slack,
+        policy=policy,
+        reserve_heads=reserve_heads,
+        reserve_residual=reserve_residual,
+        tighten_domains=tighten_domains,
+        hint_layers=hint_layers,
+        hint_cancel=hint_cancel,
+        _disabled_families=_disabled_families,
+    )
+
+
+def build_cpsat_model_from_gm(
+    gm: GraphModel,
+    *,
+    d: int,
+    d_head: int,
+    d_hidden: int,
+    costs: Costs = Costs(),
+    flex_routing: bool = True,
+    max_layers: int = 60,
+    cancel_slack: Optional[int] = 2,
+    policy: Optional[SchedulingPolicy] = None,
+    reserve_heads: int = 0,
+    reserve_residual: int = 0,
+    tighten_domains: bool = False,
+    hint_layers: Optional[Dict[int, int]] = None,
+    hint_cancel: Optional[Dict[int, int]] = None,
+    _disabled_families: frozenset = frozenset(),
+) -> BuiltModel:
+    """Build (but do not solve) the CP-SAT model from a prebuilt GraphModel.
+
+    Shared core of :func:`build_cpsat_model` (live graph) and
+    :func:`build_model_from_snapshot` (a stand-in ``GraphModel`` rebuilt from a
+    :class:`SchedulingProblem`).  The body reads only structural facts both
+    forms provide — op class via ``isinstance``, widths, edges, effective
+    consumers, pinned status — so the proto is byte-identical for a live graph
+    and its round-tripped snapshot.
+    """
     unknown = _disabled_families - CONSTRAINT_FAMILIES
     if unknown:
         raise ValueError(
@@ -641,8 +692,6 @@ def build_cpsat_model(
 
     if costs.alpha == 0 and costs.beta == 0 and costs.gamma == 0:
         raise ValueError("alpha=beta=gamma=0 — no objective.")
-
-    gm = build_graph_model(output_node, pos_encoding)
 
     n_heads_per_layer = d // d_head
     # ``pos_encoding`` is read by the attention sublayer at (nearly) every
@@ -1410,6 +1459,251 @@ def build_cpsat_model(
 
 
 # ---------------------------------------------------------------------------
+# Snapshot bridge: rebuild a stand-in GraphModel from a SchedulingProblem
+# ---------------------------------------------------------------------------
+#
+# The builder consumes a GraphModel and reads real graph-node attributes off
+# it (``isinstance`` on the graph classes, ``len(n)``, ``n.d_output`` /
+# ``n.d_v`` / ``n.n_lanes``, ``n.inputs`` for Add, ``n.node_id``).  Rebuilding
+# stand-in *real-class* instances (``object.__new__`` + attribute injection)
+# rather than lightweight records means the builder body needs no changes: an
+# ``Add`` stand-in IS an ``Add`` to ``isinstance`` and to every realization /
+# demand helper, so ``build_cpsat_model_from_gm`` produces the identical proto.
+
+_KIND_TO_CLASS = {
+    "Add": Add,
+    "Attn": Attn,
+    "Concatenate": Concatenate,
+    "Embedding": Embedding,
+    "InputNode": InputNode,
+    "Linear": Linear,
+    "FFN": FFN,
+    "LiteralValue": LiteralValue,
+}
+
+
+class _StandInGraph:
+    """The narrow slice of ``GraphAnalyzer`` the builder + solver read off
+    ``gm.graph``: ``get_all_nodes`` (validator id→node map) and
+    ``get_critical_path_length`` (solver decision strategy).  Raw-consumer /
+    topo-order queries are not reconstructed from a snapshot (the builder uses
+    ``gm.consumers_eff``, not ``gm.graph``); they raise loudly if ever read."""
+
+    def __init__(self, all_nodes, critical_path: Dict[int, int]):
+        self._all_nodes = set(all_nodes)
+        self._critical_path = critical_path
+
+    def get_all_nodes(self):
+        return self._all_nodes
+
+    def get_critical_path_length(self, node: Node) -> int:
+        return self._critical_path.get(node.node_id, 0)
+
+    def get_output_node(self):  # pragma: no cover - parity with GraphAnalyzer
+        raise NotImplementedError("stand-in graph exposes no output-node query")
+
+    def get_consumers(self, node):  # pragma: no cover - not snapshotted
+        raise NotImplementedError(
+            "raw consumers are not reconstructed from a snapshot; the builder "
+            "reads gm.consumers_eff instead"
+        )
+
+    def get_topological_order(self):  # pragma: no cover - not snapshotted
+        raise NotImplementedError("topological order is not reconstructed")
+
+
+class _ShapeCarrier:
+    """Minimal stand-in for a weight tensor: exposes only ``.shape`` so
+    ``FFN.n_lanes`` (``self.gate_proj.shape[0]``) returns the captured lane
+    count without materializing a tensor."""
+
+    __slots__ = ("shape",)
+
+    def __init__(self, n_lanes: int):
+        self.shape = (n_lanes,)
+
+
+def _stand_in_node(rec) -> Node:
+    cls = _KIND_TO_CLASS.get(rec.kind)
+    if cls is None:
+        raise ValueError(
+            f"snapshot node {rec.node_id} has unknown kind {rec.kind!r}; the "
+            f"CP-SAT builder only knows {sorted(_KIND_TO_CLASS)}"
+        )
+    node = object.__new__(cls)
+    node.node_id = rec.node_id
+    node.d_output = rec.d_output
+    node.name = rec.name
+    if rec.d_v is not None:
+        node.d_v = rec.d_v
+    if rec.n_lanes is not None:
+        # FFN.n_lanes is a read-only property over gate_proj.shape[0]; feed it a
+        # shape carrier so slots_for(FFN) reads the captured lane count.
+        node.gate_proj = _ShapeCarrier(rec.n_lanes)
+    return node
+
+
+def graph_model_from_problem(problem: SchedulingProblem) -> GraphModel:
+    """Rebuild a stand-in ``GraphModel`` from a captured problem.
+
+    The nodes are real graph-class instances carrying only the attributes the
+    builder reads; ``consumers_eff`` values are ordered tuples (the builder
+    only iterates them) so the constraint order — and thus the proto — matches
+    the capturing process byte-for-byte.
+    """
+    by_id: Dict[int, Node] = {
+        rec.node_id: _stand_in_node(rec) for rec in problem.nodes.values()
+    }
+    for rec in problem.nodes.values():
+        by_id[rec.node_id].inputs = [by_id[i] for i in rec.input_ids]
+
+    consumers_eff = {
+        by_id[nid]: tuple(by_id[c] for c in cons)
+        for nid, cons in problem.consumers.items()
+    }
+    graph = _StandInGraph(
+        by_id.values(),
+        {rec.node_id: rec.critical_path_len for rec in problem.nodes.values()},
+    )
+    return GraphModel(
+        graph=graph,
+        schedulable=[by_id[i] for i in problem.schedulable_ids],
+        edges=[(by_id[u], by_id[v]) for u, v in problem.edges],
+        consumers_eff=consumers_eff,
+        output_node=by_id[problem.output_id],
+        pos_encoding=None,
+        input_nodes=[by_id[i] for i in problem.input_ids],
+        pinned_nodes={by_id[i] for i in problem.pinned_ids},
+    )
+
+
+def build_model_from_snapshot(
+    problem: SchedulingProblem,
+    *,
+    d: int,
+    d_head: int,
+    d_hidden: int,
+    costs: Costs = Costs(),
+    flex_routing: bool = True,
+    max_layers: int = 60,
+    cancel_slack: Optional[int] = 2,
+    policy: Optional[SchedulingPolicy] = None,
+    reserve_heads: int = 0,
+    reserve_residual: int = 0,
+    tighten_domains: bool = False,
+    hint_layers: Optional[Dict[int, int]] = None,
+    hint_cancel: Optional[Dict[int, int]] = None,
+    _disabled_families: frozenset = frozenset(),
+) -> BuiltModel:
+    """Build the CP-SAT model from a captured snapshot — no live graph.
+
+    Equivalent to :func:`build_cpsat_model` on the graph the snapshot was
+    captured from, at the same geometry; the two protos are identical.
+    """
+    return build_cpsat_model_from_gm(
+        graph_model_from_problem(problem),
+        d=d,
+        d_head=d_head,
+        d_hidden=d_hidden,
+        costs=costs,
+        flex_routing=flex_routing,
+        max_layers=max_layers,
+        cancel_slack=cancel_slack,
+        policy=policy,
+        reserve_heads=reserve_heads,
+        reserve_residual=reserve_residual,
+        tighten_domains=tighten_domains,
+        hint_layers=hint_layers,
+        hint_cancel=hint_cancel,
+        _disabled_families=_disabled_families,
+    )
+
+
+# ---------------------------------------------------------------------------
+# CpModelProto dump + zero-rebuild re-solve
+# ---------------------------------------------------------------------------
+
+
+def dump_model_proto(built: BuiltModel, path) -> "os.PathLike":
+    """Serialize a built CP-SAT model to disk for a zero-rebuild re-solve.
+
+    Writes the OR-Tools model proto (text format — the installed pybind build
+    exposes no binary ``SerializeToString`` on the proto) to ``path`` and a
+    small ``<path>.meta.json`` recording the objective scale and the
+    ``n_layers`` variable's proto index, so :func:`resolve_model_proto` reads
+    the depth straight back with no graph and no model rebuild (C1's zero-build
+    re-solve).
+    """
+    import json as _json
+    from pathlib import Path as _Path
+
+    path = _Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(str(built.model.Proto()), encoding="utf-8")
+    meta = {
+        "objective_scale": built.objective_scale,
+        "n_layers_var_index": built.n_layers_var.Index(),
+    }
+    path.with_suffix(path.suffix + ".meta.json").write_text(
+        _json.dumps(meta), encoding="utf-8"
+    )
+    return path
+
+
+def resolve_model_proto(
+    path,
+    *,
+    time_budget_s: float = 60.0,
+    workers: Optional[int] = None,
+    solver_params: Optional[Dict[str, object]] = None,
+) -> Dict[str, object]:
+    """Load a dumped model proto and re-solve it — no graph, no model rebuild.
+
+    Returns ``{status_name, objective, best_bound, wall_time_s, n_layers}``;
+    ``n_layers`` (the depth) is recovered via the proto index stored by
+    :func:`dump_model_proto`.
+    """
+    import json as _json
+    import time as _time
+    from pathlib import Path as _Path
+
+    path = _Path(path)
+    text = path.read_text(encoding="utf-8")
+    meta = _json.loads(
+        path.with_suffix(path.suffix + ".meta.json").read_text(encoding="utf-8")
+    )
+    model = cp_model.CpModel()
+    if not model.Proto().parse_text_format(text):
+        raise ValueError(f"failed to parse CP-SAT proto from {path}")
+    solver = cp_model.CpSolver()
+    solver.parameters.max_time_in_seconds = time_budget_s
+    solver.parameters.num_search_workers = int(
+        workers if workers is not None else os.environ.get("TW_CPSAT_WORKERS", "16")
+    )
+    if solver_params:
+        for key, value in solver_params.items():
+            if isinstance(value, (list, tuple)):
+                getattr(solver.parameters, key).extend(value)
+            else:
+                setattr(solver.parameters, key, value)
+    t0 = _time.perf_counter()
+    status = solver.Solve(model)
+    elapsed = _time.perf_counter() - t0
+    has_solution = status in (cp_model.OPTIMAL, cp_model.FEASIBLE)
+    n_layers = None
+    if has_solution:
+        nlv = model.GetIntVarFromProtoIndex(int(meta["n_layers_var_index"]))
+        n_layers = solver.Value(nlv)
+    return {
+        "status_name": solver.StatusName(status),
+        "objective": int(solver.ObjectiveValue()) if has_solution else -1,
+        "best_bound": float(solver.BestObjectiveBound()),
+        "wall_time_s": elapsed,
+        "n_layers": n_layers,
+    }
+
+
+# ---------------------------------------------------------------------------
 # Solver
 # ---------------------------------------------------------------------------
 
@@ -1740,6 +2034,102 @@ def solve_schedule(
         hint_cancel=hint_cancel,
         _disabled_families=_disabled_families,
     )
+    return _solve_built(
+        built,
+        hint_layers=hint_layers,
+        hint_routing=hint_routing,
+        hint_cancel=hint_cancel,
+        hint_cancel_mech=hint_cancel_mech,
+        max_layers=max_layers,
+        time_budget_s=time_budget_s,
+        log_search_progress=log_search_progress,
+        solver_params=solver_params,
+        solution_trace=solution_trace,
+        strict_hint=strict_hint,
+    )
+
+
+def solve_schedule_from_snapshot(
+    problem: SchedulingProblem,
+    *,
+    d: int,
+    d_head: int,
+    d_hidden: int,
+    costs: Costs = Costs(),
+    flex_routing: bool = True,
+    time_budget_s: float = 60.0,
+    max_layers: int = 60,
+    hint_layers: Optional[Dict[int, int]] = None,
+    hint_routing: Optional[Dict[int, str]] = None,
+    hint_cancel: Optional[Dict[int, int]] = None,
+    hint_cancel_mech: Optional[Dict[int, str]] = None,
+    cancel_slack: Optional[int] = 2,
+    policy: Optional[SchedulingPolicy] = None,
+    log_search_progress: bool = False,
+    reserve_heads: int = 0,
+    reserve_residual: int = 0,
+    tighten_domains: bool = False,
+    solver_params: Optional[Dict[str, object]] = None,
+    solution_trace: Optional[List[dict]] = None,
+    strict_hint: bool = False,
+    _disabled_families: frozenset = frozenset(),
+) -> Tuple[Optional[ScheduleAssignment], SolveStats]:
+    """Build and solve the model from a captured snapshot — no live graph.
+
+    The zero-build re-solve path (C1 parameter sweeps, C2 probes): rebuild the
+    identical CP-SAT model from a fixture and solve it.  Returns the same
+    ``(assignment, stats)`` as :func:`solve_schedule`; the assignment is keyed
+    by the snapshot's node-id space (canonical ids for a loaded fixture).
+    """
+    built = build_model_from_snapshot(
+        problem,
+        d=d,
+        d_head=d_head,
+        d_hidden=d_hidden,
+        costs=costs,
+        flex_routing=flex_routing,
+        max_layers=max_layers,
+        cancel_slack=cancel_slack,
+        policy=policy,
+        reserve_heads=reserve_heads,
+        reserve_residual=reserve_residual,
+        tighten_domains=tighten_domains,
+        hint_layers=hint_layers,
+        hint_cancel=hint_cancel,
+        _disabled_families=_disabled_families,
+    )
+    return _solve_built(
+        built,
+        hint_layers=hint_layers,
+        hint_routing=hint_routing,
+        hint_cancel=hint_cancel,
+        hint_cancel_mech=hint_cancel_mech,
+        max_layers=max_layers,
+        time_budget_s=time_budget_s,
+        log_search_progress=log_search_progress,
+        solver_params=solver_params,
+        solution_trace=solution_trace,
+        strict_hint=strict_hint,
+    )
+
+
+def _solve_built(
+    built: BuiltModel,
+    *,
+    hint_layers: Optional[Dict[int, int]] = None,
+    hint_routing: Optional[Dict[int, str]] = None,
+    hint_cancel: Optional[Dict[int, int]] = None,
+    hint_cancel_mech: Optional[Dict[int, str]] = None,
+    max_layers: int = 60,
+    time_budget_s: float = 60.0,
+    log_search_progress: bool = False,
+    solver_params: Optional[Dict[str, object]] = None,
+    solution_trace: Optional[List[dict]] = None,
+    strict_hint: bool = False,
+) -> Tuple[Optional[ScheduleAssignment], SolveStats]:
+    """Validate + apply the warm-start hint, set the decision strategy, solve,
+    and read the assignment back off a pre-built model.  Shared by
+    :func:`solve_schedule` (live) and :func:`solve_schedule_from_snapshot`."""
     if log_search_progress and built.cancel_window_delta:
         print(
             f"  cancel windows widened for {len(built.cancel_window_delta)} "
