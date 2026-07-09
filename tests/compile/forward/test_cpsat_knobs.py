@@ -91,6 +91,18 @@ def test_solver_params_applied_and_solve_unchanged():
     assert stats.status_name == "OPTIMAL"
 
 
+def test_drop_decision_strategy_solves_same_depth():
+    """Dropping the hand-rolled ``AddDecisionStrategy`` (C1 arm
+    ``no_decision_strategy``) is search-only: on a graph the solver proves
+    optimal, the achieved depth is identical — only the search path changes."""
+    out = _repro_graph()
+    with_strategy, s0 = solve_schedule(out, **_SOLVE_KW)
+    without, s1 = solve_schedule(out, drop_decision_strategy=True, **_SOLVE_KW)
+    assert with_strategy is not None and without is not None
+    assert s0.status_name == "OPTIMAL" and s1.status_name == "OPTIMAL"
+    assert without.n_layers == with_strategy.n_layers
+
+
 def test_solution_trace_captures_incumbents():
     out = _repro_graph()
     trace: list = []
