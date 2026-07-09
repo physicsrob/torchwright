@@ -245,7 +245,11 @@ reading in MLP.
 Three `AddCumulative` constraints, one per resource pool. The cost
 function `heads_for(n)` returns the integer number of attention heads
 the op consumes if scheduled in the attention sublayer:
-`⌈d_v/d_head⌉` for `Attn`, `⌈d_input/d_head⌉` for `Linear`,
+`⌈d_v/d_head⌉` for `Attn`; for `Linear`, one head per `d_head`-wide
+input chunk with any nonzero weight row, floor 1
+(`realization.linear_attn_chunks` — the same list the weight-writer
+emits, so the modeled budget and the emission cannot desync; dense
+weights charge the old `⌈d_input/d_head⌉`);
 `⌈d_output/d_head⌉` for `Add` (the unit free-add cost — `Add`'s
 actual cost is `1 ·` or `2 ·` this depending on `is_free[A]`).
 

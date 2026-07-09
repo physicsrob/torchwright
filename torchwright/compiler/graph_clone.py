@@ -106,6 +106,14 @@ _REBUILT_FIELDS = frozenset(
         "_structural_type",
         "_affine_bound",
         "_semantic_affine_override",
+        # Weight-support cache (realization.live_weight_row_ranges).  Must
+        # NOT ride the generic copy: lowering's folds mutate the clone's
+        # output_matrix, and a stale copied cache would make the head charge
+        # — and the emitter's chunk list — describe the pre-fold weights,
+        # skipping chunks that are live post-fold (a miscompile, not just
+        # accounting).  The clone recomputes it on first query, which
+        # happens only after fusion has finished.
+        "_live_weight_row_ranges",
     }
 )
 

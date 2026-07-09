@@ -86,6 +86,21 @@ def _consumer_map(all_nodes: Set[Node]) -> Dict[Node, List[Node]]:
     return consumers
 
 
+def _invalidate_support_cache(node: Node) -> None:
+    """Drop the cached weight-support runs after mutating a node's weights.
+
+    ``realization.live_weight_row_ranges`` memoizes on the node
+    (``_live_weight_row_ranges``); every fold below that rewrites a
+    survivor's ``output_matrix`` must drop it, or a caller that queried the
+    node's head charge before fusing would compile against the pre-fold
+    support — the emitter would skip chunks that are live post-fold.
+    (The lowering pipeline never queries before fusing, and ``clone_graph``
+    excludes the cache from the copy; this guards direct
+    ``fuse_consecutive_linears`` callers.)
+    """
+    node.__dict__.pop("_live_weight_row_ranges", None)
+
+
 def _fuse_linear_into_linear(l1: Linear, l2: Linear) -> None:
     """Fuse ``l1 -> l2`` (both Linear) by mutating ``l2`` in place.
 
@@ -100,6 +115,7 @@ def _fuse_linear_into_linear(l1: Linear, l2: Linear) -> None:
     l2.output_matrix = fused_matrix
     l2.output_bias = fused_bias
     l2.d_input = l1.output_matrix.shape[0]
+    _invalidate_support_cache(l2)
     if l1.name and l2.name:
         l2.name = f"fused_{l1.name}_{l2.name}"
 
@@ -313,6 +329,7 @@ def _fold_through_concatenate(
     l.output_matrix = torch.cat(blocks, dim=0)
     l.output_bias = bias
     l.d_input = l.output_matrix.shape[0]
+    _invalidate_support_cache(l)
     if len(new_leaves) == 1:
         l.inputs = [new_leaves[0]]  # bypass the concat entirely
     else:
@@ -387,6 +404,7 @@ def _merge_run(run: List[Linear], fold_log: FoldLog) -> Linear:
     survivor.output_matrix = torch.cat(matrices, dim=1)
     survivor.output_bias = torch.cat(biases, dim=0)
     survivor.d_output = survivor.output_matrix.shape[1]
+    _invalidate_support_cache(survivor)
     names = [leaf.name for leaf in run if leaf.name]
     if len(names) == len(run):
         survivor.name = f"merged_{names[0]}__{names[-1]}"

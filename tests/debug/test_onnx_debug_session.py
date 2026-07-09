@@ -447,10 +447,13 @@ def test_fingerprints_are_pinned():
             cancel_slack=2,
             policy=None,
         )
-        # Pin updated 2026-07: the ``assume_zero_init`` payload key was removed
-        # when the flag was retired (universal zero-init), changing the payload
-        # layout so every pre-retirement schedule-cache entry re-solves once.
-        == "49c216e533460b7c82155a490d15bfce0fe6bd2f6c5715fb4345d2002e5a97d0"
+        # Pin updated 2026-07 (support-aware head charge): the payload gained
+        # ``linear_support`` — every Linear's live weight-row runs — because
+        # the head charge became a function of weight sparsity, the first
+        # schedule input the topology hash cannot see.  The layout change
+        # doubles as the generation bump: every pre-support-charge
+        # schedule-cache entry re-solves once under the new charge.
+        == "4c72af10fd692b94a45c457e30f32393033a065b6d9ebd715f59774f8906c880"
     )
 
 

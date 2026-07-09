@@ -15,7 +15,7 @@ from typing import Callable, Dict, Optional, Set, Tuple
 import torch
 
 from torchwright.compiler.device import get_device
-from torchwright.compiler.realization import RealizationTable
+from torchwright.compiler.realization import RealizationTable, linear_attn_heads
 from torchwright.compiler.residual_assignment import ResidualAssignment
 from torchwright.compiler.forward.cpsat_scheduler import (
     Costs,
@@ -657,8 +657,7 @@ def _count_heads_by_type(
             n = (attn_op.node.d_v + d_head - 1) // d_head
         elif attn_op.op_type == "compute_linear":
             assert attn_op.node is not None
-            d_input = len(attn_op.node.inputs[0])
-            n = (d_input + d_head - 1) // d_head
+            n = linear_attn_heads(attn_op.node, d_head)
         elif attn_op.op_type == "compute_add":
             assert attn_op.node is not None
             n = 2 * ((len(attn_op.node) + d_head - 1) // d_head)
@@ -714,8 +713,7 @@ def _count_layer_params(
             heads_used += (attn_op.node.d_v + d_head - 1) // d_head
         elif attn_op.op_type == "compute_linear":
             assert attn_op.node is not None
-            d_input = len(attn_op.node.inputs[0])
-            heads_used += (d_input + d_head - 1) // d_head
+            heads_used += linear_attn_heads(attn_op.node, d_head)
         elif attn_op.op_type == "compute_add":
             assert attn_op.node is not None
             heads_used += 2 * ((len(attn_op.node) + d_head - 1) // d_head)

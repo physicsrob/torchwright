@@ -119,7 +119,28 @@ def graph_fingerprint(
     re-solves against the now-universal zero-init model.  That miss is the
     intended invalidation: a defensive-model schedule is unsound for the
     zero-init model, so it must not be replayed.
+
+    ``linear_support`` (2026-07, support-aware head charge): every
+    ``Linear``'s live weight-row runs, keyed by canonical id.  The head
+    charge became a function of weight *sparsity*
+    (``realization.linear_attn_chunks``), which is the first schedule input
+    the topology hash cannot see — two graphs with identical topology but
+    different support schedule differently, and replaying across them would
+    under-book heads in one direction (a "Ran out of attention heads"
+    assert deep in the weight-writer, on a cache *hit*).  Its introduction
+    also changes the payload layout for every graph, which is the
+    generation bump: every pre-support-charge entry misses once and
+    re-solves under the new charge.
     """
+    from torchwright.graph.linear import Linear as _Linear
+    from torchwright.compiler.realization import live_weight_row_ranges
+
+    canon = canonical_ids(output_node)
+    linear_support = {
+        canon[n.node_id]: live_weight_row_ranges(n)
+        for n in _canonical_walk(output_node)
+        if isinstance(n, _Linear)
+    }
     payload = {
         "topology": topology_entries(output_node),
         "d": d,
@@ -129,6 +150,7 @@ def graph_fingerprint(
         "cancel_slack": cancel_slack,
         "policy": asdict(policy) if policy is not None else None,
         "cancel_window": "hint-aware-v1",
+        "linear_support": sorted(linear_support.items()),
     }
     if reserve_residual:
         payload["reserve_residual"] = reserve_residual

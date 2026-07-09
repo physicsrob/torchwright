@@ -118,6 +118,84 @@ def static_flex_class(candidates: Tuple[str, ...], policy: SchedulingPolicy) -> 
 # ---------------------------------------------------------------------------
 
 
+def live_weight_row_ranges(node: Node) -> Tuple[Tuple[int, int], ...]:
+    """The rows of ``node.output_matrix`` with any nonzero entry, as
+    ``(start, length)`` runs.
+
+    THE single support convention for attention-transport head charging —
+    nonzero entries of ``output_matrix`` only, matching what
+    ``trim_unused_slots`` reads on the MLP side.  ``output_bias`` never
+    enters: a bias needs no input read (it is written by the separate
+    ``compute_bias`` MLP op), so it cannot make a weight row live.
+
+    Runs rather than a row list or a head count because both compactness
+    and geometry matter: a dense matrix collapses to one run, and runs are
+    ``d_head``-free, so the CP-SAT snapshot can persist them
+    (``cpsat_snapshot.NodeRecord``) and recompute the head charge at
+    whatever geometry the model is later built with — a stored integer
+    would silently bake in the capture-time ``d_head``.
+
+    Computed once per node and cached on it (``_live_weight_row_ranges``);
+    every charge site queries a node many times, and by the time any
+    charge runs (scheduling, model build) the lowering folds that mutate
+    weights have finished.  Snapshot stand-in nodes carry the attribute
+    directly — they have no ``output_matrix`` to scan.
+    """
+    cached = getattr(node, "_live_weight_row_ranges", None)
+    if cached is not None:
+        return cached
+    live = node.output_matrix.ne(0).any(dim=1)
+    runs = []
+    start = None
+    for i, flag in enumerate(live.tolist()):
+        if flag and start is None:
+            start = i
+        elif not flag and start is not None:
+            runs.append((start, i - start))
+            start = None
+    if start is not None:
+        runs.append((start, len(live) - start))
+    ranges = tuple(runs)
+    node._live_weight_row_ranges = ranges
+    return ranges
+
+
+def linear_attn_chunks(node: Node, d_head: int) -> Tuple[int, ...]:
+    """The ``d_head``-wide input chunks a Linear's attention transport
+    actually needs, in ascending order.
+
+    THE single head-charge declaration.  ``_write_compute_linear`` splits a
+    Linear's input into ``d_head``-wide chunks and emits one Δ=0 self-match
+    head per chunk; a chunk whose weight rows are all zero contributes
+    exactly zero to the output (its head's O block would be zero), so it is
+    neither charged nor emitted.  Every accounting site (the CP-SAT model's
+    ``heads_for``, the eager scheduler, :func:`class_heads`, the compile
+    diagnostics) and the emitter iterate THIS list, so the budget and the
+    emission cannot desync.
+
+    Never empty: a zero-support Linear (its value is just the bias, or
+    exactly zero) keeps chunk 0 — one zero-weight head.  The floor costs
+    one head on a node type that may not exist in practice, and it keeps
+    every Linear inside the CP-SAT model (the builder skips ``h == 0``
+    nodes entirely, which would drop a zero-support *flex* Linear's routing
+    variable from the objective and its interval from the cumulative).
+    """
+    chunks = sorted(
+        {
+            c
+            for start, length in live_weight_row_ranges(node)
+            for c in range(start // d_head, (start + length - 1) // d_head + 1)
+        }
+    )
+    return tuple(chunks) if chunks else (0,)
+
+
+def linear_attn_heads(node: Node, d_head: int) -> int:
+    """Attention-transport head demand of a standalone Linear: one head per
+    live input chunk (:func:`linear_attn_chunks`), floor 1."""
+    return len(linear_attn_chunks(node, d_head))
+
+
 def class_heads(node: Node, cls: str, d_head: int) -> int:
     """Attention-head demand of realizing *node* as *cls* (0 for MLP
     classes).  Mirrors the CP-SAT model's accounting (``heads_for``): an
@@ -127,8 +205,7 @@ def class_heads(node: Node, cls: str, d_head: int) -> int:
     if cls == ATTN_HEADS:
         return (node.d_v + d_head - 1) // d_head
     if cls == ATTN_TRANSPORT:
-        d_in = len(node.inputs[0])
-        return (d_in + d_head - 1) // d_head
+        return linear_attn_heads(node, d_head)
     if cls == RESIDUAL_REUSE:
         return (node.d_output + d_head - 1) // d_head
     if cls == ATTN_COPY:
