@@ -9,12 +9,17 @@ compile path* (plan decision #2) rather than a standalone replica:
   replay, never compile or cache the (unsound) relaxed schedule;
 * ``_solver_seed`` — seed the descent lottery reproducibly;
 * ``_force_resolve`` — skip the schedule cache so a measured solve
-  re-solves instead of replaying a cached draw.
+  re-solves instead of replaying a cached draw;
+* ``_solver_params`` — general ``CpSolver.parameters`` overrides (C1 sweep),
+  merged with the seed and applied to every solve / descent rung;
+* ``_drop_decision_strategy`` — skip the hand-rolled ``AddDecisionStrategy``
+  (C1 arm ``no_decision_strategy``).
 """
 
 import pytest
 import torch
 
+import torchwright.compiler.forward.compile as compile_mod
 from torchwright.compiler.forward.compile import forward_compile
 from torchwright.compiler.forward.schedule_cache import graph_fingerprint
 from torchwright.graph import Concatenate, Linear
@@ -105,6 +110,71 @@ def test_solver_seed_is_accepted_and_replays():
     only perturbs the search, never soundness)."""
     graph = _width_graph()
     net = _compile(graph, _solver_seed=12345)
+    assert len(net.layers) > 0
+    inp = torch.randn(3, 4)
+    ref = graph.compute(3, {"x": inp})
+    got = net.compute(3, {"x": inp})[graph]
+    assert torch.allclose(got.cpu(), ref, atol=1e-3)
+
+
+def test_solver_params_merge_reaches_the_solve(monkeypatch):
+    """``_solver_params`` reaches ``solve_schedule`` merged with the
+    ``_solver_seed`` random_seed, and ``_drop_decision_strategy`` is forwarded
+    — captured at the solve boundary so the plumbing is proven independent of
+    solver behavior."""
+    captured = {}
+    real = compile_mod.solve_schedule
+
+    def _spy(*args, **kw):
+        captured["solver_params"] = kw.get("solver_params")
+        captured["drop_decision_strategy"] = kw.get("drop_decision_strategy")
+        return real(*args, **kw)
+
+    monkeypatch.setattr(compile_mod, "solve_schedule", _spy)
+    _compile(
+        _width_graph(),
+        _solver_seed=9,
+        _solver_params={"linearization_level": 2},
+        _drop_decision_strategy=True,
+    )
+    assert captured["solver_params"] == {"random_seed": 9, "linearization_level": 2}
+    assert captured["drop_decision_strategy"] is True
+
+
+def test_solver_params_none_when_unset(monkeypatch):
+    """No seed, no params → ``solver_params`` stays None and the decision
+    strategy is kept (default production behavior is byte-unchanged)."""
+    captured = {}
+    real = compile_mod.solve_schedule
+
+    def _spy(*args, **kw):
+        captured["solver_params"] = kw.get("solver_params")
+        captured["drop_decision_strategy"] = kw.get("drop_decision_strategy")
+        return real(*args, **kw)
+
+    monkeypatch.setattr(compile_mod, "solve_schedule", _spy)
+    _compile(_width_graph())
+    assert captured["solver_params"] is None
+    assert captured["drop_decision_strategy"] is False
+
+
+def test_solver_params_applied_and_schedule_replays():
+    """A general parameter override still yields a sound, replayable schedule
+    (a valid ``CpSolver`` field can only change search, never feasibility)."""
+    graph = _width_graph()
+    net = _compile(graph, _solver_params={"linearization_level": 2})
+    assert len(net.layers) > 0
+    inp = torch.randn(3, 4)
+    ref = graph.compute(3, {"x": inp})
+    got = net.compute(3, {"x": inp})[graph]
+    assert torch.allclose(got.cpu(), ref, atol=1e-3)
+
+
+def test_drop_decision_strategy_replays():
+    """Dropping the decision strategy is search-only: the compile still
+    produces a sound, replayable schedule."""
+    graph = _width_graph()
+    net = _compile(graph, _drop_decision_strategy=True)
     assert len(net.layers) > 0
     inp = torch.randn(3, 4)
     ref = graph.compute(3, {"x": inp})

@@ -1940,6 +1940,7 @@ def solve_schedule(
     solver_params: Optional[Dict[str, object]] = None,
     solution_trace: Optional[List[dict]] = None,
     strict_hint: bool = False,
+    drop_decision_strategy: bool = False,
     _disabled_families: frozenset = frozenset(),
 ) -> Tuple[Optional[ScheduleAssignment], SolveStats]:
     """Build and solve the CP-SAT scheduling model.
@@ -2046,6 +2047,7 @@ def solve_schedule(
         solver_params=solver_params,
         solution_trace=solution_trace,
         strict_hint=strict_hint,
+        drop_decision_strategy=drop_decision_strategy,
     )
 
 
@@ -2072,6 +2074,7 @@ def solve_schedule_from_snapshot(
     solver_params: Optional[Dict[str, object]] = None,
     solution_trace: Optional[List[dict]] = None,
     strict_hint: bool = False,
+    drop_decision_strategy: bool = False,
     _disabled_families: frozenset = frozenset(),
 ) -> Tuple[Optional[ScheduleAssignment], SolveStats]:
     """Build and solve the model from a captured snapshot — no live graph.
@@ -2110,6 +2113,7 @@ def solve_schedule_from_snapshot(
         solver_params=solver_params,
         solution_trace=solution_trace,
         strict_hint=strict_hint,
+        drop_decision_strategy=drop_decision_strategy,
     )
 
 
@@ -2126,10 +2130,18 @@ def _solve_built(
     solver_params: Optional[Dict[str, object]] = None,
     solution_trace: Optional[List[dict]] = None,
     strict_hint: bool = False,
+    drop_decision_strategy: bool = False,
 ) -> Tuple[Optional[ScheduleAssignment], SolveStats]:
     """Validate + apply the warm-start hint, set the decision strategy, solve,
     and read the assignment back off a pre-built model.  Shared by
-    :func:`solve_schedule` (live) and :func:`solve_schedule_from_snapshot`."""
+    :func:`solve_schedule` (live) and :func:`solve_schedule_from_snapshot`.
+
+    ``drop_decision_strategy`` is MEASUREMENT-ONLY (C1 sweep, arm
+    ``no_decision_strategy``): when True the hand-rolled critical-path-first
+    ``AddDecisionStrategy`` below is not emitted, freeing CP-SAT's fixed-search
+    subsolver slot for its default portfolio.  It cannot change the feasible
+    set — only which schedule the search finds first — so it is never set in
+    production."""
     if log_search_progress and built.cancel_window_delta:
         print(
             f"  cancel windows widened for {len(built.cancel_window_delta)} "
@@ -2192,15 +2204,18 @@ def _solve_built(
                 model.AddHint(input_cancel_layer[nid], L)
 
     # ---- Decision strategy: schedule by critical path first ----
-    nodes_by_cp = sorted(
-        gm.schedulable,
-        key=lambda n: -gm.graph.get_critical_path_length(n),
-    )
-    model.AddDecisionStrategy(
-        [layer_var[n.node_id] for n in nodes_by_cp],
-        cp_model.CHOOSE_FIRST,
-        cp_model.SELECT_MIN_VALUE,
-    )
+    # MEASUREMENT-ONLY: dropping it (C1 arm ``no_decision_strategy``) leaves
+    # the fixed-search subsolver slot to CP-SAT's default portfolio.
+    if not drop_decision_strategy:
+        nodes_by_cp = sorted(
+            gm.schedulable,
+            key=lambda n: -gm.graph.get_critical_path_length(n),
+        )
+        model.AddDecisionStrategy(
+            [layer_var[n.node_id] for n in nodes_by_cp],
+            cp_model.CHOOSE_FIRST,
+            cp_model.SELECT_MIN_VALUE,
+        )
 
     # ---- Solve ----
     solver = cp_model.CpSolver()

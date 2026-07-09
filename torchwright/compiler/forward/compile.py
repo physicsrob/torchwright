@@ -10,7 +10,7 @@ import os
 import time
 import warnings
 from dataclasses import dataclass
-from typing import Callable, Optional, Set, Tuple
+from typing import Callable, Dict, Optional, Set, Tuple
 
 import torch
 
@@ -766,6 +766,8 @@ def forward_compile(
     _force_resolve: bool = False,
     _solve_only: bool = False,
     _descent_budget_s: Optional[float] = None,
+    _solver_params: Optional[Dict[str, object]] = None,
+    _drop_decision_strategy: bool = False,
 ) -> HeadlessTransformer:
     """Compile a computation graph into a HeadlessTransformer.
 
@@ -875,6 +877,19 @@ def forward_compile(
             paying the full replay + weight-writing (which at production width
             is the ~30-minute, ~28 GB compile).  The sound schedule IS
             replayable; this only skips the replay for the measurement.
+        _solver_params: MEASUREMENT-ONLY (C1 solver-parameter sweep); never set
+            in production configs — same status as ``_disabled_families``.  A
+            dict of arbitrary ``CpSolver.parameters`` fields (scalar or list-
+            valued) applied to every solve, at ``optimize=3`` uniformly to
+            every descent rung.  Merged with the ``_solver_seed`` ``random_seed``
+            (the seed is applied first).  Shipping a winning set is a code
+            default edit, not this hatch (C1 plan Decisions #3).
+        _drop_decision_strategy: MEASUREMENT-ONLY (C1 arm
+            ``no_decision_strategy``).  When True, the scheduler's hand-rolled
+            critical-path-first ``AddDecisionStrategy`` is not emitted, leaving
+            CP-SAT's fixed-search subsolver slot to its default portfolio.
+            Cannot change the feasible set (search-only); never set in
+            production.
 
     Returns:
         A HeadlessTransformer whose compute() method reproduces
@@ -1215,6 +1230,19 @@ def forward_compile(
                     f"flex_routing={cpsat_flex_routing}, {budget_desc}"
                 )
 
+            # Merge the reproducible-draw seed with any general parameter
+            # overrides (C1 sweep, MEASUREMENT-ONLY).  An explicit
+            # ``_solver_params["random_seed"]`` would win, but the sweep passes
+            # the seed via ``_solver_seed`` and the arm params separately, so
+            # the seed is applied first and never shadowed.
+            _merged_solver_params: Optional[Dict[str, object]] = None
+            if _solver_seed is not None or _solver_params:
+                _merged_solver_params = {}
+                if _solver_seed is not None:
+                    _merged_solver_params["random_seed"] = _solver_seed
+                if _solver_params:
+                    _merged_solver_params.update(_solver_params)
+
             # One solve at a given hint + horizon.  The hint feeds straight
             # back across rungs because the whole descent runs on ONE lowered
             # graph (stable node ids within this compile) — no re-keying.
@@ -1240,14 +1268,11 @@ def forward_compile(
                     hint_cancel=hc if hc else None,
                     hint_cancel_mech=hm if hm else None,
                     log_search_progress=verbose,
-                    # Measurement-only knobs (§0 gap attribution); empty / None
-                    # in production.
+                    # Measurement-only knobs (§0 gap attribution, C1 sweep);
+                    # empty / None / False in production.
                     _disabled_families=_disabled_families,
-                    solver_params=(
-                        {"random_seed": _solver_seed}
-                        if _solver_seed is not None
-                        else None
-                    ),
+                    solver_params=_merged_solver_params,
+                    drop_decision_strategy=_drop_decision_strategy,
                 )
 
             def _horizon_for(hn):
