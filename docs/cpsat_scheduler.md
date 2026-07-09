@@ -534,7 +534,7 @@ CP-SAT against a specific heuristic policy's routing choice.
 forward_compile(
     d, d_head, output_node, pos_encoding,
     ...,
-    optimize: int = 0,                # 0=heuristic, 1=60s, 2=180s, 3=300s
+    optimize: int = 0,                # 0=heuristic,1=60s,2=330s,3=600s descent
     cpsat_costs: Costs = Costs(),     # advanced: Pareto navigator
     cpsat_flex_routing: bool = True,  # advanced: routing decision
 )
@@ -545,9 +545,9 @@ forward_compile(
 | level | scheduler | budget |
 |------:|-----------|--------|
 |     0 | heuristic `LayerScheduler` (default) | — |
-|     1 | CP-SAT, accept best-feasible           | 60s |
-|     2 | CP-SAT, accept best-feasible           | 180s |
-|     3 | CP-SAT, accept best-feasible           | 300s |
+|     1 | CP-SAT, single warm-start solve, best-feasible | 60s |
+|     2 | CP-SAT, single warm-start solve, best-feasible | 330s (180 + 150 folded floor-probe) |
+|     3 | CP-SAT, in-compile iterated descent, best-feasible | 600s (~180s/rung; rung k>0 hinted with best-so-far at horizon best+1, until budget or proven optimal) |
 
 At `optimize=0` the compiler skips CP-SAT entirely — same code path
 as before this subsystem existed.  Use it for fast iteration where

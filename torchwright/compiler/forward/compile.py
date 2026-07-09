@@ -68,6 +68,12 @@ from torchwright.graph.misc import LiteralValue
 # before trusting the norm on a new graph.
 _RMS_NORM_CONST_EXP = 44
 
+# Per-rung wall budget for the optimize=3 in-compile iterated descent; the
+# total budget is _OPTIMIZE_BUDGETS[3], so ~600/180 ≈ 3–4 rungs (a simple
+# uniform split — matches level 2's base solve length).  Module-level so it is
+# tunable / inspectable.
+_OPT3_RUNG_BUDGET_S = 180.0
+
 
 @dataclass(frozen=True)
 class RmsNormSpec:
@@ -1050,8 +1056,14 @@ def forward_compile(
     # Map optimize level to CP-SAT time budget.  Level 0 skips CP-SAT
     # entirely; higher levels accept best-feasible (not proven-optimal)
     # at budget exhaustion and fall back to the heuristic if CP-SAT
-    # finds nothing.
-    _OPTIMIZE_BUDGETS = {1: 60.0, 2: 180.0, 3: 300.0}
+    # finds nothing.  Levels 1/2 run a single warm-start solve
+    # (60 s / 330 s incl. the folded floor-probe budget).  Level 3 is a
+    # 600 s in-compile ITERATED DESCENT: rung 0 is the heuristic-hinted
+    # solve, and each later rung re-solves hinted with the best-so-far at
+    # horizon best+1 (the only rung mechanism the plan found to work), all
+    # within one forward_compile call — uniform per compile, no cross-compile
+    # state (Rob's no-preseed rule), first-seen graphs behave identically.
+    _OPTIMIZE_BUDGETS = {1: 60.0, 2: 180.0, 3: 600.0}
     if optimize not in (0, 1, 2, 3):
         raise ValueError(f"optimize must be 0, 1, 2, or 3 (got {optimize})")
     use_cpsat = optimize > 0
@@ -1179,8 +1191,11 @@ def forward_compile(
             # unchanged.  (It also served as a fast
             # INFEASIBLE classifier for width-bound geometries, measured at
             # d=4096; that classification is lost.)
+            # Levels 1/2: single solve (the +150 s folded floor-probe budget
+            # at level 2).  Level 3: the rung loop below manages its own
+            # 600 s total across rungs, so descent_budget_s is unused there.
             descent_budget_s = cpsat_time_budget_s
-            if optimize >= 2:
+            if optimize == 2:
                 descent_budget_s = cpsat_time_budget_s + min(150.0, cpsat_time_budget_s)
 
             if verbose:
@@ -1189,53 +1204,129 @@ def forward_compile(
                     f"  Heuristic warm-start: {hint_n_layers} layers "
                     f"({hint_time:.2f}s, {len(hint_layers)} hinted nodes)"
                 )
+                budget_desc = (
+                    f"{cpsat_time_budget_s:.0f}s iterated descent"
+                    if optimize == 3
+                    else f"time_budget_s={descent_budget_s}"
+                )
                 print(
                     f"  CP-SAT solver: costs={cpsat_costs}, "
-                    f"flex_routing={cpsat_flex_routing}, "
-                    f"time_budget_s={descent_budget_s}"
+                    f"flex_routing={cpsat_flex_routing}, {budget_desc}"
                 )
 
-            # Use the heuristic's layer count as the search horizon (with
-            # one slack layer) when it's tighter than the user-supplied
-            # max_layers.  CP-SAT's variable domain shrinks accordingly,
-            # which is a big win for graphs where max_layers >> n_layers.
-            solver_max_layers = max_layers
-            if hint_n_layers > 0:
-                solver_max_layers = min(max_layers, hint_n_layers + 1)
+            # One solve at a given hint + horizon.  The hint feeds straight
+            # back across rungs because the whole descent runs on ONE lowered
+            # graph (stable node ids within this compile) — no re-keying.
+            def _solve_rung(hl, hr, hc, hm, horizon, budget):
+                return solve_schedule(
+                    output_node,
+                    pos_encoding,
+                    d=d,
+                    d_head=d_head,
+                    d_hidden=solver_d_hidden,
+                    costs=cpsat_costs,
+                    flex_routing=cpsat_flex_routing,
+                    time_budget_s=budget,
+                    max_layers=horizon,
+                    policy=policy,
+                    reserve_residual=n_reserved_residual,
+                    # Sound by construction: the warm-start hint is feasible,
+                    # so it always satisfies the tightened domains (verified:
+                    # zero violations at both measured geometries).
+                    tighten_domains=True,
+                    hint_layers=hl if hl else None,
+                    hint_routing=hr if hr else None,
+                    hint_cancel=hc if hc else None,
+                    hint_cancel_mech=hm if hm else None,
+                    log_search_progress=verbose,
+                    # Measurement-only knobs (§0 gap attribution); empty / None
+                    # in production.
+                    _disabled_families=_disabled_families,
+                    solver_params=(
+                        {"random_seed": _solver_seed}
+                        if _solver_seed is not None
+                        else None
+                    ),
+                )
+
+            def _horizon_for(hn):
+                # The heuristic / best-so-far layer count + 1 slack layer is
+                # the search horizon when tighter than max_layers — a SOFT
+                # ceiling (the hint at depth hn stays feasible; a hard
+                # K-ceiling would kill the hint).
+                return min(max_layers, hn + 1) if hn > 0 else max_layers
 
             t_solve_start = time.perf_counter()
-            assignment, _stats = solve_schedule(
-                output_node,
-                pos_encoding,
-                d=d,
-                d_head=d_head,
-                d_hidden=solver_d_hidden,
-                costs=cpsat_costs,
-                flex_routing=cpsat_flex_routing,
-                time_budget_s=descent_budget_s,
-                max_layers=solver_max_layers,
-                policy=policy,
-                reserve_residual=n_reserved_residual,
-                # Sound by construction: the warm-start hint is
-                # feasible, so it always satisfies the tightened
-                # domains (verified: zero violations at both measured
-                # geometries).  Saves ~7s presolve + ~9s to first
-                # incumbent on the DOOM graph.
-                tighten_domains=True,
-                hint_layers=hint_layers if hint_layers else None,
-                hint_routing=hint_routing if hint_routing else None,
-                hint_cancel=hint_cancel if hint_cancel else None,
-                hint_cancel_mech=hint_cancel_mech if hint_cancel_mech else None,
-                log_search_progress=verbose,
-                # Measurement-only knobs (§0 gap attribution); empty / None
-                # in production.
-                _disabled_families=_disabled_families,
-                solver_params=(
-                    {"random_seed": _solver_seed}
-                    if _solver_seed is not None
-                    else None
-                ),
-            )
+            if optimize == 3:
+                # Iterated descent within the total budget: rung 0 hinted by
+                # the heuristic, each later rung hinted by the best-so-far at
+                # horizon best+1, until the budget is spent or a rung proves
+                # optimality.  Return the shallowest schedule found.
+                total_budget = cpsat_time_budget_s
+                hl, hr, hc, hm, hn = (
+                    hint_layers,
+                    hint_routing,
+                    hint_cancel,
+                    hint_cancel_mech,
+                    hint_n_layers,
+                )
+                assignment, _stats = None, None
+                rung = 0
+                while rung < 64:  # safety cap; the budget is the real stop
+                    elapsed = time.perf_counter() - t_solve_start
+                    remaining = total_budget - elapsed
+                    if remaining <= 1.0:
+                        break
+                    rung_budget = min(_OPT3_RUNG_BUDGET_S, remaining)
+                    horizon = _horizon_for(hn)
+                    asg_r, stats_r = _solve_rung(hl, hr, hc, hm, horizon, rung_budget)
+                    if verbose:
+                        print(
+                            f"  descent rung {rung}: horizon={horizon} "
+                            f"budget={rung_budget:.0f}s -> "
+                            f"n_layers={asg_r.n_layers if asg_r else None} "
+                            f"optimal={stats_r.is_optimal}"
+                        )
+                    if asg_r is not None and (
+                        assignment is None or asg_r.n_layers < assignment.n_layers
+                    ):
+                        assignment, _stats = asg_r, stats_r
+                        # Hint the next rung with this best (same lowered graph
+                        # -> same node ids).  Drop parked (keep-forever) cancels
+                        # that sit at the prior horizon; the model re-pins them.
+                        hn = asg_r.n_layers
+                        hl = asg_r.node_to_layer
+                        hr = asg_r.node_to_routing
+                        hc = {
+                            k: v
+                            for k, v in asg_r.node_to_cancel_layer.items()
+                            if v < hn
+                        }
+                        hm = asg_r.node_to_cancel_mech
+                    if _stats is None:
+                        # No incumbent yet: keep the newest stats so a
+                        # no-solution descent still surfaces the solver status.
+                        _stats = stats_r
+                    # A rung that PROVES optimality ends the descent — no deeper
+                    # rung can help.  If it proved the current incumbent optimal
+                    # (same or shallower depth), reflect that on the returned
+                    # stats even when it did not strictly improve.
+                    if stats_r.is_optimal:
+                        if assignment is not None and asg_r is not None and (
+                            asg_r.n_layers <= assignment.n_layers
+                        ):
+                            _stats = stats_r
+                        break
+                    rung += 1
+            else:
+                assignment, _stats = _solve_rung(
+                    hint_layers,
+                    hint_routing,
+                    hint_cancel,
+                    hint_cancel_mech,
+                    _horizon_for(hint_n_layers),
+                    descent_budget_s,
+                )
             # Surface the solver provenance on the returned net so
             # callers can distinguish a real solve from a fallback
             # without re-deriving it (``stats.status_name``,
