@@ -767,6 +767,7 @@ def forward_compile(
     _solve_only: bool = False,
     _descent_budget_s: Optional[float] = None,
     _canonical_cancel_reps: bool = False,
+    _pin_cancels: bool = False,
     _solver_params: Optional[Dict[str, object]] = None,
     _drop_decision_strategy: bool = False,
 ) -> HeadlessTransformer:
@@ -887,6 +888,14 @@ def forward_compile(
             model solutions replay identically to retained ones, so the
             schedule stays SOUND (unlike ``_disabled_families``) and the
             forward pass is unchanged — see ``cpsat_symmetry_sym1_plan.md``.
+        _pin_cancels: MEASUREMENT-ONLY (pinned-cancel A/B,
+            ``cpsat_pinned_cancel_plan.md`` step 2; never set in production).
+            When on, the solve equality-pins every non-keep-forever cancel
+            layer to its earliest legal value given the mechanism
+            (``cancel_in_mlp`` stays free) and drops the parked/window/
+            widening families plus the cancel hints.  A pure restriction of
+            the default model — every emitted schedule is a valid
+            default-model solution and stays SOUND to replay.
         _solver_params: MEASUREMENT-ONLY (C1 solver-parameter sweep); never set
             in production configs — same status as ``_disabled_families``.  A
             dict of arbitrary ``CpSolver.parameters`` fields (scalar or list-
@@ -1282,6 +1291,7 @@ def forward_compile(
                     # empty / None / False in production.
                     _disabled_families=_disabled_families,
                     _canonical_cancel_reps=_canonical_cancel_reps,
+                    _pin_cancels=_pin_cancels,
                     solver_params=_merged_solver_params,
                     drop_decision_strategy=_drop_decision_strategy,
                 )
