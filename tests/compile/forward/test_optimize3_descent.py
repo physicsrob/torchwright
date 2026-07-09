@@ -53,6 +53,18 @@ def test_optimize3_compiles_replays_and_is_no_worse_than_optimize1():
     assert torch.allclose(got.cpu(), ref, atol=1e-3)
 
 
+def test_optimize3_descent_budget_override_is_accepted():
+    """The measurement-only ``_descent_budget_s`` overrides the total budget
+    (production default 600s stays put) and still yields a valid solve."""
+    graph = _width_graph()
+    net = forward_compile(
+        d=80, d_head=80, output_node=graph, device="cpu", verbose=False,
+        optimize=3, _solve_only=True, _force_resolve=True, _descent_budget_s=5.0,
+    )
+    assert net.cpsat_assignment is not None
+    assert net.cpsat_assignment.n_layers >= 1
+
+
 def _fake_stats(n_layers, optimal):
     return SolveStats(
         status_name="OPTIMAL" if optimal else "FEASIBLE",

@@ -765,6 +765,7 @@ def forward_compile(
     _solver_seed: Optional[int] = None,
     _force_resolve: bool = False,
     _solve_only: bool = False,
+    _descent_budget_s: Optional[float] = None,
 ) -> HeadlessTransformer:
     """Compile a computation graph into a HeadlessTransformer.
 
@@ -1262,7 +1263,14 @@ def forward_compile(
                 # the heuristic, each later rung hinted by the best-so-far at
                 # horizon best+1, until the budget is spent or a rung proves
                 # optimality.  Return the shallowest schedule found.
-                total_budget = cpsat_time_budget_s
+                # `_descent_budget_s` is a MEASUREMENT-ONLY override of the
+                # total budget (never set in production); the per-rung split
+                # (_OPT3_RUNG_BUDGET_S) is unchanged.
+                total_budget = (
+                    _descent_budget_s
+                    if _descent_budget_s is not None
+                    else cpsat_time_budget_s
+                )
                 hl, hr, hc, hm, hn = (
                     hint_layers,
                     hint_routing,
@@ -1281,11 +1289,15 @@ def forward_compile(
                     horizon = _horizon_for(hn)
                     asg_r, stats_r = _solve_rung(hl, hr, hc, hm, horizon, rung_budget)
                     if verbose:
+                        cum = time.perf_counter() - t_solve_start
                         print(
                             f"  descent rung {rung}: horizon={horizon} "
-                            f"budget={rung_budget:.0f}s -> "
+                            f"rung_budget={rung_budget:.0f}s "
+                            f"wall={stats_r.wall_time_s:.0f}s cum={cum:.0f}s -> "
                             f"n_layers={asg_r.n_layers if asg_r else None} "
-                            f"optimal={stats_r.is_optimal}"
+                            f"bound={stats_r.best_objective_bound} "
+                            f"optimal={stats_r.is_optimal}",
+                            flush=True,
                         )
                     if asg_r is not None and (
                         assignment is None or asg_r.n_layers < assignment.n_layers
