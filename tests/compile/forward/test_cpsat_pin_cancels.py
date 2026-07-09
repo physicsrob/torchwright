@@ -225,6 +225,35 @@ def test_pinned_optimum_no_shallower_than_unpinned(name, d):
 
 
 # ---------------------------------------------------------------------------
+# Snapshot-path plumbing: the knob reaches build_model_from_snapshot
+# ---------------------------------------------------------------------------
+
+
+def test_pin_reaches_snapshot_path():
+    """The A/B runs off a frozen fixture via ``solve_schedule_from_snapshot``;
+    prove the knob is live on that path — the pinned snapshot build differs
+    from the default snapshot build and equals the pinned live build."""
+    from torchwright.compiler.forward.cpsat_scheduler import (
+        build_graph_model,
+        build_model_from_snapshot,
+    )
+    from torchwright.compiler.forward.cpsat_snapshot import (
+        snapshot_from_graph_model,
+    )
+
+    node, d, d_head = _build("fibonacci")
+    problem = snapshot_from_graph_model(build_graph_model(node))
+    cfg = dict(d=d, d_head=d_head, d_hidden=d, max_layers=_MAX_LAYERS)
+    snap_off = _proto_text(build_model_from_snapshot(problem, **cfg))
+    snap_on = _proto_text(
+        build_model_from_snapshot(problem, _pin_cancels=True, **cfg)
+    )
+    live_on = _proto_text(build_cpsat_model(node, _pin_cancels=True, **cfg))
+    assert snap_on != snap_off, "knob dead on the snapshot path"
+    assert snap_on == live_on, "pinned snapshot proto differs from pinned live"
+
+
+# ---------------------------------------------------------------------------
 # Hint dropping: a full four-family hint + strict validation does not raise
 # ---------------------------------------------------------------------------
 
