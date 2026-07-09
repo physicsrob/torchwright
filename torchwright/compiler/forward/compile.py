@@ -766,6 +766,7 @@ def forward_compile(
     _force_resolve: bool = False,
     _solve_only: bool = False,
     _descent_budget_s: Optional[float] = None,
+    _canonical_cancel_reps: bool = False,
 ) -> HeadlessTransformer:
     """Compile a computation graph into a HeadlessTransformer.
 
@@ -875,6 +876,15 @@ def forward_compile(
             paying the full replay + weight-writing (which at production width
             is the ~30-minute, ~28 GB compile).  The sound schedule IS
             replayable; this only skips the replay for the measurement.
+        _canonical_cancel_reps: MEASUREMENT-ONLY (sym1; never set in
+            production).  When on, the solve posts two extra implications per
+            eligible node that collapse two parked/cancel encoding
+            degeneracies (a dangling cancel-mechanism boolean under `parked`,
+            and a duplicate never-freed encoding) so search workers stop
+            branching on distinctions with no physical meaning.  The removed
+            model solutions replay identically to retained ones, so the
+            schedule stays SOUND (unlike ``_disabled_families``) and the
+            forward pass is unchanged — see ``cpsat_symmetry_sym1_plan.md``.
 
     Returns:
         A HeadlessTransformer whose compute() method reproduces
@@ -1243,6 +1253,7 @@ def forward_compile(
                     # Measurement-only knobs (§0 gap attribution); empty / None
                     # in production.
                     _disabled_families=_disabled_families,
+                    _canonical_cancel_reps=_canonical_cancel_reps,
                     solver_params=(
                         {"random_seed": _solver_seed}
                         if _solver_seed is not None

@@ -179,6 +179,13 @@ class SolveStats:
     # has no secondary terms).  objective_value // objective_scale recovers
     # the primary value; the raw solver log's best/bound lines are scaled.
     objective_scale: int = 1
+    # Number of non-keep-forever nodes (schedulable + freeable inputs) whose
+    # returned cancel layer sits at the virtual horizon `max_layers` — i.e.
+    # the nodes the machine leaves allocated forever (`parked`).  This is the
+    # `2^k` D-1 dangling-boolean multiplicity the sym1 canonicalization removes;
+    # logged post-hoc so a null measurement result can be read as "no effect"
+    # vs "no parked nodes to deduplicate."  -1 when no feasible solution.
+    parked_count: int = -1
 
 
 # Routing constants used both by this module and by the probe script.
@@ -611,6 +618,7 @@ def build_cpsat_model(
     hint_layers: Optional[Dict[int, int]] = None,
     hint_cancel: Optional[Dict[int, int]] = None,
     _disabled_families: frozenset = frozenset(),
+    _canonical_cancel_reps: bool = False,
 ) -> BuiltModel:
     """Build (but do not solve) the CP-SAT scheduling model.
 
@@ -650,6 +658,7 @@ def build_cpsat_model(
         hint_layers=hint_layers,
         hint_cancel=hint_cancel,
         _disabled_families=_disabled_families,
+        _canonical_cancel_reps=_canonical_cancel_reps,
     )
 
 
@@ -670,6 +679,7 @@ def build_cpsat_model_from_gm(
     hint_layers: Optional[Dict[int, int]] = None,
     hint_cancel: Optional[Dict[int, int]] = None,
     _disabled_families: frozenset = frozenset(),
+    _canonical_cancel_reps: bool = False,
 ) -> BuiltModel:
     """Build (but do not solve) the CP-SAT model from a prebuilt GraphModel.
 
@@ -679,6 +689,14 @@ def build_cpsat_model_from_gm(
     forms provide — op class via ``isinstance``, widths, edges, effective
     consumers, pinned status — so the proto is byte-identical for a live graph
     and its round-tripped snapshot.
+
+    ``_canonical_cancel_reps`` is a MEASUREMENT-ONLY knob (default OFF; the
+    production path never sets it).  When on, it posts two extra implications
+    per node that has both a ``parked`` var and (for D-1) a ``cancel_in_mlp``
+    var, collapsing two encoding degeneracies that give one physical schedule
+    multiple model representations — see ``cpsat_symmetry_sym1_plan.md``.  With
+    it OFF no variable or constraint is added, so the proto is byte-identical
+    to today.
     """
     unknown = _disabled_families - CONSTRAINT_FAMILIES
     if unknown:
@@ -870,6 +888,28 @@ def build_cpsat_model_from_gm(
     # exist (below): the gap between an addend's cancel and the Add's layer
     # depends on whether the Add runs in the free (reassign) regime.
     deferred_add_consumer_lbs: List[Tuple[cp_model.IntVar, int]] = []
+
+    def _canonicalize_cancel_reps(cl, parked, cim):
+        # sym1 (MEASUREMENT-ONLY, gated by `_canonical_cancel_reps`; default OFF
+        # posts nothing, keeping the proto byte-identical).  Removes two
+        # encoding degeneracies where one physical schedule has multiple model
+        # representations — see cpsat_symmetry_sym1_plan.md.
+        #   D-1: under `parked` no cancel op executes, so `cancel_in_mlp` only
+        #   selects which cost pool a cancel *would* charge — both pool
+        #   presences are already gated absent.  Pin it to the attention side
+        #   (cim = 0), which also drops the phantom residual-end extension
+        #   `rend = cancel_layer + cim`.  Freeable inputs have no `cim`.
+        #   D-2: `parked ⇒ cancel_layer == max_layers` is already posted; add
+        #   the converse so "never freed in-horizon" has the single `parked`
+        #   encoding, not also the duplicate `parked = 0, cancel = max_layers`
+        #   (which additionally charges a phantom cancel-head column at the
+        #   virtual layer).
+        if not _canonical_cancel_reps:
+            return
+        if cim is not None:
+            model.AddImplication(parked, cim.Not())
+        model.Add(cl <= max_layers - 1).OnlyEnforceIf(parked.Not())
+
     for n in gm.schedulable:
         cl = model.NewIntVar(0, max_layers, f"cl_n{n.node_id}")
         cancel_layer[n.node_id] = cl
@@ -932,6 +972,7 @@ def build_cpsat_model_from_gm(
                 parked.Not()
             )
             model.Add(cl == max_layers).OnlyEnforceIf(parked)
+            _canonicalize_cancel_reps(cl, parked, cim)
         elif eff_cancel_slack is not None and not consumer_layer_vars:
             # No layer-bound consumers — cancel can fire right after
             # the node's own birth layer.
@@ -945,6 +986,7 @@ def build_cpsat_model_from_gm(
                 cl <= layer_var[n.node_id] + 1 + eff_cancel_slack + delta
             ).OnlyEnforceIf(parked.Not())
             model.Add(cl == max_layers).OnlyEnforceIf(parked)
+            _canonicalize_cancel_reps(cl, parked, cim)
 
     # ---- Freeable input cancel layers ----
     # Freeable inputs are born at layer 0 (pre-allocated by the compiler
@@ -985,6 +1027,7 @@ def build_cpsat_model_from_gm(
                 parked.Not()
             )
             model.Add(cl == max_layers).OnlyEnforceIf(parked)
+            _canonicalize_cancel_reps(cl, parked, None)
         elif eff_cancel_slack is not None and not consumer_layer_vars:
             # Born at layer 0, so the hinted base is the fixed birth layer 0.
             delta = _widen_delta(n.node_id, 0)
@@ -992,6 +1035,7 @@ def build_cpsat_model_from_gm(
             parked_input_by_id[n.node_id] = parked
             model.Add(cl <= 1 + eff_cancel_slack + delta).OnlyEnforceIf(parked.Not())
             model.Add(cl == max_layers).OnlyEnforceIf(parked)
+            _canonicalize_cancel_reps(cl, parked, None)
 
     # ---- Add free/compute classification ----
     # The heuristic schedules an `Add` via `add_into` (free regime)
@@ -1594,6 +1638,7 @@ def build_model_from_snapshot(
     hint_layers: Optional[Dict[int, int]] = None,
     hint_cancel: Optional[Dict[int, int]] = None,
     _disabled_families: frozenset = frozenset(),
+    _canonical_cancel_reps: bool = False,
 ) -> BuiltModel:
     """Build the CP-SAT model from a captured snapshot — no live graph.
 
@@ -1616,6 +1661,7 @@ def build_model_from_snapshot(
         hint_layers=hint_layers,
         hint_cancel=hint_cancel,
         _disabled_families=_disabled_families,
+        _canonical_cancel_reps=_canonical_cancel_reps,
     )
 
 
@@ -1941,6 +1987,7 @@ def solve_schedule(
     solution_trace: Optional[List[dict]] = None,
     strict_hint: bool = False,
     _disabled_families: frozenset = frozenset(),
+    _canonical_cancel_reps: bool = False,
 ) -> Tuple[Optional[ScheduleAssignment], SolveStats]:
     """Build and solve the CP-SAT scheduling model.
 
@@ -2033,6 +2080,7 @@ def solve_schedule(
         hint_layers=hint_layers,
         hint_cancel=hint_cancel,
         _disabled_families=_disabled_families,
+        _canonical_cancel_reps=_canonical_cancel_reps,
     )
     return _solve_built(
         built,
@@ -2073,6 +2121,7 @@ def solve_schedule_from_snapshot(
     solution_trace: Optional[List[dict]] = None,
     strict_hint: bool = False,
     _disabled_families: frozenset = frozenset(),
+    _canonical_cancel_reps: bool = False,
 ) -> Tuple[Optional[ScheduleAssignment], SolveStats]:
     """Build and solve the model from a captured snapshot — no live graph.
 
@@ -2097,6 +2146,7 @@ def solve_schedule_from_snapshot(
         hint_layers=hint_layers,
         hint_cancel=hint_cancel,
         _disabled_families=_disabled_families,
+        _canonical_cancel_reps=_canonical_cancel_reps,
     )
     return _solve_built(
         built,
@@ -2266,6 +2316,20 @@ def _solve_built(
         # layer, so adding inputs here makes the replay reclaim their columns.
         for nid, cl_in in input_cancel_layer.items():
             node_to_cancel_layer[nid] = solver.Value(cl_in)
+        # Count the parked (never-freed-in-horizon) nodes: non-keep-forever
+        # nodes whose cancel landed at the virtual horizon.  Keyed off the
+        # returned assignment so it holds under the sym1 knob and off it.
+        parked_count = sum(
+            1
+            for n in gm.schedulable
+            if n.node_id not in built.keep_forever_ids
+            and node_to_cancel_layer[n.node_id] == max_layers
+        ) + sum(
+            1
+            for nid in input_cancel_layer
+            if nid not in built.input_keep_ids
+            and node_to_cancel_layer[nid] == max_layers
+        )
         n_layers = solver.Value(n_layers_var)
         total_heads = solver.Value(total_attn_heads)
         total_bypass = solver.Value(total_mlp_bypass)
@@ -2281,6 +2345,7 @@ def _solve_built(
         total_heads = -1
         total_bypass = -1
         objective = -1
+        parked_count = -1
         assignment = None
 
     stats = SolveStats(
@@ -2293,5 +2358,6 @@ def _solve_built(
         total_mlp_bypass_slots=total_bypass,
         is_optimal=status == cp_model.OPTIMAL,
         objective_scale=built.objective_scale,
+        parked_count=parked_count,
     )
     return assignment, stats
