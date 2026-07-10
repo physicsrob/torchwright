@@ -280,9 +280,11 @@ class BuiltModel:
     # validation to mirror the routing-aware cancel bounds.
     static_routing: Optional[Dict[int, str]] = None
     # True when the model was built with `_pin_cancels` (cancel layers
-    # equality-pinned; no parked/window/widening families).  `_solve_built`
-    # reads it to drop the cancel + cancel-mechanism hints, whose families
-    # the pinned model no longer accepts as free choices.
+    # equality-pinned; no parked/window/widening families) — the production
+    # default since 2026-07-10.  `_solve_built` reads it to drop the
+    # cancel-LAYER hints, which the pin forces; the cancel-MECHANISM hints
+    # are kept (`cancel_in_mlp` stays a free decision, and its hint bits are
+    # load-bearing for warm-start completion on head-saturated graphs).
     pin_cancels: bool = False
 
 
@@ -661,7 +663,7 @@ def build_cpsat_model(
     hint_cancel: Optional[Dict[int, int]] = None,
     _disabled_families: frozenset = frozenset(),
     _canonical_cancel_reps: bool = False,
-    _pin_cancels: bool = False,
+    _pin_cancels: bool = True,
 ) -> BuiltModel:
     """Build (but do not solve) the CP-SAT scheduling model.
 
@@ -724,7 +726,7 @@ def build_cpsat_model_from_gm(
     hint_cancel: Optional[Dict[int, int]] = None,
     _disabled_families: frozenset = frozenset(),
     _canonical_cancel_reps: bool = False,
-    _pin_cancels: bool = False,
+    _pin_cancels: bool = True,
 ) -> BuiltModel:
     """Build (but do not solve) the CP-SAT model from a prebuilt GraphModel.
 
@@ -748,19 +750,22 @@ def build_cpsat_model_from_gm(
     var, collapsing two encoding degeneracies that give one physical schedule
     multiple model representations — see ``cpsat_symmetry_sym1_plan.md``.  With
     it OFF no variable or constraint is added, so the proto is byte-identical
-    to today.
+    to today.  It has scope only with ``_pin_cancels=False``: the pinned
+    default builds no ``parked`` vars, so both implications are vacuous there.
 
-    ``_pin_cancels`` is a MEASUREMENT-ONLY knob (default OFF; the production
-    path never sets it) — the pinned-cancel A/B, ``cpsat_pinned_cancel_plan.md``
-    step 2.  When on, every non-keep-forever cancel layer is equality-pinned to
-    its earliest legal value given the chosen mechanism (an ``AddMaxEquality``
-    over the same consumer expressions the lower bounds use), replacing the
-    ``parked`` boolean, the upper-window (``cancel_slack``) constraint, and the
+    ``_pin_cancels`` is the PRODUCTION DEFAULT (on since 2026-07-10; formerly
+    the pinned-cancel A/B knob, ``cpsat_pinned_cancel_plan.md`` step 2).  When
+    on, every non-keep-forever cancel layer is equality-pinned to its earliest
+    legal value given the chosen mechanism (an ``AddMaxEquality`` over the same
+    consumer expressions the lower bounds use), replacing the ``parked``
+    boolean, the upper-window (``cancel_slack``) constraint, and the
     hint-aware widening for that node; ``cancel_in_mlp`` stays a free decision.
-    Every existing lower bound is kept, so the pinned model only ADDS
-    constraints relative to the default build — every solution it emits is a
-    valid default-model solution (machine-valid by construction).  With it OFF
-    the proto is byte-identical to today.
+    Every legacy lower bound is kept, so the pinned model only ADDS
+    constraints relative to the legacy build — every solution it emits is a
+    valid legacy-model solution (machine-valid by construction), verified
+    10/10 by re-fixing production-fixture solutions into the unpinned model.
+    ``False`` is the escape hatch: it rebuilds the legacy
+    window/parked/widening model byte-identically.
     """
     unknown = _disabled_families - CONSTRAINT_FAMILIES
     if unknown:
@@ -1233,7 +1238,7 @@ def build_cpsat_model_from_gm(
         for cl, add_id in deferred_add_consumer_lbs:
             model.Add(cl >= layer_var[add_id] + is_free[add_id])
 
-    # ---- Pinned cancel layers (_pin_cancels, measurement-only) ----
+    # ---- Pinned cancel layers (_pin_cancels, the production default) ----
     # Equality-pin each non-keep-forever cancel to its earliest legal value
     # given the mechanism, mirroring the lower bounds above term for term:
     # under an attention cancel (cim = 0) the earliest is
@@ -1242,7 +1247,7 @@ def build_cpsat_model_from_gm(
     # the non-Add term relaxes to the uniform gap-0 layer[c].  `cancel_in_mlp`
     # stays free — it still chooses which budget pays.  The kept lower bounds
     # make each pin an upper-bound-only addition, so the pinned model is a
-    # pure restriction of the default model.
+    # pure restriction of the legacy (knob-off) model.
     if _pin_cancels:
         for nid, cl, cim, non_add_ids, add_ids in deferred_pin_specs:
             birth = layer_var[nid] + 1
@@ -1784,7 +1789,7 @@ def build_model_from_snapshot(
     hint_cancel: Optional[Dict[int, int]] = None,
     _disabled_families: frozenset = frozenset(),
     _canonical_cancel_reps: bool = False,
-    _pin_cancels: bool = False,
+    _pin_cancels: bool = True,
 ) -> BuiltModel:
     """Build the CP-SAT model from a captured snapshot — no live graph.
 
@@ -2136,7 +2141,7 @@ def solve_schedule(
     drop_decision_strategy: bool = False,
     _disabled_families: frozenset = frozenset(),
     _canonical_cancel_reps: bool = False,
-    _pin_cancels: bool = False,
+    _pin_cancels: bool = True,
 ) -> Tuple[Optional[ScheduleAssignment], SolveStats]:
     """Build and solve the CP-SAT scheduling model.
 
@@ -2274,7 +2279,7 @@ def solve_schedule_from_snapshot(
     drop_decision_strategy: bool = False,
     _disabled_families: frozenset = frozenset(),
     _canonical_cancel_reps: bool = False,
-    _pin_cancels: bool = False,
+    _pin_cancels: bool = True,
 ) -> Tuple[Optional[ScheduleAssignment], SolveStats]:
     """Build and solve the model from a captured snapshot — no live graph.
 

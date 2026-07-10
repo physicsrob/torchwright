@@ -68,12 +68,6 @@ from torchwright.graph.misc import LiteralValue
 # before trusting the norm on a new graph.
 _RMS_NORM_CONST_EXP = 44
 
-# Per-rung wall budget for the optimize=3 in-compile iterated descent; the
-# total budget is _OPTIMIZE_BUDGETS[3], so ~600/180 ≈ 3–4 rungs (a simple
-# uniform split — matches level 2's base solve length).  Module-level so it is
-# tunable / inspectable.
-_OPT3_RUNG_BUDGET_S = 180.0
-
 
 @dataclass(frozen=True)
 class RmsNormSpec:
@@ -765,9 +759,9 @@ def forward_compile(
     _solver_seed: Optional[int] = None,
     _force_resolve: bool = False,
     _solve_only: bool = False,
-    _descent_budget_s: Optional[float] = None,
+    _solve_budget_s: Optional[float] = None,
     _canonical_cancel_reps: bool = False,
-    _pin_cancels: bool = False,
+    _pin_cancels: bool = True,
     _solver_params: Optional[Dict[str, object]] = None,
     _drop_decision_strategy: bool = False,
 ) -> HeadlessTransformer:
@@ -801,11 +795,19 @@ def forward_compile(
             falling back to the heuristic if CP-SAT finds nothing:
 
             * ``1``: 60s CP-SAT budget — typical iterative-dev win.
-            * ``2``: 180s — closer to optimal on d=3072+ geometry.
-            * ``3``: 300s — exhaustive; proves optimality on
-              parallelism-rich graphs.
+            * ``2``: 180s (+150s folded floor-probe budget) — closer to
+              optimal on d=3072+ geometry.
+            * ``3``: one continuous 600s solve — the production DOOM
+              configuration.  Formerly a 600s iterated descent (180s
+              rungs, each re-hinted with the best-so-far); retired
+              2026-07-10 because rung rebuilds reset the in-solve LNS
+              state that produces the deep improvements under the
+              pinned-cancel model (descent median 38 vs single-solve
+              median 37 on the d=8192 fixture).
 
-            See ``docs/cpsat_scheduler.md`` for the architecture.
+            Every level is a single hinted solve; they differ only in
+            budget.  See ``docs/cpsat_scheduler.md`` for the
+            architecture.
         cpsat_costs: Objective weights for CP-SAT (Pareto navigator).
             Defaults to ``Costs()`` (alpha=1, beta=0, gamma=0 — pure
             layer minimization).  Ignored when ``optimize=0``.
@@ -888,21 +890,32 @@ def forward_compile(
             model solutions replay identically to retained ones, so the
             schedule stays SOUND (unlike ``_disabled_families``) and the
             forward pass is unchanged — see ``cpsat_symmetry_sym1_plan.md``.
-        _pin_cancels: MEASUREMENT-ONLY (pinned-cancel A/B,
-            ``cpsat_pinned_cancel_plan.md`` step 2; never set in production).
-            When on, the solve equality-pins every non-keep-forever cancel
-            layer to its earliest legal value given the mechanism
-            (``cancel_in_mlp`` stays free) and drops the parked/window/
-            widening families plus the cancel hints.  A pure restriction of
-            the default model — every emitted schedule is a valid
-            default-model solution and stays SOUND to replay.
+        _pin_cancels: PRODUCTION DEFAULT (on since 2026-07-10; the
+            pinned-cancel ship).  When on, the solve equality-pins every
+            non-keep-forever cancel layer to its earliest legal value given
+            the cancel mechanism (``cancel_in_mlp`` stays a free decision)
+            and does not build the parked/window/widening families; the
+            warm start keeps the layer, routing, and cancel-MECHANISM
+            hints and drops only the cancel-layer values (forced by
+            propagation once the mechanism is decided).  A pure
+            restriction of the legacy model — every emitted schedule is a
+            valid legacy-model solution and stays SOUND to replay — that
+            dominates it on search (d=8192 fixture, 600s single solves:
+            pinned median 37, min 33 verified, vs unpinned median 40).
+            ``False`` is the escape hatch: it rebuilds the legacy
+            window/parked/widening model byte-identically.  See
+            ``docs/cpsat_scheduler.md`` and the umbrella
+            ``cpsat_pinned_cancel_plan.md``.
         _solver_params: MEASUREMENT-ONLY (C1 solver-parameter sweep); never set
             in production configs — same status as ``_disabled_families``.  A
             dict of arbitrary ``CpSolver.parameters`` fields (scalar or list-
-            valued) applied to every solve, at ``optimize=3`` uniformly to
-            every descent rung.  Merged with the ``_solver_seed`` ``random_seed``
-            (the seed is applied first).  Shipping a winning set is a code
-            default edit, not this hatch (C1 plan Decisions #3).
+            valued) applied to the solve.  Merged with the ``_solver_seed``
+            ``random_seed`` (the seed is applied first).  Shipping a winning
+            set is a code default edit, not this hatch (C1 plan Decisions #3).
+        _solve_budget_s: MEASUREMENT-ONLY override of the solve's wall
+            budget (the production budgets come from ``optimize``); never
+            set in production.  Formerly ``_descent_budget_s``, the total
+            budget of the retired optimize=3 iterated descent.
         _drop_decision_strategy: MEASUREMENT-ONLY (C1 arm
             ``no_decision_strategy``).  When True, the scheduler's hand-rolled
             critical-path-first ``AddDecisionStrategy`` is not emitted, leaving
@@ -1217,24 +1230,36 @@ def forward_compile(
                     bias=bias,
                 )
             )
-            # ---- Warm-start descent (the sole CP-SAT solve) ----
+            # ---- Warm-start solve (the sole CP-SAT solve) ----
+            # Every optimize level is ONE continuous hinted solve; the levels
+            # differ only in budget.
+            #
             # 2026-07-08: the floor-probe phase was removed.  It formerly ran
             # a COLD solve at horizon critical_path+1 (budget
             # min(150s, cpsat_time_budget_s)) to try to find and prove the
-            # dependency-floor schedule before this descent.  On the DOOM
+            # dependency-floor schedule before the main solve.  On the DOOM
             # production graph it never succeeded — it burned its 150s,
-            # returned UNKNOWN, and fell through to the descent anyway — so it
-            # was removed and its budget folded into the descent (the
-            # ``descent_budget_s`` below) so total CP-SAT wall time is
-            # unchanged.  (It also served as a fast
-            # INFEASIBLE classifier for width-bound geometries, measured at
-            # d=4096; that classification is lost.)
-            # Levels 1/2: single solve (the +150 s folded floor-probe budget
-            # at level 2).  Level 3: the rung loop below manages its own
-            # 600 s total across rungs, so descent_budget_s is unused there.
-            descent_budget_s = cpsat_time_budget_s
+            # returned UNKNOWN, and fell through anyway — so it was removed
+            # and its budget folded into level 2's solve (the +150 s below)
+            # so total CP-SAT wall time is unchanged.  (It also served as a
+            # fast INFEASIBLE classifier for width-bound geometries, measured
+            # at d=4096; that classification is lost.)
+            #
+            # 2026-07-10: level 3's iterated descent was retired with the
+            # pinned-cancel default (one 600 s solve replaces 180 s rungs
+            # re-hinted with the best-so-far at horizon best+1).  Under the
+            # pin the deep improvements arrive as large in-solve LNS jumps
+            # (e.g. 41->33 at 143 s), and each rung rebuild burned ~25-35 s
+            # of re-presolve and reset exactly that LNS state — measured
+            # pinned-descent depths [38,39,37,38,33] median 38 vs pinned
+            # single-solve median 37 over 15 draws (umbrella
+            # cpsat_pinned_cancel_plan.md, steps 2-3).
+            solve_budget_s = cpsat_time_budget_s
             if optimize == 2:
-                descent_budget_s = cpsat_time_budget_s + min(150.0, cpsat_time_budget_s)
+                solve_budget_s = cpsat_time_budget_s + min(150.0, cpsat_time_budget_s)
+            if _solve_budget_s is not None:
+                # MEASUREMENT-ONLY override; never set in production.
+                solve_budget_s = _solve_budget_s
 
             if verbose:
                 hint_time = time.perf_counter() - t_hint_start
@@ -1242,14 +1267,10 @@ def forward_compile(
                     f"  Heuristic warm-start: {hint_n_layers} layers "
                     f"({hint_time:.2f}s, {len(hint_layers)} hinted nodes)"
                 )
-                budget_desc = (
-                    f"{cpsat_time_budget_s:.0f}s iterated descent"
-                    if optimize == 3
-                    else f"time_budget_s={descent_budget_s}"
-                )
                 print(
                     f"  CP-SAT solver: costs={cpsat_costs}, "
-                    f"flex_routing={cpsat_flex_routing}, {budget_desc}"
+                    f"flex_routing={cpsat_flex_routing}, "
+                    f"time_budget_s={solve_budget_s}"
                 )
 
             # Merge the reproducible-draw seed with any general parameter
@@ -1265,10 +1286,15 @@ def forward_compile(
                 if _solver_params:
                     _merged_solver_params.update(_solver_params)
 
-            # One solve at a given hint + horizon.  The hint feeds straight
-            # back across rungs because the whole descent runs on ONE lowered
-            # graph (stable node ids within this compile) — no re-keying.
-            def _solve_rung(hl, hr, hc, hm, horizon, budget):
+            # One hinted solve at a given horizon.  Under the pinned-cancel
+            # model (the `_pin_cancels` default) the full four-family hint is
+            # passed; the solver keeps layers + routing + cancel MECHANISM
+            # and drops only the cancel-layer values (forced by propagation
+            # once the mechanism is decided).  The mechanism bits are
+            # load-bearing: without them the pinned model completed the hint
+            # into ZERO incumbents in 5x600 s on the d=8192 fixture
+            # (cpsat_pinned_cancel_plan.md step 2, batch 1).
+            def _solve_once(hl, hr, hc, hm, horizon, budget):
                 return solve_schedule(
                     output_node,
                     pos_encoding,
@@ -1306,90 +1332,14 @@ def forward_compile(
                 # K-ceiling would kill the hint).
                 return min(max_layers, hn + 1) if hn > 0 else max_layers
 
-            t_solve_start = time.perf_counter()
-            if optimize == 3:
-                # Iterated descent within the total budget: rung 0 hinted by
-                # the heuristic, each later rung hinted by the best-so-far at
-                # horizon best+1, until the budget is spent or a rung proves
-                # optimality.  Return the shallowest schedule found.
-                # `_descent_budget_s` is a MEASUREMENT-ONLY override of the
-                # total budget (never set in production); the per-rung split
-                # (_OPT3_RUNG_BUDGET_S) is unchanged.
-                total_budget = (
-                    _descent_budget_s
-                    if _descent_budget_s is not None
-                    else cpsat_time_budget_s
-                )
-                hl, hr, hc, hm, hn = (
-                    hint_layers,
-                    hint_routing,
-                    hint_cancel,
-                    hint_cancel_mech,
-                    hint_n_layers,
-                )
-                assignment, _stats = None, None
-                rung = 0
-                while rung < 64:  # safety cap; the budget is the real stop
-                    elapsed = time.perf_counter() - t_solve_start
-                    remaining = total_budget - elapsed
-                    if remaining <= 1.0:
-                        break
-                    rung_budget = min(_OPT3_RUNG_BUDGET_S, remaining)
-                    horizon = _horizon_for(hn)
-                    asg_r, stats_r = _solve_rung(hl, hr, hc, hm, horizon, rung_budget)
-                    if verbose:
-                        cum = time.perf_counter() - t_solve_start
-                        print(
-                            f"  descent rung {rung}: horizon={horizon} "
-                            f"rung_budget={rung_budget:.0f}s "
-                            f"wall={stats_r.wall_time_s:.0f}s cum={cum:.0f}s -> "
-                            f"n_layers={asg_r.n_layers if asg_r else None} "
-                            f"bound={stats_r.best_objective_bound} "
-                            f"optimal={stats_r.is_optimal}",
-                            flush=True,
-                        )
-                    if asg_r is not None and (
-                        assignment is None or asg_r.n_layers < assignment.n_layers
-                    ):
-                        assignment, _stats = asg_r, stats_r
-                        # Hint the next rung with this best (same lowered graph
-                        # -> same node ids).  Drop parked (keep-forever) cancels
-                        # that sit at the prior horizon; the model re-pins them.
-                        hn = asg_r.n_layers
-                        hl = asg_r.node_to_layer
-                        hr = asg_r.node_to_routing
-                        hc = {
-                            k: v
-                            for k, v in asg_r.node_to_cancel_layer.items()
-                            if v < hn
-                        }
-                        hm = asg_r.node_to_cancel_mech
-                    if _stats is None:
-                        # No incumbent yet: keep the newest stats so a
-                        # no-solution descent still surfaces the solver status.
-                        _stats = stats_r
-                    # A rung that PROVES optimality ends the descent — no deeper
-                    # rung can help.  If it proved the current incumbent optimal
-                    # (same or shallower depth), reflect that on the returned
-                    # stats even when it did not strictly improve.
-                    if stats_r.is_optimal:
-                        if (
-                            assignment is not None
-                            and asg_r is not None
-                            and (asg_r.n_layers <= assignment.n_layers)
-                        ):
-                            _stats = stats_r
-                        break
-                    rung += 1
-            else:
-                assignment, _stats = _solve_rung(
-                    hint_layers,
-                    hint_routing,
-                    hint_cancel,
-                    hint_cancel_mech,
-                    _horizon_for(hint_n_layers),
-                    descent_budget_s,
-                )
+            assignment, _stats = _solve_once(
+                hint_layers,
+                hint_routing,
+                hint_cancel,
+                hint_cancel_mech,
+                _horizon_for(hint_n_layers),
+                solve_budget_s,
+            )
             # Surface the solver provenance on the returned net so
             # callers can distinguish a real solve from a fallback
             # without re-deriving it (``stats.status_name``,
