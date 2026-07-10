@@ -197,10 +197,12 @@ class AttnLayerComponent(Component):
         exactly zero to the residual stream whatever its Q/K/V hold, so the
         liveness criterion is sound; it is the same nonzero convention
         ``trim_unused_slots`` uses on the MLP side.  Interior dead heads are
-        real: ``_write_compute_linear`` charges one head per ``d_head``-wide
-        input chunk even when that chunk's weight rows are all zero, and
-        heads from different ops interleave within a sublayer, so dead heads
-        do not sort to the tail.
+        real: a zero-support ``Linear`` keeps one floor head whose O block
+        is zero (the support-aware charge — ``realization.
+        linear_attn_chunks`` — skips zero-weight chunks but floors at one
+        head so the node stays inside the CP-SAT model), and heads from
+        different ops interleave within a sublayer, so dead heads do not
+        sort to the tail.
 
         Compaction preserves the relative order of live heads.  It changes
         no schedule and recovers no layers (the heads were charged at

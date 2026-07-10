@@ -225,9 +225,10 @@ def test_compile_records_resolved_table():
 
 
 def test_cost_summary_static_hand_computed():
-    """d_head=8; a,b: Linear 4->3 (bypass 2*3=6 slots each; transport
-    ceil(4/8)=1 head each); blk: 6 lanes; add width 3: reuse ceil(3/8)=1,
-    copy 2; literal: no slots."""
+    """d_head=8; a,b: Linear 4->3 (bypass 2*3=6 slots each; transport 1 head
+    each — dense randn weights make all of the 4-wide input's single chunk
+    live, so the support-aware charge equals the old ceil(4/8)); blk: 6
+    lanes; add width 3: reuse ceil(3/8)=1, copy 2; literal: no slots."""
     out, a, b, add, blk, lit = _test_graph()
     lowered = lower(out)
 

@@ -223,6 +223,16 @@ def check_debug_predicates(
     materialised; nodes with no residual assignment are silently
     skipped — there is no compiled value to check.
     """
+    from torchwright.graph.node import _checks_suppressed
+
+    # Honor suppress_checks() exactly like reference eval does: a debug=True
+    # forward inside the context runs the self-consistency check but skips
+    # the attached predicates.  Before this, silencing only reached the
+    # compute path, so "asserts silenced" debug passes (torchwright_doom's
+    # d3 gate leg 1a) still raised here.
+    if _checks_suppressed.get():
+        return
+
     for node in checked_nodes:
         state = first_state_with(node, ra, ordered_states)
         if state is None:

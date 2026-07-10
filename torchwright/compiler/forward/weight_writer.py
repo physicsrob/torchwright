@@ -10,6 +10,7 @@ from typing import Dict, List, Literal, Optional, Set, Tuple
 import torch
 import torch.nn.functional as F
 
+from torchwright.compiler.realization import linear_attn_chunks
 from torchwright.compiler.residual_assignment import flatten_concat_nodes
 from torchwright.compiler.forward.residual_map import ResidualStreamMap
 from torchwright.compiler.groups.transformer_layer import TransformerLayer
@@ -465,6 +466,15 @@ def _write_compute_linear(
     a d_head-sized chunk of the input and applies the corresponding slice
     of the weight matrix. Attention heads are additive, so results sum
     to give the full W @ input.
+
+    Only chunks with a live weight row get a head: a chunk whose rows of
+    ``output_matrix`` are all zero would emit a head with O == 0, which
+    contributes exactly zero to the target columns.  The chunk list comes
+    from ``realization.linear_attn_chunks`` — the same list every
+    scheduler charge site counts — so the head budget and this emission
+    cannot desync.  (Its floor keeps one zero-weight head for a
+    zero-support Linear; the target columns then correctly hold 0 plus
+    whatever ``compute_bias`` writes.)
     """
     node = op.node
     assert isinstance(node, Linear)
@@ -478,8 +488,8 @@ def _write_compute_linear(
     v_idx = op.source_cols
     o_idx = op.target_cols
 
-    # Split input across ceil(d_input / d_head) heads
-    for start in range(0, d_input, d_head):
+    for chunk in linear_attn_chunks(node, d_head):
+        start = chunk * d_head
         end = min(start + d_head, d_input)
         chunk_size = end - start
 

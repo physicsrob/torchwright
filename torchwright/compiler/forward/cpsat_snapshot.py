@@ -74,10 +74,19 @@ class NodeRecord:
 
     - ``d_output`` = ``len(node)`` = ``node.d_output`` (``Node.__len__``
       returns ``d_output``) — residual/cancel/free-add demand, MLP-bypass
-      slots (``2·d_output``), the flex-Linear objective term, and — via the
-      first input's ``d_output`` — attention-transport head demand.
+      slots (``2·d_output``), and the flex-Linear objective term.
     - ``d_v`` = ``node.d_v`` (``Attn`` only) — attention-head demand.
     - ``n_lanes`` = ``node.n_lanes`` (``FFN`` only) — MLP hidden-slot demand.
+    - ``live_row_ranges`` (``Linear`` only) — ``(start, length)`` runs of
+      ``output_matrix`` rows with any nonzero entry
+      (``realization.live_weight_row_ranges``), from which the
+      attention-transport head charge is recomputed at whatever ``d_head``
+      the model is later built with.  Runs, not a stored head count: the
+      capture is geometry-free, and an integer would silently bake in a
+      ``d_head``.  ``None`` on non-Linear kinds and on pre-support-charge
+      snapshots (the rebuild then falls back to the dense-equivalent
+      single run; such snapshots also fail the identity fingerprint gate,
+      so the fallback is determinism hygiene, not a supported path).
 
     ``input_ids`` is the ordered raw input list (the ``Add`` free/compute
     classification walks it; reconstruction wires ``node.inputs`` from it);
@@ -92,6 +101,7 @@ class NodeRecord:
     n_lanes: Optional[int] = None
     critical_path_len: int = 0
     name: Optional[str] = None
+    live_row_ranges: Optional[Tuple[Tuple[int, int], ...]] = None
 
     def to_json(self) -> dict:
         return {
@@ -103,6 +113,11 @@ class NodeRecord:
             "n_lanes": self.n_lanes,
             "critical_path_len": self.critical_path_len,
             "name": self.name,
+            "live_row_ranges": (
+                None
+                if self.live_row_ranges is None
+                else [list(r) for r in self.live_row_ranges]
+            ),
         }
 
     @classmethod
@@ -116,6 +131,13 @@ class NodeRecord:
             n_lanes=None if d["n_lanes"] is None else int(d["n_lanes"]),
             critical_path_len=int(d["critical_path_len"]),
             name=d["name"],
+            # .get: absent on pre-support-charge snapshots — see the class
+            # docstring for the rebuild fallback.
+            live_row_ranges=(
+                None
+                if d.get("live_row_ranges") is None
+                else tuple((int(a), int(b)) for a, b in d["live_row_ranges"])
+            ),
         )
 
     def remap(self, mapping: Dict[int, int]) -> "NodeRecord":
@@ -129,6 +151,7 @@ class NodeRecord:
             n_lanes=self.n_lanes,
             critical_path_len=self.critical_path_len,
             name=self.name,
+            live_row_ranges=self.live_row_ranges,
         )
 
 
@@ -472,6 +495,9 @@ class SchedulingProblem:
 
 
 def _record_for(node, graph) -> NodeRecord:
+    from torchwright.compiler.realization import live_weight_row_ranges
+    from torchwright.graph.linear import Linear as _Linear
+
     d_v = getattr(node, "d_v", None)
     n_lanes = getattr(node, "n_lanes", None)
     inputs = getattr(node, "inputs", None) or []
@@ -484,6 +510,9 @@ def _record_for(node, graph) -> NodeRecord:
         n_lanes=None if n_lanes is None else int(n_lanes),
         critical_path_len=graph.get_critical_path_length(node),
         name=getattr(node, "name", None),
+        live_row_ranges=(
+            live_weight_row_ranges(node) if isinstance(node, _Linear) else None
+        ),
     )
 
 

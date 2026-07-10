@@ -42,6 +42,7 @@ from torchwright.compiler.realization import (
     candidate_classes,
     has_flex_choice,
     is_conditional,
+    linear_attn_heads,
     static_flex_class,
 )
 from torchwright.compiler.forward.scheduling_policy import (
@@ -473,12 +474,17 @@ def heads_for(node: Node, d_head: int) -> int:
     free vs compute via a per-Add `is_free` boolean derived from
     reified consumer-ordering booleans; see the helper inside
     `solve_schedule` and `docs/cpsat_scheduler.md` §3.
+
+    A `Linear`'s charge is support-aware: one head per `d_head`-wide
+    input chunk with any nonzero weight row, floor 1
+    (`realization.linear_attn_chunks` — the same list the emitter
+    iterates, so the budget and the emission cannot desync).  A dense
+    weight matrix charges exactly the old `⌈d_input/d_head⌉`.
     """
     if isinstance(node, Attn):
         return (node.d_v + d_head - 1) // d_head
     if isinstance(node, Linear):
-        d_in = len(node.inputs[0])
-        return (d_in + d_head - 1) // d_head
+        return linear_attn_heads(node, d_head)
     if isinstance(node, Add):
         d_out = len(node)
         return (d_out + d_head - 1) // d_head
@@ -1734,6 +1740,11 @@ def _stand_in_node(rec) -> Node:
         # FFN.n_lanes is a read-only property over gate_proj.shape[0]; feed it a
         # shape carrier so slots_for(FFN) reads the captured lane count.
         node.gate_proj = _ShapeCarrier(rec.n_lanes)
+    if rec.live_row_ranges is not None:
+        # Stand-ins carry no output_matrix; injecting the captured runs into
+        # the cache attribute makes realization.live_weight_row_ranges — and
+        # so heads_for — read the identical value it read on the live node.
+        node._live_weight_row_ranges = rec.live_row_ranges
     return node
 
 
@@ -1749,7 +1760,16 @@ def graph_model_from_problem(problem: SchedulingProblem) -> GraphModel:
         rec.node_id: _stand_in_node(rec) for rec in problem.nodes.values()
     }
     for rec in problem.nodes.values():
-        by_id[rec.node_id].inputs = [by_id[i] for i in rec.input_ids]
+        node = by_id[rec.node_id]
+        node.inputs = [by_id[i] for i in rec.input_ids]
+        # Pre-support-charge snapshots carry no live_row_ranges; fall back to
+        # the dense-equivalent single run (== the old width-derived charge).
+        # Such snapshots fail the identity fingerprint gate before any solve
+        # is trusted, so this is determinism hygiene, not a supported path.
+        if isinstance(node, Linear) and rec.live_row_ranges is None:
+            node._live_weight_row_ranges = (
+                ((0, len(node.inputs[0])),) if node.inputs else ((0, 0),)
+            )
 
     consumers_eff = {
         by_id[nid]: tuple(by_id[c] for c in cons)

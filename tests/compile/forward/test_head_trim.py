@@ -2,12 +2,13 @@
 
 A head whose output projection is entirely zero contributes exactly zero to
 the residual stream whatever its Q/K/V hold, so removing it is sound.  Dead
-heads arise interior, not just trailing: ``_write_compute_linear`` charges one
-head per ``d_head``-wide input chunk even when that chunk's weight rows are
-all zero, and heads from different ops interleave within a sublayer.  The
-previous trim sliced ``[:used_heads]`` — a counter, never the matrices — so
-interior dead heads survived, each costing ``4 * d * d_head`` parameters and
-``d_head`` of KV-cache width per layer.
+heads arise interior, not just trailing: a zero-support ``Linear`` keeps one
+floor head whose O block is zero (the support-aware charge skips zero-weight
+chunks but floors at one head so the node stays inside the CP-SAT model —
+``realization.linear_attn_chunks``), and heads from different ops interleave
+within a sublayer.  The previous trim sliced ``[:used_heads]`` — a counter,
+never the matrices — so interior dead heads survived, each costing
+``4 * d * d_head`` parameters and ``d_head`` of KV-cache width per layer.
 
 Compaction changes no schedule and recovers no layers (heads were charged at
 schedule time); it is not bit-identical (reindexing perturbs the einsum
@@ -79,20 +80,21 @@ def test_trailing_trim_behavior_unchanged():
     assert attn.n_heads == 3  # heads 0..2 live, head 3 unallocated
 
 
-def test_compiled_graph_with_zero_weight_chunk_shrinks_and_matches():
-    """Compile-level: a Linear whose second d_head-wide input chunk has
-    all-zero weight rows produces an interior dead head under attention
-    routing (LEGACY_POLICY); compaction reclaims it and the compiled values
-    still match node.compute."""
+def test_compiled_zero_support_floor_head_is_compacted():
+    """Compile-level: a zero-support Linear keeps one floor head whose O
+    block is zero — the interior dead head the support-aware emitter still
+    produces (a merely *sparse* Linear no longer emits dead heads at all:
+    ``linear_attn_chunks`` skips its zero chunks).  Compaction reclaims it
+    and the compiled values still match node.compute."""
     torch.manual_seed(0)
     x = create_input("x", 2 * D_HEAD, value_range=(-1.0, 1.0))
     # `other` reads its own input: same-input siblings would merge
     # (test_sibling_linear_fusion), pooling the zero rows with live ones and
     # erasing the dead head this test needs.
     y = create_input("y", D_HEAD, value_range=(-1.0, 1.0))
-    w = torch.randn(2 * D_HEAD, 3) * 0.2
-    w[D_HEAD:] = 0.0  # second chunk's head gets O == 0
-    lin = Linear(x, w, name="halfdead")
+    # Zero weights, nonzero bias: the value is written by compute_bias (MLP),
+    # so the value check stays nontrivial while the floor head's O == 0.
+    lin = Linear(x, torch.zeros(2 * D_HEAD, 3), torch.tensor([1.5, -0.5, 0.25]), name="allzero")
     other = Linear(y, torch.randn(D_HEAD, 2) * 0.2, name="other")
     out = Concatenate([lin, other])
 
@@ -107,8 +109,20 @@ def test_compiled_graph_with_zero_weight_chunk_shrinks_and_matches():
             trim_heads=trim,
         )
 
-    trimmed = compile_(True)
     untrimmed = compile_(False)
+
+    def dead_allocated_heads(net):
+        return sum(
+            int(net_layer.attn.attn.output_matrix[h].eq(0).all())
+            for net_layer in net.layers
+            for h in range(net_layer.attn.attn.used_heads)
+        )
+
+    # The premise the support-aware emitter did NOT remove: the floor head
+    # is allocated and dead.
+    assert dead_allocated_heads(untrimmed) >= 1
+
+    trimmed = compile_(True)
     heads = lambda net: sum(layer.attn.attn.n_heads for layer in net.layers)
     assert heads(trimmed) < heads(untrimmed)
 

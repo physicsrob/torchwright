@@ -143,7 +143,26 @@ def graph_fingerprint(
     warm-start rewrite wasn't bumped and replayed a stale schedule into a
     production compile.  Adding the key changes the payload layout for
     every graph — the resulting global one-time invalidation is intended.
+
+    ``linear_support`` (2026-07, support-aware head charge): every
+    ``Linear``'s live weight-row runs, keyed by canonical id.  The head
+    charge became a function of weight *sparsity*
+    (``realization.linear_attn_chunks``), which is a schedule input
+    neither the topology hash nor ``compiler_code`` can see — two graphs
+    with identical topology but different support schedule differently,
+    and replaying across them would under-book heads in one direction (a
+    "Ran out of attention heads" assert deep in the weight-writer, on a
+    cache *hit*).
     """
+    from torchwright.graph.linear import Linear as _Linear
+    from torchwright.compiler.realization import live_weight_row_ranges
+
+    canon = canonical_ids(output_node)
+    linear_support = {
+        canon[n.node_id]: live_weight_row_ranges(n)
+        for n in _canonical_walk(output_node)
+        if isinstance(n, _Linear)
+    }
     payload = {
         "topology": topology_entries(output_node),
         "d": d,
@@ -153,6 +172,7 @@ def graph_fingerprint(
         "cancel_slack": cancel_slack,
         "policy": asdict(policy) if policy is not None else None,
         "compiler_code": compiler_code_fingerprint(),
+        "linear_support": sorted(linear_support.items()),
     }
     if reserve_residual:
         payload["reserve_residual"] = reserve_residual

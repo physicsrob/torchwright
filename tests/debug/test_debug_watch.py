@@ -406,3 +406,26 @@ def test_debug_value_after_step():
     val = mod.debug_value(y)
     assert val is not None
     assert abs(val[0, 0].item() - output[0, 0].item()) < 1e-4
+
+
+def test_suppress_checks_silences_debug_forward_asserts():
+    """suppress_checks() must reach the compiled-value re-check, not just
+    reference eval: a debug=True forward inside the context runs the
+    self-consistency check but skips the attached predicates.  Before the
+    fix, an "asserts silenced" debug pass (torchwright_doom's d3 gate leg
+    1a) still raised from check_debug_predicates."""
+    import pytest
+
+    from torchwright.graph.node import suppress_checks
+
+    x = create_input("x", 1)
+    y = assert_in_range(clamp(x, -1.0, 1.0), -0.1, 0.1)  # deliberately violated
+    with suppress_checks():  # attach-time compute also trips it otherwise
+        mod = _compile(y)
+    inp = _make_input(mod, 0.9)
+
+    with suppress_checks():
+        mod(inp, debug=True)  # consistency runs; predicate does not raise
+
+    with pytest.raises(AssertionError, match="values in"):
+        mod(inp, debug=True)

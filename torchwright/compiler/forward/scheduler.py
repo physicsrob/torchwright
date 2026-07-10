@@ -14,6 +14,7 @@ from torchwright.compiler.realization import (
     RealizationTable,
     first_hidden_slot,
     has_flex_choice,
+    linear_attn_heads,
     usable_hidden_slots,
 )
 from torchwright.compiler.residual_assignment import flatten_concat_nodes
@@ -1346,9 +1347,14 @@ class LayerScheduler:
         return total
 
     def _heads_for_linear(self, node: Linear) -> int:
-        """Number of attention heads needed for a standalone Linear."""
-        d_input = len(node.inputs[0])
-        return (d_input + self.d_head - 1) // self.d_head
+        """Number of attention heads needed for a standalone Linear.
+
+        Support-aware: one head per d_head-wide input chunk with any
+        nonzero weight row, floor 1 (realization.linear_attn_chunks — the
+        same list the weight-writer emits, so this budget and the emission
+        cannot desync).  Dense weights charge the old ceil(d_input/d_head).
+        """
+        return linear_attn_heads(node, self.d_head)
 
     def _has_zero_bias(self, node: Linear) -> bool:
         return node.output_bias.abs().sum().item() == 0

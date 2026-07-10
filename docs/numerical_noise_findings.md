@@ -13,6 +13,33 @@ observations and removing findings a fix has invalidated. See the
 
 ## Findings
 
+### staircase: the committed noise numbers measure fp32 GEMM reduction order, not the op (2026-07-09)
+
+`tests/docs/test_numerical_noise_drift.py::test_committed_measurements_match_current_code`
+fails on Modal (A100) and passes locally, for the `staircase_512_lanes` /
+`staircase_2048_lanes` rows — pre-existing since at least 2026-07-08
+(present at `99e0bb6`, before the support-aware head-charge branch; every
+full-suite run on that lineage carries this one failure).
+
+**Root cause (established; spans_plan.md W8).** The staircase's
+piecewise-linear decomposition sums thousands of ReLU lanes whose
+individual contributions reach ~6.4e5 and cancel to a result of ~4.0 —
+`ulp` at that partial-sum magnitude is 0.0625. fp64 and every sequential or
+pairwise summation return the exact value; only the fp32 **matmul** drifts.
+Holding inputs, weights, and activations bit-identical and varying *only*
+the GEMM reduction order reproduces Modal's numbers exactly (vectorized
+`V=2, Kb=64` blocking → `max_abs=0.078125, max_rel=0.0625`); the committed
+values are the `V=1` sequential-order row.  So the committed "op noise" is
+a property of the summation order — which differs between local CPU BLAS
+and A100 cuBLAS — and the op's real defect is catastrophic cancellation in
+its lane decomposition.
+
+**Status: decision pending (spans_plan.md decision 2).** Either pin the
+probe's device and reduction so the committed number means something, or
+restructure the lane decomposition so contributions don't blow up.  Do
+**not** re-run `make measure-noise` on whichever machine is to hand — that
+re-pins one device's reduction order and papers over the defect again.
+
 ### MLP-side cancel on the swish machine: worst residue 1.5e-8, gate passes (2026-07-07)
 
 An MLP-side cancel (CP-SAT intra-layer reuse, step 3) reuses the activation
