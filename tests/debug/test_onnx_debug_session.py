@@ -535,3 +535,105 @@ def test_oversized_sparse_initializer_densifies_and_session_matches(
     assert converted._external_data_dir is not None  # conversion actually ran
     got, _ = converted.step(ids, converted.empty_past())
     torch.testing.assert_close(got, ref_out, rtol=0, atol=0)
+
+
+def test_oversized_conversion_external_metadata_and_bytes(token_artifact, monkeypatch):
+    """The external stubs must describe the side file exactly: per-tensor
+    location/offset/length, dims and dtype preserved, and the file's bytes at
+    each offset equal to the densified tensor — including cumulative offsets
+    when several tensors convert.  (The true >2 GiB representation cannot run
+    in a unit test; it is exercised for real by the W6 landing gate, which
+    opens a production e1m1_lowres artifact whose embed_table declares
+    3.3 GB.  This pins the metadata arithmetic that gate relies on.)"""
+    import numpy as np
+    import onnx
+    from onnx import helper as onnx_helper
+    from onnx import numpy_helper
+
+    from torchwright.debug import onnx_debug as od
+
+    src = onnx.load(token_artifact)
+    dense_by_name = {}
+    for sp in src.graph.sparse_initializer:
+        dims = tuple(int(d) for d in sp.dims)
+        np_dtype = np.dtype(onnx_helper.tensor_dtype_to_np_dtype(sp.values.data_type))
+        dense = np.zeros(int(np.prod(dims)), dtype=np_dtype)
+        dense[numpy_helper.to_array(sp.indices)] = numpy_helper.to_array(sp.values)
+        dense_by_name[sp.values.name] = (dims, dense)
+    assert len(dense_by_name) >= 2, (
+        "fixture regression: need >= 2 sparse initializers to pin cumulative "
+        "offsets"
+    )
+
+    monkeypatch.setattr(od, "_ORT_EMBEDDED_INITIALIZER_LIMIT", 1)
+    out, _ = _build_adder()
+    session = OnnxDebugSession(token_artifact, out)
+
+    tmp_model = os.path.join(session._external_data_dir.name, "debug_model.onnx")
+    converted = onnx.load(tmp_model, load_external_data=False)
+    assert len(converted.graph.sparse_initializer) == 0
+    with open(
+        os.path.join(session._external_data_dir.name, "debug_dense.bin"), "rb"
+    ) as f:
+        blob = f.read()
+
+    stubs = {
+        t.name: t
+        for t in converted.graph.initializer
+        if t.data_location == onnx.TensorProto.EXTERNAL
+    }
+    assert set(stubs) == set(dense_by_name)
+    total = 0
+    for name, stub in stubs.items():
+        dims, dense = dense_by_name[name]
+        ext = {e.key: e.value for e in stub.external_data}
+        assert ext["location"] == "debug_dense.bin"
+        offset, length = int(ext["offset"]), int(ext["length"])
+        assert tuple(stub.dims) == dims
+        assert length == dense.nbytes
+        assert blob[offset : offset + length] == dense.tobytes()
+        total += length
+    assert total == len(blob)  # offsets tile the file exactly — no gaps
+
+
+def test_oversized_conversion_chunk_seams(token_artifact, monkeypatch):
+    """Densification writes in fixed flat blocks; the risk is at the seams
+    (an entry landing exactly on a block boundary, blocks with no entries).
+    Shrink the block size so every converted tensor spans many blocks and
+    verify the session still computes identically."""
+    from torchwright.debug import onnx_debug as od
+
+    out_ref, emb = _build_adder()
+    ref = OnnxDebugSession(token_artifact, out_ref)
+    ids = _token_ids(emb)
+    ref_out, _ = ref.step(ids, ref.empty_past())
+
+    monkeypatch.setattr(od, "_ORT_EMBEDDED_INITIALIZER_LIMIT", 1)
+    monkeypatch.setattr(od, "_DENSIFY_BLOCK_ELEMS", 7)  # prime: seams everywhere
+    out2, _ = _build_adder()
+    converted = OnnxDebugSession(token_artifact, out2)
+    got, _ = converted.step(ids, converted.empty_past())
+    torch.testing.assert_close(got, ref_out, rtol=0, atol=0)
+
+
+def test_suppress_checks_reaches_the_onnx_backend(token_artifact):
+    """suppress_checks() must silence predicate re-checks on THIS backend
+    too — checks are rebuild-side metadata (outside the fingerprint), so a
+    deliberately-violated assert attached to the rebuilt graph discriminates
+    cleanly: raises on a debug step normally, silent inside the context."""
+    import pytest
+
+    from torchwright.graph.asserts import assert_in_range
+    from torchwright.graph.node import suppress_checks
+
+    out, emb = _build_adder()
+    with suppress_checks():  # attach-time compute would trip it otherwise
+        assert_in_range(out, -1e-9, 1e-9)  # deliberately violated
+    session = OnnxDebugSession(token_artifact, out)
+    ids = _token_ids(emb)
+
+    with suppress_checks():
+        session.step(ids, session.empty_past(), debug=True)  # no raise
+
+    with pytest.raises(AssertionError, match="values in"):
+        session.step(ids, session.empty_past(), debug=True)

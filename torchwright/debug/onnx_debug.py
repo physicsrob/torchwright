@@ -112,6 +112,13 @@ def _sidecar_or_raise(onnx_path: str) -> dict:
 #: the conversion on a small artifact.
 _ORT_EMBEDDED_INITIALIZER_LIMIT = 2**31
 
+#: Flat elements per densification block in _make_session (256 MiB of fp32).
+#: Bounds peak conversion memory to one block + the COO index/value arrays,
+#: independent of the tensor's declared size.  Module-level so the chunk-seam
+#: regression test can shrink it and force multi-block writes on a small
+#: tensor.
+_DENSIFY_BLOCK_ELEMS = 64 * 1024 * 1024
+
 
 def _make_session(model, providers, owner):
     """Build the onnxruntime session for the (output-promoted) debug model.
@@ -161,17 +168,36 @@ def _make_session(model, providers, owner):
     # TensorProto: a protobuf message caps at 2 GiB, so a >2 GiB dense
     # tensor cannot even be constructed in-graph — only an EXTERNAL-stub
     # proto (dims + dtype + file/offset/length) can represent it.
+    #
+    # Densification is CHUNKED (flat blocks of _DENSIFY_BLOCK_ELEMS,
+    # scatter the block's COO entries, ndarray.tofile) so peak memory is
+    # one block plus the COO arrays — never the full dense tensor, and
+    # never a second `tobytes()` copy of it (2x 3.3 GB at production
+    # width).
     offset = 0
     with open(data_path, "wb") as f:
         for sp in oversized:
             dims = tuple(int(d) for d in sp.dims)
-            np_dtype = onnx_helper.tensor_dtype_to_np_dtype(sp.values.data_type)
-            dense = np.zeros(int(np.prod(dims)), dtype=np_dtype)
+            numel = int(np.prod(dims))
+            np_dtype = np.dtype(
+                onnx_helper.tensor_dtype_to_np_dtype(sp.values.data_type)
+            )
             idx = numpy_helper.to_array(sp.indices)
             val = numpy_helper.to_array(sp.values)
-            dense[idx] = val
-            raw = dense.tobytes()
-            f.write(raw)
+            # The exporter emits np.flatnonzero order (ascending), but
+            # sort anyway — searchsorted below silently mis-slices on
+            # unsorted input, and one O(nnz log nnz) pass is cheap.
+            order = np.argsort(idx, kind="stable")
+            idx = idx[order]
+            val = val[order]
+
+            length = numel * np_dtype.itemsize
+            for lo in range(0, numel, _DENSIFY_BLOCK_ELEMS):
+                hi = min(lo + _DENSIFY_BLOCK_ELEMS, numel)
+                block = np.zeros(hi - lo, dtype=np_dtype)
+                a, b = np.searchsorted(idx, [lo, hi])
+                block[idx[a:b] - lo] = val[a:b]
+                block.tofile(f)
 
             stub = TensorProto()
             stub.name = sp.values.name
@@ -183,7 +209,7 @@ def _make_session(model, providers, owner):
             for key, value in (
                 ("location", data_name),
                 ("offset", str(offset)),
-                ("length", str(len(raw))),
+                ("length", str(length)),
             ):
                 entry = stub.external_data.add()
                 entry.key = key
@@ -191,7 +217,7 @@ def _make_session(model, providers, owner):
             stub.data_location = TensorProto.EXTERNAL
             model.graph.initializer.append(stub)
             model.graph.sparse_initializer.remove(sp)
-            offset += len(raw)
+            offset += length
 
     # Everything still embedded fits comfortably (the artifact held it all
     # in one file), so a plain save alongside the side file suffices; ORT
