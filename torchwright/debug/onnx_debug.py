@@ -102,6 +102,105 @@ def _sidecar_or_raise(onnx_path: str) -> dict:
     return sidecar
 
 
+#: onnxruntime's embedded-initializer ceiling (bytes).  ORT >= 1.26 refuses
+#: to load ANY initializer whose dense size exceeds this unless the data is
+#: external — and a *sparse* initializer (ONNX has no external form for
+#: them) can therefore never load once its declared dense size crosses the
+#: line.  The token vocab's ``embed_table`` does exactly that at production
+#: widths (e.g. 101,617 rows x d=8192 x 4 B = 3.3 GB declared, stored
+#: sparse).  Module-level so the regression test can shrink it and exercise
+#: the conversion on a small artifact.
+_ORT_EMBEDDED_INITIALIZER_LIMIT = 2**31
+
+
+def _make_session(model, providers, owner):
+    """Build the onnxruntime session for the (output-promoted) debug model.
+
+    Small models load from in-memory bytes, as before.  When any sparse
+    initializer declares a dense size over the ORT embedded ceiling, it is
+    densified here and the model is saved to a session-lifetime temp
+    directory with large tensors as external data, then loaded by path —
+    the only load form ORT accepts for >2 GiB tensors.  Debug-session-only
+    cost (one dense materialization + disk copy); the production runtime
+    never takes this path.
+    """
+    import numpy as np
+    import onnx
+    import onnxruntime as ort
+    from onnx import helper as onnx_helper
+    from onnx import numpy_helper
+
+    providers = providers or ["CPUExecutionProvider"]
+
+    def _declared_bytes(sp) -> int:
+        n = 1
+        for d in sp.dims:
+            n *= int(d)
+        np_dtype = onnx_helper.tensor_dtype_to_np_dtype(sp.values.data_type)
+        return n * np.dtype(np_dtype).itemsize
+
+    oversized = [
+        sp
+        for sp in model.graph.sparse_initializer
+        if _declared_bytes(sp) > _ORT_EMBEDDED_INITIALIZER_LIMIT
+    ]
+    if not oversized:
+        return ort.InferenceSession(model.SerializeToString(), providers=providers)
+
+    import tempfile
+
+    from onnx import TensorProto
+
+    # The temp dir must outlive the session (ORT reads the external file at
+    # init; keeping it for the session's lifetime is the safe contract).
+    owner._external_data_dir = tempfile.TemporaryDirectory(prefix="tw_onnx_debug_")
+    data_name = "debug_dense.bin"
+    data_path = os.path.join(owner._external_data_dir.name, data_name)
+
+    # The dense bytes go straight into a side file, never into a
+    # TensorProto: a protobuf message caps at 2 GiB, so a >2 GiB dense
+    # tensor cannot even be constructed in-graph — only an EXTERNAL-stub
+    # proto (dims + dtype + file/offset/length) can represent it.
+    offset = 0
+    with open(data_path, "wb") as f:
+        for sp in oversized:
+            dims = tuple(int(d) for d in sp.dims)
+            np_dtype = onnx_helper.tensor_dtype_to_np_dtype(sp.values.data_type)
+            dense = np.zeros(int(np.prod(dims)), dtype=np_dtype)
+            idx = numpy_helper.to_array(sp.indices)
+            val = numpy_helper.to_array(sp.values)
+            dense[idx] = val
+            raw = dense.tobytes()
+            f.write(raw)
+
+            stub = TensorProto()
+            stub.name = sp.values.name
+            stub.data_type = sp.values.data_type
+            stub.dims.extend(dims)
+            # Entries set by hand: onnx.external_data_helper.set_external_data
+            # only converts tensors that already carry raw_data, and the whole
+            # point of the stub is to never materialize the bytes in-proto.
+            for key, value in (
+                ("location", data_name),
+                ("offset", str(offset)),
+                ("length", str(len(raw))),
+            ):
+                entry = stub.external_data.add()
+                entry.key = key
+                entry.value = value
+            stub.data_location = TensorProto.EXTERNAL
+            model.graph.initializer.append(stub)
+            model.graph.sparse_initializer.remove(sp)
+            offset += len(raw)
+
+    # Everything still embedded fits comfortably (the artifact held it all
+    # in one file), so a plain save alongside the side file suffices; ORT
+    # resolves external_data locations relative to the model's directory.
+    tmp_model = os.path.join(owner._external_data_dir.name, "debug_model.onnx")
+    onnx.save(model, tmp_model)
+    return ort.InferenceSession(tmp_model, providers=providers)
+
+
 class OnnxDebugSession:
     """Debuggable runtime over a compiled ONNX artifact.
 
@@ -344,10 +443,10 @@ class OnnxDebugSession:
                         )
                     )
 
-        self._session = ort.InferenceSession(
-            model.SerializeToString(),
-            providers=providers or ["CPUExecutionProvider"],
-        )
+        # Session-lifetime home of externalized initializer data; set by
+        # _make_session only when an oversized sparse tensor was converted.
+        self._external_data_dir = None
+        self._session = _make_session(model, providers, self)
         self._primary_output = "logits" if self._kind == "token" else "outputs"
         self._debug_state: Optional[_DebugState] = None
 

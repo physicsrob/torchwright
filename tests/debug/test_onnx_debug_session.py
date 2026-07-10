@@ -494,3 +494,44 @@ def test_artifact_debug_session_matches_direct(tmp_path):
     a = sess_handle(ids)
     b = sess_direct(ids)
     assert torch.allclose(a, b, atol=0)
+
+
+# ---------------------------------------------------------------------------
+# Oversized sparse initializers (the ORT >= 1.26 embedded-data ceiling)
+# ---------------------------------------------------------------------------
+
+
+def test_oversized_sparse_initializer_densifies_and_session_matches(
+    token_artifact, monkeypatch
+):
+    """ORT >= 1.26 refuses any initializer whose dense size exceeds its
+    embedded-data ceiling unless the data is external — and ONNX sparse
+    initializers have no external form, so a production-width sparse
+    ``embed_table`` (3.3 GB declared at d=8192) cannot load at all.  The
+    session densifies such tensors to external data and loads by path.
+
+    Exercised by shrinking the module ceiling so the small adder artifact's
+    own sparse initializers cross it; the converted session must behave
+    byte-for-byte like the normal in-memory one.
+    """
+    import onnx
+
+    from torchwright.debug import onnx_debug as od
+
+    model = onnx.load(token_artifact)
+    assert len(model.graph.sparse_initializer) > 0, (
+        "fixture regression: the adder artifact no longer carries sparse "
+        "initializers, so this test no longer exercises the conversion"
+    )
+
+    out_ref, emb = _build_adder()
+    ref = OnnxDebugSession(token_artifact, out_ref)
+    ids = _token_ids(emb)
+    ref_out, _ = ref.step(ids, ref.empty_past())
+
+    monkeypatch.setattr(od, "_ORT_EMBEDDED_INITIALIZER_LIMIT", 1)
+    out2, _ = _build_adder()
+    converted = OnnxDebugSession(token_artifact, out2)
+    assert converted._external_data_dir is not None  # conversion actually ran
+    got, _ = converted.step(ids, converted.empty_past())
+    torch.testing.assert_close(got, ref_out, rtol=0, atol=0)
