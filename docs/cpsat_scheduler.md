@@ -189,7 +189,11 @@ Per schedulable node `n`:
   `n` executes.
 - `cancel_layer[n]` ∈ [layer_var[n]+1, max_layers] — the layer
   where `n`'s residual columns are reclaimed. The value `max_layers`
-  is the sentinel for "never freed."
+  is the sentinel for "never freed."  Since 2026-07-10 this is a
+  derived value in production, not a free decision: the pinned-cancel
+  default equality-pins it to its earliest legal layer given the
+  mechanism (see *Pinned cancel layers* below); it is free only under
+  the `_pin_cancels=False` escape hatch.
 - `cancel_in_mlp[n]` — boolean, per non-keep-forever schedulable node
   (never freeable inputs — they stay attention-cancelled for the
   snapshot-based value lookup). 1 routes `n`'s death cancel through the
@@ -425,7 +429,59 @@ exact; the `DirectedLayerScheduler` gains **self-consumer reuse**
 to the directed replay only — the eager heuristic never learns it (that
 would shift every golden layer count with no production need).
 
-### Objective
+### Pinned cancel layers (production default)
+
+Since 2026-07-10, every non-keep-forever node's `cancel_layer` is
+**equality-pinned to its earliest legal value given the mechanism**
+(`_pin_cancels=True`, the default on `forward_compile`,
+`solve_schedule`, and every model-build entry point).  Two
+`AddMaxEquality` aux vars per node mirror the lower bounds term for
+term — attention side `max(layer[n]+1, layer[c]+1−is_attn[c] per
+non-Add consumer, layer[A]+is_free[A] per Add consumer)`, MLP side the
+same with the non-Add term relaxed to the gap-0 `layer[c]` — and
+`cancel_layer` equals whichever the free `cancel_in_mlp[n]` selects.
+Freeable inputs pin to `max(1, layer[c]+1)`.  The `parked` booleans,
+the upper cancel window, and the hint-aware widening are not built:
+the model loses ~5,380 cancel decisions on the production DOOM graph
+(−14.6% proto variables, −11.5% constraints, presolve roughly halved).
+
+Why this is sound: freeing earlier never hurts the residual-width
+resource (occupancy only shrinks), width is the only binding resource
+on the production graph, and every legacy lower bound is kept — so the
+pin only ADDS constraints, making the pinned model a pure restriction
+of the legacy model.  Every schedule it emits is a valid legacy-model
+solution by construction.
+
+Why it ships as the default (evidence, d=8192 production fixture,
+600 s single solves; details in the umbrella
+`cpsat_pinned_cancel_plan.md`):
+
+- **Audit:** real legacy-model solutions already have zero cancel
+  slack on 84.5–91.9% of nodes, and moving every slacked cancel to
+  its earliest legal position fits every layer's budgets in 6/6
+  audited data points.
+- **A/B:** pinned median depth **37** over 15 draws (min 33) vs
+  unpinned median 40 over 5 — the pinned arm's worst draw ties the
+  control's best.  All 10 verifier-covered pinned solutions were
+  hard-fixed into the UNPINNED model and came back FEASIBLE at
+  exactly the claimed depth.
+
+**The cancel-mechanism hint is load-bearing.**  Under the pin the
+warm start keeps the layer, routing, and `cancel_in_mlp` hints and
+drops only the cancel-layer values (`_solve_built` nulls
+`hint_cancel`; the values are forced by propagation once the
+mechanism is decided).  The mechanism bits carry the packing choice
+at head-saturated layers — which cancels take the same-layer MLP tier
+where the attention-head budget is exactly full — and without them
+the pinned model completed the hint into ZERO incumbents in 5×600 s
+on the production fixture.  Any caller that hints a pinned solve must
+pass `hint_cancel_mech`.
+
+`_pin_cancels=False` is the escape hatch: it rebuilds the legacy
+window/parked/widening model byte-identically (the sections below
+describing windows, widening, and the parked escape apply to that
+model).  The legacy machinery is a candidate for deletion once the
+pinned default has soaked.
 
 ```
 minimize  alpha · n_layers
@@ -540,20 +596,26 @@ CP-SAT against a specific heuristic policy's routing choice.
 forward_compile(
     d, d_head, output_node, pos_encoding,
     ...,
-    optimize: int = 0,                # 0=heuristic,1=60s,2=330s,3=600s descent
+    optimize: int = 0,                # 0=heuristic,1=60s,2=330s,3=600s
     cpsat_costs: Costs = Costs(),     # advanced: Pareto navigator
     cpsat_flex_routing: bool = True,  # advanced: routing decision
 )
 ```
 
-`optimize` is the user-facing knob:
+`optimize` is the user-facing knob.  Every CP-SAT level is one
+continuous warm-start solve of the pinned-cancel model (see *Pinned
+cancel layers* below); the levels differ only in budget:
 
 | level | scheduler | budget |
 |------:|-----------|--------|
 |     0 | heuristic `LayerScheduler` (default) | — |
 |     1 | CP-SAT, single warm-start solve, best-feasible | 60s |
 |     2 | CP-SAT, single warm-start solve, best-feasible | 330s (180 + 150 folded floor-probe) |
-|     3 | CP-SAT, in-compile iterated descent, best-feasible | 600s (~180s/rung; rung k>0 hinted with best-so-far at horizon best+1, until budget or proven optimal) |
+|     3 | CP-SAT, single warm-start solve, best-feasible | 600s |
+
+(`optimize=3` was an in-compile iterated descent — ~180s rungs, each
+re-hinted with the best-so-far at horizon best+1 — from 2026-07-08 to
+2026-07-10; see *Experiments tried* for why the rungs were retired.)
 
 At `optimize=0` the compiler skips CP-SAT entirely — same code path
 as before this subsystem existed.  Use it for fast iteration where
@@ -614,7 +676,13 @@ node:
   heuristic's cancel ran in (the same tracking-map `free(node, mech)`
   records it).  Hinted to `cancel_in_mlp[n]`.
 
-All four are passed to `solve_schedule` as `AddHint` calls.  The
+All four are passed to `solve_schedule`.  Under the pinned-cancel
+default the solver applies layers, routing, and mechanism as
+`AddHint` calls and drops the cancel-layer values before validation
+(they are forced by the pin; a captured cancel that disagreed would
+make CP-SAT silently discard the whole incumbent) — the mechanism
+bits are the load-bearing family there, see *Pinned cancel layers*
+in §3.  Under `_pin_cancels=False` all four families are hinted.  The
 heuristic's layer count also tightens the search horizon
 (`max_layers = min(user_max, hint_n_layers + 1)`), which shrinks
 each `layer_var`'s domain.
@@ -683,10 +751,15 @@ stale cancel whenever it is re-allocated or reborn via `reassign`, so
 the emitted `hint_cancel` is internally consistent (`cancel ≥ birth+1`,
 or omitted when the node dies by reassign).
 
-### Cancel-domain restriction
+### Cancel-domain restriction (legacy model, `_pin_cancels=False`)
+
+Everything in this section describes the LEGACY model, reachable via
+the `_pin_cancels=False` escape hatch — the production default pins
+every cancel to its earliest legal layer and builds none of the
+window machinery (see *Pinned cancel layers* in §3).
 
 The cancel decision space is the dominant LB-search cost when the
-attention/residual cumulatives are tight.  By default, each
+attention/residual cumulatives are tight.  In the legacy model, each
 non-pinned node's cancel layer is restricted to a small window
 above its earliest dead layer:
 
@@ -811,6 +884,25 @@ the CP-SAT one.
 
 ### Experiments tried that didn't pan out
 
+- **optimize=3 iterated descent (2026-07-08 → 2026-07-10).**  Split
+  the 600 s budget into ~180 s rungs: rung 0 solved with the
+  heuristic hint, each improving rung re-hinted the next with the
+  incumbent at horizon best+1, until budget exhaustion or proven
+  optimality.  Under the unpinned model it beat a single 600 s solve
+  (median 39 vs 40 on the d=8192 fixture) because rebuilding at a
+  tighter ceiling outpaced a stalling long solve.  Under the
+  pinned-cancel model the relationship inverted: the deep
+  improvements arrive as large in-solve LNS jumps (41→33 at 143 s in
+  one measured seed), and every rung rebuild burned ~25–35 s of
+  re-presolve and reset exactly the LNS state that produces those
+  jumps — pinned descent drew [38, 39, 37, 38, 33] (median 38, all
+  verified) vs pinned single-solve median 37 over 15 draws.  The rungs
+  only paid on seeds whose rung-0 draw stalled shallow — insurance
+  against bad draws, not a deeper tail.  Replaced by one continuous
+  600 s solve; `_solve_budget_s` (formerly `_descent_budget_s`)
+  remains the measurement-only budget override.  Evidence: umbrella
+  `cpsat_pinned_cancel_plan.md` step 3 and
+  `cpsat_single_vs_descent_600s.md`.
 - **Symmetry breaking on equivalent sibling chains.** Detected
   parallel chains feeding common `Concatenate` joins via
   `SiblingClusterAnalyzer`, grouped them by structural
