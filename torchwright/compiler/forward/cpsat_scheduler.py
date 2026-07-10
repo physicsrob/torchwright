@@ -2299,14 +2299,19 @@ def _solve_built(
     production."""
     if built.pin_cancels:
         # The pinned model (`_pin_cancels`) equality-pins every cancel layer,
-        # so a captured cancel hint would almost always contradict the pin and
-        # CP-SAT would silently discard the whole incumbent.  Drop the cancel
-        # and cancel-mechanism hints — once layers, routings, and
-        # `cancel_in_mlp` are decided, the cancels are forced by propagation —
-        # which also keeps `_validate_hint` off those families.  The layer and
-        # routing hints are kept and applied below as usual.
+        # so a captured cancel-layer hint would almost always contradict the
+        # pin and CP-SAT would silently discard the whole incumbent.  Drop it
+        # (once layers, routings, and `cancel_in_mlp` are decided the cancels
+        # are forced by propagation), which also keeps `_validate_hint` off
+        # that family.  The layer, routing, and cancel-MECHANISM hints are
+        # kept: `cancel_in_mlp` stays a free decision under the pin, and on a
+        # head-saturated graph its hint carries exactly the packing choice —
+        # which cancels take the same-layer MLP tier — that makes the warm
+        # start completable.  Measured 2026-07-09 on the d=8192 fixture:
+        # with the mechanism hint also dropped, no seed completed the hint
+        # into ANY incumbent in 600 s (0/5), vs first incumbents at 83-104 s
+        # for the unpinned control.
         hint_cancel = None
-        hint_cancel_mech = None
     if log_search_progress and built.cancel_window_delta:
         print(
             f"  cancel windows widened for {len(built.cancel_window_delta)} "
