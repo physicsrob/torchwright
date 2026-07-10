@@ -395,8 +395,13 @@ def build_graph_model(output_node: Node, pos_encoding=None) -> GraphModel:
 # external callers should use `solve_schedule` instead.
 
 
-def routing(node: Node, gm: GraphModel, policy: SchedulingPolicy) -> str:
-    """Static routing decision under the given policy.
+def routing(
+    node: Node,
+    gm: GraphModel,
+    policy: SchedulingPolicy,
+    usable_slots: Optional[int],
+) -> str:
+    """Static routing decision under the given policy and geometry.
 
     Used when `flex_routing=False`: every node has a fixed sublayer.
     With `flex_routing=True`, only `is_flex(n)` nodes' modes become
@@ -405,16 +410,31 @@ def routing(node: Node, gm: GraphModel, policy: SchedulingPolicy) -> str:
     Derived from the shared option set
     (`torchwright/compiler/realization.py:candidate_classes`) — the same
     declaration the eager path's static resolver reads, so the two paths
-    cannot drift apart on what the options are.
+    cannot drift apart on what the options are — and from the same
+    capacity rule (`static_flex_class`), so they cannot drift apart on
+    which options a given geometry actually admits.
+
+    `usable_slots` is the layer's usable MLP hidden-slot count.  It may be
+    None only when no node here has a free choice (every caller with
+    `flex_routing=True` and no standalone Linears); routing a Linear
+    without it raises rather than guessing a sublayer.
     """
     if is_conditional(node):
         # Add: residual_reuse vs attn_copy is a schedule-state conditional,
         # but both classes are attention-sublayer ops.
         return ATTN
     if has_flex_choice(node):
-        # Standalone Linear: the policy pins the sublayer here; with
-        # flex_routing=True the CP-SAT choice variable overrides this.
-        return CLASS_SUBLAYER[static_flex_class(candidate_classes(node), policy)]
+        # Standalone Linear: the policy pins the sublayer here, subject to
+        # the MLP-bypass capacity check; with flex_routing=True the CP-SAT
+        # choice variable overrides this.
+        if usable_slots is None:
+            raise ValueError(
+                f"routing() needs the layer's usable hidden-slot count to "
+                f"place {node!r}: its MLP-bypass realization may not fit the "
+                f"geometry, and picking a sublayer without checking deadlocks "
+                f"the walk"
+            )
+        return CLASS_SUBLAYER[static_flex_class(node, policy, usable_slots)]
     (single,) = candidate_classes(node)  # raises TypeError on unknown types
     return CLASS_SUBLAYER[single]
 
@@ -496,6 +516,8 @@ def _compute_layer_bounds(
     policy: SchedulingPolicy,
     flex_routing: bool,
     max_layers: int,
+    *,
+    usable_slots: Optional[int] = None,
 ) -> Tuple[Dict[int, int], Dict[int, int]]:
     """Per-node [earliest, latest] layer bounds from the dependency DAG.
 
@@ -505,6 +527,11 @@ def _compute_layer_bounds(
     after u (gap 1).  "Can" means: flexible routing, or pinned to the
     needed sublayer.  These are the same bounds CP-SAT presolve derives by
     propagation; computing them here shrinks the input model instead.
+
+    ``usable_slots`` is only read when ``flex_routing=False``, where every
+    standalone Linear is statically routed and the MLP-bypass capacity check
+    decides its sublayer.  Leaving it None there raises inside ``routing()``
+    rather than guessing, so the default cannot silently mis-route anything.
     """
 
     # Per-node allowed sublayers ("modes").  The propagation is mode-aware:
@@ -517,7 +544,7 @@ def _compute_layer_bounds(
     def modes(n: Node) -> Tuple[str, ...]:
         if flex_routing and is_flex(n, gm):
             return (ATTN, MLP)
-        return (routing(n, gm, policy),)
+        return (routing(n, gm, policy, usable_slots),)
 
     def gap(a: str, b: str) -> int:
         return 0 if (a == ATTN and b == MLP) else 1
@@ -568,6 +595,7 @@ def critical_path_layers(
     *,
     policy: Optional[SchedulingPolicy] = None,
     flex_routing: bool = True,
+    usable_slots: Optional[int] = None,
 ) -> int:
     """Exact minimum layer count imposed by the dependency DAG alone.
 
@@ -577,11 +605,20 @@ def critical_path_layers(
     optimum EQUALS this value (measured on the DOOM graph at d=8192).
     Costs milliseconds beyond the graph-model build — usable as a
     pre-solve bound or a probe horizon.
+
+    Under the default ``flex_routing=True`` a standalone Linear may take
+    either sublayer, so no geometry is consulted and ``usable_slots`` is
+    unused.  With ``flex_routing=False`` every Linear is statically routed
+    and the layer's usable hidden-slot count decides whether the MLP bypass
+    is even available: pass it (:func:`realization.usable_hidden_slots`) or
+    the call raises.
     """
     if policy is None:
         policy = LEGACY_POLICY
     gm = build_graph_model(output_node, pos_encoding)
-    es, _ = _compute_layer_bounds(gm, policy, flex_routing, max_layers=1 << 20)
+    es, _ = _compute_layer_bounds(
+        gm, policy, flex_routing, max_layers=1 << 20, usable_slots=usable_slots
+    )
     return max(es.values()) + 1
 
 
@@ -690,6 +727,13 @@ def build_cpsat_model_from_gm(
     consumers, pinned status — so the proto is byte-identical for a live graph
     and its round-tripped snapshot.
 
+    ``d_hidden`` here is the count of hidden slots a layer can hand out, not
+    the raw MLP width: ``forward_compile`` passes
+    ``realization.usable_hidden_slots(d_hidden, bias)``, which is one less than
+    the width when ``bias=False`` reserves slot 0 for the constant lane.  Both
+    the hidden-slot cumulative and the static routing rule read it, so they
+    admit and place exactly the same set of MLP-bypass Linears.
+
     ``_canonical_cancel_reps`` is a MEASUREMENT-ONLY knob (default OFF; the
     production path never sets it).  When on, it posts two extra implications
     per node that has both a ``parked`` var and (for D-1) a ``cancel_in_mlp``
@@ -751,7 +795,9 @@ def build_cpsat_model_from_gm(
     # propagation instead of the uniform [0, max_layers-1]; presolve would
     # derive the same bounds itself, this just hands them over up front.
     bounds = (
-        _compute_layer_bounds(gm, policy, flex_routing, max_layers)
+        _compute_layer_bounds(
+            gm, policy, flex_routing, max_layers, usable_slots=d_hidden
+        )
         if tighten_domains
         else None
     )
@@ -789,7 +835,7 @@ def build_cpsat_model_from_gm(
             v = model.NewBoolVar(f"is_attn_n{n.node_id}")
             static_routing[n.node_id] = "flex"
         else:
-            r = routing(n, gm, policy)
+            r = routing(n, gm, policy, d_hidden)
             v = model.NewBoolVar(f"is_attn_n{n.node_id}_pinned")
             if r == ATTN:
                 model.Add(v == 1)
@@ -1392,7 +1438,7 @@ def build_cpsat_model_from_gm(
         elif flex_routing and is_flex(n, gm):
             attn_term.append(h * is_attn[n.node_id])
         else:
-            r = routing(n, gm, policy)
+            r = routing(n, gm, policy, d_hidden)
             if r == ATTN:
                 fixed_attn_heads += h
     total_attn_heads = model.NewIntVar(
@@ -1412,7 +1458,7 @@ def build_cpsat_model_from_gm(
         if flex_routing:
             mlp_bypass_term.append((2 * n.d_output) * is_attn[n.node_id].Not())
         else:
-            r = routing(n, gm, policy)
+            r = routing(n, gm, policy, d_hidden)
             if r == MLP:
                 fixed_mlp_bypass += 2 * n.d_output
     total_mlp_bypass = model.NewIntVar(

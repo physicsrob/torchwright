@@ -189,19 +189,42 @@ class AttnLayerComponent(Component):
         return output, (K, V)
 
     def trim_unused_heads(self):
-        """Remove trailing unused (all-zero) heads after compilation.
+        """Drop every head that cannot contribute, compacting the survivors.
 
-        Heads are allocated contiguously from index 0, so slicing
-        [:used_heads] is safe.  Keeps at least 1 head to avoid
-        degenerate empty-tensor shapes in downstream ops.
+        Two kinds of dead head: everything past ``used_heads`` (never
+        allocated — the old trailing-slice trim), and allocated heads whose
+        output projection is entirely zero.  A head with ``O == 0`` adds
+        exactly zero to the residual stream whatever its Q/K/V hold, so the
+        liveness criterion is sound; it is the same nonzero convention
+        ``trim_unused_slots`` uses on the MLP side.  Interior dead heads are
+        real: ``_write_compute_linear`` charges one head per ``d_head``-wide
+        input chunk even when that chunk's weight rows are all zero, and
+        heads from different ops interleave within a sublayer, so dead heads
+        do not sort to the tail.
+
+        Compaction preserves the relative order of live heads.  It changes
+        no schedule and recovers no layers (the heads were charged at
+        schedule time); it reclaims each dead head's ``4 * d * d_head``
+        parameters and ``d_head`` of KV-cache width per layer.  Not
+        bit-identical: reindexing perturbs the einsum accumulation order at
+        the ~1e-6 level.  The matrix-occupancy sidecar is unaffected — its
+        placements are recorded in untrimmed full-width coordinates.
+
+        Keeps at least 1 head to avoid degenerate empty-tensor shapes in
+        downstream ops.
         """
-        n = max(self.used_heads, 1)
-        if n < self.n_heads:
-            self.query_matrix = self.query_matrix[:n].contiguous()
-            self.key_matrix = self.key_matrix[:n].contiguous()
-            self.value_matrix = self.value_matrix[:n].contiguous()
-            self.output_matrix = self.output_matrix[:n].contiguous()
-            self.n_heads = n
+        alloc = self.output_matrix[: min(max(self.used_heads, 1), self.n_heads)]
+        live = alloc.reshape(alloc.shape[0], -1).ne(0).any(dim=1)
+        idx = live.nonzero(as_tuple=True)[0]
+        if idx.numel() == 0:
+            idx = torch.zeros(1, dtype=torch.long, device=alloc.device)
+        if idx.numel() < self.n_heads:
+            self.query_matrix = self.query_matrix.index_select(0, idx).contiguous()
+            self.key_matrix = self.key_matrix.index_select(0, idx).contiguous()
+            self.value_matrix = self.value_matrix.index_select(0, idx).contiguous()
+            self.output_matrix = self.output_matrix.index_select(0, idx).contiguous()
+            self.n_heads = idx.numel()
+            self.used_heads = self.n_heads
 
     def num_params(self) -> int:
         return (

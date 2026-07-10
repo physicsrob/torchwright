@@ -244,6 +244,44 @@ def test_sibling_linears_fuse_under_an_attn_consumer():
     assert split_linears == merged_linears == 1
 
 
+def test_merged_leaves_wider_than_the_mlp_still_compile():
+    """The merge is the only fold that grows a node's ``d_output``, so it is the
+    only one that can turn ``n`` individually-placeable Linears into one Linear
+    with no MLP-bypass realization: the bypass costs ``2 * d_output`` hidden
+    slots, and ``2 * 40 = 80`` exceeds this ``d_hidden=64`` layer's whole pool.
+
+    Static routing is capacity-aware (``realization.static_flex_class``), so the
+    merged Linear goes to attention transport instead of being skipped by the
+    MLP placer in every layer forever.  Before that, this graph raised
+    ``No progress`` while the same graph with the merge *declined* — by
+    attaching a debug assert to a leaf — compiled fine, which made a debug
+    annotation decide schedulability.
+    """
+    n, d_hidden = 40, 64
+    assert 2 * n > d_hidden
+
+    with fresh_graph_session():
+        merged = compile_headless(
+            _build_split_attn(n), d=D, d_head=D_HEAD, d_hidden=d_hidden, verbose=False
+        )
+    with fresh_graph_session():
+        x = create_input("x", D_EMBED, value_range=(-1.0, 1.0))
+        lanes = _lanes(x, _weight_matrix(n))
+        for lane in lanes:
+            assert_in_range(lane, -1e9, 1e9)  # every leaf checked -> no merge
+        declined = compile_headless(
+            _attn_over(x, concat(lanes), n),
+            d=D,
+            d_head=D_HEAD,
+            d_hidden=d_hidden,
+            verbose=False,
+        )
+
+    # Both compile.  The merged form is no deeper — it was the *unschedulable*
+    # one, not the expensive one.
+    assert merged.n_layers <= declined.n_layers
+
+
 def test_merge_is_exact_on_the_graph():
     """The fold preserves the concat's value exactly, not just to tolerance."""
     probe = _probe()
@@ -523,3 +561,125 @@ def test_output_node_leaf_declines_merge():
     assert _census(out).get("Linear", 0) == 3
     assert lanes[1] in out.inputs
     assert len(lanes[1]) == 1
+
+
+# --- Slice records: merged leaves stay addressable --------------------------
+#
+# The merge orphans every leaf but one, yet each leaf's value survives as a
+# column slice of the widened survivor.  ``FoldLog.slices`` records where, the
+# lowering boundary translates the records to source nodes, and the compile's
+# source re-key turns them into residual-column slices.  Without this chain an
+# output ``Concatenate`` of merged leaves has nothing to gather: compiling
+# ``Concatenate([Linear(x, Wa), Linear(x, Wb)])`` raised ``KeyError`` from
+# ``ResidualAssignment.get_node_indices`` — while attaching a debug assert to
+# either leaf (declining the merge) made it compile, so a debug annotation
+# decided compilability.
+
+
+def test_output_concat_of_merged_siblings_compiles_and_matches_compute():
+    """The regression reproducer, pinned at the compile level."""
+    from torchwright.compiler.export import compile_headless
+
+    with fresh_graph_session():
+        x = create_input("x", D_EMBED, value_range=(-1.0, 1.0))
+        lanes = _lanes(x, _weight_matrix(N))
+        out = concat(lanes)
+        compiled = compile_headless(out, d=D, d_head=D_HEAD, verbose=False)
+        probe = _probe()
+        got = compiled(probe).cpu()
+        ref = out.compute(1, {"x": probe})
+    torch.testing.assert_close(got, ref, rtol=0, atol=1e-5)
+
+
+def test_merged_leaves_are_probeable_as_survivor_slices():
+    """Each merged source leaf keeps an addressable residual assignment (its
+    slice of the survivor's columns), so probe_compiled checks it against the
+    oracle instead of skipping it."""
+    from torchwright.compiler.export import compile_headless
+    from torchwright.debug.probe import probe_compiled
+
+    with fresh_graph_session():
+        x = create_input("x", D_EMBED, value_range=(-1.0, 1.0))
+        lanes = _lanes(x, _weight_matrix(N))
+        out = concat(lanes)
+        compiled = compile_headless(out, d=D, d_head=D_HEAD, verbose=False)
+        report = probe_compiled(compiled, out, {"x": _probe()}, n_pos=1, atol=1e-5)
+    assert report.first_divergent is None, report.format_short()
+    checked = {n.name for n in report.per_node}
+    assert {lane.name for lane in lanes} <= checked
+
+
+def test_fold_log_records_merge_slices():
+    """The fold-log layer: one record per run member, offsets in run order,
+    survivor self-record at offset 0."""
+    from torchwright.graph.optimize import FoldLog
+
+    with fresh_graph_session():
+        x = create_input("x", D_EMBED)
+        lanes = _lanes(x, _weight_matrix(3))
+        out = concat(lanes)
+        log = FoldLog()
+        assert fuse_consecutive_linears({out}, fold_log=log) > 0
+
+    survivor = lanes[0]  # _merge_run widens run[0] in place
+    assert log.slices[lanes[0]] == (survivor, 0, 1)
+    assert log.slices[lanes[1]] == (survivor, 1, 1)
+    assert log.slices[lanes[2]] == (survivor, 2, 1)
+
+
+def _four_nodes():
+    """Four distinct real nodes for FoldLog identity bookkeeping tests.
+
+    FoldLog keys and targets by node object; the tests below never read
+    weights or widths off the nodes, only identities, so minimal one-column
+    Linears over one input serve.
+    """
+    x = create_input("x", 2)
+    return [Linear(x, torch.zeros(2, 1), name=t) for t in ("a", "b", "c", "d")]
+
+
+def test_fold_log_merge_composition():
+    """A member that was itself a merge survivor: its members' records follow
+    it into the new survivor in one retarget step."""
+    from torchwright.graph.optimize import FoldLog
+
+    with fresh_graph_session():
+        a, b, c, _ = _four_nodes()
+        log = FoldLog()
+        log.record_merge([a, b], [3, 2])  # a widened to 5: a=[0:3], b=[3:5]
+        log.record_merge([c, a], [4, 5])  # c widened to 9, a's block at offset 4
+        assert log.slices[c] == (c, 0, 4)
+        assert log.slices[a] == (c, 4, 3)  # a's ORIGINAL value, not its widened one
+        assert log.slices[b] == (c, 4 + 3, 2)
+
+
+def test_fold_log_duplicate_survivor_occurrence_keeps_offset_zero():
+    """``concat([l, l])``: the survivor's own columns stay at the front; the
+    second occurrence duplicates them and must not retarget the self-record."""
+    from torchwright.graph.optimize import FoldLog
+
+    with fresh_graph_session():
+        a, _, _, _ = _four_nodes()
+        log = FoldLog()
+        log.record_merge([a, a], [3, 3])
+        assert log.slices[a] == (a, 0, 3)
+
+
+def test_fold_log_move_retargets_and_invalidates_slices():
+    """record_move: slices of the orphan's value follow it onto the survivor;
+    slices of the survivor's replaced value are dropped."""
+    from torchwright.graph.optimize import FoldLog
+
+    with fresh_graph_session():
+        a, b, s, ffn = _four_nodes()
+        log = FoldLog()
+        log.record_merge([s, a], [3, 2])  # s holds s=[0:3], a=[3:5]
+        log.record_merge([ffn, b], [1, 1])  # unrelated records pointing at ffn
+        # The FFN fold moves s's (widened) value onto ffn: records that read
+        # s's columns follow; records that read ffn's OLD columns are
+        # invalidated.
+        log.record_move(orphan=s, survivor=ffn)
+        assert log.slices[s] == (ffn, 0, 3)
+        assert log.slices[a] == (ffn, 3, 2)
+        assert ffn not in log.slices
+        assert b not in log.slices

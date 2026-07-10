@@ -103,12 +103,58 @@ def has_flex_choice(node: Node) -> bool:
     return not is_conditional(node) and len(candidate_classes(node)) > 1
 
 
-def static_flex_class(candidates: Tuple[str, ...], policy: SchedulingPolicy) -> str:
+def first_hidden_slot(bias: bool) -> int:
+    """The lowest hidden slot a scheduled node may pack into.
+
+    ``bias=False`` reserves hidden slot 0 for the weight-writer's constant
+    lane (the BiasFold), so packing starts at slot 1.
+    """
+    return 0 if bias else 1
+
+
+def usable_hidden_slots(d_hidden: int, bias: bool) -> int:
+    """Hidden slots one layer's MLP can hand out to scheduled nodes.
+
+    The eager scheduler's slot packing, the CP-SAT hidden-slot cumulative,
+    and :func:`static_flex_class` below must agree on this number: the
+    routing rule decides whether a node *can* live in the MLP, and the two
+    schedulers then have to be able to place what it decided.
+    """
+    return d_hidden - first_hidden_slot(bias)
+
+
+def fits_mlp_bypass(node: Node, usable_slots: int) -> bool:
+    """Whether *node* has an MLP-bypass realization at all under this geometry.
+
+    The bypass identity ``act(z) − act(−z) = z`` spends two hidden slots per
+    output column, so a Linear whose ``2 · d_output`` exceeds a layer's entire
+    usable hidden pool can never be placed — not in this layer, not in any
+    layer, no matter how empty the MLP is.  That makes this a *structural*
+    property of the node and the geometry, unlike the scheduler's per-layer
+    "no slots left right now" check, which is transient.
+    """
+    return class_hidden_slots(node, MLP_BYPASS) <= usable_slots
+
+
+def static_flex_class(node: Node, policy: SchedulingPolicy, usable_slots: int) -> str:
     """The static policy's pick for a free choice — the one rule both the
     optimize=0 resolver and the CP-SAT model's pinned (``flex_routing=
-    False``) routing apply: attention transport unless
-    ``local_in_attention == "never"``."""
-    choice = ATTN_TRANSPORT if policy.local_in_attention != "never" else MLP_BYPASS
+    False``) routing apply.
+
+    Capacity is checked before policy.  A Linear too wide for the MLP bypass
+    (:func:`fits_mlp_bypass`) has exactly one realization left, so it goes to
+    attention transport whatever ``local_in_attention`` says; routing it to a
+    sublayer that cannot hold it deadlocks the eager walk and makes the CP-SAT
+    model infeasible.  Otherwise the policy decides: attention transport
+    unless ``local_in_attention == "never"``.
+    """
+    candidates = candidate_classes(node)
+    if not fits_mlp_bypass(node, usable_slots):
+        choice = ATTN_TRANSPORT
+    elif policy.local_in_attention != "never":
+        choice = ATTN_TRANSPORT
+    else:
+        choice = MLP_BYPASS
     assert choice in candidates
     return choice
 
@@ -286,16 +332,33 @@ class RealizationTable:
 
     # -- resolvers ---------------------------------------------------------
 
-    def resolve_static(self, policy: SchedulingPolicy) -> "RealizationTable":
-        """The optimize=0 resolver: the static policy picks every free choice.
+    def resolve_static(
+        self, nodes: Iterable[Node], policy: SchedulingPolicy, usable_slots: int
+    ) -> "RealizationTable":
+        """The optimize=0 resolver: :func:`static_flex_class` picks every free
+        choice.
 
-        ``policy.local_in_attention == "never"`` routes standalone Linears
-        to the MLP bypass; anything else to attention transport.
+        ``policy.local_in_attention == "never"`` routes standalone Linears to
+        the MLP bypass and anything else to attention transport — except that
+        a Linear too wide for a layer's usable hidden pool (``usable_slots``,
+        from :func:`usable_hidden_slots`) has no MLP realization and goes to
+        attention regardless.
+
+        Takes *nodes* because the capacity check reads each unresolved node's
+        width, which the ``node_id``-keyed entries do not carry.
         """
+        by_id = {n.node_id: n for n in nodes if is_schedulable(n)}
         resolved: Dict[int, Entry] = {}
         for node_id, entry in self.entries.items():
             if entry.resolved is None and not entry.conditional:
-                choice = static_flex_class(entry.candidates, policy)
+                node = by_id.get(node_id)
+                if node is None:
+                    raise UnresolvedRealizationError(
+                        f"node {node_id} has an unresolved entry "
+                        f"{entry.candidates} but is absent from the nodes "
+                        f"passed to resolve_static"
+                    )
+                choice = static_flex_class(node, policy, usable_slots)
                 resolved[node_id] = replace(entry, resolved=choice)
             else:
                 resolved[node_id] = entry

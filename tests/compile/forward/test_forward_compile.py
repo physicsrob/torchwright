@@ -663,3 +663,119 @@ def test_compile_attend_argmax_dot():
             "value": torch.randn(n_pos, 3),
         },
     )
+
+
+# ---------------------------------------------------------------------------
+# The `No progress` deadlock message
+#
+# Distinct failures used to produce one identical string.  The message now
+# names the node, the resource, and the arithmetic, and separates three cases:
+# a node routed to a sublayer that cannot hold it (a compiler bug, since the
+# node has another realization class); a node whose only realization class does
+# not fit the geometry (no schedule exists); and an ordinary out-of-budget
+# deadlock (optimize>0 may still schedule it).
+#
+# The `RuntimeError` type and the `No progress:` prefix are a contract —
+# `test_optimize1_compiles_where_eager_heuristic_cannot` matches on the string.
+# ---------------------------------------------------------------------------
+
+
+def _width_starved_out():
+    """8 chains x -> Li(12 cols) -> {Ma_i, Mb_i}; at d=48 the Li's cannot
+    coexist.  Same fixture as tests/compile/forward/test_cpsat_intralayer.py;
+    the Ma's are grouped before the Mb's so no two adjacent concat leaves share
+    an input (which the sibling fold would merge, unravelling the starvation).
+    """
+    torch.manual_seed(0)
+    x = create_input("x", 4)
+    mas, mbs = [], []
+    for i in range(8):
+        li = Linear(x, torch.randn(4, 12), torch.zeros(12), name=f"L{i}")
+        mas.append(Linear(li, torch.randn(12, 2), torch.zeros(2), name=f"Ma{i}"))
+        mbs.append(Linear(li, torch.randn(12, 2), torch.zeros(2), name=f"Mb{i}"))
+    return Linear(Concatenate(mas + mbs), torch.randn(32, 4), torch.zeros(4), name="out")
+
+
+def test_no_progress_names_the_out_of_budget_nodes():
+    """Residual-column exhaustion: the only deadlock a correct compiler can
+    reach.  The message must name a starved node, its column demand, and how
+    many columns were actually free."""
+    with pytest.raises(RuntimeError, match="No progress") as exc:
+        forward_compile(
+            d=48, d_head=8, output_node=_width_starved_out(), device="cpu",
+            verbose=False,
+        )
+    msg = str(exc.value)
+    assert "Out of budget this layer" in msg
+    assert "residual columns" in msg
+    assert "COMPILER BUG" not in msg
+    assert "Too big for the geometry" not in msg
+    # Names a specific node, its demand, and what was free.
+    assert "Linear 'L4' (id" in msg or "Linear 'L5' (id" in msg
+    assert "needs 12 residual columns, 1 free this layer" in msg
+
+
+def test_no_progress_names_an_ffn_too_wide_for_the_mlp():
+    """An FFN's only realization class is the MLP composite, so `n_lanes`
+    beyond a layer's usable hidden pool is unschedulable at any layer and no
+    routing rule can rescue it.  That is a geometry problem, not a bug."""
+    torch.manual_seed(0)
+    x = create_input("x", 4, value_range=(-1.0, 1.0))
+    ffn = linear_relu_linear(
+        x, torch.randn(40, 4), torch.zeros(40),
+        torch.randn(40, 3), torch.zeros(3), name="fat",
+    )
+    with pytest.raises(RuntimeError, match="No progress") as exc:
+        forward_compile(
+            d=64, d_head=8, output_node=ffn, d_hidden=32, device="cpu", verbose=False,
+        )
+    msg = str(exc.value)
+    assert "Too big for the geometry" in msg
+    assert "d=64, d_hidden=32, d_head=8" in msg
+    assert "FFN 'fat' (id" in msg
+    assert "needs 40 MLP hidden slots, but a layer holds at most 32" in msg
+    assert "COMPILER BUG" not in msg
+
+
+def test_no_progress_calls_a_misrouted_linear_a_compiler_bug(monkeypatch):
+    """A standalone Linear has two realization classes.  If it lands in the MLP
+    bypass without room for its `2 * d_output` slots, the routing rule failed —
+    that is a compiler bug (D1), and the message has to say so rather than
+    read like the geometry is too small.
+
+    Reached by defeating `fits_mlp_bypass`, the capacity check that makes this
+    unreachable on the real code path.
+    """
+    from torchwright.compiler import realization
+
+    monkeypatch.setattr(realization, "fits_mlp_bypass", lambda node, usable: True)
+
+    torch.manual_seed(0)
+    x = create_input("x", 4, value_range=(-1.0, 1.0))
+    wide = Linear(x, torch.randn(4, 33) * 0.2, name="wide")  # 2*33 = 66 > 64
+    out = Concatenate([Linear(wide, torch.randn(33, 2) * 0.2, name="tap"), wide])
+
+    with pytest.raises(RuntimeError, match="No progress") as exc:
+        forward_compile(
+            d=64, d_head=8, output_node=out, d_hidden=64, device="cpu", verbose=False,
+        )
+    msg = str(exc.value)
+    assert "COMPILER BUG" in msg
+    assert "Linear 'wide' (id" in msg
+    assert "needs 66 MLP hidden slots, but a layer holds at most 64" in msg
+    assert "Too big for the geometry" not in msg
+
+
+def test_no_progress_truncation_says_how_many_it_dropped():
+    """A DOOM-scale deadlock would list hundreds of starved nodes.  The
+    transient section caps the list — and says what it left out."""
+    with pytest.raises(RuntimeError, match="No progress") as exc:
+        forward_compile(
+            d=48, d_head=8, output_node=_width_starved_out(), device="cpu",
+            verbose=False,
+        )
+    msg = str(exc.value)
+    listed = [ln for ln in msg.splitlines() if "free this layer" in ln]
+    assert len(listed) <= 8
+    if "more like these" in msg:
+        assert len(listed) == 8

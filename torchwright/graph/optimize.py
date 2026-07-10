@@ -5,7 +5,7 @@ layer count and parameter overhead.
 """
 
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Set
+from typing import Dict, List, Optional, Set, Tuple
 
 import torch
 
@@ -29,13 +29,27 @@ class FoldLog:
     - ``value_changed``: nodes that survive in the graph but no longer
       compute their pre-fusion value (the move survivors themselves,
       and Concatenates whose leaves were absorbed).
+    - ``slices``: node → ``(holder, offset, width)`` — the node's
+      pre-fusion value survives as a *column slice* of a wider holder
+      (the sibling merge: ``concat(Linear, ..., Linear)`` widened into
+      one Linear holds every leaf's columns at a known offset).  The
+      residual-assignment re-key turns these into addressable column
+      ranges, which is what keeps an output ``Concatenate`` of merged
+      leaves gatherable.
 
     Every other orphan's value simply ceases to exist; reachability
-    from the output identifies those without bookkeeping here.
+    from the output identifies those without bookkeeping here.  A
+    dangling slice record — one whose holder is itself later orphaned —
+    stays in the dict but is harmless: an orphan is never scheduled, so
+    it never appears in the residual assignment and the re-key skips
+    the record.  The one hazard is a holder that survives with a *new*
+    value; both such folds run through :meth:`record_move`, which
+    drops the invalidated records.
     """
 
     moves: Dict[Node, Node] = field(default_factory=dict)
     value_changed: Set[Node] = field(default_factory=set)
+    slices: Dict[Node, Tuple[Node, int, int]] = field(default_factory=dict)
 
     def record_move(self, orphan: Node, survivor: Node) -> None:
         # A survivor absorbing a second downstream Linear stops holding
@@ -43,11 +57,53 @@ class FoldLog:
         for prev, holder in list(self.moves.items()):
             if holder is survivor:
                 del self.moves[prev]
+        # Same for slice records: the survivor's columns now hold the
+        # orphan's value, so slices of the survivor's OLD value are lost...
+        for key, (holder, _, _) in list(self.slices.items()):
+            if holder is survivor:
+                del self.slices[key]
+        # ...while slices of the ORPHAN's value follow it onto the survivor
+        # (the move preserves width and column order — the survivor's
+        # post-fold output IS the orphan's pre-fold output).
+        for key, (holder, off, w) in list(self.slices.items()):
+            if holder is orphan:
+                self.slices[key] = (survivor, off, w)
         self.moves[orphan] = survivor
         self.value_changed.add(survivor)
 
     def record_value_changed(self, node: Node) -> None:
         self.value_changed.add(node)
+
+    def record_merge(self, run: List[Node], widths: List[int]) -> None:
+        """Record a sibling merge: ``run[0]`` widened in place to hold every
+        run member's columns side by side, the rest orphaned.
+
+        ``widths`` are the members' pre-merge output widths (captured before
+        the survivor is mutated).  Composes with earlier merges: a record
+        already pointing at a run member follows it to its new offset inside
+        the survivor, and a member that already has a record of its own (it
+        was a previous merge's survivor, re-merged after a splice exposed a
+        new adjacent sibling) keeps that record — its original value is a
+        slice of a slice, and the retarget above rewrites it in one step.
+        """
+        survivor = run[0]
+        offset = 0
+        for member, width in zip(run, widths):
+            if member is survivor:
+                # The survivor's pre-merge columns stay at offset 0, so
+                # records pointing at it need no retarget — and a duplicate
+                # occurrence later in the run (``concat([l, l])``) merely
+                # duplicates those columns, so it records nothing new either.
+                if member not in self.slices:
+                    self.slices[member] = (survivor, 0, width)
+                offset += width
+                continue
+            for key, (holder, o, w) in list(self.slices.items()):
+                if holder is member:
+                    self.slices[key] = (survivor, offset + o, w)
+            if member not in self.slices:
+                self.slices[member] = (survivor, offset, width)
+            offset += width
 
 
 # --- Fold policy for checked values (docs/assert_metadata_plan.md) --------
@@ -70,10 +126,32 @@ class FoldLog:
 # survives (it moves onto the FFN): there the orphan's checks and claim
 # MIGRATE to the survivor instead of blocking the fold — mirroring how
 # a wrapper above the orphaned Linear used to be rewired onto the FFN.
+#
+# The gates conflate three distinct predicates; when weighing whether a
+# gate can be relaxed, name which one it implements:
+#
+# - *erased* — the node is an ORPHAN whose value ceases to exist
+#   (``_blocks_absorb`` on l1 / u / a concat leaf).  Losing its metadata
+#   only LOOSENS the compiled graph's guarantees (a check stops running,
+#   a claim stops tightening).  This is the genuinely relaxable,
+#   measurable policy choice described above.
+# - *replaced* — the node SURVIVES but computes a different value (the
+#   FFN->Linear fold's b).  Its old checks may not be erased
+#   (``_blocks_absorb(b)`` declines — a checkability policy), but its old
+#   CLAIM may not be retained either: a stale claim wrongly TIGHTENS the
+#   new value's bounds.  That half is a SOUNDNESS rule, not a policy —
+#   the unconditional metadata transfer inside ``_fold_ffn_into_linear``
+#   enforces it and is not relaxable.
+# - *widened* — the node survives holding its old value as a column
+#   slice of a wider one (the sibling merge's survivor).  Same soundness
+#   concern as *replaced*, plus none of checks / claims / overrides can
+#   re-attach to a column slice, so ``_blocks_merge`` declines on all
+#   three.  Not relaxable without per-slice metadata that does not exist.
 
 
 def _blocks_absorb(node: Node) -> bool:
-    """True when *node*'s value may not be erased by a fold."""
+    """True when *node*'s value may not be erased by a fold (the *erased*
+    predicate above — the relaxable checkability policy)."""
     return bool(node.checks)
 
 
@@ -151,14 +229,19 @@ def _fold_ffn_into_linear(
     b.out_bias = b.out_bias @ l.output_matrix + l.output_bias
     b.out_proj = b.out_proj @ l.output_matrix
     b.d_output = l.output_matrix.shape[1]
-    # l's checks and range claim describe l's value, which now lives on
-    # b — migrate them so the value stays runtime-checkable.  b's own
-    # metadata is guaranteed empty here (a checked b declines the fold),
-    # so this is a plain transfer, not a merge.
-    if l.checks:
-        b.checks = list(l.checks)
-        b.claimed_type = l.claimed_type
-        b.integer_claim = l.integer_claim
+    # l's checks and range claim describe l's value, which now lives on b —
+    # migrate them so the value stays runtime-checkable.  The transfer is
+    # UNCONDITIONAL: b's value is replaced, so whatever claim b carried
+    # describes a value that no longer exists, and retaining it would
+    # wrongly TIGHTEN the new value's bounds — an unsoundness, not a lost
+    # optimization.  (b's checks are guaranteed empty here — a checked b
+    # declines the fold — and today every claim arrives via attach_assert,
+    # which always appends a check first, so a conditional transfer gated
+    # on ``l.checks`` happened to also clear b's claim whenever one could
+    # exist.  Nothing enforces that implication; this doesn't rely on it.)
+    b.checks = list(l.checks)
+    b.claimed_type = l.claimed_type
+    b.integer_claim = l.integer_claim
     # This fold inverts survivorship: b's VALUE becomes what l's was, so a
     # semantic affine override installed on b describes the pre-fold value
     # and must not be re-applied by the bounds refresh.  (The other two
@@ -175,6 +258,7 @@ def _fold_through_concatenate(
     c: Concatenate,
     output_nodes: Set[Node],
     consumers: Dict[Node, List[Node]],
+    hint_targets: Set[Node],
     touched: Set[Node],
     mutated: Set[Node],
     fold_log: FoldLog,
@@ -220,13 +304,17 @@ def _fold_through_concatenate(
         return 0
 
     # Splice nested single-consumer concat leaves inline first, so the
-    # folds below see a flat leaf list.
+    # folds below see a flat leaf list.  A splice is value-identical but
+    # still orphans the nested concat, so the hint gate applies (a waiter
+    # can name a Concatenate: the scheduler marks one computed once its
+    # leaves are).
     applied = 0
     leaves: List[Node] = []
     for leaf in c.inputs:
         if (
             isinstance(leaf, Concatenate)
             and not _blocks_absorb(leaf)
+            and not _blocks_orphan(leaf, hint_targets)
             and leaf not in touched
             and leaf not in output_nodes
             and len(consumers.get(leaf, [])) == 1
@@ -256,6 +344,7 @@ def _fold_through_concatenate(
             allow_value_folds
             and isinstance(leaf, LiteralValue)
             and not _blocks_absorb(leaf)
+            and not _blocks_orphan(leaf, hint_targets)
             and has_non_literal
         ):
             bias = bias + leaf.value @ m
@@ -267,6 +356,7 @@ def _fold_through_concatenate(
             allow_value_folds
             and isinstance(leaf, Linear)
             and not _blocks_absorb(leaf)
+            and not _blocks_orphan(leaf, hint_targets)
             and leaf not in touched
             and leaf not in output_nodes
             and len(consumers.get(leaf, [])) == 1
@@ -313,8 +403,10 @@ def _fold_through_concatenate(
     l.output_matrix = torch.cat(blocks, dim=0)
     l.output_bias = bias
     l.d_input = l.output_matrix.shape[0]
-    if len(new_leaves) == 1:
-        l.inputs = [new_leaves[0]]  # bypass the concat entirely
+    if len(new_leaves) == 1 and not _blocks_orphan(c, hint_targets):
+        # Bypass the concat entirely — unless the concat itself carries or is
+        # named by a hint, in which case it stays interposed (one leaf wide).
+        l.inputs = [new_leaves[0]]
     else:
         c.inputs = new_leaves
         c.d_output = sum(len(x) for x in new_leaves)
@@ -331,13 +423,47 @@ def _scheduling_hint_targets(all_nodes: Set[Node]) -> Set[Node]:
     """Every node some other node names as a scheduling predecessor.
 
     Orphaning one of these leaves a dangling hint: ``GraphAnalyzer.is_ready``
-    waits on a node that never enters ``computed_nodes``, and the scheduler
-    dies with ``No progress``.
+    waits on a node that never enters ``computed_nodes``.  At ``optimize=0``
+    the compile loop then runs out of layers ("did not converge"); at
+    ``optimize>=1`` CP-SAT's bound propagation dies with a bare ``KeyError``
+    — not ``No progress``, whose raise requires a *ready* node, and a
+    hint-blocked node is never ready.
     """
     targets: Set[Node] = set()
     for node in all_nodes:
         targets |= node.scheduling_predecessors
     return targets
+
+
+def _blocks_orphan(node: Node, hint_targets: Set[Node]) -> bool:
+    """True when orphaning *node* would break caller-declared scheduling.
+
+    Two directions, both fatal in their own way:
+
+    - *carrier*: the node holds ``scheduling_predecessors``.  Orphaning it
+      deletes the ordering edge — values stay correct, but the residual-
+      pressure serialization the caller asked for (``sequential_scope``) is
+      silently undone.
+    - *target*: another node names this one as a predecessor.  Orphaning it
+      leaves the waiter permanently un-ready (see
+      :func:`_scheduling_hint_targets` for the two failure shapes).
+
+    Declining the fold is correct, not merely safe: every fold contracts an
+    edge between orphan and survivor, and contracting ``u -> v`` creates a
+    cycle exactly when another path from ``u`` to ``v`` exists — hint edges
+    ARE such paths, so migrating them onto the survivor is unsound in
+    general (for the sibling merge, an intra-run hint would make the merged
+    node wait on itself).
+
+    Consulted at every orphaning site in this module.  It cannot be checked
+    inside the fold functions themselves — they don't see ``hint_targets``
+    — so each call site in :func:`_fuse_one_pass` (and
+    :func:`_fold_through_concatenate`, which receives the set) gates before
+    folding.  The set must be computed fresh per pass by the orchestrator:
+    a pass that deletes hint carriers would otherwise leave later passes
+    reading an empty set and merging what the hints protected.
+    """
+    return bool(node.scheduling_predecessors) or node in hint_targets
 
 
 def _blocks_merge(node: Node, hint_targets: Set[Node]) -> bool:
@@ -349,21 +475,18 @@ def _blocks_merge(node: Node, hint_targets: Set[Node]) -> bool:
     block, but nothing can re-attach a predicate, a range claim, or a semantic
     affine override to a *slice* of a node, so all three decline the merge.
 
-    *Scheduling hints*: the merge orphans every leaf but one.  A leaf carrying
-    ``scheduling_predecessors`` would have its ordering constraint silently
-    dropped (the survivor keeps only its own), and a leaf that another node
-    names as a predecessor would leave that node waiting forever.
-    ``sequential_scope`` builds exactly this shape — sibling Linears over one
-    input, serialized to bound residual pressure — so an ungated merge would
-    quietly undo the pressure limit the caller asked for.
+    *Scheduling hints*: the merge orphans every leaf but one — the shared
+    :func:`_blocks_orphan` rule.  ``sequential_scope`` builds exactly this
+    shape — sibling Linears over one input, serialized to bound residual
+    pressure — so an ungated merge would quietly undo the pressure limit the
+    caller asked for.
     """
     return (
         bool(node.checks)
         or node.claimed_type is not None
         or node.integer_claim
         or node._semantic_affine_override is not None
-        or bool(node.scheduling_predecessors)
-        or node in hint_targets
+        or _blocks_orphan(node, hint_targets)
     )
 
 
@@ -384,6 +507,11 @@ def _merge_run(run: List[Linear], fold_log: FoldLog) -> Linear:
     survivor = run[0]
     matrices = [leaf.output_matrix for leaf in run]
     biases = [leaf.output_bias for leaf in run]
+    # Each member's pre-merge value survives as a column slice of the widened
+    # survivor — record where, so the residual-assignment re-key can keep the
+    # members addressable (an output Concatenate of merged leaves is gathered
+    # leaf by leaf; without these records its leaves have no columns).
+    fold_log.record_merge(list(run), [m.shape[1] for m in matrices])
     survivor.output_matrix = torch.cat(matrices, dim=1)
     survivor.output_bias = torch.cat(biases, dim=0)
     survivor.d_output = survivor.output_matrix.shape[1]
@@ -525,7 +653,8 @@ def _bypass_trivial_concatenate(
     - the concat is a caller-held output (its identity must survive);
     - it is checked or carries a semantic affine override (it stays
       materialized so its predicates keep reading a real residual value);
-    - it is the target of a scheduling hint (orphaning it dangles the hint);
+    - it carries or is the target of a scheduling hint
+      (:func:`_blocks_orphan` — orphaning it dangles the hint);
     - its one distinct consumer is a ``Linear``, in which case
       :func:`_fold_through_concatenate` owns this concat and does the bypass
       itself as part of absorbing the leaf.  Racing it here would just split
@@ -533,7 +662,7 @@ def _bypass_trivial_concatenate(
 
     Returns 1 if the concat was bypassed.
     """
-    if len(c.inputs) != 1 or c in output_nodes or c in hint_targets:
+    if len(c.inputs) != 1 or c in output_nodes or _blocks_orphan(c, hint_targets):
         return 0
     if _blocks_absorb(c) or c._semantic_affine_override is not None:
         return 0
@@ -592,7 +721,14 @@ def _fuse_one_pass(
             if isinstance(inp, Concatenate):
                 if len(consumers.get(inp, [])) == 1:
                     applied += _fold_through_concatenate(
-                        node, inp, output_nodes, consumers, touched, mutated, fold_log
+                        node,
+                        inp,
+                        output_nodes,
+                        consumers,
+                        hint_targets,
+                        touched,
+                        mutated,
+                        fold_log,
                     )
                 continue
             if len(consumers.get(inp, [])) != 1:
@@ -601,6 +737,8 @@ def _fuse_one_pass(
             if isinstance(inp, Linear):
                 l1, l2 = inp, node
                 if _blocks_absorb(l1):  # l1's checked value would be erased
+                    continue
+                if _blocks_orphan(l1, hint_targets):  # l1's hint edges would dangle
                     continue
                 d_in = l1.output_matrix.shape[0]
                 d_mid = l1.output_matrix.shape[1]
@@ -624,6 +762,12 @@ def _fuse_one_pass(
                     continue
                 if _blocks_absorb(b):  # b's checked pre-fold value would be erased
                     continue  # (l's checks migrate — see the fold)
+                # l is the orphan here even though its VALUE survives (it
+                # moves onto b): hint edges are keyed by node identity, so a
+                # waiter naming l never sees it computed, and l's own
+                # predecessors would stop constraining anything.
+                if _blocks_orphan(l, hint_targets):
+                    continue
                 n_lanes = b.n_lanes
                 d_b = b.d_output
                 d_z = l.output_matrix.shape[1]
@@ -645,6 +789,8 @@ def _fuse_one_pass(
                 continue
             u, b = inp, node
             if _blocks_absorb(u):  # u's checked value would be erased
+                continue
+            if _blocks_orphan(u, hint_targets):  # u's hint edges would dangle
                 continue
             d_x = u.output_matrix.shape[0]
             d_u = u.output_matrix.shape[1]

@@ -264,18 +264,20 @@ against.
 Two entry points in `torchwright/compiler/export.py`, one loader
 front door in `torchwright/compiler/onnx_load.py`:
 
-    compiled = compile_headless(graph, pos_encoding, *, d=..., d_head=...,
-                                optimize=0, assume_zero_init=False, ...)
+    compiled = compile_headless(graph, *, d=..., d_head=...,
+                                optimize=0, bias=True, ...)
 
 In-process `CompiledHeadless` for tests and debugging.  `graph` is a
 single output `Node` (outputs gathered at the node's natural residual
-columns).  All other parameters are keyword-only.  `optimize` and
-`assume_zero_init` thread straight to `forward_compile`, so this backend
-can reproduce a production `optimize=2` schedule exactly.  Passing the
-`PosEncoding` first (the pre-2026 argument order) raises a `TypeError`
-naming the new order.
+columns) and the ONLY positional parameter — there is no `pos_encoding`
+argument (position is rotary, applied inside attention), and the
+`assume_zero_init` flag was retired 2026-07 (universal zero-init).  All
+other parameters are keyword-only.  `optimize` and `bias` thread
+straight to `forward_compile`, so this backend can reproduce a
+production `optimize=2` / `bias=False` schedule exactly.  Passing a
+non-`Node` first argument raises a `TypeError` naming the expectation.
 
-    artifact = compile_to_onnx(output_node, pos_encoding, embedding, path, ...)
+    artifact = compile_to_onnx(output_node, embedding, output_path, ...)
 
 The exporter returns an **`OnnxArtifact`**: the written paths
 (`path`, `meta_path`, `debug_path`) plus small build metadata (`kind`,
@@ -285,8 +287,8 @@ built strictly from paths and scalars after export completes — it
 holds no graph, no weights, no exporter state (the exporters'
 streaming memory bound is a hard invariant).  `artifact.load()`
 returns the matching runtime module; `artifact.debug_session(
-output_node, pos_encoding)` opens an `OnnxDebugSession` (see
-*Debugging the ONNX artifact* below).
+output_node)` opens an `OnnxDebugSession` (see *Debugging the ONNX
+artifact* below).
 
     model = load_onnx(path)        # torchwright.compiler.onnx_load
 
@@ -379,10 +381,10 @@ seconds; the compile it replaces is minutes):
 
     from torchwright.debug.onnx_debug import OnnxDebugSession
 
-    output_node, pos_encoding = build_my_graph()   # deterministic rebuild
-    sess = OnnxDebugSession("model.onnx", output_node, pos_encoding)
+    output_node = build_my_graph()   # deterministic rebuild
+    sess = OnnxDebugSession("model.onnx", output_node)
     # or, holding the export's OnnxArtifact:
-    # sess = artifact.debug_session(output_node, pos_encoding)
+    # sess = artifact.debug_session(output_node)
 
     out, past = sess.step(inputs, sess.empty_past(), debug=True)
     val = sess.debug_value(node)

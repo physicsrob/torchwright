@@ -15,7 +15,7 @@ from typing import Callable, Dict, Optional, Set, Tuple
 import torch
 
 from torchwright.compiler.device import get_device
-from torchwright.compiler.realization import RealizationTable
+from torchwright.compiler.realization import RealizationTable, usable_hidden_slots
 from torchwright.compiler.residual_assignment import ResidualAssignment
 from torchwright.compiler.forward.cpsat_scheduler import (
     Costs,
@@ -1107,8 +1107,11 @@ def forward_compile(
     # bias=False reserves hidden slot 0 (the constant lane), so the solver's
     # cumulative slot capacity must drop by one — mirroring the heuristic's
     # slot-1 packing base — or a solver-feasible layer that exactly fills
-    # d_hidden is unpackable on replay.
-    solver_d_hidden = d_hidden if bias else d_hidden - 1
+    # d_hidden is unpackable on replay.  The same number decides whether a
+    # standalone Linear has an MLP-bypass realization at all, so both
+    # resolvers read it: `resolve_static` below, and `routing()` inside the
+    # CP-SAT model (which receives it as its `d_hidden`).
+    solver_d_hidden = usable_hidden_slots(d_hidden, bias)
 
     if use_cpsat:
         # Architecture doc §3 marks admission_control as a model
@@ -1360,8 +1363,10 @@ def forward_compile(
                     # (same or shallower depth), reflect that on the returned
                     # stats even when it did not strictly improve.
                     if stats_r.is_optimal:
-                        if assignment is not None and asg_r is not None and (
-                            asg_r.n_layers <= assignment.n_layers
+                        if (
+                            assignment is not None
+                            and asg_r is not None
+                            and (asg_r.n_layers <= assignment.n_layers)
                         ):
                             _stats = stats_r
                         break
@@ -1420,8 +1425,10 @@ def forward_compile(
         if _disabled_families or _solve_only:
             net.cpsat_assignment = assignment
             if verbose:
-                claim = "no feasible incumbent" if assignment is None else (
-                    f"n_layers={assignment.n_layers}"
+                claim = (
+                    "no feasible incumbent"
+                    if assignment is None
+                    else (f"n_layers={assignment.n_layers}")
                 )
                 mode = (
                     f"disabled={sorted(_disabled_families)}"
@@ -1485,7 +1492,9 @@ def forward_compile(
                 admission_budget_fraction=admission_budget_fraction,
                 policy=policy,
                 # Fallback resolves statically, same as optimize=0.
-                realization_table=lowered.realization_table.resolve_static(policy),
+                realization_table=lowered.realization_table.resolve_static(
+                    graph.get_all_nodes(), policy, solver_d_hidden
+                ),
                 bias=bias,
             )
         else:
@@ -1523,7 +1532,9 @@ def forward_compile(
             admission_budget_fraction=admission_budget_fraction,
             policy=policy,
             # The static policy is the optimize=0 resolver.
-            realization_table=lowered.realization_table.resolve_static(policy),
+            realization_table=lowered.realization_table.resolve_static(
+                graph.get_all_nodes(), policy, solver_d_hidden
+            ),
             bias=bias,
         )
 
@@ -1790,9 +1801,20 @@ def forward_compile(
     # stay as they are.
     copy_to_source = {copy: src for src, copy in lowered.node_map.items()}
     for state in ra.mapping:
-        ra.mapping[state] = {
-            copy_to_source.get(n, n): cols for n, cols in ra.mapping[state].items()
-        }
+        old = ra.mapping[state]
+        new = {copy_to_source.get(n, n): cols for n, cols in old.items()}
+        # Sliced values: a source node whose value survives fusion as a column
+        # slice of a widened copy node (the sibling merge) gets the matching
+        # slice of the holder's columns, wherever the holder is materialized.
+        # This is what keeps an output Concatenate of merged leaves gatherable
+        # — its source leaves have no whole-node counterpart in the copy.
+        # A holder absent from this state (freed, or orphaned by a later fold)
+        # simply contributes no entry, same as any other unmaterialized node.
+        for src, (holder, off, w) in lowered.slice_map.items():
+            holder_cols = old.get(holder)
+            if holder_cols is not None:
+                new[src] = holder_cols[off : off + w]
+        ra.mapping[state] = new
     for entry in placement_recorder.entries:
         if entry.node is not None:
             entry.node = copy_to_source.get(entry.node, entry.node)

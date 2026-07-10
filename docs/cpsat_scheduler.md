@@ -518,8 +518,14 @@ variable rather than fixed by the policy.
 When `True` (the default), each standalone `Linear` (a `Linear`
 outside any chain) gets its own `is_attn` decision variable and the
 solver picks attention versus MLP per node. When `False`, standalone
-Linears are pinned per `policy.local_in_attention` and only the
-placement and cancellation decisions are optimized.
+Linears are pinned by `realization.static_flex_class` — normally per
+`policy.local_in_attention`, except that a Linear whose MLP-bypass
+demand (`2 * d_output` hidden slots) exceeds a layer's usable hidden
+pool has no MLP realization at all and is pinned to attention
+regardless — and only the placement and cancellation decisions are
+optimized.  That capacity check is what the eager `resolve_static`
+applies too; if the two ever disagree, `resolve_from_assignment`
+raises `UnresolvedRealizationError`.
 
 `flex_routing=True` weakly dominates `flex_routing=False` on the
 solver objective: anything `flex_routing=False` can produce is also

@@ -724,3 +724,281 @@ def test_concat_fold_skips_checked_leaf_only():
     assert leaf1 in c.inputs
     assert leaf2 not in c.inputs
     assert torch.allclose(top.compute(n_pos, vals), before, atol=1e-5)
+
+
+# ---------------------------------------------------------------------------
+# Scheduling-hint orphan gates
+#
+# Every fold that orphans a node consults _blocks_orphan: an orphan that
+# CARRIES scheduling_predecessors would have the caller's ordering silently
+# dropped (a sequential_scope graph compiles into fewer layers than asked,
+# values correct — the residual-pressure limit undone); an orphan that is the
+# TARGET of a hint leaves its waiter permanently un-ready ("did not converge"
+# at optimize=0, a bare KeyError inside CP-SAT at optimize>=1).  Hints on the
+# SURVIVOR are fine — its identity persists — so each gate has a positive
+# control.
+# ---------------------------------------------------------------------------
+
+
+def _hinted(node):
+    """Attach an ordering edge FROM node (node becomes a hint carrier)."""
+    from torchwright.graph.scheduling_hints import add_scheduling_dependency
+
+    gate = InputNode("gate", 1, value_range=(-1.0, 1.0))
+    add_scheduling_dependency(node, gate)
+    return node
+
+
+def _waited_on(node, out_width=1):
+    """Make node a hint target: some sibling in the graph waits on it.
+    Returns the waiter (must stay reachable from the test's output)."""
+    from torchwright.graph.scheduling_hints import add_scheduling_dependency
+
+    src = node
+    while not isinstance(src, InputNode):
+        src = src.inputs[0]
+    waiter = Linear(src, torch.zeros(len(src), out_width), name="waiter")
+    add_scheduling_dependency(waiter, node)
+    return waiter
+
+
+def test_linear_fold_declines_hint_carrier_orphan():
+    inp = InputNode("x", 4, value_range=(-2.0, 2.0))
+    l1 = _hinted(Linear(inp, torch.randn(4, 3), name="l1"))
+    l2 = Linear(l1, torch.randn(3, 2), name="l2")
+    assert fuse_consecutive_linears({l2}) == 0
+    assert l2.inputs[0] is l1
+
+
+def test_linear_fold_declines_hint_target_orphan():
+    inp = InputNode("x", 4, value_range=(-2.0, 2.0))
+    l1 = Linear(inp, torch.randn(4, 3), name="l1")
+    l2 = Linear(l1, torch.randn(3, 2), name="l2")
+    waiter = _waited_on(l1)
+    assert fuse_consecutive_linears({Concatenate([l2, waiter])}) == 0
+    assert l2.inputs[0] is l1
+
+
+def test_linear_fold_survivor_may_carry_and_be_named_by_hints():
+    """Positive control: hints on the SURVIVOR (l2) don't decline the fold."""
+    inp = InputNode("x", 4, value_range=(-2.0, 2.0))
+    l1 = Linear(inp, torch.randn(4, 3), name="l1")
+    l2 = _hinted(Linear(l1, torch.randn(3, 2), name="l2"))
+    waiter = _waited_on(l2)
+    assert fuse_consecutive_linears({Concatenate([l2, waiter])}) == 1
+    assert l2.inputs[0] is inp
+    assert l2.scheduling_predecessors  # the carrier edge survived
+
+
+def test_gate_fold_declines_hinted_upstream_linear():
+    inp = InputNode("x", 10, value_range=(-2.0, 2.0))
+    u = _hinted(Linear(inp, torch.randn(10, 6) * 0.2, name="u"))
+    b = _block(u, 6, 8, 4, seed=1)
+    assert fuse_consecutive_linears({b}) == 0
+    assert b.inputs[0] is u
+
+    inp2 = InputNode("x2", 10, value_range=(-2.0, 2.0))
+    u2 = Linear(inp2, torch.randn(10, 6) * 0.2, name="u2")
+    b2 = _block(u2, 6, 8, 4, seed=1)
+    waiter = _waited_on(u2)
+    assert fuse_consecutive_linears({Concatenate([b2, waiter])}) == 0
+    assert b2.inputs[0] is u2
+
+
+def test_ffn_fold_declines_hinted_downstream_linear():
+    """The FFN->Linear fold orphans l even though l's VALUE moves onto the
+    FFN: hint edges are keyed by node identity, so a waiter naming l would
+    never see it computed."""
+    inp = InputNode("x", 6, value_range=(-2.0, 2.0))
+    b = _block(inp, 6, 8, 4, seed=2)
+    l = _hinted(Linear(b, torch.randn(4, 3) * 0.2, name="l"))
+    sink = Concatenate([l])
+    assert fuse_consecutive_linears({sink}) == 0
+    assert sink.inputs[0] is l
+
+    inp2 = InputNode("x2", 6, value_range=(-2.0, 2.0))
+    b2 = _block(inp2, 6, 8, 4, seed=2)
+    l2 = Linear(b2, torch.randn(4, 3) * 0.2, name="l2")
+    waiter = _waited_on(l2)
+    assert fuse_consecutive_linears({Concatenate([l2, waiter])}) == 0
+
+
+def test_concat_fold_declines_hinted_linear_leaf():
+    inp = InputNode("x", 4, value_range=(-2.0, 2.0))
+    leaf = _hinted(Linear(inp, torch.randn(4, 3), name="leaf"))
+    other = InputNode("y", 2, value_range=(-2.0, 2.0))
+    c = Concatenate([leaf, other])
+    l = Linear(c, torch.randn(5, 2), name="l")
+    assert fuse_consecutive_linears({l}) == 0
+    assert leaf in c.inputs
+
+
+def test_concat_fold_declines_hinted_literal_leaf():
+    from torchwright.graph.misc import LiteralValue
+
+    inp = InputNode("x", 4, value_range=(-2.0, 2.0))
+    lit = LiteralValue(torch.ones(2), name="lit")
+    waiter = _waited_on_literal(lit, inp)
+    c = Concatenate([Linear(inp, torch.randn(4, 3), name="leaf"), lit])
+    l = Linear(c, torch.randn(5, 2), name="l")
+    # The Linear leaf still absorbs (1 fold); the literal must survive.
+    fuse_consecutive_linears({Concatenate([l, waiter])})
+    assert lit in c.inputs
+
+
+def _waited_on_literal(lit, src):
+    from torchwright.graph.scheduling_hints import add_scheduling_dependency
+
+    waiter = Linear(src, torch.zeros(len(src), 1), name="waiter")
+    add_scheduling_dependency(waiter, lit)
+    return waiter
+
+
+def test_concat_fold_declines_hinted_nested_concat_splice():
+    """A splice is value-identical but still orphans the nested concat; a
+    waiter can name a Concatenate (the scheduler marks one computed once its
+    leaves are), so the gate applies."""
+    from torchwright.graph.scheduling_hints import add_scheduling_dependency
+
+    inp = InputNode("x", 4, value_range=(-2.0, 2.0))
+    a = Linear(inp, torch.randn(4, 2), name="a")
+    inner = Concatenate([a, InputNode("y", 1, value_range=(-1.0, 1.0))])
+    c = Concatenate([inner, InputNode("z", 1, value_range=(-1.0, 1.0))])
+    l = Linear(c, torch.randn(4, 2), name="l")
+    waiter = Linear(inp, torch.zeros(4, 1), name="waiter")
+    add_scheduling_dependency(waiter, inner)
+
+    fuse_consecutive_linears({Concatenate([l, waiter])})
+    assert inner in c.inputs  # splice declined; the waiter's target survives
+
+
+def test_compile_with_dangling_style_hint_target_now_compiles():
+    """Compile-level: the graph whose hint target used to be fused away.
+
+    On the pre-gate code, ``a`` (sole consumer ``b``) was absorbed into ``b``,
+    the waiter never became ready, and optimize=0 ran out of layers.  The
+    gate declines that fold, so this compiles — and the ordering holds.
+    """
+    from torchwright.compiler.forward.compile import forward_compile
+    from torchwright.graph.scheduling_hints import add_scheduling_dependency
+
+    inp = InputNode("x", 4, value_range=(-1.0, 1.0))
+    a = Linear(inp, torch.zeros(4, 6), torch.zeros(6), name="a")
+    b = Linear(a, torch.zeros(6, 3), torch.zeros(3), name="b")
+    w = Linear(inp, torch.zeros(4, 3), torch.zeros(3), name="waiter")
+    add_scheduling_dependency(w, a)
+    out = Concatenate([b, w])
+
+    net = forward_compile(
+        d=64, d_head=8, output_node=out, verbose=False, max_layers=6, device="cpu"
+    )
+    assert len(net.layers) >= 1  # previously: "did not converge in 6 layers"
+
+
+def test_sequential_scope_serializes_under_forward_compile():
+    """Compile-level: sequential_scope's ordering survives fusion.
+
+    Each iteration is a 2-Linear chain; the entry Linear carries the hint.
+    Pre-gate, ``_fuse_linear_into_linear`` deleted every carrier and the
+    3 iterations compiled into one layer — values correct, the caller's
+    residual-pressure serialization silently undone.
+    """
+    from torchwright.compiler.export import compile_headless
+    from torchwright.graph import fresh_graph_session
+    from torchwright.graph.scheduling_hints import sequential_scope
+    from torchwright.ops.inout_nodes import create_input
+
+    def build(serialize):
+        x = create_input("x", 4, value_range=(-1.0, 1.0))
+
+        def make(i):
+            a = Linear(x, torch.zeros(4, 6), torch.zeros(6), name=f"a{i}")
+            return Linear(a, torch.zeros(6, 3), torch.zeros(3), name=f"b{i}")
+
+        if serialize:
+            rows = sequential_scope(
+                [lambda i=i: make(i) for i in range(3)], batch_size=1
+            )
+        else:
+            rows = [make(i) for i in range(3)]
+        return Concatenate(rows)
+
+    with fresh_graph_session():
+        parallel_layers = compile_headless(
+            build(serialize=False), d=64, d_head=8, verbose=False
+        ).n_layers
+    with fresh_graph_session():
+        serial_layers = compile_headless(
+            build(serialize=True), d=64, d_head=8, verbose=False
+        ).n_layers
+
+    # 3 serialized iterations cannot fit the depth of the parallel form.
+    assert serial_layers > parallel_layers
+    assert serial_layers >= 3
+
+
+def test_assert_hints_intact_names_the_pass():
+    """The lower()-level tripwire: a pass that orphans a hint target (the
+    collapse passes have no orphan gates) fails loudly, attributed."""
+    from torchwright.graph.scheduling_hints import (
+        add_scheduling_dependency,
+        assert_hints_intact,
+    )
+
+    inp = InputNode("x", 4, value_range=(-1.0, 1.0))
+    a = Linear(inp, torch.zeros(4, 3), name="a")
+    w = Linear(inp, torch.zeros(4, 3), name="waiter")
+    add_scheduling_dependency(w, a)
+    out = Concatenate([w])  # a is NOT reachable — simulates an orphaning pass
+
+    with pytest.raises(RuntimeError, match="some-pass orphaned a scheduling hint"):
+        assert_hints_intact(out, "some-pass")
+
+    # Intact graph passes silently.
+    assert_hints_intact(Concatenate([a, w]), "some-pass")
+
+
+def test_ffn_fold_clears_survivor_stale_claim_without_checks():
+    """Soundness (the *replaced* predicate): the FFN survivor's value is
+    replaced by the fold, so a claim it carried — installed WITHOUT a check,
+    which nothing forbids — must not survive onto the new value, where it
+    would wrongly tighten bounds.  The gate that made this safe by accident
+    is ``bool(b.checks)``; this constructs the case that gate misses."""
+    from torchwright.graph.value_type import NodeValueType, Range
+
+    inp = InputNode("x", 6, value_range=(-1.0, 1.0))
+    b = _block(inp, 6, 8, 4, seed=29)
+    # A claim with NO check: bypasses attach_assert (which always appends a
+    # check first), simulating any future path that sets claims directly.
+    b.claimed_type = NodeValueType(value_range=Range(-0.5, 0.5))
+    b.integer_claim = True
+    assert not b.checks  # the _blocks_absorb(b) gate does not fire
+
+    l = Linear(b, torch.randn(4, 3) * 0.2, torch.randn(3) * 0.1, name="l")
+    sink = Concatenate([l])
+
+    assert fuse_consecutive_linears({sink}) == 1  # fold proceeds (b unchecked)
+    # b now computes l's value; the stale claim on the OLD value is gone.
+    assert b.claimed_type is None
+    assert b.integer_claim is False
+    assert b.checks == []
+
+
+def test_ffn_fold_unconditional_transfer_still_migrates():
+    """The unconditional transfer changes nothing for the covered case: l's
+    checks and claim still land on b (regression guard alongside
+    test_ffn_fold_migrates_checks_from_orphaned_linear)."""
+    from torchwright.graph.asserts import assert_in_range
+    from torchwright.graph.value_type import NodeValueType, Range
+
+    inp = InputNode("x", 6, value_range=(-1.0, 1.0))
+    b = _block(inp, 6, 8, 4, seed=31)
+    b.claimed_type = NodeValueType(value_range=Range(-0.5, 0.5))  # stale, no check
+    l = Linear(b, torch.randn(4, 3) * 0.2, torch.randn(3) * 0.1, name="l")
+    assert_in_range(l, -1000.0, 1000.0)
+    sink = Concatenate([l])
+
+    assert fuse_consecutive_linears({sink}) == 1
+    assert len(b.checks) == 1
+    assert b.claimed_type is not None
+    assert b.claimed_type.value_range.lo == -1000.0  # l's claim, not b's stale one

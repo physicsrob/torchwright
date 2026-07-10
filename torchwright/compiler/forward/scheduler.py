@@ -7,9 +7,15 @@ lists for the weight writer.
 Mutates residual_map (allocate, free, reassign) and computed_nodes (add).
 """
 
+from dataclasses import dataclass
 from typing import Dict, List, Optional, Set, Tuple
 
-from torchwright.compiler.realization import RealizationTable
+from torchwright.compiler.realization import (
+    RealizationTable,
+    first_hidden_slot,
+    has_flex_choice,
+    usable_hidden_slots,
+)
 from torchwright.compiler.residual_assignment import flatten_concat_nodes
 from torchwright.compiler.forward.cpsat_scheduler import ScheduleAssignment
 from torchwright.compiler.forward.graph_analysis import GraphAnalyzer
@@ -20,6 +26,53 @@ from torchwright.compiler.forward.weight_writer import AttnHeadOp, MLPOp
 from torchwright.graph import Node, Linear, Attn, Add, Concatenate
 from torchwright.graph.misc import LiteralValue
 from torchwright.graph.ffn import FFN
+
+
+@dataclass(frozen=True)
+class SkipReason:
+    """Why one ready node was not placed during one layer.
+
+    Recorded at every point the layer walk passes over a node it could
+    otherwise have scheduled, and folded into the ``No progress`` deadlock
+    message.  Three distinct failures used to produce that one string with no
+    way to tell them apart: MLP-slot over-demand, attention-head over-demand,
+    and residual-column exhaustion.
+
+    ``structural`` is the distinction that matters: the node's demand exceeds
+    what a whole layer could ever supply, so no schedule places it and no
+    amount of retrying helps.  A non-structural skip is an ordinary deadlock —
+    this layer's budget is spent, or the residual stream is full right now.
+
+    Among structural skips, ``rerouteable`` separates the two causes.  When the
+    node has a second realization class (only a standalone ``Linear`` does
+    today: MLP bypass or attention transport), the resolver picked one that
+    cannot hold it and that is a compiler bug — the capacity check in
+    ``realization.static_flex_class`` exists to make this unreachable.  When it
+    does not, the node's only realization is too big for the geometry and the
+    graph cannot compile at this ``d`` / ``d_hidden``.
+    """
+
+    node: Node
+    op_label: str  # the op that would have been emitted
+    resource: str  # "attn heads" | "MLP hidden slots" | "residual columns"
+    demand: int
+    available: int  # free right now, this layer
+    capacity: int  # the most a layer could ever supply
+    rerouteable: bool  # the node has a second realization class
+
+    @property
+    def structural(self) -> bool:
+        return self.demand > self.capacity
+
+    def format_line(self) -> str:
+        name = f" {self.node.name!r}" if getattr(self.node, "name", "") else ""
+        head = (
+            f"{type(self.node).__name__}{name} (id {self.node.node_id}) "
+            f"via {self.op_label}: needs {self.demand} {self.resource}"
+        )
+        if not self.structural:
+            return f"{head}, {self.available} free this layer"
+        return f"{head}, but a layer holds at most {self.capacity}"
 
 
 class LayerScheduler:
@@ -59,8 +112,10 @@ class LayerScheduler:
         # weight-writer's BiasFold): packing starts at slot 1, so the
         # effective per-layer capacity is d_hidden - 1.  Must agree with the
         # capacity CP-SAT models (forward_compile passes the solver
-        # d_hidden - 1) or a solver-feasible layer is unpackable on replay.
+        # usable_hidden_slots(d_hidden, bias)) or a solver-feasible layer is
+        # unpackable on replay.
         self.bias = bias
+        self.usable_hidden_slots = usable_hidden_slots(self.d_hidden, bias)
         self.n_heads = d // d_head
         self.pos_encoding = pos_encoding
         self.policy = policy if policy is not None else SchedulingPolicy()
@@ -71,9 +126,10 @@ class LayerScheduler:
         # statically from the policy through the same code path the
         # optimize=0 compile uses.
         if realization_table is None:
-            realization_table = RealizationTable.build(
-                graph.get_all_nodes()
-            ).resolve_static(self.policy)
+            all_nodes = graph.get_all_nodes()
+            realization_table = RealizationTable.build(all_nodes).resolve_static(
+                all_nodes, self.policy, self.usable_hidden_slots
+            )
         self.realization_table = realization_table
         # Eager (within-layer) freeing is always on: when a node is placed, free
         # any of its inputs that just became dead so their columns can be reused
@@ -88,6 +144,9 @@ class LayerScheduler:
         # column handoff resolves regardless of candidate order — see the
         # retry loop in ``_schedule_attn_sublayer``.
         self._retry_within_layer = False
+        # Why each ready node was passed over in the layer being scheduled;
+        # rebuilt per pass, read only by ``_deadlock_message``.
+        self._skips: List[SkipReason] = []
 
         # Admission control state (see _is_admissible).  When clusters
         # is None or empty, admission is disabled and the scheduler
@@ -151,16 +210,109 @@ class LayerScheduler:
             remaining = self.graph.get_all_nodes() - computed_nodes
             remaining = {n for n in remaining if not isinstance(n, Concatenate)}
             if remaining:
-                raise RuntimeError(
-                    f"No progress: {len(remaining)} nodes remaining, "
-                    f"{residual_map.get_free_count()} free columns"
-                )
+                raise RuntimeError(self._deadlock_message(remaining, residual_map))
 
         return attn_ops, mlp_ops, biased_linears
+
+    def _deadlock_message(
+        self, remaining: Set[Node], residual_map: ResidualStreamMap
+    ) -> str:
+        """The ``No progress`` text, itemized by why each ready node was
+        passed over.
+
+        The ``No progress:`` prefix and the ``RuntimeError`` type are a
+        contract: ``test_optimize1_compiles_where_eager_heuristic_cannot``
+        matches on the string, and that test's deadlock (residual-column
+        exhaustion at d=48) is a legitimate one the directed replay resolves.
+        """
+        lines = [
+            f"No progress: {len(remaining)} nodes remaining, "
+            f"{residual_map.get_free_count()} free columns."
+        ]
+        if not self._skips:
+            lines.append(
+                "  No ready node recorded a skip reason — the deadlock is in "
+                "the layer walk's bookkeeping, not in a capacity check."
+            )
+            return "\n".join(lines)
+
+        # One line per node, keeping its first (most specific) skip.  A node
+        # skipped for slots in the MLP pass is not also reported for columns.
+        seen: Set[int] = set()
+        misrouted, too_big, transient = [], [], []
+        for skip in self._skips:
+            if skip.node.node_id in seen:
+                continue
+            seen.add(skip.node.node_id)
+            if not skip.structural:
+                transient.append(skip)
+            elif skip.rerouteable:
+                misrouted.append(skip)
+            else:
+                too_big.append(skip)
+
+        def section(header: str, skips: List[SkipReason], limit: int = 8) -> None:
+            if not skips:
+                return
+            lines.append(header)
+            lines.extend(f"    {s.format_line()}" for s in skips[:limit])
+            if len(skips) > limit:
+                lines.append(f"    ... and {len(skips) - limit} more like these")
+
+        # Structural skips are never truncated: each one is a distinct
+        # unschedulable node, and the first is the one to act on.
+        section(
+            "  COMPILER BUG — these nodes were routed to a sublayer that "
+            "cannot hold them, though another realization class could "
+            "(realization.static_flex_class should have made this "
+            "unreachable):",
+            misrouted,
+            limit=len(misrouted),
+        )
+        section(
+            f"  Too big for the geometry — these nodes have one realization "
+            f"class and it does not fit at d={self.d}, "
+            f"d_hidden={self.d_hidden}, d_head={self.d_head}. No schedule "
+            f"exists; the graph or the geometry has to change:",
+            too_big,
+            limit=len(too_big),
+        )
+        section(
+            "  Out of budget this layer — a legitimate deadlock at this "
+            "geometry (optimize>0 may find a schedule the eager walk "
+            "cannot):",
+            transient,
+        )
+        return "\n".join(lines)
+
+    def _record_skip(
+        self,
+        node: Node,
+        op_label: str,
+        resource: str,
+        demand: int,
+        available: int,
+        capacity: int,
+    ) -> None:
+        self._skips.append(
+            SkipReason(
+                node,
+                op_label,
+                resource,
+                demand,
+                available,
+                capacity,
+                rerouteable=has_flex_choice(node),
+            )
+        )
 
     def _schedule_layer_inner(
         self, residual_map: ResidualStreamMap, computed_nodes: Set[Node]
     ) -> Tuple[List[AttnHeadOp], List[MLPOp], List[Node], bool]:
+        # Skip reasons for THIS pass only.  ``schedule_layer`` may call this
+        # twice (the admission-bypass retry), and it is the retry's skips that
+        # explain a deadlock — the first pass's were provisional.
+        self._skips: List[SkipReason] = []
         # Nodes already computed before this layer.  A node born THIS layer must
         # not be MLP-cancelled this layer even if a same-layer MLP consumer
         # makes it dead: the model requires every cancel at birth+1 or later
@@ -359,8 +511,6 @@ class LayerScheduler:
         computed_snapshot = set(computed_nodes)
         add_into_live_addends = set()
         for add_node in sorted(free_adds, key=self._critical_path_key):
-            if heads_used >= self.n_heads:
-                break
             a0, a1 = add_node.inputs
             d0 = self._is_dead_for_add(a0, add_node, computed_snapshot)
             d1 = self._is_dead_for_add(a1, add_node, computed_snapshot)
@@ -368,6 +518,16 @@ class LayerScheduler:
             live_addend = a1 if d0 else a0
             n_heads = (len(live_addend) + self.d_head - 1) // self.d_head
             if heads_used + n_heads > self.n_heads:
+                # An add_into has no second realization class, so a structural
+                # skip here is terminal: nothing downstream can rescue it.
+                self._record_skip(
+                    add_node,
+                    "add_into",
+                    "attn heads",
+                    n_heads,
+                    self.n_heads - heads_used,
+                    self.n_heads,
+                )
                 continue
             self._require_live(
                 dead_addend,
@@ -454,6 +614,25 @@ class LayerScheduler:
             deferred (over budget, inadmissible, or no columns available)."""
             nonlocal heads_used
             if heads_used + n_heads_needed > self.n_heads:
+                # Recorded, but believed unreachable as a *deadlock* cause: a
+                # committed cancel or any placement makes attn_ops non-empty
+                # (the batched "cancel" op below), so at a No-progress raise
+                # heads_used is 0 and this fires only when the node alone
+                # exceeds the whole head budget.  Every op's head demand is
+                # bounded by its residual footprint (compute_linear reads
+                # d_input <= d columns; compute_attn reads d_v <= d; a deferred
+                # Add costs ~2*ceil(w/d_head) heads but needs both w-wide
+                # addends live, so 2w <= d caps it at the budget).  If this
+                # line ever appears in a deadlock message, that reasoning is
+                # wrong and the message is how you find out.
+                self._record_skip(
+                    node,
+                    op_type,
+                    "attn heads",
+                    n_heads_needed,
+                    self.n_heads - heads_used,
+                    self.n_heads,
+                )
                 return False
             if not self._is_admissible(node):
                 self._admission_deferred = True
@@ -532,6 +711,16 @@ class LayerScheduler:
                             target_cols = self._try_allocate(node, residual_map)
 
             if target_cols is None:
+                # Every cancel-promotion and self-consumer-reuse escape above
+                # has been tried; the residual stream simply has no room.
+                self._record_skip(
+                    node,
+                    op_type,
+                    "residual columns",
+                    len(node),
+                    residual_map.get_free_count(),
+                    self.d,
+                )
                 return False
 
             op = AttnHeadOp(op_type, node, target_cols)
@@ -632,7 +821,7 @@ class LayerScheduler:
         mlp_ops = []
         # Slot 0 is the constant lane under bias=False — see LayerScheduler
         # __init__ and weight_writer.BiasFold.
-        next_slot = 0 if self.bias else 1
+        next_slot = first_hidden_slot(self.bias)
 
         # Dead nodes to zero via `cancel_bypass` this layer (attention batch was
         # full, or the directed replay routed them here).  MLP-phase placements
@@ -694,12 +883,31 @@ class LayerScheduler:
         for ffn in ffns:
             n_lanes = ffn.n_lanes
             if next_slot + n_lanes > self.d_hidden:
+                # MLP_COMPOSITE is an FFN's only realization class, so an FFN
+                # with more lanes than a layer's usable pool is unschedulable
+                # at this d_hidden — no routing rule can rescue it.
+                self._record_skip(
+                    ffn,
+                    "compute_ffn",
+                    "MLP hidden slots",
+                    n_lanes,
+                    self.d_hidden - next_slot,
+                    self.usable_hidden_slots,
+                )
                 continue
             if not self._is_admissible(ffn):
                 self._admission_deferred = True
                 continue
             target_cols = self._try_allocate(ffn, residual_map)
             if target_cols is None:
+                self._record_skip(
+                    ffn,
+                    "compute_ffn",
+                    "residual columns",
+                    len(ffn),
+                    residual_map.get_free_count(),
+                    self.d,
+                )
                 continue
             mlp_slots = list(range(next_slot, next_slot + n_lanes))
             next_slot += n_lanes
@@ -746,12 +954,32 @@ class LayerScheduler:
                     continue
                 n_slots = 2 * node.d_output
                 if next_slot + n_slots > self.d_hidden:
+                    # A structural skip here means the node was routed to the
+                    # MLP bypass despite not fitting in one — the capacity
+                    # check in `realization.static_flex_class` failed to fire,
+                    # or the solve's assignment contradicts it.
+                    self._record_skip(
+                        node,
+                        "compute_linear_bypass",
+                        "MLP hidden slots",
+                        n_slots,
+                        self.d_hidden - next_slot,
+                        self.usable_hidden_slots,
+                    )
                     continue
                 if not self._is_admissible(node):
                     self._admission_deferred = True
                     continue
                 target_cols = self._try_allocate(node, residual_map)
                 if target_cols is None:
+                    self._record_skip(
+                        node,
+                        "compute_linear_bypass",
+                        "residual columns",
+                        len(node),
+                        residual_map.get_free_count(),
+                        self.d,
+                    )
                     continue
                 mlp_slots = list(range(next_slot, next_slot + n_slots))
                 next_slot += n_slots
@@ -792,6 +1020,14 @@ class LayerScheduler:
                 continue
             target_cols = self._try_allocate(node, residual_map)
             if target_cols is None:
+                self._record_skip(
+                    node,
+                    "compute_literal_value",
+                    "residual columns",
+                    len(node),
+                    residual_map.get_free_count(),
+                    self.d,
+                )
                 continue
             assert len(target_cols) == len(node) == node.value.numel(), (
                 f"Literal allocation width mismatch for {node!r}: "

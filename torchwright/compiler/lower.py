@@ -54,6 +54,7 @@ from torchwright.compiler.realization import (
 from torchwright.compiler.utils import get_ancestor_nodes
 from torchwright.graph import Node
 from torchwright.graph.optimize import FoldLog, fuse_consecutive_linears
+from torchwright.graph.scheduling_hints import assert_hints_intact
 from torchwright.graph.attn import Attn
 from torchwright.graph.ffn import FFN
 from torchwright.graph.embedding import Embedding
@@ -123,6 +124,14 @@ class LoweredGraph:
     realization_table: RealizationTable
     source_output_node: Optional[Node] = None
     node_map: Dict[Node, Node] = field(default_factory=dict)
+    # Source node -> (copy node, column offset, width) for source values that
+    # survive fusion as a column slice of a widened copy node (the sibling
+    # merge).  ``node_map`` cannot express these — it maps whole values — and
+    # dropping them would leave an output Concatenate of merged leaves with
+    # nothing to gather.  Consumed by forward_compile's source re-key, which
+    # turns each record into the matching slice of the holder's residual
+    # columns.
+    slice_map: Dict[Node, tuple] = field(default_factory=dict)
     # Per-subgraph collapse/decline log when the univariate collapse
     # pass ran (None when it didn't) — see torchwright.compiler.collapse.
     collapse_report: Optional["CollapseReport"] = None
@@ -148,6 +157,7 @@ class LoweredGraph:
         d_head: int,
         realization_table: Optional[RealizationTable] = None,
         policy: Optional["SchedulingPolicy"] = None,
+        usable_slots: Optional[int] = None,
     ) -> CostSummary:
         """Hardware demand readable *before* scheduling.
 
@@ -155,16 +165,28 @@ class LoweredGraph:
         counts from a resolved realization table plus each class's
         resource signature.  Pass the resolved table you intend to compile
         with; by default the static policy resolves the free choices (the
-        optimize=0 rule).  ``Add`` demand is reported as its two
-        conditional bounds.
+        optimize=0 rule), which needs ``usable_slots`` — the layer's usable
+        MLP hidden-slot count, from
+        :func:`realization.usable_hidden_slots` — because a Linear too wide
+        for the bypass is routed to attention whatever the policy says.
+        ``Add`` demand is reported as its two conditional bounds.
         """
         from torchwright.compiler.forward.scheduling_policy import SchedulingPolicy
 
-        if realization_table is None:
-            realization_table = self.realization_table.resolve_static(
-                policy if policy is not None else SchedulingPolicy()
-            )
         nodes = get_ancestor_nodes({self.output_node})
+        if realization_table is None:
+            if usable_slots is None:
+                raise ValueError(
+                    "cost_summary needs usable_slots to resolve the "
+                    "realization table statically (the MLP-bypass capacity "
+                    "rule reads it); pass it, or pass a resolved "
+                    "realization_table"
+                )
+            realization_table = self.realization_table.resolve_static(
+                nodes,
+                policy if policy is not None else SchedulingPolicy(),
+                usable_slots,
+            )
         return summarize_cost(nodes, realization_table, d_head)
 
 
@@ -356,6 +378,16 @@ def lower(
 
     copy_output = copy.output_node
 
+    # Hint integrity after every graph-mutating pass.  The fusion folds
+    # decline any rewrite that would orphan a hint carrier or target
+    # (_blocks_orphan in graph/optimize.py), so a firing here after fusion is
+    # a bug in those gates.  The collapse passes have no such gates — they
+    # orphan whole subgraph interiors without consulting
+    # scheduling_predecessors — so hints + collapse is unsupported: a hinted
+    # member orphaned by a collapse fails loudly here, attributed to the
+    # pass, instead of miscompiling into a bare KeyError downstream.
+    assert_hints_intact(copy_output, "fuse_consecutive_linears")
+
     collapse_report = None
     collapse_pl_report = None
     n_collapsed = 0
@@ -369,6 +401,7 @@ def lower(
             verbose=verbose,
         )
         n_collapsed = collapse_report.n_collapsed
+        assert_hints_intact(copy_output, "collapse_univariate_subgraphs")
     if collapse_pl:
         from torchwright.compiler.collapse_pl import collapse_pl_subgraphs
 
@@ -379,25 +412,42 @@ def lower(
             verbose=verbose,
         )
         n_collapsed += collapse_pl_report.n_collapsed
+        assert_hints_intact(copy_output, "collapse_pl_subgraphs")
 
     copy_nodes = get_ancestor_nodes({copy_output})
 
+    slice_map: Dict[Node, tuple] = {}
     if not n_fused and not n_collapsed:
         node_map = dict(copy.node_map)
     else:
         # Fusion orphans copy nodes and changes what some survivors
         # compute, so the map must track VALUES, not object identity: a
         # source node maps to the copy node that computes its value, or
-        # to nothing if that value no longer exists in the copy.
+        # to nothing if that value no longer exists in the copy.  A value
+        # that survives as a column slice of a widened sibling-merge
+        # survivor goes to slice_map instead — node_map has no way to say
+        # "columns [off, off+w) of that node".
         node_map: Dict[Node, Node] = {}
         for src, clone in copy.node_map.items():
+            # Slice records take precedence over moves: a merge-widened
+            # survivor that a later fold moves onto an FFN has both, and the
+            # slice is the precise one — the source's original value is the
+            # front columns of what moved, not the whole moved value (the
+            # move retargets the slice's holder, so the record already
+            # points at the FFN).
+            slice_rec = fold_log.slices.get(clone)
+            if slice_rec is not None and slice_rec[0] in copy_nodes:
+                # Holder still live in the copy; a dangling record (holder
+                # itself orphaned by a later fold) means the value is gone.
+                slice_map[src] = slice_rec
+                continue
             survivor = fold_log.moves.get(clone)
             if survivor is not None:
                 node_map[src] = survivor
-            elif clone in fold_log.value_changed or clone not in copy_nodes:
+                continue
+            if clone in fold_log.value_changed or clone not in copy_nodes:
                 continue  # value gone (changed in place, or orphaned)
-            else:
-                node_map[src] = clone
+            node_map[src] = clone
 
     table = RealizationTable.build(copy_nodes)
     if verbose:
@@ -410,6 +460,7 @@ def lower(
         realization_table=table,
         source_output_node=output_node,
         node_map=node_map,
+        slice_map=slice_map,
         collapse_report=collapse_report,
         collapse_pl_report=collapse_pl_report,
     )

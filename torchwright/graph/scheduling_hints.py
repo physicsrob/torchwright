@@ -29,6 +29,45 @@ def add_scheduling_dependency(node: Node, depends_on: Node) -> None:
     node.scheduling_predecessors.add(depends_on)
 
 
+def assert_hints_intact(output_node: Node, context: str) -> None:
+    """Every scheduling predecessor of every reachable node is itself
+    reachable from ``output_node``.
+
+    The same invariant ``clone_graph`` asserts during its remap — but the
+    clone runs *before* fusion, so its check cannot see a hint orphaned by
+    a later pass.  A dangling hint's downstream symptom is far from its
+    cause: ``Compilation did not converge in N layers`` at ``optimize=0``,
+    a bare ``KeyError: <node_id>`` inside CP-SAT's bound propagation at
+    ``optimize>=1`` — neither names a node or mentions scheduling.  Calling
+    this after each graph-mutating pass converts both into an error naming
+    the node, the missing predecessor, and (via ``context``) the pass that
+    orphaned it.
+
+    O(V + hint edges); walks ``inputs`` only (data reachability — a hint
+    edge must point at a node something will actually compute).
+    """
+    reachable = set()
+    stack: List[Node] = [output_node]
+    while stack:
+        cur = stack.pop()
+        if cur in reachable:
+            continue
+        reachable.add(cur)
+        stack.extend(cur.inputs)
+    for node in reachable:
+        for pred in node.scheduling_predecessors:
+            if pred not in reachable:
+                raise RuntimeError(
+                    f"{context} orphaned a scheduling hint: {node!r} waits "
+                    f"on {pred!r}, which is no longer reachable from the "
+                    f"output and so can never be computed.  The scheduler "
+                    f"would never find {node!r} ready — this graph cannot "
+                    f"compile.  The pass named above removed a node that a "
+                    f"hint edge depends on; its orphan gate (_blocks_orphan "
+                    f"in graph/optimize.py) should have declined the rewrite."
+                )
+
+
 def _current_node_id() -> int:
     """Snapshot the current global_node_id counter."""
     import torchwright.graph.node as _node_mod
