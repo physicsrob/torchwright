@@ -422,7 +422,7 @@ def _tiny_graph():
     return add(multiply_const(a, 2.0), b)
 
 
-def test_fingerprints_are_pinned():
+def test_fingerprints_are_pinned(monkeypatch):
     """The fingerprint encodings are persistence formats.
 
     ``graph_fingerprint`` keys every ``TW_SCHEDULE_CACHE_DIR`` entry and
@@ -431,11 +431,22 @@ def test_fingerprints_are_pinned():
     fails, you changed the encoding: confirm that is intentional and
     update the pins (existing schedule caches will re-solve and existing
     debug sidecars will need re-export).
+
+    ``graph_fingerprint``'s ``compiler_code`` payload component is
+    source-dependent BY DESIGN (any torchwright edit must invalidate
+    cached schedules), so it is patched to a sentinel here: the pin
+    covers the payload *layout*, which is the persistence format, not
+    the code hash that intentionally changes with every edit.
     """
     out = _tiny_graph()
     assert (
         debug_fingerprint(out, d=256, d_head=16)
         == "50bcb97a0852df4782908a8418bb1a34d2674af2555f1c4f3183b1e65d0e0e29"
+    )
+    from torchwright.compiler import graph_identity
+
+    monkeypatch.setattr(
+        graph_identity, "compiler_code_fingerprint", lambda: "pin-sentinel"
     )
     assert (
         graph_fingerprint(
@@ -447,10 +458,11 @@ def test_fingerprints_are_pinned():
             cancel_slack=2,
             policy=None,
         )
-        # Pin updated 2026-07: the ``assume_zero_init`` payload key was removed
-        # when the flag was retired (universal zero-init), changing the payload
-        # layout so every pre-retirement schedule-cache entry re-solves once.
-        == "49c216e533460b7c82155a490d15bfce0fe6bd2f6c5715fb4345d2002e5a97d0"
+        # Pin updated 2026-07-09 (schedule-cache commit f4c1436): the payload
+        # gained the ``compiler_code`` key (sentinel-patched above) and lost
+        # the hand-bumped ``cancel_window`` generation string; every prior
+        # schedule-cache entry re-solves once, as that commit intended.
+        == "9b9f0c732c1828d3d214849555f2e1747a656c13fed1bd2fe06e96f114c180c8"
     )
 
 

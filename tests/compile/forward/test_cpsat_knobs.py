@@ -316,7 +316,11 @@ def test_schedule_cache_optimize_gate_end_to_end(tmp_path, monkeypatch):
 
 
 # ---------------------------------------------------------------------------
-# Hint-aware cancel-window widening (the silent optimize=2 fallback fix)
+# Hint-aware cancel-window widening (the silent optimize=2 fallback fix).
+# The window/widening machinery belongs to the LEGACY model — the pinned
+# production default (``_pin_cancels``) neither builds windows nor keeps
+# cancel-layer hints — so every build/solve in this section passes
+# ``_pin_cancels=False``.
 # ---------------------------------------------------------------------------
 
 
@@ -328,7 +332,7 @@ def _deferred_cancel_hint(max_layers, cancel_slack=2):
     from torchwright.compiler.forward.cpsat_scheduler import Concatenate
 
     out = _repro_graph()
-    assignment, stats = solve_schedule(out, **_SOLVE_KW)
+    assignment, stats = solve_schedule(out, _pin_cancels=False, **_SOLVE_KW)
     assert assignment is not None and stats.status_name == "OPTIMAL"
 
     gm = build_graph_model(out)
@@ -403,7 +407,7 @@ def test_deferred_cancel_hint_rejected_without_widening():
         max_layers=max_layers,
     )
 
-    blind = build_cpsat_model(out, **build_kw)
+    blind = build_cpsat_model(out, _pin_cancels=False, **build_kw)
     assert blind.cancel_window_delta is None
     status = _hard_fix_and_solve(blind, hint_layers, hint_routing, hint_cancel)
     assert status == "INFEASIBLE", (
@@ -412,7 +416,8 @@ def test_deferred_cancel_hint_rejected_without_widening():
     )
 
     aware = build_cpsat_model(
-        out, hint_layers=hint_layers, hint_cancel=hint_cancel, **build_kw
+        out, hint_layers=hint_layers, hint_cancel=hint_cancel,
+        _pin_cancels=False, **build_kw
     )
     assert aware.cancel_window_delta == {target_id: 1}
     status = _hard_fix_and_solve(aware, hint_layers, hint_routing, hint_cancel)
@@ -434,6 +439,7 @@ def test_deferred_cancel_hint_accepted_by_solve_schedule():
         hint_routing=hint_routing,
         hint_cancel=hint_cancel,
         strict_hint=True,
+        _pin_cancels=False,
         **_SOLVE_KW,
     )
     assert assignment is not None
@@ -442,9 +448,12 @@ def test_deferred_cancel_hint_accepted_by_solve_schedule():
 
 def test_strict_hint_validation_raises_on_invalid_hint():
     """A genuinely invalid hint (cancel before birth+1) raises under
-    ``strict_hint=True`` and warns under the default."""
+    ``strict_hint=True`` and warns under the default.  Legacy model only:
+    the pinned default drops cancel-layer hints before validation (their
+    values are forced by the pin), so this contract lives behind
+    ``_pin_cancels=False``."""
     out = _repro_graph()
-    assignment, _ = solve_schedule(out, **_SOLVE_KW)
+    assignment, _ = solve_schedule(out, _pin_cancels=False, **_SOLVE_KW)
     assert assignment is not None
     hint_layers = dict(assignment.node_to_layer)
     # Pick any non-keep-forever node and hint its cancel AT its birth layer
@@ -464,12 +473,14 @@ def test_strict_hint_validation_raises_on_invalid_hint():
             hint_layers=hint_layers,
             hint_cancel=bad_cancel,
             strict_hint=True,
+            _pin_cancels=False,
             **_SOLVE_KW,
         )
 
     with pytest.warns(RuntimeWarning, match="hint validation"):
         assignment2, _ = solve_schedule(
-            out, hint_layers=hint_layers, hint_cancel=bad_cancel, **_SOLVE_KW
+            out, hint_layers=hint_layers, hint_cancel=bad_cancel,
+            _pin_cancels=False, **_SOLVE_KW
         )
     # Default mode keeps the fall-back-don't-fail contract: still solves.
     assert assignment2 is not None
@@ -478,9 +489,10 @@ def test_strict_hint_validation_raises_on_invalid_hint():
 def test_strict_hint_validation_raises_on_keep_forever_cancel():
     """A cancel hint below max_layers for a keep-forever node (pinned or
     Concatenate-consumed) is a hint the model pins to max_layers — strict
-    mode names it."""
+    mode names it.  Legacy model only (the pinned default drops cancel-layer
+    hints before validation)."""
     out = _repro_graph()
-    assignment, _ = solve_schedule(out, **_SOLVE_KW)
+    assignment, _ = solve_schedule(out, _pin_cancels=False, **_SOLVE_KW)
     assert assignment is not None
     gm = build_graph_model(out)
     # The output node is the schedulable pinned node (inputs are modeled as
@@ -492,6 +504,7 @@ def test_strict_hint_validation_raises_on_keep_forever_cancel():
             hint_layers=dict(assignment.node_to_layer),
             hint_cancel={keep.node_id: 1},
             strict_hint=True,
+            _pin_cancels=False,
             **_SOLVE_KW,
         )
 

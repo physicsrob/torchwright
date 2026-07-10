@@ -1,5 +1,11 @@
 """sym1: parked/cancel-mechanism canonicalization (measurement-only knob).
 
+The knob targets the ``parked`` booleans of the legacy cancel-window model,
+which the pinned-cancel production default (``_pin_cancels``, shipped
+2026-07-10) does not build — so every build/solve here passes
+``_pin_cancels=False``: sym1 has scope only on the legacy model, where it
+remains reachable through the escape hatch.
+
 Pins the ``_canonical_cancel_reps`` knob's four contract points (plan
 ``cpsat_symmetry_sym1_plan.md`` §5.2):
 
@@ -108,23 +114,30 @@ def _lower(out, d):
 
 @pytest.mark.parametrize("name", _NAMES)
 def test_knob_off_is_byte_identical(name):
-    """With the knob off the proto equals the default build (no perturbation)."""
+    """With the knob off the proto equals the plain legacy build."""
     node, d, d_head = _build(name)
-    cfg = dict(d=d, d_head=d_head, d_hidden=d, max_layers=_MAX_LAYERS)
+    cfg = dict(
+        d=d, d_head=d_head, d_hidden=d, max_layers=_MAX_LAYERS,
+        _pin_cancels=False,
+    )
     default = _proto_text(build_cpsat_model(node, **cfg))
     off = _proto_text(build_cpsat_model(node, _canonical_cancel_reps=False, **cfg))
-    assert off == default, f"{name}: knob-off proto differs from default build"
+    assert off == default, f"{name}: knob-off proto differs from legacy build"
 
 
 @pytest.mark.parametrize("name", _NAMES)
 def test_knob_on_changes_proto(name):
-    """With the knob on the proto differs — the implications are really posted.
+    """With the knob on the legacy proto differs — the implications are really
+    posted.
 
     Every example graph has at least one non-keep-forever node with a cancel
     window (``cancel_slack`` default 2), so each gets a ``parked`` var and the
     D-2 converse ``cancel_layer <= max_layers - 1`` under ``parked.Not()``."""
     node, d, d_head = _build(name)
-    cfg = dict(d=d, d_head=d_head, d_hidden=d, max_layers=_MAX_LAYERS)
+    cfg = dict(
+        d=d, d_head=d_head, d_hidden=d, max_layers=_MAX_LAYERS,
+        _pin_cancels=False,
+    )
     off = _proto_text(build_cpsat_model(node, _canonical_cancel_reps=False, **cfg))
     on = _proto_text(build_cpsat_model(node, _canonical_cancel_reps=True, **cfg))
     assert on != off, f"{name}: knob-on proto identical to off (knob is dead)"
@@ -153,6 +166,7 @@ def test_canonical_form_on_solved_model(name, d):
         low, d=d, d_head=d_head, d_hidden=d, max_layers=100,
         time_budget_s=60.0, policy=SchedulingPolicy(),
         tighten_domains=True, _canonical_cancel_reps=True,
+        _pin_cancels=False,
     )
     assert asg is not None and stats.is_optimal, (
         f"{name} d={d}: expected a proven-optimal solve (got "
@@ -191,6 +205,7 @@ def test_depth_invariance_on_vs_off(name, d):
             low, d=d, d_head=d_head, d_hidden=d, max_layers=100,
             time_budget_s=60.0, policy=SchedulingPolicy(),
             tighten_domains=True, _canonical_cancel_reps=canonical,
+            _pin_cancels=False,
         )
 
     off_asg, off_stats = _solve(False)
@@ -219,6 +234,7 @@ def test_knob_on_compile_replays_clean():
         net = forward_compile(
             d=d, d_head=d_head, output_node=build(), device="cpu",
             verbose=False, optimize=1, _canonical_cancel_reps=canonical,
+            _pin_cancels=False, _force_resolve=True,
         )
         return len(net.layers)
 

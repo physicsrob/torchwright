@@ -1,24 +1,25 @@
-"""_pin_cancels: earliest-legal cancel pinning (measurement-only knob).
+"""_pin_cancels: earliest-legal cancel pinning (the production default).
 
-Pins the ``_pin_cancels`` knob's contract points (plan
-``cpsat_pinned_cancel_plan.md``, step 2):
+Pins the ``_pin_cancels`` contract points (shipped 2026-07-10; evidence in
+the umbrella ``cpsat_pinned_cancel_plan.md``):
 
-- **byte-identity off** — with the knob off the built CP-SAT model proto is
-  identical to the default build (production is never perturbed).
-- **knob is live** — with the knob on the proto differs (the pin equalities
-  are actually posted).
+- **default is pinned** — the default build IS the pinned model (proto equal
+  to an explicit ``_pin_cancels=True`` build, no ``parked`` vars).
+- **knob-off reproduces the legacy model** — ``_pin_cancels=False`` is the
+  escape hatch: its proto differs from the default and rebuilds the
+  window/parked/widening machinery (``parked`` vars present).
 - **restriction invariant** — a pinned-model solution, hard-fixed into the
-  UNPINNED model (layers, routings, cancel mechanisms, cancel layers, input
-  cancels), is feasible there: the pin only ADDS constraints, so every
-  schedule it emits is a valid default-model solution (machine-valid by
+  UNPINNED legacy model (layers, routings, cancel mechanisms, cancel layers,
+  input cancels), is feasible there: the pin only ADDS constraints, so every
+  schedule it emits is a valid legacy-model solution (machine-valid by
   construction).
-- **hint dropping** — a full four-family hint passed to a pinned solve with
-  ``strict_hint=True`` does not raise: the cancel + mechanism hints are
-  dropped before validation (their families are equality-pinned), layers +
-  routing are kept.
-- **end-to-end replay** — an ``optimize=1`` compile with the knob on replays
+- **hint contract** — a full four-family hint from a LEGACY-model solve
+  passed to a pinned solve with ``strict_hint=True`` does not raise: the
+  cancel-LAYER hints are dropped before validation (forced by the pin);
+  layers, routing, and cancel-MECHANISM hints are kept.
+- **end-to-end replay** — a default (pinned) ``optimize=1`` compile replays
   cleanly through ``DirectedLayerScheduler`` (the always-on replay-depth
-  tripwire and I1–I4 stay silent).
+  tripwire and I1–I4 stay silent), and so does a knob-off compile.
 
 CP-SAT solves are CPU-only, so this file runs on the plain suite.
 """
@@ -109,32 +110,42 @@ def _lower(out, d):
 
 
 # ---------------------------------------------------------------------------
-# Byte-identity off / knob-is-live
+# Default is pinned / knob-off reproduces the legacy model
 # ---------------------------------------------------------------------------
 
 
 @pytest.mark.parametrize("name", _NAMES)
-def test_knob_off_is_byte_identical(name):
-    """With the knob off the proto equals the default build (no perturbation)."""
+def test_default_build_is_pinned(name):
+    """The default build IS the pinned model: proto equal to an explicit
+    ``_pin_cancels=True`` build, no ``parked`` vars, the pin equalities
+    really posted."""
+    node, d, d_head = _build(name)
+    cfg = dict(d=d, d_head=d_head, d_hidden=d, max_layers=_MAX_LAYERS)
+    default = _proto_text(build_cpsat_model(node, **cfg))
+    on = _proto_text(build_cpsat_model(node, _pin_cancels=True, **cfg))
+    assert default == on, f"{name}: default proto differs from pinned build"
+    assert "parked" not in default, f"{name}: default build has parked vars"
+    assert "pin_attn" in default or "pin_mlp" in default, (
+        f"{name}: default build posts no pin aux vars (pin is dead)"
+    )
+
+
+@pytest.mark.parametrize("name", _NAMES)
+def test_knob_off_reproduces_legacy_model(name):
+    """``_pin_cancels=False`` is the escape hatch: the proto differs from the
+    (pinned) default and rebuilds the window/parked/widening machinery.
+
+    Every example graph has at least one non-keep-forever node, so the legacy
+    build gets its ``parked`` var + upper window back and loses the pins."""
     node, d, d_head = _build(name)
     cfg = dict(d=d, d_head=d_head, d_hidden=d, max_layers=_MAX_LAYERS)
     default = _proto_text(build_cpsat_model(node, **cfg))
     off = _proto_text(build_cpsat_model(node, _pin_cancels=False, **cfg))
-    assert off == default, f"{name}: knob-off proto differs from default build"
-
-
-@pytest.mark.parametrize("name", _NAMES)
-def test_knob_on_changes_proto(name):
-    """With the knob on the proto differs — the pins are really posted.
-
-    Every example graph has at least one non-keep-forever node, so each gets
-    its equality pin and loses its ``parked`` var + upper window."""
-    node, d, d_head = _build(name)
-    cfg = dict(d=d, d_head=d_head, d_hidden=d, max_layers=_MAX_LAYERS)
-    off = _proto_text(build_cpsat_model(node, _pin_cancels=False, **cfg))
-    on = _proto_text(build_cpsat_model(node, _pin_cancels=True, **cfg))
-    assert on != off, f"{name}: knob-on proto identical to off (knob is dead)"
-    assert "parked" not in on, f"{name}: pinned model still builds parked vars"
+    assert off != default, f"{name}: knob-off proto identical to default"
+    assert "parked" in off, f"{name}: legacy build has no parked vars"
+    assert "pin_attn" not in off and "pin_mlp" not in off, (
+        f"{name}: legacy build still posts pin aux vars"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -161,9 +172,9 @@ def _solve_cfg(d, d_head):
 @pytest.mark.parametrize("name,d", _SOLVE_CELLS)
 def test_pinned_solution_valid_in_unpinned_model(name, d):
     """Solve the pinned model, then hard-fix its full decision assignment into
-    the UNPINNED model and re-solve: feasibility there proves the pin only
-    added constraints (every pinned schedule is machine-valid by construction).
-    """
+    the UNPINNED legacy model and re-solve: feasibility there proves the pin
+    only added constraints (every pinned schedule is machine-valid by
+    construction)."""
     build, _, d_head = _example_specs()[name]
     torch.manual_seed(0)
     low = _lower(build(), d)
@@ -177,6 +188,7 @@ def test_pinned_solution_valid_in_unpinned_model(name, d):
     built = build_cpsat_model(
         low, d=d, d_head=d_head, d_hidden=d, max_layers=100,
         policy=SchedulingPolicy(), tighten_domains=True,
+        _pin_cancels=False,  # the legacy model is the verification target
     )
     for nid, L in asg.node_to_layer.items():
         built.model.Add(built.layer_var[nid] == L)
@@ -230,9 +242,10 @@ def test_pinned_optimum_no_shallower_than_unpinned(name, d):
 
 
 def test_pin_reaches_snapshot_path():
-    """The A/B runs off a frozen fixture via ``solve_schedule_from_snapshot``;
-    prove the knob is live on that path — the pinned snapshot build differs
-    from the default snapshot build and equals the pinned live build."""
+    """Fixture-based solves go through ``solve_schedule_from_snapshot``; prove
+    the snapshot path agrees with the live path on the new default — the
+    default snapshot build is pinned (equals the pinned live build) and the
+    knob-off escape hatch is live there too."""
     from torchwright.compiler.forward.cpsat_scheduler import (
         build_graph_model,
         build_model_from_snapshot,
@@ -244,31 +257,35 @@ def test_pin_reaches_snapshot_path():
     node, d, d_head = _build("fibonacci")
     problem = snapshot_from_graph_model(build_graph_model(node))
     cfg = dict(d=d, d_head=d_head, d_hidden=d, max_layers=_MAX_LAYERS)
-    snap_off = _proto_text(build_model_from_snapshot(problem, **cfg))
-    snap_on = _proto_text(
-        build_model_from_snapshot(problem, _pin_cancels=True, **cfg)
+    snap_default = _proto_text(build_model_from_snapshot(problem, **cfg))
+    snap_off = _proto_text(
+        build_model_from_snapshot(problem, _pin_cancels=False, **cfg)
     )
-    live_on = _proto_text(build_cpsat_model(node, _pin_cancels=True, **cfg))
-    assert snap_on != snap_off, "knob dead on the snapshot path"
-    assert snap_on == live_on, "pinned snapshot proto differs from pinned live"
+    live_default = _proto_text(build_cpsat_model(node, **cfg))
+    assert snap_default != snap_off, "knob dead on the snapshot path"
+    assert snap_default == live_default, (
+        "default (pinned) snapshot proto differs from default live"
+    )
 
 
 # ---------------------------------------------------------------------------
-# Hint dropping: a full four-family hint + strict validation does not raise
+# Hint contract: a full four-family legacy hint + strict validation is fine
 # ---------------------------------------------------------------------------
 
 
 def test_full_hint_with_pin_passes_strict_validation():
-    """Cancel + mechanism hints are dropped before ``_validate_hint`` when the
-    pin is on (the pinned model has no cancel freedom for them to warm-start);
-    layer + routing hints stay.  ``strict_hint=True`` would raise on any
-    violation the validator can see."""
+    """A full four-family hint from a LEGACY-model solve does not blow up a
+    strict pinned solve: the cancel-LAYER hints — which may contradict the
+    pin (the legacy model can cancel later than earliest-legal) — are dropped
+    before ``_validate_hint``; layer, routing, and cancel-MECHANISM hints are
+    kept.  ``strict_hint=True`` would raise on any violation the validator
+    can see."""
     build, _, d_head = _example_specs()["fibonacci"]
     d = 208
     torch.manual_seed(0)
     low = _lower(build(), d)
     cfg = _solve_cfg(d, d_head)
-    donor, donor_stats = solve_schedule(low, **cfg)
+    donor, donor_stats = solve_schedule(low, _pin_cancels=False, **cfg)
     assert donor is not None, f"donor solve failed ({donor_stats.status_name})"
     asg, stats = solve_schedule(
         low,
@@ -286,19 +303,30 @@ def test_full_hint_with_pin_passes_strict_validation():
 
 
 # ---------------------------------------------------------------------------
-# End-to-end: a knob-on optimize=1 compile replays cleanly — the always-on
-# replay-depth tripwire and I1-I4 stay silent, so the pinned schedule is
-# machine-valid all the way through DirectedLayerScheduler.
+# End-to-end: a default (pinned) optimize=1 compile replays cleanly — the
+# always-on replay-depth tripwire and I1-I4 stay silent, so the pinned
+# schedule is machine-valid all the way through DirectedLayerScheduler.
+# The knob-off escape hatch must replay clean too.
 # ---------------------------------------------------------------------------
 
 
-def test_pin_on_compile_replays_clean():
+def test_default_pinned_compile_replays_clean():
     build, d, d_head = _example_specs()["caesar"]
     torch.manual_seed(0)
     net = forward_compile(
         d=d, d_head=d_head, output_node=build(), device="cpu",
-        verbose=False, optimize=1, _pin_cancels=True,
+        verbose=False, optimize=1,
     )
     # A raise above would be the replay-depth tripwire (or any compile error)
     # firing; a clean return with real layers is the tripwire staying silent.
+    assert len(net.layers) > 0
+
+
+def test_knob_off_compile_replays_clean():
+    build, d, d_head = _example_specs()["caesar"]
+    torch.manual_seed(0)
+    net = forward_compile(
+        d=d, d_head=d_head, output_node=build(), device="cpu",
+        verbose=False, optimize=1, _pin_cancels=False, _force_resolve=True,
+    )
     assert len(net.layers) > 0

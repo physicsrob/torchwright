@@ -434,10 +434,16 @@ def test_parked_escape_leaves_node_unfreed_and_charges_no_head():
     """A schedule that never frees a dead node (cancel == max_layers) is
     feasible via the parked escape, even though its last consumer ran much
     earlier — the cancel-head interval is gated absent so no head is charged
-    in-horizon."""
+    in-horizon.  Legacy model only: the pinned production default
+    (``_pin_cancels``) removes the parked escape (every cancel is pinned to
+    its earliest legal layer), so this pins the ``_pin_cancels=False``
+    escape hatch."""
     x, a, b = _chain_ab()
     max_layers = 20
-    built = build_cpsat_model(b, d=64, d_head=8, d_hidden=64, max_layers=max_layers)
+    built = build_cpsat_model(
+        b, d=64, d_head=8, d_hidden=64, max_layers=max_layers,
+        _pin_cancels=False,
+    )
     # A dead after layer 1 (B reads it there) but parked to max_layers.
     hint_layers = {a.node_id: 0, b.node_id: 1}
     hint_cancel = {a.node_id: max_layers}

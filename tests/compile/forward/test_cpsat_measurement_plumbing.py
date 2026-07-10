@@ -7,11 +7,11 @@ compile path* (plan decision #2) rather than a standalone replica:
 * ``_disabled_families`` — a solve-only diagnostic: solve with the named
   constraint families relaxed, return the assignment/stats before the
   replay, never compile or cache the (unsound) relaxed schedule;
-* ``_solver_seed`` — seed the descent lottery reproducibly;
+* ``_solver_seed`` — seed the solve lottery reproducibly;
 * ``_force_resolve`` — skip the schedule cache so a measured solve
   re-solves instead of replaying a cached draw;
 * ``_solver_params`` — general ``CpSolver.parameters`` overrides (C1 sweep),
-  merged with the seed and applied to every solve / descent rung;
+  merged with the seed and applied to the solve;
 * ``_drop_decision_strategy`` — skip the hand-rolled ``AddDecisionStrategy``
   (C1 arm ``no_decision_strategy``).
 """

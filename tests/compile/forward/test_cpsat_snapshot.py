@@ -135,8 +135,14 @@ def test_canonicalized_snapshot_rebuilds_a_valid_model():
 
 
 def test_hinted_build_proto_identical():
+    # Legacy (knob-off) model: the widening machinery only exists there —
+    # the pinned production default skips window sizing entirely, which
+    # would make this proto comparison vacuous on the widening path.
     node, d, d_head = _build("caesar")
-    cfg = dict(d=d, d_head=d_head, d_hidden=d, max_layers=40, tighten_domains=True)
+    cfg = dict(
+        d=d, d_head=d_head, d_hidden=d, max_layers=40, tighten_domains=True,
+        _pin_cancels=False,
+    )
     # A feasible schedule -> hint dicts that exercise the cancel-window widening.
     asg, _ = solve_schedule(node, time_budget_s=20.0, **cfg)
     assert asg is not None
