@@ -1,12 +1,17 @@
-"""Persistent cache of solved ``ScheduleAssignment``s, keyed by topology.
+"""Persistent cache of solved ``ScheduleAssignment``s.
 
-A CP-SAT schedule depends only on the graph topology and the solve
-geometry — not on weight values, assets, or git state.  Winning the
-search once per graph shape is enough; this cache makes the win durable
-so later compiles of the same shape skip the solver entirely (measured
-motivation: at d=8192 the 180s solve is a 50-64 layer lottery and the
-proven optimum took ~2 minutes to find — re-fighting that per compile is
-pure waste).
+Keyed by topology + solve geometry + **compiler code identity**
+(:func:`torchwright.compiler.graph_identity.compiler_code_fingerprint`):
+the solve outcome is a function of the solver model and warm-start code,
+not just the graph, so any torchwright change misses and re-solves.
+Within one code state, winning the search once per graph shape is enough;
+this cache makes the win durable so later compiles of the same shape skip
+the solver entirely (measured motivation: at d=8192 the 180s solve is a
+50-64 layer lottery and the proven optimum took ~2 minutes to find —
+re-fighting that per compile is pure waste).  Hits are additionally gated
+on the requested optimize level (``load_assignment(min_optimize=...)``) so
+a bigger budget in the config buys a bigger solve, once, instead of
+silently replaying a smaller budget's draw.
 
 Opt-in: the cache is active only when ``TW_SCHEDULE_CACHE_DIR`` is set
 (one JSON file per fingerprint inside that directory).  Replayed
@@ -58,11 +63,22 @@ def cache_dir() -> Optional[Path]:
 def load_assignment(
     fingerprint: str,
     output_node: Node,
+    *,
+    min_optimize: int = 0,
 ) -> Optional[Tuple[ScheduleAssignment, Dict[str, Any]]]:
     """Return (assignment, meta) for a cached fingerprint, or None.
 
     Stored keys are canonical ids; they are remapped onto the CURRENT
-    graph's node ids via the same deterministic traversal."""
+    graph's node ids via the same deterministic traversal.
+
+    ``min_optimize`` gates hits on the entry's validated optimize level
+    (``meta["optimize"]``): an entry solved at a lower level than the
+    request misses, so raising ``optimize`` in a config actually buys a
+    bigger solve instead of silently replaying the smaller budget's
+    draw.  The level is validated, not just provenance — a higher-level
+    re-solve that fails to beat the cached schedule upgrades the entry's
+    level in place (see :func:`store_assignment`), so the re-solve
+    happens once per level, not per compile."""
     base = cache_dir()
     if base is None:
         return None
@@ -70,6 +86,8 @@ def load_assignment(
     if not path.exists():
         return None
     data = json.loads(path.read_text(encoding="utf-8"))
+    if int(data.get("meta", {}).get("optimize", 0) or 0) < min_optimize:
+        return None
     current_by_canon = {c: nid for nid, c in _canonical_ids(output_node).items()}
 
     def _remap(table: Dict[str, Any]) -> Dict[int, Any]:
@@ -103,6 +121,14 @@ def store_assignment(
     """Persist ``assignment`` unless an equal-or-better entry exists.
 
     Returns True when the entry was written.
+
+    The schedule ratchet is one-way (fewer layers only), but the entry's
+    validated optimize level (``meta["optimize"]``) ratchets
+    independently: when a higher-level solve fails to beat the cached
+    schedule, that is proof the entry is as good as that level produces,
+    so the level is upgraded in place and future requests at that level
+    replay it (the ``min_optimize`` gate in :func:`load_assignment`)
+    instead of re-solving every compile.
     """
     base = cache_dir()
     if base is None:
@@ -111,6 +137,14 @@ def store_assignment(
     if prior_path.exists():
         prior = json.loads(prior_path.read_text(encoding="utf-8"))
         if prior.get("n_layers", 1 << 30) <= assignment.n_layers:
+            new_level = int(meta.get("optimize", 0) or 0)
+            prior_meta = prior.get("meta", {})
+            if new_level > int(prior_meta.get("optimize", 0) or 0):
+                prior_meta["optimize"] = new_level
+                prior["meta"] = prior_meta
+                tmp = prior_path.with_suffix(".json.tmp")
+                tmp.write_text(json.dumps(prior), encoding="utf-8")
+                tmp.replace(prior_path)
             return False
     base.mkdir(parents=True, exist_ok=True)
     canon = _canonical_ids(output_node)

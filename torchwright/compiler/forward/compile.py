@@ -1157,7 +1157,7 @@ def forward_compile(
         cached = (
             None
             if (_force_resolve or _disabled_families)
-            else load_assignment(schedule_fp, output_node)
+            else load_assignment(schedule_fp, output_node, min_optimize=optimize)
         )
         if cached is not None:
             assignment, _cached_meta = cached
@@ -1395,6 +1395,7 @@ def forward_compile(
                                 net.cpsat_solve_stats.best_objective_bound
                             ),
                             "is_optimal": net.cpsat_solve_stats.is_optimal,
+                            "optimize": optimize,
                             "d": d,
                             "d_head": d_head,
                             "d_hidden": d_hidden if d_hidden else d,

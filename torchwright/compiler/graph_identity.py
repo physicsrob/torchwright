@@ -23,9 +23,39 @@ from __future__ import annotations
 import hashlib
 import json
 from dataclasses import asdict
+from functools import lru_cache
+from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
 from torchwright.graph import Node
+
+
+@lru_cache(maxsize=1)
+def compiler_code_fingerprint() -> str:
+    """Content hash of every ``.py`` source in the torchwright package.
+
+    Participates in the schedule-cache fingerprint so ANY torchwright
+    change invalidates cached schedules and forces a fresh solve.  The
+    solver's search behavior is a function of compiler code the topology
+    hash cannot see (the warm-start heuristic, the CP-SAT model,
+    lowering passes); before this, invalidation was a hand-bumped
+    generation string that a compiler change could — and did — forget to
+    bump, silently replaying a stale schedule.  A spurious re-solve
+    after a cosmetic edit costs one solver budget; a stale schedule
+    mislabels the production artifact.
+
+    Content-hashed rather than git-derived so it works where ``.git`` is
+    absent (the Modal compile container mounts sources only) and is
+    dirty-aware by construction.  Cached per process — sources don't
+    change mid-run.
+    """
+    root = Path(__file__).resolve().parents[1]
+    h = hashlib.sha256()
+    for p in sorted(root.rglob("*.py")):
+        h.update(str(p.relative_to(root)).encode())
+        h.update(b"\0")
+        h.update(p.read_bytes())
+    return h.hexdigest()
 
 
 def _canonical_walk(output_node: Node) -> List[Node]:
@@ -103,22 +133,16 @@ def graph_fingerprint(
     non-zero so the common case (no reservation) keeps hashing byte-identically
     to the pre-feature layout and existing cache entries still hit.
 
-    ``cancel_window`` is a deliberate generation bump (2026-07): the model
-    gained hint-aware cancel-window widening (``hint-aware-v1``), so every
-    pre-widening cache entry — solved against a model that rejected the
-    warm-start hint and typically fell back — must miss and re-solve once.
-    Unlike ``reserve_residual`` it is unconditional: invalidating the old
-    generation is the point.  Sound as a pure function of the payload
-    because the warm-start hint is a deterministic function of the same
-    topology+geometry this fingerprint already hashes.
-
-    ``assume_zero_init`` was an unconditional payload key until the flag was
-    retired (2026-07, universal zero-init).  Dropping it changes the payload
-    layout for every graph, so every pre-retirement entry — including the
-    ``assume_zero_init=False`` (defensive-model) schedules — misses once and
-    re-solves against the now-universal zero-init model.  That miss is the
-    intended invalidation: a defensive-model schedule is unsound for the
-    zero-init model, so it must not be replayed.
+    ``compiler_code`` (:func:`compiler_code_fingerprint`) keys the cache on
+    the torchwright sources themselves, so any compiler change — solver
+    model, warm-start heuristic, lowering — invalidates every cached
+    schedule and forces a fresh solve.  It replaces the earlier hand-bumped
+    generation mechanisms (the ``cancel_window: hint-aware-v1`` string, the
+    ``assume_zero_init`` payload-layout change), which relied on a human
+    remembering that a compiler edit changed the solve; the 2026-07
+    warm-start rewrite wasn't bumped and replayed a stale schedule into a
+    production compile.  Adding the key changes the payload layout for
+    every graph — the resulting global one-time invalidation is intended.
     """
     payload = {
         "topology": topology_entries(output_node),
@@ -128,7 +152,7 @@ def graph_fingerprint(
         "flex_routing": flex_routing,
         "cancel_slack": cancel_slack,
         "policy": asdict(policy) if policy is not None else None,
-        "cancel_window": "hint-aware-v1",
+        "compiler_code": compiler_code_fingerprint(),
     }
     if reserve_residual:
         payload["reserve_residual"] = reserve_residual

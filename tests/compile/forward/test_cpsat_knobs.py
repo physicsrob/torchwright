@@ -233,6 +233,88 @@ def test_schedule_cache_disabled_without_env(monkeypatch):
     )
 
 
+def test_schedule_cache_keys_on_compiler_code(monkeypatch):
+    """Any torchwright source change must invalidate cached schedules: the
+    fingerprint includes a content hash of the package sources, so an edit
+    the topology hash cannot see (warm-start heuristic, solver model) still
+    misses instead of replaying a stale schedule."""
+    from torchwright.compiler import graph_identity
+
+    out = _repro_graph()
+    kw = dict(
+        d=64,
+        d_head=8,
+        d_hidden=64,
+        flex_routing=True,
+        cancel_slack=2,
+        policy=None,
+    )
+    fp_before = graph_identity.graph_fingerprint(out, **kw)
+    assert fp_before == graph_identity.graph_fingerprint(out, **kw)
+    monkeypatch.setattr(
+        graph_identity, "compiler_code_fingerprint", lambda: "edited-sources"
+    )
+    assert graph_identity.graph_fingerprint(out, **kw) != fp_before
+
+
+def test_schedule_cache_min_optimize_gate(tmp_path, monkeypatch):
+    """An entry solved at a lower optimize level misses a higher-level
+    request; a failed higher-level improvement upgrades the entry's level
+    in place so the re-solve happens once, not per compile."""
+    from torchwright.compiler.forward.cpsat_scheduler import (
+        ScheduleAssignment,
+    )
+    from torchwright.compiler.forward.schedule_cache import (
+        load_assignment,
+        store_assignment,
+    )
+
+    monkeypatch.setenv("TW_SCHEDULE_CACHE_DIR", str(tmp_path))
+    dummy = create_input("dummy", 1)
+    fp = "cafe" * 16
+
+    assert store_assignment(
+        fp, ScheduleAssignment({}, {}, {}, 3), {"optimize": 1}, dummy
+    )
+    assert load_assignment(fp, dummy, min_optimize=1) is not None
+    assert load_assignment(fp, dummy, min_optimize=2) is None
+
+    # A WORSE schedule from an optimize=3 solve: the schedule ratchet
+    # refuses it, but the fact that level 3 couldn't beat the entry
+    # certifies the entry at level 3.
+    assert not store_assignment(
+        fp, ScheduleAssignment({}, {}, {}, 5), {"optimize": 3}, dummy
+    )
+    hit = load_assignment(fp, dummy, min_optimize=3)
+    assert hit is not None
+    assignment, meta = hit
+    assert assignment.n_layers == 3  # the better schedule survived
+    assert meta["optimize"] == 3
+
+    # Lower-level requests replay a higher-level entry (safe direction).
+    assert load_assignment(fp, dummy, min_optimize=0) is not None
+
+
+def test_schedule_cache_optimize_gate_end_to_end(tmp_path, monkeypatch):
+    """Raising ``optimize`` in a compile actually re-solves instead of
+    replaying the lower level's cached draw; the level then sticks and the
+    next same-level compile is CACHED."""
+    from torchwright.compiler.forward.compile import forward_compile
+
+    monkeypatch.setenv("TW_SCHEDULE_CACHE_DIR", str(tmp_path))
+    kw = dict(d=64, d_head=8, device="cpu", verbose=False)
+
+    net1 = forward_compile(output_node=_repro_graph(), optimize=1, **kw)
+    assert net1.cpsat_solve_stats.status_name in ("OPTIMAL", "FEASIBLE")
+
+    net2 = forward_compile(output_node=_repro_graph(), optimize=2, **kw)
+    assert net2.cpsat_solve_stats.status_name != "CACHED"
+
+    net3 = forward_compile(output_node=_repro_graph(), optimize=2, **kw)
+    assert net3.cpsat_solve_stats.status_name == "CACHED"
+    assert len(net3.layers) == len(net2.layers)
+
+
 # ---------------------------------------------------------------------------
 # Hint-aware cancel-window widening (the silent optimize=2 fallback fix)
 # ---------------------------------------------------------------------------
