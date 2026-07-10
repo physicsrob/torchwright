@@ -279,6 +279,11 @@ class BuiltModel:
     # "flex" when routing is a free decision variable.  Used by hint
     # validation to mirror the routing-aware cancel bounds.
     static_routing: Optional[Dict[int, str]] = None
+    # True when the model was built with `_pin_cancels` (cancel layers
+    # equality-pinned; no parked/window/widening families).  `_solve_built`
+    # reads it to drop the cancel + cancel-mechanism hints, whose families
+    # the pinned model no longer accepts as free choices.
+    pin_cancels: bool = False
 
 
 # ---------------------------------------------------------------------------
@@ -656,6 +661,7 @@ def build_cpsat_model(
     hint_cancel: Optional[Dict[int, int]] = None,
     _disabled_families: frozenset = frozenset(),
     _canonical_cancel_reps: bool = False,
+    _pin_cancels: bool = False,
 ) -> BuiltModel:
     """Build (but do not solve) the CP-SAT scheduling model.
 
@@ -696,6 +702,7 @@ def build_cpsat_model(
         hint_cancel=hint_cancel,
         _disabled_families=_disabled_families,
         _canonical_cancel_reps=_canonical_cancel_reps,
+        _pin_cancels=_pin_cancels,
     )
 
 
@@ -717,6 +724,7 @@ def build_cpsat_model_from_gm(
     hint_cancel: Optional[Dict[int, int]] = None,
     _disabled_families: frozenset = frozenset(),
     _canonical_cancel_reps: bool = False,
+    _pin_cancels: bool = False,
 ) -> BuiltModel:
     """Build (but do not solve) the CP-SAT model from a prebuilt GraphModel.
 
@@ -741,6 +749,18 @@ def build_cpsat_model_from_gm(
     multiple model representations — see ``cpsat_symmetry_sym1_plan.md``.  With
     it OFF no variable or constraint is added, so the proto is byte-identical
     to today.
+
+    ``_pin_cancels`` is a MEASUREMENT-ONLY knob (default OFF; the production
+    path never sets it) — the pinned-cancel A/B, ``cpsat_pinned_cancel_plan.md``
+    step 2.  When on, every non-keep-forever cancel layer is equality-pinned to
+    its earliest legal value given the chosen mechanism (an ``AddMaxEquality``
+    over the same consumer expressions the lower bounds use), replacing the
+    ``parked`` boolean, the upper-window (``cancel_slack``) constraint, and the
+    hint-aware widening for that node; ``cancel_in_mlp`` stays a free decision.
+    Every existing lower bound is kept, so the pinned model only ADDS
+    constraints relative to the default build — every solution it emits is a
+    valid default-model solution (machine-valid by construction).  With it OFF
+    the proto is byte-identical to today.
     """
     unknown = _disabled_families - CONSTRAINT_FAMILIES
     if unknown:
@@ -874,7 +894,15 @@ def build_cpsat_model_from_gm(
     # the lower bound: the heuristic almost always cancels within 1–2
     # layers of the last consumer, so K=2 cuts the cancel decision
     # space ~30x with negligible loss of optimality.
-    eff_cancel_slack = None if "cancel_slack" in _disabled_families else cancel_slack
+    # Under `_pin_cancels` the equality pin (posted after `is_free` exists,
+    # below) subsumes the upper window entirely: forcing `eff_cancel_slack`
+    # to None here skips the whole window/parked/widening block per node,
+    # exactly the family the pin replaces.
+    eff_cancel_slack = (
+        None
+        if ("cancel_slack" in _disabled_families or _pin_cancels)
+        else cancel_slack
+    )
 
     # Hint-aware cancel-window widening.  Freeing a node's columns costs
     # attention-head work charged against the same per-layer head budget as
@@ -934,6 +962,12 @@ def build_cpsat_model_from_gm(
     # exist (below): the gap between an addend's cancel and the Add's layer
     # depends on whether the Add runs in the free (reassign) regime.
     deferred_add_consumer_lbs: List[Tuple[cp_model.IntVar, int]] = []
+    # `_pin_cancels` equality pins are likewise deferred until `is_free`
+    # exists (Add-consumer terms read it): per node, (node_id, cl, cim,
+    # non-Add consumer ids with layer vars, Add consumer ids with layer vars).
+    deferred_pin_specs: List[
+        Tuple[int, cp_model.IntVar, cp_model.IntVar, List[int], List[int]]
+    ] = []
 
     def _canonicalize_cancel_reps(cl, parked, cim):
         # sym1 (MEASUREMENT-ONLY, gated by `_canonical_cancel_reps`; default OFF
@@ -1001,6 +1035,24 @@ def build_cpsat_model_from_gm(
                         model.Add(cl >= layer_var[c.node_id]).OnlyEnforceIf(cim)
                 consumer_layer_vars.append(layer_var[c.node_id])
                 consumer_ids.append(c.node_id)
+        if _pin_cancels:
+            deferred_pin_specs.append(
+                (
+                    n.node_id,
+                    cl,
+                    cim,
+                    [
+                        c.node_id
+                        for c in consumers
+                        if c.node_id in layer_var and not isinstance(c, Add)
+                    ],
+                    [
+                        c.node_id
+                        for c in consumers
+                        if c.node_id in layer_var and isinstance(c, Add)
+                    ],
+                )
+            )
         if eff_cancel_slack is not None and consumer_layer_vars:
             delta = _widen_delta(n.node_id, _hinted_last_consumer(consumer_ids))
             last_cons = model.NewIntVar(0, max_layers - 1, f"last_cons_n{n.node_id}")
@@ -1061,6 +1113,18 @@ def build_cpsat_model_from_gm(
                 consumer_ids.append(c.node_id)
         if keep_forever:
             input_keep_ids.add(n.node_id)
+            continue
+        if _pin_cancels:
+            # Inputs have no mechanism choice (always attention-cancelled), so
+            # the earliest legal cancel is the uniform gap-1 bound the model
+            # posts above: max(1, layer[c] + 1) over layer-bound consumers,
+            # falling back to the birth-based earliest (layer 1) when none.
+            if consumer_layer_vars:
+                model.AddMaxEquality(
+                    cl, [1] + [v + 1 for v in consumer_layer_vars]
+                )
+            else:
+                model.Add(cl == 1)
             continue
         if eff_cancel_slack is not None and consumer_layer_vars:
             delta = _widen_delta(n.node_id, _hinted_last_consumer(consumer_ids))
@@ -1168,6 +1232,40 @@ def build_cpsat_model_from_gm(
     if "cancel_consumer_lb" not in _disabled_families:
         for cl, add_id in deferred_add_consumer_lbs:
             model.Add(cl >= layer_var[add_id] + is_free[add_id])
+
+    # ---- Pinned cancel layers (_pin_cancels, measurement-only) ----
+    # Equality-pin each non-keep-forever cancel to its earliest legal value
+    # given the mechanism, mirroring the lower bounds above term for term:
+    # under an attention cancel (cim = 0) the earliest is
+    # max(layer[n] + 1, layer[c] + 1 - is_attn[c] per non-Add consumer,
+    # layer[A] + is_free[A] per Add consumer); under an MLP cancel (cim = 1)
+    # the non-Add term relaxes to the uniform gap-0 layer[c].  `cancel_in_mlp`
+    # stays free — it still chooses which budget pays.  The kept lower bounds
+    # make each pin an upper-bound-only addition, so the pinned model is a
+    # pure restriction of the default model.
+    if _pin_cancels:
+        for nid, cl, cim, non_add_ids, add_ids in deferred_pin_specs:
+            birth = layer_var[nid] + 1
+            if not non_add_ids and not add_ids:
+                # No layer-bound consumers: both mechanisms share the
+                # birth-based earliest.
+                model.Add(cl == birth)
+                continue
+            add_exprs = [layer_var[a] + is_free[a] for a in add_ids]
+            pin_attn = model.NewIntVar(1, max_layers, f"pin_attn_n{nid}")
+            model.AddMaxEquality(
+                pin_attn,
+                [birth]
+                + [layer_var[c] + 1 - is_attn[c] for c in non_add_ids]
+                + add_exprs,
+            )
+            pin_mlp = model.NewIntVar(1, max_layers, f"pin_mlp_n{nid}")
+            model.AddMaxEquality(
+                pin_mlp,
+                [birth] + [layer_var[c] for c in non_add_ids] + add_exprs,
+            )
+            model.Add(cl == pin_attn).OnlyEnforceIf(cim.Not())
+            model.Add(cl == pin_mlp).OnlyEnforceIf(cim)
 
     # ---- Combined attn-heads + cancel-cols cumulative ----
     # Per-node attn interval is OPTIONAL (gated by is_attn[n]) when
@@ -1545,6 +1643,7 @@ def build_cpsat_model_from_gm(
         ),
         eff_cancel_slack=eff_cancel_slack,
         static_routing=static_routing,
+        pin_cancels=_pin_cancels,
     )
 
 
@@ -1685,6 +1784,7 @@ def build_model_from_snapshot(
     hint_cancel: Optional[Dict[int, int]] = None,
     _disabled_families: frozenset = frozenset(),
     _canonical_cancel_reps: bool = False,
+    _pin_cancels: bool = False,
 ) -> BuiltModel:
     """Build the CP-SAT model from a captured snapshot — no live graph.
 
@@ -1708,6 +1808,7 @@ def build_model_from_snapshot(
         hint_cancel=hint_cancel,
         _disabled_families=_disabled_families,
         _canonical_cancel_reps=_canonical_cancel_reps,
+        _pin_cancels=_pin_cancels,
     )
 
 
@@ -2035,6 +2136,7 @@ def solve_schedule(
     drop_decision_strategy: bool = False,
     _disabled_families: frozenset = frozenset(),
     _canonical_cancel_reps: bool = False,
+    _pin_cancels: bool = False,
 ) -> Tuple[Optional[ScheduleAssignment], SolveStats]:
     """Build and solve the CP-SAT scheduling model.
 
@@ -2128,6 +2230,7 @@ def solve_schedule(
         hint_cancel=hint_cancel,
         _disabled_families=_disabled_families,
         _canonical_cancel_reps=_canonical_cancel_reps,
+        _pin_cancels=_pin_cancels,
     )
     return _solve_built(
         built,
@@ -2171,6 +2274,7 @@ def solve_schedule_from_snapshot(
     drop_decision_strategy: bool = False,
     _disabled_families: frozenset = frozenset(),
     _canonical_cancel_reps: bool = False,
+    _pin_cancels: bool = False,
 ) -> Tuple[Optional[ScheduleAssignment], SolveStats]:
     """Build and solve the model from a captured snapshot — no live graph.
 
@@ -2196,6 +2300,7 @@ def solve_schedule_from_snapshot(
         hint_cancel=hint_cancel,
         _disabled_families=_disabled_families,
         _canonical_cancel_reps=_canonical_cancel_reps,
+        _pin_cancels=_pin_cancels,
     )
     return _solve_built(
         built,
@@ -2238,6 +2343,21 @@ def _solve_built(
     subsolver slot for its default portfolio.  It cannot change the feasible
     set — only which schedule the search finds first — so it is never set in
     production."""
+    if built.pin_cancels:
+        # The pinned model (`_pin_cancels`) equality-pins every cancel layer,
+        # so a captured cancel-layer hint would almost always contradict the
+        # pin and CP-SAT would silently discard the whole incumbent.  Drop it
+        # (once layers, routings, and `cancel_in_mlp` are decided the cancels
+        # are forced by propagation), which also keeps `_validate_hint` off
+        # that family.  The layer, routing, and cancel-MECHANISM hints are
+        # kept: `cancel_in_mlp` stays a free decision under the pin, and on a
+        # head-saturated graph its hint carries exactly the packing choice —
+        # which cancels take the same-layer MLP tier — that makes the warm
+        # start completable.  Measured 2026-07-09 on the d=8192 fixture:
+        # with the mechanism hint also dropped, no seed completed the hint
+        # into ANY incumbent in 600 s (0/5), vs first incumbents at 83-104 s
+        # for the unpinned control.
+        hint_cancel = None
     if log_search_progress and built.cancel_window_delta:
         print(
             f"  cancel windows widened for {len(built.cancel_window_delta)} "
