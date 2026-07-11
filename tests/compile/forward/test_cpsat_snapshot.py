@@ -15,6 +15,7 @@ import pytest
 import torch
 
 from torchwright.compiler.forward.cpsat_scheduler import (
+    DiagnosticHint,
     build_cpsat_model,
     build_graph_model,
     build_model_from_snapshot,
@@ -149,16 +150,13 @@ def test_hinted_build_proto_identical():
     hint_layers = dict(asg.node_to_layer)
     hint_cancel = dict(asg.node_to_cancel_layer)
 
-    live = _proto_text(
-        build_cpsat_model(node, hint_layers=hint_layers, hint_cancel=hint_cancel, **cfg)
-    )
+    hint = DiagnosticHint(layers=hint_layers, cancel=hint_cancel)
+    live = _proto_text(build_cpsat_model(node, diagnostic_hint=hint, **cfg))
     problem = SchedulingProblem.loads(
         snapshot_from_graph_model(build_graph_model(node)).dumps()
     )
     snap = _proto_text(
-        build_model_from_snapshot(
-            problem, hint_layers=hint_layers, hint_cancel=hint_cancel, **cfg
-        )
+        build_model_from_snapshot(problem, diagnostic_hint=hint, **cfg)
     )
     assert snap == live
 

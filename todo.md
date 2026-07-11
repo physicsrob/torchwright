@@ -24,13 +24,12 @@ remaining work is architectural cleanup and integration hygiene.
   - Weighted cache keys include `Costs`, and the cache ratchets on realized
     objective rather than layer count alone.
 
-- [ ] Reduce or isolate the legacy parallel-hint API.
+- [x] Reduce or isolate the legacy parallel-hint API.
   - Production compilation passes one complete incumbent assignment.
-  - `solve_schedule` still accepts `hint_layers`, `hint_routing`,
-    `hint_cancel`, and `hint_cancel_mech` for snapshots, experiments, and older
-    tests.
-  - Move those parameters behind an explicitly diagnostic/internal interface,
-    or migrate remaining callers to serialized assignments.
+  - `solve_schedule` no longer accepts four parallel hint mappings. Tests and
+    experiments use one immutable `DiagnosticHint` behind the private
+    `_diagnostic_hint` seam; complete warm starts use `ScheduleAssignment`.
+  - Snapshot/model-building diagnostics consume the same single hint object.
 
 ## Provenance and cache semantics
 

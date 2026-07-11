@@ -14,6 +14,7 @@ import torch
 from torchwright.compiler.forward.compile import forward_compile
 from torchwright.compiler.forward.cpsat_scheduler import (
     ATTN,
+    DiagnosticHint,
     MLP,
     build_cpsat_model,
     critical_path_layers,
@@ -395,17 +396,24 @@ def test_eager_warm_start_hint_is_accepted_not_dropped():
     assert hint_n > 0, "eager warm start deadlocked"
     assert any(v == MLP for v in hint_mech.values()), "expected MLP-cancels in the hint"
 
+    hint = DiagnosticHint(
+        layers=hint_layers,
+        routing=hint_routing,
+        cancel=hint_cancel,
+        cancel_mech=hint_mech,
+    )
     built = build_cpsat_model(
         out,
         d=d,
         d_head=d_head,
         d_hidden=d_hidden,
         max_layers=max_layers,
-        hint_layers=hint_layers,
-        hint_cancel=hint_cancel,
+        diagnostic_hint=hint,
     )
     violations = _validate_hint(
-        built, hint_layers, hint_routing, hint_cancel, hint_mech, max_layers=max_layers
+        built,
+        hint,
+        max_layers=max_layers,
     )
     assert violations == [], f"eager warm-start hint has violations: {violations}"
 
@@ -417,10 +425,7 @@ def test_eager_warm_start_hint_is_accepted_not_dropped():
         d_head=d_head,
         d_hidden=d_hidden,
         max_layers=max_layers,
-        hint_layers=hint_layers,
-        hint_routing=hint_routing,
-        hint_cancel=hint_cancel,
-        hint_cancel_mech=hint_mech,
+        _diagnostic_hint=hint,
         strict_hint=True,
     )
     assert asg is not None, f"solver found no schedule ({stats.status_name})"

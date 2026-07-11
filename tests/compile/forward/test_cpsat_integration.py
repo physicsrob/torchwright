@@ -253,8 +253,8 @@ def test_cpsat_warm_start_layer_count_no_worse():
     """Warm-start must not produce a worse schedule than the heuristic.
 
     ``forward_compile`` runs a schedule-only heuristic pass before
-    invoking CP-SAT and feeds the result as ``hint_layers``.  Because
-    the hint is feasible, CP-SAT can always match it; with
+    invoking CP-SAT and feeds the complete assignment as ``incumbent``.
+    Because the warm start is feasible, CP-SAT can always match it; with
     ``cpsat_costs.alpha=1`` (the default) it tries to beat it.
     """
     out, inputs = _build_branchy()

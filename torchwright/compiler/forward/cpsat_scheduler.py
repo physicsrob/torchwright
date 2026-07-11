@@ -13,6 +13,8 @@ Public API:
 - `Costs` — objective weights `(alpha, beta, gamma)`.
 - `ScheduleAssignment` — solver output contract: per-node layer,
   cancel layer, and routing.
+- `DiagnosticHint` — one immutable, explicitly non-production container for
+  partial/invalid warm starts used by tests and measurement tooling.
 - `SolveStats` — solver metadata (status, objective, LB, walltime,
   log) for diagnostics.
 - `solve_schedule(...)` — build and solve, return
@@ -312,6 +314,47 @@ class ScheduleAssignment:
             tuple(self.node_to_routing.items()),
             tuple(self.node_to_cancel_layer.items()),
             tuple(self.node_to_cancel_mech.items()),
+        )
+
+
+@dataclass(frozen=True)
+class DiagnosticHint:
+    """Partial warm start for tests, snapshots, and solver experiments.
+
+    Production compilation passes a complete :class:`ScheduleAssignment` as
+    ``incumbent``.  This type deliberately isolates diagnostic cases that need
+    an incomplete or intentionally invalid hint without exposing four parallel
+    mappings on the production solver API.
+    """
+
+    layers: Mapping[int, int] = field(default_factory=dict)
+    routing: Mapping[int, str] = field(default_factory=dict)
+    cancel: Mapping[int, int] = field(default_factory=dict)
+    cancel_mech: Mapping[int, str] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        for name in ("layers", "routing", "cancel", "cancel_mech"):
+            value = getattr(self, name)
+            object.__setattr__(
+                self,
+                name,
+                MappingProxyType(dict(sorted(value.items()))),
+            )
+
+    @classmethod
+    def from_assignment(cls, assignment: ScheduleAssignment) -> "DiagnosticHint":
+        return cls(
+            layers=assignment.node_to_layer,
+            routing=assignment.node_to_routing,
+            cancel=assignment.node_to_cancel_layer,
+            cancel_mech=assignment.node_to_cancel_mech,
+        )
+
+    def without_cancel_layers(self) -> "DiagnosticHint":
+        return DiagnosticHint(
+            layers=self.layers,
+            routing=self.routing,
+            cancel_mech=self.cancel_mech,
         )
 
 
@@ -866,8 +909,7 @@ def build_cpsat_model(
     reserve_heads: int = 0,
     reserve_residual: int = 0,
     tighten_domains: bool = False,
-    hint_layers: Optional[Dict[int, int]] = None,
-    hint_cancel: Optional[Dict[int, int]] = None,
+    diagnostic_hint: Optional[DiagnosticHint] = None,
     _disabled_families: frozenset = frozenset(),
     _canonical_cancel_reps: bool = False,
     _pin_cancels: bool = True,
@@ -880,11 +922,9 @@ def build_cpsat_model(
     decision strategy, solves, and reads the variables back out of the
     returned :class:`BuiltModel`.
 
-    ``hint_layers`` / ``hint_cancel`` are used ONLY to size the per-node
-    cancel windows (see the widening comment at the cancel-layer section) —
-    hint *application* (``AddHint``) stays in :func:`solve_schedule`.  With
-    both left as None the model is byte-identical to the hint-less build,
-    so diagnostics, the probe script, and hint-less callers are unchanged.
+    ``diagnostic_hint.layers`` / ``diagnostic_hint.cancel`` are used only to
+    size per-node cancel windows; hint application stays in the solve path.
+    With no diagnostic hint the model is byte-identical to a hint-less build.
 
     ``_disabled_families`` is a diagnostic-only escape hatch: each name in
     :data:`CONSTRAINT_FAMILIES` gates one constraint family, and listing it
@@ -907,8 +947,7 @@ def build_cpsat_model(
         reserve_heads=reserve_heads,
         reserve_residual=reserve_residual,
         tighten_domains=tighten_domains,
-        hint_layers=hint_layers,
-        hint_cancel=hint_cancel,
+        diagnostic_hint=diagnostic_hint,
         _disabled_families=_disabled_families,
         _canonical_cancel_reps=_canonical_cancel_reps,
         _pin_cancels=_pin_cancels,
@@ -929,8 +968,7 @@ def build_cpsat_model_from_gm(
     reserve_heads: int = 0,
     reserve_residual: int = 0,
     tighten_domains: bool = False,
-    hint_layers: Optional[Dict[int, int]] = None,
-    hint_cancel: Optional[Dict[int, int]] = None,
+    diagnostic_hint: Optional[DiagnosticHint] = None,
     _disabled_families: frozenset = frozenset(),
     _canonical_cancel_reps: bool = False,
     _pin_cancels: bool = True,
@@ -980,6 +1018,9 @@ def build_cpsat_model_from_gm(
             f"Unknown constraint family/families {sorted(unknown)}; "
             f"valid names: {sorted(CONSTRAINT_FAMILIES)}"
         )
+
+    hint_layers = diagnostic_hint.layers if diagnostic_hint is not None else None
+    hint_cancel = diagnostic_hint.cancel if diagnostic_hint is not None else None
 
     if policy is None:
         policy = LEGACY_POLICY
@@ -2002,8 +2043,7 @@ def build_model_from_snapshot(
     reserve_heads: int = 0,
     reserve_residual: int = 0,
     tighten_domains: bool = False,
-    hint_layers: Optional[Dict[int, int]] = None,
-    hint_cancel: Optional[Dict[int, int]] = None,
+    diagnostic_hint: Optional[DiagnosticHint] = None,
     _disabled_families: frozenset = frozenset(),
     _canonical_cancel_reps: bool = False,
     _pin_cancels: bool = True,
@@ -2026,8 +2066,7 @@ def build_model_from_snapshot(
         reserve_heads=reserve_heads,
         reserve_residual=reserve_residual,
         tighten_domains=tighten_domains,
-        hint_layers=hint_layers,
-        hint_cancel=hint_cancel,
+        diagnostic_hint=diagnostic_hint,
         _disabled_families=_disabled_families,
         _canonical_cancel_reps=_canonical_cancel_reps,
         _pin_cancels=_pin_cancels,
@@ -2158,10 +2197,7 @@ class _IncumbentTrace(cp_model.CpSolverSolutionCallback):
 
 def _validate_hint(
     built: BuiltModel,
-    hint_layers: Optional[Dict[int, int]],
-    hint_routing: Optional[Dict[int, str]],
-    hint_cancel: Optional[Dict[int, int]],
-    hint_cancel_mech: Optional[Dict[int, str]] = None,
+    hint: DiagnosticHint,
     *,
     max_layers: int,
     strict: bool = False,
@@ -2192,6 +2228,10 @@ def _validate_hint(
     naming the first violations; the default emits one ``RuntimeWarning``
     (production keeps its fall-back-don't-fail contract).
     """
+    hint_layers = hint.layers
+    hint_routing = hint.routing
+    hint_cancel = hint.cancel
+    hint_cancel_mech = hint.cancel_mech
     violations: List[str] = []
     gm = built.gm
     all_nodes: Dict[int, Node] = {n.node_id: n for n in gm.graph.get_all_nodes()}
@@ -2343,10 +2383,6 @@ def solve_schedule(
     time_budget_s: float = 60.0,
     max_layers: int = 60,
     incumbent: Optional[ScheduleAssignment] = None,
-    hint_layers: Optional[Dict[int, int]] = None,
-    hint_routing: Optional[Dict[int, str]] = None,
-    hint_cancel: Optional[Dict[int, int]] = None,
-    hint_cancel_mech: Optional[Dict[int, str]] = None,
     cancel_slack: Optional[int] = 2,
     policy: Optional[SchedulingPolicy] = None,
     log_search_progress: bool = False,
@@ -2360,6 +2396,7 @@ def solve_schedule(
     _disabled_families: frozenset = frozenset(),
     _canonical_cancel_reps: bool = False,
     _pin_cancels: bool = True,
+    _diagnostic_hint: Optional[DiagnosticHint] = None,
 ) -> Tuple[Optional[ScheduleAssignment], SolveStats]:
     """Build and solve the CP-SAT scheduling model.
 
@@ -2385,23 +2422,10 @@ def solve_schedule(
         time_budget_s: per-solve wall-clock cap.
         max_layers: search horizon.  Should be at least the heuristic's
             layer count.
-        hint_layers: optional warm-start mapping ``node_id -> layer``.
-        hint_routing: optional warm-start mapping
-            ``node_id -> "attn"|"mlp"`` for flex Linears.  When the
-            heuristic placed a standalone Linear in attention vs
-            MLP-bypass, hinting the same routing lets CP-SAT
-            reconstruct the heuristic's solution as a starting
-            incumbent.
-        hint_cancel: optional warm-start mapping ``node_id -> layer``
-            for the cancel layer.  Captures when the heuristic freed
-            each node's columns; combined with ``hint_layers`` this
-            gives a complete schedule the solver can verify and
-            improve from.  ``hint_layers``/``hint_cancel`` are also
-            forwarded to :func:`build_cpsat_model` to widen each hinted
-            node's cancel window just enough to admit the hint (the
-            heuristic defers a free when a layer's heads are full, which
-            otherwise lands past the uniform window and silently
-            invalidates the whole incumbent).
+        incumbent: complete semantic assignment used as the production warm
+            start. Tests and measurement tooling that require a partial or
+            intentionally invalid hint use the private ``_diagnostic_hint``
+            seam with one :class:`DiagnosticHint` value.
         cancel_slack: when not None, restrict each non-pinned node's
             cancel layer to ``[earliest_dead, earliest_dead + K]``
             where ``earliest_dead = max(layer[c] + 1)`` over consumers
@@ -2435,17 +2459,13 @@ def solve_schedule(
     handling (no-incumbent, FEASIBLE-not-OPTIMAL) is the caller's
     responsibility.
     """
+    if incumbent is not None and _diagnostic_hint is not None:
+        raise ValueError("pass either incumbent or _diagnostic_hint, not both")
     if incumbent is not None:
         incumbent.validate(output_node)
-        if any(
-            hint is not None
-            for hint in (hint_layers, hint_routing, hint_cancel, hint_cancel_mech)
-        ):
-            raise ValueError("pass either incumbent or legacy hint mappings, not both")
-        hint_layers = dict(incumbent.node_to_layer)
-        hint_routing = dict(incumbent.node_to_routing)
-        hint_cancel = dict(incumbent.node_to_cancel_layer)
-        hint_cancel_mech = dict(incumbent.node_to_cancel_mech)
+        hint = DiagnosticHint.from_assignment(incumbent)
+    else:
+        hint = _diagnostic_hint
 
     built = build_cpsat_model(
         output_node,
@@ -2461,18 +2481,14 @@ def solve_schedule(
         reserve_heads=reserve_heads,
         reserve_residual=reserve_residual,
         tighten_domains=tighten_domains,
-        hint_layers=hint_layers,
-        hint_cancel=hint_cancel,
+        diagnostic_hint=hint,
         _disabled_families=_disabled_families,
         _canonical_cancel_reps=_canonical_cancel_reps,
         _pin_cancels=_pin_cancels,
     )
     return _solve_built(
         built,
-        hint_layers=hint_layers,
-        hint_routing=hint_routing,
-        hint_cancel=hint_cancel,
-        hint_cancel_mech=hint_cancel_mech,
+        hint=hint,
         max_layers=max_layers,
         time_budget_s=time_budget_s,
         log_search_progress=log_search_progress,
@@ -2493,10 +2509,7 @@ def solve_schedule_from_snapshot(
     flex_routing: bool = True,
     time_budget_s: float = 60.0,
     max_layers: int = 60,
-    hint_layers: Optional[Dict[int, int]] = None,
-    hint_routing: Optional[Dict[int, str]] = None,
-    hint_cancel: Optional[Dict[int, int]] = None,
-    hint_cancel_mech: Optional[Dict[int, str]] = None,
+    incumbent: Optional[ScheduleAssignment] = None,
     cancel_slack: Optional[int] = 2,
     policy: Optional[SchedulingPolicy] = None,
     log_search_progress: bool = False,
@@ -2510,6 +2523,7 @@ def solve_schedule_from_snapshot(
     _disabled_families: frozenset = frozenset(),
     _canonical_cancel_reps: bool = False,
     _pin_cancels: bool = True,
+    _diagnostic_hint: Optional[DiagnosticHint] = None,
 ) -> Tuple[Optional[ScheduleAssignment], SolveStats]:
     """Build and solve the model from a captured snapshot — no live graph.
 
@@ -2518,6 +2532,13 @@ def solve_schedule_from_snapshot(
     ``(assignment, stats)`` as :func:`solve_schedule`; the assignment is keyed
     by the snapshot's node-id space (canonical ids for a loaded fixture).
     """
+    if incumbent is not None and _diagnostic_hint is not None:
+        raise ValueError("pass either incumbent or _diagnostic_hint, not both")
+    hint = (
+        DiagnosticHint.from_assignment(incumbent)
+        if incumbent is not None
+        else _diagnostic_hint
+    )
     built = build_model_from_snapshot(
         problem,
         d=d,
@@ -2531,18 +2552,14 @@ def solve_schedule_from_snapshot(
         reserve_heads=reserve_heads,
         reserve_residual=reserve_residual,
         tighten_domains=tighten_domains,
-        hint_layers=hint_layers,
-        hint_cancel=hint_cancel,
+        diagnostic_hint=hint,
         _disabled_families=_disabled_families,
         _canonical_cancel_reps=_canonical_cancel_reps,
         _pin_cancels=_pin_cancels,
     )
     return _solve_built(
         built,
-        hint_layers=hint_layers,
-        hint_routing=hint_routing,
-        hint_cancel=hint_cancel,
-        hint_cancel_mech=hint_cancel_mech,
+        hint=hint,
         max_layers=max_layers,
         time_budget_s=time_budget_s,
         log_search_progress=log_search_progress,
@@ -2556,10 +2573,7 @@ def solve_schedule_from_snapshot(
 def _solve_built(
     built: BuiltModel,
     *,
-    hint_layers: Optional[Dict[int, int]] = None,
-    hint_routing: Optional[Dict[int, str]] = None,
-    hint_cancel: Optional[Dict[int, int]] = None,
-    hint_cancel_mech: Optional[Dict[int, str]] = None,
+    hint: Optional[DiagnosticHint] = None,
     max_layers: int = 60,
     time_budget_s: float = 60.0,
     log_search_progress: bool = False,
@@ -2592,7 +2606,8 @@ def _solve_built(
         # with the mechanism hint also dropped, no seed completed the hint
         # into ANY incumbent in 600 s (0/5), vs first incumbents at 83-104 s
         # for the unpinned control.
-        hint_cancel = None
+        if hint is not None:
+            hint = hint.without_cancel_layers()
     if log_search_progress and built.cancel_window_delta:
         print(
             f"  cancel windows widened for {len(built.cancel_window_delta)} "
@@ -2617,33 +2632,24 @@ def _solve_built(
     # discard them and explore alternatives — which is exactly why a
     # bad hint is validated loudly here instead of vanishing behind
     # the `if nid in ...` guards below.
-    if any(
-        h is not None
-        for h in (hint_layers, hint_routing, hint_cancel, hint_cancel_mech)
-    ):
+    if hint is not None:
         _validate_hint(
             built,
-            hint_layers,
-            hint_routing,
-            hint_cancel,
-            hint_cancel_mech,
+            hint,
             max_layers=max_layers,
             strict=strict_hint,
         )
-    if hint_layers is not None:
-        for nid, L in hint_layers.items():
+    if hint is not None:
+        for nid, L in hint.layers.items():
             if nid in layer_var and 0 <= L < max_layers:
                 model.AddHint(layer_var[nid], L)
-    if hint_routing is not None:
-        for nid, route in hint_routing.items():
+        for nid, route in hint.routing.items():
             if nid in is_attn:
                 model.AddHint(is_attn[nid], 1 if route == ATTN else 0)
-    if hint_cancel_mech is not None:
-        for nid, mech in hint_cancel_mech.items():
+        for nid, mech in hint.cancel_mech.items():
             if nid in cancel_in_mlp:
                 model.AddHint(cancel_in_mlp[nid], 1 if mech == MLP else 0)
-    if hint_cancel is not None:
-        for nid, L in hint_cancel.items():
+        for nid, L in hint.cancel.items():
             if nid in cancel_layer and 0 <= L <= max_layers:
                 model.AddHint(cancel_layer[nid], L)
             elif nid in input_cancel_layer and 0 <= L <= max_layers:

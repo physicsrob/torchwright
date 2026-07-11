@@ -31,6 +31,7 @@ from ortools.sat.python import cp_model
 from torchwright.compiler.forward.compile import forward_compile
 from torchwright.compiler.forward.cpsat_scheduler import (
     ATTN,
+    DiagnosticHint,
     MLP,
     build_cpsat_model,
     solve_schedule,
@@ -289,10 +290,7 @@ def test_full_hint_with_pin_passes_strict_validation():
     assert donor is not None, f"donor solve failed ({donor_stats.status_name})"
     asg, stats = solve_schedule(
         low,
-        hint_layers=donor.node_to_layer,
-        hint_routing=donor.node_to_routing,
-        hint_cancel=donor.node_to_cancel_layer,
-        hint_cancel_mech=donor.node_to_cancel_mech,
+        _diagnostic_hint=DiagnosticHint.from_assignment(donor),
         strict_hint=True,
         _pin_cancels=True,
         **cfg,

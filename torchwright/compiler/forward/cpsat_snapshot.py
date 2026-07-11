@@ -200,9 +200,9 @@ class FrozenHint:
     """The eager warm-start hint, frozen into the snapshot.
 
     A shared hint improves A/B matching across re-solves (every arm starts
-    from the identical incumbent), and it is exactly what a consumer passes to
-    ``solve_schedule`` as ``hint_layers`` / ``hint_routing`` / ``hint_cancel`` /
-    ``hint_cancel_mech``.
+    from the identical incumbent). Snapshot tooling converts it to the single
+    ``DiagnosticHint`` seam, or to a complete ``ScheduleAssignment`` when all
+    semantic fields are available.
     """
 
     layers: Dict[int, int]
