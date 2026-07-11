@@ -10,7 +10,7 @@ import hashlib
 import os
 import time
 import warnings
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Callable, Dict, Optional, Set, Tuple
 
 import torch
@@ -1384,6 +1384,7 @@ def forward_compile(
     heuristic_failure = None
     solver_candidate = None
     prebuilt_replay_plan = None
+    cached_solver_attempt = None
 
     def _build_heuristic_assignment() -> ScheduleAssignment:
         """Produce the baseline schedule consumed by replay and CP-SAT."""
@@ -1481,6 +1482,25 @@ def forward_compile(
         )
         if cached is not None:
             assignment, _cached_meta = cached
+            _cached_solver_meta = _cached_meta.get("solver_attempt") or {}
+            if _cached_solver_meta:
+                cached_solver_attempt = SolveStats(
+                    status_name=str(_cached_solver_meta.get("status_name", "UNKNOWN")),
+                    objective_value=int(_cached_solver_meta.get("objective_value", -1)),
+                    best_objective_bound=float(
+                        _cached_solver_meta.get("best_objective_bound", -1)
+                    ),
+                    wall_time_s=0.0,
+                    solver_log="",
+                    total_attn_heads=int(
+                        _cached_solver_meta.get("total_attn_heads", -1)
+                    ),
+                    total_mlp_bypass_slots=int(
+                        _cached_solver_meta.get("total_mlp_bypass_slots", -1)
+                    ),
+                    is_optimal=bool(_cached_solver_meta.get("is_optimal", False)),
+                    objective_scale=int(_cached_meta.get("objective_scale", 1)),
+                )
             if verbose:
                 print(
                     f"  CP-SAT schedule cache HIT ({schedule_fp[:12]}...): "
@@ -1499,7 +1519,7 @@ def forward_compile(
                 solver_log="",
                 total_attn_heads=-1,
                 total_mlp_bypass_slots=-1,
-                is_optimal=bool(_cached_meta.get("is_optimal", False)),
+                is_optimal=bool(_cached_solver_meta.get("is_optimal", False)),
                 objective_scale=int(_cached_meta.get("objective_scale", 1)),
             )
 
@@ -1800,10 +1820,27 @@ def forward_compile(
                 bias=bias,
             )
             if cached is not None:
+                selected_meta = _cached_meta.get("selected", {})
+                selected_blocks = selected_meta.get(
+                    "realized_objective_blocks",
+                    _cached_meta.get("realized_objective_blocks"),
+                )
                 provenance = SchedulingProvenance(
-                    origin=str(_cached_meta.get("origin", "solver")),
+                    origin=str(
+                        selected_meta.get(
+                            "origin", _cached_meta.get("origin", "solver")
+                        )
+                    ),
                     delivery="cache",
-                    is_optimal=net.cpsat_solve_stats.is_optimal,
+                    selected_is_optimal=bool(selected_meta.get("is_optimal", False)),
+                    selected_objective=selected_meta.get(
+                        "realized_objective",
+                        _cached_meta.get("realized_objective"),
+                    ),
+                    selected_objective_blocks=(
+                        tuple(selected_blocks) if selected_blocks is not None else None
+                    ),
+                    solver_attempt=cached_solver_attempt,
                 )
             elif assignment is heuristic_assignment:
                 provenance = SchedulingProvenance(
@@ -1815,7 +1852,6 @@ def forward_compile(
                 provenance = SchedulingProvenance(
                     origin="solver",
                     delivery="fresh",
-                    is_optimal=net.cpsat_solve_stats.is_optimal,
                     solver_attempt=net.cpsat_solve_stats,
                 )
             net.schedule_result = ScheduleResult(assignment, provenance)
@@ -1873,7 +1909,7 @@ def forward_compile(
             for layer_idx, planned_layer in enumerate(replay_plan.layers):
                 for node_id in planned_layer.newly_computed_ids:
                     on_node_scheduled(nodes_by_id[node_id], layer_idx)
-    if use_cpsat and cached is None and solver_candidate is not None:
+    if use_cpsat:
         realized_objective = _replay_plan_objective(
             replay_plan,
             cpsat_costs,
@@ -1882,16 +1918,38 @@ def forward_compile(
         realized_objective_blocks = _replay_plan_objective_blocks(
             replay_plan, cpsat_costs
         )
+        provenance = net.schedule_result.provenance
+        if cached is None:
+            selected_is_optimal = bool(
+                net.cpsat_solve_stats.is_optimal
+                and cpsat_costs.alpha > 0
+                and cpsat_costs.beta
+                == cpsat_costs.gamma
+                == cpsat_costs.earliness
+                == cpsat_costs.waste
+                == 0
+            )
+        else:
+            selected_is_optimal = provenance.selected_is_optimal
+        provenance = replace(
+            provenance,
+            selected_is_optimal=selected_is_optimal,
+            selected_objective=realized_objective,
+            selected_objective_blocks=realized_objective_blocks,
+        )
+        net.schedule_result = ScheduleResult(assignment, provenance)
+
+    if use_cpsat and cached is None and solver_candidate is not None:
+        provenance = net.schedule_result.provenance
+        solver_attempt = provenance.solver_attempt
         stored = store_assignment(
             schedule_fp,
             assignment,
             {
                 "status_name": net.cpsat_solve_stats.status_name,
                 "best_objective_bound": net.cpsat_solve_stats.best_objective_bound,
-                "is_optimal": net.cpsat_solve_stats.is_optimal,
-                "origin": (
-                    "heuristic" if assignment is heuristic_assignment else "solver"
-                ),
+                "is_optimal": provenance.selected_is_optimal,
+                "origin": provenance.origin,
                 "optimize": optimize,
                 "d": d,
                 "d_head": d_head,
@@ -1900,6 +1958,24 @@ def forward_compile(
                 "realized_objective_blocks": realized_objective_blocks,
                 "objective_scale": net.cpsat_solve_stats.objective_scale,
                 "costs": weighted_cost_key,
+                "selected": {
+                    "origin": provenance.origin,
+                    "is_optimal": provenance.selected_is_optimal,
+                    "realized_objective": provenance.selected_objective,
+                    "realized_objective_blocks": provenance.selected_objective_blocks,
+                },
+                "solver_attempt": (
+                    {
+                        "status_name": solver_attempt.status_name,
+                        "objective_value": solver_attempt.objective_value,
+                        "best_objective_bound": solver_attempt.best_objective_bound,
+                        "total_attn_heads": solver_attempt.total_attn_heads,
+                        "total_mlp_bypass_slots": solver_attempt.total_mlp_bypass_slots,
+                        "is_optimal": solver_attempt.is_optimal,
+                    }
+                    if solver_attempt is not None
+                    else None
+                ),
             },
             output_node=output_node,
         )

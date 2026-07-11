@@ -17,6 +17,13 @@
   were removed. Recompile source graphs directly to HF.
 - The obsolete `calculator_v2` compatibility name was removed; use
   `examples.calculator_simple`.
+- HF bundle builders now stage and validate a complete bundle before replacing
+  the destination. A failed compile leaves an existing published bundle
+  untouched, and successful recompilation removes stale files.
+- Token compilation now requires exactly one `Embedding` reachable from the
+  output and verifies that it is the same node supplied to the HF API.
+- Schedule metadata distinguishes the emitted schedule and its certified
+  optimality from the independent CP-SAT attempt that proposed a candidate.
 
 There are intentionally no compatibility aliases. Pin an older release to
 load historical Python APIs, or recompile the source graph with the current

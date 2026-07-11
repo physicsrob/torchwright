@@ -1,4 +1,5 @@
 import dataclasses
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -10,7 +11,13 @@ from torchwright.compiler.forward.compile import (
     _replay_plan_objective,
     forward_compile,
 )
-from torchwright.compiler.forward.cpsat_scheduler import Costs, ScheduleAssignment
+from torchwright.compiler.forward.cpsat_scheduler import (
+    Costs,
+    ScheduleAssignment,
+    ScheduleResult,
+    SchedulingProvenance,
+    SolveStats,
+)
 from torchwright.compiler.forward.replay_plan import (
     PlannedAttentionOp,
     PlannedLayer,
@@ -26,6 +33,7 @@ from torchwright.compiler.token_model import (
     CompileHeader,
     LayerShape,
     make_layer_callback,
+    schedule_provenance,
 )
 from torchwright.graph import Attn, Linear
 from torchwright.ops.inout_nodes import create_input
@@ -182,9 +190,7 @@ def test_trivial_graph_uses_placeholder_layer_without_planned_operations():
         output_node=x,
         optimize=0,
         verbose=False,
-        on_layer_compiled=make_layer_callback(
-            CompileHeader(16, 16, True, True), sink
-        ),
+        on_layer_compiled=make_layer_callback(CompileHeader(16, 16, True, True), sink),
     )
 
     assert net.schedule_result.assignment.n_layers == 0
@@ -297,9 +303,7 @@ def test_weighted_cache_ratchets_on_realized_objective(tmp_path, monkeypatch):
     )
 
 
-def test_weighted_cache_compares_blocks_across_different_scales(
-    tmp_path, monkeypatch
-):
+def test_weighted_cache_compares_blocks_across_different_scales(tmp_path, monkeypatch):
     monkeypatch.setenv("TW_SCHEDULE_CACHE_DIR", str(tmp_path))
     x = create_input("x", 1)
     y = Linear(x, torch.ones(1, 1), torch.zeros(1))
@@ -332,3 +336,39 @@ def test_weighted_cache_compares_blocks_across_different_scales(
         },
         y,
     )
+
+
+def test_artifact_provenance_does_not_transfer_solver_optimality_to_selection():
+    stats = SolveStats(
+        status_name="OPTIMAL",
+        objective_value=10,
+        best_objective_bound=10,
+        wall_time_s=1.0,
+        solver_log="",
+        total_attn_heads=1,
+        total_mlp_bypass_slots=0,
+        is_optimal=True,
+    )
+    assignment = ScheduleAssignment({}, {}, {}, 0)
+    compiled = SimpleNamespace(
+        cpsat_solve_stats=stats,
+        schedule_result=ScheduleResult(
+            assignment,
+            SchedulingProvenance(
+                origin="heuristic",
+                delivery="fresh",
+                selected_is_optimal=False,
+                selected_objective=9,
+                selected_objective_blocks=(9, 0),
+                solver_attempt=stats,
+            ),
+        ),
+    )
+
+    provenance = schedule_provenance(compiled, optimize=1).to_dict()
+
+    assert provenance["selected_origin"] == "heuristic"
+    assert provenance["selected_is_optimal"] is False
+    assert provenance["selected_objective"] == 9
+    assert provenance["solver_status"] == "OPTIMAL"
+    assert provenance["solver_is_optimal"] is True

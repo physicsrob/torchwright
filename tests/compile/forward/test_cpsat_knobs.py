@@ -231,6 +231,23 @@ def test_schedule_cache_round_trip(tmp_path, monkeypatch):
     net2 = forward_compile(output_node=out2, **kw)
     assert net2.cpsat_solve_stats.status_name == "CACHED"
     assert len(net2.layers) == len(net1.layers)
+    fresh_provenance = net1.schedule_result.provenance
+    cached_provenance = net2.schedule_result.provenance
+    assert fresh_provenance.delivery == "fresh"
+    assert cached_provenance.delivery == "cache"
+    assert cached_provenance.origin == fresh_provenance.origin
+    assert cached_provenance.selected_objective == fresh_provenance.selected_objective
+    assert (
+        cached_provenance.selected_objective_blocks
+        == fresh_provenance.selected_objective_blocks
+    )
+    assert cached_provenance.selected_is_optimal == fresh_provenance.selected_is_optimal
+    assert cached_provenance.solver_attempt is not None
+    assert fresh_provenance.solver_attempt is not None
+    assert (
+        cached_provenance.solver_attempt.status_name
+        == fresh_provenance.solver_attempt.status_name
+    )
 
     inputs = {"x": torch.randn(3, 8)}
     torch.testing.assert_close(
@@ -441,7 +458,8 @@ def test_deferred_cancel_hint_rejected_without_widening():
     aware = build_cpsat_model(
         out,
         diagnostic_hint=DiagnosticHint(layers=hint_layers, cancel=hint_cancel),
-        _pin_cancels=False, **build_kw
+        _pin_cancels=False,
+        **build_kw,
     )
     assert aware.cancel_window_delta == {target_id: 1}
     status = _hard_fix_and_solve(aware, hint_layers, hint_routing, hint_cancel)
@@ -512,7 +530,8 @@ def test_strict_hint_validation_raises_on_invalid_hint():
                 layers=hint_layers,
                 cancel=bad_cancel,
             ),
-            _pin_cancels=False, **_SOLVE_KW
+            _pin_cancels=False,
+            **_SOLVE_KW,
         )
     # Default mode keeps the fall-back-don't-fail contract: still solves.
     assert assignment2 is not None

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from pathlib import Path
 
 import pytest
 
@@ -14,12 +15,14 @@ from torchwright.compiler.hf import (
     build_fast_tokenizer,
     compile_hf_bundle,
     compile_to_hf,
+    save_hf_bundle,
 )
-from torchwright.graph import Embedding
+from torchwright.graph import Concatenate, Embedding
 
 
 def _graph():
     import examples.adder as adder
+
     old = adder.max_digits
     adder.max_digits = 1
     try:
@@ -37,6 +40,7 @@ def direct():
 
 def test_direct_phi3_is_stock_fp32_eval(direct):
     from transformers import Phi3ForCausalLM
+
     model, _ = direct
     assert isinstance(model, Phi3ForCausalLM)
     assert not model.training
@@ -57,6 +61,7 @@ def test_padding_and_fusion_are_zero_filled(direct):
 def test_stock_streaming_bundle_loads_without_custom_code(tmp_path, monkeypatch):
     import importlib
     from transformers import AutoModelForCausalLM
+
     hf_build = importlib.import_module("torchwright.compiler.hf.build")
     monkeypatch.setattr(
         hf_build.tempfile,
@@ -73,6 +78,118 @@ def test_stock_streaming_bundle_loads_without_custom_code(tmp_path, monkeypatch)
     assert "auto_map" not in config
     loaded = AutoModelForCausalLM.from_pretrained(tmp_path)
     assert loaded.config.model_type == "phi3"
+
+
+def test_failed_bundle_compile_preserves_existing_destination(tmp_path):
+    destination = tmp_path / "published"
+    destination.mkdir()
+    sentinel = destination / "existing.txt"
+    sentinel.write_text("keep me")
+    out, emb, d, d_head = _graph()
+
+    with pytest.raises(ValueError, match="bos_token"):
+        compile_hf_bundle(
+            out,
+            emb,
+            destination,
+            d=d,
+            d_head=d_head,
+            bos_token="<missing-bos>",
+            write_tokenizer=False,
+        )
+
+    assert {path.name for path in destination.iterdir()} == {"existing.txt"}
+    assert sentinel.read_text() == "keep me"
+    assert not list(tmp_path.glob(".published.staging-*"))
+
+
+def test_publish_swap_failure_rolls_back_existing_destination(tmp_path, monkeypatch):
+    import torchwright.compiler.hf.build as hf_build
+
+    destination = tmp_path / "published"
+    destination.mkdir()
+    (destination / "existing.txt").write_text("old")
+    real_replace = hf_build.os.replace
+
+    def fail_staging_publish(source, target):
+        if (
+            ".published.staging-" in str(source)
+            and not str(source).endswith(".previous")
+            and Path(target) == destination
+        ):
+            raise OSError("simulated publish failure")
+        return real_replace(source, target)
+
+    monkeypatch.setattr(hf_build.os, "replace", fail_staging_publish)
+    with pytest.raises(OSError, match="simulated publish failure"):
+        with hf_build._staged_bundle_directory(destination) as staging:
+            (Path(staging) / "new.txt").write_text("new")
+
+    assert {path.name for path in destination.iterdir()} == {"existing.txt"}
+    assert (destination / "existing.txt").read_text() == "old"
+    assert not list(tmp_path.glob(".published.staging-*"))
+
+
+def test_successful_bundle_publish_replaces_stale_destination(tmp_path):
+    destination = tmp_path / "published"
+    destination.mkdir()
+    (destination / "stale.txt").write_text("old")
+    out, emb, d, d_head = _graph()
+
+    compile_hf_bundle(
+        out,
+        emb,
+        destination,
+        d=d,
+        d_head=d_head,
+        write_tokenizer=False,
+    )
+
+    assert not (destination / "stale.txt").exists()
+    assert (destination / "model.safetensors.index.json").is_file()
+
+
+def test_failed_save_bundle_preserves_existing_destination(tmp_path, direct):
+    model, _ = direct
+    destination = tmp_path / "published"
+    destination.mkdir()
+    sentinel = destination / "existing.txt"
+    sentinel.write_text("keep me")
+
+    with pytest.raises(IndexError):
+        save_hf_bundle(model, ["too-short"], destination)
+
+    assert {path.name for path in destination.iterdir()} == {"existing.txt"}
+    assert sentinel.read_text() == "keep me"
+
+
+def test_bundle_rejects_foreign_same_shape_embedding_before_writing(tmp_path):
+    out, emb, d, d_head = _graph()
+    foreign = Embedding(
+        list(emb.tokenizer.vocab)[1:],
+        d_embed=emb.d_embed,
+    )
+
+    with pytest.raises(ValueError, match="not the Embedding reachable"):
+        compile_hf_bundle(out, foreign, tmp_path / "bundle", d=d, d_head=d_head)
+
+    assert not (tmp_path / "bundle").exists()
+
+
+def test_bundle_rejects_multiple_reachable_embeddings_before_writing(tmp_path):
+    first = Embedding(["a"], d_embed=2, table=torch.eye(2), special_tokens=["<unk>"])
+    second = Embedding(["a"], d_embed=2, table=torch.eye(2), special_tokens=["<unk>"])
+
+    with pytest.raises(ValueError, match="exactly one Embedding.*found 2"):
+        compile_hf_bundle(
+            Concatenate([first, second]),
+            first,
+            tmp_path / "bundle",
+            d=16,
+            d_head=16,
+        )
+
+    assert not (tmp_path / "bundle").exists()
 
 
 def test_trivial_graph_streaming_announces_placeholder_shape(tmp_path):

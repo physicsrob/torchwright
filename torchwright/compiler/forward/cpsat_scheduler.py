@@ -423,8 +423,15 @@ class SchedulingProvenance:
 
     origin: str  # "heuristic" or "solver"
     delivery: str  # "fresh" or "cache"
-    is_optimal: bool = False
+    selected_is_optimal: bool = False
+    selected_objective: Optional[int] = None
+    selected_objective_blocks: Optional[Tuple[int, int]] = None
     solver_attempt: Optional[SolveStats] = None
+
+    @property
+    def is_optimal(self) -> bool:
+        """Compatibility alias for the selected schedule's certification."""
+        return self.selected_is_optimal
 
 
 @dataclass(frozen=True)

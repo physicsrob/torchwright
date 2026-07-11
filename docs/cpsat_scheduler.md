@@ -110,6 +110,14 @@ The selected plan is emitted without replaying its assignment. With weighted
 `Costs`, incumbent and solver-candidate plans are each built at most once and
 compared using realized head, bypass-slot, earliness, and residual-waste costs.
 
+`ScheduleResult` records the emitted assignment separately from the solver
+attempt. Its provenance names the selected origin (`heuristic` or `solver`),
+delivery (`fresh` or `cache`), realized objective, and selected-schedule
+optimality certificate. `SolveStats` remains attached as `solver_attempt`; an
+optimal solver candidate therefore never certifies a different heuristic plan
+that wins the realized replay comparison. The schedule cache persists both
+records and reconstructs the same distinction on a hit.
+
 ### `ScheduleAssignment`
 
 The contract between the solver and the replay. A frozen dataclass:

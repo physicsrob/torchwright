@@ -101,20 +101,8 @@ def _write_meta(onnx_path: str, meta: dict) -> str:
 
 
 def _schedule_provenance(compiled, optimize: int) -> dict:
-    """Solver provenance for the artifact meta.
-
-    ``compiled.cpsat_solve_stats`` carries the CP-SAT outcome (including the
-    synthetic CACHED stats on a schedule-cache hit) but was dropped at export,
-    so a heuristic-fallback artifact was indistinguishable from a real solve.
-    ``status`` values: OPTIMAL / FEASIBLE / CACHED mean the artifact runs a
-    CP-SAT schedule; UNKNOWN / INFEASIBLE with ``optimize > 0`` mean the
-    solver failed and the artifact ships the heuristic fallback; ``null``
-    means the solver never ran (``optimize == 0``).
-    """
-    values = schedule_provenance(compiled, optimize).to_dict()
-    # Preserve the sidecar's explicit null status for heuristic compiles.
-    values.setdefault("status", None)
-    return values
+    """Selected-schedule provenance plus the independent solver attempt."""
+    return schedule_provenance(compiled, optimize).to_dict()
 
 
 def debug_meta_path_for(onnx_path: str) -> str:
@@ -772,9 +760,7 @@ def _make_stream_layer_weights_cb(
             nh, hd = attn.n_heads, attn.n_heads * d_head
             per_layer_n_heads.append(nh)
             if per_layer_rotary is not None:
-                per_layer_rotary.append(
-                    {"base": attn.rope_base, "d_rot": attn.d_rot}
-                )
+                per_layer_rotary.append({"base": attn.rope_base, "d_rot": attn.d_rot})
 
             def emit(name: str, arr: np.ndarray) -> None:
                 dense_tp, sparse_tp = _tensor_to_proto(name, arr)
@@ -786,10 +772,12 @@ def _make_stream_layer_weights_cb(
             emit(f"l{i}_WO", attn.wo)
             _add_int64_init(
                 f"l{i}_qkv_view_shape",
-                np.array([0, nh, d_head], dtype=np.int64), dense_inits,
+                np.array([0, nh, d_head], dtype=np.int64),
+                dense_inits,
             )
             _add_int64_init(
-                f"l{i}_ctx_flat_shape", np.array([0, hd], dtype=np.int64),
+                f"l{i}_ctx_flat_shape",
+                np.array([0, hd], dtype=np.int64),
                 dense_inits,
             )
 

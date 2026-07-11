@@ -57,7 +57,10 @@ The default is a stock `Phi3ForCausalLM` contract: SwiGLU graph, biasless
 projections, RMSNorm, no custom code, and no `trust_remote_code`. A legacy
 ReLU graph must opt in explicitly with `architecture="custom"`, which produces
 `TorchwrightCustomForCausalLM`. `compile_hf_bundle` writes sharded safetensors
-one layer at a time for large-model publishing.
+one layer at a time for large-model publishing. Publication is transactional:
+the destination is replaced only after the staged config, tensor manifest, and
+tokenizer validate. Token artifacts currently require one graph `Embedding`,
+and the supplied `embedding` argument must be that exact node.
 
 
 ## Key Concepts

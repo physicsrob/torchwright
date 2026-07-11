@@ -43,10 +43,15 @@ class CompileProfile(str, Enum):
 @dataclass(frozen=True)
 class ScheduleProvenance:
     optimize: int
-    status: Optional[str]
-    objective: Optional[float] = None
-    best_bound: Optional[float] = None
-    is_optimal: Optional[bool] = None
+    selected_origin: Optional[str] = None
+    delivery: Optional[str] = None
+    selected_objective: Optional[int] = None
+    selected_objective_blocks: Optional[tuple[int, int]] = None
+    selected_is_optimal: Optional[bool] = None
+    solver_status: Optional[str] = None
+    solver_objective: Optional[float] = None
+    solver_best_bound: Optional[float] = None
+    solver_is_optimal: Optional[bool] = None
 
     def to_dict(self) -> dict:
         return {key: value for key, value in asdict(self).items() if value is not None}
@@ -222,22 +227,30 @@ def resolve_rope(layers: list[CompiledLayerWeights], d_head: int) -> tuple[float
 
 
 def schedule_provenance(compiled, optimize: int) -> ScheduleProvenance:
-    stats = getattr(compiled, "cpsat_solve_stats", None)
-    if stats is None:
-        return ScheduleProvenance(optimize=int(optimize), status=None)
+    result = getattr(compiled, "schedule_result", None)
+    if result is None:
+        return ScheduleProvenance(optimize=int(optimize))
+    selected = result.provenance
+    stats = selected.solver_attempt
     return ScheduleProvenance(
         optimize=int(optimize),
-        status=stats.status_name,
-        objective=stats.objective_value,
-        best_bound=stats.best_objective_bound,
-        is_optimal=stats.is_optimal,
+        selected_origin=selected.origin,
+        delivery=selected.delivery,
+        selected_objective=selected.selected_objective,
+        selected_objective_blocks=selected.selected_objective_blocks,
+        selected_is_optimal=selected.selected_is_optimal,
+        solver_status=stats.status_name if stats is not None else None,
+        solver_objective=stats.objective_value if stats is not None else None,
+        solver_best_bound=(stats.best_objective_bound if stats is not None else None),
+        solver_is_optimal=stats.is_optimal if stats is not None else None,
     )
 
 
 def build_token_weights(compiled, output_node: Node, embedding: Embedding, d: int):
     """Fold token placement, literals and RMS constants into full-width weights."""
     assignment = compiled.residual_assignment
-    assert assignment is not None and compiled.layers
+    if assignment is None or not compiled.layers:
+        raise ValueError("compiled model has no residual assignment or layers")
     in_state = compiled.layers[0].attn.in_state
     out_state = compiled.layers[-1].mlp.out_state
     embedding_indices = None
@@ -245,15 +258,25 @@ def build_token_weights(compiled, output_node: Node, embedding: Embedding, d: in
     for node in assignment.get_nodes(in_state):
         indices = assignment.get_node_indices(in_state, node)
         if isinstance(node, Embedding):
-            embedding_indices = indices
+            if node is embedding:
+                embedding_indices = indices
+            else:
+                raise ValueError(
+                    "compiled residual assignment contains an Embedding other than "
+                    "the supplied embedding"
+                )
         elif isinstance(node, LiteralValue):
             literal_seeds.extend(zip(indices, map(float, node.value)))
         elif not isinstance(node, (Concatenate, InputNode)):
             raise AssertionError(f"unexpected input-state node {type(node).__name__}")
-    assert embedding_indices is not None, "No Embedding node in residual assignment"
+    if embedding_indices is None:
+        raise ValueError("supplied embedding is absent from the residual assignment")
     compact = embedding.table.detach().cpu().numpy().astype(np.float32, copy=False)
     vocab_size = compact.shape[0]
-    assert compact.shape[1] == len(embedding_indices)
+    if compact.shape[1] != len(embedding_indices):
+        raise ValueError(
+            "embedding width does not match its compiled residual placement"
+        )
     embed = np.zeros((vocab_size, d), dtype=np.float32)
     embed[:, embedding_indices] = compact
     rms = compiled.rms_norm_spec
@@ -263,7 +286,8 @@ def build_token_weights(compiled, output_node: Node, embedding: Embedding, d: in
     for col, value in literal_seeds:
         embed[:, col] = value
     output_indices = assignment.get_node_indices(out_state, output_node)
-    assert len(output_indices) == compact.shape[1]
+    if len(output_indices) != compact.shape[1]:
+        raise ValueError("output width does not match the token embedding width")
     lm_head = np.zeros((vocab_size, d), dtype=np.float32)
     lm_head[:, output_indices] = compact
     gain = np.full(d, rms.gain, dtype=np.float32) if rms is not None else None
