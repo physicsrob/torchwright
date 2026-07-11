@@ -32,7 +32,8 @@ import os
 import time
 import warnings
 from dataclasses import dataclass, field
-from typing import Dict, FrozenSet, List, Optional, Set, Tuple
+from types import MappingProxyType
+from typing import Dict, FrozenSet, List, Mapping, Optional, Set, Tuple
 
 from ortools.sat.python import cp_model
 
@@ -146,9 +147,9 @@ class ScheduleAssignment:
     cancel layer so the replay reclaims their columns once consumed.
     """
 
-    node_to_layer: Dict[int, int]
-    node_to_cancel_layer: Dict[int, int]
-    node_to_routing: Dict[int, str]
+    node_to_layer: Mapping[int, int]
+    node_to_cancel_layer: Mapping[int, int]
+    node_to_routing: Mapping[int, str]
     n_layers: int
     # Which sublayer each node's cancel runs in: "attn" (a batched attention
     # cancel head) or "mlp" (a ``cancel_bypass`` MLP op).  Keyed by the same
@@ -156,7 +157,134 @@ class ScheduleAssignment:
     # always attention-cancelled and are omitted (the replay defaults absent
     # nodes to "attn").  ``DirectedLayerScheduler`` routes each directed cancel
     # to its assigned mechanism.
-    node_to_cancel_mech: Dict[int, str] = field(default_factory=dict)
+    node_to_cancel_mech: Mapping[int, str] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        # ``frozen=True`` does not freeze nested dictionaries. Defensive,
+        # canonical copies keep validation, cache identity, and replay stable
+        # even if a caller later mutates the mappings used to construct us.
+        for name in (
+            "node_to_layer",
+            "node_to_cancel_layer",
+            "node_to_routing",
+            "node_to_cancel_mech",
+        ):
+            value = getattr(self, name)
+            object.__setattr__(
+                self, name, MappingProxyType(dict(sorted(value.items())))
+            )
+
+    @classmethod
+    def from_heuristic_trace(
+        cls,
+        output_node: Node,
+        *,
+        node_to_layer: Dict[int, int],
+        node_to_routing: Dict[int, str],
+        observed_cancel_layer: Dict[int, int],
+        observed_cancel_mech: Dict[int, str],
+        n_layers: int,
+    ) -> "ScheduleAssignment":
+        """Complete and validate a schedule-only heuristic trace."""
+        gm = build_graph_model(output_node)
+        sched_ids = {node.node_id for node in gm.schedulable}
+        input_ids = {node.node_id for node in gm.input_nodes}
+        layer_map = {nid: layer for nid, layer in node_to_layer.items() if nid in sched_ids}
+        if set(layer_map) != sched_ids:
+            missing = sorted(sched_ids - set(layer_map))
+            extra = sorted(set(layer_map) - sched_ids)
+            raise ValueError(
+                f"heuristic trace layer coverage mismatch: missing={missing}, extra={extra}"
+            )
+        if set(node_to_routing) != sched_ids:
+            missing = sorted(sched_ids - set(node_to_routing))
+            extra = sorted(set(node_to_routing) - sched_ids)
+            raise ValueError(
+                f"heuristic trace routing coverage mismatch: missing={missing}, extra={extra}"
+            )
+        cancel = {nid: int(n_layers) for nid in sched_ids | input_ids}
+        unknown_cancel = set(observed_cancel_layer) - (sched_ids | input_ids)
+        if unknown_cancel:
+            raise ValueError(
+                f"heuristic trace has cancellation for unknown nodes: {sorted(unknown_cancel)}"
+            )
+        cancel.update({int(k): int(v) for k, v in observed_cancel_layer.items()})
+        assignment = cls(
+            node_to_layer=layer_map,
+            node_to_cancel_layer=cancel,
+            node_to_routing=dict(node_to_routing),
+            n_layers=int(n_layers),
+            node_to_cancel_mech={
+                nid: mech for nid, mech in observed_cancel_mech.items()
+                if nid in sched_ids
+            },
+        )
+        assignment.validate(output_node)
+        return assignment
+
+    def validate(self, output_node: Node) -> None:
+        gm = build_graph_model(output_node)
+        sched_ids = {node.node_id for node in gm.schedulable}
+        input_ids = {node.node_id for node in gm.input_nodes}
+        if set(self.node_to_layer) != sched_ids:
+            raise ValueError("assignment node_to_layer does not cover schedulable nodes")
+        if set(self.node_to_routing) != sched_ids:
+            raise ValueError("assignment node_to_routing does not cover schedulable nodes")
+        if not (sched_ids | input_ids) <= set(self.node_to_cancel_layer):
+            raise ValueError("assignment cancellation map is incomplete")
+        for nid, layer in self.node_to_layer.items():
+            if not 0 <= int(layer) < self.n_layers:
+                raise ValueError(f"node {nid} has invalid layer {layer}")
+            if self.node_to_routing[nid] not in (ATTN, MLP):
+                raise ValueError(f"node {nid} has invalid routing {self.node_to_routing[nid]!r}")
+            cancel = self.node_to_cancel_layer[nid]
+            if not int(layer) <= int(cancel) <= self.n_layers:
+                raise ValueError(
+                    f"node {nid} cancel layer {cancel} precedes birth {layer}"
+                )
+        if set(self.node_to_cancel_mech) - sched_ids:
+            raise ValueError("assignment has cancellation mechanisms for non-schedulable nodes")
+        if any(mech not in (ATTN, MLP) for mech in self.node_to_cancel_mech.values()):
+            raise ValueError("assignment has an invalid cancellation mechanism")
+
+    def canonical_key(self) -> tuple:
+        """Stable tie-break independent of mapping insertion order."""
+        return (
+            self.n_layers,
+            tuple(self.node_to_layer.items()),
+            tuple(self.node_to_routing.items()),
+            tuple(self.node_to_cancel_layer.items()),
+            tuple(self.node_to_cancel_mech.items()),
+        )
+
+
+def choose_dominating_assignment(
+    costs: Costs,
+    incumbent: Optional[ScheduleAssignment],
+    candidate: Optional[ScheduleAssignment],
+) -> Optional[ScheduleAssignment]:
+    """Select a candidate only when its comparable objective dominates.
+
+    Pure-depth is the production default and is fully evaluable from an
+    assignment. Resource-weighted objectives also depend on concrete replay
+    choices (notably free-Add head cost), so CP-SAT's objective governs those
+    until ReplayPlan exposes the physical counts at this boundary.
+    """
+    if incumbent is None:
+        return candidate
+    if candidate is None:
+        return incumbent
+    pure_depth = (
+        costs.alpha > 0
+        and costs.beta == costs.gamma == costs.earliness == costs.waste == 0
+    )
+    if not pure_depth:
+        return candidate
+    if candidate.n_layers < incumbent.n_layers:
+        return candidate
+    if candidate.n_layers > incumbent.n_layers:
+        return incumbent
+    return min((incumbent, candidate), key=lambda item: item.canonical_key())
 
 
 @dataclass(frozen=True)
@@ -187,6 +315,22 @@ class SolveStats:
     # logged post-hoc so a null measurement result can be read as "no effect"
     # vs "no parked nodes to deduplicate."  -1 when no feasible solution.
     parked_count: int = -1
+
+
+@dataclass(frozen=True)
+class SchedulingProvenance:
+    """Orthogonal origin/delivery metadata for a selected assignment."""
+
+    origin: str  # "heuristic" or "solver"
+    delivery: str  # "fresh" or "cache"
+    is_optimal: bool = False
+    solver_attempt: Optional[SolveStats] = None
+
+
+@dataclass(frozen=True)
+class ScheduleResult:
+    assignment: ScheduleAssignment
+    provenance: SchedulingProvenance
 
 
 # Routing constants used both by this module and by the probe script.
@@ -2145,6 +2289,7 @@ def solve_schedule(
     flex_routing: bool = True,
     time_budget_s: float = 60.0,
     max_layers: int = 60,
+    incumbent: Optional[ScheduleAssignment] = None,
     hint_layers: Optional[Dict[int, int]] = None,
     hint_routing: Optional[Dict[int, str]] = None,
     hint_cancel: Optional[Dict[int, int]] = None,
@@ -2237,6 +2382,20 @@ def solve_schedule(
     handling (no-incumbent, FEASIBLE-not-OPTIMAL) is the caller's
     responsibility.
     """
+    if incumbent is not None:
+        incumbent.validate(output_node)
+        if any(
+            hint is not None
+            for hint in (hint_layers, hint_routing, hint_cancel, hint_cancel_mech)
+        ):
+            raise ValueError(
+                "pass either incumbent or legacy hint mappings, not both"
+            )
+        hint_layers = dict(incumbent.node_to_layer)
+        hint_routing = dict(incumbent.node_to_routing)
+        hint_cancel = dict(incumbent.node_to_cancel_layer)
+        hint_cancel_mech = dict(incumbent.node_to_cancel_mech)
+
     built = build_cpsat_model(
         output_node,
         pos_encoding,

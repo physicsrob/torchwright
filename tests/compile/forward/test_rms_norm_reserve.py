@@ -6,7 +6,7 @@ onnxruntime is checked in ``tests/hf/test_rms_norm_identity.py``.
 
 The energy-bound test permanently encodes the finding that broke the shipping
 graph: q=30 was validated only on ``calculator_simple`` (data energy ~1e8) and
-silently broke the identity on ``calculator_v2`` (squaring path reaches
+silently broke the identity on ``calculator_simple`` (squaring path reaches
 Sigma data^2 ~ 2.6e13).  The identity holds iff Sigma data^2 stays under the
 constant's reduction half-ULP ~ 2^(2q-24).
 """
@@ -303,7 +303,7 @@ def test_energy_bound_identity_holds_below_and_breaks_above():
     bound = 2.0 ** (2 * q - 24)  # ~6.9e10
     # calculator_simple-scale energy: well under the bound -> identity holds
     assert _rmsnorm_identity_holds(d, n_const, q, data_energy=1e8)
-    # calculator_v2 squaring-path energy: over the bound -> identity breaks
+    # calculator_simple squaring-path energy: over the bound -> identity breaks
     assert not _rmsnorm_identity_holds(d, n_const, q, data_energy=2.6e13)
     # the default q clears the same high energy with margin
     assert _rmsnorm_identity_holds(d, n_const, _RMS_NORM_CONST_EXP, data_energy=2.6e13)

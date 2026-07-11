@@ -56,6 +56,16 @@ from torchwright.compiler.forward.compile import (
     forward_compile,
     rms_norm_width_supported,
 )
+from torchwright.compiler.token_model import (
+    CompileHeader,
+    CompileProfile,
+    ReluLayerWeights,
+    SwishLayerWeights,
+    TokenModelSpec,
+    build_token_weights,
+    make_layer_callback,
+    schedule_provenance,
+)
 from torchwright.graph import Concatenate, Embedding, LiteralValue, Node
 from torchwright.graph.attn import CAUSAL_MASK_SENTINEL
 from torchwright.graph.rope import ROPE_BASE
@@ -68,8 +78,7 @@ from torchwright.graph.misc import InputNode
 # alone (docs/no_bias_plan.md Phase N0; bit-identical values).  v4 was the
 # rotary positional encoding (no `pos_encoding_full` table) plus the optional
 # identity RMSNorm.  The binary initializer set differs from every earlier
-# version, so an older artifact must be re-exported rather than loaded
-# against this converter.
+# version, so an older artifact must be re-exported rather than loaded.
 TOKEN_META_FORMAT = "torchwright.token.v5"
 DEBUG_META_FORMAT = "torchwright.debug.v1"
 
@@ -102,16 +111,10 @@ def _schedule_provenance(compiled, optimize: int) -> dict:
     solver failed and the artifact ships the heuristic fallback; ``null``
     means the solver never ran (``optimize == 0``).
     """
-    stats = getattr(compiled, "cpsat_solve_stats", None)
-    if stats is None:
-        return {"optimize": int(optimize), "status": None}
-    return {
-        "optimize": int(optimize),
-        "status": stats.status_name,
-        "objective": stats.objective_value,
-        "best_bound": stats.best_objective_bound,
-        "is_optimal": stats.is_optimal,
-    }
+    values = schedule_provenance(compiled, optimize).to_dict()
+    # Preserve the sidecar's explicit null status for heuristic compiles.
+    values.setdefault("status", None)
+    return values
 
 
 def debug_meta_path_for(onnx_path: str) -> str:
@@ -759,118 +762,63 @@ def _make_stream_layer_weights_cb(
     Appends each layer's ``nh`` to ``per_layer_n_heads`` for Phase 2.
     """
 
-    def on_layer_compiled(i: int, layer) -> None:
-        attn = layer.attn.attn
-        mlp = layer.mlp
+    class OnnxLayerSink:
+        def begin(self, header):
+            assert header.d == d and header.d_head == d_head
+            assert header.trim_heads == trim_heads and header.bias == bias
 
-        # Trim each layer here, before its tensors are read and nulled
-        # below.  ``used_heads`` (attn) and the per-slot weight columns
-        # (mlp) were populated by write_attn_sublayer/write_mlp_sublayer
-        # during this layer's compile, so both trims see final counts.
-        if trim_heads:
-            attn.trim_unused_heads()  # n_heads -> used heads (KV cache + attn MatMuls)
-            mlp.trim_unused_slots()  # d_hidden -> used slots (MLP MatMuls)
+        def write_layer(self, i, weights):
+            attn = weights.attention
+            nh, hd = attn.n_heads, attn.n_heads * d_head
+            per_layer_n_heads.append(nh)
+            if per_layer_rotary is not None:
+                per_layer_rotary.append(
+                    {"base": attn.rope_base, "d_rot": attn.d_rot}
+                )
 
-        nh = attn.n_heads  # post-trim head count
-        hd = nh * d_head
-        per_layer_n_heads.append(nh)
+            def emit(name: str, arr: np.ndarray) -> None:
+                dense_tp, sparse_tp = _tensor_to_proto(name, arr)
+                _append_proto(dense_tp, sparse_tp, dense_inits, sparse_inits)
 
-        # RoPE on the one global grid (rotate_half over the rotary front d_rot,
-        # rotation by absolute position).  Record the shared base and the
-        # partial-rotary width; the rotation is emitted unconditionally below
-        # (there is no per-head enable).  base/d_rot are asserted global in
-        # _add_rope_inits.
-        if per_layer_rotary is not None:
-            per_layer_rotary.append(
-                {
-                    "base": getattr(attn, "rope_base", None),
-                    "d_rot": getattr(attn, "rope_d_rot", None),
-                }
+            emit(f"l{i}_WQ", attn.wq)
+            emit(f"l{i}_WK", attn.wk)
+            emit(f"l{i}_WV", attn.wv)
+            emit(f"l{i}_WO", attn.wo)
+            _add_int64_init(
+                f"l{i}_qkv_view_shape",
+                np.array([0, nh, d_head], dtype=np.int64), dense_inits,
+            )
+            _add_int64_init(
+                f"l{i}_ctx_flat_shape", np.array([0, hd], dtype=np.int64),
+                dense_inits,
             )
 
-        def emit(name: str, arr: np.ndarray) -> None:
-            dense_tp, sparse_tp = _tensor_to_proto(name, arr)
-            _append_proto(dense_tp, sparse_tp, dense_inits, sparse_inits)
+            def emit_bias(name, value):
+                if value is not None:
+                    emit(name, value)
 
-        # (nh, d, d_head) → (d, nh, d_head) → (d, hd)
-        emit(
-            f"l{i}_WQ",
-            attn.query_matrix.permute(1, 0, 2)
-            .reshape(d, hd)
-            .contiguous()
-            .cpu()
-            .numpy(),
-        )
-        attn.query_matrix = None
-        emit(
-            f"l{i}_WK",
-            attn.key_matrix.permute(1, 0, 2).reshape(d, hd).contiguous().cpu().numpy(),
-        )
-        attn.key_matrix = None
-        emit(
-            f"l{i}_WV",
-            attn.value_matrix.permute(1, 0, 2)
-            .reshape(d, hd)
-            .contiguous()
-            .cpu()
-            .numpy(),
-        )
-        attn.value_matrix = None
-        # (nh, d_head, d) → (hd, d): canonical W_O layout that feeds
-        # one (t, hd) @ (hd, d) MatMul at inference time.
-        emit(
-            f"l{i}_WO",
-            attn.output_matrix.reshape(hd, d).contiguous().cpu().numpy(),
-        )
-        attn.output_matrix = None
-
-        # Per-layer reshape constants for the ONNX graph.
-        _add_int64_init(
-            f"l{i}_qkv_view_shape",
-            np.array([0, nh, d_head], dtype=np.int64),
-            dense_inits,
-        )
-        _add_int64_init(
-            f"l{i}_ctx_flat_shape",
-            np.array([0, hd], dtype=np.int64),
-            dense_inits,
-        )
-
-        def emit_bias(name: str, lin) -> None:
-            # bias=False: no bias initializers exist in the artifact.  The
-            # writer folded every bias into the matrices, so the in-process
-            # vectors must be exactly zero — assert it (defense in depth
-            # against a missed writer site) instead of emitting.
-            if bias:
-                emit(name, lin.output_bias.cpu().numpy())
+            if isinstance(weights, SwishLayerWeights):
+                emit(f"l{i}_Wgate", weights.wgate)
+                emit_bias(f"l{i}_bgate", weights.bgate)
+                emit(f"l{i}_Wup", weights.wup)
+                emit_bias(f"l{i}_bup", weights.bup)
+                emit(f"l{i}_Wdown", weights.wdown)
+                emit_bias(f"l{i}_bdown", weights.bdown)
             else:
-                assert (lin.output_bias == 0.0).all(), (
-                    f"{name}: nonzero bias vector under bias=False — a "
-                    f"writer site skipped the BiasFold redirect.  Compiler "
-                    f"bug."
-                )
-            lin.output_bias = None
+                assert isinstance(weights, ReluLayerWeights)
+                emit(f"l{i}_W1", weights.w1)
+                emit_bias(f"l{i}_b1", weights.b1)
+                emit(f"l{i}_W2", weights.w2)
+                emit_bias(f"l{i}_b2", weights.b2)
 
-        if getattr(mlp, "activation", "relu") == "swish":
-            # Gated (SwiGLU) sublayer: gate / up / down projections.
-            emit(f"l{i}_Wgate", mlp.gate_proj.output_matrix.cpu().numpy())
-            mlp.gate_proj.output_matrix = None
-            emit_bias(f"l{i}_bgate", mlp.gate_proj)
-            emit(f"l{i}_Wup", mlp.up_proj.output_matrix.cpu().numpy())
-            mlp.up_proj.output_matrix = None
-            emit_bias(f"l{i}_bup", mlp.up_proj)
-            emit(f"l{i}_Wdown", mlp.down_proj.output_matrix.cpu().numpy())
-            mlp.down_proj.output_matrix = None
-            emit_bias(f"l{i}_bdown", mlp.down_proj)
-        else:
-            emit(f"l{i}_W1", mlp.linear1.output_matrix.cpu().numpy())
-            mlp.linear1.output_matrix = None
-            emit_bias(f"l{i}_b1", mlp.linear1)
-            emit(f"l{i}_W2", mlp.linear2.output_matrix.cpu().numpy())
-            mlp.linear2.output_matrix = None
-            emit_bias(f"l{i}_b2", mlp.linear2)
+        def finalize(self, spec, weights):
+            # Graph assembly below consumes the finalized semantic values.
+            self.spec = spec
+            self.token_weights = weights
 
-    return on_layer_compiled
+    return make_layer_callback(
+        CompileHeader(d, d_head, trim_heads, bias), OnnxLayerSink()
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -1065,7 +1013,7 @@ def _emit_cached_layer_nodes(
         ``d_rot`` dims (``front*cos + rotate_half(front)*sin``) and pass the last
         ``d_head - d_rot`` dims (the NoPE tail) through unchanged.  Matches
         graph/rope.py (vanilla partial rotary, half-split over d_rot);
-        modeling_torchwright.py mirrors this op sequence.
+        modeling_torchwright_custom.py mirrors this op sequence.
 
         ``d_rot == d_head`` (full rotary) emits the exact pre-partial 6-node
         sequence — byte-for-byte the same graph, so the cancel-head denormal-ULP
@@ -1074,7 +1022,7 @@ def _emit_cached_layer_nodes(
         No ``src + (rot - src)`` reconstruction: cross-backend onnxruntime/torch
         agreement is not algebraic — the cancel-head rows that cancel to denormal
         magnitude differ by one denormal ULP regardless of the form (the
-        test_convert parity bound tolerates it; no token or meaningful logit
+        direct-HF parity bound tolerates it; no token or meaningful logit
         moves), and the full suite is bit-exact with the direct form, so the
         extra Sub/Add bought nothing.
         """
@@ -1346,6 +1294,7 @@ def compile_to_onnx(
     rms_norm_eps: float = 1e-5,
     rms_norm_const_exp: Optional[int] = None,
     bias: bool = True,
+    profile: Optional[Union[CompileProfile, str]] = None,
     _solver_seed: Optional[int] = None,
     _force_resolve: bool = False,
 ) -> OnnxArtifact:
@@ -1414,7 +1363,7 @@ def compile_to_onnx(
     hold pinned constants so the forced RMS is an exact power of two and the
     uniform gain cancels it.  This makes the artifact a stock Llama-style
     decoder (a skeptic can't say "no normalization"); it adds the gain weights
-    as initializers (mapped by ``convert.py``) and folds the constants into
+    as initializers and folds the constants into
     ``embed_table`` (no new buffer).  The norm is **on by default**: ``None``
     enables it.  With the norm on, ``d`` must be a **supported width: any
     multiple of 1024 up to 16384, or any power of two** (the full table and
@@ -1438,6 +1387,13 @@ def compile_to_onnx(
     # Validate the cache config up front — a ValueError after the
     # (potentially very long) streaming compile would waste the whole run.
     cache_stride_resolved = _resolve_cache_stride(cache_stride, max_seq_len)
+
+    machine = None
+    if profile is not None:
+        resolved_profile = CompileProfile(profile)
+        machine = resolved_profile.machine
+        bias = resolved_profile.bias
+        rms_norm = resolved_profile.rms_norm
 
     # Resolve the norm policy.  RMSNorm is on by default (None -> True): every
     # shipped artifact should carry the real norm.  Refuse an unsupported
@@ -1490,6 +1446,7 @@ def compile_to_onnx(
         trim_heads=trim_heads,
         optimize=optimize,
         bias=bias,
+        machine=machine,
         d_hidden=d_hidden,
         # Measurement-only (§0): reproducible descent seed + fresh-solve for
         # the sound production draw.  Never set in production configs.
@@ -1626,6 +1583,16 @@ def compile_to_onnx(
     lm_head = np.zeros((vocab_size, d), dtype=np.float32)
     lm_head[:, output_indices] = embed_table_compact
 
+    # The backend-neutral builder is the contract for these semantic folds.
+    # Keep the local variables used by the mature graph emitter, but replace
+    # them with the shared builder's results and assert equivalence while this
+    # exporter assembly is incrementally moved behind the sink boundary.
+    token_weights = build_token_weights(compiled, output_node, embedding, d)
+    assert np.array_equal(embed_table, token_weights.embed_table)
+    assert np.array_equal(lm_head, token_weights.lm_head)
+    embed_table = token_weights.embed_table
+    lm_head = token_weights.lm_head
+
     # Initializers
     _add_float_init("embed_table", embed_table, dense_inits, sparse_inits)
     _add_float_init("lm_head", lm_head, dense_inits, sparse_inits)
@@ -1634,7 +1601,8 @@ def compile_to_onnx(
     # uniform (d,) vector = 2^m, which cancels the forced rms = 2^m exactly.  A
     # single shared eps scalar feeds every norm.
     if rms_spec is not None:
-        gain_vec = np.full(d, rms_spec.gain, dtype=np.float32)
+        gain_vec = token_weights.norm_gain
+        assert gain_vec is not None
         for i in range(n_layers):
             _add_float_init(
                 f"l{i}_input_layernorm", gain_vec, dense_inits, sparse_inits
@@ -1673,6 +1641,29 @@ def compile_to_onnx(
     # emits cos/sin from cache_position when active (no-op otherwise).
     rope_base_val, rope_d_rot_val = _add_rope_inits(
         per_layer_rotary, d_head, dense_inits
+    )
+    on_layer_compiled.token_model_sink.finalize(
+        TokenModelSpec(
+            d=d,
+            d_head=d_head,
+            max_seq_len=max_seq_len,
+            vocab=tuple(embedding.tokenizer.vocab),
+            vocab_size=vocab_size,
+            activation=compiled.activation,
+            bias=bool(bias),
+            rms_norm=rms_spec is not None,
+            rms_norm_eps=float(rms_spec.eps if rms_spec else rms_norm_eps),
+            rope_base=rope_base_val,
+            d_rot=rope_d_rot_val,
+            n_layers=n_layers,
+            per_layer_n_heads=tuple(per_layer_n_heads),
+            per_layer_d_hidden=tuple(
+                int(getattr(layer.mlp, "d_hidden", d)) for layer in compiled.layers
+            ),
+            schedule_provenance=schedule_provenance(compiled, optimize),
+            extra_metadata=dict(extra_metadata or {}),
+        ),
+        token_weights,
     )
     _emit_cached_preamble(nodes)
     # the residual seed (no projection).  Position is a rotation applied inside
@@ -1755,13 +1746,12 @@ def compile_to_onnx(
         # The full static slot count S: with the symbolic cache_slots
         # first dim on past_K_i, loaders read S from here.
         "cache_stride": cache_stride_resolved,
-        # RoPE on the one global grid; the converter rebuilds the rotation from
-        # the base and the partial-rotary width d_rot (== d_head for full rotary).
+        # RoPE on one global grid; sibling backends rebuild the rotation from
+        # the base and partial-rotary width d_rot (== d_head for full rotary).
         "rope_base": rope_base_val,
         "d_rot": rope_d_rot_val,
         # Whether a real (identity) RMSNorm is emitted, and its epsilon — the HF
-        # converter needs the eps to build the config (the gain weights it reads
-        # from the initializers, but eps is not a tensor).
+        # Sibling backends need eps in their config; unlike gain, it is not a tensor.
         "rms_norm": rms_spec is not None,
         "rms_norm_eps": rms_spec.eps if rms_spec is not None else None,
         # Machine kind ("relu" | "swish"): which MLP-sublayer emission the

@@ -60,15 +60,15 @@ def _example_specs():
     from examples import (
         binary_increment,
         caesar_cipher,
-        calculator_v2,
+        calculator_simple,
         fibonacci,
         sort_digits_v1,
     )
 
     return {
-        "calculator": (lambda: calculator_v2.create_network_parts()[0], 1024, 16),
+        "calculator": (lambda: calculator_simple.create_network_parts()[0], calculator_simple.D_MODEL, calculator_simple.D_HEAD),
         "caesar": (lambda: caesar_cipher.create_network_parts()[0], 512, 16),
-        "sort_digits": (lambda: sort_digits_v1.create_network_parts()[0], 384, 32),
+        "sort_digits": (lambda: sort_digits_v1.create_network_parts()[0], sort_digits_v1.D_MODEL, sort_digits_v1.D_HEAD),
         "fibonacci": (lambda: fibonacci.create_network_parts()[0], 512, 16),
         "binary_increment": (
             lambda: binary_increment.create_network_parts()[0], 256, 16

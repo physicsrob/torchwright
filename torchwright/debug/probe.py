@@ -35,7 +35,6 @@ from typing import Any, Dict, Iterator, List, Optional, Protocol, Sequence, Tupl
 
 import torch
 
-from torchwright.compiler.export import CompiledHeadless, compile_headless
 from torchwright.compiler.graph_clone import topological_order
 from torchwright.compiler.residual_assignment import (
     ResidualAssignment,
@@ -433,6 +432,9 @@ def probe_graph(
     workflow.  The compilation uses the same defaults as
     :func:`torchwright.compiler.forward.compile.forward_compile`.
     """
+    # Keep the ONNX-backed export module out of compiler-only/HF imports.
+    from torchwright.compiler.export import compile_headless
+
     compiled = compile_headless(
         output_node,
         d=d,

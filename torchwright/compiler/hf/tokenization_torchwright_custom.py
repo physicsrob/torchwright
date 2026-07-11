@@ -1,4 +1,4 @@
-"""``TorchwrightTokenizer`` — a character-level tokenizer over a fixed
+"""``TorchwrightCustomTokenizer`` — a character-level tokenizer over a fixed
 vocabulary.
 
 The vocabulary is a JSON list of tokens in id order (``vocab.json``), one
@@ -20,7 +20,7 @@ from transformers import PreTrainedTokenizer
 VOCAB_FILES_NAMES = {"vocab_file": "vocab.json"}
 
 
-class TorchwrightTokenizer(PreTrainedTokenizer):
+class TorchwrightCustomTokenizer(PreTrainedTokenizer):
     """Standalone slow ``PreTrainedTokenizer`` over a fixed vocabulary.
 
     A character-level encoder backed by the ``{token: id}`` bijection read from
@@ -43,7 +43,7 @@ class TorchwrightTokenizer(PreTrainedTokenizer):
     ):
         if vocab_file is None:
             raise ValueError(
-                "TorchwrightTokenizer needs vocab_file (vocab.json); load via "
+                "TorchwrightCustomTokenizer needs vocab_file (vocab.json); load via "
                 "from_pretrained on a saved bundle."
             )
 

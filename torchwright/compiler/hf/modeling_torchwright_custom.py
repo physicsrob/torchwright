@@ -39,7 +39,7 @@ from transformers.modeling_outputs import (
     CausalLMOutputWithPast,
 )
 
-from .configuration_torchwright import TorchwrightConfig
+from .configuration_torchwright_custom import TorchwrightCustomConfig
 
 # The fused flash/efficient attention kernels round differently across devices
 # and runs; this model's outputs must be bit-reproducible, so attention is
@@ -47,14 +47,14 @@ from .configuration_torchwright import TorchwrightConfig
 _SDPA_BACKEND = [SDPBackend.MATH]
 
 
-class TorchwrightAttention(nn.Module):
+class TorchwrightCustomAttention(nn.Module):
     """Causal multi-head attention, ``scale=1.0``, no bias.
 
     ``n_heads`` is this layer's own head count (layers may differ);
     ``d_head`` is shared across all layers.
     """
 
-    def __init__(self, config: TorchwrightConfig, layer_idx: int):
+    def __init__(self, config: TorchwrightCustomConfig, layer_idx: int):
         super().__init__()
         self.layer_idx = layer_idx
         self.d = config.d
@@ -138,10 +138,10 @@ class TorchwrightAttention(nn.Module):
         return self.o_proj(attn)
 
 
-class TorchwrightMLP(nn.Module):
+class TorchwrightCustomMLP(nn.Module):
     """``fc2(relu(fc1(x)))`` — both linears biased."""
 
-    def __init__(self, config: TorchwrightConfig, layer_idx: int):
+    def __init__(self, config: TorchwrightCustomConfig, layer_idx: int):
         super().__init__()
         d_hidden = config.d_hidden_per_layer[layer_idx]
         self.fc1 = nn.Linear(config.d, d_hidden, bias=True)
@@ -151,7 +151,7 @@ class TorchwrightMLP(nn.Module):
         return self.fc2(F.relu(self.fc1(x)))
 
 
-class TorchwrightRMSNorm(nn.Module):
+class TorchwrightCustomRMSNorm(nn.Module):
     """Root-mean-square norm, ``x / sqrt(mean(x^2, -1) + eps) * weight`` —
     the same form as Llama's."""
 
@@ -165,19 +165,19 @@ class TorchwrightRMSNorm(nn.Module):
         return x * torch.rsqrt(ms + self.eps) * self.weight
 
 
-class TorchwrightDecoderLayer(nn.Module):
+class TorchwrightCustomDecoderLayer(nn.Module):
     """Pre-norm decoder block: ``x = x + attn(norm(x)); x = x + mlp(norm(x))``.
     The norms are ``nn.Identity`` when ``config.rms_norm`` is off."""
 
-    def __init__(self, config: TorchwrightConfig, layer_idx: int):
+    def __init__(self, config: TorchwrightCustomConfig, layer_idx: int):
         super().__init__()
-        self.self_attn = TorchwrightAttention(config, layer_idx)
-        self.mlp = TorchwrightMLP(config, layer_idx)
+        self.self_attn = TorchwrightCustomAttention(config, layer_idx)
+        self.mlp = TorchwrightCustomMLP(config, layer_idx)
         # Norm weights exist in the checkpoint only when rms_norm is on;
         # Identity keeps the no-norm state dict free of stray parameters.
         if config.rms_norm:
-            self.input_layernorm = TorchwrightRMSNorm(config.d, config.rms_norm_eps)
-            self.post_attention_layernorm = TorchwrightRMSNorm(
+            self.input_layernorm = TorchwrightCustomRMSNorm(config.d, config.rms_norm_eps)
+            self.post_attention_layernorm = TorchwrightCustomRMSNorm(
                 config.d, config.rms_norm_eps
             )
         else:
@@ -203,11 +203,11 @@ class TorchwrightDecoderLayer(nn.Module):
         return hidden_states
 
 
-class TorchwrightPreTrainedModel(PreTrainedModel):
-    config_class = TorchwrightConfig
+class TorchwrightCustomPreTrainedModel(PreTrainedModel):
+    config_class = TorchwrightCustomConfig
     base_model_prefix = "model"
     supports_gradient_checkpointing = False
-    _no_split_modules = ["TorchwrightDecoderLayer"]
+    _no_split_modules = ["TorchwrightCustomDecoderLayer"]
     _supports_sdpa = True
 
     def _init_weights(self, module):
@@ -225,18 +225,18 @@ class TorchwrightPreTrainedModel(PreTrainedModel):
             nn.init.normal_(module.weight, mean=0.0, std=std)
 
 
-class TorchwrightModel(TorchwrightPreTrainedModel):
+class TorchwrightCustomModel(TorchwrightCustomPreTrainedModel):
     """Decoder trunk: token embedding, ``n_layers`` decoder blocks, final norm."""
 
-    def __init__(self, config: TorchwrightConfig):
+    def __init__(self, config: TorchwrightCustomConfig):
         super().__init__(config)
         self.embed_tokens = nn.Embedding(config.vocab_size, config.d)
         self.layers = nn.ModuleList(
-            [TorchwrightDecoderLayer(config, i) for i in range(config.n_layers)]
+            [TorchwrightCustomDecoderLayer(config, i) for i in range(config.n_layers)]
         )
         # Final norm before the LM head; Identity when rms_norm is off.
         self.norm = (
-            TorchwrightRMSNorm(config.d, config.rms_norm_eps)
+            TorchwrightCustomRMSNorm(config.d, config.rms_norm_eps)
             if config.rms_norm
             else nn.Identity()
         )
@@ -262,7 +262,7 @@ class TorchwrightModel(TorchwrightPreTrainedModel):
         if inputs_embeds is not None:
             raise NotImplementedError("inputs_embeds is not supported; pass input_ids.")
         if input_ids is None:
-            raise ValueError("TorchwrightModel requires input_ids.")
+            raise ValueError("TorchwrightCustomModel requires input_ids.")
         # `use_cache` is a generation parameter, which transformers 5.x strips
         # off the config dataclass — read it defensively, defaulting to True
         # (a bare forward must not crash on the missing attribute).
@@ -337,16 +337,16 @@ class TorchwrightModel(TorchwrightPreTrainedModel):
         )
 
 
-class TorchwrightForCausalLM(TorchwrightPreTrainedModel, GenerationMixin):
+class TorchwrightCustomForCausalLM(TorchwrightCustomPreTrainedModel, GenerationMixin):
     """Torchwright decoder with a language-modeling head.
 
     The head is untied: a separate ``(vocab_size, d)`` Linear over the final
     hidden state, no bias.
     """
 
-    def __init__(self, config: TorchwrightConfig):
+    def __init__(self, config: TorchwrightCustomConfig):
         super().__init__(config)
-        self.model = TorchwrightModel(config)
+        self.model = TorchwrightCustomModel(config)
         self.lm_head = nn.Linear(config.d, config.vocab_size, bias=False)
         self.post_init()
 
@@ -419,8 +419,8 @@ class TorchwrightForCausalLM(TorchwrightPreTrainedModel, GenerationMixin):
 
 
 __all__ = [
-    "TorchwrightConfig",
-    "TorchwrightPreTrainedModel",
-    "TorchwrightModel",
-    "TorchwrightForCausalLM",
+    "TorchwrightCustomConfig",
+    "TorchwrightCustomPreTrainedModel",
+    "TorchwrightCustomModel",
+    "TorchwrightCustomForCausalLM",
 ]

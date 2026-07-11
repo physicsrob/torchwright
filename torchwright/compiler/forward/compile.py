@@ -16,6 +16,7 @@ import torch
 
 from torchwright.compiler.device import get_device
 from torchwright.compiler.realization import (
+    CLASS_SUBLAYER,
     RealizationTable,
     linear_attn_heads,
     usable_hidden_slots,
@@ -24,7 +25,10 @@ from torchwright.compiler.residual_assignment import ResidualAssignment
 from torchwright.compiler.forward.cpsat_scheduler import (
     Costs,
     ScheduleAssignment,
+    ScheduleResult,
+    SchedulingProvenance,
     SolveStats,
+    choose_dominating_assignment,
     solve_schedule,
 )
 from torchwright.compiler.forward.schedule_cache import (
@@ -64,11 +68,11 @@ from torchwright.graph.misc import LiteralValue
 # Constraints).  This bound is GRAPH-DEPENDENT, so q is a tunable knob
 # (rms_norm_const_exp); this is only the default.
 #
-# q=44 (gain 2^39 at d=1024) clears the shipping graph with margin: calculator_v2
+# q=44 (gain 2^39 at d=1024) clears the shipping graph with margin: calculator_simple
 # reaches Sigma data^2 ~ 2.6e13 (2^44.6) on its squaring path (999*999, 999+1),
 # and 2^(2*44-24) = 2^64 ~ 1.8e19 leaves ~2^19 of headroom.  The earlier q=30
 # was validated only on calculator_simple (energy ~1e8) and SILENTLY broke the
-# identity on calculator_v2 — raise q (or measure the deepest-layer energy)
+# identity on calculator_simple — raise q (or measure the deepest-layer energy)
 # before trusting the norm on a new graph.
 _RMS_NORM_CONST_EXP = 44
 
@@ -380,7 +384,20 @@ class _TrackingResidualStreamMap(ResidualStreamMap):
         super().reassign(old_node, new_node)
 
 
-def _run_heuristic_warm_start(
+@dataclass(frozen=True)
+class HeuristicScheduleTrace:
+    node_to_layer: Dict[int, int]
+    node_to_routing: Dict[int, str]
+    observed_cancel_layer: Dict[int, int]
+    observed_cancel_mech: Dict[int, str]
+    n_layers: int
+
+    @property
+    def is_complete(self) -> bool:
+        return self.n_layers > 0 and bool(self.node_to_layer)
+
+
+def _build_heuristic_schedule_trace(
     graph: GraphAnalyzer,
     d: int,
     d_head: int,
@@ -395,15 +412,12 @@ def _run_heuristic_warm_start(
     policy: Optional[SchedulingPolicy],
     output_node: Node,
     max_layers: int,
-) -> tuple[dict, dict, dict, dict, int]:
-    """Run the heuristic LayerScheduler in schedule-only mode and
-    capture per-node layer, routing, cancel-layer, and cancel-mechanism
-    hints for CP-SAT.  Mutates a *clone* of ``residual_map`` and
-    ``computed``; the caller's state is untouched.
+) -> HeuristicScheduleTrace:
+    """Plan with the heuristic and return its typed semantic trace.
 
-    Returns ``(hint_layers, hint_routing, hint_cancel, hint_cancel_mech,
-    hint_n_layers)``.  On heuristic deadlock, all dicts are empty and
-    n_layers is 0 — the CP-SAT solve will then cold-start without a hint.
+    Mutates clones of ``residual_map`` and ``computed``; the caller's state is
+    untouched. Detailed scheduler failures propagate so optimize=0 reports
+    the original geometry diagnostic and optimize>0 can explicitly cold-solve.
     """
     hint_rmap = _TrackingResidualStreamMap(copy.deepcopy(residual_map))
     hint_computed = set(computed)
@@ -433,23 +447,20 @@ def _run_heuristic_warm_start(
             break
         hint_rmap.current_layer = hi
         prev_hint = set(hint_computed)
-        try:
-            attn_ops, mlp_ops, _ = hint_scheduler.schedule_layer(
-                hint_rmap, hint_computed
-            )
-        except RuntimeError:
-            # Heuristic deadlocked / no progress.  Drop the hint
-            # and let CP-SAT cold-start.
-            return {}, {}, {}, {}, 0
-        # Routing decisions for standalone Linears: heuristic placed
-        # compute_linear in attention or compute_linear_bypass in
-        # MLP.  FFNs are non-flex (always the MLP composite) so we
-        # don't hint them.
+        # A baseline assignment is part of the compiler contract, not merely
+        # an optional solver hint. Preserve LayerScheduler's detailed
+        # geometry/deadlock diagnostic if it cannot construct one.
+        attn_ops, mlp_ops, _ = hint_scheduler.schedule_layer(
+            hint_rmap, hint_computed
+        )
+        # Record the complete routing contract. CP-SAT formerly needed hints
+        # only for flexible Linears, but deterministic replay needs every
+        # schedulable node's chosen sublayer.
         for op in attn_ops:
-            if op.op_type == "compute_linear" and op.node is not None:
+            if op.node is not None and op.op_type != "cancel":
                 hint_routing[op.node.node_id] = "attn"
         for op in mlp_ops:
-            if op.op_type == "compute_linear_bypass":
+            if op.node is not None and not op.op_type.startswith("cancel"):
                 hint_routing[op.node.node_id] = "mlp"
         for node in graph.get_all_nodes():
             if isinstance(node, Concatenate) and node not in hint_computed:
@@ -460,12 +471,23 @@ def _run_heuristic_warm_start(
         if not attn_ops and not mlp_ops:
             break
     hint_n_layers = max(hint_layers.values()) + 1 if hint_layers else 0
-    return (
-        hint_layers,
-        hint_routing,
-        dict(hint_rmap.cancel_layer),
-        dict(hint_rmap.cancel_mech),
-        hint_n_layers,
+    # Operation lists contain auxiliary work as well as the node's semantic
+    # realization (notably a biased attention-routed Linear has an MLP bias
+    # write, and an all-zero transport may have only that auxiliary op). Read
+    # every non-conditional routing decision from the resolved table; retain
+    # observed routing only for conditional Adds whose reuse/copy class is a
+    # schedule-time decision.
+    for node in graph.get_all_nodes():
+        entry = hint_scheduler.realization_table.entries.get(node.node_id)
+        if entry is not None and not entry.conditional:
+            assert entry.resolved is not None
+            hint_routing[node.node_id] = CLASS_SUBLAYER[entry.resolved]
+    return HeuristicScheduleTrace(
+        node_to_layer=hint_layers,
+        node_to_routing=hint_routing,
+        observed_cancel_layer=dict(hint_rmap.cancel_layer),
+        observed_cancel_mech=dict(hint_rmap.cancel_mech),
+        n_layers=hint_n_layers,
     )
 
 
@@ -670,6 +692,32 @@ def _count_heads_by_type(
     return counts
 
 
+def _planned_layer_shape(attn_ops, mlp_ops, d, d_head, d_hidden, trim_heads):
+    """Exact dense tensor dimensions after the streaming trim."""
+    from torchwright.compiler.token_model import LayerShape
+
+    if not trim_heads:
+        return LayerShape(d // d_head, d_hidden)
+    heads = 0
+    for op in attn_ops:
+        if op.op_type == "compute_attn":
+            heads += (op.node.d_v + d_head - 1) // d_head
+        elif op.op_type == "compute_linear":
+            heads += linear_attn_heads(op.node, d_head)
+        elif op.op_type == "compute_add":
+            width = len(op.target_cols)
+            self_add = op.source_cols == op.source_cols_b
+            for start in range(0, width, d_head):
+                chunk = min(d_head, width - start)
+                heads += 1 if self_add or 2 * chunk <= d_head else 2
+        elif op.op_type in ("cancel", "add_into"):
+            heads += (len(op.target_cols) + d_head - 1) // d_head
+    last_slot = max(
+        (slot for op in mlp_ops for slot in op.mlp_slots), default=0
+    )
+    return LayerShape(max(heads, 1), max(last_slot + 1, 1))
+
+
 def _params_per_slot(d: int, activation: str, bias: bool = True) -> int:
     """Parameters one occupied hidden slot costs, by machine.
 
@@ -757,6 +805,7 @@ def forward_compile(
     rms_norm_eps: float = 1e-5,
     rms_norm_const_exp: int = _RMS_NORM_CONST_EXP,
     bias: bool = True,
+    machine: Optional[str] = None,
     _disabled_families: frozenset = frozenset(),
     _solver_seed: Optional[int] = None,
     _force_resolve: bool = False,
@@ -780,6 +829,10 @@ def forward_compile(
         d_hidden: MLP hidden width per layer (the per-layer pool of
             ``L1->ReLU->L2`` neurons).  Independent of ``d``; defaults
             to ``d`` for backwards compatibility.
+        machine: Optional required physical MLP machine (``"swish"`` or
+            ``"relu"``). When set, graph FFNs must match and graphs without
+            FFNs still use the requested machine. ``None`` retains legacy
+            inference from FFN nodes.
         on_layer_compiled: Optional streaming hook, called with
             ``(layer_index, layer)`` after each layer's weights are fully
             written.  The callback may extract weight tensors and then
@@ -1014,7 +1067,20 @@ def forward_compile(
             f"is uniformly one machine (all-ReLU or all-swish).  Build the whole "
             f"graph from a single op package (ops/relu or ops/swiglu)."
         )
-    activation = activations.pop() if activations else "relu"
+    inferred_activation = activations.pop() if activations else None
+    if machine not in (None, "relu", "swish"):
+        raise ValueError(
+            f"machine must be 'relu', 'swish', or None; got {machine!r}"
+        )
+    if machine is not None and inferred_activation not in (None, machine):
+        raise ValueError(
+            f"requested machine={machine!r}, but the graph contains "
+            f"{inferred_activation!r} FFNs. Build the graph from the matching "
+            f"ops package."
+        )
+    # Explicit profiles decide the physical machine even for graphs without
+    # FFNs. Legacy callers retain the historical no-FFN -> ReLU behavior.
+    activation = machine or inferred_activation or "relu"
     if activation == "relu":
         gated = [n for n in ffn_nodes if n.up_proj is not None]
         if gated:
@@ -1040,6 +1106,7 @@ def forward_compile(
     # Solver provenance, populated only when CP-SAT runs (optimize>0); stays
     # None for the heuristic path so callers can always query it.
     net.cpsat_solve_stats = None
+    net.schedule_result = None
     residual_map = ResidualStreamMap(d)
     # Reserve one constant-1 residual column for the Δ=0 self-match heads behind
     # every Linear/Add/Cancel/add_into.  It is a LiteralValue input node, so all
@@ -1137,6 +1204,43 @@ def forward_compile(
     # CP-SAT model (which receives it as its `d_hidden`).
     solver_d_hidden = usable_hidden_slots(d_hidden, bias)
 
+    assignment = None
+    heuristic_assignment = None
+    heuristic_trace = None
+    heuristic_failure = None
+    solver_candidate = None
+
+    def _build_heuristic_assignment() -> ScheduleAssignment:
+        """Produce the baseline schedule consumed by replay and CP-SAT."""
+        nonlocal heuristic_trace
+        heuristic_trace = _build_heuristic_schedule_trace(
+            graph=graph,
+            d=d,
+            d_head=d_head,
+            pos_encoding=pos_encoding,
+            d_hidden=d_hidden,
+            residual_map=residual_map,
+            computed=computed,
+            clusters=clusters,
+            admission_budget_fraction=admission_budget_fraction,
+            policy=policy,
+            output_node=output_node,
+            max_layers=max_layers,
+            bias=bias,
+        )
+        if not heuristic_trace.is_complete:
+            raise RuntimeError(
+                "heuristic scheduler did not produce a complete schedule assignment"
+            )
+        return ScheduleAssignment.from_heuristic_trace(
+            output_node,
+            node_to_layer=heuristic_trace.node_to_layer,
+            node_to_routing=heuristic_trace.node_to_routing,
+            observed_cancel_layer=heuristic_trace.observed_cancel_layer,
+            observed_cancel_mech=heuristic_trace.observed_cancel_mech,
+            n_layers=heuristic_trace.n_layers,
+        )
+
     if use_cpsat:
         # Architecture doc §3 marks admission_control as a model
         # precondition; the CP-SAT cumulative does not represent the
@@ -1157,7 +1261,6 @@ def forward_compile(
         # therefore misses whenever graph construction changed.  A hit
         # skips the warm start and the solver entirely and is surfaced as
         # status_name="CACHED" — never silently.
-        assignment = None
         hint_n_layers = 0
         t_solve_start = time.perf_counter()
         schedule_fp = graph_fingerprint(
@@ -1215,23 +1318,19 @@ def forward_compile(
             # known-feasible incumbent dramatically shrinks the time the
             # solver needs to find any feasible schedule.
             t_hint_start = time.perf_counter()
-            hint_layers, hint_routing, hint_cancel, hint_cancel_mech, hint_n_layers = (
-                _run_heuristic_warm_start(
-                    graph=graph,
-                    d=d,
-                    d_head=d_head,
-                    pos_encoding=pos_encoding,
-                    d_hidden=d_hidden,
-                    residual_map=residual_map,
-                    computed=computed,
-                    clusters=clusters,
-                    admission_budget_fraction=admission_budget_fraction,
-                    policy=policy,
-                    output_node=output_node,
-                    max_layers=max_layers,
-                    bias=bias,
-                )
-            )
+            try:
+                heuristic_assignment = _build_heuristic_assignment()
+            except RuntimeError as exc:
+                # Some width-starved geometries require global scheduling and
+                # have no heuristic incumbent. CP-SAT may still construct a
+                # valid assignment from scratch; retain the baseline failure
+                # in case the cold solve also finds nothing.
+                heuristic_failure = exc
+            if heuristic_trace is not None:
+                hint_n_layers = heuristic_trace.n_layers
+                hint_layers = heuristic_trace.node_to_layer
+            else:
+                hint_layers = {}
             # ---- Warm-start solve (the sole CP-SAT solve) ----
             # Every optimize level is ONE continuous hinted solve; the levels
             # differ only in budget.
@@ -1296,7 +1395,7 @@ def forward_compile(
             # load-bearing: without them the pinned model completed the hint
             # into ZERO incumbents in 5x600 s on the d=8192 fixture
             # (cpsat_pinned_cancel_plan.md step 2, batch 1).
-            def _solve_once(hl, hr, hc, hm, horizon, budget):
+            def _solve_once(incumbent, horizon, budget):
                 return solve_schedule(
                     output_node,
                     pos_encoding,
@@ -1313,10 +1412,7 @@ def forward_compile(
                     # so it always satisfies the tightened domains (verified:
                     # zero violations at both measured geometries).
                     tighten_domains=True,
-                    hint_layers=hl if hl else None,
-                    hint_routing=hr if hr else None,
-                    hint_cancel=hc if hc else None,
-                    hint_cancel_mech=hm if hm else None,
+                    incumbent=incumbent,
                     log_search_progress=verbose,
                     # Measurement-only knobs (§0 gap attribution, C1 sweep);
                     # empty / None / False in production.
@@ -1335,10 +1431,7 @@ def forward_compile(
                 return min(max_layers, hn + 1) if hn > 0 else max_layers
 
             assignment, _stats = _solve_once(
-                hint_layers,
-                hint_routing,
-                hint_cancel,
-                hint_cancel_mech,
+                heuristic_assignment,
                 _horizon_for(hint_n_layers),
                 solve_budget_s,
             )
@@ -1347,11 +1440,20 @@ def forward_compile(
             # without re-deriving it (``stats.status_name``,
             # ``is_optimal``, the LB/objective gap).
             net.cpsat_solve_stats = _stats
+            solver_candidate = assignment
+            if not (_disabled_families or _solve_only):
+                assignment = choose_dominating_assignment(
+                    cpsat_costs, heuristic_assignment, assignment
+                )
 
             # A relaxed (_disabled_families) schedule is unsound to replay, so
             # it must never poison the fingerprint-keyed cache that production
             # compiles replay from.
-            if assignment is not None and not _disabled_families:
+            if (
+                assignment is not None
+                and solver_candidate is not None
+                and not _disabled_families
+            ):
                 if (
                     store_assignment(
                         schedule_fp,
@@ -1362,6 +1464,11 @@ def forward_compile(
                                 net.cpsat_solve_stats.best_objective_bound
                             ),
                             "is_optimal": net.cpsat_solve_stats.is_optimal,
+                            "origin": (
+                                "heuristic"
+                                if assignment is heuristic_assignment
+                                else "solver"
+                            ),
                             "optimize": optimize,
                             "d": d,
                             "d_head": d_head,
@@ -1403,11 +1510,9 @@ def forward_compile(
                 )
             return net
 
-        if assignment is None:
-            # CP-SAT found no feasible incumbent within budget — fall
-            # back to the heuristic schedule.  The warm-start was a
-            # sunk cost; we already know the heuristic produces a
-            # valid schedule.
+        if cached is None and solver_candidate is None:
+            # CP-SAT found no feasible incumbent within budget — retain the
+            # known-feasible heuristic incumbent supplied to it.
             #
             # A fallback returns a valid-but-unoptimized compile with no
             # error, so a layer-count-only measurement cannot tell it from
@@ -1416,16 +1521,13 @@ def forward_compile(
             # optimizer result.  ``UNKNOWN`` means CP-SAT found no incumbent
             # within the budget (expected at small budgets / hard geometries);
             # ``INFEASIBLE`` on a graph the heuristic schedules would indicate
-            # a CP-SAT model bug — see ``docs/cpsat_scheduler.md``.  The
-            # fallback uses the EAGER heuristic (below), which is typically
-            # shallower than the no-eager warm-start hint (``hint_n_layers``).
+            # a CP-SAT model bug — see ``docs/cpsat_scheduler.md``.
             fallback_msg = (
                 f"CP-SAT returned no usable assignment "
                 f"(status={_stats.status_name}, "
-                f"{cpsat_time_budget_s:.0f}s budget); falling back to the "
-                f"eager heuristic schedule (the no-eager warm-start hint was "
-                f"{hint_n_layers} layers; the eager fallback is typically "
-                f"shallower). The compile is valid but UNOPTIMIZED — "
+                f"{cpsat_time_budget_s:.0f}s budget); retaining the "
+                f"{hint_n_layers}-layer heuristic incumbent. The compile is "
+                f"valid but UNOPTIMIZED — "
                 f"optimize>0 did not take effect. status=INFEASIBLE (vs "
                 f"UNKNOWN/timeout) on a graph the heuristic schedules would "
                 f"indicate a CP-SAT model bug, not a hard instance."
@@ -1441,26 +1543,19 @@ def forward_compile(
                 for line in _stats.solver_log.splitlines()[-40:]:
                     print(f"  {line}")
                 print("--- end CP-SAT solver log ---")
-            # Eager heuristic fallback: on a CP-SAT timeout the compile runs the
-            # same eager schedule the warm start emitted, so a fallback never
-            # regresses below the heuristic's depth.
-            scheduler = LayerScheduler(
-                graph,
-                d,
-                d_head,
-                pos_encoding,
-                d_hidden=d_hidden,
-                clusters=clusters,
-                admission_budget_fraction=admission_budget_fraction,
-                policy=policy,
-                # Fallback resolves statically, same as optimize=0.
-                realization_table=lowered.realization_table.resolve_static(
-                    graph.get_all_nodes(), policy, solver_d_hidden
-                ),
-                bias=bias,
-            )
-        else:
-            if verbose and net.cpsat_solve_stats.status_name != "CACHED":
+            # Replay the exact baseline that seeded the solver. Scheduling is
+            # complete before weight emission; fallback cannot silently run a
+            # second, behaviorally different heuristic pass.
+            if heuristic_assignment is None:
+                assert heuristic_failure is not None
+                raise heuristic_failure
+            assignment = heuristic_assignment
+        if assignment is not None:
+            if (
+                verbose
+                and net.cpsat_solve_stats.status_name != "CACHED"
+                and assignment is not heuristic_assignment
+            ):
                 solve_time = time.perf_counter() - t_solve_start
                 print(
                     f"  CP-SAT solved in {solve_time:.2f}s: "
@@ -1483,27 +1578,102 @@ def forward_compile(
                 ),
                 bias=bias,
             )
+            if cached is not None:
+                provenance = SchedulingProvenance(
+                    origin=str(_cached_meta.get("origin", "solver")),
+                    delivery="cache",
+                    is_optimal=net.cpsat_solve_stats.is_optimal,
+                )
+            elif assignment is heuristic_assignment:
+                provenance = SchedulingProvenance(
+                    origin="heuristic",
+                    delivery="fresh",
+                    solver_attempt=net.cpsat_solve_stats,
+                )
+            else:
+                provenance = SchedulingProvenance(
+                    origin="solver",
+                    delivery="fresh",
+                    is_optimal=net.cpsat_solve_stats.is_optimal,
+                    solver_attempt=net.cpsat_solve_stats,
+                )
+            net.schedule_result = ScheduleResult(assignment, provenance)
     else:
-        scheduler = LayerScheduler(
+        assignment = _build_heuristic_assignment()
+        scheduler = DirectedLayerScheduler(
             graph,
             d,
             d_head,
             pos_encoding,
+            assignment=assignment,
             d_hidden=d_hidden,
             clusters=clusters,
             admission_budget_fraction=admission_budget_fraction,
             policy=policy,
-            # The static policy is the optimize=0 resolver.
-            realization_table=lowered.realization_table.resolve_static(
-                graph.get_all_nodes(), policy, solver_d_hidden
+            # The heuristic assignment is now the optimize=0 resolver.
+            realization_table=lowered.realization_table.resolve_from_assignment(
+                assignment.node_to_routing
             ),
             bias=bias,
+        )
+        net.schedule_result = ScheduleResult(
+            assignment,
+            SchedulingProvenance(origin="heuristic", delivery="fresh"),
         )
 
     # Realization completeness: every schedulable node's entry is resolved
     # or explicitly conditional before the walk starts (the walk only reads).
     scheduler.realization_table.check_complete(graph.get_all_nodes())
     net.realization_table = scheduler.realization_table
+
+    # Streaming artifact sinks need final tensor dimensions before layer 0 is
+    # allocated. Replay the selected semantic assignment against cloned
+    # allocator state, retaining only two integers per layer. Dense emission
+    # below still owns the real allocator and weights; this preflight is
+    # lightweight and deterministic, and its announced shapes are asserted by
+    # the sink as each trimmed layer arrives.
+    schedule_planned = getattr(on_layer_compiled, "on_schedule_planned", None)
+    if schedule_planned is not None:
+        plan_rmap = copy.deepcopy(residual_map)
+        plan_computed = set(computed)
+        plan_scheduler = DirectedLayerScheduler(
+            graph,
+            d,
+            d_head,
+            pos_encoding,
+            assignment=assignment,
+            d_hidden=d_hidden,
+            clusters=clusters,
+            admission_budget_fraction=admission_budget_fraction,
+            policy=policy,
+            realization_table=scheduler.realization_table,
+            bias=bias,
+        )
+        layer_shapes = []
+        for layer_idx in range(max_layers):
+            if output_node in plan_computed:
+                break
+            plan_scheduler.set_current_layer(layer_idx)
+            attn_ops, mlp_ops, _ = plan_scheduler.schedule_layer(
+                plan_rmap, plan_computed
+            )
+            for node in graph.get_all_nodes():
+                if isinstance(node, Concatenate) and node not in plan_computed:
+                    if all(
+                        leaf in plan_computed
+                        for leaf in flatten_concat_nodes([node])
+                    ):
+                        plan_computed.add(node)
+            layer_shapes.append(
+                _planned_layer_shape(
+                    attn_ops, mlp_ops, d, d_head, d_hidden, trim_heads
+                )
+            )
+        else:
+            raise RuntimeError(
+                f"Schedule shape planning did not converge in {max_layers} layers"
+            )
+        schedule_planned(tuple(layer_shapes))
 
     # Save input indices before scheduling (scheduling may free/reassign them)
     input_indices: dict[Node, list[int]] = {}

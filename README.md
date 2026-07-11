@@ -43,6 +43,22 @@ Both examples can be compiled to ONNX for portable inference:
 make compile     # produces adder.onnx and calculator_simple.onnx
 ```
 
+Hugging Face is a sibling compile target and does not use ONNX as an
+intermediate artifact:
+
+```python
+from torchwright.compiler import compile_to_hf, compile_hf_bundle
+
+model = compile_to_hf(output_node, embedding, d=1024)
+compile_hf_bundle(output_node, embedding, "hf_bundle", d=1024)
+```
+
+The default is a stock `Phi3ForCausalLM` contract: SwiGLU graph, biasless
+projections, RMSNorm, no custom code, and no `trust_remote_code`. A legacy
+ReLU graph must opt in explicitly with `architecture="custom"`, which produces
+`TorchwrightCustomForCausalLM`. `compile_hf_bundle` writes sharded safetensors
+one layer at a time for large-model publishing.
+
 
 ## Key Concepts
 

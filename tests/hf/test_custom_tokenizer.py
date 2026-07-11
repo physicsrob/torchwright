@@ -1,4 +1,4 @@
-"""Generic TorchwrightTokenizer behavior (char-level + bos handling).
+"""Generic TorchwrightCustomTokenizer behavior (char-level + bos handling).
 
 Fast and self-contained: writes a tiny vocab.json and exercises the tokenizer
 directly — no ONNX artifact, no model. Covers the bos-prepend default, the
@@ -14,7 +14,7 @@ import pytest
 
 pytest.importorskip("transformers")
 
-from torchwright.compiler.hf.tokenization_torchwright import TorchwrightTokenizer
+from torchwright.compiler.hf.tokenization_torchwright_custom import TorchwrightCustomTokenizer
 
 _VOCAB = ["<unk>", "<bos>", "<eos>"] + list("0123456789+-*\n")
 
@@ -27,7 +27,7 @@ def vocab_file(tmp_path):
 
 
 def test_char_level_encode_decode_round_trip(vocab_file):
-    tok = TorchwrightTokenizer(
+    tok = TorchwrightCustomTokenizer(
         vocab_file=vocab_file, bos_token="<bos>", eos_token="<eos>"
     )
     ids = tok("12*34\n")["input_ids"]
@@ -38,7 +38,7 @@ def test_char_level_encode_decode_round_trip(vocab_file):
 
 
 def test_add_bos_token_false_persists(tmp_path, vocab_file):
-    tok = TorchwrightTokenizer(
+    tok = TorchwrightCustomTokenizer(
         vocab_file=vocab_file,
         bos_token="<bos>",
         eos_token="<eos>",
@@ -47,7 +47,7 @@ def test_add_bos_token_false_persists(tmp_path, vocab_file):
     assert tok("12")["input_ids"] == [tok._token_to_id[c] for c in "12"]  # no bos
     save_dir = tmp_path / "tok"
     tok.save_pretrained(save_dir)
-    reloaded = TorchwrightTokenizer.from_pretrained(save_dir)
+    reloaded = TorchwrightCustomTokenizer.from_pretrained(save_dir)
     assert reloaded.add_bos_token is False
     assert reloaded("12")["input_ids"] == [reloaded._token_to_id[c] for c in "12"]
 
@@ -55,7 +55,7 @@ def test_add_bos_token_false_persists(tmp_path, vocab_file):
 def test_no_bos_token_never_emits_none(vocab_file):
     # A model with no bos passes bos_token=None; add_bos_token must collapse to
     # False so no None id is ever prefixed into input_ids.
-    tok = TorchwrightTokenizer(
+    tok = TorchwrightCustomTokenizer(
         vocab_file=vocab_file, bos_token=None, eos_token="<eos>", add_bos_token=True
     )
     assert tok.add_bos_token is False

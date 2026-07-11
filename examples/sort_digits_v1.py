@@ -47,7 +47,7 @@ rides RoPE rotary offset heads (``attend_to_offset``) that resolve
 
 Residual footprint. 10 key-side indicator columns + 1 score column +
 1 position scalar + value passthrough. No per-input mask. V1 is the
-narrowest of the four variants (D_MODEL = 384).
+narrowest of the four variants (D_MODEL = 512, a supported Phi-3/RMSNorm width).
 """
 
 from typing import List, Tuple
@@ -76,7 +76,7 @@ from torchwright.ops.swiglu.map_select import in_range, select
 from torchwright.ops.swiglu.scalar_encoding import digit_to_scaled_scalar
 from torchwright.ops.swiglu.sequence_ops import check_is_digit, output_sequence
 
-D_MODEL = 384
+D_MODEL = 512
 # Rotary width the graph is built against; must match the d_head it is compiled
 # at.  The indicator-basis content head spans W = 1 + 10 = 11 columns, which
 # must fit the slow planes (W <= d_head/2), so d_head must be >= 22 -> 32.

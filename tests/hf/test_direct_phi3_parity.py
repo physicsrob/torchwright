@@ -1,11 +1,11 @@
-"""Converter round-trip: ONNX artifact → native model → bit-exact parity.
+"""Direct stock Phi-3 compilation plus an ONNX sibling-backend parity gate.
 
 Compiles a small example (``binary_increment``, ~3s on CPU; no committed
-artifact — ``*.onnx`` is gitignored), converts it with ``compiler/hf/convert``,
-and checks that the native :class:`TorchwrightForCausalLM`:
+artifact — ``*.onnx`` is gitignored), compiles HF directly,
+and checks that the stock :class:`Phi3ForCausalLM`:
 
 1. derives a config whose scalar dims agree with the artifact's debug sidecar;
-2. consumes every ONNX initializer (the converter asserts this internally — a
+2. consumes every ONNX initializer (the direct compiler asserts this internally — a
    new unmapped weight would raise);
 3. produces **bit-exact** logits versus the ONNX oracle on the prefill and
    through several greedy decode steps (the cached-decode path);
@@ -25,9 +25,10 @@ import pytest
 torch = pytest.importorskip("torch")
 pytest.importorskip("transformers")
 pytest.importorskip("safetensors")
+pytest.importorskip("onnxruntime")
 
 from torchwright.compiler.export import debug_meta_path_for
-from torchwright.compiler.hf.convert import convert_onnx_to_hf
+from torchwright.compiler.hf import compile_to_hf
 from torchwright.compiler.onnx_load import load_onnx
 
 from tests.hf._hf_parity import (
@@ -51,8 +52,12 @@ def artifact_path():
 
 
 @pytest.fixture(scope="module")
-def converted(artifact_path):
-    model = convert_onnx_to_hf(artifact_path, bos_token=_BOS, eos_token=_EOS)
+def direct_model(artifact_path):
+    from examples import binary_increment
+    out, emb = binary_increment.create_network_parts()
+    model = compile_to_hf(
+        out, emb, d=binary_increment.D_MODEL, d_head=binary_increment.D_HEAD
+    )
     oracle = load_onnx(artifact_path)
     return model, oracle
 
@@ -62,23 +67,27 @@ def _prefill_ids(oracle):
     return [tok2id[t] for t in ([_BOS] + list(_PREFILL_TEXT))]
 
 
-def test_config_matches_debug_sidecar(artifact_path, converted):
-    model, _ = converted
+def test_config_matches_debug_sidecar(artifact_path, direct_model):
+    model, _ = direct_model
     cfg = model.config
     with open(debug_meta_path_for(artifact_path)) as f:
         dbg = json.load(f)
-    assert cfg.d == dbg["d"]
-    assert cfg.d_head == dbg["d_head"]
-    assert cfg.n_layers == dbg["n_layers"]
-    # Per-layer trimmed hidden widths come straight from the debug sidecar list.
-    assert cfg.d_hidden_per_layer == [int(x) for x in dbg["d_hidden"]]
-    assert len(cfg.n_heads_per_layer) == cfg.n_layers
+    assert cfg.hidden_size == dbg["d"]
+    assert cfg.head_dim == dbg["d_head"]
+    assert cfg.num_hidden_layers == dbg["n_layers"]
+    # The Phi-3 profile is biasless and reserves one constant lane; the
+    # independently compiled legacy ONNX profile may therefore be one slot
+    # narrower while remaining semantically identical.
+    assert cfg.intermediate_size in {
+        max(int(x) for x in dbg["d_hidden"]),
+        max(int(x) for x in dbg["d_hidden"]) + 1,
+    }
     # Untied vanilla layout: no separate embedding/output-gather width remains.
     assert not cfg.tie_word_embeddings
 
 
-def test_prefill_and_decode_bit_exact(converted):
-    """ONNX oracle (onnxruntime) vs native HF model (torch): the meaningful
+def test_prefill_and_decode_bit_exact(direct_model):
+    """ONNX oracle (onnxruntime) vs stock Phi-3 model (torch): the meaningful
     logits are bit-identical and decode the same tokens; the cancel-head rows
     that cancel to denormal magnitude differ only by a denormal ULP.
 
@@ -94,13 +103,13 @@ def test_prefill_and_decode_bit_exact(converted):
       is an FMA contraction one runtime applies and the other does not).  We bound
       those rows far below any real cancellation failure (~1e-4+) instead of
       demanding equality.
-    * We teacher-force the native model on the *oracle's* token stream rather
+    * We teacher-force the HF model on the *oracle's* token stream rather
       than letting each backend free-run on its own argmax. Past the meaningful
       output the logits are all-denormal noise whose argmax is arbitrary, so two
       free-running loops would pick different garbage and diverge; teacher
       forcing keeps every compared row on identical inputs.
     """
-    model, oracle = converted
+    model, oracle = direct_model
     prefill = _prefill_ids(oracle)
     o_ids, o_logits = oracle_decode(oracle, prefill, _N_STEPS)
     h_logits = hf_teacher_forced(model, prefill, o_ids)
@@ -115,7 +124,7 @@ def test_prefill_and_decode_bit_exact(converted):
     ), "cross-backend logit divergence exceeds the denormal noise floor"
 
 
-def test_bare_forward_without_use_cache(converted):
+def test_bare_forward_without_use_cache(direct_model):
     """A plain ``model(input_ids=...)`` with NO kwargs must not crash.
 
     Regression for the transformers-5.x config stripping ``use_cache`` off the
@@ -123,7 +132,7 @@ def test_bare_forward_without_use_cache(converted):
     Every other test passes ``use_cache=True`` and masked it. This is the
     standard logit-eval call a Hub consumer makes outside ``generate``.
     """
-    model, oracle = converted
+    model, oracle = direct_model
     prefill = _prefill_ids(oracle)
     with torch.no_grad():
         out = model(input_ids=torch.tensor([prefill]))
@@ -131,9 +140,9 @@ def test_bare_forward_without_use_cache(converted):
     assert torch.isfinite(out.logits).all()
 
 
-def test_labels_loss_path(converted):
+def test_labels_loss_path(direct_model):
     """``labels=`` returns a finite scalar loss (the training/perplexity path)."""
-    model, oracle = converted
+    model, oracle = direct_model
     ids = torch.tensor([_prefill_ids(oracle)])
     with torch.no_grad():
         out = model(input_ids=ids, labels=ids)
@@ -141,34 +150,24 @@ def test_labels_loss_path(converted):
     assert torch.isfinite(out.loss)
 
 
-def test_inputs_embeds_rejected(converted):
-    """inputs_embeds isn't supported (the table-lookup width is non-standard)."""
-    import pytest as _pytest
-
-    model, oracle = converted
+def test_inputs_embeds_supported(direct_model):
+    """Stock Phi-3 accepts the standard inputs_embeds path."""
+    model, oracle = direct_model
     ids = torch.tensor([_prefill_ids(oracle)])
     emb = model.model.embed_tokens(ids)
-    with _pytest.raises(NotImplementedError):
-        model(inputs_embeds=emb)
+    with torch.no_grad():
+        out = model(inputs_embeds=emb)
+    assert out.logits.shape[:2] == ids.shape
 
 
-def test_fp32_only_guard(converted):
-    """A downcast model must refuse to run (fp32-only invariant), not emit garbage."""
-    import pytest as _pytest
-
-    from torchwright.compiler.hf.modeling_torchwright import TorchwrightForCausalLM
-
-    model, oracle = converted
-    half = TorchwrightForCausalLM(
-        model.config
-    ).half()  # fresh; guard fires pre-correctness
-    with _pytest.raises(RuntimeError, match="fp32"):
-        half(input_ids=torch.tensor([_prefill_ids(oracle)]))
+def test_compiler_returns_fp32(direct_model):
+    model, oracle = direct_model
+    assert {p.dtype for p in model.parameters()} == {torch.float32}
 
 
-def test_position_ids_are_honored(converted):
+def test_position_ids_are_honored(direct_model):
     """position_ids must shift which absolute PE rows are used (not be ignored)."""
-    model, oracle = converted
+    model, oracle = direct_model
     ids = torch.tensor([_prefill_ids(oracle)])
     T = ids.shape[1]
     with torch.no_grad():
@@ -180,26 +179,23 @@ def test_position_ids_are_honored(converted):
     assert not torch.equal(default, shifted)
 
 
-def test_unsupported_attention_mask_raises(converted):
-    """A 4D / wrong-length mask must fail loudly, not silently drop to causal."""
-    import pytest as _pytest
-
-    model, oracle = converted
+def test_standard_attention_mask(direct_model):
+    model, oracle = direct_model
     ids = torch.tensor([_prefill_ids(oracle)])
-    T = ids.shape[1]
-    with _pytest.raises(NotImplementedError):
-        model(input_ids=ids, attention_mask=torch.ones(1, 1, T, T))  # 4D
-    with _pytest.raises(NotImplementedError):
-        model(input_ids=ids, attention_mask=torch.ones(1, T + 5))  # wrong length
+    with torch.no_grad():
+        out = model(input_ids=ids, attention_mask=torch.ones_like(ids))
+    assert out.logits.shape[:2] == ids.shape
 
 
-def test_save_load_round_trip(tmp_path, converted):
-    from torchwright.compiler.hf.modeling_torchwright import TorchwrightForCausalLM
+def test_save_load_round_trip(tmp_path, direct_model):
+    from transformers import Phi3ForCausalLM
 
-    model, oracle = converted
+    model, oracle = direct_model
     save_dir = tmp_path / "bundle"
     model.save_pretrained(save_dir)
-    reloaded = TorchwrightForCausalLM.from_pretrained(save_dir).eval()
+    reloaded = Phi3ForCausalLM.from_pretrained(
+        save_dir, attn_implementation="eager"
+    ).eval()
 
     prefill = _prefill_ids(oracle)
     with torch.no_grad():

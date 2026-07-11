@@ -1,6 +1,6 @@
 """Shared helpers for the HF-parity tests (leading underscore → not collected).
 
-Everything here keeps the native ``TorchwrightForCausalLM`` and the ONNX oracle
+Everything here keeps the stock Phi-3 model and the ONNX oracle
 (:class:`OnnxTokenModule`) on the **CPU**: both backends are deterministic
 there, so the parity assertion can be exact (``max|Δlogit| == 0``). On a GPU,
 cuBLAS picks matmul algorithms run-to-run, so the same comparison would only
@@ -34,6 +34,8 @@ def compile_example(name: str) -> str:
         embedding,
         os.path.join(out_dir, f"{name}.onnx"),
         d=module.D_MODEL,
+        d_head=getattr(module, "D_HEAD", 16),
+        bias=False,
     )
     return artifact.path
 
@@ -62,7 +64,7 @@ def oracle_decode(
 def hf_decode(
     model, prefill_ids: List[int], n_steps: int
 ) -> Tuple[List[int], List[torch.Tensor]]:
-    """Greedy argmax decode through the native model with a stock DynamicCache.
+    """Greedy argmax decode through the HF model with a stock DynamicCache.
 
     Mirrors :func:`oracle_decode` step-for-step so the two are directly
     comparable. Explicit ``cache_position`` keeps the position bookkeeping
@@ -103,7 +105,7 @@ def hf_decode(
 def hf_teacher_forced(
     model, prefill_ids: List[int], forced_ids: List[int]
 ) -> List[torch.Tensor]:
-    """Decode the native model along a FIXED token stream (teacher forcing).
+    """Decode the HF model along a FIXED token stream (teacher forcing).
 
     Mirrors :func:`hf_decode` step-for-step but feeds ``forced_ids`` (the
     oracle's tokens) instead of the model's own argmax, so every per-step logit

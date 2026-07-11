@@ -19,7 +19,14 @@ def main():
         sys.exit(1)
 
     output_node, embedding = module.create_network_parts()
-    compile_to_onnx(output_node, embedding, f"{name}.onnx", d=module.D_MODEL)
+    compile_to_onnx(
+        output_node,
+        embedding,
+        f"{name}.onnx",
+        d=getattr(module, "D_MODEL", 1024),
+        d_head=getattr(module, "D_HEAD", 16),
+        bias=False,
+    )
 
 
 if __name__ == "__main__":
