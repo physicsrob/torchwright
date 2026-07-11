@@ -2,6 +2,8 @@
 
 __all__ = [
     "CompileProfile",
+    "HFBundleReport",
+    "ScheduleProvenance",
     "compile_to_hf",
     "compile_hf_bundle",
     "save_hf_bundle",
@@ -10,10 +12,10 @@ __all__ = [
 
 def __getattr__(name):
     if name in __all__:
-        if name == "CompileProfile":
-            from .token_model import CompileProfile
+        if name in {"CompileProfile", "ScheduleProvenance"}:
+            from . import token_model
 
-            return CompileProfile
+            return getattr(token_model, name)
         from .hf import build
 
         return getattr(build, name)

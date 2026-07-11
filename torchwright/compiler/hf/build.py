@@ -8,6 +8,7 @@ import os
 import shutil
 import tempfile
 from contextlib import contextmanager
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Optional, Union
 
@@ -22,6 +23,7 @@ from torchwright.compiler.token_model import (
     CompileHeader,
     CompileProfile,
     ReluLayerWeights,
+    ScheduleProvenance,
     SwishLayerWeights,
     TokenModelSpec,
     build_token_weights,
@@ -32,6 +34,19 @@ from torchwright.compiler.token_model import (
 from torchwright.graph import Embedding, Node
 
 HFArchitecture = Union[CompileProfile, str]
+
+
+@dataclass(frozen=True)
+class HFBundleReport:
+    """Small, immutable report for a published Hugging Face bundle.
+
+    This deliberately contains only paths and compile facts.  In particular,
+    it does not retain the graph, emitted weights, or private compiler state.
+    """
+
+    output_dir: Union[str, os.PathLike]
+    n_layers: int
+    schedule_provenance: ScheduleProvenance
 
 
 def _validate_embedding_contract(output_node: Node, embedding: Embedding) -> None:
@@ -296,11 +311,15 @@ def compile_hf_bundle(
     write_tokenizer=True,
     _solver_seed=None,
     _force_resolve=False,
-):
-    """Compile and transactionally publish a sharded safetensors HF bundle."""
+) -> HFBundleReport:
+    """Compile and transactionally publish a sharded safetensors HF bundle.
+
+    Returns an :class:`HFBundleReport` whose layer count and selected-schedule
+    provenance describe the bundle that was successfully published.
+    """
     _validate_embedding_contract(output_node, embedding)
     with _staged_bundle_directory(output_dir) as staging:
-        _compile_hf_bundle_into(
+        report = _compile_hf_bundle_into(
             output_node,
             embedding,
             staging,
@@ -325,7 +344,7 @@ def compile_hf_bundle(
             _force_resolve=_force_resolve,
         )
         _validate_staged_bundle(staging, expect_tokenizer=write_tokenizer)
-    return output_dir
+    return replace(report, output_dir=output_dir)
 
 
 def _compile_hf_bundle_into(
@@ -623,7 +642,13 @@ def _compile_hf_bundle_into(
                 eos_token=eos_token,
                 add_bos_token=add_bos_token,
             ).save_pretrained(output_dir)
-    return output_dir
+    provenance = spec.schedule_provenance
+    assert provenance is not None
+    return HFBundleReport(
+        output_dir=output_dir,
+        n_layers=spec.n_layers,
+        schedule_provenance=provenance,
+    )
 
 
 # The public in-memory entry point intentionally reuses the streaming bundle

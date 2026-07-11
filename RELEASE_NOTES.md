@@ -24,6 +24,9 @@
   output and verifies that it is the same node supplied to the HF API.
 - Schedule metadata distinguishes the emitted schedule and its certified
   optimality from the independent CP-SAT attempt that proposed a candidate.
+- `compile_hf_bundle` returns an immutable `HFBundleReport` containing the
+  published output directory, layer count, and typed selected-schedule
+  provenance.
 
 There are intentionally no compatibility aliases. Pin an older release to
 load historical Python APIs, or recompile the source graph with the current

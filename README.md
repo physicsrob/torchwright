@@ -50,7 +50,8 @@ intermediate artifact:
 from torchwright.compiler import compile_to_hf, compile_hf_bundle
 
 model = compile_to_hf(output_node, embedding, d=1024)
-compile_hf_bundle(output_node, embedding, "hf_bundle", d=1024)
+report = compile_hf_bundle(output_node, embedding, "hf_bundle", d=1024)
+print(report.n_layers, report.schedule_provenance.selected_origin)
 ```
 
 The default is a stock `Phi3ForCausalLM` contract: SwiGLU graph, biasless
@@ -59,8 +60,10 @@ ReLU graph must opt in explicitly with `architecture="custom"`, which produces
 `TorchwrightCustomForCausalLM`. `compile_hf_bundle` writes sharded safetensors
 one layer at a time for large-model publishing. Publication is transactional:
 the destination is replaced only after the staged config, tensor manifest, and
-tokenizer validate. Token artifacts currently require one graph `Embedding`,
-and the supplied `embedding` argument must be that exact node.
+tokenizer validate. Its immutable `HFBundleReport` return value exposes the
+published layer count and selected-schedule provenance without retaining graph,
+weight, or private compiler state. Token artifacts currently require one graph
+`Embedding`, and the supplied `embedding` argument must be that exact node.
 
 
 ## Key Concepts

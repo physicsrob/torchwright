@@ -12,6 +12,7 @@ pytest.importorskip("transformers")
 pytest.importorskip("safetensors")
 
 from torchwright.compiler.hf import (
+    HFBundleReport,
     build_fast_tokenizer,
     compile_hf_bundle,
     compile_to_hf,
@@ -69,13 +70,19 @@ def test_stock_streaming_bundle_loads_without_custom_code(tmp_path, monkeypatch)
         lambda *args, **kwargs: pytest.fail("bundle build created a spool"),
     )
     out, emb, d, d_head = _graph()
-    compile_hf_bundle(out, emb, tmp_path, d=d, d_head=d_head, max_seq_len=64)
+    report = compile_hf_bundle(out, emb, tmp_path, d=d, d_head=d_head, max_seq_len=64)
     files = {p.name for p in tmp_path.iterdir()}
     assert "model.safetensors.index.json" in files
     assert not any(name.startswith("layer-") for name in files)
     assert not any(name.endswith(".py") for name in files)
     config = json.loads((tmp_path / "config.json").read_text())
     assert "auto_map" not in config
+    assert isinstance(report, HFBundleReport)
+    assert report.output_dir == tmp_path
+    assert report.n_layers == config["num_hidden_layers"]
+    assert report.schedule_provenance.optimize == 0
+    assert report.schedule_provenance.selected_origin == "heuristic"
+    assert report.schedule_provenance.delivery == "fresh"
     loaded = AutoModelForCausalLM.from_pretrained(tmp_path)
     assert loaded.config.model_type == "phi3"
 

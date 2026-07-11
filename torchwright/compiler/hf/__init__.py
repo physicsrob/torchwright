@@ -25,6 +25,8 @@ from .tokenization_torchwright_custom import TorchwrightCustomTokenizer
 from .build import (
     CompileProfile,
     HFArchitecture,
+    HFBundleReport,
+    ScheduleProvenance,
     build_fast_tokenizer,
     compile_hf_bundle,
     compile_to_hf,
@@ -42,5 +44,7 @@ __all__ = [
     "save_hf_bundle",
     "build_fast_tokenizer",
     "HFArchitecture",
+    "HFBundleReport",
+    "ScheduleProvenance",
     "CompileProfile",
 ]
