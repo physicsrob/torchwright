@@ -122,7 +122,9 @@ def store_assignment(
 
     Returns True when the entry was written.
 
-    The schedule ratchet is one-way (fewer layers only), but the entry's
+    The schedule ratchet is one-way by realized objective when the caller
+    supplies ``meta["realized_objective"]``; legacy callers fall back to fewer
+    layers. The entry's
     validated optimize level (``meta["optimize"]``) ratchets
     independently: when a higher-level solve fails to beat the cached
     schedule, that is proof the entry is as good as that level produces,
@@ -136,9 +138,16 @@ def store_assignment(
     prior_path = base / f"{fingerprint}.json"
     if prior_path.exists():
         prior = json.loads(prior_path.read_text(encoding="utf-8"))
-        if prior.get("n_layers", 1 << 30) <= assignment.n_layers:
+        prior_meta = prior.get("meta", {})
+        prior_objective = prior_meta.get("realized_objective")
+        new_objective = meta.get("realized_objective")
+        prior_dominates = (
+            int(prior_objective) <= int(new_objective)
+            if prior_objective is not None and new_objective is not None
+            else prior.get("n_layers", 1 << 30) <= assignment.n_layers
+        )
+        if prior_dominates:
             new_level = int(meta.get("optimize", 0) or 0)
-            prior_meta = prior.get("meta", {})
             if new_level > int(prior_meta.get("optimize", 0) or 0):
                 prior_meta["optimize"] = new_level
                 prior["meta"] = prior_meta

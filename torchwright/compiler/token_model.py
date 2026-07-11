@@ -146,9 +146,11 @@ def make_layer_callback(header: CompileHeader, sink: TokenModelSink) -> Callable
     """Return a ``forward_compile`` callback which transfers layer ownership."""
     begun = False
 
-    def on_schedule_planned(shapes) -> None:
+    def on_replay_plan(plan) -> None:
         nonlocal header, begun
-        header = replace(header, layer_shapes=tuple(shapes))
+        header = replace(
+            header, layer_shapes=tuple(layer.shape for layer in plan.layers)
+        )
         sink.begin(header)
         begun = True
 
@@ -177,8 +179,10 @@ def make_layer_callback(header: CompileHeader, sink: TokenModelSink) -> Callable
             array(attn.query_matrix.permute(1, 0, 2).reshape(header.d, hd)),
             array(attn.key_matrix.permute(1, 0, 2).reshape(header.d, hd)),
             array(attn.value_matrix.permute(1, 0, 2).reshape(header.d, hd)),
-            array(attn.output_matrix.reshape(hd, header.d)), nh,
-            getattr(attn, "rope_base", None), getattr(attn, "rope_d_rot", None),
+            array(attn.output_matrix.reshape(hd, header.d)),
+            nh,
+            getattr(attn, "rope_base", None),
+            getattr(attn, "rope_d_rot", None),
         )
         attn.query_matrix = attn.key_matrix = attn.value_matrix = None
         attn.output_matrix = None
@@ -205,7 +209,7 @@ def make_layer_callback(header: CompileHeader, sink: TokenModelSink) -> Callable
         sink.write_layer(index, record)
 
     callback.token_model_sink = sink
-    callback.on_schedule_planned = on_schedule_planned
+    callback.on_replay_plan = on_replay_plan
     return callback
 
 
@@ -222,8 +226,10 @@ def schedule_provenance(compiled, optimize: int) -> ScheduleProvenance:
     if stats is None:
         return ScheduleProvenance(optimize=int(optimize), status=None)
     return ScheduleProvenance(
-        optimize=int(optimize), status=stats.status_name,
-        objective=stats.objective_value, best_bound=stats.best_objective_bound,
+        optimize=int(optimize),
+        status=stats.status_name,
+        objective=stats.objective_value,
+        best_bound=stats.best_objective_bound,
         is_optimal=stats.is_optimal,
     )
 

@@ -125,6 +125,31 @@ class Costs:
     waste: int = 0
 
 
+def lexicographic_objective_scale(max_secondary: int) -> int:
+    """Return the shared multiplier that makes the primary block dominant."""
+    return int(max_secondary) + 1 if max_secondary else 1
+
+
+def evaluate_objective_components(
+    costs: Costs,
+    *,
+    n_layers: int,
+    total_attn_heads: int,
+    total_mlp_bypass_slots: int,
+    earliness_sum: int,
+    waste_sum: int,
+    objective_scale: int,
+) -> int:
+    """Evaluate concrete counts with the same objective algebra as CP-SAT."""
+    primary = (
+        costs.alpha * n_layers
+        + costs.beta * total_attn_heads
+        + costs.gamma * total_mlp_bypass_slots
+    )
+    secondary = costs.earliness * earliness_sum + costs.waste * waste_sum
+    return objective_scale * primary + secondary
+
+
 @dataclass(frozen=True)
 class ScheduleAssignment:
     """Per-node placement, cancellation, and routing decisions.
@@ -189,7 +214,9 @@ class ScheduleAssignment:
         gm = build_graph_model(output_node)
         sched_ids = {node.node_id for node in gm.schedulable}
         input_ids = {node.node_id for node in gm.input_nodes}
-        layer_map = {nid: layer for nid, layer in node_to_layer.items() if nid in sched_ids}
+        layer_map = {
+            nid: layer for nid, layer in node_to_layer.items() if nid in sched_ids
+        }
         if set(layer_map) != sched_ids:
             missing = sorted(sched_ids - set(layer_map))
             extra = sorted(set(layer_map) - sched_ids)
@@ -215,7 +242,8 @@ class ScheduleAssignment:
             node_to_routing=dict(node_to_routing),
             n_layers=int(n_layers),
             node_to_cancel_mech={
-                nid: mech for nid, mech in observed_cancel_mech.items()
+                nid: mech
+                for nid, mech in observed_cancel_mech.items()
                 if nid in sched_ids
             },
         )
@@ -227,23 +255,31 @@ class ScheduleAssignment:
         sched_ids = {node.node_id for node in gm.schedulable}
         input_ids = {node.node_id for node in gm.input_nodes}
         if set(self.node_to_layer) != sched_ids:
-            raise ValueError("assignment node_to_layer does not cover schedulable nodes")
+            raise ValueError(
+                "assignment node_to_layer does not cover schedulable nodes"
+            )
         if set(self.node_to_routing) != sched_ids:
-            raise ValueError("assignment node_to_routing does not cover schedulable nodes")
+            raise ValueError(
+                "assignment node_to_routing does not cover schedulable nodes"
+            )
         if not (sched_ids | input_ids) <= set(self.node_to_cancel_layer):
             raise ValueError("assignment cancellation map is incomplete")
         for nid, layer in self.node_to_layer.items():
             if not 0 <= int(layer) < self.n_layers:
                 raise ValueError(f"node {nid} has invalid layer {layer}")
             if self.node_to_routing[nid] not in (ATTN, MLP):
-                raise ValueError(f"node {nid} has invalid routing {self.node_to_routing[nid]!r}")
+                raise ValueError(
+                    f"node {nid} has invalid routing {self.node_to_routing[nid]!r}"
+                )
             cancel = self.node_to_cancel_layer[nid]
             if not int(layer) <= int(cancel) <= self.n_layers:
                 raise ValueError(
                     f"node {nid} cancel layer {cancel} precedes birth {layer}"
                 )
         if set(self.node_to_cancel_mech) - sched_ids:
-            raise ValueError("assignment has cancellation mechanisms for non-schedulable nodes")
+            raise ValueError(
+                "assignment has cancellation mechanisms for non-schedulable nodes"
+            )
         if any(mech not in (ATTN, MLP) for mech in self.node_to_cancel_mech.values()):
             raise ValueError("assignment has an invalid cancellation mechanism")
 
@@ -1054,9 +1090,7 @@ def build_cpsat_model_from_gm(
     # to None here skips the whole window/parked/widening block per node,
     # exactly the family the pin replaces.
     eff_cancel_slack = (
-        None
-        if ("cancel_slack" in _disabled_families or _pin_cancels)
-        else cancel_slack
+        None if ("cancel_slack" in _disabled_families or _pin_cancels) else cancel_slack
     )
 
     # Hint-aware cancel-window widening.  Freeing a node's columns costs
@@ -1275,9 +1309,7 @@ def build_cpsat_model_from_gm(
             # posts above: max(1, layer[c] + 1) over layer-bound consumers,
             # falling back to the birth-based earliest (layer 1) when none.
             if consumer_layer_vars:
-                model.AddMaxEquality(
-                    cl, [1] + [v + 1 for v in consumer_layer_vars]
-                )
+                model.AddMaxEquality(cl, [1] + [v + 1 for v in consumer_layer_vars])
             else:
                 model.Add(cl == 1)
             continue
@@ -1768,7 +1800,7 @@ def build_cpsat_model_from_gm(
         secondary_terms.append(costs.waste * sum(occupancy))
     objective_scale = 1
     if secondary_terms:
-        objective_scale = max_secondary + 1
+        objective_scale = lexicographic_objective_scale(max_secondary)
         model.Minimize(objective_scale * primary + sum(secondary_terms))
     else:
         model.Minimize(primary)
@@ -2388,9 +2420,7 @@ def solve_schedule(
             hint is not None
             for hint in (hint_layers, hint_routing, hint_cancel, hint_cancel_mech)
         ):
-            raise ValueError(
-                "pass either incumbent or legacy hint mappings, not both"
-            )
+            raise ValueError("pass either incumbent or legacy hint mappings, not both")
         hint_layers = dict(incumbent.node_to_layer)
         hint_routing = dict(incumbent.node_to_routing)
         hint_cancel = dict(incumbent.node_to_cancel_layer)

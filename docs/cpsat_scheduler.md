@@ -92,8 +92,23 @@ fewer layers).
    └───────────────────────────────┘
               │
               ▼
+   immutable ReplayPlan
+     planned attention/MLP ops
+     exact physical resource counts
+     residual snapshots + layer shapes
+              │
+              ▼
+   streaming dense emission
+   (no scheduler or allocator access)
+              │
+              ▼
    HeadlessTransformer
 ```
+
+The directed scheduler/allocator walk occurs once per assignment considered.
+The selected plan is emitted without replaying its assignment. With weighted
+`Costs`, incumbent and solver-candidate plans are each built at most once and
+compared using realized head, bypass-slot, earliness, and residual-waste costs.
 
 ### `ScheduleAssignment`
 
