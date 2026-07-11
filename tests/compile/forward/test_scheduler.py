@@ -24,7 +24,6 @@ from torchwright.compiler.forward.scheduling_policy import (
     LEGACY_POLICY,
     SchedulingPolicy,
 )
-from torchwright.compiler.forward.weight_writer import AttnHeadOp, MLPOp
 from torchwright.graph import Linear, Attn, Add, Concatenate
 from torchwright.graph.misc import InputNode, LiteralValue
 from torchwright.ops.relu.linear_relu_linear import linear_relu_linear
@@ -86,7 +85,7 @@ def _make_ffn(inp, d_hidden, d_out, name=""):
 
 
 def test_schedule_attn_node():
-    """Attn node produces AttnHeadOp('compute_attn')."""
+    """Attn node produces a compute_attn scheduler operation."""
     pos = _make_reserved_block()
     v = InputNode("v", 4, value_range=(-100.0, 100.0))
     attn_node = _make_attn(v)
@@ -107,7 +106,7 @@ def test_schedule_attn_node():
 
 
 def test_schedule_block():
-    """An FFN produces MLPOp('compute_ffn'); the FFN is marked computed."""
+    """An FFN produces compute_ffn; the FFN is marked computed."""
     pos = _make_reserved_block()
     x = InputNode("x", 4, value_range=(-100.0, 100.0))
     ffn = _make_ffn(x, 8, 3, "chain")
@@ -130,7 +129,7 @@ def test_schedule_block():
 
 
 def test_schedule_constant():
-    """LiteralValue node produces MLPOp('compute_literal_value') with no MLP slots.
+    """LiteralValue produces compute_literal_value with no MLP slots.
 
     Note: in the compile loop, Constants are typically pre-populated as input nodes.
     This tests the scheduler's capability to handle Constants that aren't pre-populated.
@@ -175,7 +174,7 @@ def test_schedule_zero_bias_linear():
 
 
 def test_schedule_zero_bias_linear_bypass():
-    """Zero-bias Linear with default policy produces MLPOp('compute_linear_bypass')."""
+    """Zero-bias Linear with default policy produces compute_linear_bypass."""
     pos = _make_reserved_block()
     x = InputNode("x", 4, value_range=(-100.0, 100.0))
     linear = _make_linear(x, 3, "lin")
@@ -316,7 +315,7 @@ def test_schedule_biased_linear_bypass():
 
 
 def test_schedule_cancellation():
-    """Dead node (all consumers computed) produces cancel AttnHeadOp."""
+    """Dead node (all consumers computed) produces a cancel operation."""
     pos = _make_reserved_block()
     x = InputNode("x", 4, value_range=(-100.0, 100.0))
     a = _make_linear(x, 4, "a")
@@ -336,7 +335,7 @@ def test_schedule_cancellation():
     attn_ops, mlp_ops, _biased = scheduler.schedule_layer(rmap, computed)
 
     cancel_ops = [op for op in attn_ops if op.op_type == "cancel"]
-    # Cancels are coalesced into a single AttnHeadOp whose target_cols
+    # Cancels are coalesced into a single operation whose target_cols
     # is the union of all cols to clear in this layer — check that x's
     # cols are present in that batch.
     cancel_targets = {c for op in cancel_ops for c in op.target_cols}
@@ -352,7 +351,7 @@ def test_schedule_cancellation():
 
 
 def test_schedule_free_add():
-    """Add with one dead-for-add addend produces add_into AttnHeadOp.
+    """Add with one dead-for-add addend produces add_into.
 
     dead_node's only consumer (besides add_node) is nothing — dead for add.
     live_node has another consumer (other) that isn't computed — NOT dead for add.

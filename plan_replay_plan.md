@@ -380,6 +380,15 @@ dual implementation or compatibility layer.
 - ReplayPlan-specific tests cover defensive immutability, physical shape/cost
   accounting, writer type enforcement, one directed walk, zero-layer graphs,
   exact weighted dominance, and weighted cache ratcheting.
+- Follow-up review made the zero-layer runtime placeholder a planned layer, so
+  streaming sinks receive its `(1 head, 1 hidden slot)` shape before allocation.
+  It also added in-process planned/emitted shape assertions, including
+  post-compaction removal of zero-output attention heads.
+- Weighted cache ratcheting now compares scale-independent `(primary,
+  secondary)` objective blocks; the scaled total and scale remain metadata for
+  diagnostics only. ReplayPlan construction now deeply freezes column
+  collections and rejects malformed operations, unresolved node IDs, tensors,
+  and duplicate resolver entries.
 - A three-run warm micro-fixture measured a 5.8 ms median compile in this
   environment. This is a smoke measurement, not the representative
   before/after performance study still tracked in `todo.md`.

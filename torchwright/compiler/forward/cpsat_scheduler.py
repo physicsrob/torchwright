@@ -141,13 +141,34 @@ def evaluate_objective_components(
     objective_scale: int,
 ) -> int:
     """Evaluate concrete counts with the same objective algebra as CP-SAT."""
+    primary, secondary = objective_blocks(
+        costs,
+        n_layers=n_layers,
+        total_attn_heads=total_attn_heads,
+        total_mlp_bypass_slots=total_mlp_bypass_slots,
+        earliness_sum=earliness_sum,
+        waste_sum=waste_sum,
+    )
+    return objective_scale * primary + secondary
+
+
+def objective_blocks(
+    costs: Costs,
+    *,
+    n_layers: int,
+    total_attn_heads: int,
+    total_mlp_bypass_slots: int,
+    earliness_sum: int,
+    waste_sum: int,
+) -> tuple[int, int]:
+    """Return the primary and secondary blocks before lexicographic scaling."""
     primary = (
         costs.alpha * n_layers
         + costs.beta * total_attn_heads
         + costs.gamma * total_mlp_bypass_slots
     )
     secondary = costs.earliness * earliness_sum + costs.waste * waste_sum
-    return objective_scale * primary + secondary
+    return int(primary), int(secondary)
 
 
 @dataclass(frozen=True)

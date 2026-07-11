@@ -5,6 +5,8 @@ import torch
 
 from torchwright.compiler.forward.compile import (
     _choose_dominating_replay_plan,
+    _count_heads_by_type,
+    _count_layer_params,
     _replay_plan_objective,
     forward_compile,
 )
@@ -16,12 +18,16 @@ from torchwright.compiler.forward.replay_plan import (
     ReplayPlan,
     planned_layer_shape,
 )
-from torchwright.compiler.forward.scheduler import DirectedLayerScheduler
+from torchwright.compiler.forward.scheduler import DirectedLayerScheduler, _AttentionOp
 from torchwright.compiler.forward.schedule_cache import store_assignment
-from torchwright.compiler.forward.weight_writer import AttnHeadOp, write_attn_sublayer
+from torchwright.compiler.forward.weight_writer import write_attn_sublayer
 from torchwright.compiler.groups.transformer_layer import TransformerLayer
-from torchwright.compiler.token_model import LayerShape
-from torchwright.graph import Linear
+from torchwright.compiler.token_model import (
+    CompileHeader,
+    LayerShape,
+    make_layer_callback,
+)
+from torchwright.graph import Attn, Linear
 from torchwright.ops.inout_nodes import create_input
 
 
@@ -29,7 +35,7 @@ def test_planned_operations_defensively_freeze_scheduler_lists():
     node = create_input("x", 2)
     target = [3, 4]
     source = [1, 2]
-    mutable = AttnHeadOp("cancel", node, target, source_cols=source)
+    mutable = _AttentionOp("cancel", node, target, source_cols=source)
 
     planned = PlannedAttentionOp.from_scheduler_op(mutable)
     target.append(5)
@@ -39,6 +45,44 @@ def test_planned_operations_defensively_freeze_scheduler_lists():
     assert planned.source_cols == (1, 2)
     with pytest.raises(dataclasses.FrozenInstanceError):
         planned.target_cols = ()
+
+
+def test_planned_operations_reject_tensor_indices():
+    node = create_input("x", 2)
+    with pytest.raises(TypeError, match="target_cols must contain only integers"):
+        PlannedAttentionOp("cancel", node, torch.tensor([0, 1]))
+
+
+def test_replay_plan_rejects_missing_node_resolution():
+    x = create_input("x", 1)
+    assignment = ScheduleAssignment(
+        node_to_layer={},
+        node_to_cancel_layer={x.node_id: 0},
+        node_to_routing={},
+        n_layers=0,
+    )
+    layer = PlannedLayer(
+        attention_ops=[],
+        mlp_ops=[],
+        biased_linear_ids=set(),
+        shape=LayerShape(1, 1),
+        residual_snapshot=[(x.node_id, [0])],
+        newly_computed_ids=[],
+        emitted_attention_heads=0,
+        mlp_bypass_slots=0,
+    )
+
+    assert layer.attention_ops == ()
+    assert layer.residual_snapshot == ((x.node_id, (0,)),)
+    with pytest.raises(ValueError, match="does not resolve"):
+        ReplayPlan(
+            assignment=assignment,
+            layers=[layer],
+            input_indices=[(x.node_id, [0])],
+            final_indices=[(x.node_id, [0])],
+            nodes_by_id=[],
+            const_one_col=15,
+        )
 
 
 def test_planned_accounting_drives_shape_and_weighted_counts():
@@ -59,11 +103,47 @@ def test_planned_accounting_drives_shape_and_weighted_counts():
     assert shape == LayerShape(n_heads=3, d_hidden=7)
     assert heads == 3
     assert bypass_slots == 4
+    assert _count_heads_by_type((add_like,), 16) == {"compute_add": 3}
+    assert _count_layer_params((add_like,), (bypass,), 64, 16) == (
+        3 * 4 * 64 * 16 + 4 * (2 * 64 + 2)
+    )
+
+
+def test_planned_attention_heads_exclude_zero_output_chunks():
+    q = create_input("q", 4)
+    k = create_input("k", 4)
+    v = create_input("v", 4)
+    output = torch.zeros(8, 2)
+    output[4:, :] = 1.0
+    node = Attn(
+        q,
+        k,
+        v,
+        torch.eye(4),
+        torch.eye(4),
+        torch.ones(4, 8),
+        output,
+    )
+    op = PlannedAttentionOp(
+        "compute_attn",
+        node,
+        (8, 9),
+        source_cols=(4, 5, 6, 7),
+        q_source_cols=(0, 1, 2, 3),
+        k_source_cols=(0, 1, 2, 3),
+    )
+
+    shape, heads, _ = planned_layer_shape(
+        (op,), (), d=16, d_head=4, d_hidden=16, trim_heads=True
+    )
+
+    assert heads == 1
+    assert shape.n_heads == 1
 
 
 def test_writer_rejects_mutable_scheduler_operations():
     node = create_input("x", 1)
-    op = AttnHeadOp("cancel", node, [0])
+    op = _AttentionOp("cancel", node, [0])
     with pytest.raises(TypeError, match="PlannedAttentionOp"):
         write_attn_sublayer(TransformerLayer(16, 16), [op], 15)
 
@@ -87,11 +167,32 @@ def test_selected_assignment_has_one_directed_walk(monkeypatch):
 
 
 def test_trivial_graph_uses_placeholder_layer_without_planned_operations():
+    class Sink:
+        def begin(self, header):
+            self.header = header
+
+        def write_layer(self, index, weights):
+            self.written = (index, weights)
+
     x = create_input("x", 2)
-    net = forward_compile(d=16, d_head=16, output_node=x, optimize=0, verbose=False)
+    sink = Sink()
+    net = forward_compile(
+        d=16,
+        d_head=16,
+        output_node=x,
+        optimize=0,
+        verbose=False,
+        on_layer_compiled=make_layer_callback(
+            CompileHeader(16, 16, True, True), sink
+        ),
+    )
 
     assert net.schedule_result.assignment.n_layers == 0
     assert len(net.layers) == 1
+    assert sink.header.layer_shapes == (LayerShape(1, 1),)
+    assert sink.written[0] == 0
+    assert sink.written[1].attention.n_heads == 1
+    assert sink.written[1].d_hidden == 1
     assert net.residual_assignment.get_node_indices(net.layers[0].attn.in_state, x)
 
 
@@ -185,6 +286,49 @@ def test_weighted_cache_ratchets_on_realized_objective(tmp_path, monkeypatch):
         n_layers=1,
     )
 
-    assert store_assignment("weighted", assignment, {"realized_objective": 20}, y)
-    assert store_assignment("weighted", assignment, {"realized_objective": 10}, y)
-    assert not store_assignment("weighted", assignment, {"realized_objective": 30}, y)
+    assert store_assignment(
+        "weighted", assignment, {"realized_objective_blocks": (20, 0)}, y
+    )
+    assert store_assignment(
+        "weighted", assignment, {"realized_objective_blocks": (10, 0)}, y
+    )
+    assert not store_assignment(
+        "weighted", assignment, {"realized_objective_blocks": (30, 0)}, y
+    )
+
+
+def test_weighted_cache_compares_blocks_across_different_scales(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setenv("TW_SCHEDULE_CACHE_DIR", str(tmp_path))
+    x = create_input("x", 1)
+    y = Linear(x, torch.ones(1, 1), torch.zeros(1))
+    assignment = ScheduleAssignment(
+        node_to_layer={y.node_id: 0},
+        node_to_cancel_layer={x.node_id: 1, y.node_id: 1},
+        node_to_routing={y.node_id: "mlp"},
+        n_layers=1,
+    )
+
+    assert store_assignment(
+        "scaled",
+        assignment,
+        {
+            "realized_objective": 210,
+            "realized_objective_blocks": (2, 10),
+            "objective_scale": 100,
+        },
+        y,
+    )
+    # The raw total is smaller only because its scale differs. Its secondary
+    # block is worse, so it must not replace the incumbent.
+    assert not store_assignment(
+        "scaled",
+        assignment,
+        {
+            "realized_objective": 22,
+            "realized_objective_blocks": (2, 20),
+            "objective_scale": 1,
+        },
+        y,
+    )

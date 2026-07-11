@@ -15,6 +15,7 @@ from torchwright.compiler.hf import (
     compile_hf_bundle,
     compile_to_hf,
 )
+from torchwright.graph import Embedding
 
 
 def _graph():
@@ -72,6 +73,31 @@ def test_stock_streaming_bundle_loads_without_custom_code(tmp_path, monkeypatch)
     assert "auto_map" not in config
     loaded = AutoModelForCausalLM.from_pretrained(tmp_path)
     assert loaded.config.model_type == "phi3"
+
+
+def test_trivial_graph_streaming_announces_placeholder_shape(tmp_path):
+    embedding = Embedding(
+        ["a"],
+        d_embed=2,
+        table=torch.tensor([[1.0, 0.0], [0.0, 1.0]]),
+    )
+
+    compile_hf_bundle(
+        embedding,
+        embedding,
+        tmp_path,
+        d=16,
+        d_head=16,
+        d_hidden=16,
+        bos_token=None,
+        eos_token=None,
+        write_tokenizer=False,
+    )
+
+    config = json.loads((tmp_path / "config.json").read_text())
+    assert config["num_hidden_layers"] == 1
+    assert config["num_attention_heads"] == 1
+    assert config["intermediate_size"] == 1
 
 
 def test_fast_tokenizer_character_round_trip(direct):

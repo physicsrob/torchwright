@@ -19,7 +19,6 @@ from torchwright.compiler.device import get_device
 from torchwright.compiler.realization import (
     CLASS_SUBLAYER,
     RealizationTable,
-    linear_attn_heads,
     usable_hidden_slots,
 )
 from torchwright.compiler.residual_assignment import ResidualAssignment
@@ -30,7 +29,7 @@ from torchwright.compiler.forward.cpsat_scheduler import (
     SchedulingProvenance,
     SolveStats,
     choose_dominating_assignment,
-    evaluate_objective_components,
+    objective_blocks,
     solve_schedule,
 )
 from torchwright.compiler.forward.schedule_cache import (
@@ -56,14 +55,13 @@ from torchwright.compiler.forward.sibling_clusters import (
     SiblingClusterAnalyzer,
 )
 from torchwright.compiler.forward.weight_writer import (
-    AttnHeadOp,
-    MLPOp,
     PlacementRecorder,
     write_attn_sublayer,
     write_mlp_sublayer,
 )
 from torchwright.compiler.groups.transformer_layer import TransformerLayer
 from torchwright.compiler.transformer import HeadlessTransformer
+from torchwright.compiler.token_model import LayerShape
 from torchwright.compiler.residual_assignment import flatten_concat_nodes
 from torchwright.graph import Node, Linear, Concatenate
 from torchwright.graph.node import reserve_node_id_above
@@ -676,31 +674,13 @@ def _verify_end_of_layer_writes(
 
 
 def _count_heads_by_type(
-    attn_ops: list[AttnHeadOp],
+    attn_ops: tuple[PlannedAttentionOp, ...],
     d_head: int,
 ) -> dict[str, int]:
     """Count attention heads consumed by each op type."""
     counts: dict[str, int] = {}
     for attn_op in attn_ops:
-        if attn_op.op_type == "compute_attn":
-            assert attn_op.node is not None
-            from torchwright.graph.attn import Attn as _Attn
-
-            assert isinstance(attn_op.node, _Attn)
-            n = (attn_op.node.d_v + d_head - 1) // d_head
-        elif attn_op.op_type == "compute_linear":
-            assert attn_op.node is not None
-            n = linear_attn_heads(attn_op.node, d_head)
-        elif attn_op.op_type == "compute_add":
-            assert attn_op.node is not None
-            n = 2 * ((len(attn_op.node) + d_head - 1) // d_head)
-        elif attn_op.op_type == "cancel":
-            n = (len(attn_op.target_cols) + d_head - 1) // d_head
-        elif attn_op.op_type == "add_into":
-            assert attn_op.node is not None
-            n = (len(attn_op.node) + d_head - 1) // d_head
-        else:
-            n = 0
+        n = attn_op.emitted_heads(d_head)
         counts[attn_op.op_type] = counts.get(attn_op.op_type, 0) + n
     return counts
 
@@ -712,6 +692,15 @@ def _replay_plan_objective(
     objective_scale: int,
 ) -> int:
     """Evaluate one assignment using its realized physical placement."""
+    primary, secondary = _replay_plan_objective_blocks(plan, costs)
+    return objective_scale * primary + secondary
+
+
+def _replay_plan_objective_blocks(
+    plan: ReplayPlan,
+    costs: Costs,
+) -> tuple[int, int]:
+    """Return scale-independent primary and secondary objective blocks."""
     nodes = plan.node_resolver()
     finite_lifetime_ids = {
         node_id
@@ -726,14 +715,13 @@ def _replay_plan_objective(
         for node_id, _ in layer.residual_snapshot
         if node_id in finite_lifetime_ids
     )
-    return evaluate_objective_components(
+    return objective_blocks(
         costs,
-        n_layers=len(plan.layers),
+        n_layers=plan.assignment.n_layers,
         total_attn_heads=plan.total_attention_heads,
         total_mlp_bypass_slots=plan.total_mlp_bypass_slots,
         earliness_sum=sum(plan.assignment.node_to_layer.values()),
         waste_sum=waste_sum,
-        objective_scale=objective_scale,
     )
 
 
@@ -882,6 +870,31 @@ def _build_replay_plan(
         )
 
     _check_replay_depth(assignment, replay_birth_layer, len(layers))
+    if not layers:
+        # Runtime models require one layer to expose input/output residual
+        # states.  Make that physical placeholder part of the plan so sinks
+        # receive its exact shape before it is allocated and emission has no
+        # out-of-plan fallback path.
+        shape, emitted_heads, bypass_slots = planned_layer_shape(
+            (),
+            (),
+            d=d,
+            d_head=d_head,
+            d_hidden=d_hidden,
+            trim_heads=trim_heads,
+        )
+        layers.append(
+            PlannedLayer(
+                attention_ops=(),
+                mlp_ops=(),
+                biased_linear_ids=frozenset(),
+                shape=shape,
+                residual_snapshot=_snapshot_residual_map(planned_rmap),
+                newly_computed_ids=(),
+                emitted_attention_heads=emitted_heads,
+                mlp_bypass_slots=bypass_slots,
+            )
+        )
     if isinstance(output_node, Concatenate):
         final_nodes = flatten_concat_nodes([output_node])
     else:
@@ -914,8 +927,8 @@ def _params_per_slot(d: int, activation: str, bias: bool = True) -> int:
 
 
 def _count_layer_params(
-    attn_ops: list[AttnHeadOp],
-    mlp_ops: list[MLPOp],
+    attn_ops: tuple[PlannedAttentionOp, ...],
+    mlp_ops: tuple[PlannedMlpOp, ...],
     d: int,
     d_head: int,
     activation: str = "relu",
@@ -930,25 +943,7 @@ def _count_layer_params(
     """
     params_per_head = 4 * d * d_head
 
-    heads_used = 0
-    for attn_op in attn_ops:
-        if attn_op.op_type == "compute_attn":
-            assert attn_op.node is not None
-            from torchwright.graph.attn import Attn as _Attn
-
-            assert isinstance(attn_op.node, _Attn)
-            heads_used += (attn_op.node.d_v + d_head - 1) // d_head
-        elif attn_op.op_type == "compute_linear":
-            assert attn_op.node is not None
-            heads_used += linear_attn_heads(attn_op.node, d_head)
-        elif attn_op.op_type == "compute_add":
-            assert attn_op.node is not None
-            heads_used += 2 * ((len(attn_op.node) + d_head - 1) // d_head)
-        elif attn_op.op_type == "cancel":
-            heads_used += (len(attn_op.target_cols) + d_head - 1) // d_head
-        elif attn_op.op_type == "add_into":
-            assert attn_op.node is not None
-            heads_used += (len(attn_op.node) + d_head - 1) // d_head
+    heads_used = sum(op.emitted_heads(d_head) for op in attn_ops)
 
     slots_used = 0
     bias_entries = 0
@@ -1494,7 +1489,9 @@ def forward_compile(
                 )
             net.cpsat_solve_stats = SolveStats(
                 status_name="CACHED",
-                objective_value=assignment.n_layers,
+                objective_value=float(
+                    _cached_meta.get("realized_objective", assignment.n_layers)
+                ),
                 best_objective_bound=float(
                     _cached_meta.get("best_objective_bound", -1)
                 ),
@@ -1503,6 +1500,7 @@ def forward_compile(
                 total_attn_heads=-1,
                 total_mlp_bypass_slots=-1,
                 is_optimal=bool(_cached_meta.get("is_optimal", False)),
+                objective_scale=int(_cached_meta.get("objective_scale", 1)),
             )
 
         if assignment is None:
@@ -1881,6 +1879,9 @@ def forward_compile(
             cpsat_costs,
             objective_scale=net.cpsat_solve_stats.objective_scale,
         )
+        realized_objective_blocks = _replay_plan_objective_blocks(
+            replay_plan, cpsat_costs
+        )
         stored = store_assignment(
             schedule_fp,
             assignment,
@@ -1896,6 +1897,8 @@ def forward_compile(
                 "d_head": d_head,
                 "d_hidden": d_hidden if d_hidden else d,
                 "realized_objective": realized_objective,
+                "realized_objective_blocks": realized_objective_blocks,
+                "objective_scale": net.cpsat_solve_stats.objective_scale,
                 "costs": weighted_cost_key,
             },
             output_node=output_node,
@@ -2046,14 +2049,7 @@ def forward_compile(
             f"{total_layer_time:.2f}s total layer time"
         )
 
-    # Ensure at least one layer exists for ResidualAssignment states.
-    # If compile produced zero layers (trivial graph), run the callback on
-    # the placeholder too so every layer in net.layers is consistently in
-    # the extracted state.
-    if not net.layers:
-        fallback_layer = net.add_layer(append=True)
-        if on_layer_compiled is not None:
-            on_layer_compiled(0, fallback_layer)
+    assert net.layers, "ReplayPlan must include the runtime placeholder layer"
 
     # 4. Build ResidualAssignment bridge from saved input indices
     in_state = net.layers[0].attn.in_state
@@ -2177,6 +2173,18 @@ def forward_compile(
     if on_layer_compiled is None:
         for layer in net.layers:
             layer.mlp.trim_unused_slots()
+        if trim_heads:
+            for index, (layer, planned_layer) in enumerate(
+                zip(net.layers, replay_plan.layers)
+            ):
+                actual = LayerShape(
+                    layer.attn.attn.n_heads,
+                    layer.mlp.d_hidden,
+                )
+                assert actual == planned_layer.shape, (
+                    f"layer {index} shape diverged from replay plan: "
+                    f"announced {planned_layer.shape}, emitted {actual}"
+                )
         if verbose:
             mlp_before = d_hidden * len(net.layers)
             mlp_after = sum(layer.mlp.d_hidden for layer in net.layers)

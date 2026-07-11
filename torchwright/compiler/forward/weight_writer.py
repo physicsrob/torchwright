@@ -5,7 +5,7 @@ captured in a replay plan. No scheduler, allocator, or ResidualAssignment —
 just scatter writes.
 """
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Dict, Iterable, List, Literal, Optional, Set, Tuple
 
 import torch
@@ -93,52 +93,6 @@ class PlacementRecorder:
                 self._layer, matrix_kind, node, op_type, list(rows), list(cols), mode
             )
         )
-
-
-@dataclass
-class AttnHeadOp:
-    op_type: Literal[
-        "compute_attn",
-        "compute_linear",
-        "compute_add",
-        "cancel",
-        "add_into",
-    ]
-    node: Optional[Node]
-    target_cols: List[int]
-    # Primary source columns captured at schedule time.  Meaning depends on
-    # op_type:
-    #   compute_attn: V input columns
-    #   compute_linear: input columns
-    #   compute_add: first addend's columns
-    #   add_into: live addend's columns
-    source_cols: Optional[List[int]] = None
-    # compute_add: second addend's columns.
-    source_cols_b: Optional[List[int]] = None
-    # compute_attn: Q and K input columns (V is in source_cols).
-    q_source_cols: Optional[List[int]] = None
-    k_source_cols: Optional[List[int]] = None
-
-
-@dataclass
-class MLPOp:
-    op_type: Literal[
-        "compute_ffn",
-        "compute_literal_value",
-        "compute_bias",
-        "compute_linear_bypass",
-        "cancel_bypass",
-    ]
-    # None for ``cancel_bypass`` — the op zeroes a dying node's columns but is
-    # not itself a graph node (like the attention ``cancel``, which is outside
-    # invariant I2's literal/bias scope).
-    node: Optional[Node]
-    target_cols: List[int]
-    mlp_slots: List[int] = field(default_factory=list)
-    # Input columns captured at schedule time.  Used by compute_ffn (the FFN's
-    # input), compute_linear_bypass (the Linear's input), and cancel_bypass
-    # (the dying node's own columns — it reads what it negates).
-    source_cols: Optional[List[int]] = None
 
 
 def write_attn_sublayer(
@@ -325,7 +279,7 @@ def _allocate_head(attn):
 
 def _write_compute_attn(
     attn,
-    op: AttnHeadOp,
+    op: PlannedAttentionOp,
     recorder: Optional[PlacementRecorder] = None,
 ):
     """Copy an Attn node's Q/K/V/O matrices into attention heads.
@@ -451,7 +405,7 @@ def _self_match_source(d_head: int, const_one_col: int):
 
 def _write_compute_linear(
     attn,
-    op: AttnHeadOp,
+    op: PlannedAttentionOp,
     const_one_col: int,
     recorder: Optional[PlacementRecorder] = None,
 ):
@@ -522,7 +476,7 @@ def _write_compute_linear(
 
 def _write_compute_add(
     attn,
-    op: AttnHeadOp,
+    op: PlannedAttentionOp,
     const_one_col: int,
     recorder: Optional[PlacementRecorder] = None,
 ):
@@ -643,7 +597,7 @@ def _write_compute_add(
 
 def _write_cancel(
     attn,
-    op: AttnHeadOp,
+    op: PlannedAttentionOp,
     const_one_col: int,
     recorder: Optional[PlacementRecorder] = None,
 ):
@@ -691,7 +645,7 @@ def _write_cancel(
 
 def _write_add_into(
     attn,
-    op: AttnHeadOp,
+    op: PlannedAttentionOp,
     const_one_col: int,
     recorder: Optional[PlacementRecorder] = None,
 ):
@@ -879,7 +833,7 @@ def _mlp_in_out(mlp):
 
 def _write_compute_ffn(
     mlp,
-    op: MLPOp,
+    op: PlannedMlpOp,
     biased_linears: Optional[Set[Node]] = None,
     recorder: Optional[PlacementRecorder] = None,
     bias_fold: Optional[BiasFold] = None,
@@ -1055,7 +1009,9 @@ def _write_compute_ffn(
         recorder.add("mlp.W_out", ffn, op.op_type, mlp_slots, out_idx, "dense")
 
 
-def _write_compute_literal_value(mlp, op: MLPOp, bias_fold: Optional[BiasFold] = None):
+def _write_compute_literal_value(
+    mlp, op: PlannedMlpOp, bias_fold: Optional[BiasFold] = None
+):
     """Write a constant value via MLP output bias (or the constant lane).
 
     Under ``bias=False`` the value rides the constant lane's down-projection
@@ -1081,7 +1037,9 @@ def _write_compute_literal_value(mlp, op: MLPOp, bias_fold: Optional[BiasFold] =
     out_lin.output_bias[cols_t] = node.value.to(target_dtype)
 
 
-def _write_compute_bias(mlp, op: MLPOp, bias_fold: Optional[BiasFold] = None):
+def _write_compute_bias(
+    mlp, op: PlannedMlpOp, bias_fold: Optional[BiasFold] = None
+):
     """Add bias to MLP output bias (for biased Linear split).
 
     Under ``bias=False`` the deferred bias rides the constant lane's
@@ -1197,7 +1155,7 @@ def _write_bypass_lane_pair(
 
 def _write_cancel_bypass(
     mlp,
-    op: MLPOp,
+    op: PlannedMlpOp,
     recorder: Optional[PlacementRecorder] = None,
     bias_fold: Optional[BiasFold] = None,
 ):
@@ -1231,7 +1189,7 @@ def _write_cancel_bypass(
 
 def _write_compute_linear_bypass(
     mlp,
-    op: MLPOp,
+    op: PlannedMlpOp,
     biased_linears: Optional[Set[Node]] = None,
     recorder: Optional[PlacementRecorder] = None,
     bias_fold: Optional[BiasFold] = None,
