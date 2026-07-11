@@ -152,7 +152,7 @@ serve as fixtures); no swiglu ops exist yet.
   Machine kind recorded as `"activation"` in `OnnxArtifact`, the token
   meta, and the debug sidecar — deliberately **outside** the frozen
   topology fingerprint; `OnnxDebugSession` cross-checks it explicitly
-  (a same-shape relu rebuild trips it; negative test). The HF converter
+  (a same-shape relu rebuild trips it; negative test). The HF direct compiler
   refuses swish artifacts loudly (the native module is relu-only).
   Tests: `tests/debug/test_swish_onnx_debug.py`.
 - **A5 — cost model. DONE (2026-07-02).** CP-SAT and `cost_summary`
@@ -267,11 +267,11 @@ packages, and none used the deleted offset apparatus. Full suite green
 with both packages. Notes for a fresh session:
 
 - **Two examples stay on the ReLU machine, deliberately**:
-  `calculator_v2` (the graph behind `calculator_hf_export.py` and
+  `calculator_simple` (the graph behind `calculator_hf_export.py` and
   `tests/hf/test_rms_norm_identity.py`; also the remaining exerciser
   of relu-only `relu_add` / `multiply_integers`) and
-  `binary_increment` (the fixture behind `tests/hf/test_convert.py`).
-  The HF converter's native module is relu-only by the A4 decision;
+  `binary_increment` (the fixture behind `tests/hf/test_direct_phi3_parity.py`).
+  The HF direct compiler's native module is relu-only by the A4 decision;
   both flip when the stock-HF conversion lands
   (`docs/phi3_conversion_plan.md` — the Llama target died in audit).
   So `ops/relu`'s consumers are its own tests plus these two HF-facing
@@ -295,10 +295,10 @@ tests. Parked state and findings:
   double compile silently loosens bounds; fires on swish via the
   rms_norm energy cert). Fix plan: `docs/lowering_copy_plan.md` —
   Phase C resumes at its L4.
-- **`calculator_v2` and `binary_increment` stay on relu.** Both sit
+- **`calculator_simple` and `binary_increment` stay on relu.** Both sit
   behind the HF conversion path (`calculator_hf_export.py` /
-  `tests/hf/`), and the HF converter's native module is relu-only by
-  the A4 decision. calculator_v2 is also the remaining exerciser of
+  `tests/hf/`), and the HF direct compiler's native module is relu-only by
+  the A4 decision. calculator_simple is also the remaining exerciser of
   relu-only ops (`relu_add`, `multiply_integers`). So the Phase C
   end-state sentence weakens to: after cutover, `ops/relu`'s consumers
   are its own tests plus the two HF-path examples.

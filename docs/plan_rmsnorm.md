@@ -1,5 +1,9 @@
 # Plan: RMSNorm as a compiled-transformer identity
 
+> **Historical/superseded in its publishing details:** HF compilation now
+> consumes backend-neutral compiler weights directly; references below to an
+> ONNX-to-HF direct compiler describe the former implementation.
+
 **Status: IMPLEMENTED** on branch `worktree-rmsnorm-prototype` (commits
 `ee78b5f` constant_values cleanup, `f0bf50f` the norm). **Width contract
 generalized 2026-07-06**: the power-of-two-`d` restriction described below was
@@ -11,7 +15,7 @@ recorded inline and in *Open questions*:
 
 - **The constant exponent is `q=44` by default, not 30.** The `q=30`
   prototypes were validated only on `calculator_simple` (data energy ~1e8). The
-  *shipping* graph `calculator_v2` reaches `Σ data² ~ 2.6e13` on its squaring
+  *shipping* graph `calculator_simple` reaches `Σ data² ~ 2.6e13` on its squaring
   path (`999*999`, `999+1`), which exceeds the `q=30` reduction half-ULP bound
   (`~2^36`) and **silently broke the identity** (logits off by ~1e7). `q=44`
   (gain `2^39` at `d=1024`, bound `2^64`) clears it with ~`2^19` margin
@@ -81,8 +85,8 @@ RMSNorm computes, per position, `rms = sqrt(mean(x^2) + eps)` then outputs
 
 **Insertion points (pre-norm).** Each emitter currently produces, per layer,
 `res = res + attn(res)` then `res = res + mlp(res)` with no norm
-(`export.py:_emit_cached_layer_nodes` lines ~822–938; `modeling_torchwright.py`
-`TorchwrightDecoderLayer.forward`). Pre-norm inserts the norm on the *input* to
+(`export.py:_emit_cached_layer_nodes` lines ~822–938; `modeling_torchwright_custom.py`
+`TorchwrightCustomDecoderLayer.forward`). Pre-norm inserts the norm on the *input* to
 each sublayer only: `res = res + attn(norm(res))`, `res = res + mlp(norm(res))`.
 The skip term stays the un-normed `res`, so the residual stream itself is never
 overwritten with normed values. A **final norm** is applied to the last hidden
@@ -210,18 +214,18 @@ through the scheduler's real cancel heads:
 
 ## Design decisions (LEANINGS unless marked)
 
-1. **Emission feature, ONNX-first, with a hard converter gate.** The norm is an
+1. **Emission feature, ONNX-first, with a hard direct compiler gate.** The norm is an
    identity that reuses existing weights, so adding it is a *rendering* choice.
    But after the merge the emitters are **not** parallel siblings — there is a
    dependency order:
    - `compile_to_onnx` (`export.py`) is the **source of truth**.
-   - The HF model is **converted from the ONNX artifact** by
+   - The HF model is **direct_model from the ONNX artifact** by
      `convert.py:convert_onnx_to_hf` (it reads ONNX initializers → HF state
-     dict), and `modeling_torchwright.py` **transcribes** the ONNX forward
+     dict), and `modeling_torchwright_custom.py` **transcribes** the ONNX forward
      one-for-one.
    - `convert.py:_assert_all_mapped` (lines ~223–236) **raises** if any ONNX
      initializer is unmapped. So if the norm adds a per-layer initializer (a
-     gain vector), the converter *must* map it and the shipped model *must* have
+     gain vector), the direct compiler *must* map it and the shipped model *must* have
      a matching parameter — or HF conversion fails loudly.
 
    Order of work: ONNX emission → teach `convert.py` → shipped HF model + config.
@@ -250,7 +254,7 @@ through the scheduler's real cancel heads:
    seed constant. What is *not* a graph value is the never-freed column
    reservation: a `LiteralValue` with no consumer would be reclaimed
    (`graph_analysis.py:202`; see *the one unavoidable core hook*).
-5. **Config impact.** `TorchwrightConfig` currently lists normalization among
+5. **Config impact.** `TorchwrightCustomConfig` currently lists normalization among
    "invariants this config does NOT carry a knob for" (lines ~18–28). Adding the
    norm means new fields (at least `rms_norm_eps`; possibly a norm-on flag) and
    rewriting the "no normalization" docstrings in **both** shipped files. The
@@ -284,8 +288,8 @@ through the scheduler's real cancel heads:
    multiplies to 0 and never reaches the logits. Storage: HF
    `embed_tokens.weight` is already dense `(vocab, d)`, so seeding adds nothing
    and the buffer is *removed*; the ONNX COO init grows by `vocab × (1 or 2)`
-   nonzeros. **Atomicity:** exporter (`export.py`), converter (`convert.py`
-   mapping + `_assert_all_mapped`), HF buffer (`modeling_torchwright.py`), and the
+   nonzeros. **Atomicity:** exporter (`export.py`), direct compiler (`convert.py`
+   mapping + `_assert_all_mapped`), HF buffer (`modeling_torchwright_custom.py`), and the
    meta format must change together, or conversion/load fails before the norm is
    reached. Caveat: deleting `constant_values` changes the just-landed `fa49576`
    seed for *all* token models (norm-off included) — worth a glance from its
@@ -298,7 +302,7 @@ through the scheduler's real cancel heads:
 gather reproduces it at every position. `embed_table` is already built
 `(vocab, d)` (`export.py:1199–1200`) and gathered straight into the seed
 (`export.py:1244–1245`); the constant is one more populated column — no bespoke
-buffer, no new initializer, and the converter gate (`convert.py:_assert_all_mapped`,
+buffer, no new initializer, and the direct compiler gate (`convert.py:_assert_all_mapped`,
 ~223–236) stays satisfied because nothing new is introduced on the constant path.
 (The graph's *own* constants are not seeded — they live in the per-layer MLP
 bias; see decision 6.)
@@ -353,7 +357,7 @@ this is *lifetime + metadata*. The split:
   strictly broader blast radius than today; the exporter already flags the finite
   requirement at `export.py:1262–1264`). The pinned constant is finite, but the
   norm path must not let non-finite values reach reserved/scratch columns.
-- **Shipped-file hermeticity + converter gate** — restated from decisions 1/5:
+- **Shipped-file hermeticity + direct compiler gate** — restated from decisions 1/5:
   the shipped RMSNorm is torch-only; the gain vectors are the only new ONNX
   initializers and must be mapped in `convert.py` or conversion fails. The
   constant introduces no initializer (it folds into `embed_table`, decision 6),
@@ -384,7 +388,7 @@ this is *lifetime + metadata*. The split:
    breaking, so the remaining risk is (a) a `value_range` too loose to certify
    (raises spuriously → needs tighter graph bounds or a higher `q`) and (b) the
    rendered-frame diff itself.
-5. **Shipping graph — RESOLVED.** `calculator_v2` (the production HF-export
+5. **Shipping graph — RESOLVED.** `calculator_simple` (the production HF-export
    graph) is bit-exact identity through the ONNX oracle including `999*999`
    (`tests/hf/test_rms_norm_identity.py`), after raising `q` to 44 — see the
    status note. The existing `tests/hf/test_calculator_parity.py` now compiles

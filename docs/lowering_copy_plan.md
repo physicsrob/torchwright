@@ -400,7 +400,7 @@ effect); doom-side render
 walkthrough re-verification happens at the next doom compile (handoff
 note, not blocking here). Then **Phase C resumes**: its parked state
 (examples flipped to swiglu, three mechanical fixture-expectation fixes
-in `test_module.py` / `test_onnx_debug_session.py`, `calculator_v2` and
+in `test_module.py` / `test_onnx_debug_session.py`, `calculator_simple` and
 `binary_increment` staying relu for the HF path) is recorded in
 `docs/swiglu_step2_plan.md`.
 
