@@ -27,6 +27,7 @@ from torchwright.compiler.export import (
 )
 from torchwright.compiler.forward.compile import forward_compile
 from torchwright.compiler.graph_identity import canonical_ids
+from torchwright.graph import Embedding
 from torchwright.ops.relu.arithmetic_ops import multiply_2d
 from torchwright.ops.linear import add
 from torchwright.ops.inout_nodes import create_input
@@ -138,6 +139,56 @@ def test_matrices_table_shapes_and_axes():
             assert rec["layer"] == i
             assert rec["shape"] == shape, mid
             assert rec["axis0"] == a0 and rec["axis1"] == a1, mid
+
+
+def test_matrices_table_uses_explicit_attention_width():
+    out = _build_graph()
+    net = forward_compile(
+        d=256,
+        d_head=16,
+        n_heads=3,
+        output_node=out,
+        verbose=False,
+        device="cpu",
+        trim_heads=False,
+    )
+    matrices, _, n_heads, _ = _build_matrix_occupancy(
+        net, canonical_ids(out), 256, 16, 3
+    )
+
+    assert n_heads == 3
+    for i in range(len(net.layers)):
+        assert matrices[f"L{i}.attn.W_Q"]["shape"] == [256, 48]
+        assert matrices[f"L{i}.attn.W_O"]["shape"] == [48, 256]
+
+
+def test_onnx_sidecar_uses_explicit_attention_width(tmp_path):
+    embedding = Embedding(
+        ["a"],
+        d_embed=2,
+        table=torch.tensor([[1.0, 0.0], [0.0, 1.0]]),
+    )
+    path = tmp_path / "decoupled.onnx"
+    compile_to_onnx(
+        embedding,
+        embedding,
+        str(path),
+        d=32,
+        d_head=8,
+        n_heads=3,
+        d_hidden=16,
+        trim_heads=False,
+        max_seq_len=8,
+        verbose=False,
+    )
+
+    with open(debug_meta_path_for(str(path))) as f:
+        data = json.load(f)
+    assert data["d"] == 32
+    assert data["d_head"] == 8
+    assert data["n_heads"] == 3
+    assert data["matrices"]["L0.attn.W_Q"]["shape"] == [32, 24]
+    assert data["matrices"]["L0.attn.W_O"]["shape"] == [24, 32]
 
 
 # ---------------------------------------------------------------------------

@@ -423,6 +423,7 @@ class SchedulingProblem:
         output_node,
         d: int,
         d_head: int,
+        n_heads: Optional[int] = None,
         d_hidden: int,
         flex_routing: bool,
         cancel_slack: Optional[int],
@@ -453,6 +454,7 @@ class SchedulingProblem:
             output_node,
             d=d,
             d_head=d_head,
+            n_heads=n_heads,
             d_hidden=d_hidden if fingerprint_d_hidden is None else fingerprint_d_hidden,
             flex_routing=flex_routing,
             cancel_slack=cancel_slack,
@@ -460,7 +462,7 @@ class SchedulingProblem:
             reserve_residual=reserve_residual,
             bias=bias,
         )
-        geometry = {
+        geometry: Dict[str, object] = {
             "d": d,
             "d_head": d_head,
             "d_hidden": d_hidden,
@@ -472,6 +474,11 @@ class SchedulingProblem:
             "bias": bias,
             "policy": _asdict(policy) if policy is not None else None,
         }
+        from torchwright.compiler.utils import resolve_n_heads
+
+        resolved_n_heads = resolve_n_heads(d, d_head, n_heads, require_divisible=False)
+        if d % d_head != 0 or resolved_n_heads != d // d_head:
+            geometry["n_heads"] = resolved_n_heads
         identity = SnapshotIdentity(
             fingerprint=fingerprint,
             critical_path_layers=critical_path_layers,

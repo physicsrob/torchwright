@@ -54,6 +54,18 @@ report = compile_hf_bundle(output_node, embedding, "hf_bundle", d=1024)
 print(report.n_layers, report.schedule_provenance.selected_origin)
 ```
 
+Attention geometry can be chosen independently of residual width:
+
+```python
+model = compile_to_hf(
+    output_node, embedding, d=512, d_head=128, n_heads=3
+)
+```
+
+Here the residual width is 512 and the flattened attention width is
+`3 * 128 = 384`. When `n_heads` is omitted it defaults to `d // d_head`,
+and `d` must then be divisible by `d_head`.
+
 The default is a stock `Phi3ForCausalLM` contract: SwiGLU graph, biasless
 projections, RMSNorm, no custom code, and no `trust_remote_code`. A legacy
 ReLU graph must opt in explicitly with `architecture="custom"`, which produces
@@ -134,6 +146,10 @@ because they describe the compiler's internals.
   the circuits literature. Both names refer to the same thing.
 - **attention head** — One head within multi-head attention, parameterised
   by `W_Q`, `W_K`, `W_V`, `W_O`. Same meaning as in the circuits work.
+- **`d_head`** — Width of one attention head.
+- **`n_heads`** — Maximum attention heads available per compiled layer.
+  Defaults to `d // d_head`; it can be set explicitly to make the flattened
+  attention width (`n_heads * d_head`) independent of `d`.
 - **neuron** — One dimension of the MLP's hidden layer (the intermediate
   representation between `linear1` and `linear2`). Anthropic uses both
   *MLP neuron* and *ReLU unit* for this concept; we use **neuron**.

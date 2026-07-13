@@ -48,6 +48,7 @@ from torchwright.compiler.realization import (
     linear_attn_heads,
     static_flex_class,
 )
+from torchwright.compiler.utils import resolve_n_heads
 from torchwright.compiler.forward.scheduling_policy import (
     LEGACY_POLICY,
     SchedulingPolicy,
@@ -907,6 +908,7 @@ def build_cpsat_model(
     *,
     d: int,
     d_head: int,
+    n_heads: Optional[int] = None,
     d_hidden: int,
     costs: Costs = Costs(),
     flex_routing: bool = True,
@@ -945,6 +947,7 @@ def build_cpsat_model(
         gm,
         d=d,
         d_head=d_head,
+        n_heads=n_heads,
         d_hidden=d_hidden,
         costs=costs,
         flex_routing=flex_routing,
@@ -966,6 +969,7 @@ def build_cpsat_model_from_gm(
     *,
     d: int,
     d_head: int,
+    n_heads: Optional[int] = None,
     d_hidden: int,
     costs: Costs = Costs(),
     flex_routing: bool = True,
@@ -1035,7 +1039,7 @@ def build_cpsat_model_from_gm(
     if costs.alpha == 0 and costs.beta == 0 and costs.gamma == 0:
         raise ValueError("alpha=beta=gamma=0 — no objective.")
 
-    n_heads_per_layer = d // d_head
+    n_heads_per_layer = resolve_n_heads(d, d_head, n_heads, require_divisible=False)
     # ``pos_encoding`` is read by the attention sublayer at (nearly) every
     # layer, so it stays resident for the whole schedule — reserve its columns
     # permanently.  Every OTHER input node is *freeable*: the heuristic frees
@@ -2041,6 +2045,7 @@ def build_model_from_snapshot(
     *,
     d: int,
     d_head: int,
+    n_heads: Optional[int] = None,
     d_hidden: int,
     costs: Costs = Costs(),
     flex_routing: bool = True,
@@ -2064,6 +2069,7 @@ def build_model_from_snapshot(
         graph_model_from_problem(problem),
         d=d,
         d_head=d_head,
+        n_heads=n_heads,
         d_hidden=d_hidden,
         costs=costs,
         flex_routing=flex_routing,
@@ -2384,6 +2390,7 @@ def solve_schedule(
     *,
     d: int,
     d_head: int,
+    n_heads: Optional[int] = None,
     d_hidden: int,
     costs: Costs = Costs(),
     flex_routing: bool = True,
@@ -2419,9 +2426,10 @@ def solve_schedule(
             scheduler operates over.
         pos_encoding: vestigial — always ``None`` under RoPE; retained for
             call-site compatibility.
-        d, d_head, d_hidden: transformer geometry. ``n_heads_per_layer
-            = d // d_head``.  Residual budget is
+        d, d_head, d_hidden: transformer geometry. Residual budget is
             ``d - input_residual_cols``.
+        n_heads: Per-layer attention-head capacity. Defaults to
+            ``d // d_head``.
         costs: objective weights. See :class:`Costs`.
         flex_routing: if True, CP-SAT picks attention vs MLP for each
             standalone ``Linear``.  If False, standalone Linears use
@@ -2479,6 +2487,7 @@ def solve_schedule(
         pos_encoding,
         d=d,
         d_head=d_head,
+        n_heads=n_heads,
         d_hidden=d_hidden,
         costs=costs,
         flex_routing=flex_routing,
@@ -2511,6 +2520,7 @@ def solve_schedule_from_snapshot(
     *,
     d: int,
     d_head: int,
+    n_heads: Optional[int] = None,
     d_hidden: int,
     costs: Costs = Costs(),
     flex_routing: bool = True,
@@ -2550,6 +2560,7 @@ def solve_schedule_from_snapshot(
         problem,
         d=d,
         d_head=d_head,
+        n_heads=n_heads,
         d_hidden=d_hidden,
         costs=costs,
         flex_routing=flex_routing,

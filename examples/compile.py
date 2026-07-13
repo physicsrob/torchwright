@@ -25,6 +25,7 @@ def main():
         f"{name}.onnx",
         d=getattr(module, "D_MODEL", 1024),
         d_head=getattr(module, "D_HEAD", 16),
+        n_heads=getattr(module, "N_HEADS", None),
         bias=False,
     )
 

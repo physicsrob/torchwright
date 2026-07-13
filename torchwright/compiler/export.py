@@ -66,6 +66,7 @@ from torchwright.compiler.token_model import (
     make_layer_callback,
     schedule_provenance,
 )
+from torchwright.compiler.utils import resolve_n_heads
 from torchwright.graph import Concatenate, Embedding, LiteralValue, Node
 from torchwright.graph.attn import CAUSAL_MASK_SENTINEL
 from torchwright.graph.rope import ROPE_BASE
@@ -174,7 +175,7 @@ class OnnxArtifact:
 
 # Axis labels per matrix kind: (axis0 = what rows index, axis1 = what cols
 # index).  The attention head and d_head dims are flattened into a single
-# "head" axis of width n_heads*d_head == d, so head ``h`` occupies columns
+# "head" axis of width n_heads*d_head, so head ``h`` occupies columns
 # (or rows, for W_O) ``range(h*d_head, (h+1)*d_head)``.
 _MATRIX_AXES = {
     "attn.W_Q": ("residual_in", "head"),
@@ -234,7 +235,9 @@ def _diag_rects(matrix_id, rows, cols):
     return rects
 
 
-def _build_matrix_occupancy(compiled, canon, d: int, d_head: int):
+def _build_matrix_occupancy(
+    compiled, canon, d: int, d_head: int, n_heads: Optional[int] = None
+):
     """Build the ``matrices`` table and ``placements`` map for the sidecar.
 
     Returns ``(matrices, placements, n_heads, d_hidden_per_layer)``.  All
@@ -245,8 +248,8 @@ def _build_matrix_occupancy(compiled, canon, d: int, d_head: int):
     ``_<op_type>`` / ``_unreachable`` buckets — they occupy real matrix
     area, so completeness needs them, but they are not user-graph nodes.
     """
-    n_heads = d // d_head
-    head_dim = n_heads * d_head  # == d
+    n_heads = resolve_n_heads(d, d_head, n_heads)
+    head_dim = n_heads * d_head
 
     matrices: Dict[str, dict] = {}
     d_hidden_per_layer: List[int] = []
@@ -299,6 +302,7 @@ def _write_debug_sidecar(
     output_node: Node,
     d: int,
     d_head: int,
+    n_heads: int,
     kind: str,
     input_specs: List[tuple],
     checked_nodes: List[Node],
@@ -390,7 +394,7 @@ def _write_debug_sidecar(
         }
     )
     matrices, placements, n_heads, d_hidden_per_layer = _build_matrix_occupancy(
-        compiled, canon, d, d_head
+        compiled, canon, d, d_head, n_heads
     )
 
     # Per-node metadata keyed by canonical id — the same key space as
@@ -717,6 +721,7 @@ def _add_rope_inits(
 def _make_stream_layer_weights_cb(
     d: int,
     d_head: int,
+    n_heads: int,
     dense_inits: list,
     sparse_inits: list,
     per_layer_n_heads: list,
@@ -743,7 +748,7 @@ def _make_stream_layer_weights_cb(
     model is emitted instead.
 
     After trimming, each layer's attention matrices have shape
-    ``(nh, d, d_head)`` where ``nh <= d // d_head``.  Weight matrices
+    ``(nh, d, d_head)`` where ``nh <= n_heads``.  Weight matrices
     are emitted at the trimmed size and per-layer reshape constants
     are added so the ONNX graph can reshape to the correct head count.
 
@@ -753,6 +758,7 @@ def _make_stream_layer_weights_cb(
     class OnnxLayerSink:
         def begin(self, header):
             assert header.d == d and header.d_head == d_head
+            assert header.n_heads == n_heads
             assert header.trim_heads == trim_heads and header.bias == bias
 
         def write_layer(self, i, weights):
@@ -805,7 +811,7 @@ def _make_stream_layer_weights_cb(
             self.token_weights = weights
 
     return make_layer_callback(
-        CompileHeader(d, d_head, trim_heads, bias), OnnxLayerSink()
+        CompileHeader(d, d_head, trim_heads, bias, n_heads=n_heads), OnnxLayerSink()
     )
 
 
@@ -1283,6 +1289,7 @@ def compile_to_onnx(
     rms_norm_const_exp: Optional[int] = None,
     bias: bool = True,
     profile: Optional[Union[CompileProfile, str]] = None,
+    n_heads: Optional[int] = None,
     _solver_seed: Optional[int] = None,
     _force_resolve: bool = False,
 ) -> OnnxArtifact:
@@ -1295,6 +1302,10 @@ def compile_to_onnx(
     ``extra_metadata`` is a free-form dict written under the sidecar's
     ``"extra"`` key (surfaced via ``OnnxTokenModule.metadata``); top-level
     sidecar keys are unchanged.
+
+    ``n_heads`` is the attention-head capacity of each compiled layer. It
+    defaults to ``d // d_head``. When explicit, ``n_heads * d_head`` is the
+    flattened attention width and may differ from ``d``.
 
     Writes three files:
         ``<output_path>``     — the ONNX model
@@ -1397,6 +1408,7 @@ def compile_to_onnx(
             f"Use a supported d, or pass rms_norm=False to export without "
             f"the norm."
         )
+    n_heads = resolve_n_heads(d, d_head, n_heads)
 
     # Attached-check coverage for the debug sidecar.  Collection order
     # doesn't matter: compilation never mutates the source graph, so its
@@ -1413,6 +1425,7 @@ def compile_to_onnx(
     on_layer_compiled = _make_stream_layer_weights_cb(
         d,
         d_head,
+        n_heads,
         dense_inits,
         sparse_inits,
         per_layer_n_heads,
@@ -1426,6 +1439,7 @@ def compile_to_onnx(
     compiled = forward_compile(
         d=d,
         d_head=d_head,
+        n_heads=n_heads,
         output_node=output_node,
         verbose=verbose,
         max_layers=max_layers,
@@ -1453,7 +1467,7 @@ def compile_to_onnx(
     rms_spec = compiled.rms_norm_spec
     t_compile = time.perf_counter() - t0
     if verbose and per_layer_n_heads:
-        _max_heads = d // d_head
+        _max_heads = n_heads
         _total = _max_heads * len(per_layer_n_heads)
         _kept = sum(per_layer_n_heads)
         print(
@@ -1775,6 +1789,7 @@ def compile_to_onnx(
             output_node=output_node,
             d=d,
             d_head=d_head,
+            n_heads=n_heads,
             kind="token",
             # The token graph reads its ids from the Embedding node's
             # input slot; one 1-wide column matches the convention
@@ -2247,6 +2262,7 @@ def compile_headless(
     *,
     d: int = 1024,
     d_head: int = 16,
+    n_heads: Optional[int] = None,
     max_layers: int = 400,
     verbose: bool = False,
     device: str = "cpu",
@@ -2271,6 +2287,10 @@ def compile_headless(
     when omitted; pass an explicit value to decouple the MLP intermediate
     width from the residual stream width.
 
+    ``n_heads`` is the per-layer attention-head capacity. It defaults to
+    ``d // d_head``; pass it explicitly to decouple the flattened attention
+    width ``n_heads * d_head`` from ``d``.
+
     ``optimize`` and ``bias`` thread straight to ``forward_compile`` (same
     meaning as on :func:`compile_to_onnx`) — so this in-process debug backend
     can reproduce a production ``optimize=2`` / ``bias=False`` schedule
@@ -2294,6 +2314,7 @@ def compile_headless(
     net = forward_compile(
         d=d,
         d_head=d_head,
+        n_heads=n_heads,
         output_node=combined_output,
         verbose=verbose,
         max_layers=max_layers,

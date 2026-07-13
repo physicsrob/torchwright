@@ -70,6 +70,7 @@ class CompileHeader:
     trim_heads: bool
     bias: bool
     layer_shapes: tuple[LayerShape, ...] = ()
+    n_heads: Optional[int] = None
 
 
 @dataclass

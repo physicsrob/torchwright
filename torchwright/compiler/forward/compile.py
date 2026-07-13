@@ -62,6 +62,7 @@ from torchwright.compiler.forward.weight_writer import (
 from torchwright.compiler.groups.transformer_layer import TransformerLayer
 from torchwright.compiler.transformer import HeadlessTransformer
 from torchwright.compiler.token_model import LayerShape
+from torchwright.compiler.utils import resolve_n_heads
 from torchwright.compiler.residual_assignment import flatten_concat_nodes
 from torchwright.graph import Node, Linear, Concatenate
 from torchwright.graph.node import reserve_node_id_above
@@ -408,6 +409,7 @@ def _build_heuristic_schedule_trace(
     graph: GraphAnalyzer,
     d: int,
     d_head: int,
+    n_heads: int,
     pos_encoding,
     d_hidden: int,
     residual_map: ResidualStreamMap,
@@ -433,6 +435,7 @@ def _build_heuristic_schedule_trace(
         d,
         d_head,
         pos_encoding,
+        n_heads=n_heads,
         d_hidden=d_hidden,
         clusters=clusters,
         admission_budget_fraction=admission_budget_fraction,
@@ -775,6 +778,7 @@ def _build_replay_plan(
     const_one: Node,
     d: int,
     d_head: int,
+    n_heads: int,
     d_hidden: int,
     trim_heads: bool,
     max_layers: int,
@@ -848,6 +852,7 @@ def _build_replay_plan(
             planned_mlp_ops,
             d=d,
             d_head=d_head,
+            n_heads=n_heads,
             d_hidden=d_hidden,
             trim_heads=trim_heads,
         )
@@ -880,6 +885,7 @@ def _build_replay_plan(
             (),
             d=d,
             d_head=d_head,
+            n_heads=n_heads,
             d_hidden=d_hidden,
             trim_heads=trim_heads,
         )
@@ -982,6 +988,7 @@ def forward_compile(
     rms_norm_const_exp: int = _RMS_NORM_CONST_EXP,
     bias: bool = True,
     machine: Optional[str] = None,
+    n_heads: Optional[int] = None,
     _disabled_families: frozenset = frozenset(),
     _solver_seed: Optional[int] = None,
     _force_resolve: bool = False,
@@ -997,6 +1004,9 @@ def forward_compile(
     Args:
         d: Residual stream dimension.
         d_head: Attention head dimension.
+        n_heads: Attention heads available in each compiled layer. Defaults
+            to ``d // d_head``; when explicit, the flattened attention width
+            ``n_heads * d_head`` is independent of ``d``.
         output_node: The graph node whose value should appear in the output.
         verbose: Print compilation progress.
         max_layers: Safety limit on number of layers.
@@ -1160,6 +1170,8 @@ def forward_compile(
         solve-only mode the returned net carries only the solve outputs
         (``cpsat_assignment`` / ``cpsat_solve_stats``) and cannot compute.
     """
+    n_heads = resolve_n_heads(d, d_head, n_heads)
+
     # 0. Lowering boundary: certify vocabulary and build the
     # compiler-private copy (docs/lowering_copy_plan.md).  Compilation is
     # a pure function of the source graph: from here on every pass —
@@ -1273,7 +1285,9 @@ def forward_compile(
         )
 
     # 2. Initialize
-    net = HeadlessTransformer(d, d_head, d_hidden=d_hidden, activation=activation)
+    net = HeadlessTransformer(
+        d, d_head, n_heads=n_heads, d_hidden=d_hidden, activation=activation
+    )
     # Emission mode: False means no physical bias parameters (the exporter
     # reads this; in-process bias tensors stay as zeros).
     net.bias = bias
@@ -1397,6 +1411,7 @@ def forward_compile(
             graph=graph,
             d=d,
             d_head=d_head,
+            n_heads=n_heads,
             pos_encoding=pos_encoding,
             d_hidden=d_hidden,
             residual_map=residual_map,
@@ -1447,6 +1462,7 @@ def forward_compile(
             output_node,
             d=d,
             d_head=d_head,
+            n_heads=n_heads,
             d_hidden=d_hidden if d_hidden else d,
             flex_routing=cpsat_flex_routing,
             cancel_slack=2,
@@ -1614,6 +1630,7 @@ def forward_compile(
                     pos_encoding,
                     d=d,
                     d_head=d_head,
+                    n_heads=n_heads,
                     d_hidden=solver_d_hidden,
                     costs=cpsat_costs,
                     flex_routing=cpsat_flex_routing,
@@ -1755,6 +1772,7 @@ def forward_compile(
                     d_head,
                     pos_encoding,
                     assignment=candidate_assignment,
+                    n_heads=n_heads,
                     d_hidden=d_hidden,
                     clusters=clusters,
                     admission_budget_fraction=admission_budget_fraction,
@@ -1775,6 +1793,7 @@ def forward_compile(
                     const_one=const_one,
                     d=d,
                     d_head=d_head,
+                    n_heads=n_heads,
                     d_hidden=d_hidden,
                     trim_heads=trim_heads,
                     max_layers=max_layers,
@@ -1808,6 +1827,7 @@ def forward_compile(
                 d_head,
                 pos_encoding,
                 assignment=assignment,
+                n_heads=n_heads,
                 d_hidden=d_hidden,
                 clusters=clusters,
                 admission_budget_fraction=admission_budget_fraction,
@@ -1863,6 +1883,7 @@ def forward_compile(
             d_head,
             pos_encoding,
             assignment=assignment,
+            n_heads=n_heads,
             d_hidden=d_hidden,
             clusters=clusters,
             admission_budget_fraction=admission_budget_fraction,
@@ -1897,6 +1918,7 @@ def forward_compile(
             const_one=const_one,
             d=d,
             d_head=d_head,
+            n_heads=n_heads,
             d_hidden=d_hidden,
             trim_heads=trim_heads,
             max_layers=max_layers,
@@ -2201,7 +2223,7 @@ def forward_compile(
     # re-trimming would slice ``None``.  Hence the ``on_layer_compiled is None``
     # guard: only the in-process return value still carries live weights to trim.
     if trim_heads and on_layer_compiled is None:
-        max_heads = d // d_head
+        max_heads = n_heads
         for layer in net.layers:
             layer.attn.attn.trim_unused_heads()
         if verbose:

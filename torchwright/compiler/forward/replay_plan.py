@@ -7,6 +7,7 @@ from typing import Literal, Mapping, Optional
 from torchwright.compiler.forward.cpsat_scheduler import ScheduleAssignment
 from torchwright.compiler.realization import linear_attn_live_heads
 from torchwright.compiler.token_model import LayerShape
+from torchwright.compiler.utils import resolve_n_heads
 from torchwright.graph import Node
 
 
@@ -343,11 +344,13 @@ def planned_layer_shape(
     d_head: int,
     d_hidden: int,
     trim_heads: bool,
+    n_heads: Optional[int] = None,
 ) -> tuple[LayerShape, int, int]:
+    n_heads = resolve_n_heads(d, d_head, n_heads, require_divisible=False)
     emitted_heads = sum(op.emitted_heads(d_head) for op in attention_ops)
     bypass_slots = sum(op.bypass_slot_count for op in mlp_ops)
     if not trim_heads:
-        shape = LayerShape(d // d_head, d_hidden)
+        shape = LayerShape(n_heads, d_hidden)
     else:
         last_slot = max((slot for op in mlp_ops for slot in op.mlp_slots), default=0)
         shape = LayerShape(max(emitted_heads, 1), max(last_slot + 1, 1))

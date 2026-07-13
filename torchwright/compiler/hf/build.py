@@ -31,6 +31,7 @@ from torchwright.compiler.token_model import (
     resolve_rope,
     schedule_provenance,
 )
+from torchwright.compiler.utils import resolve_n_heads
 from torchwright.graph import Embedding, Node
 
 HFArchitecture = Union[CompileProfile, str]
@@ -294,6 +295,7 @@ def compile_hf_bundle(
     *,
     d=1024,
     d_head=16,
+    n_heads=None,
     max_seq_len=512,
     max_layers=400,
     optimize=0,
@@ -316,6 +318,9 @@ def compile_hf_bundle(
 
     Returns an :class:`HFBundleReport` whose layer count and selected-schedule
     provenance describe the bundle that was successfully published.
+
+    ``n_heads`` defaults to ``d // d_head``. Set it explicitly to make the
+    flattened attention width ``n_heads * d_head`` independent of ``d``.
     """
     _validate_embedding_contract(output_node, embedding)
     with _staged_bundle_directory(output_dir) as staging:
@@ -325,6 +330,7 @@ def compile_hf_bundle(
             staging,
             d=d,
             d_head=d_head,
+            n_heads=n_heads,
             max_seq_len=max_seq_len,
             max_layers=max_layers,
             optimize=optimize,
@@ -354,6 +360,7 @@ def _compile_hf_bundle_into(
     *,
     d=1024,
     d_head=16,
+    n_heads=None,
     max_seq_len=512,
     max_layers=400,
     optimize=0,
@@ -393,6 +400,7 @@ def _compile_hf_bundle_into(
     rms_on = profile.rms_norm if rms_norm is None else bool(rms_norm)
     if rms_on and not rms_norm_width_supported(d):
         raise ValueError(f"rms_norm is on but d={d} is unsupported")
+    n_heads = resolve_n_heads(d, d_head, n_heads)
 
     class DirectShardSink:
         def __init__(self):
@@ -468,12 +476,13 @@ def _compile_hf_bundle_into(
         compiled = forward_compile(
             d=d,
             d_head=d_head,
+            n_heads=n_heads,
             output_node=output_node,
             verbose=verbose,
             max_layers=max_layers,
             device=None,
             on_layer_compiled=make_layer_callback(
-                CompileHeader(d, d_head, trim_heads, bias), sink
+                CompileHeader(d, d_head, trim_heads, bias, n_heads=n_heads), sink
             ),
             trim_heads=trim_heads,
             optimize=optimize,
@@ -661,6 +670,7 @@ def compile_to_hf(
     *,
     d=1024,
     d_head=16,
+    n_heads=None,
     max_seq_len=512,
     max_layers=400,
     optimize=0,
@@ -681,6 +691,8 @@ def compile_to_hf(
 
     The default is stock ``Phi3ForCausalLM``. The custom implementation is
     reachable only through the explicit ``architecture="custom"`` opt-in.
+    ``n_heads`` defaults to ``d // d_head`` and may be set explicitly to
+    decouple attention width from ``d``.
     """
     with tempfile.TemporaryDirectory(prefix="torchwright-hf-model-") as directory:
         compile_hf_bundle(
@@ -689,6 +701,7 @@ def compile_to_hf(
             directory,
             d=d,
             d_head=d_head,
+            n_heads=n_heads,
             max_seq_len=max_seq_len,
             max_layers=max_layers,
             optimize=optimize,

@@ -224,6 +224,33 @@ def test_trivial_graph_streaming_announces_placeholder_shape(tmp_path):
     assert config["intermediate_size"] == 1
 
 
+def test_trivial_graph_accepts_explicit_decoupled_head_count(tmp_path):
+    embedding = Embedding(
+        ["a"],
+        d_embed=2,
+        table=torch.tensor([[1.0, 0.0], [0.0, 1.0]]),
+    )
+
+    compile_hf_bundle(
+        embedding,
+        embedding,
+        tmp_path,
+        d=32,
+        d_head=8,
+        n_heads=3,
+        d_hidden=16,
+        trim_heads=False,
+        bos_token=None,
+        eos_token=None,
+        write_tokenizer=False,
+    )
+
+    config = json.loads((tmp_path / "config.json").read_text())
+    assert config["hidden_size"] == 32
+    assert config["head_dim"] == 8
+    assert config["num_attention_heads"] == 3
+
+
 def test_fast_tokenizer_character_round_trip(direct):
     _, emb = direct
     vocab = list(emb.tokenizer.vocab)

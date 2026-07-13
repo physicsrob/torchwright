@@ -28,6 +28,7 @@ from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
 from torchwright.graph import Node
+from torchwright.compiler.utils import resolve_n_heads
 
 
 @lru_cache(maxsize=1)
@@ -112,6 +113,7 @@ def graph_fingerprint(
     *,
     d: int,
     d_head: int,
+    n_heads: Optional[int] = None,
     d_hidden: int,
     flex_routing: bool,
     cancel_slack: Optional[int],
@@ -157,6 +159,7 @@ def graph_fingerprint(
     from torchwright.graph.linear import Linear as _Linear
     from torchwright.compiler.realization import live_weight_row_ranges
 
+    n_heads = resolve_n_heads(d, d_head, n_heads, require_divisible=False)
     canon = canonical_ids(output_node)
     linear_support = {
         canon[n.node_id]: live_weight_row_ranges(n)
@@ -176,6 +179,10 @@ def graph_fingerprint(
     }
     if reserve_residual:
         payload["reserve_residual"] = reserve_residual
+    # Preserve the historical payload for the default coupled geometry.  A
+    # decoupled capacity changes the feasible schedule and must key separately.
+    if d % d_head != 0 or n_heads != d // d_head:
+        payload["n_heads"] = n_heads
     # bias=False reserves hidden slot 0 (the constant lane), changing the
     # modeled slot capacity, hence the schedule — it MUST key the cache.
     # Added only when False (the ``reserve_residual`` compatibility pattern)

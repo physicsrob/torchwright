@@ -17,6 +17,7 @@ from torchwright.compiler.realization import (
     linear_attn_heads,
     usable_hidden_slots,
 )
+from torchwright.compiler.utils import resolve_n_heads
 from torchwright.compiler.residual_assignment import flatten_concat_nodes
 from torchwright.compiler.forward.cpsat_scheduler import ScheduleAssignment
 from torchwright.compiler.forward.graph_analysis import GraphAnalyzer
@@ -139,6 +140,7 @@ class LayerScheduler:
         policy: Optional[SchedulingPolicy] = None,
         realization_table: Optional[RealizationTable] = None,
         bias: bool = True,
+        n_heads: Optional[int] = None,
     ):
         self.graph = graph
         self.d = d
@@ -152,7 +154,7 @@ class LayerScheduler:
         # unpackable on replay.
         self.bias = bias
         self.usable_hidden_slots = usable_hidden_slots(self.d_hidden, bias)
-        self.n_heads = d // d_head
+        self.n_heads = resolve_n_heads(d, d_head, n_heads, require_divisible=False)
         self.pos_encoding = pos_encoding
         self.policy = policy if policy is not None else SchedulingPolicy()
         # The resolved realization table the walk reads (one artifact,
@@ -1588,6 +1590,7 @@ class DirectedLayerScheduler(LayerScheduler):
         policy: Optional[SchedulingPolicy] = None,
         realization_table: Optional[RealizationTable] = None,
         bias: bool = True,
+        n_heads: Optional[int] = None,
     ):
         # The directed path's resolver is the solve itself: its per-node
         # sublayer decisions (node_to_routing) resolve the table the walk
@@ -1601,6 +1604,7 @@ class DirectedLayerScheduler(LayerScheduler):
             d,
             d_head,
             pos_encoding,
+            n_heads=n_heads,
             d_hidden=d_hidden,
             clusters=clusters,
             admission_budget_fraction=admission_budget_fraction,
