@@ -287,8 +287,16 @@ def build_token_weights(compiled, output_node: Node, embedding: Embedding, d: in
     for col, value in literal_seeds:
         embed[:, col] = value
     output_indices = assignment.get_node_indices(out_state, output_node)
-    if len(output_indices) != compact.shape[1]:
-        raise ValueError("output width does not match the token embedding width")
+    if list(output_indices) != list(embedding_indices):
+        raise ValueError(
+            "tied token layout violated: the output must occupy the "
+            "embedding's exact ordered residual bank (token.v6 held handoff); "
+            f"embedding={list(embedding_indices)[:8]}..., "
+            f"output={list(output_indices)[:8]}..."
+        )
+    # The compact untied projection over the bank — the stock-architecture HF
+    # target's genuine lm_head.  The tied surfaces (v6 ONNX readout, the
+    # custom HF model) transpose/share embed_table itself and ignore this.
     lm_head = np.zeros((vocab_size, d), dtype=np.float32)
     lm_head[:, output_indices] = compact
     gain = np.full(d, rms.gain, dtype=np.float32) if rms is not None else None

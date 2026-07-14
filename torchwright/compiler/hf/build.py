@@ -487,6 +487,11 @@ def _compile_hf_bundle_into(
             trim_heads=trim_heads,
             optimize=optimize,
             bias=bias,
+            # token.v6 held-bank contract: the output is written into the
+            # embedding's exact ordered residual bank, same as compile_to_onnx
+            # — the custom target's storage-tied lm_head and the shared
+            # build_token_weights tied-layout validation both rely on it.
+            output_layout_source=embedding,
             d_hidden=d_hidden,
             rms_norm=rms_on,
             rms_norm_eps=rms_norm_eps,
