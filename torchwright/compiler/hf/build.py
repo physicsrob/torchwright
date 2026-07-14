@@ -489,8 +489,8 @@ def _compile_hf_bundle_into(
             bias=bias,
             # token.v6 held-bank contract: the output is written into the
             # embedding's exact ordered residual bank, same as compile_to_onnx
-            # — the custom target's storage-tied lm_head and the shared
-            # build_token_weights tied-layout validation both rely on it.
+            # — both targets' storage-tied lm_head and the shared
+            # build_token_weights tied-layout validation rely on it.
             output_layout_source=embedding,
             d_hidden=d_hidden,
             rms_norm=rms_on,
@@ -598,7 +598,10 @@ def _compile_hf_bundle_into(
                 resid_pdrop=0.0,
                 embd_pdrop=0.0,
                 use_cache=True,
-                tie_word_embeddings=False,
+                # token.v6: one serialized token table; stock Phi-3's normal
+                # tie_weights() path reconstructs lm_head as an alias of
+                # embed_tokens at load.
+                tie_word_embeddings=True,
                 bos_token_id=bos_id,
                 eos_token_id=eos_id,
                 pad_token_id=None,
@@ -609,20 +612,15 @@ def _compile_hf_bundle_into(
         shard_count = spec.n_layers + 1
         weight_map, total_size = sink.weight_map, sink.total_size
         gain = token.norm_gain
+        # token.v6 tied readout: lm_head aliases embed_tokens for both
+        # targets (the custom model via _tied_weights_keys, stock Phi-3 via
+        # tie_word_embeddings=True), so the state dict carries no separate
+        # unembed.  The folded RMS constants in embed_table are cleared
+        # before readout by the zeroed final-gain coordinates below, and
+        # the literal seed by the compiled clear_literal_seed op.
         final_sd = {
             "model.embed_tokens.weight": _torch(token.embed_table),
         }
-        if target == "custom":
-            # token.v6 tied readout: lm_head shares embed_tokens' storage
-            # (_tied_weights_keys); the state dict carries no separate
-            # unembed.  The folded RMS constants in embed_table are cleared
-            # before readout by the zeroed final-gain coordinates below, and
-            # the literal seed by the compiled clear_literal_seed op.
-            pass
-        else:
-            # Stock architectures have no torchwright tie; ship the compact
-            # untied projection (zero off the output bank).
-            final_sd["lm_head.weight"] = _torch(token.lm_head)
         if gain is not None:
             # Final norm: exact zero on the pinned-constant coordinates so
             # the tied readout never sees the folded RMS constants — the

@@ -977,3 +977,33 @@ either make those two baseline gates deterministic or explicitly disposition
 them. The external DOOM-width held-capacity/layer-count measurement required
 by H6 also remains a release measurement; it is not authorization to add a
 no-hold mode.
+
+## 16. Addendum: direct-HF builder retargeting (2026-07-14)
+
+Section 10 targets `torchwright/compiler/hf/convert.py`, and section 15's
+record reflects that path: at implementation time the Phi-3 tie lived in the
+converter and `tests/hf/test_convert.py` verified it. The subsequent merge of
+main replaced the converter with the direct streaming builder
+(`torchwright/compiler/hf/build.py`, commit 1706c8b), which had been written
+untied for stock Phi-3 before the v6 contract existed. The merge deleted
+`convert.py` and its tests, silently dropping the Phi-3 half of section 10's
+acceptance criteria; the post-merge reconciliation (d006732) carried the
+held-bank scheduling contract into the direct path but kept the stock target
+untied and rewrote the parity tests to assert that state.
+
+This addendum records the correction. The direct builder is now the sole HF
+path and satisfies section 1's success conditions for both targets:
+
+- stock `Phi3Config` is constructed with `tie_word_embeddings=True`;
+- both targets serialize only `model.embed_tokens.weight`; stock Phi-3's
+  normal `tie_weights()` path reconstructs the `lm_head.weight` alias at
+  load;
+- `TokenModelWeights` no longer carries a separate `lm_head` projection
+  (`build_token_weights` still validates the ordered-bank equality that
+  makes the tied readout exact); and
+- `tests/hf/test_direct_phi3_parity.py` and `tests/hf/test_phi3_compile.py`
+  assert storage identity after compile and after save/reload, and the
+  absence of `lm_head.weight` from every serialized weight map.
+
+Where section 10 says `convert.py`, read `build.py`; the contract is
+unchanged.

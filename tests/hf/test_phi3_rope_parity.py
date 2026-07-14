@@ -31,9 +31,9 @@ Pinned here, at flagship geometry (``head_dim=128``, ``d_rot=64`` ⇒ factor
 * P0(c): ``Phi3Config`` accepts an explicit ``head_dim``, persists it
   through a save/load round trip, and the modeling code honors it — the
   finding that selects pad-to-per-layer-max over pad-to-``d/d_head`` in the
-  direct compiler — and ``tie_word_embeddings=False`` keeps the stock Phi3
-  ``lm_head`` untied (the torchwright tie is expressed by shipping the
-  compact projection over the same token.v6 output bank).
+  direct compiler — and ``tie_word_embeddings=True`` makes the stock Phi3
+  ``lm_head`` a storage alias of ``embed_tokens`` (the token.v6 tie: one
+  serialized token table serves lookup and readout).
 
 CPU-only, no artifact compile — this is a pure modeling-code probe.
 """

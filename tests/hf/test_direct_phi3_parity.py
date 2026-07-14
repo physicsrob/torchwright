@@ -73,7 +73,8 @@ def test_custom_config_rejects_explicit_untied():
     deliberate untied experiment) must raise on the custom config, not be
     silently overridden — HF's tie_weights() would otherwise clone the
     embedding over a checkpoint's real lm_head and return wrong logits with
-    no error.  (The stock Phi3 target keeps its genuine untied lm_head.)"""
+    no error.  (The stock Phi3 target ties through its ordinary
+    tie_word_embeddings flag instead — no custom guard needed there.)"""
     from torchwright.compiler.hf.configuration_torchwright_custom import (
         TorchwrightCustomConfig,
     )
@@ -99,8 +100,8 @@ def test_config_matches_debug_sidecar(artifact_path, direct_model):
         max(int(x) for x in dbg["d_hidden"]),
         max(int(x) for x in dbg["d_hidden"]) + 1,
     }
-    # Untied vanilla layout: no separate embedding/output-gather width remains.
-    assert not cfg.tie_word_embeddings
+    # token.v6 tied layout: one token table serves lookup and readout.
+    assert cfg.tie_word_embeddings
 
 
 def test_artifact_uses_one_physically_tied_table(artifact_path):
@@ -225,12 +226,31 @@ def test_standard_attention_mask(direct_model):
     assert out.logits.shape[:2] == ids.shape
 
 
+def test_direct_model_is_storage_tied(direct_model):
+    """The compiled model's lm_head and embed_tokens are one tensor, not two
+    equal copies — the token.v6 tie survives the from_pretrained load path."""
+    model, _ = direct_model
+    assert model.config.tie_word_embeddings
+    assert (
+        model.lm_head.weight.data_ptr() == model.model.embed_tokens.weight.data_ptr()
+    )
+
+
 def test_save_load_round_trip(tmp_path, direct_model):
+    from safetensors import safe_open
     from transformers import Phi3ForCausalLM
 
     model, oracle = direct_model
     save_dir = tmp_path / "bundle"
     model.save_pretrained(save_dir)
+    # token.v6 tied: exactly one serialized token table, under the embedding's
+    # key; lm_head is reconstructed as an alias by tie_weights() at load.
+    saved_keys = set()
+    for shard in save_dir.glob("*.safetensors"):
+        with safe_open(shard, framework="pt", device="cpu") as handle:
+            saved_keys |= set(handle.keys())
+    assert "model.embed_tokens.weight" in saved_keys
+    assert "lm_head.weight" not in saved_keys
     reloaded = Phi3ForCausalLM.from_pretrained(
         save_dir, attn_implementation="eager"
     ).eval()
@@ -240,8 +260,8 @@ def test_save_load_round_trip(tmp_path, direct_model):
         a = model(input_ids=torch.tensor([prefill]), use_cache=True).logits
         b = reloaded(input_ids=torch.tensor([prefill]), use_cache=True).logits
     assert torch.equal(a, b)
-    # Untied: lm_head and embed_tokens are independent tensors (separate storage).
+    # Tied: lm_head and embed_tokens share storage after reload as well.
     assert (
         reloaded.lm_head.weight.data_ptr()
-        != reloaded.model.embed_tokens.weight.data_ptr()
+        == reloaded.model.embed_tokens.weight.data_ptr()
     )

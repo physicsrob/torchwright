@@ -138,7 +138,6 @@ class TokenModelSpec:
 @dataclass(frozen=True)
 class TokenModelWeights:
     embed_table: np.ndarray
-    lm_head: np.ndarray
     norm_gain: Optional[np.ndarray]
 
 
@@ -294,10 +293,5 @@ def build_token_weights(compiled, output_node: Node, embedding: Embedding, d: in
             f"embedding={list(embedding_indices)[:8]}..., "
             f"output={list(output_indices)[:8]}..."
         )
-    # The compact untied projection over the bank — the stock-architecture HF
-    # target's genuine lm_head.  The tied surfaces (v6 ONNX readout, the
-    # custom HF model) transpose/share embed_table itself and ignore this.
-    lm_head = np.zeros((vocab_size, d), dtype=np.float32)
-    lm_head[:, output_indices] = compact
     gain = np.full(d, rms.gain, dtype=np.float32) if rms is not None else None
-    return TokenModelWeights(embed, lm_head, gain)
+    return TokenModelWeights(embed, gain)
