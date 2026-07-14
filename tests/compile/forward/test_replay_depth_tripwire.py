@@ -36,6 +36,7 @@ from torchwright.compiler.forward.cpsat_scheduler import (
     ScheduleAssignment,
     solve_schedule,
 )
+from torchwright.compiler.residual_assignment import flatten_concat_nodes
 from torchwright.graph import Concatenate, Linear
 from torchwright.ops.inout_nodes import create_input
 
@@ -90,9 +91,24 @@ def test_tripwire_fires_on_deeper_replay(monkeypatch):
         n2l[out_id] += 1
         if out_id in n2cl:
             n2cl[out_id] = max(n2cl[out_id], asg.n_layers + 1)
-        mutated = dataclasses.replace(
-            asg, node_to_layer=n2l, node_to_cancel_layer=n2cl
-        )
+        # The mutation must stay replay-SOUND (its only defect the extra
+        # emitted layer): a value the moved sink reads whose cancel now sits
+        # at or before the sink's new layer would be released by the atomic
+        # attention batch while the sink still needs it, and the batch's A2
+        # whole-batch last-reader validation correctly rejects that as an
+        # unsound assignment before the depth tripwire can fire.  Push such
+        # cancels past the new horizon (they simply never fire).
+        leaves = []
+        for inp in args[0].inputs:
+            if isinstance(inp, Concatenate):
+                leaves.extend(flatten_concat_nodes([inp]))
+            else:
+                leaves.append(inp)
+        for leaf in leaves:
+            cl = n2cl.get(leaf.node_id)
+            if cl is not None and cl <= n2l[out_id]:
+                n2cl[leaf.node_id] = n2l[out_id] + 1
+        mutated = dataclasses.replace(asg, node_to_layer=n2l, node_to_cancel_layer=n2cl)
         return mutated, stats
 
     monkeypatch.setattr(compile_mod, "solve_schedule", deeper)

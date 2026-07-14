@@ -5,7 +5,7 @@ sidecar, checks its format key, and returns an ``OnnxTokenModule`` — an
 ``onnxruntime``-backed callable speaking the static-cache prefill/decode
 protocol:
 
-- ``OnnxTokenModule`` — token I/O (``torchwright.token.v5``), produced
+- ``OnnxTokenModule`` — token I/O (``torchwright.token.v6``), produced
   by :func:`torchwright.compiler.export.compile_to_onnx`; adds the
   vocab tokenizer and an argmax :meth:`OnnxTokenModule.generate` loop.
 
@@ -103,7 +103,7 @@ class OnnxTokenModule:
 
     Args:
         onnx_path: Path to the ``.onnx`` file.  A sidecar
-            ``<stem>.meta.json`` with format ``torchwright.token.v5``
+            ``<stem>.meta.json`` with format ``torchwright.token.v6``
             must exist alongside it.
         providers: ``onnxruntime`` execution providers list.  Defaults
             to CPU.
@@ -309,7 +309,7 @@ def load_onnx(onnx_path: str, providers=None) -> OnnxTokenModule:
     """Load a torchwright token-I/O ONNX export.
 
     Reads ``<stem>.meta.json`` next to ``onnx_path`` and returns an
-    :class:`OnnxTokenModule` (``torchwright.token.v5``).
+    :class:`OnnxTokenModule` (``torchwright.token.v6``).
     """
     meta_path = meta_path_for(onnx_path)
     if not os.path.exists(meta_path):

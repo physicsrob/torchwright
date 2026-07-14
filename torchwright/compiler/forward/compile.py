@@ -16,7 +16,9 @@ import torch
 
 from torchwright.compiler.device import get_device
 from torchwright.compiler.realization import (
+    ATTN_TRANSPORT,
     RealizationTable,
+    is_schedulable,
     linear_attn_heads,
     usable_hidden_slots,
 )
@@ -33,7 +35,10 @@ from torchwright.compiler.forward.schedule_cache import (
     store_assignment,
 )
 from torchwright.compiler.forward.graph_analysis import GraphAnalyzer
-from torchwright.compiler.forward.residual_map import ResidualStreamMap
+from torchwright.compiler.forward.residual_map import (
+    HeldOutputLayout,
+    ResidualStreamMap,
+)
 from torchwright.compiler.forward.scheduler import (
     DirectedLayerScheduler,
     LayerScheduler,
@@ -52,7 +57,7 @@ from torchwright.compiler.forward.weight_writer import (
 from torchwright.compiler.groups.transformer_layer import TransformerLayer
 from torchwright.compiler.transformer import HeadlessTransformer
 from torchwright.compiler.residual_assignment import flatten_concat_nodes
-from torchwright.graph import Node, Linear, Concatenate
+from torchwright.graph import Add, Attn, Embedding, Node, Linear, Concatenate
 from torchwright.graph.node import reserve_node_id_above
 from torchwright.graph.misc import LiteralValue
 
@@ -350,6 +355,7 @@ class _TrackingResidualStreamMap(ResidualStreamMap):
         # directly because the tracking subclass is a different type.
         self._free = set(base._free)
         self._node_to_indices = dict(base._node_to_indices)
+        self._held = set(getattr(base, "_held", set()))
         self._reserved = set(getattr(base, "_reserved", set()))
         self.current_layer: int = 0
         self.cancel_layer: dict[int, int] = {}
@@ -372,6 +378,11 @@ class _TrackingResidualStreamMap(ResidualStreamMap):
         self.cancel_mech[node.node_id] = mech
         super().free(node, mech)
 
+    def hold(self, node: Node, mech: str = "attn"):  # type: ignore[override]
+        self.cancel_layer[node.node_id] = self.current_layer
+        self.cancel_mech[node.node_id] = mech
+        return super().hold(node, mech)
+
     def reassign(self, old_node: Node, new_node: Node) -> None:  # type: ignore[override]
         # The new node is born here (free-add reuse), so any stale cancel
         # recorded for it by an earlier rolled-back allocation is wrong.
@@ -393,6 +404,8 @@ def _run_heuristic_warm_start(
     bias: bool = True,
     admission_budget_fraction: float,
     policy: Optional[SchedulingPolicy],
+    realization_table: RealizationTable,
+    held_output_layout: Optional[HeldOutputLayout],
     output_node: Node,
     max_layers: int,
 ) -> tuple[dict, dict, dict, dict, int]:
@@ -416,6 +429,7 @@ def _run_heuristic_warm_start(
         clusters=clusters,
         admission_budget_fraction=admission_budget_fraction,
         policy=policy,
+        realization_table=realization_table,
         # The warm start emits the eager (within-layer freeing) schedule — the
         # shallower one that frees and reuses a column inside a consumer's
         # layer.  Units 1 and 2 taught the CP-SAT model to represent exactly
@@ -425,6 +439,7 @@ def _run_heuristic_warm_start(
         # solver used to need.  (The no-eager mode has been removed;
         # ``LayerScheduler`` is always eager.)
         bias=bias,
+        held_output_layout=held_output_layout,
     )
     hint_layers: dict = {}
     hint_routing: dict = {}
@@ -726,7 +741,11 @@ def _count_layer_params(
     for mlp_op in mlp_ops:
         if mlp_op.mlp_slots:
             slots_used += len(mlp_op.mlp_slots)
-        if mlp_op.op_type in ("compute_literal_value", "compute_bias"):
+        if mlp_op.op_type in (
+            "compute_literal_value",
+            "compute_bias",
+            "clear_literal_seed",
+        ):
             bias_entries += len(mlp_op.target_cols)
 
     params_per_slot = _params_per_slot(d, activation, bias)
@@ -757,6 +776,7 @@ def forward_compile(
     rms_norm_eps: float = 1e-5,
     rms_norm_const_exp: int = _RMS_NORM_CONST_EXP,
     bias: bool = True,
+    output_layout_source: Optional[Node] = None,
     _disabled_families: frozenset = frozenset(),
     _solver_seed: Optional[int] = None,
     _force_resolve: bool = False,
@@ -857,6 +877,16 @@ def forward_compile(
             ``d_hidden >= 2``.  In-process bias tensors remain as zeros so
             probes and debug work unchanged; the ONNX exporter emits no
             bias initializers.  See docs/no_bias_plan.md.
+        output_layout_source: Internal held-bank contract for token export.
+            When provided, this must be the graph's unique reachable
+            :class:`Embedding`, and the equally wide schedulable output is
+            freshly written into the embedding's exact ordered residual
+            columns.  The source bank is held (never returned to ordinary
+            allocation) between source cancellation and output birth.  A
+            direct flex ``Linear`` target is forced to attention so source
+            cancellation and output writing can share one attention event;
+            a direct MLP-only target is rejected.  Generic headless compiles
+            leave this as ``None``.  Token export always supplies it.
         _disabled_families: MEASUREMENT-ONLY (CP-SAT expressiveness plan §0
             gap attribution); never set in production configs.  A non-empty
             set of :data:`cpsat_scheduler.CONSTRAINT_FAMILIES` names puts the
@@ -965,6 +995,54 @@ def forward_compile(
         key=lambda n: n.node_id,
     )
 
+    held_source: Optional[Node] = None
+    direct_held_handoff = False
+    forced_realization_classes: Dict[int, str] = {}
+    if output_layout_source is not None:
+        try:
+            held_source = lowered.copy_of(output_layout_source)
+        except KeyError as exc:
+            raise ValueError(
+                f"output_layout_source {output_layout_source!r} is not a whole "
+                f"reachable value after lowering"
+            ) from exc
+        embeddings = [n for n in graph.get_all_nodes() if isinstance(n, Embedding)]
+        if len(embeddings) != 1 or embeddings[0] is not held_source:
+            raise ValueError(
+                "held output layout requires exactly one reachable Embedding, "
+                f"the requested source; found {[repr(n) for n in embeddings]}"
+            )
+        if not graph.is_input_node(held_source):
+            raise ValueError("held output layout source must be a graph input")
+        if output_node is held_source:
+            raise ValueError("held output layout source and target must differ")
+        if isinstance(output_node, Concatenate) or not is_schedulable(output_node):
+            raise ValueError(
+                "held output layout requires a non-Concatenate schedulable "
+                f"target, got {type(output_node).__name__}"
+            )
+        if len(held_source) != len(output_node) or len(held_source) == 0:
+            raise ValueError(
+                f"held output layout width mismatch: source={len(held_source)}, "
+                f"target={len(output_node)}"
+            )
+        direct_leaves = []
+        for inp in output_node.inputs:
+            if isinstance(inp, Concatenate):
+                direct_leaves.extend(flatten_concat_nodes([inp]))
+            else:
+                direct_leaves.append(inp)
+        direct_held_handoff = held_source in direct_leaves
+        if direct_held_handoff:
+            if isinstance(output_node, Linear):
+                forced_realization_classes[output_node.node_id] = ATTN_TRANSPORT
+            elif not isinstance(output_node, (Attn, Add)):
+                raise ValueError(
+                    "held output layout has no direct MLP handoff: target "
+                    f"{output_node!r} directly reads the tied Embedding but "
+                    f"{type(output_node).__name__} is MLP-only"
+                )
+
     # RoPE end state (docs/rope_port_plan.md §1, Phase 5): position is a
     # rotation applied inside attention, not a residual node — there is no
     # PosEncoding.  ``pos_encoding`` is kept as an internal ``None`` so the
@@ -1045,9 +1123,10 @@ def forward_compile(
     # every Linear/Add/Cancel/add_into.  It is a LiteralValue input node, so all
     # three runtime surfaces initialise it to 1.0 with no new emission code
     # (in-process get_input_res_stream's LiteralValue branch; the ONNX/HF
-    # embed-table row fold, token.v5).  It is allocated once and never freed — no graph
-    # node owns it and no op targets it — so the column holds 1.0 unchanged
-    # through every layer.  The runtime rotates it by absolute position
+    # embed-table row fold, token.v6).  It is allocated once and no graph node
+    # owns or writes it, so the column holds 1.0 through every attention read.
+    # A compiler-internal final-MLP op then clears it before tied readout.  The
+    # runtime rotates it by absolute position
     # (rotate_half over d_head), making the self-match logit ∝ Σ_p cos((i−j)·θ_p)
     # peak at i==j — a bit-identical Δ=0 transport.
     # Before minting any compile-internal node, push the global id counter past
@@ -1062,6 +1141,13 @@ def forward_compile(
     residual_map.allocate(const_one)
     for node in input_nodes:
         residual_map.allocate(node)
+    held_output_layout: Optional[HeldOutputLayout] = None
+    if held_source is not None:
+        held_output_layout = HeldOutputLayout(
+            source=held_source,
+            target=output_node,
+            bank=tuple(residual_map.get_indices(held_source)),
+        )
     # The runtime always zero-initialises the residual stream (the contract
     # `HeadlessTransformer.get_input_res_stream` provides, and the ONNX
     # embed-table's zero-scatter into non-allocated columns), so every
@@ -1136,6 +1222,12 @@ def forward_compile(
     # resolvers read it: `resolve_static` below, and `routing()` inside the
     # CP-SAT model (which receives it as its `d_hidden`).
     solver_d_hidden = usable_hidden_slots(d_hidden, bias)
+    static_realization_table = lowered.realization_table.resolve_static(
+        graph.get_all_nodes(),
+        policy,
+        solver_d_hidden,
+        forced_classes=forced_realization_classes,
+    )
 
     if use_cpsat:
         # Architecture doc §3 marks admission_control as a model
@@ -1170,6 +1262,8 @@ def forward_compile(
             policy=policy,
             reserve_residual=n_reserved_residual,
             bias=bias,
+            held_output_source=held_source,
+            held_output_target=(output_node if held_source is not None else None),
         )
         if verbose:
             # Print the schedule fingerprint unconditionally (not only on a
@@ -1227,6 +1321,8 @@ def forward_compile(
                     clusters=clusters,
                     admission_budget_fraction=admission_budget_fraction,
                     policy=policy,
+                    realization_table=static_realization_table,
+                    held_output_layout=held_output_layout,
                     output_node=output_node,
                     max_layers=max_layers,
                     bias=bias,
@@ -1325,6 +1421,16 @@ def forward_compile(
                     _pin_cancels=_pin_cancels,
                     solver_params=_merged_solver_params,
                     drop_decision_strategy=_drop_decision_strategy,
+                    held_source_id=(
+                        held_output_layout.source.node_id
+                        if held_output_layout is not None
+                        else None
+                    ),
+                    held_target_id=(
+                        held_output_layout.target.node_id
+                        if held_output_layout is not None
+                        else None
+                    ),
                 )
 
             def _horizon_for(hn):
@@ -1348,33 +1454,14 @@ def forward_compile(
             # ``is_optimal``, the LB/objective gap).
             net.cpsat_solve_stats = _stats
 
-            # A relaxed (_disabled_families) schedule is unsound to replay, so
-            # it must never poison the fingerprint-keyed cache that production
-            # compiles replay from.
-            if assignment is not None and not _disabled_families:
-                if (
-                    store_assignment(
-                        schedule_fp,
-                        assignment,
-                        {
-                            "status_name": net.cpsat_solve_stats.status_name,
-                            "best_objective_bound": (
-                                net.cpsat_solve_stats.best_objective_bound
-                            ),
-                            "is_optimal": net.cpsat_solve_stats.is_optimal,
-                            "optimize": optimize,
-                            "d": d,
-                            "d_head": d_head,
-                            "d_hidden": d_hidden if d_hidden else d,
-                        },
-                        output_node=output_node,
-                    )
-                    and verbose
-                ):
-                    print(
-                        f"  CP-SAT schedule cached ({schedule_fp[:12]}...): "
-                        f"n_layers={assignment.n_layers}"
-                    )
+            # The schedule-cache commit happens at the successful END of the
+            # compile (after directed replay and its validations), not here —
+            # defense in depth so no model/replay defect can turn a transient
+            # failed solve into a persistent cached failure.  Consequence: a
+            # relaxed (_disabled_families) or solve-only (_solve_only) run
+            # returns before that point and never writes production cache
+            # state (deliberate — a measurement seam should not populate the
+            # cache; pinned by the §5.4 cache tests).
 
         # Solve-only measurement (§0 gap attribution).  Return the solve
         # outputs now — before building the directed replay — for either a
@@ -1455,9 +1542,13 @@ def forward_compile(
                 policy=policy,
                 # Fallback resolves statically, same as optimize=0.
                 realization_table=lowered.realization_table.resolve_static(
-                    graph.get_all_nodes(), policy, solver_d_hidden
+                    graph.get_all_nodes(),
+                    policy,
+                    solver_d_hidden,
+                    forced_classes=forced_realization_classes,
                 ),
                 bias=bias,
+                held_output_layout=held_output_layout,
             )
         else:
             if verbose and net.cpsat_solve_stats.status_name != "CACHED":
@@ -1482,6 +1573,7 @@ def forward_compile(
                     assignment.node_to_routing
                 ),
                 bias=bias,
+                held_output_layout=held_output_layout,
             )
     else:
         scheduler = LayerScheduler(
@@ -1495,9 +1587,13 @@ def forward_compile(
             policy=policy,
             # The static policy is the optimize=0 resolver.
             realization_table=lowered.realization_table.resolve_static(
-                graph.get_all_nodes(), policy, solver_d_hidden
+                graph.get_all_nodes(),
+                policy,
+                solver_d_hidden,
+                forced_classes=forced_realization_classes,
             ),
             bias=bias,
+            held_output_layout=held_output_layout,
         )
 
     # Realization completeness: every schedulable node's entry is resolved
@@ -1590,6 +1686,10 @@ def forward_compile(
         attn_ops, mlp_ops, biased_linears = scheduler.schedule_layer(
             residual_map, computed
         )
+        clears_literal_seed = held_output_layout is not None and output_node in computed
+        if clears_literal_seed:
+            const_col = residual_map.get_indices(const_one)[0]
+            mlp_ops.append(MLPOp("clear_literal_seed", const_one, [const_col], []))
         t_attn_start = time.perf_counter()
         placement_recorder.set_layer(i)
         write_attn_sublayer(
@@ -1610,6 +1710,11 @@ def forward_compile(
             const_one=const_one,
             bias=bias,
         )
+        if clears_literal_seed:
+            # The runtime value is now exact zero.  Retire allocator ownership
+            # before the final snapshot, while retaining input_indices so all
+            # runtime surfaces still seed the pre-layer value to one.
+            residual_map.free(const_one)
         t_layer_end = time.perf_counter()
 
         layer_time = t_layer_end - t_layer_start
@@ -1697,6 +1802,62 @@ def forward_compile(
     if directed_replay and assignment is not None:
         _check_replay_depth(assignment, replay_birth_layer, len(net.layers))
 
+    if held_output_layout is not None:
+        if residual_map._held:
+            raise AssertionError(
+                f"held output bank was never claimed: {sorted(residual_map._held)[:8]}"
+            )
+        if residual_map.is_allocated(held_output_layout.source):
+            raise AssertionError(
+                "held source still owns residual columns at completion"
+            )
+        actual_output_bank = tuple(residual_map.get_indices(output_node))
+        if actual_output_bank != held_output_layout.bank:
+            raise AssertionError(
+                f"held output bank order changed: expected "
+                f"{held_output_layout.bank}, got {actual_output_bank}"
+            )
+        if residual_map.is_allocated(const_one):
+            raise AssertionError("final literal seed was not retired")
+
+    # Schedule-cache commit, deferred from the solve to here — after directed
+    # replay, the replay-depth tripwire, and the output-layout validation all
+    # passed.  Defense in depth: atomic batch replay is the correctness
+    # mechanism, but no future model/replay defect should turn a transient
+    # failed solve into a persistent cached failure.  A cache hit
+    # (status_name == "CACHED") is not rewritten; the eager fallback
+    # (assignment is None) has nothing to store; relaxed and solve-only
+    # measurement runs returned before the replay and never reach this line.
+    if (
+        use_cpsat
+        and assignment is not None
+        and net.cpsat_solve_stats is not None
+        and net.cpsat_solve_stats.status_name != "CACHED"
+    ):
+        if (
+            store_assignment(
+                schedule_fp,
+                assignment,
+                {
+                    "status_name": net.cpsat_solve_stats.status_name,
+                    "best_objective_bound": (
+                        net.cpsat_solve_stats.best_objective_bound
+                    ),
+                    "is_optimal": net.cpsat_solve_stats.is_optimal,
+                    "optimize": optimize,
+                    "d": d,
+                    "d_head": d_head,
+                    "d_hidden": d_hidden if d_hidden else d,
+                },
+                output_node=output_node,
+            )
+            and verbose
+        ):
+            print(
+                f"  CP-SAT schedule cached ({schedule_fp[:12]}...): "
+                f"n_layers={assignment.n_layers}"
+            )
+
     # layer_capacity is constant per layer; avoids touching layer tensors,
     # which may have been freed by on_layer_compiled.
     transformer_params = layer_capacity * len(net.layers)
@@ -1742,6 +1903,11 @@ def forward_compile(
         ra.assign(out_state, output_node, residual_map.get_indices(output_node))
     net.residual_assignment = ra
     net.placements = placement_recorder
+    # Per-layer attention-head usage by op type (``_count_heads_by_type``).
+    # Observability only: tests read this to assert a layer's exact head
+    # charge (e.g. a collective-handoff layer sitting at full capacity)
+    # instead of re-deriving head counts by hand.
+    net.per_layer_head_counts = per_layer_head_counts
 
     # Certify the RMSNorm identity against the graph's value ranges: the norm is
     # the identity only while the data energy stays under the pinned constant's

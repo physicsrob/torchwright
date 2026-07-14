@@ -12,7 +12,7 @@ import torch
 
 from torchwright.compiler.export import compile_to_onnx
 from torchwright.debug.probe import probe_compiled
-from torchwright.graph import FFN
+from torchwright.graph import FFN, Linear
 from torchwright.ops.inout_nodes import create_embedding
 from torchwright.ops.relu.linear_relu_linear import linear_relu_linear
 
@@ -32,7 +32,7 @@ def _build():
     emb = create_embedding(vocab=VOCAB)
     d = len(emb)
     g = torch.Generator().manual_seed(3)
-    out = linear_relu_linear(
+    block = linear_relu_linear(
         emb,
         torch.randn(24, d, generator=g) * 0.2,
         torch.randn(24, generator=g) * 0.1,
@@ -40,7 +40,11 @@ def _build():
         torch.randn(d, generator=g) * 0.1,
         name="ffn",
     )
-    return out, emb
+    # Token.v6 deliberately has no direct MLP read/cancel/overwrite handoff;
+    # keep the FFN observable in the debug surface behind a final
+    # attention-routable identity writer.
+    output = Linear(block, torch.eye(d), name="output")
+    return output, block, emb
 
 
 def _token_ids(emb) -> torch.Tensor:
@@ -51,15 +55,15 @@ def _token_ids(emb) -> torch.Tensor:
 
 def test_onnx_debug_session_roundtrips_block_graph(tmp_path):
     onnx_path = str(tmp_path / "blk.onnx")
-    out_block, emb = _build()
+    output, out_block, emb = _build()
     assert isinstance(out_block, FFN)
     compile_to_onnx(
-        out_block, emb, onnx_path, d=D, d_head=D_HEAD, max_seq_len=16, verbose=False
+        output, emb, onnx_path, d=D, d_head=D_HEAD, max_seq_len=16, verbose=False
     )
 
     # Fresh rebuild: different node ids, same canonical topology.
-    out2_block, emb2 = _build()
-    session = OnnxDebugSession(onnx_path, out2_block)
+    output2, out2_block, emb2 = _build()
+    session = OnnxDebugSession(onnx_path, output2)
 
     ids = _token_ids(emb2)
     report = probe_compiled(

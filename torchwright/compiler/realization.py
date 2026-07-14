@@ -410,7 +410,11 @@ class RealizationTable:
     # -- resolvers ---------------------------------------------------------
 
     def resolve_static(
-        self, nodes: Iterable[Node], policy: SchedulingPolicy, usable_slots: int
+        self,
+        nodes: Iterable[Node],
+        policy: SchedulingPolicy,
+        usable_slots: int,
+        forced_classes: Optional[Dict[int, str]] = None,
     ) -> "RealizationTable":
         """The optimize=0 resolver: :func:`static_flex_class` picks every free
         choice.
@@ -425,9 +429,19 @@ class RealizationTable:
         width, which the ``node_id``-keyed entries do not carry.
         """
         by_id = {n.node_id: n for n in nodes if is_schedulable(n)}
+        forced_classes = forced_classes or {}
         resolved: Dict[int, Entry] = {}
         for node_id, entry in self.entries.items():
-            if entry.resolved is None and not entry.conditional:
+            forced = forced_classes.get(node_id)
+            if forced is not None:
+                if entry.conditional or forced not in entry.candidates:
+                    raise UnresolvedRealizationError(
+                        f"cannot force node {node_id} to realization {forced!r}; "
+                        f"candidates={entry.candidates}, "
+                        f"conditional={entry.conditional}"
+                    )
+                resolved[node_id] = replace(entry, resolved=forced)
+            elif entry.resolved is None and not entry.conditional:
                 node = by_id.get(node_id)
                 if node is None:
                     raise UnresolvedRealizationError(

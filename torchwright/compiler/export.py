@@ -5,7 +5,7 @@ metadata; ``artifact.load()`` / ``artifact.debug_session(...)``):
 
     compile_to_onnx(output_node, embedding, path, ...)
         Token I/O: token_ids -> logits.  Sidecar format
-        ``TOKEN_META_FORMAT`` (currently ``torchwright.token.v5``)
+        ``TOKEN_META_FORMAT`` (currently ``torchwright.token.v6``)
         carries the vocab.  Consumer: ``OnnxTokenModule`` via
         :func:`torchwright.compiler.onnx_load.load_onnx`.
 
@@ -61,16 +61,12 @@ from torchwright.graph.attn import CAUSAL_MASK_SENTINEL
 from torchwright.graph.rope import ROPE_BASE
 from torchwright.graph.misc import InputNode
 
-# v5: input-state constant seeds (the rotary Δ=0 self-match const-1 column)
-# are folded into ``embed_table`` rows — the mechanism the pinned RMSNorm
-# constants already used — so the ``constant_values`` initializer and the
-# post-Gather seed Add are gone and the residual seed is the token gather
-# alone (docs/no_bias_plan.md Phase N0; bit-identical values).  v4 was the
-# rotary positional encoding (no `pos_encoding_full` table) plus the optional
-# identity RMSNorm.  The binary initializer set differs from every earlier
-# version, so an older artifact must be re-exported rather than loaded
-# against this converter.
-TOKEN_META_FORMAT = "torchwright.token.v5"
+# v6: the token table is physically tied.  The compiler returns the logical
+# output in the embedding's exact ordered residual bank, clears every folded
+# seed before readout, and the final MatMul transposes ``embed_table`` itself.
+# There is no ``lm_head`` initializer and no unembed mask.  The binary layout
+# is intentionally incompatible with every earlier token artifact.
+TOKEN_META_FORMAT = "torchwright.token.v6"
 DEBUG_META_FORMAT = "torchwright.debug.v1"
 
 
@@ -1361,7 +1357,7 @@ def compile_to_onnx(
 
     Writes three files:
         ``<output_path>``     — the ONNX model
-        ``<stem>.meta.json``  — ``{"format": "torchwright.token.v5",
+        ``<stem>.meta.json``  — ``{"format": "torchwright.token.v6",
                                    "vocab": [...]}``
         ``<stem>.debug.json`` — the debug sidecar (residual assignment
                                 keyed by canonical node id, structural
@@ -1410,11 +1406,13 @@ def compile_to_onnx(
     supply a non-zero stream.
 
     ``rms_norm`` emits a real RMSNorm — pre-norm on each sublayer input plus a
-    final norm — that acts as the bit-exact identity: a few reserved columns
-    hold pinned constants so the forced RMS is an exact power of two and the
-    uniform gain cancels it.  This makes the artifact a stock Llama-style
-    decoder (a skeptic can't say "no normalization"); it adds the gain weights
-    as initializers (mapped by ``convert.py``) and folds the constants into
+    final norm. Reserved columns hold pinned constants so the forced RMS is an
+    exact power of two and the gain makes every learned coordinate bit-exactly
+    unchanged. Pre-layer gains are uniform; the final gain is exact zero only
+    on the pinned coordinates, clearing them before tied readout without an
+    unembed mask. This makes the artifact a stock Llama-style decoder (a
+    skeptic can't say "no normalization"); it adds the gain weights as
+    initializers (mapped by ``convert.py``) and folds the constants into
     ``embed_table`` (no new buffer).  The norm is **on by default**: ``None``
     enables it.  With the norm on, ``d`` must be a **supported width: any
     multiple of 1024 up to 16384, or any power of two** (the full table and
@@ -1490,6 +1488,7 @@ def compile_to_onnx(
         trim_heads=trim_heads,
         optimize=optimize,
         bias=bias,
+        output_layout_source=embedding,
         d_hidden=d_hidden,
         # Measurement-only (§0): reproducible descent seed + fresh-solve for
         # the sound production draw.  Never set in production configs.
@@ -1525,16 +1524,22 @@ def compile_to_onnx(
     in_state = compiled.layers[0].attn.in_state
     out_state = compiled.layers[-1].mlp.out_state
 
-    embedding_indices: Optional[List[int]] = None
+    embedding_indices = compiled.residual_assignment.get_node_indices(
+        in_state, embedding
+    )
     # Input-state literal seeds as (column, value) pairs, folded into
-    # embed_table rows below (token.v5) — there is no separate
+    # embed_table rows below (token.v6) — there is no separate
     # constant_values initializer or post-Gather seed Add anymore.
     literal_seeds: List[Tuple[int, float]] = []
 
     for node in compiled.residual_assignment.get_nodes(in_state):
         indices = compiled.residual_assignment.get_node_indices(in_state, node)
         if isinstance(node, Embedding):
-            embedding_indices = indices
+            assert node is embedding, (
+                "the token compiler contract permits exactly one reachable "
+                "Embedding, and it must be the explicit source"
+            )
+            assert indices == embedding_indices
         elif isinstance(node, LiteralValue):
             # The rotary Δ=0 self-match const-1 column: an input-state
             # LiteralValue explicitly placed there by forward_compile, seeded
@@ -1557,8 +1562,6 @@ def compile_to_onnx(
                 f"InputNode are expected"
             )
 
-    assert embedding_indices is not None, "No Embedding node in residual assignment"
-
     d_embed = len(embedding_indices)
 
     embed_table_compact = (
@@ -1573,18 +1576,14 @@ def compile_to_onnx(
     output_indices = compiled.residual_assignment.get_node_indices(
         out_state, output_node
     )
-    assert len(output_indices) == d_embed, (
-        f"output column count {len(output_indices)} != embedding width "
-        f"{d_embed}; the unembed reuses the embedding table, so the output "
-        f"node must be d_embed wide"
+    assert output_indices == embedding_indices, (
+        "tied output bank order differs from the embedding bank: "
+        f"embedding={embedding_indices}, output={output_indices}"
     )
 
-    # Vanilla untied (llama3-style) layout: fold the residual column-placement
-    # scatters into the weights, so the runtime does a plain (vocab, d) table
-    # lookup and a full-width unembed — no embedding_proj / pos_proj / output
-    # column gather.  Each folded table is mostly zeros (only d_embed / d_pos of
-    # the d columns are populated), so _add_float_init stores them COO-sparse:
-    # the ONNX file stays compact even though the dense HF weights are (vocab, d).
+    # Fold the residual column placement into one full-width tied table.  Its
+    # learned coordinates occupy the ordered held bank; folded seed columns
+    # initialize the transformer but are exact zero by final readout.
     # ZERO-INIT CONTRACT.  The table starts as all-zeros and only the
     # embedding, pinned-RMSNorm, and literal-seed columns below are written;
     # every column allocated to a graph node stays zero.  A per-token
@@ -1602,7 +1601,7 @@ def compile_to_onnx(
     # EVERY vocab row, so the per-token gather reproduces the constants at
     # every position.  The reserved columns are allocated to no node, so every
     # weight row that reads them is zero — the constants contribute nothing to
-    # any matmul or to lm_head, yet their energy dominates mean(x^2) so the
+    # any transformer matmul, yet their energy dominates mean(x^2) so the
     # forced RMS is an exact power of two.  These are the only genuine new
     # seed constants.
     if rms_spec is not None:
@@ -1614,21 +1613,13 @@ def compile_to_onnx(
     # per-token gather reproduces the constant at every position.  The
     # literal's columns are disjoint from the embedding's and the RMSNorm's
     # (residual allocation is pairwise disjoint, I1), so these cells are zero
-    # before the fold and the gathered row is bit-identical to the pre-v5
+    # before the fold and the gathered row is bit-identical to the pre-v6
     # ``Gather -> Add(constant_values)`` pair this replaces.
     for idx, val in literal_seeds:
         embed_table[:, idx] = val
 
-    # Untied unembed weight in nn.Linear (out, in) == (vocab, d) convention,
-    # nonzero only at the output node's residual columns.  logits = res @ W.T
-    # sums over all d columns, but W is exactly zero off the output columns, so
-    # the rest of the residual contributes nothing.
-    lm_head = np.zeros((vocab_size, d), dtype=np.float32)
-    lm_head[:, output_indices] = embed_table_compact
-
     # Initializers
     _add_float_init("embed_table", embed_table, dense_inits, sparse_inits)
-    _add_float_init("lm_head", lm_head, dense_inits, sparse_inits)
     # Pinned-constant RMSNorm gain weights (Llama3-named on the HF side): one
     # per pre-attention norm, one per pre-MLP norm, and a final norm.  Each is a
     # uniform (d,) vector = 2^m, which cancels the forced rms = 2^m exactly.  A
@@ -1642,7 +1633,9 @@ def compile_to_onnx(
             _add_float_init(
                 f"l{i}_post_attention_layernorm", gain_vec, dense_inits, sparse_inits
             )
-        _add_float_init("final_norm", gain_vec, dense_inits, sparse_inits)
+        final_gain_vec = gain_vec.copy()
+        final_gain_vec[list(rms_spec.reserved_cols)] = 0.0
+        _add_float_init("final_norm", final_gain_vec, dense_inits, sparse_inits)
         _add_float_init(
             "_rms_eps",
             np.array([rms_spec.eps], dtype=np.float32),
@@ -1663,7 +1656,7 @@ def compile_to_onnx(
     _add_scalar_inits(dense_inits)
 
     # Nodes: preamble (mask + pos), token embed, residual stream, layers,
-    # full-width unembed.
+    # full-width tied unembed.
     nodes: list = []
 
     def add(op, ins, outs, **attrs):
@@ -1678,7 +1671,7 @@ def compile_to_onnx(
     # the residual seed (no projection).  Position is a rotation applied inside
     # attention (RoPE), so there is no additive position table — the seed is
     # the token embedding alone, whose rows carry the pinned RMSNorm constant
-    # and the const-1 self-match column (both folded above, token.v5).
+    # and the const-1 self-match column (both folded above, token.v6).
     add("Gather", ["embed_table", "token_ids"], ["res_0"], axis=0)
 
     current_res = "res_0"
@@ -1710,13 +1703,11 @@ def compile_to_onnx(
         )
         current_res = "_final_normed"
 
-    # Untied unembed over the full residual stream: logits = res @ lm_head.T.
-    # lm_head is zero off the output node's columns, so the rest of the residual
-    # (live scratch, freed columns) multiplies to zero and never reaches the
-    # logits — provided those columns stay finite (a NaN/Inf in scratch would
-    # now poison every logit, where the old column gather ignored them).
-    add("Transpose", ["lm_head"], ["_lm_head_T"], perm=[1, 0])
-    add("MatMul", [current_res, "_lm_head_T"], ["logits"])
+    # Physical tying: the same full-width table feeds token Gather and final
+    # MatMul.  The compiler placed the logical output in its learned bank and
+    # cleared the const-one seed; final_norm zeroed only the pinned RMS seeds.
+    add("Transpose", ["embed_table"], ["_embed_table_T"], perm=[1, 0])
+    add("MatMul", [current_res, "_embed_table_T"], ["logits"])
 
     # Graph I/O value infos
     token_ids_vi = helper.make_tensor_value_info(

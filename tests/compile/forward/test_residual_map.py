@@ -73,6 +73,39 @@ def test_reassign():
     assert rmap.get_free_count() == 56  # unchanged
 
 
+def test_hold_bank_is_not_free_and_only_full_ordered_claim_succeeds():
+    rmap = ResidualStreamMap(16)
+    source = InputNode("source", 4, value_range=(-10.0, 10.0))
+    target = InputNode("target", 4, value_range=(-10.0, 10.0))
+    bank = rmap.allocate(source)
+    free_before = rmap.get_free_count()
+
+    assert rmap.hold(source) == bank
+    assert not rmap.is_allocated(source)
+    assert rmap.get_free_count() == free_before
+
+    other = InputNode("other", free_before, value_range=(-10.0, 10.0))
+    assert set(rmap.allocate(other)).isdisjoint(bank)
+    with pytest.raises(AssertionError, match="complete held bank"):
+        rmap.allocate_at(target, bank[:-1] + [rmap.get_indices(other)[0]])
+
+    assert rmap.allocate_at(target, bank) == bank
+    assert rmap.get_indices(target) == bank
+    with pytest.raises(AssertionError, match="already allocated"):
+        rmap.allocate_at(target, bank)
+
+
+def test_hold_rejects_a_second_bank():
+    rmap = ResidualStreamMap(16)
+    a = InputNode("a", 3, value_range=(-10.0, 10.0))
+    b = InputNode("b", 3, value_range=(-10.0, 10.0))
+    rmap.allocate(a)
+    rmap.allocate(b)
+    rmap.hold(a)
+    with pytest.raises(AssertionError, match="another held bank"):
+        rmap.hold(b)
+
+
 def test_build_residual_assignment():
     """Build a ResidualAssignment and verify get_node_indices works."""
     rmap = ResidualStreamMap(64)

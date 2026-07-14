@@ -5,7 +5,7 @@ Compiles the 1-digit adder — a swish, ``bias=False``, ``rms_norm`` example
 with non-uniform per-layer head counts and MLP widths, so the padding path
 is genuinely exercised — converts it with ``compiler/hf/convert``, and gates:
 
-1. the derived config matches the artifact (dims, rope, untied head);
+1. the derived config matches the artifact (dims, rope, tied head);
 2. **bounded-relative logit parity + token-exact decode** against the
    ``load_onnx`` oracle, eager attention pinned.  NOT bit-exactness: the
    claim is weaker than the native converter's by design, from four
@@ -141,7 +141,7 @@ def test_config_matches_artifact(artifact_path, converted):
     assert cfg.max_position_embeddings == oracle.cache_stride
     assert cfg.rope_parameters["rope_theta"] == ROPE_BASE
     assert cfg.rope_parameters["partial_rotary_factor"] == 1.0  # full rotary
-    assert not cfg.tie_word_embeddings
+    assert cfg.tie_word_embeddings
     assert cfg.pad_token_id is None
     # The parity claims below are measured against eager attention.
     assert model.config._attn_implementation == "eager"
@@ -318,7 +318,7 @@ def _tiny_phi3_config(n_heads: int, d: int = 64, d_head: int = 16):
             "partial_rotary_factor": 0.5,
         },
         max_position_embeddings=64,
-        tie_word_embeddings=False,
+        tie_word_embeddings=True,
         bos_token_id=None,
         eos_token_id=None,
         pad_token_id=None,
@@ -453,15 +453,20 @@ def test_mlp_padding_contributes_exactly_zero():
 def test_rms_norm_is_bitexact_identity_on_real_rows(converted):
     """The pinned-constant RMSNorm survives Phi3RMSNorm bit-exactly: on real
     embedded rows (which carry the pinned constant) every norm in the
-    converted model returns its input unchanged — the forced rms is an exact
-    power of two and the uniform gain cancels it."""
+    converted model returns learned coordinates unchanged.  The final norm
+    additionally zeros only the pinned seed coordinates after computing the
+    same forced denominator."""
     model, oracle = converted
     ids = torch.tensor([_prefill_ids(oracle, "1+2\n")])
     with torch.no_grad():
         rows = model.model.embed_tokens(ids)
         l0 = model.model.layers[0]
         assert torch.equal(l0.input_layernorm(rows), rows)
-        assert torch.equal(model.model.norm(rows), rows)
+        final = model.model.norm(rows)
+        pinned = model.model.norm.weight == 0.0
+        assert pinned.any()
+        assert torch.equal(final[..., ~pinned], rows[..., ~pinned])
+        assert (final[..., pinned] == 0.0).all()
 
 
 def test_fast_tokenizer_round_trip(converted, tmp_path):
@@ -523,7 +528,7 @@ def test_fast_tokenizer_round_trip(converted, tmp_path):
 
 def test_save_load_round_trip_bit_exact(converted, tmp_path):
     """save_pretrained → from_pretrained (same eager backend) reproduces the
-    in-memory model's logits bit-exactly, with the head still untied."""
+    in-memory model's logits bit-exactly, with the head still tied."""
     from transformers import AutoModelForCausalLM, Phi3ForCausalLM
 
     model, oracle = converted
@@ -541,7 +546,7 @@ def test_save_load_round_trip_bit_exact(converted, tmp_path):
     assert torch.equal(a, b)
     assert (
         reloaded.lm_head.weight.data_ptr()
-        != reloaded.model.embed_tokens.weight.data_ptr()
+        == reloaded.model.embed_tokens.weight.data_ptr()
     )
 
 
@@ -587,13 +592,13 @@ def test_save_bundle_is_fully_stock(artifact_path, tmp_path):
 
 def _tiny_swish_graph():
     """A 2-FFN swish token graph (the test_no_bias_onnx fixture shape)."""
-    from torchwright.graph import FFN
+    from torchwright.graph import FFN, Linear
     from torchwright.ops.inout_nodes import create_embedding
 
     emb = create_embedding(vocab=list("01+") + ["\n", _BOS, _EOS, "default"])
     d = len(emb)
     g = torch.Generator().manual_seed(23)
-    out = FFN(
+    gated = FFN(
         emb,
         gate_proj=torch.randn(24, d, generator=g) * 0.2,
         gate_bias=torch.randn(24, generator=g) * 0.1,
@@ -604,6 +609,9 @@ def _tiny_swish_graph():
         activation="swish",
         name="gated",
     )
+    # Keep the logical output off the direct MLP-only tied handoff: the held
+    # bank has no same-event MLP read/cancel/write operation.
+    out = Linear(gated, torch.eye(d), name="output")
     return out, emb
 
 

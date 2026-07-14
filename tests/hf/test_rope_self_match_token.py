@@ -13,7 +13,7 @@ This pins that the migration survives export + convert on both non-in-process
 surfaces:
 
 * the reserved constant-1 column rides the embedding table's rows (the
-  token.v5 fold) and reaches the HF model as a literal 1.0 column in every
+  token.v6 fold) and reaches the HF model as a literal 1.0 column in every
   vocab row,
 * the self-match heads are full-width rotary like every other head (one global
   grid, no per-head enable), so transport stays correct and the model still
@@ -77,7 +77,7 @@ def test_hf_self_match_rotary_heads_and_const_column():
     # is full-width rotary on the one global grid; the single shared base carried
     # through the converter (there is no per-head enable).
     assert hf.config.rope_base == ROPE_BASE
-    # The const-1 column is folded into the embedding table (token.v5): at
+    # The const-1 column is folded into the embedding table (token.v6): at
     # least one residual column is a literal 1.0 in EVERY vocab row, so the
     # per-token lookup reproduces it at every position.
     emb = hf.model.embed_tokens.weight

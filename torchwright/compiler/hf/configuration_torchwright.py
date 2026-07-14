@@ -10,8 +10,8 @@ class TorchwrightConfig(PretrainedConfig):
 
     The model is a pre-norm decoder with a uniform residual width ``d``: a
     ``(vocab_size, d)`` token embedding feeds ``n_layers`` attention+MLP
-    blocks, and an untied ``(vocab_size, d)`` ``lm_head`` reads out the
-    logits. Attention is causal with ``scale=1.0`` and rotary position
+    blocks, and the same ``(vocab_size, d)`` table is tied to ``lm_head`` for
+    readout. Attention is causal with ``scale=1.0`` and rotary position
     embeddings; the MLP is ``fc2(relu(fc1(x)))``. Head count and MLP hidden
     width may vary per layer. When ``rms_norm`` is set, each sublayer input
     and the final hidden state pass through a Llama-style RMSNorm. Weights
@@ -79,7 +79,5 @@ class TorchwrightConfig(PretrainedConfig):
         kwargs.pop("hidden_size", None)
         self.num_hidden_layers = self.n_layers
         self.hidden_size = self.d
-        # The LM head is untied; keep tie_weights() from cloning it onto the
-        # input embedding.
-        kwargs.setdefault("tie_word_embeddings", False)
+        kwargs["tie_word_embeddings"] = True
         super().__init__(**kwargs)

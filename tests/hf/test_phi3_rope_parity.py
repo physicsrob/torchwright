@@ -31,7 +31,7 @@ Pinned here, at flagship geometry (``head_dim=128``, ``d_rot=64`` ⇒ factor
 * P0(c): ``Phi3Config`` accepts an explicit ``head_dim``, persists it
   through a save/load round trip, and the modeling code honors it — the
   finding that selects pad-to-per-layer-max over pad-to-``d/d_head`` in the
-  converter — and ``tie_word_embeddings=False`` keeps ``lm_head`` untied.
+  converter — with the standard tied embedding/LM-head contract.
 
 CPU-only, no artifact compile — this is a pure modeling-code probe.
 """
@@ -67,7 +67,7 @@ def _phi3_config(base: float, **overrides) -> Phi3Config:
             "partial_rotary_factor": FACTOR,
         },
         max_position_embeddings=65536,
-        tie_word_embeddings=False,
+        tie_word_embeddings=True,
         bos_token_id=None,
         eos_token_id=None,
         pad_token_id=None,
@@ -216,10 +216,9 @@ def test_head_dim_accepted_persisted_and_honored(tmp_path):
     assert out.logits.shape == (1, 3, cfg.vocab_size)
 
 
-def test_untied_lm_head():
-    """``tie_word_embeddings=False`` keeps ``lm_head`` a separate tensor —
-    the artifact's unembed is genuinely untied from its embedding."""
+def test_tied_lm_head():
+    """The stock Phi-3 tying path aliases the two parameter names."""
     from transformers.models.phi3.modeling_phi3 import Phi3ForCausalLM
 
     model = Phi3ForCausalLM(_phi3_config(10_000.0))
-    assert model.lm_head.weight.data_ptr() != model.model.embed_tokens.weight.data_ptr()
+    assert model.lm_head.weight.data_ptr() == model.model.embed_tokens.weight.data_ptr()

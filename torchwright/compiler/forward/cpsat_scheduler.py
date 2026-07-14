@@ -252,6 +252,12 @@ class BuiltModel:
     # schedulable iteration stays clean; `solve_schedule` reads these into the
     # assignment so `DirectedLayerScheduler` frees the inputs at replay.
     input_cancel_layer: Dict[int, cp_model.IntVar]
+    # Optional held-bank contract.  The source is a freeable input whose
+    # physically-cancelled columns remain unavailable until the target (the
+    # graph output) is born.  Retained here so hint validation uses the same
+    # gap-0 source semantics as the model.
+    held_source_id: Optional[int] = None
+    held_target_id: Optional[int] = None
     # The lexicographic multiplier applied to the primary objective block
     # when Costs has secondary terms (earliness/waste); 1 otherwise.
     # ObjectiveValue() // objective_scale recovers the primary value.
@@ -667,6 +673,8 @@ def build_cpsat_model(
     tighten_domains: bool = False,
     hint_layers: Optional[Dict[int, int]] = None,
     hint_cancel: Optional[Dict[int, int]] = None,
+    held_source_id: Optional[int] = None,
+    held_target_id: Optional[int] = None,
     _disabled_families: frozenset = frozenset(),
     _canonical_cancel_reps: bool = False,
     _pin_cancels: bool = True,
@@ -708,6 +716,8 @@ def build_cpsat_model(
         tighten_domains=tighten_domains,
         hint_layers=hint_layers,
         hint_cancel=hint_cancel,
+        held_source_id=held_source_id,
+        held_target_id=held_target_id,
         _disabled_families=_disabled_families,
         _canonical_cancel_reps=_canonical_cancel_reps,
         _pin_cancels=_pin_cancels,
@@ -730,6 +740,8 @@ def build_cpsat_model_from_gm(
     tighten_domains: bool = False,
     hint_layers: Optional[Dict[int, int]] = None,
     hint_cancel: Optional[Dict[int, int]] = None,
+    held_source_id: Optional[int] = None,
+    held_target_id: Optional[int] = None,
     _disabled_families: frozenset = frozenset(),
     _canonical_cancel_reps: bool = False,
     _pin_cancels: bool = True,
@@ -786,6 +798,9 @@ def build_cpsat_model_from_gm(
     if costs.alpha == 0 and costs.beta == 0 and costs.gamma == 0:
         raise ValueError("alpha=beta=gamma=0 — no objective.")
 
+    if (held_source_id is None) != (held_target_id is None):
+        raise ValueError("held_source_id and held_target_id must be supplied together")
+
     n_heads_per_layer = d // d_head
     # ``pos_encoding`` is read by the attention sublayer at (nearly) every
     # layer, so it stays resident for the whole schedule — reserve its columns
@@ -810,6 +825,21 @@ def build_cpsat_model_from_gm(
     # (a loud out-of-columns / liveness failure under width pressure, exactly
     # where DOOM-class graphs run).
     freeable_inputs = [n for n in gm.input_nodes if n is not gm.output_node]
+    held_source = None
+    held_target = None
+    if held_source_id is not None:
+        by_id = {n.node_id: n for n in gm.graph.get_all_nodes()}
+        held_source = by_id.get(held_source_id)
+        held_target = by_id.get(held_target_id)
+        if held_source not in freeable_inputs:
+            raise ValueError("held source must be a freeable graph input")
+        if held_target is not gm.output_node or held_target not in gm.schedulable:
+            raise ValueError("held target must be the schedulable graph output")
+        if len(held_source) != len(held_target):
+            raise ValueError(
+                f"held source/target width mismatch: {len(held_source)} != "
+                f"{len(held_target)}"
+            )
     reserved_residual = 1 + reserve_residual
     available_residual = d - reserved_residual
     if available_residual <= 0:
@@ -861,8 +891,16 @@ def build_cpsat_model_from_gm(
     # at its layer; is_attn[n] == 0 means it runs in MLP.
     is_attn: Dict[int, cp_model.IntVar] = {}
     static_routing: Dict[int, str] = {}
+    held_direct_handoff = (
+        held_source is not None
+        and held_target in gm.consumers_eff.get(held_source, set())
+    )
     for n in gm.schedulable:
-        if flex_routing and is_flex(n, gm):
+        if held_direct_handoff and n is held_target:
+            v = model.NewBoolVar(f"is_attn_n{n.node_id}_held_pinned")
+            model.Add(v == 1)
+            static_routing[n.node_id] = ATTN
+        elif flex_routing and is_flex(n, gm):
             v = model.NewBoolVar(f"is_attn_n{n.node_id}")
             static_routing[n.node_id] = "flex"
         else:
@@ -874,6 +912,12 @@ def build_cpsat_model_from_gm(
                 model.Add(v == 0)
             static_routing[n.node_id] = r
         is_attn[n.node_id] = v
+
+    # A direct source->target handoff must execute in attention: that sublayer
+    # reads the old source value, cancels it, and writes the target into the
+    # reclaimed bank in one event.  There is intentionally no MLP equivalent.
+    if held_direct_handoff:
+        model.Add(is_attn[held_target.node_id] == 1)
 
     # ---- Dependency constraints ----
     # Edge u->v: same-layer ok iff u is_attn AND v is mlp (i.e., NOT
@@ -910,9 +954,7 @@ def build_cpsat_model_from_gm(
     # to None here skips the whole window/parked/widening block per node,
     # exactly the family the pin replaces.
     eff_cancel_slack = (
-        None
-        if ("cancel_slack" in _disabled_families or _pin_cancels)
-        else cancel_slack
+        None if ("cancel_slack" in _disabled_families or _pin_cancels) else cancel_slack
     )
 
     # Hint-aware cancel-window widening.  Freeing a node's columns costs
@@ -1105,10 +1147,13 @@ def build_cpsat_model_from_gm(
     input_cancel_layer: Dict[int, cp_model.IntVar] = {}
     input_keep_ids: Set[int] = set()
     parked_input_by_id: Dict[int, cp_model.IntVar] = {}
+    held_input_pin_spec = None
     for n in freeable_inputs:
         cl = model.NewIntVar(0, max_layers, f"cl_in{n.node_id}")
         input_cancel_layer[n.node_id] = cl
-        model.Add(cl >= 1)  # born at layer 0; live through at least layer 0
+        is_held_source = n is held_source
+        if not is_held_source:
+            model.Add(cl >= 1)  # ordinary input lives through layer 0
         keep_forever = False
         consumer_layer_vars = []
         consumer_ids = []
@@ -1119,11 +1164,38 @@ def build_cpsat_model_from_gm(
                 break
             if c.node_id in layer_var:
                 if "cancel_consumer_lb" not in _disabled_families:
-                    model.Add(cl >= layer_var[c.node_id] + 1)
+                    if is_held_source:
+                        # Attention readers permit cancel-after-read in their
+                        # own layer; MLP readers require the following layer.
+                        # Add's free/compute-dependent term is deferred until
+                        # is_free exists below.
+                        if not isinstance(c, Add):
+                            model.Add(
+                                cl >= layer_var[c.node_id] + 1 - is_attn[c.node_id]
+                            )
+                    else:
+                        model.Add(cl >= layer_var[c.node_id] + 1)
                 consumer_layer_vars.append(layer_var[c.node_id])
                 consumer_ids.append(c.node_id)
         if keep_forever:
             input_keep_ids.add(n.node_id)
+            continue
+        if is_held_source:
+            non_add_ids = [
+                c.node_id
+                for c in gm.consumers_eff.get(n, set())
+                if c.node_id in layer_var and not isinstance(c, Add)
+            ]
+            add_ids = [
+                c.node_id
+                for c in gm.consumers_eff.get(n, set())
+                if c.node_id in layer_var and isinstance(c, Add)
+            ]
+            held_input_pin_spec = (cl, non_add_ids, add_ids)
+            # The bank is held from this physical cancel until target birth.
+            model.Add(cl <= layer_var[held_target.node_id])
+            # The held source has its own equality/window treatment below,
+            # after Add classification exists.
             continue
         if _pin_cancels:
             # Inputs have no mechanism choice (always attention-cancelled), so
@@ -1131,9 +1203,7 @@ def build_cpsat_model_from_gm(
             # posts above: max(1, layer[c] + 1) over layer-bound consumers,
             # falling back to the birth-based earliest (layer 1) when none.
             if consumer_layer_vars:
-                model.AddMaxEquality(
-                    cl, [1] + [v + 1 for v in consumer_layer_vars]
-                )
+                model.AddMaxEquality(cl, [1] + [v + 1 for v in consumer_layer_vars])
             else:
                 model.Add(cl == 1)
             continue
@@ -1230,6 +1300,23 @@ def build_cpsat_model_from_gm(
         else:
             model.Add(is_free_A == 0)
         is_free[A.node_id] = is_free_A
+
+    if held_target is not None and isinstance(held_target, Add):
+        # The output must be a fresh write into the zeroed held bank.  A free
+        # Add would reassign an addend's unrelated allocation instead.
+        model.Add(is_free[held_target.node_id] == 0)
+
+    if held_input_pin_spec is not None:
+        cl, non_add_ids, add_ids = held_input_pin_spec
+        add_exprs = [layer_var[a] + is_free[a] for a in add_ids]
+        if "cancel_consumer_lb" not in _disabled_families:
+            for expr in add_exprs:
+                model.Add(cl >= expr)
+        if _pin_cancels:
+            model.AddMaxEquality(
+                cl,
+                [0] + [layer_var[c] + 1 - is_attn[c] for c in non_add_ids] + add_exprs,
+            )
 
     # ---- Deferred Add-consumer cancel lower bounds ----
     # (See the cancel-layer section.)  The gap is `is_free[A]`: 1 for a
@@ -1524,7 +1611,11 @@ def build_cpsat_model_from_gm(
     # intermediates once they die — the whole point of the input-freeing fix.
     for n in freeable_inputs:
         cl_in = input_cancel_layer[n.node_id]
-        iv = model.NewIntervalVar(0, cl_in, cl_in, f"riv_in{n.node_id}")
+        # A held source's physical value dies at cl_in, but its columns remain
+        # unavailable to ordinary allocation until target birth.  Model that
+        # ownership gap by extending residual occupancy to layer[target].
+        rend_in = layer_var[held_target.node_id] if n is held_source else cl_in
+        iv = model.NewIntervalVar(0, rend_in, rend_in, f"riv_in{n.node_id}")
         resid_intervals.append(iv)
         resid_demands.append(len(n))
     if "residual_cumulative" not in _disabled_families and resid_intervals:
@@ -1547,7 +1638,7 @@ def build_cpsat_model_from_gm(
         elif flex_routing and is_flex(n, gm):
             attn_term.append(h * is_attn[n.node_id])
         else:
-            r = routing(n, gm, policy, d_hidden)
+            r = static_routing[n.node_id]
             if r == ATTN:
                 fixed_attn_heads += h
     total_attn_heads = model.NewIntVar(
@@ -1567,7 +1658,7 @@ def build_cpsat_model_from_gm(
         if flex_routing:
             mlp_bypass_term.append((2 * n.d_output) * is_attn[n.node_id].Not())
         else:
-            r = routing(n, gm, policy, d_hidden)
+            r = static_routing[n.node_id]
             if r == MLP:
                 fixed_mlp_bypass += 2 * n.d_output
     total_mlp_bypass = model.NewIntVar(
@@ -1619,7 +1710,14 @@ def build_cpsat_model_from_gm(
         for n in freeable_inputs:
             if n.node_id in input_keep_ids:
                 continue
-            occupancy.append(len(n) * input_cancel_layer[n.node_id])
+            occupancy.append(
+                len(n)
+                * (
+                    layer_var[held_target.node_id]
+                    if n is held_source
+                    else input_cancel_layer[n.node_id]
+                )
+            )
             max_secondary += costs.waste * len(n) * max_layers
         secondary_terms.append(costs.waste * sum(occupancy))
     objective_scale = 1
@@ -1643,6 +1741,8 @@ def build_cpsat_model_from_gm(
         available_residual=available_residual,
         n_heads_per_layer=n_heads_per_layer,
         input_cancel_layer=input_cancel_layer,
+        held_source_id=held_source_id,
+        held_target_id=held_target_id,
         objective_scale=objective_scale,
         layer_bounds=layer_bounds,
         keep_forever_ids=frozenset(keep_forever_ids),
@@ -1807,6 +1907,8 @@ def build_model_from_snapshot(
     tighten_domains: bool = False,
     hint_layers: Optional[Dict[int, int]] = None,
     hint_cancel: Optional[Dict[int, int]] = None,
+    held_source_id: Optional[int] = None,
+    held_target_id: Optional[int] = None,
     _disabled_families: frozenset = frozenset(),
     _canonical_cancel_reps: bool = False,
     _pin_cancels: bool = True,
@@ -1831,6 +1933,8 @@ def build_model_from_snapshot(
         tighten_domains=tighten_domains,
         hint_layers=hint_layers,
         hint_cancel=hint_cancel,
+        held_source_id=held_source_id,
+        held_target_id=held_target_id,
         _disabled_families=_disabled_families,
         _canonical_cancel_reps=_canonical_cancel_reps,
         _pin_cancels=_pin_cancels,
@@ -2068,9 +2172,11 @@ def _validate_hint(
                 )
             continue
         birth = (hint_layers or {}).get(nid) if in_sched else 0
-        if birth is not None and L < birth + 1:
+        min_lifetime = 0 if nid == built.held_source_id else 1
+        if birth is not None and L < birth + min_lifetime:
             violations.append(
-                f"cancel hint before birth+1: {_desc(nid)} cancel={L} " f"birth={birth}"
+                f"cancel hint before birth+{min_lifetime}: {_desc(nid)} "
+                f"cancel={L} birth={birth}"
             )
         node = all_nodes.get(nid)
         mech = (hint_cancel_mech or {}).get(nid, ATTN)
@@ -2149,6 +2255,8 @@ def solve_schedule(
     hint_routing: Optional[Dict[int, str]] = None,
     hint_cancel: Optional[Dict[int, int]] = None,
     hint_cancel_mech: Optional[Dict[int, str]] = None,
+    held_source_id: Optional[int] = None,
+    held_target_id: Optional[int] = None,
     cancel_slack: Optional[int] = 2,
     policy: Optional[SchedulingPolicy] = None,
     log_search_progress: bool = False,
@@ -2253,6 +2361,8 @@ def solve_schedule(
         tighten_domains=tighten_domains,
         hint_layers=hint_layers,
         hint_cancel=hint_cancel,
+        held_source_id=held_source_id,
+        held_target_id=held_target_id,
         _disabled_families=_disabled_families,
         _canonical_cancel_reps=_canonical_cancel_reps,
         _pin_cancels=_pin_cancels,
@@ -2287,6 +2397,8 @@ def solve_schedule_from_snapshot(
     hint_routing: Optional[Dict[int, str]] = None,
     hint_cancel: Optional[Dict[int, int]] = None,
     hint_cancel_mech: Optional[Dict[int, str]] = None,
+    held_source_id: Optional[int] = None,
+    held_target_id: Optional[int] = None,
     cancel_slack: Optional[int] = 2,
     policy: Optional[SchedulingPolicy] = None,
     log_search_progress: bool = False,
@@ -2323,6 +2435,8 @@ def solve_schedule_from_snapshot(
         tighten_domains=tighten_domains,
         hint_layers=hint_layers,
         hint_cancel=hint_cancel,
+        held_source_id=held_source_id,
+        held_target_id=held_target_id,
         _disabled_families=_disabled_families,
         _canonical_cancel_reps=_canonical_cancel_reps,
         _pin_cancels=_pin_cancels,

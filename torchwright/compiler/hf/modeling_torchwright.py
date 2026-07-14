@@ -1,5 +1,5 @@
 """PyTorch Torchwright model — a pre-norm causal decoder with rotary position
-embeddings, per-layer head and MLP widths, and an untied LM head.
+embeddings, per-layer head and MLP widths, and a tied LM head.
 
 The forward path:
 
@@ -7,7 +7,7 @@ The forward path:
     for each layer:
         h = h + attn(norm(h))                      # causal, scale=1.0, RoPE, no bias
         h = h + mlp(norm(h))                       # fc2(relu(fc1(h))), biased
-    logits = lm_head(norm(h))                      # untied, no bias
+    logits = lm_head(norm(h))                      # tied to embed_tokens, no bias
 
 ``norm`` is a Llama-style RMSNorm when ``config.rms_norm`` is set and
 ``nn.Identity`` otherwise.
@@ -340,9 +340,10 @@ class TorchwrightModel(TorchwrightPreTrainedModel):
 class TorchwrightForCausalLM(TorchwrightPreTrainedModel, GenerationMixin):
     """Torchwright decoder with a language-modeling head.
 
-    The head is untied: a separate ``(vocab_size, d)`` Linear over the final
-    hidden state, no bias.
+    The head is storage-tied to ``model.embed_tokens`` and has no bias.
     """
+
+    _tied_weights_keys = {"lm_head.weight": "model.embed_tokens.weight"}
 
     def __init__(self, config: TorchwrightConfig):
         super().__init__(config)

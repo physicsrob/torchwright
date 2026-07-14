@@ -39,7 +39,7 @@ def _tiny_model(rope_base):
     )
     model = TorchwrightForCausalLM(cfg).eval()
     # A finite, non-zero embedding table so a broken rotary path can't hide
-    # behind an all-zero residual (token.v5: const seeds ride the embedding
+    # behind an all-zero residual (token.v6: const seeds ride the embedding
     # rows; there is no separate constant_values buffer to perturb).
     with torch.no_grad():
         model.model.embed_tokens.weight.copy_(torch.randn(cfg.vocab_size, cfg.d) * 0.1)

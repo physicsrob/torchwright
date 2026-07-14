@@ -28,8 +28,8 @@ Native initializer → parameter map (ground truth: ``compiler/export.py``
 ``compile_to_onnx``; layouts confirmed against ``components/*``):
 
     embed_table              -> model.embed_tokens.weight  (vocab, d)
-                                (rows carry the folded const seeds, token.v5)
-    lm_head                  -> lm_head.weight              (vocab, d)  UNTIED
+                                (rows carry the folded const seeds, token.v6)
+                              -> lm_head.weight              (same parameter)
     rope_freq/_base/_split   -> TorchwrightConfig.rope_base (config-derived; not a param)
     l{i}_input_layernorm     -> model.layers.{i}.input_layernorm.weight          (d,)
     l{i}_post_attention_layernorm -> model.layers.{i}.post_attention_layernorm.weight (d,)
@@ -123,7 +123,7 @@ def _assert_meta_format(meta: dict) -> None:
     fmt = meta.get("format")
     assert fmt == TOKEN_META_FORMAT, (
         f"artifact meta format {fmt!r} != expected {TOKEN_META_FORMAT!r}; this "
-        f"converter reads the vanilla untied token layout — re-export the "
+        f"converter reads the tied token.v6 layout — re-export the "
         f"artifact with the current exporter."
     )
 
@@ -195,9 +195,7 @@ def build_config(
     # are never valid INPUT ids. So vocab_size (the model's output dimension) is
     # the table's row count, not the tokenizer's token count.
     embed_table = inits["embed_table"]
-    # Vanilla untied layout: embed_table is (vocab, d) — the full residual width
-    # — and the unembed is a separate (vocab, d) lm_head, so there is no
-    # d_embed / d_pos / output-gather width left to read.
+    # The physically tied table is (vocab, d), the full residual width.
     vocab_size, d = embed_table.shape
     assert (
         len(vocab) <= vocab_size
@@ -261,7 +259,7 @@ def build_config(
         d_rot=rope_d_rot,
         bos_token_id=bos_id,
         eos_token_id=eos_id,
-        tie_word_embeddings=False,
+        tie_word_embeddings=True,
         use_cache=True,
         rms_norm=rms_norm,
         rms_norm_eps=rms_norm_eps,
@@ -306,9 +304,10 @@ def build_state_dict(config, inits: Dict[str, np.ndarray]) -> Tuple[dict, set]:
         return inits[name]
 
     embed_table = take("embed_table")  # (vocab, d) — rows carry the const seeds
+    tied_weight = _t(embed_table)
     sd: dict = {
-        "model.embed_tokens.weight": _t(embed_table),
-        "lm_head.weight": _t(take("lm_head")),  # untied (vocab, d)
+        "model.embed_tokens.weight": tied_weight,
+        "lm_head.weight": tied_weight,
     }
 
     for i in range(config.n_layers):
@@ -476,7 +475,7 @@ def build_phi3_config(
         resid_pdrop=0.0,
         embd_pdrop=0.0,
         use_cache=True,
-        tie_word_embeddings=False,
+        tie_word_embeddings=True,
         bos_token_id=_resolve_token_id(vocab, bos_token, "bos"),
         eos_token_id=_resolve_token_id(vocab, eos_token, "eos"),
         # Phi3Config defaults pad_token_id=32000, which is out of range for
@@ -534,9 +533,10 @@ def build_phi3_state_dict(config, inits: Dict[str, np.ndarray]) -> Tuple[dict, s
     qkv_rows = config.num_attention_heads * d_head
     inter = int(config.intermediate_size)
 
+    tied_weight = _t(take("embed_table"))
     sd: dict = {
-        "model.embed_tokens.weight": _t(take("embed_table")),  # (vocab, d)
-        "lm_head.weight": _t(take("lm_head")),  # untied (vocab, d)
+        "model.embed_tokens.weight": tied_weight,
+        "lm_head.weight": tied_weight,
     }
 
     # One float64 √d_head, rounded per-element at the fp32 cast below.
@@ -690,10 +690,13 @@ def convert_onnx_to_hf(
         model = TorchwrightForCausalLM(config)
 
     missing, unexpected = model.load_state_dict(sd, strict=False)
-    # Untied: embed_tokens.weight and lm_head.weight are loaded as two separate
-    # tensors, so neither may be missing.
     assert not missing, f"missing params after load: {missing}"
     assert not unexpected, f"unexpected params in state dict: {unexpected}"
+
+    model.tie_weights()
+    assert (
+        model.lm_head.weight.data_ptr() == model.model.embed_tokens.weight.data_ptr()
+    ), "HF conversion failed to preserve tied embedding/lm_head storage"
 
     model = model.to(torch.float32).eval()
     return model

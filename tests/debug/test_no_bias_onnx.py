@@ -17,7 +17,7 @@ import torch
 
 from torchwright.compiler.export import compile_to_onnx, meta_path_for
 from torchwright.debug.probe import probe_compiled
-from torchwright.graph import FFN
+from torchwright.graph import FFN, Linear
 from torchwright.ops.inout_nodes import create_embedding
 from torchwright.ops.relu.linear_relu_linear import linear_relu_linear
 
@@ -67,7 +67,10 @@ def _build(machine="swish"):
             torch.randn(d, generator=g) * 0.1,
             name="ffn",
         )
-    return out, emb
+    # Token.v6 deliberately rejects a direct MLP-only tied handoff. The final
+    # identity writer preserves this fixture's FFN/bias behavior while giving
+    # the held bank an attention-routable output operation.
+    return Linear(out, torch.eye(d), name="output"), emb
 
 
 def _token_ids(emb) -> torch.Tensor:

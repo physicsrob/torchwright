@@ -423,15 +423,33 @@ recipe: re-solve with the diagnostic-only
 the end to `[layer, cancel)` for a lower bound, and compare layer
 counts); `scripts/intralayer_example_sweep.py` runs that measurement.
 
-**Self-consumer subtlety (trap #2).**  The `[layer, cancel)` accounting
-for attention-cancel is exact when a *distinct* node takes the dying
-node's columns in that attention sublayer.  It is silent on a
-width-starved graph forcing a node's own last consumer to be the only
-reuser (`Ma0 = Linear(L0)` reusing L0's columns).  The model stays
-exact; the `DirectedLayerScheduler` gains **self-consumer reuse**
-(capture→cancel→free→allocate, preserving I1/I4) to realize it, scoped
-to the directed replay only — the eager heuristic never learns it (that
-would shift every golden layer count with no production need).
+**Atomic attention batch (the replay of this occupancy).**  The
+`[layer, cancel)` accounting for attention-cancel prices the layer as
+ONE aggregate transition — all heads read the layer-entry residual and
+their deltas sum, so only `free + released ≥ allocated` matters, and no
+per-output ordering (each output allocating after releasing at most one
+input) need exist for an admitted layer (the deterministic
+counterexample: one source with two simultaneous same-layer readers,
+docs/cpsat_atomic_attention_replay_plan.md §5.1).  The
+`DirectedLayerScheduler` therefore replays the assigned attention
+sublayer **atomically**: it captures every batch member's source
+columns while all inputs are live (I4's check relocated with the
+capture site), preflights the exact head charge and the aggregate
+ordinary-column width (both provably equivalent to the model's charges
+— a failure is a model/replay contract violation and raises, never
+defers), releases every value whose assigned attention-mechanism
+cancel equals the current layer in one coalesced cancel, then places
+every output against the aggregate-freed pool.  The legacy dead-list
+promotion/leftover paths are bypassed on the directed replay (the batch
+is the single definition of the attention transition); an overdue
+attention cancel (assigned layer passed, value still allocated) is an
+assertion, not a silent reschedule.  The earlier *unary self-consumer
+reuse* (one dying input per placement, plus a within-layer retry loop)
+was an incomplete realization of the same density and has been removed.
+The eager heuristic keeps its historical promotion/leftover machinery
+unchanged (that would shift every golden layer count with no production
+need); the `optimize=0` held tied-bank handoff remains the one narrow
+heuristic-side capture→cancel→hold→claim path.
 
 ### Pinned cancel layers (production default)
 

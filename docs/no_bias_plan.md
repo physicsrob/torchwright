@@ -20,6 +20,10 @@ re-measure land at the flagship's Phase D `bias=False` flip; the
 Llama conversion is unscheduled.  Measured biased/no-bias parity and
 the D7 obligation are recorded in `numerical_noise_findings.md`.
 
+The token.v5 reference above is historical. Token export now emits only
+token.v6: one `embed_table` is tied between input and output, and the literal
+constant lane is cancelled in the final MLP update.
+
 ## Settled decisions
 
 1. **One independent flag: `bias: bool = True`** on `forward_compile`,
@@ -221,8 +225,9 @@ would silently under-report matrix occupancy in the sidecar.
 
 With `bias=False` + `rms_norm=True` on the swish machine, the ONNX
 artifact is structurally a standard Llama-style decoder — Gather →
-[norm → attn → norm → gated MLP] × L → norm → lm_head — with no bias
-tensors anywhere.
+[norm → attn → norm → gated MLP] × L → norm → tied lm_head — with no bias
+tensors anywhere. The artifact stores one `embed_table`, not a second head
+initializer.
 
 ## Numerical implications (stated upfront)
 

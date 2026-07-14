@@ -6,7 +6,13 @@ generalized 2026-07-06**: the power-of-two-`d` restriction described below was
 lifted to "any multiple of 1024 up to 16384, or any power of two" by pinning
 one or two columns per set bit of `d`'s odd factor — the user-facing contract,
 table, and mechanism live in `rms_norm_dmodel.md`; this file remains the
-original design study. The design below is what shipped, with two corrections
+original design study. **Tied-v6 correction 2026-07-13:** every pre-layer norm
+still acts as the identity on the full residual stream, but the final norm's
+gain is zero on the pinned coordinates. Its denominator sees the pins first,
+then the gain clears them before the shared embedding table is used as the
+unembed weight. The learned coordinates remain bit-exactly unchanged; there is
+no unembed mask. The design below is what shipped, with this correction and two
+earlier corrections
 recorded inline and in *Open questions*:
 
 - **The constant exponent is `q=44` by default, not 30.** The `q=30`
@@ -77,7 +83,9 @@ RMSNorm computes, per position, `rms = sqrt(mean(x^2) + eps)` then outputs
    compiled weight is reused unchanged**. The constant column(s) are seeded once
    (folded into the embedding table — see *the one unavoidable core hook*), pass
    through each norm unchanged, and are never written by any sublayer, so they
-   re-pin the RMS at every layer (including the final norm).
+   re-pin the RMS at every layer (including the final norm). In token.v6 only,
+   the final gain is subsequently set to zero at those pinned coordinates; the
+   RMS calculation still uses their energy, while its output clears them.
 
 **Insertion points (pre-norm).** Each emitter currently produces, per layer,
 `res = res + attn(res)` then `res = res + mlp(res)` with no norm
@@ -86,9 +94,9 @@ RMSNorm computes, per position, `rms = sqrt(mean(x^2) + eps)` then outputs
 each sublayer only: `res = res + attn(norm(res))`, `res = res + mlp(norm(res))`.
 The skip term stays the un-normed `res`, so the residual stream itself is never
 overwritten with normed values. A **final norm** is applied to the last hidden
-state before the unembed (an untied `lm_head` over the full residual stream,
-`export.py:1265–1266` — `res @ lm_head.T`; no output-column gather post-merge),
-matching a standard Llama-style decoder. **[LOCKED: include the final norm.]**
+state before the unembed (the tied full-width `embed_table` is transposed for
+`res @ embed_table.T`; no output-column gather or mask post-merge), matching a
+standard Llama-style decoder. **[LOCKED: include the final norm.]**
 
 ### Why the gain is necessarily large (a credibility caveat)
 
@@ -279,9 +287,10 @@ through the scheduler's real cancel heads:
 
    Bit-exact: the constant lands in a disjoint reserved column, so `gather + pos`
    equals today's `gather + pos + (zero) constant_values` (HF parity
-   `max_logit_diff == 0` is the gate). `lm_head` is built from the compact
-   real-feature table and is zero off the output columns, so the finite `2^q`
-   multiplies to 0 and never reaches the logits. Storage: HF
+   `max_logit_diff == 0` is the gate). In token.v6, the output is freshly placed
+   in the embedding's ordered learned bank and the final norm zeros the pinned
+   coordinates; the same full-width `embed_table` is then the unembed weight.
+   Therefore the finite `2^q` never reaches the logits. Storage: HF
    `embed_tokens.weight` is already dense `(vocab, d)`, so seeding adds nothing
    and the buffer is *removed*; the ONNX COO init grows by `vocab × (1 or 2)`
    nonzeros. **Atomicity:** exporter (`export.py`), converter (`convert.py`
@@ -347,7 +356,8 @@ this is *lifetime + metadata*. The split:
 - **RMSNorm, not LayerNorm** — LayerNorm subtracts the mean, which the large
   constants would dominate and which would shift every data column.
 - **The final norm reads every column, so scratch must stay finite.** Unlike the
-  unembed (`res @ lm_head.T`, which contributes only the output columns), the
+  tied unembed (`res @ embed_table.T`, whose table is zero outside learned and
+  seed columns), the
   final norm computes `mean(x²)` over **all** `d` columns — a single Inf/NaN in
   any freed/scratch column would poison `rms` and therefore *every* logit (a
   strictly broader blast radius than today; the exporter already flags the finite

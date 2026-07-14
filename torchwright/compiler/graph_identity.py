@@ -118,6 +118,8 @@ def graph_fingerprint(
     policy,
     reserve_residual: int = 0,
     bias: bool = True,
+    held_output_source: Optional[Node] = None,
+    held_output_target: Optional[Node] = None,
 ) -> str:
     """Topology + geometry + solver-knob hash for the CP-SAT schedule cache.
 
@@ -182,6 +184,16 @@ def graph_fingerprint(
     # so every existing biased-compile entry keeps hashing byte-identically.
     if not bias:
         payload["bias"] = False
+    if (held_output_source is None) != (held_output_target is None):
+        raise ValueError("held output fingerprint requires both endpoints")
+    if held_output_source is not None:
+        try:
+            payload["held_output_source"] = canon[held_output_source.node_id]
+            payload["held_output_target"] = canon[held_output_target.node_id]
+        except KeyError as exc:
+            raise ValueError(
+                "held output endpoint is not reachable from output"
+            ) from exc
     encoded = json.dumps(payload, sort_keys=True, default=str).encode("utf-8")
     return hashlib.sha256(encoded).hexdigest()
 

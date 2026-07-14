@@ -20,7 +20,10 @@ from torchwright.compiler.realization import (
 from torchwright.compiler.residual_assignment import flatten_concat_nodes
 from torchwright.compiler.forward.cpsat_scheduler import ScheduleAssignment
 from torchwright.compiler.forward.graph_analysis import GraphAnalyzer
-from torchwright.compiler.forward.residual_map import ResidualStreamMap
+from torchwright.compiler.forward.residual_map import (
+    HeldOutputLayout,
+    ResidualStreamMap,
+)
 from torchwright.compiler.forward.sibling_clusters import SiblingClusters
 from torchwright.compiler.forward.scheduling_policy import SchedulingPolicy
 from torchwright.compiler.forward.weight_writer import AttnHeadOp, MLPOp
@@ -104,6 +107,7 @@ class LayerScheduler:
         policy: Optional[SchedulingPolicy] = None,
         realization_table: Optional[RealizationTable] = None,
         bias: bool = True,
+        held_output_layout: Optional[HeldOutputLayout] = None,
     ):
         self.graph = graph
         self.d = d
@@ -132,6 +136,7 @@ class LayerScheduler:
                 all_nodes, self.policy, self.usable_hidden_slots
             )
         self.realization_table = realization_table
+        self.held_output_layout = held_output_layout
         # Eager (within-layer) freeing is always on: when a node is placed, free
         # any of its inputs that just became dead so their columns can be reused
         # *in the same layer*.  This is the within-layer column-reuse density
@@ -139,12 +144,6 @@ class LayerScheduler:
         # attention cancels + MLP cancels), so the eager schedule is both the
         # production heuristic and the CP-SAT warm-start incumbent.  See
         # ``_freshly_dead_inputs``.
-        # Within-layer retry of deferred attention compute candidates.  False
-        # for the heuristic (single order-preserving pass, historical
-        # behavior); DirectedLayerScheduler sets it True so a same-layer
-        # column handoff resolves regardless of candidate order — see the
-        # retry loop in ``_schedule_attn_sublayer``.
-        self._retry_within_layer = False
         # Why each ready node was passed over in the layer being scheduled;
         # rebuilt per pass, read only by ``_deadlock_message``.
         self._skips: List[SkipReason] = []
@@ -335,6 +334,9 @@ class LayerScheduler:
         # keyed on absolute id values and does not survive a rebuild.
         for node in sorted(all_ready, key=lambda n: n.node_id):
             if isinstance(node, Add):
+                if self._is_forced_fresh_add(node):
+                    deferred_adds.append(node)
+                    continue
                 a0, a1 = node.inputs
                 d0 = self._is_dead_for_add(a0, node, computed_nodes)
                 d1 = self._is_dead_for_add(a1, node, computed_nodes)
@@ -377,6 +379,8 @@ class LayerScheduler:
         newly_ready = self._get_ready_nodes(computed_nodes) - all_ready
         for node in newly_ready:
             if isinstance(node, Add):
+                if self._is_forced_fresh_add(node):
+                    continue  # attention pass is over; retry fresh next layer
                 a0, a1 = node.inputs
                 d0 = self._is_dead_for_add(a0, node, computed_nodes)
                 d1 = self._is_dead_for_add(a1, node, computed_nodes)
@@ -597,17 +601,138 @@ class LayerScheduler:
                 )
             )
 
+        # --- Atomic attention batch transition (directed replay) -----------
+        # The solver-assigned attention sublayer is one physical
+        # read/cancel/write event: every head reads the pre-attention
+        # residual and the deltas sum, so replay may capture every source,
+        # release every assigned cancel, then place every output — no
+        # per-output bootstrap order is required, and the residual model only
+        # guarantees the aggregate transition exists, never such an ordering
+        # (docs/cpsat_atomic_attention_replay_plan.md).  A non-None hook
+        # return is the complete release set; the legacy dead-list cancel
+        # paths are bypassed below.
+        batch_releases = self._assigned_attention_releases(
+            [node for _, node, _ in compute_candidates],
+            residual_map,
+            computed_nodes,
+        )
+        batch_sources: Optional[Dict[Node, Dict[str, List[int]]]] = None
+        if batch_releases is not None:
+            layer_label = getattr(self, "_current_layer", None)
+            # A1: capture every batch member's sources while all inputs are
+            # still allocated, before any release commits.  This is compiler
+            # invariant I4's schedule-time check relocated with the capture
+            # site — the placement loop consumes these saved captures and
+            # must not re-run the liveness lookup after a legitimate release.
+            batch_sources = {
+                node: self._capture_attn_sources(op_type, node, residual_map)
+                for op_type, node, _ in compute_candidates
+            }
+            release_cols = {
+                u: list(residual_map.get_indices(u)) for u in batch_releases
+            }
+
+            # A3: exact attention charge, before mutation.  Free-Add heads
+            # (already in heads_used) + every compute candidate's heads + the
+            # coalesced cancel, charged once over the distinct release
+            # columns.  This is equivalent to the CP-SAT attention cumulative
+            # (per-op compute charges agree exactly; the pooled column-unit
+            # cancel charge rounds to the same head count), so a
+            # model-feasible assignment can never fail here — a failure is a
+            # model/replay contract violation, never a legitimate deferral.
+            distinct_cancel_cols: Set[int] = set()
+            for cols in release_cols.values():
+                distinct_cancel_cols.update(cols)
+            compute_heads = sum(h for _, _, h in compute_candidates)
+            cancel_head_charge = (
+                len(distinct_cancel_cols) + self.d_head - 1
+            ) // self.d_head
+            if heads_used + compute_heads + cancel_head_charge > self.n_heads:
+                raise AssertionError(
+                    f"Model/replay contract violation (A3) at layer "
+                    f"{layer_label}: attention head charge {heads_used} "
+                    f"(free Adds) + {compute_heads} (compute) + "
+                    f"{cancel_head_charge} (coalesced cancel of "
+                    f"{len(distinct_cancel_cols)} cols) exceeds "
+                    f"n_heads={self.n_heads}."
+                )
+
+            # A4: aggregate residual preflight over ORDINARY columns, before
+            # mutation.  The held bank and its exact target are excluded from
+            # both sides: hold(source) does not make the bank generally free,
+            # and allocate_at(target, bank) claims the held bank without
+            # consuming ordinary columns.  The held claim is checked directly
+            # on the intended transition — the bank is already held from an
+            # earlier layer, or the held source is in this batch's release
+            # set — because can_allocate_at would false-negative here (the
+            # preflight runs before the release commits the bank to the held
+            # state).  Aggregate width suffices: the allocator takes
+            # arbitrary noncontiguous columns, so there is no fragmentation
+            # condition.
+            layout = self.held_output_layout
+            held_release_width = 0
+            if layout is not None and layout.source in release_cols:
+                held_release_width = len(release_cols[layout.source])
+            ordinary_release_width = (
+                sum(len(cols) for cols in release_cols.values()) - held_release_width
+            )
+            ordinary_demand = 0
+            for _, node, _ in compute_candidates:
+                if layout is not None and node is layout.target:
+                    bank_already_held = bool(residual_map._held)
+                    if not (bank_already_held or layout.source in release_cols):
+                        raise AssertionError(
+                            f"Model/replay contract violation (A4) at layer "
+                            f"{layer_label}: held target {node!r} is in the "
+                            f"attention batch but its bank is neither already "
+                            f"held nor released by this batch (held source "
+                            f"{layout.source!r})."
+                        )
+                else:
+                    ordinary_demand += len(node)
+            ordinary_free = residual_map.get_free_count() + ordinary_release_width
+            if ordinary_demand > ordinary_free:
+                raise AssertionError(
+                    f"Model/replay contract violation (A4) at layer "
+                    f"{layer_label}: attention batch needs {ordinary_demand} "
+                    f"ordinary residual columns but only {ordinary_free} are "
+                    f"available ({residual_map.get_free_count()} free on "
+                    f"entry + {ordinary_release_width} released)."
+                )
+
+            # Commit: the release columns join the single coalesced cancel op
+            # and ownership transitions (ordinary values become free; a held
+            # source becomes held).  A3 already covered the merged charge, so
+            # the batch always fits the remaining head budget.
+            result = try_add_cancel(sorted(distinct_cancel_cols))
+            assert result is not None, (
+                "A3 preflight passed but the coalesced cancel batch does not "
+                "fit the head budget — the two charges diverged."
+            )
+            commit_cancel(*result)
+            for u in batch_releases:
+                self._release_cancelled(u, residual_map, mech="attn")
+
         # Cancellation candidates (exclude live addends of add_into ops, and
         # dead nodes the directed replay routed to the MLP mechanism — those
-        # are cancelled in the MLP sublayer, never here).
-        cancel_candidates = [
-            n
-            for n in dead
-            if n is not self.pos_encoding
-            and n not in add_into_live_addends
-            and self._attn_cancel_eligible(n)
-        ]
-        cancel_candidates.sort(key=lambda n: (-len(n), n.node_id))  # largest first
+        # are cancelled in the MLP sublayer, never here).  Under an atomic
+        # batch the list stays EMPTY: the batch is the single definition of
+        # the attention transition, so the placement-time cancel promotion
+        # and the end-of-sublayer leftover loop below never run — a value
+        # dead at layer entry is already in the batch's release set, and
+        # re-processing it here would double-charge or KeyError on its freed
+        # columns.
+        if batch_releases is None:
+            cancel_candidates = [
+                n
+                for n in dead
+                if n is not self.pos_encoding
+                and n not in add_into_live_addends
+                and self._attn_cancel_eligible(n)
+            ]
+            cancel_candidates.sort(key=lambda n: (-len(n), n.node_id))  # largest first
+        else:
+            cancel_candidates = []
 
         # 2b-2d. Schedule compute ops with cancellation promotion
         def _try_place(op_type, node, n_heads_needed) -> bool:
@@ -641,33 +766,19 @@ class LayerScheduler:
 
             # Capture source columns at schedule time, BEFORE allocating this
             # op's target.  The weight-writer reads sources from the op
-            # directly, so later free()s (eager freeing, or the self-consumer
-            # reuse below) don't orphan the lookups.  ``_require_live`` runs
-            # here while every input is still allocated (I4), so the capture
-            # also holds when a dying input is freed and its own columns are
-            # reused for this op's output.
-            sources: dict = {}
-            if op_type == "compute_linear":
-                self._require_live(
-                    node.inputs[0],
-                    residual_map,
-                    f"compute_linear input for {node!r}",
-                )
-                sources["source_cols"] = residual_map.resolve_indices(node.inputs[0])
-            elif op_type == "compute_attn":
-                q_in, k_in, v_in = node.inputs
-                self._require_live(q_in, residual_map, f"compute_attn Q for {node!r}")
-                self._require_live(k_in, residual_map, f"compute_attn K for {node!r}")
-                self._require_live(v_in, residual_map, f"compute_attn V for {node!r}")
-                sources["q_source_cols"] = residual_map.resolve_indices(q_in)
-                sources["k_source_cols"] = residual_map.resolve_indices(k_in)
-                sources["source_cols"] = residual_map.resolve_indices(v_in)
-            elif op_type == "compute_add":
-                a0, a1 = node.inputs
-                self._require_live(a0, residual_map, f"compute_add a0 for {node!r}")
-                self._require_live(a1, residual_map, f"compute_add a1 for {node!r}")
-                sources["source_cols"] = residual_map.resolve_indices(a0)
-                sources["source_cols_b"] = residual_map.resolve_indices(a1)
+            # directly, so later free()s (eager freeing, or the held-bank
+            # handoff below) don't orphan the lookups.  ``_require_live`` runs
+            # inside the capture while every input is still allocated (I4),
+            # so the capture also holds when a dying input is freed and its
+            # own columns are reused for this op's output.  Under an atomic
+            # batch the capture already happened before the batch's releases
+            # committed — consume it; re-running the liveness lookup on a
+            # legitimately released input would be a wrong duplicate.
+            sources = (
+                batch_sources[node]
+                if batch_sources is not None
+                else self._capture_attn_sources(op_type, node, residual_map)
+            )
 
             target_cols = self._try_allocate(node, residual_map)
 
@@ -688,18 +799,18 @@ class LayerScheduler:
                     break
                 cancel_candidates.pop(0)
                 commit_cancel(additions, delta)
-                residual_map.free(cn)
+                self._release_cancelled(cn, residual_map, mech="attn")
                 target_cols = self._try_allocate(node, residual_map)
 
-            # Self-consumer reuse (directed replay only): placing ``node`` may
-            # make one of its OWN inputs dead (node is that input's last
-            # consumer).  The solver schedules that input's cancel at this layer
-            # (gap-0 intra-layer reuse), but it is not dead until node places —
-            # the chicken-and-egg the promotion path above cannot break.  Cancel
-            # and free the dying input now (its value was captured for node's
-            # source above), then allocate node's target from the freed pool.
-            # Order — capture, cancel, free, allocate — keeps I1 (free precedes
-            # allocate) and I4 (require_live ran while the input was live).
+            # Held-bank handoff (heuristic only): placing ``node`` may make
+            # the registered tied source dead (node is its last consumer).
+            # Cancel and hold the dying source now (its value was captured
+            # for node's source above), then claim the held bank for node's
+            # own output.  Order — capture, cancel, hold, allocate — keeps I1
+            # (release precedes allocate) and I4 (require_live ran while the
+            # source was live).  Inert on the directed replay: the atomic
+            # batch already released everything assigned here, so the lookup
+            # below finds nothing allocated.
             if target_cols is None:
                 reuse = self._dying_input_to_reuse(node, residual_map, computed_nodes)
                 if reuse is not None:
@@ -708,12 +819,28 @@ class LayerScheduler:
                         additions, delta = result
                         if heads_used + n_heads_needed + delta <= self.n_heads:
                             commit_cancel(additions, delta)
-                            residual_map.free(reuse)
+                            self._release_cancelled(reuse, residual_map, mech="attn")
                             target_cols = self._try_allocate(node, residual_map)
 
             if target_cols is None:
-                # Every cancel-promotion and self-consumer-reuse escape above
-                # has been tried; the residual stream simply has no room.
+                if batch_sources is not None:
+                    # The batch preflight (A4) proved the aggregate transition
+                    # fits, so after the committed releases every directed
+                    # attention target must allocate.  Reaching this line
+                    # means the preflight and the allocator disagree — an
+                    # internal bug, never a normal deferral.
+                    raise AssertionError(
+                        f"Model/replay contract violation (post-preflight "
+                        f"allocation) at layer "
+                        f"{getattr(self, '_current_layer', None)}: batch "
+                        f"member {node!r} failed to allocate "
+                        f"{len(node)} columns with "
+                        f"{residual_map.get_free_count()} free after the "
+                        f"batch released its cancels "
+                        f"(held bank: {sorted(residual_map._held) or None})."
+                    )
+                # Every cancel-promotion and held-handoff escape above has
+                # been tried; the residual stream simply has no room.
                 self._record_skip(
                     node,
                     op_type,
@@ -760,26 +887,13 @@ class LayerScheduler:
                 biased_linears.append(node)
             return True
 
-        # Single pass for the heuristic (order-preserving, identical to the
-        # historical loop).  The directed replay retries deferred candidates
-        # within the layer: a same-layer column handoff means candidate W's
-        # allocation can depend on candidate R's placement (R's placement
-        # surfaces the dying node whose columns W reuses via
-        # ``_freshly_dead_inputs``), and the sorted candidate order does not
-        # guarantee R comes before W.  The retry loop reaches a fixpoint —
-        # each pass either places a candidate or terminates.
-        pending = list(compute_candidates)
-        while pending:
-            deferred = []
-            progress = False
-            for cand in pending:
-                if _try_place(*cand):
-                    progress = True
-                else:
-                    deferred.append(cand)
-            if not progress or not self._retry_within_layer:
-                break
-            pending = deferred
+        # Single order-preserving candidate pass.  The directed replay needs
+        # no within-layer retry: every assigned same-layer attention release
+        # was committed by the atomic batch above before placement began, so
+        # no candidate's allocation depends on another candidate placing
+        # first.
+        for cand in compute_candidates:
+            _try_place(*cand)
 
         # 2e. Remaining cancellations — try to fold remaining dead cols
         # into the same batch.
@@ -790,7 +904,7 @@ class LayerScheduler:
                 continue
             additions, delta = result
             commit_cancel(additions, delta)
-            residual_map.free(cn)
+            self._release_cancelled(cn, residual_map, mech="attn")
 
         # The batched death-cancel op is emitted by the caller.  The MLP
         # sublayer does not extend it (fresh MLP allocations need no cancel
@@ -1069,7 +1183,7 @@ class LayerScheduler:
                     source_cols=cols,
                 )
             )
-            residual_map.free(node, mech="mlp")
+            self._release_cancelled(node, residual_map, mech="mlp")
 
         return mlp_ops
 
@@ -1230,19 +1344,43 @@ class LayerScheduler:
         safe."""
         return True
 
+    def _assigned_attention_releases(
+        self,
+        batch_nodes: List[Node],
+        residual_map: ResidualStreamMap,
+        computed_nodes: Set[Node],
+    ) -> Optional[List[Node]]:
+        """The complete release set of this layer's atomic attention batch,
+        or ``None`` to keep the greedy heuristic behavior.
+
+        ``batch_nodes`` are the attention compute candidates being placed
+        this layer.  A non-``None`` return makes the batch the single
+        definition of the attention transition: the shared sublayer walk
+        captures every candidate's sources, preflights the head charge and
+        residual width, commits every returned release into the one coalesced
+        cancel, and bypasses the legacy dead-list cancel paths (promotion
+        during placement and the end-of-sublayer leftover loop) for this
+        sublayer.
+
+        Base: ``None`` — the heuristic keeps its promotion/leftover
+        machinery.  ``DirectedLayerScheduler`` returns the solver-assigned
+        attention-mechanism cancels for the current layer.
+        """
+        return None
+
     def _dying_input_to_reuse(
         self, node: Node, residual_map: ResidualStreamMap, computed_nodes: Set[Node]
     ) -> Optional[Node]:
         """An input leaf of ``node`` that placing ``node`` makes dead, whose
-        columns may be cancelled+freed to allocate ``node``'s own output
-        (self-consumer intra-layer reuse).
+        columns may be cancelled+freed to allocate ``node``'s own output.
 
-        The eager heuristic never self-consumer-reuses — it would change
-        heuristic schedules and every golden layer count — so the base class
-        returns ``None``.  ``DirectedLayerScheduler`` overrides this to replay
-        the solver's gap-0 intra-layer schedules.
+        The eager heuristic does not perform ordinary self-consumer reuse; the
+        one case it supports is the registered tied-input -> output handoff
+        (``optimize=0`` replay of the held bank).  The directed replay never
+        reaches this: all its assigned same-layer releases — held source
+        included — commit through the atomic attention batch before placement.
         """
-        return None
+        return self._held_handoff_dying_source(node, residual_map, computed_nodes)
 
     def _is_dead_for_add(
         self, addend: Node, add_node: Add, computed_nodes: Set[Node]
@@ -1253,6 +1391,13 @@ class LayerScheduler:
         residual stream, so their columns can't be reused for add_into.
         """
         if addend is self.pos_encoding:
+            return False
+        if (
+            self.held_output_layout is not None
+            and addend is self.held_output_layout.source
+        ):
+            # The tied bank must pass through a physical cancel into the held
+            # state; a free Add may never inherit it through reassign().
             return False
         if isinstance(addend, Concatenate):
             return False
@@ -1295,7 +1440,11 @@ class LayerScheduler:
                 # snapshot-based lookup.  Existing dead-node cancellation
                 # also leaves them alone until a later layer, so eager-
                 # freeing must respect the same invariant.
-                continue
+                if (
+                    self.held_output_layout is None
+                    or cur is not self.held_output_layout.source
+                ):
+                    continue
             if self._get_effective_consumers(cur).issubset(computed_nodes):
                 result.append(cur)
         return result
@@ -1362,9 +1511,63 @@ class LayerScheduler:
     def _try_allocate(
         self, node: Node, residual_map: ResidualStreamMap
     ) -> Optional[List[int]]:
+        if (
+            self.held_output_layout is not None
+            and node is self.held_output_layout.target
+        ):
+            bank = self.held_output_layout.bank
+            if not residual_map.can_allocate_at(node, bank):
+                return None
+            return residual_map.allocate_at(node, bank)
         if len(node) > residual_map.get_free_count():
             return None
         return residual_map.allocate(node)
+
+    def _is_forced_fresh_add(self, node: Node) -> bool:
+        return (
+            self.held_output_layout is not None
+            and node is self.held_output_layout.target
+        )
+
+    def _release_cancelled(
+        self, node: Node, residual_map: ResidualStreamMap, *, mech: str
+    ) -> None:
+        """Apply the allocator transition after a charged physical cancel."""
+        layout = self.held_output_layout
+        if layout is not None and node is layout.source:
+            actual = tuple(residual_map.get_indices(node))
+            if actual != layout.bank:
+                raise AssertionError(
+                    f"held source {node!r} moved from bank {layout.bank} to "
+                    f"{actual} before cancellation"
+                )
+            residual_map.hold(node, mech=mech)
+            return
+        residual_map.free(node, mech=mech)
+
+    def _held_handoff_dying_source(
+        self, node: Node, residual_map: ResidualStreamMap, computed_nodes: Set[Node]
+    ) -> Optional[Node]:
+        """The tied input when ``node`` is its final attention reader/writer."""
+        layout = self.held_output_layout
+        if layout is None or node is not layout.target:
+            return None
+        source = layout.source
+        if not residual_map.is_allocated(source):
+            return None
+        leaves: List[Node] = []
+        for inp in node.inputs:
+            if isinstance(inp, Concatenate):
+                leaves.extend(flatten_concat_nodes([inp]))
+            else:
+                leaves.append(inp)
+        if source not in leaves:
+            return None
+        if not (self._get_effective_consumers(source) - {node}).issubset(
+            computed_nodes
+        ):
+            return None
+        return source
 
     def _critical_path_key(self, node: Node):
         # node_id tie-break: critical-path ties are common, and a stable
@@ -1471,6 +1674,48 @@ class LayerScheduler:
                 deferred.append(c)
         return admissible, deferred
 
+    def _capture_attn_sources(
+        self, op_type: str, node: Node, residual_map: ResidualStreamMap
+    ) -> Dict[str, List[int]]:
+        """Capture an attention compute op's source columns while every input
+        is still allocated.
+
+        Runs the I4 schedule-time liveness check (``_require_live``) at the
+        capture site and returns exactly the attributes later copied onto the
+        emitted ``AttnHeadOp`` (the weight-writer reads sources from the op,
+        never from the residual map at write time).  The heuristic calls this
+        lazily at placement; the directed replay calls it for its complete
+        attention batch before any release commits.  Either way the capture
+        happens while the inputs are live, so a later legitimate release
+        never invalidates it — callers consume the saved result and must not
+        re-run the liveness lookup afterwards.
+        """
+        sources: Dict[str, List[int]] = {}
+        if op_type == "compute_linear":
+            self._require_live(
+                node.inputs[0],
+                residual_map,
+                f"compute_linear input for {node!r}",
+            )
+            sources["source_cols"] = residual_map.resolve_indices(node.inputs[0])
+        elif op_type == "compute_attn":
+            q_in, k_in, v_in = node.inputs
+            self._require_live(q_in, residual_map, f"compute_attn Q for {node!r}")
+            self._require_live(k_in, residual_map, f"compute_attn K for {node!r}")
+            self._require_live(v_in, residual_map, f"compute_attn V for {node!r}")
+            sources["q_source_cols"] = residual_map.resolve_indices(q_in)
+            sources["k_source_cols"] = residual_map.resolve_indices(k_in)
+            sources["source_cols"] = residual_map.resolve_indices(v_in)
+        elif op_type == "compute_add":
+            a0, a1 = node.inputs
+            self._require_live(a0, residual_map, f"compute_add a0 for {node!r}")
+            self._require_live(a1, residual_map, f"compute_add a1 for {node!r}")
+            sources["source_cols"] = residual_map.resolve_indices(a0)
+            sources["source_cols_b"] = residual_map.resolve_indices(a1)
+        else:
+            raise ValueError(f"not an attention compute op: {op_type!r}")
+        return sources
+
     def _require_live(
         self,
         node: Node,
@@ -1524,10 +1769,16 @@ class DirectedLayerScheduler(LayerScheduler):
       sublayer or the MLP bypass per the realization table resolved from
       ``assignment.node_to_routing`` (the solve is the resolver).
       ``policy.local_in_attention`` is ignored.
-    - **Cancellation.** Dead-node candidates restricted to nodes with
-      ``assignment.node_to_cancel_layer[n] == current_layer``.  The
-      heuristic's eager freeing of freshly-dead inputs is suppressed,
-      so cancellation timing follows the assignment exactly.
+    - **Cancellation.** Attention-mechanism cancels replay as ONE atomic
+      batch per layer (``_assigned_attention_releases``): every value whose
+      assigned cancel layer equals the current layer is released after all
+      batch sources are captured and before any output places — matching the
+      aggregate transition the residual cumulative priced, with no
+      per-output bootstrap order.  The legacy dead-list promotion/leftover
+      paths are bypassed on this scheduler.  MLP-mechanism cancels keep the
+      sequential ``cancel_bypass`` path, restricted to their assigned layer;
+      mid-layer eager freeing is restricted to the assignment's cancel
+      timing (load-bearing for the MLP sublayer's gap-0 cancels).
 
     What it preserves (by inheriting the parent's per-layer code path):
     cancel coalescing into a single batched ``AttnHeadOp("cancel")``,
@@ -1553,6 +1804,7 @@ class DirectedLayerScheduler(LayerScheduler):
         policy: Optional[SchedulingPolicy] = None,
         realization_table: Optional[RealizationTable] = None,
         bias: bool = True,
+        held_output_layout: Optional[HeldOutputLayout] = None,
     ):
         # The directed path's resolver is the solve itself: its per-node
         # sublayer decisions (node_to_routing) resolve the table the walk
@@ -1572,13 +1824,10 @@ class DirectedLayerScheduler(LayerScheduler):
             policy=policy,
             realization_table=realization_table,
             bias=bias,
+            held_output_layout=held_output_layout,
         )
         self._assignment = assignment
         self._current_layer: int = -1
-        # Same-layer column handoffs (a cancel at the last attention
-        # consumer's own layer) make within-layer placement order matter;
-        # the retry pass in ``_schedule_attn_sublayer`` resolves it.
-        self._retry_within_layer = True
 
     def set_current_layer(self, layer: int) -> None:
         """Tell the subclass which transformer layer is being built next.
@@ -1617,6 +1866,76 @@ class DirectedLayerScheduler(LayerScheduler):
         # `[layer, cancel + 1)` residual budget the model reserved overflows.
         return False
 
+    def _assigned_attention_releases(
+        self,
+        batch_nodes: List[Node],
+        residual_map: ResidualStreamMap,
+        computed_nodes: Set[Node],
+    ) -> List[Node]:
+        """The solver-assigned attention transition for the current layer.
+
+        Returns every allocated value whose assigned cancel mechanism is
+        attention and whose assigned cancel layer EQUALS the current layer —
+        values already dead on layer entry and values that die only after
+        all batch readers run, alike.  Equality is scoped to this hook; the
+        ``<=`` in :meth:`_find_dead_nodes` survives only for MLP-cancel
+        deferral re-surfacing.  Two model bounds keep the set well-formed
+        (an implementation "defensively" handling either forbidden case
+        would be dead code hiding a model regression): free-Add addends are
+        bounded ``cancel >= layer[A] + is_free[A]``, one layer after the
+        add, so the batch never collides with the free-Add ``reassign``;
+        ordinary freeable inputs carry the uniform gap-1 bound, so any input
+        here is already dead on entry — the held source is the only input
+        the model lets die mid-attention.
+
+        Raises on an overdue attention-mechanism cancel (assigned layer
+        already passed but the value is still allocated): an assignment that
+        fit only because a cancel occurred on time is not soundly replayed
+        by delaying it, and an equality-only match would otherwise implement
+        "assert" as "silently leak the columns".  Also validates A2: every
+        uncomputed effective consumer of a released value must be in the
+        batch, or the assignment and the replay contract disagree — fail
+        before mutation.
+        """
+        n2cl = self._assignment.node_to_cancel_layer
+        graph_nodes = self.graph.get_all_nodes()
+        batch = set(batch_nodes)
+        releases: List[Node] = []
+        for node in sorted(residual_map.get_allocated_nodes(), key=lambda n: n.node_id):
+            if node not in graph_nodes:
+                continue  # compile-internal allocations (const_one) never cancel
+            cl = n2cl.get(node.node_id)
+            if cl is None or cl > self._current_layer:
+                continue
+            if not self._attn_cancel_eligible(node):
+                continue  # MLP-mechanism cancels flow through cancel_bypass
+            if cl < self._current_layer:
+                raise AssertionError(
+                    f"Model/replay contract violation (overdue cancel) at "
+                    f"layer {self._current_layer}: {node!r} was assigned an "
+                    f"attention-mechanism cancel at layer {cl} but is still "
+                    f"allocated — the batch that should have released it "
+                    f"never did, and replaying the cancel late would leak "
+                    f"the columns the model already reclaimed."
+                )
+            releases.append(node)
+        for u in releases:
+            missing = [
+                c
+                for c in self._get_effective_consumers(u) - computed_nodes
+                if c not in batch
+            ]
+            if missing:
+                raise AssertionError(
+                    f"Model/replay contract violation (A2) at layer "
+                    f"{self._current_layer}: {u!r} is assigned an "
+                    f"attention-mechanism cancel this layer, but its "
+                    f"uncomputed consumer(s) "
+                    f"{[repr(m) for m in missing[:4]]} are not in this "
+                    f"layer's attention batch."
+                )
+        return releases
+
     def _literal_needed_now(self, node: Node, computed_nodes: Set[Node]) -> bool:
         # Assignment-driven: the CP-SAT layer assignment already places each
         # constant just-in-time, and ``_get_ready_nodes`` only releases it at
@@ -1642,12 +1961,14 @@ class DirectedLayerScheduler(LayerScheduler):
             cl = n2cl.get(node.node_id)
             if cl is None or cl > self._current_layer:
                 continue
-            # A directed cancel at this layer whose last consumer ALSO runs
-            # this layer (an attention-sublayer read — the intra-layer-reuse
-            # regime) is not dead at layer start; it surfaces through
-            # ``_freshly_dead_inputs`` right after that consumer is placed.
-            # The ``<=`` above (rather than ``==``) re-surfaces a directed
-            # cancel that a full head budget deferred past its assigned layer.
+            # The ``<=`` above (rather than ``==``) no longer serves attention
+            # cancels — those flow exclusively through the atomic batch hook
+            # (``_assigned_attention_releases``: equality matching plus the
+            # overdue assertion).  It survives only for the MLP-cancel path,
+            # whose ``cancel_bypass`` still defers silently when a layer's
+            # hidden slots run out and relies on the ``<=`` to resurface the
+            # deferred node (the callers' mechanism filters keep the two
+            # paths disjoint).
             if not self._is_dead(node, computed_nodes):
                 continue
             dead.append(node)
@@ -1661,10 +1982,12 @@ class DirectedLayerScheduler(LayerScheduler):
     ) -> List[Node]:
         # Mid-layer freeing restricted to the assignment's cancel timing:
         # surface a freshly-dead input only when the solver scheduled its
-        # cancel at (or before) the current layer.  This is how a directed
-        # same-layer free-after-read (cancel == the last attention-sublayer
-        # consumer's layer) executes — the parent's walk fires right after
-        # that consumer is placed, exactly like the eager heuristic.
+        # cancel at (or before) the current layer.  On the attention side
+        # this surface is inert under the atomic batch (batch-released values
+        # are no longer allocated, and attention-mech cancels never linger
+        # past their layer); it remains load-bearing for the MLP sublayer's
+        # ``_surface_mlp_freshly_dead``, which executes the solver's gap-0
+        # MLP-mechanism cancels right after the last MLP reader places.
         n2cl = self._assignment.node_to_cancel_layer
         return [
             n
@@ -1672,34 +1995,3 @@ class DirectedLayerScheduler(LayerScheduler):
             if n2cl.get(n.node_id) is not None
             and n2cl[n.node_id] <= self._current_layer
         ]
-
-    def _dying_input_to_reuse(
-        self, node: Node, residual_map: ResidualStreamMap, computed_nodes: Set[Node]
-    ) -> Optional[Node]:
-        # Directed replay of a gap-0 self-consumer handoff: return an input
-        # leaf of ``node`` whose solver-assigned cancel is at (or before) this
-        # layer and whose only uncomputed consumer is ``node`` itself, so
-        # placing ``node`` makes it dead and its columns can be cancelled+freed
-        # for ``node``'s own output.  Graph-source leaves are excluded — they
-        # stay in the residual stream for the snapshot-based value lookup, the
-        # same invariant ``_freshly_dead_inputs`` respects.
-        n2cl = self._assignment.node_to_cancel_layer
-        leaves: List[Node] = []
-        for inp in node.inputs:
-            if isinstance(inp, Concatenate):
-                leaves.extend(flatten_concat_nodes([inp]))
-            else:
-                leaves.append(inp)
-        for leaf in leaves:
-            if leaf is self.pos_encoding:
-                continue
-            if not residual_map.is_allocated(leaf):
-                continue
-            if self.graph.is_input_node(leaf):
-                continue
-            cl = n2cl.get(leaf.node_id)
-            if cl is None or cl > self._current_layer:
-                continue
-            if (self._get_effective_consumers(leaf) - {node}).issubset(computed_nodes):
-                return leaf
-        return None

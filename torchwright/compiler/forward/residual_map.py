@@ -1,4 +1,5 @@
-from typing import Dict, List, Set
+from dataclasses import dataclass
+from typing import Dict, List, Set, Tuple
 
 from torchwright.compiler.residual_assignment import (
     ResidualAssignment,
@@ -6,6 +7,21 @@ from torchwright.compiler.residual_assignment import (
     flatten_concat_nodes,
 )
 from torchwright.graph import Node, Concatenate
+
+
+@dataclass(frozen=True)
+class HeldOutputLayout:
+    """One ordered input-bank -> output-bank ownership handoff.
+
+    ``bank`` is captured immediately after the source input is allocated and
+    is never recomputed or sorted.  Its order is semantic: coordinate ``k`` of
+    the source and target must occupy ``bank[k]`` so one token table can serve
+    as both embedding and unembedding weight.
+    """
+
+    source: Node
+    target: Node
+    bank: Tuple[int, ...]
 
 
 class ResidualStreamMap:
@@ -20,6 +36,11 @@ class ResidualStreamMap:
         self.d = d
         self._free: Set[int] = set(range(d))
         self._node_to_indices: Dict[Node, List[int]] = {}
+        # Columns that have been physically zeroed by a scheduled cancel but
+        # are deliberately unavailable to ordinary allocation until a named
+        # output claims the complete ordered bank via ``allocate_at``.  Unlike
+        # ``_reserved``, held columns are transient and contain runtime zero.
+        self._held: Set[int] = set()
         # Columns permanently withheld from the free pool: never allocated to
         # any node, never freed, for the whole compile.  The sole current user
         # is the pinned-constant RMSNorm (``_reserve_rms_norm_columns``), which
@@ -67,6 +88,70 @@ class ResidualStreamMap:
         self._free |= set(self._node_to_indices[node])
         del self._node_to_indices[node]
         self._check_invariants(f"free({node!r})")
+
+    def hold(self, node: Node, mech: str = "attn") -> List[int]:
+        """Move a cancelled node's columns into the transient held set.
+
+        The caller is responsible for emitting/charging the physical cancel
+        before calling this method.  ``mech`` mirrors :meth:`free` so the
+        warm-start tracking subclass can record the cancellation mechanism.
+        """
+        if node not in self._node_to_indices:
+            raise KeyError(f"Node {node} is not allocated")
+        if self._held:
+            raise AssertionError(
+                f"ResidualStreamMap.hold({node!r}): another held bank already "
+                f"exists at columns {sorted(self._held)[:8]}; the held-output "
+                f"layout supports exactly one bank"
+            )
+        indices = self._node_to_indices.pop(node)
+        self._held |= set(indices)
+        self._check_invariants(f"hold({node!r})")
+        return list(indices)
+
+    def can_allocate_at(self, node: Node, ordered_cols) -> bool:
+        """Whether ``node`` can claim the one complete currently-held bank."""
+        cols = list(ordered_cols)
+        return (
+            node not in self._node_to_indices
+            and len(cols) == len(node)
+            and len(set(cols)) == len(cols)
+            and bool(self._held)
+            and set(cols) == self._held
+        )
+
+    def allocate_at(self, node: Node, ordered_cols) -> List[int]:
+        """Assign ``node`` the complete held bank in the supplied order.
+
+        This is intentionally *not* a general precoloured allocator: free,
+        reserved, partially-held, or currently-owned columns are rejected.
+        """
+        cols = list(ordered_cols)
+        if node in self._node_to_indices:
+            raise AssertionError(
+                f"ResidualStreamMap.allocate_at({node!r}): node is already "
+                f"allocated at {self._node_to_indices[node]}"
+            )
+        if len(cols) != len(node):
+            raise ValueError(
+                f"ResidualStreamMap.allocate_at({node!r}): {len(cols)} columns "
+                f"for node width {len(node)}"
+            )
+        if len(set(cols)) != len(cols):
+            raise AssertionError(
+                f"ResidualStreamMap.allocate_at({node!r}): duplicate columns "
+                f"in ordered bank {cols[:8]}"
+            )
+        if set(cols) != self._held:
+            raise AssertionError(
+                f"ResidualStreamMap.allocate_at({node!r}): requested columns "
+                f"{cols[:8]} are not the complete held bank "
+                f"{sorted(self._held)[:8]}"
+            )
+        self._held.clear()
+        self._node_to_indices[node] = cols
+        self._check_invariants(f"allocate_at({node!r}, {cols[:4]}...)")
+        return list(cols)
 
     def reassign(self, old_node: Node, new_node: Node):
         if old_node not in self._node_to_indices:
@@ -136,7 +221,7 @@ class ResidualStreamMap:
         Invariants (all must hold after any successful mutation):
           1. Pairwise disjointness: no two nodes share a column.
           2. free ∩ allocated == ∅.
-          3. free ∪ allocated == {0 .. d-1}.
+          3. free ∪ allocated ∪ held ∪ reserved == {0 .. d-1}.
 
         Called at the end of every mutator (allocate/free/reassign) so a
         corrupted state is surfaced at the *source* rather than the next
@@ -178,14 +263,37 @@ class ResidualStreamMap:
                 f"reserved columns {ov[:8]} are also in the free pool. "
                 f"d={self.d}."
             )
-        total = self._free | seen.keys() | self._reserved
+        held_overlap_alloc = self._held & seen.keys()
+        if held_overlap_alloc:
+            ov = sorted(held_overlap_alloc)
+            raise AssertionError(
+                f"ResidualStreamMap invariant violated after {where}: "
+                f"held columns {ov[:8]} are also allocated "
+                f"(e.g. { {c: repr(seen[c]) for c in ov[:3]} }). d={self.d}."
+            )
+        held_overlap_free = self._held & self._free
+        if held_overlap_free:
+            ov = sorted(held_overlap_free)
+            raise AssertionError(
+                f"ResidualStreamMap invariant violated after {where}: held "
+                f"columns {ov[:8]} are also free. d={self.d}."
+            )
+        held_overlap_reserved = self._held & self._reserved
+        if held_overlap_reserved:
+            ov = sorted(held_overlap_reserved)
+            raise AssertionError(
+                f"ResidualStreamMap invariant violated after {where}: held "
+                f"columns {ov[:8]} are also reserved. d={self.d}."
+            )
+        total = self._free | seen.keys() | self._held | self._reserved
         if total != set(range(self.d)):
             missing = sorted(set(range(self.d)) - total)
             raise AssertionError(
                 f"ResidualStreamMap invariant violated after {where}: "
                 f"columns {missing[:8]} are neither free, allocated, "
                 f"nor reserved. d={self.d}, free={len(self._free)}, "
-                f"allocated={len(seen)}, reserved={len(self._reserved)}."
+                f"allocated={len(seen)}, held={len(self._held)}, "
+                f"reserved={len(self._reserved)}."
             )
 
     def build_residual_assignment(

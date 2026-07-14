@@ -127,6 +127,7 @@ class MLPOp:
         "compute_bias",
         "compute_linear_bypass",
         "cancel_bypass",
+        "clear_literal_seed",
     ]
     # None for ``cancel_bypass`` — the op zeroes a dying node's columns but is
     # not itself a graph node (like the attention ``cancel``, which is outside
@@ -221,6 +222,8 @@ def write_mlp_sublayer(
             )
         elif op.op_type == "cancel_bypass":
             _write_cancel_bypass(layer.mlp, op, recorder, bias_fold)
+        elif op.op_type == "clear_literal_seed":
+            _write_clear_literal_seed(layer.mlp, op, bias_fold)
         else:
             raise ValueError(f"Unknown mlp op_type: {op.op_type}")
 
@@ -1113,6 +1116,33 @@ def _write_compute_bias(mlp, op: MLPOp, bias_fold: Optional[BiasFold] = None):
     cols_t = torch.as_tensor(op.target_cols, dtype=torch.long)
     target_dtype = out_lin.output_bias.dtype
     out_lin.output_bias[cols_t] += node.output_bias.to(target_dtype)
+
+
+def _write_clear_literal_seed(mlp, op: MLPOp, bias_fold: Optional[BiasFold] = None):
+    """Cancel a compiler-internal literal in the final MLP residual update.
+
+    The literal remains live through final attention (self-match heads read
+    it), then this additive ``-value`` makes its post-MLP residual coordinate
+    exact zero.  Under ``bias=False`` the already-reserved constant lane emits
+    the same delta, so no new hidden slot or scheduling decision is required.
+    """
+    node = op.node
+    assert isinstance(node, LiteralValue)
+    assert len(op.target_cols) == node.value.numel()
+    values = -node.value
+    out_lin = _mlp_in_out(mlp)[1]
+    if bias_fold is not None:
+        bias_fold.out_bias(
+            out_lin,
+            op.target_cols,
+            values,
+            node=node,
+            op_type=op.op_type,
+            accumulate=True,
+        )
+        return
+    cols_t = torch.as_tensor(op.target_cols, dtype=torch.long)
+    out_lin.output_bias[cols_t] += values.to(out_lin.output_bias.dtype)
 
 
 def _write_bypass_lane_pair(

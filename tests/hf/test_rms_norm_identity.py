@@ -7,9 +7,9 @@ both with the RMSNorm forced on and with it off, and asserts:
   with and without the norm — i.e. the emitted RMSNorm is exactly the identity,
   including through the scheduler's cancel heads, on the squaring-path
   expressions whose energy broke the original q=30 setting; and
-* the converted HF model carries the norm as Llama3-named ``weight`` parameters
-  (``input_layernorm`` / ``post_attention_layernorm`` / ``model.norm``), each a
-  uniform power-of-two gain, while the norm-off model carries none.
+* the converted HF model carries Llama3-named norm weights; transformer-layer
+  gains are uniform powers of two, while the final gain zeros only the pinned
+  seed columns after using them in its denominator.
 
 CPU-only and deterministic, so the bar is exact-bit (see ``_hf_parity``).
 
@@ -88,15 +88,16 @@ def test_converted_model_has_llama3_norm_params(path_on):
     assert "model.norm.weight" in sd, "missing final norm"
     assert "model.layers.0.input_layernorm.weight" in sd
     assert "model.layers.0.post_attention_layernorm.weight" in sd
-    # every gain is a single power-of-two value (the cancel constant)
-    norm_keys = [
-        k for k in sd if k.endswith("layernorm.weight") or k == "model.norm.weight"
-    ]
-    gains = {round(float(sd[k].min()), 6) for k in norm_keys}
-    gains |= {round(float(sd[k].max()), 6) for k in norm_keys}
-    assert len(gains) == 1, f"gains not uniform: {gains}"
+    layer_keys = [k for k in sd if k.endswith("layernorm.weight")]
+    gains = {round(float(sd[k].min()), 6) for k in layer_keys}
+    gains |= {round(float(sd[k].max()), 6) for k in layer_keys}
+    assert len(gains) == 1, f"layer gains not uniform: {gains}"
     g = next(iter(gains))
     assert math.log2(g) == int(math.log2(g)), f"gain {g} is not a power of two"
+    final = sd["model.norm.weight"]
+    assert float(final.max()) == g
+    assert (final == 0.0).any(), "final norm must clear pinned RMS seed columns"
+    assert set(final.unique().tolist()) == {0.0, g}
 
 
 def test_norm_off_model_has_no_norm_params(path_off):
@@ -122,13 +123,14 @@ _TINY_TOKENS = [_BOS, "1", "+", "2", "\n"]
 def _compile_tiny_5120(rms_norm: bool) -> str:
     import torch
 
+    from torchwright.graph import Linear
     from torchwright.ops.inout_nodes import create_embedding
     from torchwright.ops.relu.linear_relu_linear import linear_relu_linear
 
     emb = create_embedding(vocab=_TINY_VOCAB)
     d_e = len(emb)
     g = torch.Generator().manual_seed(3)
-    out = linear_relu_linear(
+    ffn = linear_relu_linear(
         emb,
         torch.randn(24, d_e, generator=g) * 0.2,
         torch.randn(24, generator=g) * 0.1,
@@ -136,6 +138,10 @@ def _compile_tiny_5120(rms_norm: bool) -> str:
         torch.randn(d_e, generator=g) * 0.1,
         name="ffn",
     )
+    # The held-bank contract deliberately has no direct MLP
+    # read/cancel/overwrite event. Keep this RMS fixture's output behind an
+    # attention-routable identity writer.
+    out = Linear(ffn, torch.eye(d_e), name="output")
     d_dir = tempfile.mkdtemp(prefix=f"tw_rmsnorm5120_{rms_norm}_")
     art = compile_to_onnx(
         out,

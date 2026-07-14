@@ -549,3 +549,100 @@ def test_descent_valid_compile_on_width_starved_graph():
     assert net.cpsat_solve_stats is not None
     # The compile is valid and necessarily deeper than the probe horizon.
     assert len(net.layers) > cp + 1
+
+
+# ---------------------------------------------------------------------------
+# Schedule-cache commit timing (atomic-attention-replay plan §§4.5, 5.4):
+# the cache entry is written only after the directed replay and its
+# validations succeed — never between the solve and the replay.
+# ---------------------------------------------------------------------------
+
+
+def test_schedule_cache_not_written_when_replay_fails(tmp_path, monkeypatch):
+    """A successful solve whose directed replay fails must store NOTHING:
+    no future model/replay defect may turn a transient failure into a
+    persistent cached one."""
+    from torchwright.compiler.forward import compile as compile_mod
+    from torchwright.compiler.forward.compile import forward_compile
+
+    monkeypatch.setenv("TW_SCHEDULE_CACHE_DIR", str(tmp_path))
+
+    store_calls = []
+    real_store = compile_mod.store_assignment
+
+    def counting_store(*args, **kwargs):
+        store_calls.append(args)
+        return real_store(*args, **kwargs)
+
+    monkeypatch.setattr(compile_mod, "store_assignment", counting_store)
+
+    class ExplodingDirectedScheduler(compile_mod.DirectedLayerScheduler):
+        def schedule_layer(self, *args, **kwargs):
+            raise RuntimeError("injected replay failure")
+
+    monkeypatch.setattr(
+        compile_mod, "DirectedLayerScheduler", ExplodingDirectedScheduler
+    )
+
+    with pytest.raises(RuntimeError, match="injected replay failure"):
+        forward_compile(
+            output_node=_repro_graph(),
+            d=64,
+            d_head=8,
+            device="cpu",
+            verbose=False,
+            optimize=1,
+        )
+    assert store_calls == []
+    assert list(tmp_path.glob("*.json")) == []
+
+
+def test_schedule_cache_stores_once_after_replay_and_not_on_hit(
+    tmp_path, monkeypatch
+):
+    """The positive mirror: a successful non-cached solve stores exactly once
+    (after replay), and a cache hit does not store again."""
+    from torchwright.compiler.forward import compile as compile_mod
+    from torchwright.compiler.forward.compile import forward_compile
+
+    monkeypatch.setenv("TW_SCHEDULE_CACHE_DIR", str(tmp_path))
+
+    store_calls = []
+    real_store = compile_mod.store_assignment
+
+    def counting_store(*args, **kwargs):
+        store_calls.append(args)
+        return real_store(*args, **kwargs)
+
+    monkeypatch.setattr(compile_mod, "store_assignment", counting_store)
+    kw = dict(d=64, d_head=8, device="cpu", verbose=False, optimize=1)
+
+    net1 = forward_compile(output_node=_repro_graph(), **kw)
+    assert net1.cpsat_solve_stats.status_name in ("OPTIMAL", "FEASIBLE")
+    assert len(store_calls) == 1
+    assert len(list(tmp_path.glob("*.json"))) == 1
+
+    net2 = forward_compile(output_node=_repro_graph(), **kw)
+    assert net2.cpsat_solve_stats.status_name == "CACHED"
+    assert len(store_calls) == 1  # a hit is not rewritten
+
+
+def test_schedule_cache_solve_only_stores_nothing(tmp_path, monkeypatch):
+    """A ``_solve_only`` measurement run returns before the replay and no
+    longer populates the schedule cache — the deliberate behavior change of
+    moving the store past the replay (a measurement seam should not write
+    production cache state)."""
+    from torchwright.compiler.forward.compile import forward_compile
+
+    monkeypatch.setenv("TW_SCHEDULE_CACHE_DIR", str(tmp_path))
+    net = forward_compile(
+        output_node=_repro_graph(),
+        d=64,
+        d_head=8,
+        device="cpu",
+        verbose=False,
+        optimize=1,
+        _solve_only=True,
+    )
+    assert net.cpsat_assignment is not None  # the solve itself succeeded
+    assert list(tmp_path.glob("*.json")) == []

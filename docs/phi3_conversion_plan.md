@@ -81,7 +81,7 @@ Rejected alternatives, recorded so they aren't relitigated:
   config-accepts/modeling-ignores asymmetry suggests upstream would
   treat it as unsupported-by-design for Llama checkpoints.
 
-## Ground truth: what the artifact provides (token.v5)
+## Ground truth: what the artifact provides (token.v6)
 
 From `compile_to_onnx` on a swish, `bias=False`, `rms_norm` graph:
 
@@ -97,12 +97,17 @@ From `compile_to_onnx` on a swish, `bias=False`, `rms_norm` graph:
   Runtime pattern is `down(silu(gate(x)) · up(x))` — exactly Phi-3's,
   whose fused `qkv_proj` / `gate_up_proj` are plain concatenations.
 - **Norms**: `l{i}_input_layernorm`, `l{i}_post_attention_layernorm`,
-  `final_norm` — already Llama/Phi3-named, each a uniform `(d,)`
-  vector `2^m` cancelling the forced `rms = 2^m` exactly, plus a
-  shared `_rms_eps` scalar. This maps 1:1.
-- **Embedding / head**: `embed_table` (over-allocated: row count is
-  the logit width, which the compiler pads past `len(vocab)`) and an
-  untied `lm_head`.
+  `final_norm` — already Llama/Phi3-named. Per-layer gains are uniform
+  `(d,)` vectors `2^m` cancelling the forced `rms = 2^m` exactly. The
+  final gain has the same value on learned coordinates and exact zero on
+  the pinned-RMS coordinates: the denominator still sees the pins, then
+  the gain clears them before unembedding. `_rms_eps` is shared. This
+  maps 1:1.
+- **Embedding / head**: one over-allocated `embed_table` (row count is
+  the logit width, which the compiler pads past `len(vocab)`). It feeds
+  both the input `Gather` and final `MatMul`; there is no `lm_head`
+  initializer. The HF input and output parameter names alias this one
+  tensor.
 - **Meta**: `activation`, `bias`, `rms_norm(_eps)`, `rope_base`,
   `d_rot`, `d`, `d_head`, per-layer head counts, `cache_stride`,
   `vocab`, `max_seq_len`. `cache_stride` and the strided-decode slot
@@ -115,7 +120,7 @@ From `compile_to_onnx` on a swish, `bias=False`, `rms_norm` graph:
 
 | artifact | Phi-3 parameter | note |
 |---|---|---|
-| `embed_table` | `model.embed_tokens.weight` | keep padded rows; `vocab_size` = logit width |
+| `embed_table` | `model.embed_tokens.weight` and `lm_head.weight` | one tied tensor; keep padded rows; `vocab_size` = logit width |
 | `l{i}_WQᵀ · √d_head` | rows `[0, H·dh)` of `qkv_proj.weight` | the scaling fold — Q only |
 | `l{i}_WKᵀ` | rows `[H·dh, 2H·dh)` | |
 | `l{i}_WVᵀ` | rows `[2H·dh, 3H·dh)` | |
@@ -127,7 +132,9 @@ From `compile_to_onnx` on a swish, `bias=False`, `rms_norm` graph:
 | `l{i}_post_attention_layernorm` | `layers[i].post_attention_layernorm.weight` | 1:1 |
 | `final_norm` | `model.norm.weight` | 1:1 |
 | `_rms_eps` | `config.rms_norm_eps` | |
-| `lm_head` | `lm_head.weight` | `tie_word_embeddings=False` |
+
+Config sets `tie_word_embeddings=True`; conversion calls the framework's
+normal tying path and verifies storage identity after load.
 
 Config: `hidden_size = d`, heads padded to uniform (see below),
 `rope_parameters = {rope_type: "default", rope_theta: rope_base,

@@ -59,8 +59,9 @@ Remaining: **Phase 8** (`torchwright_doom` — rewire the
 DOOM call sites, full render parity, and the 42k real-log recency replay). **`main` merged in
 (`f281ee8`)**: ONNX/HF now
 run in CI (the Modal image carries `onnxruntime`/`transformers` — the runtime-parity gap is closed),
-the float-I/O headless ONNX export and the delta-transfer compile mode were removed, and the token
-export uses a vanilla untied embedding.
+the float-I/O headless ONNX export and the delta-transfer compile mode were removed. That merge's
+token export was untied; the current token.v6 format supersedes it with one table shared by input
+and output.
 
 > **RoPE** = rotary position embeddings: instead of adding a position vector to the
 > residual stream, attention rotates each query and key by an angle proportional to its
@@ -1022,7 +1023,8 @@ step on a separate `torchwright_doom` branch**, not a per-phase gate in this rep
   delta_transfer removed on `main`) flow through `_current_pos_attn_matrices` (`weight_writer.py`),
   and the host-position-table sites are in `transformer.py`, `export.py`, `modeling_torchwright.py`.
   **All line numbers here predate the `main` merge — re-grep before per-site work** (the merge
-  refactored `export.py`/`modeling_torchwright.py`, e.g. the untied embedding and removed headless
+  refactored `export.py`/`modeling_torchwright.py`, e.g. the then-untied embedding (now tied in
+  token.v6) and removed headless
   export shifted those line numbers). ✅ **Executed in Phase 5 (this branch):** the per-class rewrite
   and the host-table deletion landed; `get_prev_value` is now a module function in `attention_ops.py`,
   and `_current_pos_attn_matrices` / `graph/pos_encoding.py` no longer exist.
@@ -1045,8 +1047,9 @@ step on a separate `torchwright_doom` branch**, not a per-phase gate in this rep
   itself* unconditional — drop the per-head `rotary_width` flag.)
 - **Runtime rotation parity.** ✅ DONE (Phase 0) **and now CI-tested** — `main` (`f281ee8` merge) added
   `onnxruntime`/`transformers` to the Modal image, so the ONNX/HF rotation tests run in CI; the full
-  suite is green (`test_rope_token.py` passes the token-ONNX/HF RoPE path through the untied
-  embedding). The "add onnxruntime to the Modal image" blocking gate is resolved.
+  suite is green (`test_rope_token.py` passes the token-ONNX/HF RoPE path; that historical run used
+  the pre-v6 untied layout, while current coverage uses the tied table). The "add onnxruntime to the
+  Modal image" blocking gate is resolved.
 - **Oracle-first.** ✅ DONE (Phase 0). `Attn.compute` rotary path landed before any head migration;
   `probe_compiled` parity confirmed.
 - **Recency confirm-compile.** ✅ **DONE.** The unproven-mechanism crack is closed. `soft_blend`
