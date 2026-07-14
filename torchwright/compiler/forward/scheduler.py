@@ -59,6 +59,8 @@ class SkipReason:
     node: Node
     op_label: str  # the op that would have been emitted
     resource: str  # "attn heads" | "MLP hidden slots" | "residual columns"
+    #   | "held output bank" (the tied target waiting for its source's
+    #   columns to be cancelled into the held state)
     demand: int
     available: int  # free right now, this layer
     capacity: int  # the most a layer could ever supply
@@ -157,6 +159,10 @@ class LayerScheduler:
         if clusters is not None:
             for cluster_id in clusters.clusters:
                 self._in_flight[cluster_id] = set()
+
+        # Layer index for diagnostics.  The heuristic walk never sets it;
+        # ``DirectedLayerScheduler`` drives it via ``set_current_layer``.
+        self._current_layer: Optional[int] = None
 
     def schedule_layer(
         self, residual_map: ResidualStreamMap, computed_nodes: Set[Node]
@@ -348,7 +354,19 @@ class LayerScheduler:
                 ready.add(node)
             # else: skip unschedulable source nodes (InputNode, Embedding, etc.)
 
-        dead = self._find_dead_nodes(residual_map, computed_nodes)
+        # Layer-start deadness snapshot for the legacy attention-cancel paths
+        # (placement-time promotion and the end-of-sublayer leftover loop).
+        # Must be taken here, before the attention sublayer's free-Add
+        # placements mutate state — the attention cancel path relies on
+        # layer-start deadness to never see a keep-forever node (see
+        # ``_is_keep_forever``).  The directed replay never consumes it (its
+        # atomic batch is the single definition of the attention transition),
+        # so it skips the O(allocated x consumers) scan.
+        dead = (
+            []
+            if self._uses_atomic_attention_batch()
+            else self._find_dead_nodes(residual_map, computed_nodes)
+        )
 
         had_schedulable = bool(ready) or bool(free_adds) or bool(deferred_adds)
 
@@ -618,7 +636,7 @@ class LayerScheduler:
         )
         batch_sources: Optional[Dict[Node, Dict[str, List[int]]]] = None
         if batch_releases is not None:
-            layer_label = getattr(self, "_current_layer", None)
+            layer_label = self._current_layer
             # A1: capture every batch member's sources while all inputs are
             # still allocated, before any release commits.  This is compiler
             # invariant I4's schedule-time check relocated with the capture
@@ -679,7 +697,7 @@ class LayerScheduler:
             ordinary_demand = 0
             for _, node, _ in compute_candidates:
                 if layout is not None and node is layout.target:
-                    bank_already_held = bool(residual_map._held)
+                    bank_already_held = residual_map.has_held()
                     if not (bank_already_held or layout.source in release_cols):
                         raise AssertionError(
                             f"Model/replay contract violation (A4) at layer "
@@ -842,13 +860,29 @@ class LayerScheduler:
                     raise AssertionError(
                         f"Model/replay contract violation (post-preflight "
                         f"allocation) at layer "
-                        f"{getattr(self, '_current_layer', None)}: batch "
+                        f"{self._current_layer}: batch "
                         f"member {node!r} failed to allocate "
                         f"{len(node)} columns with "
                         f"{residual_map.get_free_count()} free after the "
                         f"batch released its cancels "
-                        f"(held bank: {sorted(residual_map._held) or None})."
+                        f"(held bank: {residual_map.held_columns() or None})."
                     )
+                layout = self.held_output_layout
+                if layout is not None and node is layout.target:
+                    # The held target allocates only via the complete held
+                    # bank (``can_allocate_at``), so this failure means the
+                    # bank is not yet held — the tied source is still live.
+                    # Free ordinary columns are irrelevant; reporting them
+                    # would claim demand <= available on a skipped node.
+                    self._record_skip(
+                        node,
+                        op_type,
+                        "held output bank",
+                        len(node),
+                        0,
+                        len(layout.bank),
+                    )
+                    return False
                 # Every cancel-promotion and held-handoff escape above has
                 # been tried; the residual stream simply has no room.
                 self._record_skip(
@@ -1392,6 +1426,16 @@ class LayerScheduler:
         """
         return None
 
+    def _uses_atomic_attention_batch(self) -> bool:
+        """Static companion of :meth:`_assigned_attention_releases`.
+
+        ``True`` promises that hook always returns a batch (never ``None``),
+        so the layer-start dead-list snapshot in ``_schedule_layer_inner``
+        is never consumed and may be skipped.  Base: ``False``.
+        ``DirectedLayerScheduler``: ``True``.
+        """
+        return False
+
     def _dying_input_to_reuse(
         self, node: Node, residual_map: ResidualStreamMap, computed_nodes: Set[Node]
     ) -> Optional[Node]:
@@ -1579,13 +1623,7 @@ class LayerScheduler:
         source = layout.source
         if not residual_map.is_allocated(source):
             return None
-        leaves: List[Node] = []
-        for inp in node.inputs:
-            if isinstance(inp, Concatenate):
-                leaves.extend(flatten_concat_nodes([inp]))
-            else:
-                leaves.append(inp)
-        if source not in leaves:
+        if source not in flatten_concat_nodes(list(node.inputs)):
             return None
         if not (self._get_effective_consumers(source) - {node}).issubset(
             computed_nodes
@@ -1830,6 +1868,21 @@ class DirectedLayerScheduler(LayerScheduler):
         bias: bool = True,
         held_output_layout: Optional[HeldOutputLayout] = None,
     ):
+        # The CP-SAT model does not represent the sibling-cluster admission
+        # constraint (docs/cpsat_scheduler.md §3 Model preconditions), so a
+        # replay under admission gating could defer a batch member AFTER the
+        # atomic attention batch committed its releases — stranding a node
+        # whose inputs were already cancelled.  forward_compile rejects the
+        # combination up front; reject it here too so direct construction
+        # (tests, tooling) cannot reach that state.
+        if clusters is not None:
+            raise ValueError(
+                "DirectedLayerScheduler does not support sibling-cluster "
+                "admission control (clusters): the CP-SAT model has no "
+                "admission constraint, so the directed replay must run "
+                "ungated.  Pass clusters=None (use the heuristic "
+                "LayerScheduler for admission-controlled schedules)."
+            )
         # The directed path's resolver is the solve itself: its per-node
         # sublayer decisions (node_to_routing) resolve the table the walk
         # reads.  policy.local_in_attention plays no part here.
@@ -1959,6 +2012,11 @@ class DirectedLayerScheduler(LayerScheduler):
                     f"layer's attention batch."
                 )
         return releases
+
+    def _uses_atomic_attention_batch(self) -> bool:
+        # _assigned_attention_releases above always returns a list, so the
+        # layer-start dead-list snapshot is never consumed on this scheduler.
+        return True
 
     def _literal_needed_now(self, node: Node, computed_nodes: Set[Node]) -> bool:
         # Assignment-driven: the CP-SAT layer assignment already places each

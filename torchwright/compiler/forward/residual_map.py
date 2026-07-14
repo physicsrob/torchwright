@@ -183,6 +183,14 @@ class ResidualStreamMap:
     def get_free_count(self) -> int:
         return len(self._free)
 
+    def has_held(self) -> bool:
+        """Whether the one transient held bank currently exists."""
+        return bool(self._held)
+
+    def held_columns(self) -> List[int]:
+        """Sorted columns of the transient held bank (empty when none)."""
+        return sorted(self._held)
+
     def get_allocated_nodes(self) -> Set[Node]:
         return set(self._node_to_indices.keys())
 

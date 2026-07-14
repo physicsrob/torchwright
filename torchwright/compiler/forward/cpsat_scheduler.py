@@ -904,6 +904,10 @@ def build_cpsat_model_from_gm(
     )
     for n in gm.schedulable:
         if held_direct_handoff and n is held_target:
+            # A direct source->target handoff must execute in attention:
+            # that sublayer reads the old source value, cancels it, and
+            # writes the target into the reclaimed bank in one event.
+            # There is intentionally no MLP equivalent.
             v = model.NewBoolVar(f"is_attn_n{n.node_id}_held_pinned")
             model.Add(v == 1)
             static_routing[n.node_id] = ATTN
@@ -919,12 +923,6 @@ def build_cpsat_model_from_gm(
                 model.Add(v == 0)
             static_routing[n.node_id] = r
         is_attn[n.node_id] = v
-
-    # A direct source->target handoff must execute in attention: that sublayer
-    # reads the old source value, cancels it, and writes the target into the
-    # reclaimed bank in one event.  There is intentionally no MLP equivalent.
-    if held_direct_handoff:
-        model.Add(is_attn[held_target.node_id] == 1)
 
     # ---- Dependency constraints ----
     # Edge u->v: same-layer ok iff u is_attn AND v is mlp (i.e., NOT

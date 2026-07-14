@@ -1539,7 +1539,6 @@ def compile_to_onnx(
                 "the token compiler contract permits exactly one reachable "
                 "Embedding, and it must be the explicit source"
             )
-            assert indices == embedding_indices
         elif isinstance(node, LiteralValue):
             # The rotary Δ=0 self-match const-1 column: an input-state
             # LiteralValue explicitly placed there by forward_compile, seeded

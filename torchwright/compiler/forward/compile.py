@@ -355,8 +355,8 @@ class _TrackingResidualStreamMap(ResidualStreamMap):
         # directly because the tracking subclass is a different type.
         self._free = set(base._free)
         self._node_to_indices = dict(base._node_to_indices)
-        self._held = set(getattr(base, "_held", set()))
-        self._reserved = set(getattr(base, "_reserved", set()))
+        self._held = set(base._held)
+        self._reserved = set(base._reserved)
         self.current_layer: int = 0
         self.cancel_layer: dict[int, int] = {}
         # Which sublayer each free ran in ("attn"/"mlp"), captured alongside
@@ -1026,12 +1026,7 @@ def forward_compile(
                 f"held output layout width mismatch: source={len(held_source)}, "
                 f"target={len(output_node)}"
             )
-        direct_leaves = []
-        for inp in output_node.inputs:
-            if isinstance(inp, Concatenate):
-                direct_leaves.extend(flatten_concat_nodes([inp]))
-            else:
-                direct_leaves.append(inp)
+        direct_leaves = flatten_concat_nodes(list(output_node.inputs))
         direct_held_handoff = held_source in direct_leaves
         if direct_held_handoff:
             if isinstance(output_node, Linear):
@@ -1040,7 +1035,10 @@ def forward_compile(
                 raise ValueError(
                     "held output layout has no direct MLP handoff: target "
                     f"{output_node!r} directly reads the tied Embedding but "
-                    f"{type(output_node).__name__} is MLP-only"
+                    f"{type(output_node).__name__} is MLP-only; wrap the "
+                    f"output in an identity Linear (e.g. "
+                    f"Linear(out, torch.eye(len(out)))) to give the handoff "
+                    f"an attention-transport target"
                 )
 
     # RoPE end state (docs/rope_port_plan.md §1, Phase 5): position is a
@@ -1541,12 +1539,7 @@ def forward_compile(
                 admission_budget_fraction=admission_budget_fraction,
                 policy=policy,
                 # Fallback resolves statically, same as optimize=0.
-                realization_table=lowered.realization_table.resolve_static(
-                    graph.get_all_nodes(),
-                    policy,
-                    solver_d_hidden,
-                    forced_classes=forced_realization_classes,
-                ),
+                realization_table=static_realization_table,
                 bias=bias,
                 held_output_layout=held_output_layout,
             )
@@ -1586,12 +1579,7 @@ def forward_compile(
             admission_budget_fraction=admission_budget_fraction,
             policy=policy,
             # The static policy is the optimize=0 resolver.
-            realization_table=lowered.realization_table.resolve_static(
-                graph.get_all_nodes(),
-                policy,
-                solver_d_hidden,
-                forced_classes=forced_realization_classes,
-            ),
+            realization_table=static_realization_table,
             bias=bias,
             held_output_layout=held_output_layout,
         )
@@ -1803,9 +1791,10 @@ def forward_compile(
         _check_replay_depth(assignment, replay_birth_layer, len(net.layers))
 
     if held_output_layout is not None:
-        if residual_map._held:
+        if residual_map.has_held():
             raise AssertionError(
-                f"held output bank was never claimed: {sorted(residual_map._held)[:8]}"
+                f"held output bank was never claimed: "
+                f"{residual_map.held_columns()[:8]}"
             )
         if residual_map.is_allocated(held_output_layout.source):
             raise AssertionError(

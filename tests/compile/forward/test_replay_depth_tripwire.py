@@ -98,13 +98,7 @@ def test_tripwire_fires_on_deeper_replay(monkeypatch):
         # whole-batch last-reader validation correctly rejects that as an
         # unsound assignment before the depth tripwire can fire.  Push such
         # cancels past the new horizon (they simply never fire).
-        leaves = []
-        for inp in args[0].inputs:
-            if isinstance(inp, Concatenate):
-                leaves.extend(flatten_concat_nodes([inp]))
-            else:
-                leaves.append(inp)
-        for leaf in leaves:
+        for leaf in flatten_concat_nodes(list(args[0].inputs)):
             cl = n2cl.get(leaf.node_id)
             if cl is not None and cl <= n2l[out_id]:
                 n2cl[leaf.node_id] = n2l[out_id] + 1

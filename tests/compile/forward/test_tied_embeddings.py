@@ -654,5 +654,72 @@ def test_direct_held_handoff_shares_the_atomic_attention_batch():
     # to the free pool (d - const(1) - x(2) - out(4) = 5 free), so the bank
     # was never reported as ordinary free.
     assert list(rmap.get_indices(out)) == list(bank)
-    assert not rmap._held
+    assert not rmap.has_held()
     assert rmap.get_free_count() == d - 1 - 2 - 4
+
+
+def test_directed_scheduler_rejects_sibling_clusters():
+    """The CP-SAT model has no admission constraint, so the directed replay
+    must run ungated: an admission deferral after the atomic attention batch
+    committed its releases would strand a batch member whose inputs were
+    already cancelled.  forward_compile rejects optimize>0 with
+    admission_control=True; direct construction must be rejected too."""
+    from torchwright.compiler.forward.cpsat_scheduler import ScheduleAssignment
+    from torchwright.compiler.forward.scheduler import DirectedLayerScheduler
+    from torchwright.compiler.forward.sibling_clusters import SiblingClusters
+
+    emb = _embedding()
+    out = _identity(emb, "output")
+    asg = ScheduleAssignment(
+        node_to_layer={out.node_id: 0},
+        node_to_cancel_layer={},
+        node_to_routing={out.node_id: "attn"},
+        n_layers=1,
+    )
+    with pytest.raises(ValueError, match="admission control"):
+        DirectedLayerScheduler(
+            GraphAnalyzer(out),
+            8,
+            4,
+            None,
+            assignment=asg,
+            clusters=SiblingClusters(),
+        )
+
+
+def test_unheld_bank_skip_names_the_held_output_bank():
+    """A held target that cannot allocate because the bank is not yet held
+    is skipped for the "held output bank", not for "residual columns" —
+    the latter would report demand <= free, a self-contradictory line
+    pointing at column exhaustion when the real blocker is that the tied
+    source was never cancelled into the held state."""
+    emb = _embedding()
+    out = _identity(emb, "output")
+
+    d = 8
+    graph = GraphAnalyzer(out)
+    rmap = ResidualStreamMap(d)
+    rmap.allocate(emb)
+    computed = {emb}
+    bank = tuple(rmap.get_indices(emb))
+    layout = HeldOutputLayout(source=emb, target=out, bank=bank)
+    all_nodes = graph.get_all_nodes()
+    table = RealizationTable.build(all_nodes).resolve_static(
+        all_nodes,
+        SchedulingPolicy(),
+        usable_hidden_slots(d, True),
+        forced_classes={out.node_id: ATTN_TRANSPORT},
+    )
+    # d_head == d leaves a single attention head: the dying-source escape
+    # (cancel emb AND compute out in one layer: two heads) cannot fit, so
+    # the target is passed over with the bank still unheld.
+    sched = LayerScheduler(
+        graph, d, d, None, realization_table=table, held_output_layout=layout
+    )
+    with pytest.raises(RuntimeError, match="No progress"):
+        sched.schedule_layer(rmap, computed)
+    skips = [s for s in sched._skips if s.node is out]
+    assert skips
+    assert skips[-1].resource == "held output bank"
+    assert skips[-1].available == 0
+    assert skips[-1].capacity == len(bank)
