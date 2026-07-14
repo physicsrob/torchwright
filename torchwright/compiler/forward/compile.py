@@ -2033,7 +2033,12 @@ def forward_compile(
             assignment=assignment,
             n_heads=n_heads,
             d_hidden=d_hidden,
-            clusters=clusters,
+            # The heuristic trace above already ran under admission gating,
+            # so its assignment is admission-shaped; the directed replay of
+            # that assignment must run UNGATED (DirectedLayerScheduler
+            # rejects clusters: a gate that defers a batch member after the
+            # atomic attention batch committed its releases would strand it).
+            clusters=None,
             admission_budget_fraction=admission_budget_fraction,
             policy=policy,
             # The heuristic assignment is now the optimize=0 resolver.
@@ -2286,45 +2291,10 @@ def forward_compile(
 
     # The tied output-layout validation (held bank claimed, source retired,
     # bank order preserved, literal seed cleared) runs inside
-    # ``_build_replay_plan`` against the planner's live allocator state.
-
-    # Schedule-cache commit, deferred from the solve to here — after directed
-    # replay, the replay-depth tripwire, and the output-layout validation all
-    # passed.  Defense in depth: atomic batch replay is the correctness
-    # mechanism, but no future model/replay defect should turn a transient
-    # failed solve into a persistent cached failure.  A cache hit
-    # (status_name == "CACHED") is not rewritten; the eager fallback
-    # (assignment is None) has nothing to store; relaxed and solve-only
-    # measurement runs returned before the replay and never reach this line.
-    if (
-        use_cpsat
-        and assignment is not None
-        and net.cpsat_solve_stats is not None
-        and net.cpsat_solve_stats.status_name != "CACHED"
-    ):
-        if (
-            store_assignment(
-                schedule_fp,
-                assignment,
-                {
-                    "status_name": net.cpsat_solve_stats.status_name,
-                    "best_objective_bound": (
-                        net.cpsat_solve_stats.best_objective_bound
-                    ),
-                    "is_optimal": net.cpsat_solve_stats.is_optimal,
-                    "optimize": optimize,
-                    "d": d,
-                    "d_head": d_head,
-                    "d_hidden": d_hidden if d_hidden else d,
-                },
-                output_node=output_node,
-            )
-            and verbose
-        ):
-            print(
-                f"  CP-SAT schedule cached ({schedule_fp[:12]}...): "
-                f"n_layers={assignment.n_layers}"
-            )
+    # ``_build_replay_plan`` against the planner's live allocator state, and
+    # the schedule-cache commit above runs only after that plan build — so no
+    # model/replay defect can turn a transient failed solve into a persistent
+    # cached failure.
 
     # layer_capacity is constant per layer; avoids touching layer tensors,
     # which may have been freed by on_layer_compiled.

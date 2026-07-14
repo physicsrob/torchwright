@@ -53,6 +53,7 @@ def _compile(rms_norm: bool) -> str:
         emb,
         os.path.join(d_dir, "m.onnx"),
         d=calculator_simple.D_MODEL,
+        d_head=calculator_simple.D_HEAD,
         rms_norm=rms_norm,
     )
     return art.path

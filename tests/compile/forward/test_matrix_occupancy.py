@@ -27,7 +27,7 @@ from torchwright.compiler.export import (
 )
 from torchwright.compiler.forward.compile import forward_compile
 from torchwright.compiler.graph_identity import canonical_ids
-from torchwright.graph import Embedding
+from torchwright.graph import Embedding, Linear
 from torchwright.ops.relu.arithmetic_ops import multiply_2d
 from torchwright.ops.linear import add
 from torchwright.ops.inout_nodes import create_input
@@ -168,9 +168,13 @@ def test_onnx_sidecar_uses_explicit_attention_width(tmp_path):
         d_embed=2,
         table=torch.tensor([[1.0, 0.0], [0.0, 1.0]]),
     )
+    # token.v6: the output must be a schedulable node distinct from the tied
+    # Embedding source — the identity Linear gives the held handoff an
+    # attention-transport target without changing any value.
+    out = Linear(embedding, torch.eye(2), name="output")
     path = tmp_path / "decoupled.onnx"
     compile_to_onnx(
-        embedding,
+        out,
         embedding,
         str(path),
         d=32,
