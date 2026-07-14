@@ -813,6 +813,16 @@ class LayerScheduler:
             # below finds nothing allocated.
             if target_cols is None:
                 reuse = self._dying_input_to_reuse(node, residual_map, computed_nodes)
+                if reuse is not None and reuse in add_into_live_addends:
+                    # Same-layer cancel of an add_into live addend — excluded
+                    # on every other cancel path (the cancel-candidate and
+                    # freshly-dead filters) and forbidden by the model
+                    # (`cl >= layer[A] + is_free[A]`).  Unreachable through
+                    # schedule_layer today (a free Add consuming the source
+                    # is an ancestor of the single-output target, so the two
+                    # never share a layer-start ready set); guarded for
+                    # parity and against future placement-rule changes.
+                    reuse = None
                 if reuse is not None:
                     result = try_add_cancel(residual_map.get_indices(reuse))
                     if result is not None:
@@ -1321,10 +1331,24 @@ class LayerScheduler:
         """May this dead node be zeroed by an MLP ``cancel_bypass`` op?
 
         The eager heuristic MLP-cancels any dead node the attention batch could
-        not fit (fall-back), so the base returns True.
+        not fit (fall-back), so the base returns True — with one exception:
+        the held source.  The CP-SAT model gives inputs no MLP cancel
+        mechanism (no ``cancel_in_mlp`` var is created for freeable inputs),
+        and its held-source bound demands ``cl >= layer[c] + 1`` for MLP
+        readers, so an MLP hold at the last reader's own layer is a schedule
+        the model cannot represent — as a warm-start hint CP-SAT silently
+        drops the incumbent.  Declining here costs nothing: the MLP cancel
+        would occupy the bank through the end of its layer anyway
+        (``[layer, cancel + 1)``), so the attention hold one layer later
+        frees the bank at the same layer and only shifts which budget pays.
         ``DirectedLayerScheduler`` overrides this to MLP-cancel only the nodes
-        the solver assigned to the MLP mechanism.
+        the solver assigned to the MLP mechanism (never an input).
         """
+        if (
+            self.held_output_layout is not None
+            and node is self.held_output_layout.source
+        ):
+            return False
         return True
 
     def _mlp_cancel_defers_live_addends(self) -> bool:

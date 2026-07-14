@@ -39,8 +39,13 @@ def _width_graph():
 
 def _compile(out, **kw):
     return forward_compile(
-        d=80, d_head=80, output_node=out, device="cpu", verbose=False,
-        optimize=1, **kw,
+        d=80,
+        d_head=80,
+        output_node=out,
+        device="cpu",
+        verbose=False,
+        optimize=1,
+        **kw,
     )
 
 
@@ -58,6 +63,30 @@ def test_disabled_families_is_solve_only():
     assert relaxed.cpsat_assignment.n_layers <= sound_n
     # best_objective_bound is a certified lower bound on the sound optimum.
     assert relaxed.cpsat_solve_stats.best_objective_bound <= sound_n
+
+
+def test_add_live_addend_gap_family_is_accepted():
+    """Known optimality gap #2's diagnostic knob (docs/cpsat_scheduler.md):
+    the family name resolves (unknown names raise), the relaxed solve stays
+    solve-only, and its depth is a valid lower bound on the sound optimum.
+    The graph carries a free Add so the relaxed `layer[A]` form of the
+    Add-consumer cancel term is actually constructed."""
+    torch.manual_seed(0)
+    x = create_input("x", 4)
+    u = Linear(x, torch.randn(4, 4), torch.zeros(4), name="u")
+    w = Linear(x, torch.randn(4, 4), torch.zeros(4), name="w")
+    from torchwright.graph import Add
+
+    out = Linear(Add(w, u), torch.randn(4, 4), torch.zeros(4), name="out")
+
+    sound = _compile(out)
+    assert len(sound.layers) > 0
+    sound_n = sound.cpsat_solve_stats.objective_value
+
+    relaxed = _compile(out, _disabled_families=frozenset({"add_live_addend_gap"}))
+    assert len(relaxed.layers) == 0  # never replayed
+    assert relaxed.cpsat_assignment is not None
+    assert relaxed.cpsat_assignment.n_layers <= sound_n
 
 
 def test_relaxed_solve_never_touches_the_cache(tmp_path, monkeypatch):

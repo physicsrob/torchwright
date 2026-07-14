@@ -30,7 +30,7 @@ from torchwright.compiler.forward.cpsat_scheduler import (
     critical_path_layers,
     solve_schedule,
 )
-from torchwright.graph import Concatenate, Linear
+from torchwright.graph import Add, Concatenate, Linear
 from torchwright.ops.inout_nodes import create_input
 
 
@@ -429,6 +429,84 @@ def test_eager_warm_start_hint_is_accepted_not_dropped():
         f"solver returned {asg.n_layers} layers, worse than the accepted "
         f"hint's {hint_n} — the incumbent was silently dropped"
     )
+
+
+def test_validate_hint_flags_mlp_mechanism_on_input():
+    """Inputs have no MLP cancel mechanism in the model (no cancel_in_mlp var
+    for freeable inputs), so an MLP-mech hint on an input is a hint the model
+    cannot represent and must be flagged — the former leniency read the MLP
+    mechanism as gap-0-for-everything and stayed silent."""
+    from torchwright.compiler.forward.cpsat_scheduler import _validate_hint
+
+    torch.manual_seed(0)
+    x = create_input("x", 4)
+    y = Linear(x, torch.randn(4, 4), torch.zeros(4), name="y")
+    out = Linear(y, torch.randn(4, 4), torch.zeros(4), name="out")
+    built = build_cpsat_model(out, d=16, d_head=4, d_hidden=16, max_layers=6)
+    hint_layers = {y.node_id: 0, out.node_id: 1}
+
+    violations = _validate_hint(
+        built, hint_layers, None, {x.node_id: 1}, {x.node_id: MLP}, max_layers=6
+    )
+    assert any("MLP cancel mechanism" in v for v in violations), violations
+
+    clean = _validate_hint(
+        built, hint_layers, None, {x.node_id: 1}, {x.node_id: ATTN}, max_layers=6
+    )
+    assert clean == [], clean
+
+
+def test_validate_hint_checks_add_consumer_free_gap():
+    """The former deliberate blind spot: an Add consumer's cancel bound is
+    `layer + is_free` regardless of mechanism, and is_free is a pure function
+    of the layer assignment — so the validator derives it from the layer
+    hints.  Here w's only consumer is the Add (dead addend -> free add), so
+    u's cancel needs gap 1; the gap-0 hint used to pass silently."""
+    from torchwright.compiler.forward.cpsat_scheduler import _validate_hint
+
+    torch.manual_seed(0)
+    x = create_input("x", 4)
+    u = Linear(x, torch.randn(4, 4), torch.zeros(4), name="u")
+    w = Linear(x, torch.randn(4, 4), torch.zeros(4), name="w")
+    add = Add(w, u)
+    out = Linear(add, torch.randn(4, 4), torch.zeros(4), name="out")
+    built = build_cpsat_model(out, d=16, d_head=4, d_hidden=16, max_layers=6)
+    hint_layers = {u.node_id: 0, w.node_id: 0, add.node_id: 1, out.node_id: 2}
+
+    violations = _validate_hint(
+        built, hint_layers, None, {u.node_id: 1}, None, max_layers=6
+    )
+    assert any("consumer's layer+1" in v for v in violations), violations
+
+    clean = _validate_hint(built, hint_layers, None, {u.node_id: 2}, None, max_layers=6)
+    assert clean == [], clean
+
+
+def test_validate_hint_held_target_add_permits_gap_zero():
+    """The held target is a forced fresh compute (the model pins its is_free
+    to 0), so a gap-0 cancel of an addend at the target's own layer is legal
+    — the derivation must special-case it instead of reading the sole-consumer
+    addend as `free` and demanding gap 1."""
+    from torchwright.compiler.forward.cpsat_scheduler import _validate_hint
+
+    torch.manual_seed(0)
+    src = create_input("src", 4)
+    left = Linear(src, torch.eye(4), torch.zeros(4), name="left")
+    out = Add(left, src)
+    built = build_cpsat_model(
+        out,
+        d=16,
+        d_head=4,
+        d_hidden=16,
+        max_layers=6,
+        held_source_id=src.node_id,
+        held_target_id=out.node_id,
+    )
+    hint_layers = {left.node_id: 0, out.node_id: 1}
+    clean = _validate_hint(
+        built, hint_layers, None, {src.node_id: 1}, {src.node_id: ATTN}, max_layers=6
+    )
+    assert clean == [], clean
 
 
 def test_parked_escape_leaves_node_unfreed_and_charges_no_head():

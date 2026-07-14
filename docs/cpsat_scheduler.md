@@ -423,6 +423,25 @@ recipe: re-solve with the diagnostic-only
 the end to `[layer, cancel)` for a lower bound, and compare layer
 counts); `scripts/intralayer_example_sweep.py` runs that measurement.
 
+**Known optimality gap #2 — the live-addend gap-1 bound.**  An `Add`
+consumer bounds its addends' cancels at `layer[A] + is_free[A]`,
+unconditionally of cancel mechanism.  For the **dead** addend of a free
+add the `+1` is genuine occupancy: its columns rebirth into the Add via
+`reassign`, so the interval must run through the Add's layer.  For the
+**live** addend it is a conservatism: the value is only *read* by the
+add_into copy, and a same-layer cancel-after-read is physically the same
+transition every other attention read tolerates — but the eager
+scheduler excludes add_into live addends from same-layer cancels (the
+`add_into_live_addends` filters, honored by every cancel path including
+the held-bank handoff), and the model conservatively holds the live
+addend to the dead addend's bound to match.  Closing it would need the
+relaxed bound in the model **plus** the same-layer live-addend cancel in
+the heuristic and the directed replay — all or none.
+Bindingness-measurement recipe (same never-replay rule as gap #1):
+re-solve with the diagnostic-only
+`_disabled_families={"add_live_addend_gap"}` relaxation, which drops the
+term to `layer[A]` for a lower bound, and compare layer counts.
+
 **Atomic attention batch (the replay of this occupancy).**  The
 `[layer, cancel)` accounting for attention-cancel prices the layer as
 ONE aggregate transition — all heads read the layer-entry residual and

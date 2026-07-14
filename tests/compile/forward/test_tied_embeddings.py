@@ -3,7 +3,10 @@
 import torch
 import pytest
 
-from torchwright.compiler.forward.compile import forward_compile
+from torchwright.compiler.forward.compile import (
+    _run_heuristic_warm_start,
+    forward_compile,
+)
 from torchwright.compiler.forward.cpsat_scheduler import (
     build_cpsat_model,
     build_graph_model,
@@ -11,7 +14,19 @@ from torchwright.compiler.forward.cpsat_scheduler import (
     solve_schedule,
 )
 from torchwright.compiler.forward.cpsat_snapshot import snapshot_from_graph_model
+from torchwright.compiler.forward.graph_analysis import GraphAnalyzer
+from torchwright.compiler.forward.residual_map import (
+    HeldOutputLayout,
+    ResidualStreamMap,
+)
+from torchwright.compiler.forward.scheduler import LayerScheduler
+from torchwright.compiler.forward.scheduling_policy import SchedulingPolicy
 from torchwright.compiler.graph_identity import graph_fingerprint
+from torchwright.compiler.realization import (
+    ATTN_TRANSPORT,
+    RealizationTable,
+    usable_hidden_slots,
+)
 from torchwright.graph import Add, Concatenate, Embedding, Linear
 from torchwright.graph.ffn import FFN
 from torchwright.graph.misc import LiteralValue
@@ -160,6 +175,214 @@ def test_output_add_is_fresh_compute_not_add_into():
     assert "compute_add" in output_ops
     assert "add_into" not in output_ops
     assert _banks(net, embedding, output)[0] == _banks(net, embedding, output)[1]
+
+
+def _add_output_graph():
+    """The canonical tied Add shape: each addend's only consumer is the
+    output, so the model's E_dead for both addends is the constant 1."""
+    embedding = _embedding()
+    left = _identity(embedding, "left")
+    right = _identity(embedding, "right")
+    return embedding, Add(left, right)
+
+
+def test_add_target_held_model_is_feasible():
+    """Regression: the held-target pin `is_free == 0` posted ON TOP of the
+    is_free <=> OR(E_dead) biconditional made the model hard-INFEASIBLE for
+    any Add target with a sole-consumer addend — the canonical
+    `logits = transported_embedding + correction` shape."""
+    embedding, output = _add_output_graph()
+    asg, stats = solve_schedule(
+        output,
+        d=20,
+        d_head=4,
+        d_hidden=20,
+        max_layers=8,
+        time_budget_s=30.0,
+        held_source_id=embedding.node_id,
+        held_target_id=output.node_id,
+    )
+    assert asg is not None, (
+        f"held Add-target model has no solution (status={stats.status_name}) "
+        f"— the is_free pin contradicts the E_dead biconditional"
+    )
+
+
+def test_output_add_compiles_at_optimize_1_without_fallback():
+    """The production-path companion: an optimize>=1 tied Add compile must
+    come from a real solve, never the silent eager fallback
+    (require_solver=True turns the fallback into a hard error)."""
+    embedding, output = _add_output_graph()
+    net = forward_compile(
+        d=20,
+        d_head=4,
+        d_hidden=20,
+        output_node=output,
+        output_layout_source=embedding,
+        rms_norm=False,
+        verbose=False,
+        optimize=1,
+        require_solver=True,
+    )
+    output_ops = [e.op_type for e in net.placements.entries if e.node is output]
+    assert "compute_add" in output_ops
+    assert "add_into" not in output_ops
+    assert _banks(net, embedding, output)[0] == _banks(net, embedding, output)[1]
+
+
+def _held_warm_start_hints(output, embedding, *, d, d_head, d_hidden, max_layers=12):
+    """Run the REAL warm-start seam (`compile._run_heuristic_warm_start`) on a
+    held-layout graph, mirroring forward_compile's setup: inputs allocated in
+    node_id order, the bank captured immediately after the source allocates."""
+    graph = GraphAnalyzer(output)
+    nodes = graph.get_all_nodes()
+    input_nodes = sorted(
+        (n for n in nodes if graph.is_input_node(n)), key=lambda n: n.node_id
+    )
+    rmap = ResidualStreamMap(d)
+    for n in input_nodes:
+        rmap.allocate(n)
+    layout = HeldOutputLayout(
+        source=embedding, target=output, bank=tuple(rmap.get_indices(embedding))
+    )
+    table = RealizationTable.build(nodes).resolve_static(
+        nodes, SchedulingPolicy(), usable_hidden_slots(d_hidden, True)
+    )
+    hints = _run_heuristic_warm_start(
+        graph=graph,
+        d=d,
+        d_head=d_head,
+        pos_encoding=None,
+        d_hidden=d_hidden,
+        residual_map=rmap,
+        computed=set(input_nodes),
+        clusters=None,
+        admission_budget_fraction=0.4,
+        policy=None,
+        realization_table=table,
+        held_output_layout=layout,
+        output_node=output,
+        max_layers=max_layers,
+    )
+    return hints, layout
+
+
+def _ffn_chain_graph():
+    """The held-across-layers fixture shape: the source's last (and only)
+    reader is MLP-routed, so an MLP-mechanism hold of the source would fire
+    at the reader's own layer — a timing the model cannot represent."""
+    embedding = _embedding()
+    a = _relu_identity(embedding, "a")
+    b = _relu_identity(a, "b")
+    output = _relu_identity(b, "output")
+    return embedding, a, output
+
+
+def test_warm_start_holds_source_via_attention_at_reader_layer_plus_one():
+    """Regression (warm-start/model contract): inputs have no MLP cancel
+    mechanism in the CP-SAT model (no cancel_in_mlp var; MLP readers bound the
+    held source at cl >= layer + 1), so the heuristic must hold the tied bank
+    via an attention cancel at the last MLP reader's layer + 1 — never via an
+    MLP cancel at the reader's own layer."""
+    embedding, a, output = _ffn_chain_graph()
+    (hl, _hr, hc, hm, hint_n), _ = _held_warm_start_hints(
+        output, embedding, d=20, d_head=4, d_hidden=16
+    )
+    assert hint_n > 0, "warm start deadlocked"
+    assert hm[embedding.node_id] == "attn"
+    assert hc[embedding.node_id] == hl[a.node_id] + 1
+
+
+def test_warm_start_held_hint_is_model_feasible_knob_off():
+    """The hint the warm start emits must BE a schedule of the knob-off
+    (_pin_cancels=False) held model: hard-fix every hinted variable as an
+    equality and assert the point is feasible.  Before the fix the source's
+    MLP-mechanism gap-0 hold hard-fixed cancel[emb] below the model's
+    lower bound and this point was INFEASIBLE."""
+    from ortools.sat.python import cp_model
+
+    embedding, _a, output = _ffn_chain_graph()
+    (hl, _hr, hc, hm, hint_n), _ = _held_warm_start_hints(
+        output, embedding, d=20, d_head=4, d_hidden=16
+    )
+    assert hint_n > 0, "warm start deadlocked"
+    built = build_cpsat_model(
+        output,
+        d=20,
+        d_head=4,
+        d_hidden=16,
+        max_layers=8,
+        held_source_id=embedding.node_id,
+        held_target_id=output.node_id,
+        _pin_cancels=False,
+    )
+    # Hard-fix (mirrors test_cpsat_intralayer._hard_fix_and_solve): equality
+    # per hinted variable, then a plain feasibility solve.
+    model = built.model
+    for nid, layer in hl.items():
+        if nid in built.layer_var:
+            model.Add(built.layer_var[nid] == layer)
+    for nid, layer in hc.items():
+        if nid in built.cancel_layer:
+            model.Add(built.cancel_layer[nid] == layer)
+        elif nid in built.input_cancel_layer:
+            model.Add(built.input_cancel_layer[nid] == layer)
+    for nid, mech in hm.items():
+        if nid in built.cancel_in_mlp:
+            model.Add(built.cancel_in_mlp[nid] == (1 if mech == "mlp" else 0))
+    solver = cp_model.CpSolver()
+    solver.parameters.max_time_in_seconds = 10.0
+    solver.parameters.num_search_workers = 1
+    status = solver.StatusName(solver.Solve(model))
+    assert status in ("OPTIMAL", "FEASIBLE"), (
+        f"warm-start hint is not a schedule of the held model ({status}) — "
+        f"CP-SAT would silently drop the incumbent"
+    )
+
+
+def test_held_handoff_declines_same_layer_live_addend():
+    """Guard parity: the held handoff must honor the add_into live-addend
+    exclusion like the other same-layer cancel paths (the cancel-candidate
+    and freshly-dead filters).  This state is unreachable through
+    schedule_layer today — a free Add consuming the source is an ancestor of
+    the single-output target, so the two are never in one layer-start ready
+    set — so the attention sublayer is driven directly with the co-resident
+    state to pin the guard against future placement-rule changes."""
+    embedding = _embedding()
+    x = _identity(embedding, "x")
+    free_add = Add(x, embedding)
+    output = Linear(Concatenate([free_add, embedding]), torch.randn(8, 4), name="out")
+    graph = GraphAnalyzer(output)
+    nodes = graph.get_all_nodes()
+    rmap = ResidualStreamMap(20)
+    rmap.allocate(embedding)
+    bank = tuple(rmap.get_indices(embedding))
+    rmap.allocate(x)
+    layout = HeldOutputLayout(source=embedding, target=output, bank=bank)
+    table = RealizationTable.build(nodes).resolve_static(
+        nodes,
+        SchedulingPolicy(),
+        usable_hidden_slots(16, True),
+        forced_classes={output.node_id: ATTN_TRANSPORT},
+    )
+    sched = LayerScheduler(
+        graph,
+        20,
+        4,
+        None,
+        d_hidden=16,
+        realization_table=table,
+        held_output_layout=layout,
+    )
+    computed = {embedding, x}
+    sched._skips = []
+    sched._schedule_attn_sublayer({output}, [], [free_add], [], rmap, computed)
+    # The free Add reused x's columns with the source as its LIVE addend; the
+    # handoff must decline the same-layer hold (the target defers a layer).
+    assert free_add in computed
+    assert output not in computed
+    assert rmap.is_allocated(embedding)
+    assert not rmap._held
 
 
 def test_direct_mlp_only_target_is_rejected_before_scheduling():

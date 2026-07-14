@@ -216,6 +216,13 @@ CONSTRAINT_FAMILIES = frozenset(
         # column handoff) actually costs on a given graph.  See the derisk doc's
         # 2026-07-08 second correction.
         "mlp_cancel_occupancy",
+        # DIAGNOSTIC-ONLY relaxation (same never-replay rule): relaxes the
+        # Add-consumer cancel bound `cancel >= layer[A] + is_free[A]` to
+        # `cancel >= layer[A]`, dropping the live-addend gap-1 conservatism
+        # (known optimality gap #2 — see docs/cpsat_scheduler.md).  The
+        # resulting layer count is a valid LOWER BOUND on the sound optimum,
+        # so sound-minus-relaxed measures what the live-addend hold costs.
+        "add_live_addend_gap",
     }
 )
 
@@ -1250,6 +1257,24 @@ def build_cpsat_model_from_gm(
     for A in gm.schedulable:
         if not isinstance(A, Add):
             continue
+        if A is held_target:
+            # The output must be a fresh write into the zeroed held bank — a
+            # free Add would reassign an addend's unrelated allocation
+            # instead — and the executors always compute it fresh
+            # (LayerScheduler._is_forced_fresh_add) regardless of addend
+            # deadness.  Pin is_free to 0 WITHOUT the E_dead biconditional
+            # below: posting both would (a) go hard-INFEASIBLE whenever an
+            # addend's only consumer is this Add (E_dead is the constant 1,
+            # forcing is_free to 1 against the pin — the canonical
+            # `logits = transported_embedding + correction` shape), and
+            # (b) otherwise spuriously force every addend not-dead.  The
+            # pinned var still lands in `is_free`: every Add is indexed
+            # downstream (Add-consumer cancel bounds, residual start shift,
+            # attention head charge).
+            is_free_held = model.NewBoolVar(f"is_free_A{A.node_id}")
+            model.Add(is_free_held == 0)
+            is_free[A.node_id] = is_free_held
+            continue
         addend_dead_bools: List[cp_model.IntVar] = []
         for E in A.inputs:
             E_dead = model.NewBoolVar(f"E_dead_A{A.node_id}_E{E.node_id}")
@@ -1301,14 +1326,24 @@ def build_cpsat_model_from_gm(
             model.Add(is_free_A == 0)
         is_free[A.node_id] = is_free_A
 
-    if held_target is not None and isinstance(held_target, Add):
-        # The output must be a fresh write into the zeroed held bank.  A free
-        # Add would reassign an addend's unrelated allocation instead.
-        model.Add(is_free[held_target.node_id] == 0)
+    # Every Add-consumer cancel bound below shares one term: an Add A bounds
+    # its addends' cancels at `layer[A] + is_free[A]`.  The is_free part is a
+    # CONSERVATISM for the live addend (known optimality gap #2 — see
+    # docs/cpsat_scheduler.md): the dead addend genuinely rebirths through
+    # the Add's layer, but the live addend is only held to the same bound to
+    # match the scheduler's exclusion of add_into live addends from
+    # same-layer cancels (honored by every cancel path, held handoff
+    # included).  The diagnostic-only "add_live_addend_gap" family relaxes
+    # the term to `layer[A]` for a bindingness lower bound; a schedule solved
+    # with it disabled must NEVER be compiled/replayed.
+    def _add_consumer_cancel_expr(add_id: int):
+        if "add_live_addend_gap" in _disabled_families:
+            return layer_var[add_id]
+        return layer_var[add_id] + is_free[add_id]
 
     if held_input_pin_spec is not None:
         cl, non_add_ids, add_ids = held_input_pin_spec
-        add_exprs = [layer_var[a] + is_free[a] for a in add_ids]
+        add_exprs = [_add_consumer_cancel_expr(a) for a in add_ids]
         if "cancel_consumer_lb" not in _disabled_families:
             for expr in add_exprs:
                 model.Add(cl >= expr)
@@ -1323,13 +1358,13 @@ def build_cpsat_model_from_gm(
     # free-add — the reused addend rebirths into its dead addend's columns
     # via `reassign`, so the addend's interval must run through the Add's
     # layer for the residual handoff to stay contiguous (the live addend is
-    # conservatively held to the same bound, matching the scheduler's
-    # exclusion of add_into live addends from same-layer cancels); 0 for a
-    # compute-add — fresh columns, pre-sublayer reads, so a same-layer cancel
-    # is legal and the eager heuristic exploits it via `_freshly_dead_inputs`.
+    # conservatively held to the same bound — known optimality gap #2, see
+    # `_add_consumer_cancel_expr` above); 0 for a compute-add — fresh
+    # columns, pre-sublayer reads, so a same-layer cancel is legal and the
+    # eager heuristic exploits it via `_freshly_dead_inputs`.
     if "cancel_consumer_lb" not in _disabled_families:
         for cl, add_id in deferred_add_consumer_lbs:
-            model.Add(cl >= layer_var[add_id] + is_free[add_id])
+            model.Add(cl >= _add_consumer_cancel_expr(add_id))
 
     # ---- Pinned cancel layers (_pin_cancels, the production default) ----
     # Equality-pin each non-keep-forever cancel to its earliest legal value
@@ -1349,7 +1384,7 @@ def build_cpsat_model_from_gm(
                 # birth-based earliest.
                 model.Add(cl == birth)
                 continue
-            add_exprs = [layer_var[a] + is_free[a] for a in add_ids]
+            add_exprs = [_add_consumer_cancel_expr(a) for a in add_ids]
             pin_attn = model.NewIntVar(1, max_layers, f"pin_attn_n{nid}")
             model.AddMaxEquality(
                 pin_attn,
@@ -2148,6 +2183,48 @@ def _validate_hint(
                 f"{_desc(nid)} hint={route}"
             )
 
+    def _hinted_add_is_free(A: Add) -> Optional[bool]:
+        """Mirror the model's is_free derivation on the LAYER hints: is_free
+        is the OR over addends E of "E dead at A" — every consumer of E other
+        than A hinted strictly before A (see the Add free/compute
+        classification in the model builder; keep the two in sync).  Returns
+        None (check leniently) when a needed layer hint is missing.  The held
+        target is a forced fresh compute (is_free pinned 0), never derived.
+        """
+        if A.node_id == built.held_target_id:
+            return False
+        a_hint = (hint_layers or {}).get(A.node_id)
+        if a_hint is None:
+            return None
+        saw_unknown = False
+        for E in A.inputs:
+            if (
+                isinstance(E, Concatenate)
+                or E in gm.pinned_nodes
+                or E.node_id not in built.layer_var
+            ):
+                continue  # E_dead is the constant 0
+            others = [c for c in gm.consumers_eff.get(E, set()) if c is not A]
+            if any(
+                isinstance(c, Concatenate) or c.node_id not in built.layer_var
+                for c in others
+            ):
+                continue  # an always-alive consumer: E_dead is the constant 0
+            dead: Optional[bool] = True
+            for C in others:
+                c_hint = (hint_layers or {}).get(C.node_id)
+                if c_hint is None:
+                    dead = None
+                    break
+                if c_hint >= a_hint:
+                    dead = False
+                    break
+            if dead:
+                return True
+            if dead is None:
+                saw_unknown = True
+        return None if saw_unknown else False
+
     for nid, L in (hint_cancel or {}).items():
         in_sched = nid in built.cancel_layer
         in_input = nid in built.input_cancel_layer
@@ -2180,6 +2257,17 @@ def _validate_hint(
             )
         node = all_nodes.get(nid)
         mech = (hint_cancel_mech or {}).get(nid, ATTN)
+        if in_input and mech == MLP:
+            # Inputs have no MLP cancel mechanism in the model (no
+            # `cancel_in_mlp` var is created for freeable inputs), so an
+            # MLP-mech hint on an input can only come from a heuristic
+            # emitting a schedule the model cannot represent.  Flag it, then
+            # check the gaps as the attention mechanism the model assumes.
+            violations.append(
+                f"MLP cancel mechanism hinted for an input (inputs are "
+                f"always attention-cancelled in the model): {_desc(nid)}"
+            )
+            mech = ATTN
         hinted_cons: List[int] = []
         all_cons_hinted = True
         for c in gm.consumers_eff.get(node, set()):
@@ -2191,17 +2279,21 @@ def _validate_hint(
                 continue
             hinted_cons.append(c_hint)
             # Mirror the mechanism-conditional cancel bound.  An MLP cancel
-            # fires after both sublayers' reads, so it permits gap 0 for EVERY
-            # consumer (attn or mlp).  An attention cancel keeps the routing-
-            # aware gap: an attention-routed consumer permits a same-layer
-            # cancel (gap 0); an MLP-routed consumer keeps the layer-after bound
-            # (gap 1).  Routing comes from the hint when present, else the
-            # model's pinned routing; flex consumers without a routing hint are
-            # checked leniently (gap 0).  Add consumers are also checked
-            # leniently — their true bound is `layer + is_free`, which the model
-            # enforces but a hint-only check cannot see (a deliberate blind
-            # spot).
-            if mech == MLP or isinstance(c, Add):
+            # fires after both sublayers' reads, so it permits gap 0 for every
+            # non-Add consumer (attn or mlp).  An attention cancel keeps the
+            # routing-aware gap: an attention-routed consumer permits a
+            # same-layer cancel (gap 0); an MLP-routed consumer keeps the
+            # layer-after bound (gap 1).  Routing comes from the hint when
+            # present, else the model's pinned routing; flex consumers without
+            # a routing hint are checked leniently (gap 0).  An Add consumer's
+            # bound is `layer + is_free` regardless of mechanism (the model
+            # posts it unconditionally); is_free is a pure function of the
+            # layer assignment, so derive it from the layer hints
+            # (`_hinted_add_is_free` above), lenient (gap 0) when a needed
+            # layer hint is missing.
+            if isinstance(c, Add):
+                gap = 1 if _hinted_add_is_free(c) else 0
+            elif mech == MLP:
                 gap = 0
             else:
                 route = (hint_routing or {}).get(c.node_id)
