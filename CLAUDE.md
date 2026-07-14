@@ -272,9 +272,13 @@ single output `Node` (outputs gathered at the node's natural residual
 columns) and the ONLY positional parameter — there is no `pos_encoding`
 argument (position is rotary, applied inside attention), and the
 `assume_zero_init` flag was retired 2026-07 (universal zero-init).  All
-other parameters are keyword-only.  `optimize` and `bias` thread
-straight to `forward_compile`, so this backend can reproduce a
-production `optimize=2` / `bias=False` schedule exactly.  Passing a
+other parameters are keyword-only.  `optimize`, `bias`, and
+`output_layout_source` thread straight to `forward_compile`, so this
+backend can reproduce a production `optimize=2` / `bias=False` schedule
+exactly — for a token (v6) artifact that requires
+`output_layout_source=<the graph's Embedding>`, because
+`compile_to_onnx` always compiles with the tied held-bank contract and
+an untied compile produces a structurally different schedule.  Passing a
 non-`Node` first argument raises a `TypeError` naming the expectation.
 
     artifact = compile_to_onnx(output_node, embedding, output_path, ...)
@@ -413,9 +417,14 @@ Requirements and caveats:
   stop and report; (2) ONNX-emission bug in `compiler/export.py` —
   also D1; (3) a debug-sidecar/canonical-id remap bug.  Recompiling
   via `compile_headless` and re-running `debug=True` discriminates
-  (1) from (2)+(3) — run the discrimination compile with
-  `TW_SCHEDULE_CACHE_DIR` unset: a cache-replayed schedule bug
-  reproduces on both backends and would masquerade as cause 2/3.
+  (1) from (2)+(3) — pass
+  `output_layout_source=<the graph's Embedding>` so the recompile
+  solves the same tied (token.v6) schedule the artifact was built
+  with (omitting it compiles an untied schedule, and a held-bank
+  scheduler bug would not reproduce), and run the discrimination
+  compile with `TW_SCHEDULE_CACHE_DIR` unset: a cache-replayed
+  schedule bug reproduces on both backends and would masquerade as
+  cause 2/3.
 - The debug session is separate from any production session: the
   promoted outputs defeat onnxruntime's memory-reuse planning.  Never
   put it on a hot path.

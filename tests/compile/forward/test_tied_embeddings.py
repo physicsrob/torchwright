@@ -813,6 +813,30 @@ def test_direct_held_handoff_shares_the_atomic_attention_batch():
     assert rmap.get_free_count() == d - 1 - 2 - 4
 
 
+def test_compile_headless_reproduces_the_tied_schedule(tmp_path):
+    """compile_headless(output_layout_source=...) solves the same tied
+    (token.v6) schedule compile_to_onnx always builds, so the documented
+    OnnxDebugSession discrimination recompile (CLAUDE.md, D1) reproduces a
+    v6 artifact's structure instead of silently compiling an untied one."""
+    from torchwright.compiler.export import compile_headless, compile_to_onnx
+
+    embedding = _embedding()
+    output = _identity(embedding, "output")
+    compiled = compile_headless(output, d=16, d_head=4, output_layout_source=embedding)
+    in_bank, out_bank = _banks(compiled._net, embedding, output)
+    assert in_bank == out_bank  # ordered held-bank handoff, the v6 contract
+
+    artifact = compile_to_onnx(
+        output,
+        embedding,
+        str(tmp_path / "tied.onnx"),
+        d=16,
+        d_head=4,
+        rms_norm=False,  # compile_headless has no rms_norm path
+    )
+    assert artifact.n_layers == len(compiled._net.layers)
+
+
 def test_directed_scheduler_rejects_sibling_clusters():
     """The CP-SAT model has no admission constraint, so the directed replay
     must run ungated: an admission deferral after the atomic attention batch

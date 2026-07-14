@@ -261,8 +261,13 @@ def test_probe_and_debug_value_parity_with_headless(token_artifact):
 
     # In-process backend over another fresh rebuild — the compiled circuit matches
     # the oracle to fp32 round-off, so this stays tight (no onnxruntime rounding).
+    # output_layout_source makes the headless compile solve the same tied
+    # (token.v6) schedule the artifact was built with — the D1 discrimination
+    # recompile this parity test stands in for.
     out_h, emb_h = _build_adder()
-    headless = compile_headless(out_h, d=D, d_head=D_HEAD, verbose=False)
+    headless = compile_headless(
+        out_h, d=D, d_head=D_HEAD, verbose=False, output_layout_source=emb_h
+    )
     report_h = probe_compiled(headless, out_h, iv, n_pos=len(TOKENS), atol=1e-3)
     assert report_h.first_divergent is None, report_h.format_short()
 
@@ -574,8 +579,7 @@ def test_oversized_conversion_external_metadata_and_bytes(token_artifact, monkey
         dense[numpy_helper.to_array(sp.indices)] = numpy_helper.to_array(sp.values)
         dense_by_name[sp.values.name] = (dims, dense)
     assert len(dense_by_name) >= 2, (
-        "fixture regression: need >= 2 sparse initializers to pin cumulative "
-        "offsets"
+        "fixture regression: need >= 2 sparse initializers to pin cumulative " "offsets"
     )
 
     monkeypatch.setattr(od, "_ORT_EMBEDDED_INITIALIZER_LIMIT", 1)

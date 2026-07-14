@@ -62,6 +62,21 @@ def _prefill_ids(oracle):
     return [tok2id[t] for t in ([_BOS] + list(_PREFILL_TEXT))]
 
 
+def test_config_rejects_explicit_untied():
+    """An explicit tie_word_embeddings=False (a pre-v6 saved config, or a
+    deliberate untied experiment) must raise, not be silently overridden —
+    HF's tie_weights() would otherwise clone the embedding over the
+    checkpoint's real lm_head and return wrong logits with no error."""
+    from torchwright.compiler.hf.configuration_torchwright import (
+        TorchwrightConfig,
+    )
+
+    with pytest.raises(ValueError, match="tie_word_embeddings"):
+        TorchwrightConfig(tie_word_embeddings=False)
+    assert TorchwrightConfig().tie_word_embeddings
+    assert TorchwrightConfig(tie_word_embeddings=True).tie_word_embeddings
+
+
 def test_config_matches_debug_sidecar(artifact_path, converted):
     model, _ = converted
     cfg = model.config

@@ -79,5 +79,18 @@ class TorchwrightConfig(PretrainedConfig):
         kwargs.pop("hidden_size", None)
         self.num_hidden_layers = self.n_layers
         self.hidden_size = self.d
+        # Torchwright models are storage-tied (token.v6): lm_head shares
+        # embed_tokens' storage, so an untied config has no meaning here.
+        # Overriding an explicit False silently would let HF's tie_weights()
+        # clone the embedding over a checkpoint's real lm_head (pre-v6
+        # converters saved tie_word_embeddings: false with a distinct
+        # unembed) — wrong logits with no error.  Reject it loudly instead.
+        if kwargs.get("tie_word_embeddings", True) is False:
+            raise ValueError(
+                "TorchwrightConfig requires tie_word_embeddings=True: the "
+                "unembed is storage-tied to the embedding (token.v6).  A "
+                "config with tie_word_embeddings=False is a pre-v6 artifact "
+                "— regenerate it with the current converter."
+            )
         kwargs["tie_word_embeddings"] = True
         super().__init__(**kwargs)

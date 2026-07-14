@@ -2267,6 +2267,7 @@ def compile_headless(
     trim_heads: bool = True,
     optimize: int = 0,
     bias: bool = True,
+    output_layout_source: Optional[Node] = None,
 ) -> CompiledHeadless:
     """Compile a graph to an in-process callable.
 
@@ -2283,10 +2284,15 @@ def compile_headless(
     when omitted; pass an explicit value to decouple the MLP intermediate
     width from the residual stream width.
 
-    ``optimize`` and ``bias`` thread straight to ``forward_compile`` (same
-    meaning as on :func:`compile_to_onnx`) — so this in-process debug backend
-    can reproduce a production ``optimize=2`` / ``bias=False`` schedule
-    exactly.  The residual stream is always zero-initialised (the
+    ``optimize``, ``bias``, and ``output_layout_source`` thread straight to
+    ``forward_compile`` (same meaning as on :func:`compile_to_onnx`) — so
+    this in-process debug backend can reproduce a production ``optimize=2``
+    / ``bias=False`` schedule exactly.  ``compile_to_onnx`` always compiles
+    with ``output_layout_source=<the graph's Embedding>`` (the tied
+    token.v6 held-bank contract), so reproducing a token artifact's
+    schedule requires passing the same Embedding here; leaving it ``None``
+    compiles an untied schedule with a different structure and CP-SAT
+    fingerprint.  The residual stream is always zero-initialised (the
     ``assume_zero_init`` flag was retired 2026-07).
     """
     from torchwright.graph.asserts import collect_debug_nodes
@@ -2314,6 +2320,7 @@ def compile_headless(
         trim_heads=trim_heads,
         optimize=optimize,
         bias=bias,
+        output_layout_source=output_layout_source,
     )
 
     assert net.residual_assignment is not None
