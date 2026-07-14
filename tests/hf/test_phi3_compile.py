@@ -18,7 +18,7 @@ from torchwright.compiler.hf import (
     compile_to_hf,
     save_hf_bundle,
 )
-from torchwright.graph import Concatenate, Embedding
+from torchwright.graph import Concatenate, Embedding, Linear
 
 
 def _graph():
@@ -199,18 +199,25 @@ def test_bundle_rejects_multiple_reachable_embeddings_before_writing(tmp_path):
     assert not (tmp_path / "bundle").exists()
 
 
-def test_trivial_graph_streaming_announces_placeholder_shape(tmp_path):
+def test_trivial_graph_streaming_announces_layer_shape(tmp_path):
+    # token.v6: the output must be a schedulable node distinct from the tied
+    # Embedding source, so the smallest token model is ONE layer holding the
+    # attention-transport head plus the coalesced source-cancel head — two
+    # heads, which is why d/d_head must be >= 2 (there is no zero-op
+    # placeholder token compile anymore).  The streaming sink must announce
+    # that layer's shape before its weights arrive.
     embedding = Embedding(
         ["a"],
         d_embed=2,
         table=torch.tensor([[1.0, 0.0], [0.0, 1.0]]),
     )
+    out = Linear(embedding, torch.eye(2), name="output")
 
     compile_hf_bundle(
-        embedding,
+        out,
         embedding,
         tmp_path,
-        d=16,
+        d=32,
         d_head=16,
         d_hidden=16,
         bos_token=None,
@@ -220,7 +227,7 @@ def test_trivial_graph_streaming_announces_placeholder_shape(tmp_path):
 
     config = json.loads((tmp_path / "config.json").read_text())
     assert config["num_hidden_layers"] == 1
-    assert config["num_attention_heads"] == 1
+    assert config["num_attention_heads"] == 2  # transport + coalesced cancel
     assert config["intermediate_size"] == 1
 
 
@@ -230,9 +237,10 @@ def test_trivial_graph_accepts_explicit_decoupled_head_count(tmp_path):
         d_embed=2,
         table=torch.tensor([[1.0, 0.0], [0.0, 1.0]]),
     )
+    out = Linear(embedding, torch.eye(2), name="output")
 
     compile_hf_bundle(
-        embedding,
+        out,
         embedding,
         tmp_path,
         d=32,
