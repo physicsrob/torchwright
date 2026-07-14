@@ -51,6 +51,7 @@ def _compile(rms_norm: bool) -> str:
         emb,
         os.path.join(d_dir, "m.onnx"),
         d=calculator_simple.D_MODEL,
+        d_head=calculator_simple.D_HEAD,
         rms_norm=rms_norm,
     )
     return art.path
@@ -84,9 +85,13 @@ def test_norm_is_bit_exact_identity_in_onnx(path_on, path_off, text):
 
 def _compile_hf(rms_norm):
     from examples import calculator_simple
+
     out, emb = calculator_simple.create_network_parts()
     return compile_to_hf(
-        out, emb, d=calculator_simple.D_MODEL, d_head=calculator_simple.D_HEAD,
+        out,
+        emb,
+        d=calculator_simple.D_MODEL,
+        d_head=calculator_simple.D_HEAD,
         rms_norm=rms_norm,
     )
 

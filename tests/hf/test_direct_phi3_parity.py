@@ -166,17 +166,22 @@ def test_compiler_returns_fp32(direct_model):
 
 
 def test_position_ids_are_honored(direct_model):
-    """position_ids must shift which absolute PE rows are used (not be ignored)."""
+    """Non-uniform position IDs must change relative rotary offsets.
+
+    A uniform shift cannot test this: RoPE attention is translation-invariant,
+    so adding the same constant to every position preserves every relative
+    offset. Stretching the positions changes those offsets and therefore must
+    change this position-sensitive compiled model's logits.
+    """
     model, oracle = direct_model
     ids = torch.tensor([_prefill_ids(oracle)])
     T = ids.shape[1]
     with torch.no_grad():
         default = model(input_ids=ids).logits  # cache_position = arange(0, T)
-        shifted = model(
-            input_ids=ids, position_ids=torch.arange(100, 100 + T)[None]
+        stretched = model(
+            input_ids=ids, position_ids=(2 * torch.arange(T))[None]
         ).logits
-    # Different absolute positions -> different PE -> different logits.
-    assert not torch.equal(default, shifted)
+    assert not torch.equal(default, stretched)
 
 
 def test_standard_attention_mask(direct_model):
