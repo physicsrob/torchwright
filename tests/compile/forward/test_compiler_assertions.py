@@ -84,6 +84,61 @@ def test_D_check_invariants_catches_pairwise_overlap():
         rmap._check_invariants("poisoned")
 
 
+def test_D_check_invariants_catches_held_overlap_with_allocated():
+    """A held column that is also owned by a live node fires the
+    held-vs-allocated disjointness branch."""
+    rmap = ResidualStreamMap(16)
+    a = InputNode("a", 4, value_range=(-100.0, 100.0))
+    rmap.allocate(a)
+
+    # Poison: mark one of a's columns as held while a stays allocated.
+    rmap._held.add(rmap.get_indices(a)[0])
+
+    with pytest.raises(AssertionError, match=r"held columns .* are also allocated"):
+        rmap._check_invariants("poisoned")
+
+
+def test_D_check_invariants_catches_held_overlap_with_free():
+    """A held column that is also in the free pool fires the
+    held-vs-free disjointness branch."""
+    rmap = ResidualStreamMap(16)
+
+    # Poison: mark a free column as held without removing it from _free.
+    rmap._held.add(next(iter(rmap._free)))
+
+    with pytest.raises(AssertionError, match=r"held columns .* are also free"):
+        rmap._check_invariants("poisoned")
+
+
+def test_D_check_invariants_catches_held_overlap_with_reserved():
+    """A held column that is also reserved fires the held-vs-reserved
+    disjointness branch."""
+    rmap = ResidualStreamMap(16)
+    rmap.reserve([0, 1])
+
+    # Poison: mark a reserved column as held.
+    rmap._held.add(0)
+
+    with pytest.raises(AssertionError, match=r"held columns .* are also reserved"):
+        rmap._check_invariants("poisoned")
+
+
+def test_D_check_invariants_totality_covers_held():
+    """A column dropped from the held bank (without landing anywhere else)
+    fires the totality check — held columns are part of the
+    free/allocated/held/reserved partition of {0..d-1}."""
+    rmap = ResidualStreamMap(16)
+    a = InputNode("a", 4, value_range=(-100.0, 100.0))
+    rmap.allocate(a)
+    rmap.hold(a)
+
+    # Poison: lose one held column entirely.
+    rmap._held.discard(sorted(rmap._held)[0])
+
+    with pytest.raises(AssertionError, match=r"neither free, allocated"):
+        rmap._check_invariants("poisoned")
+
+
 # ---------------------------------------------------------------------------
 # C — literal stability
 # ---------------------------------------------------------------------------
@@ -328,7 +383,13 @@ def test_no_bias_slot0_claim_fires():
         activation="relu",
     )
     cols = rmap.allocate(ffn)
-    op = MLPOp("compute_ffn", ffn, cols, mlp_slots=[0, 1, 2, 3], source_cols=rmap.get_indices(x))
+    op = MLPOp(
+        "compute_ffn",
+        ffn,
+        cols,
+        mlp_slots=[0, 1, 2, 3],
+        source_cols=rmap.get_indices(x),
+    )
     layer = TransformerLayer(D, D_HEAD)
     with pytest.raises(AssertionError, match="constant lane"):
         write_mlp_sublayer(layer, [op], rmap, const_one=const_one, bias=False)

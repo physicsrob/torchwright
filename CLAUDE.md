@@ -805,17 +805,19 @@ across refactors.
 ## I1 — Allocator self-consistency
 
 `ResidualStreamMap`'s internal state is consistent after every
-mutation:
+mutation.  Every column belongs to exactly one of four pools — free,
+allocated, held (the one transient tied-embedding bank), reserved
+(permanently withheld, e.g. the RMSNorm pinned constant):
 
 1. Pairwise disjoint — no column appears in two nodes' index lists.
-2. `_free ∩ allocated == ∅`.
-3. `_free ∪ allocated == {0 .. d-1}`.
+2. `_free`, allocated, `_held`, and `_reserved` are pairwise disjoint.
+3. `_free ∪ allocated ∪ _held ∪ _reserved == {0 .. d-1}`.
 
 **Enforced in** `torchwright/compiler/forward/residual_map.py`:
 `ResidualStreamMap._check_invariants`, called at the end of
-`allocate`, `free`, and `reassign`.  `allocate` also runs a
-pre-commit uniqueness check so a firing assertion names the
-conflicting node.
+`allocate`, `free`, `hold`, `allocate_at`, `reassign`, and `reserve`.
+`allocate` also runs a pre-commit uniqueness check so a firing
+assertion names the conflicting node.
 
 **What a fire means.** Either (a) allocator code was edited and no
 longer preserves the invariant, or (b) an external caller reached
