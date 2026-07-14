@@ -838,6 +838,16 @@ def build_cpsat_model_from_gm(
         by_id = {n.node_id: n for n in gm.graph.get_all_nodes()}
         held_source = by_id.get(held_source_id)
         held_target = by_id.get(held_target_id)
+        if held_source is None:
+            raise ValueError(
+                f"held_source_id {held_source_id} does not name a node in "
+                f"the scheduled graph"
+            )
+        if held_target is None:
+            raise ValueError(
+                f"held_target_id {held_target_id} does not name a node in "
+                f"the scheduled graph"
+            )
         if held_source not in freeable_inputs:
             raise ValueError("held source must be a freeable graph input")
         if held_target is not gm.output_node or held_target not in gm.schedulable:
@@ -1950,7 +1960,29 @@ def build_model_from_snapshot(
 
     Equivalent to :func:`build_cpsat_model` on the graph the snapshot was
     captured from, at the same geometry; the two protos are identical.
+
+    The held-bank endpoints default to the snapshot's own stored contract
+    (``problem.held_source_id`` / ``problem.held_target_id``).  Explicit
+    kwargs equal to the stored pair are allowed (idempotent re-supply);
+    kwargs that disagree with a stored contract raise — a snapshot solved
+    under a different held contract than it captured is a wrong-problem
+    measure.  Kwargs against a held-less snapshot are honoured (a capture
+    site that has not yet learned to store the contract).
     """
+    if held_source_id is None and held_target_id is None:
+        held_source_id = problem.held_source_id
+        held_target_id = problem.held_target_id
+    elif problem.held_source_id is not None or problem.held_target_id is not None:
+        if (held_source_id, held_target_id) != (
+            problem.held_source_id,
+            problem.held_target_id,
+        ):
+            raise ValueError(
+                f"held endpoints ({held_source_id}, {held_target_id}) "
+                f"conflict with the snapshot's stored held contract "
+                f"({problem.held_source_id}, {problem.held_target_id}); "
+                f"drop the kwargs to use the snapshot's values"
+            )
     return build_cpsat_model_from_gm(
         graph_model_from_problem(problem),
         d=d,

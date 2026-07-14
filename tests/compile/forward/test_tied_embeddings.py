@@ -476,20 +476,175 @@ def test_cpsat_charges_direct_compute_and_cancel_in_same_layer():
 
 
 def test_held_live_and_snapshot_models_are_identical():
+    """The snapshot alone carries the held contract: a captured-with-held
+    problem round-trips through JSON and rebuilds the live proto with NO
+    re-supplied kwargs.  A held-less capture builds a different (relaxed)
+    proto — the non-vacuity check."""
+    from torchwright.compiler.forward.cpsat_snapshot import SchedulingProblem
+
     embedding = _embedding()
     output = _identity(embedding, "output")
-    cfg = dict(
-        d=9,
-        d_head=2,
-        d_hidden=16,
-        max_layers=4,
+    geometry = dict(d=9, d_head=2, d_hidden=16, max_layers=4)
+    live = build_cpsat_model(
+        output,
+        **geometry,
         held_source_id=embedding.node_id,
         held_target_id=output.node_id,
     )
-    live = build_cpsat_model(output, **cfg)
-    problem = snapshot_from_graph_model(build_graph_model(output))
-    snap = build_model_from_snapshot(problem, **cfg)
+    problem = snapshot_from_graph_model(
+        build_graph_model(output),
+        held_source_id=embedding.node_id,
+        held_target_id=output.node_id,
+    )
+    roundtripped = SchedulingProblem.loads(problem.dumps())
+    snap = build_model_from_snapshot(roundtripped, **geometry)
     assert str(live.model.Proto()) == str(snap.model.Proto())
+
+    # Idempotent re-supply of the stored pair is allowed.
+    resupplied = build_model_from_snapshot(
+        roundtripped,
+        **geometry,
+        held_source_id=embedding.node_id,
+        held_target_id=output.node_id,
+    )
+    assert str(resupplied.model.Proto()) == str(live.model.Proto())
+
+    # A held-less capture solves a strictly relaxed model.
+    relaxed = build_model_from_snapshot(
+        snapshot_from_graph_model(build_graph_model(output)), **geometry
+    )
+    assert str(relaxed.model.Proto()) != str(live.model.Proto())
+
+
+def test_snapshot_held_contract_validation():
+    """Loud misses on every malformed held contract: unpaired endpoints,
+    ids that name no captured node, kwargs conflicting with the stored
+    contract, and unknown ids reaching the model builder."""
+    from torchwright.compiler.forward.cpsat_snapshot import SchedulingProblem
+
+    embedding = _embedding()
+    output = _identity(embedding, "output")
+    gm = build_graph_model(output)
+    geometry = dict(d=9, d_head=2, d_hidden=16, max_layers=4)
+
+    with pytest.raises(ValueError, match="supplied together"):
+        snapshot_from_graph_model(gm, held_source_id=embedding.node_id)
+
+    with pytest.raises(ValueError, match="not a captured node"):
+        snapshot_from_graph_model(
+            gm, held_source_id=10**9, held_target_id=output.node_id
+        )
+
+    # from_json enforces pairing on hand-edited/corrupt fixtures too.
+    d = snapshot_from_graph_model(gm).to_json()
+    d["held_source_id"] = output.node_id
+    with pytest.raises(ValueError, match="supplied together"):
+        SchedulingProblem.from_json(d)
+
+    problem = snapshot_from_graph_model(
+        gm, held_source_id=embedding.node_id, held_target_id=output.node_id
+    )
+    with pytest.raises(ValueError, match="conflict"):
+        build_model_from_snapshot(
+            problem,
+            **geometry,
+            held_source_id=output.node_id,
+            held_target_id=output.node_id,
+        )
+
+    # The model builder names an unknown id instead of crashing on
+    # Node.__eq__(None) deep inside a list-membership check.
+    with pytest.raises(ValueError, match="does not name a node"):
+        build_cpsat_model(
+            output,
+            **geometry,
+            held_source_id=10**9,
+            held_target_id=output.node_id,
+        )
+
+
+def test_canonicalized_snapshot_remaps_and_rebuilds_held_ids():
+    """canonicalized() carries the held endpoints into the canonical id
+    space, and the canonical problem still rebuilds without re-supplied
+    kwargs."""
+    from torchwright.compiler.graph_identity import canonical_ids
+
+    embedding = _embedding()
+    output = _identity(embedding, "output")
+    geometry = dict(d=9, d_head=2, d_hidden=16, max_layers=4)
+    problem = snapshot_from_graph_model(
+        build_graph_model(output),
+        held_source_id=embedding.node_id,
+        held_target_id=output.node_id,
+    )
+    canon = problem.canonicalized(output)
+    mapping = canonical_ids(output)
+    assert canon.held_source_id == mapping[embedding.node_id]
+    assert canon.held_target_id == mapping[output.node_id]
+
+    snap = build_model_from_snapshot(canon, **geometry)
+    # Canonical relabeling renames proto variables, so byte-identity is a
+    # live-id-space pin (above); here it suffices that the rebuilt model
+    # actually carries the held contract — the direct-handoff attention pin
+    # only exists when the endpoints survived the remap.
+    assert "held_pinned" in str(snap.model.Proto())
+    relaxed = build_model_from_snapshot(
+        snapshot_from_graph_model(build_graph_model(output)).canonicalized(output),
+        **geometry,
+    )
+    assert "held_pinned" not in str(relaxed.model.Proto())
+
+
+def test_snapshot_identity_matches_production_cache_key_for_tied_graph(tmp_path):
+    """with_identity derives the held endpoints from the snapshot's own
+    stored ids, so a tied fixture's fingerprint equals the production
+    schedule-cache key — and load() gates on exactly that key."""
+    embedding = _embedding()
+    output = _identity(embedding, "output")
+    fp_cfg = dict(
+        d=16,
+        d_head=4,
+        d_hidden=16,
+        flex_routing=True,
+        cancel_slack=2,
+        policy=None,
+    )
+    production_fp = graph_fingerprint(
+        output,
+        **fp_cfg,
+        held_output_source=embedding,
+        held_output_target=output,
+    )
+    problem = (
+        snapshot_from_graph_model(
+            build_graph_model(output),
+            held_source_id=embedding.node_id,
+            held_target_id=output.node_id,
+        )
+        .canonicalized(output)
+        .with_identity(
+            output_node=output,
+            d=16,
+            d_head=4,
+            d_hidden=16,
+            flex_routing=True,
+            cancel_slack=2,
+            policy=None,
+            critical_path_layers=1,
+        )
+    )
+    assert problem.identity.fingerprint == production_fp
+
+    path = problem.save(tmp_path / "tied.json")
+    from torchwright.compiler.forward.cpsat_snapshot import SchedulingProblem
+
+    loaded = SchedulingProblem.load(path, expected_fingerprint=production_fp)
+    assert loaded.held_source_id == problem.held_source_id
+
+    heldless_fp = graph_fingerprint(output, **fp_cfg)
+    assert heldless_fp != production_fp
+    with pytest.raises(ValueError, match="does not match the"):
+        SchedulingProblem.load(path, expected_fingerprint=heldless_fp)
 
 
 def test_held_contract_participates_in_schedule_cache_identity():

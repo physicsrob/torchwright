@@ -46,12 +46,18 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, FrozenSet, Optional, Tuple
 
-from torchwright.compiler.graph_identity import canonical_ids, graph_fingerprint
+from torchwright.compiler.graph_identity import (
+    canonical_ids,
+    graph_fingerprint,
+    nodes_by_canonical_id,
+)
 
 # Bumped whenever the on-disk schema or the set of facts the builder reads
 # changes.  The loader refuses a snapshot whose ``format_version`` differs from
 # this, so a schema drift is a loud miss, never a silent wrong-graph measure.
-FORMAT_VERSION = 1
+# v2: held-bank contract endpoints (held_source_id / held_target_id) — a v1
+# snapshot of a tied graph would silently re-solve a relaxed model.
+FORMAT_VERSION = 2
 
 
 # ---------------------------------------------------------------------------
@@ -262,6 +268,13 @@ class SchedulingProblem:
     ``id_space`` records whether ids are the live process-cumulative
     ``node_id`` (``"live"``) or topology-canonical (``"canonical"``); the
     latter is what persists to disk.
+
+    ``held_source_id`` / ``held_target_id`` carry the tied-embedding
+    held-bank contract (both or neither, in this problem's id space).  A
+    snapshot of a tied compile that dropped them would re-solve a strictly
+    relaxed model — no hold bound on the source's cancel, no source
+    residual-interval extension to the target's birth, no attention pin on
+    the direct handoff — and pin an unattainable layer count.
     """
 
     nodes: Dict[int, NodeRecord]
@@ -271,9 +284,25 @@ class SchedulingProblem:
     pinned_ids: FrozenSet[int]
     edges: Tuple[Tuple[int, int], ...]
     consumers: Dict[int, Tuple[int, ...]]
+    held_source_id: Optional[int] = None
+    held_target_id: Optional[int] = None
     id_space: str = "live"
     identity: Optional[SnapshotIdentity] = None
     hint: Optional[FrozenHint] = None
+
+    def __post_init__(self) -> None:
+        if (self.held_source_id is None) != (self.held_target_id is None):
+            raise ValueError(
+                "held_source_id and held_target_id must be supplied together"
+            )
+        for field_name, nid in (
+            ("held_source_id", self.held_source_id),
+            ("held_target_id", self.held_target_id),
+        ):
+            if nid is not None and nid not in self.nodes:
+                raise ValueError(
+                    f"{field_name} {nid} is not a captured node in this snapshot"
+                )
 
     # -- id-space transforms ----------------------------------------------
 
@@ -308,6 +337,12 @@ class SchedulingProblem:
                 mapping[k]: tuple(mapping[c] for c in v)
                 for k, v in self.consumers.items()
             },
+            held_source_id=(
+                None if self.held_source_id is None else mapping[self.held_source_id]
+            ),
+            held_target_id=(
+                None if self.held_target_id is None else mapping[self.held_target_id]
+            ),
             id_space=id_space,
             identity=self.identity,
             hint=None if self.hint is None else self.hint.remap(mapping),
@@ -326,6 +361,8 @@ class SchedulingProblem:
             "pinned_ids": sorted(self.pinned_ids),
             "edges": [[u, v] for u, v in self.edges],
             "consumers": {str(k): list(v) for k, v in self.consumers.items()},
+            "held_source_id": self.held_source_id,
+            "held_target_id": self.held_target_id,
             "identity": None if self.identity is None else self.identity.to_json(),
             "hint": None if self.hint is None else self.hint.to_json(),
         }
@@ -353,6 +390,12 @@ class SchedulingProblem:
             consumers={
                 int(k): tuple(int(c) for c in v) for k, v in d["consumers"].items()
             },
+            held_source_id=(
+                None if d["held_source_id"] is None else int(d["held_source_id"])
+            ),
+            held_target_id=(
+                None if d["held_target_id"] is None else int(d["held_target_id"])
+            ),
             id_space=d["id_space"],
             identity=(
                 None
@@ -446,8 +489,29 @@ class SchedulingProblem:
         so the stored identity matches the production schedule-cache key —
         ``forward_compile`` keys the cache on the raw ``d_hidden`` but solves
         with ``d_hidden - 1`` when ``bias=False`` (the reserved constant lane).
+
+        The held-bank endpoints feed the fingerprint from this problem's own
+        stored ids (never a caller-supplied pair, so the identity can never
+        desync from the contract the snapshot solves) — the production
+        schedule-cache key includes them, so a tied fixture's identity must
+        too.
         """
         from dataclasses import asdict as _asdict
+
+        held_source_node = held_target_node = None
+        if self.held_source_id is not None:
+            by_key = nodes_by_canonical_id(output_node)
+            if self.id_space != "canonical":
+                by_key = {n.node_id: n for n in by_key.values()}
+            try:
+                held_source_node = by_key[self.held_source_id]
+                held_target_node = by_key[self.held_target_id]
+            except KeyError as exc:
+                raise ValueError(
+                    f"held endpoint id {exc.args[0]} not found in the "
+                    f"{self.id_space} id space of output_node's graph; the "
+                    f"snapshot does not match this graph"
+                ) from exc
 
         fingerprint = graph_fingerprint(
             output_node,
@@ -459,6 +523,8 @@ class SchedulingProblem:
             policy=policy,
             reserve_residual=reserve_residual,
             bias=bias,
+            held_output_source=held_source_node,
+            held_output_target=held_target_node,
         )
         geometry = {
             "d": d,
@@ -516,7 +582,12 @@ def _record_for(node, graph) -> NodeRecord:
     )
 
 
-def snapshot_from_graph_model(gm) -> SchedulingProblem:
+def snapshot_from_graph_model(
+    gm,
+    *,
+    held_source_id: Optional[int] = None,
+    held_target_id: Optional[int] = None,
+) -> SchedulingProblem:
     """Capture the structural problem from a live ``GraphModel`` (cheap).
 
     Reads only what the CP-SAT builder reads; adds no fingerprint hashing
@@ -524,6 +595,11 @@ def snapshot_from_graph_model(gm) -> SchedulingProblem:
     fixture).  Iteration orders (``schedulable``, ``edges``, per-node consumer
     sets) are frozen exactly as the live builder sees them, so the rebuilt
     proto matches byte-for-byte in the capturing process.
+
+    ``held_source_id`` / ``held_target_id`` are the tied-embedding held-bank
+    endpoints (live ids, both or neither) — the same pair the capture site
+    passes to ``solve_schedule``.  A tied compile's snapshot captured without
+    them describes a strictly relaxed scheduling problem.
     """
     graph = gm.graph
     nodes: Dict[int, NodeRecord] = {}
@@ -542,6 +618,8 @@ def snapshot_from_graph_model(gm) -> SchedulingProblem:
         pinned_ids=frozenset(n.node_id for n in gm.pinned_nodes),
         edges=tuple((u.node_id, v.node_id) for u, v in gm.edges),
         consumers=consumers,
+        held_source_id=held_source_id,
+        held_target_id=held_target_id,
         id_space="live",
     )
 
