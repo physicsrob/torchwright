@@ -5,7 +5,7 @@ from __future__ import annotations
 from transformers import PretrainedConfig
 
 
-class TorchwrightConfig(PretrainedConfig):
+class TorchwrightCustomConfig(PretrainedConfig):
     """Configuration for a Torchwright causal decoder.
 
     The model is a pre-norm decoder with a uniform residual width ``d``: a
@@ -37,7 +37,7 @@ class TorchwrightConfig(PretrainedConfig):
         rms_norm_eps: RMSNorm epsilon.
     """
 
-    model_type = "torchwright"
+    model_type = "torchwright_custom"
 
     def __init__(
         self,
@@ -67,7 +67,7 @@ class TorchwrightConfig(PretrainedConfig):
         # instantiates configs with all-zero defaults, which must not raise.
         if self.d_head and (self.d_rot % 2 != 0 or not (0 < self.d_rot <= self.d_head)):
             raise ValueError(
-                f"TorchwrightConfig.d_rot must be even and in (0, "
+                f"TorchwrightCustomConfig.d_rot must be even and in (0, "
                 f"d_head={self.d_head}]; got {self.d_rot}."
             )
         self.rms_norm = bool(rms_norm)
@@ -87,10 +87,10 @@ class TorchwrightConfig(PretrainedConfig):
         # unembed) — wrong logits with no error.  Reject it loudly instead.
         if kwargs.get("tie_word_embeddings", True) is False:
             raise ValueError(
-                "TorchwrightConfig requires tie_word_embeddings=True: the "
-                "unembed is storage-tied to the embedding (token.v6).  A "
+                "TorchwrightCustomConfig requires tie_word_embeddings=True: "
+                "the unembed is storage-tied to the embedding (token.v6).  A "
                 "config with tie_word_embeddings=False is a pre-v6 artifact "
-                "— regenerate it with the current converter."
+                "— rebuild it with compile_to_hf / compile_hf_bundle."
             )
         kwargs["tie_word_embeddings"] = True
         super().__init__(**kwargs)

@@ -1,15 +1,17 @@
 """The identity RMSNorm is bit-exact on the shipping graph, end to end.
 
-Compiles ``examples/calculator_v2.py`` (the production HF-export graph, d=1024)
+Compiles ``examples/calculator_simple.py`` (the production HF-export graph, d=1024)
 both with the RMSNorm forced on and with it off, and asserts:
 
 * the ONNX oracle (real onnxruntime execution) produces **bit-identical** logits
   with and without the norm — i.e. the emitted RMSNorm is exactly the identity,
   including through the scheduler's cancel heads, on the squaring-path
   expressions whose energy broke the original q=30 setting; and
-* the converted HF model carries Llama3-named norm weights; transformer-layer
-  gains are uniform powers of two, while the final gain zeros only the pinned
-  seed columns after using them in its denominator.
+* the direct-built HF model carries the norm as Llama3-named ``weight``
+  parameters (``input_layernorm`` / ``post_attention_layernorm`` /
+  ``model.norm``); transformer-layer gains are uniform powers of two, while
+  the final gain zeros only the pinned seed columns after using them in its
+  denominator (token.v6 tied readout), and the norm-off model carries none.
 
 CPU-only and deterministic, so the bar is exact-bit (see ``_hf_parity``).
 
@@ -32,7 +34,7 @@ pytest.importorskip("transformers")
 pytest.importorskip("safetensors")
 
 from torchwright.compiler.export import compile_to_onnx
-from torchwright.compiler.hf.convert import convert_onnx_to_hf, read_vocab
+from torchwright.compiler.hf import compile_to_hf
 from torchwright.compiler.onnx_load import load_onnx
 
 _BOS, _EOS = "<bos>", "<eos>"
@@ -42,15 +44,15 @@ _EXPRS = ["12*34\n", "999+1\n", "0-7\n", "999*999\n", "321*3\n"]
 
 
 def _compile(rms_norm: bool) -> str:
-    from examples import calculator_v2
+    from examples import calculator_simple
 
-    out_node, emb = calculator_v2.create_network_parts()
+    out_node, emb = calculator_simple.create_network_parts()
     d_dir = tempfile.mkdtemp(prefix=f"tw_rmsnorm_{rms_norm}_")
     art = compile_to_onnx(
         out_node,
         emb,
         os.path.join(d_dir, "m.onnx"),
-        d=calculator_v2.D_MODEL,
+        d=calculator_simple.D_MODEL,
         rms_norm=rms_norm,
     )
     return art.path
@@ -76,14 +78,27 @@ def _last_logits(oracle, vocab, text):
 def test_norm_is_bit_exact_identity_in_onnx(path_on, path_off, text):
     """norm-on oracle == norm-off oracle, bit-for-bit (the norm is identity)."""
     on, off = load_onnx(path_on), load_onnx(path_off)
-    vocab = read_vocab(path_on)
+    vocab = load_onnx(path_on).vocab
     lo_on = _last_logits(on, vocab, text)
     lo_off = _last_logits(off, vocab, text)
     assert (lo_on - lo_off).abs().max().item() == 0.0
 
 
-def test_converted_model_has_llama3_norm_params(path_on):
-    model = convert_onnx_to_hf(path_on, bos_token=_BOS, eos_token=_EOS)
+def _compile_hf(rms_norm):
+    from examples import calculator_simple
+
+    out, emb = calculator_simple.create_network_parts()
+    return compile_to_hf(
+        out,
+        emb,
+        d=calculator_simple.D_MODEL,
+        d_head=calculator_simple.D_HEAD,
+        rms_norm=rms_norm,
+    )
+
+
+def test_direct_model_model_has_llama3_norm_params(path_on):
+    model = _compile_hf(True)
     sd = model.state_dict()
     assert "model.norm.weight" in sd, "missing final norm"
     assert "model.layers.0.input_layernorm.weight" in sd
@@ -101,11 +116,8 @@ def test_converted_model_has_llama3_norm_params(path_on):
 
 
 def test_norm_off_model_has_no_norm_params(path_off):
-    model = convert_onnx_to_hf(path_off, bos_token=_BOS, eos_token=_EOS)
-    sd = model.state_dict()
-    assert not [
-        k for k in sd if "layernorm" in k or k == "model.norm.weight"
-    ], "norm-off model unexpectedly carries norm weights"
+    with pytest.raises(ValueError, match="requires rms_norm=True"):
+        _compile_hf(False)
 
 
 # ===========================================================================
@@ -159,7 +171,7 @@ def test_norm_is_bit_exact_identity_at_5120():
     path_on = _compile_tiny_5120(rms_norm=True)
     path_off = _compile_tiny_5120(rms_norm=False)
     on, off = load_onnx(path_on), load_onnx(path_off)
-    t2i = {t: i for i, t in enumerate(read_vocab(path_on))}
+    t2i = {t: i for i, t in enumerate(load_onnx(path_on).vocab)}
     import torch
 
     ids = torch.tensor([t2i[t] for t in _TINY_TOKENS], dtype=torch.int64)

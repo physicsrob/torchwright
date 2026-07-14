@@ -21,7 +21,7 @@ each other.  Sequences are MSB-first (``seq[0]`` most significant); each
 function documents how wide the caller must size the inputs so the fixed-width
 result never drops a nonzero carry.
 
-``calculator_v2`` is the scalar-space alternative (digits → a number,
+``calculator_simple`` is the scalar-space alternative (digits → a number,
 thermometer-coded arithmetic); ``embedding_arithmetic`` is the older
 spherical-code / ``map_to_table`` version of these same algorithms.
 """
@@ -38,7 +38,9 @@ from torchwright.ops.swiglu.onehot_table import onehot_lookup
 
 from examples._calculator_common import (
     CALC_VOCAB,
+    D_HEAD,
     D_MODEL,
+    MAX_POSITIONS,
     _CARRY_W,
     _NO,
     _YES,
@@ -51,6 +53,8 @@ from examples._calculator_common import (
 __all__ = [
     "CALC_VOCAB",
     "D_MODEL",
+    "D_HEAD",
+    "MAX_POSITIONS",
     "add_digit_seqs",
     "subtract_digit_seqs",
     "compare_digit_seqs",

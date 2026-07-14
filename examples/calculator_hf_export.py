@@ -1,19 +1,16 @@
 """Export the compiled calculator as a standard HuggingFace causal LM.
 
-The calculator (``examples/calculator_v2.py``) is compiled by torchwright into a
-transformer; this script reimplements that artifact as a native
-``transformers`` model (``compiler/hf``) and writes a self-contained,
-``trust_remote_code`` bundle — proving the compiled artifact is a *bona fide*
-standard transformer, not a bespoke runtime.
+The calculator (``examples/calculator_simple.py``) is compiled by torchwright into a
+transformer; this script compiles it directly to a stock Phi-3
+``transformers`` bundle — no custom model code or ``trust_remote_code``.
 
 What it does:
 
-1. Ensures ``calculator_v2.onnx`` exists (compiles it in-process if missing —
-   the artifact is gitignored, never committed).
-2. Converts ONNX → safetensors + ``config.json`` + the shipped
+1. Compiles the calculator graph directly into sharded safetensors.
+2. Writes ``config.json`` + the shipped
    modeling/config/tokenizer files, and writes a model card.
-3. Demos a clean-room reload via ``AutoModelForCausalLM.from_pretrained(...,
-   trust_remote_code=True)`` and greedy generation.
+3. Demos a clean-room reload via ordinary ``AutoModelForCausalLM`` and greedy
+   generation.
 4. Optionally ``push_to_hub``.
 
 Usage:
@@ -21,11 +18,8 @@ Usage:
     uv run python -m examples.calculator_hf_export --out DIR
     uv run python -m examples.calculator_hf_export --push user/calculator-tw
 
-fp32, greedy-only, CPU-fine. The model is token-identical (in fact bit-exact) to
-the ONNX runtime across the calculator's reliable range; at the extreme top of
-its multiply range the compiled circuit runs at its numerical-noise budget and
-the two fp32 backends can round a borderline digit differently (see
-``tests/hf/test_calculator_parity.py``).
+fp32, greedy-only, CPU-fine. The graph uses the maintained one-hot/SwiGLU
+calculator implementation and the saved model is ordinary stock Phi-3.
 """
 
 from __future__ import annotations
@@ -33,7 +27,6 @@ from __future__ import annotations
 import argparse
 import os
 
-ONNX_PATH = "calculator_v2.onnx"
 BOS = "<bos>"
 EOS = "<eos>"
 
@@ -53,7 +46,7 @@ pipeline_tag: text-generation
 This is a **compiled** transformer: a computation graph for integer arithmetic
 (`A op B` with `op` in `+ - *`) compiled by
 [torchwright](https://github.com/) into transformer weights, then reimplemented
-here as a native `transformers` causal LM. The weights are not trained — they
+here as a stock Phi-3 `transformers` causal LM. The weights are not trained — they
 are *emitted* by a compiler from the arithmetic graph.
 
 * **Task**: greedy text generation. Prompt `"<bos>" + "12*34\\n"`, read back the
@@ -63,10 +56,8 @@ are *emitted* by a compiler from the arithmetic graph.
 * **Decoding**: greedy (`do_sample=False`) only.
 * **Hardware**: CPU is fine (tiny model).
 
-It is token-identical — in fact bit-exact — to the source ONNX runtime across
-the calculator's reliable range. At the very top of its multiply range the
-compiled piecewise-linear arithmetic runs at its numerical-noise budget, where
-two faithful fp32 backends can round one borderline output digit differently.
+The same source graph may be compiled independently to ONNX for sibling-backend
+validation; ONNX is not an intermediate artifact for this bundle.
 
 ## Normalization: a genuine RMSNorm that computes the identity
 
@@ -95,8 +86,8 @@ exact identity, and we name it rather than hide it.
 ```python
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
-model = AutoModelForCausalLM.from_pretrained(REPO, trust_remote_code=True).eval()
-tok = AutoTokenizer.from_pretrained(REPO, trust_remote_code=True)
+model = AutoModelForCausalLM.from_pretrained(REPO).eval()
+tok = AutoTokenizer.from_pretrained(REPO)
 
 enc = tok("12*34\\n", return_tensors="pt")
 out = model.generate(enc["input_ids"], max_new_tokens=10, do_sample=False,
@@ -107,24 +98,13 @@ print(tok.decode(out[0, enc["input_ids"].shape[1]:], skip_special_tokens=True))
 """
 
 
-def ensure_artifact() -> str:
-    if os.path.exists(ONNX_PATH):
-        return ONNX_PATH
-    import importlib
-
-    from torchwright.compiler.export import compile_to_onnx
-
-    module = importlib.import_module("examples.calculator_v2")
-    output_node, embedding = module.create_network_parts()
-    compile_to_onnx(output_node, embedding, ONNX_PATH, d=module.D_MODEL)
-    return ONNX_PATH
-
-
 def export(out_dir: str) -> None:
-    from torchwright.compiler.hf.convert import save_bundle
+    from examples import calculator_simple
+    from torchwright.compiler.hf import compile_hf_bundle
 
-    onnx_path = ensure_artifact()
-    save_bundle(onnx_path, out_dir, bos_token=BOS, eos_token=EOS)
+    output_node, embedding = calculator_simple.create_network_parts()
+    compile_hf_bundle(output_node, embedding, out_dir,
+        d=calculator_simple.D_MODEL, bos_token=BOS, eos_token=EOS)
     with open(os.path.join(out_dir, "README.md"), "w") as f:
         f.write(_MODEL_CARD)
     print(f"Wrote bundle to {out_dir}: {sorted(os.listdir(out_dir))}")
@@ -135,10 +115,10 @@ def demo(out_dir: str) -> None:
     import torch
     from transformers import AutoModelForCausalLM, AutoTokenizer
 
-    model = AutoModelForCausalLM.from_pretrained(out_dir, trust_remote_code=True).eval()
-    tok = AutoTokenizer.from_pretrained(out_dir, trust_remote_code=True)
+    model = AutoModelForCausalLM.from_pretrained(out_dir).eval()
+    tok = AutoTokenizer.from_pretrained(out_dir)
 
-    print("\n=== clean-room trust_remote_code demo ===")
+    print("\n=== clean-room stock Phi-3 demo ===")
     for expr in ["12*34\n", "7+8\n", "100-99\n", "123*4\n"]:
         enc = tok(expr, return_tensors="pt")
         with torch.no_grad():
@@ -168,8 +148,8 @@ def main() -> None:
     if args.push:
         from transformers import AutoModelForCausalLM, AutoTokenizer
 
-        model = AutoModelForCausalLM.from_pretrained(args.out, trust_remote_code=True)
-        tok = AutoTokenizer.from_pretrained(args.out, trust_remote_code=True)
+        model = AutoModelForCausalLM.from_pretrained(args.out)
+        tok = AutoTokenizer.from_pretrained(args.out)
         model.push_to_hub(args.push)
         tok.push_to_hub(args.push)
         print(f"Pushed to https://huggingface.co/{args.push}")

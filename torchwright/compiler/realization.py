@@ -52,7 +52,7 @@ RESIDUAL_REUSE = "residual_reuse"
 ATTN_COPY = "attn_copy"
 
 #: Which sublayer each class occupies.  Both Add classes are attention ops
-#: (add_into and compute_add are AttnHeadOps).
+#: (add_into and compute_add become planned attention operations).
 CLASS_SUBLAYER: Dict[str, str] = {
     ATTN_TRANSPORT: "attn",
     ATTN_HEADS: "attn",
@@ -206,6 +206,22 @@ def live_weight_row_ranges(node: Node) -> Tuple[Tuple[int, int], ...]:
     return ranges
 
 
+def _linear_live_attn_chunks(node: Node, d_head: int) -> Tuple[int, ...]:
+    """Attention chunks with a nonzero output block, without the model floor."""
+    return tuple(
+        sorted(
+            {
+                chunk
+                for start, length in live_weight_row_ranges(node)
+                for chunk in range(
+                    start // d_head,
+                    (start + length - 1) // d_head + 1,
+                )
+            }
+        )
+    )
+
+
 def linear_attn_chunks(node: Node, d_head: int) -> Tuple[int, ...]:
     """The ``d_head``-wide input chunks a Linear's attention transport
     actually needs, in ascending order.
@@ -226,20 +242,24 @@ def linear_attn_chunks(node: Node, d_head: int) -> Tuple[int, ...]:
     nodes entirely, which would drop a zero-support *flex* Linear's routing
     variable from the objective and its interval from the cumulative).
     """
-    chunks = sorted(
-        {
-            c
-            for start, length in live_weight_row_ranges(node)
-            for c in range(start // d_head, (start + length - 1) // d_head + 1)
-        }
-    )
-    return tuple(chunks) if chunks else (0,)
+    chunks = _linear_live_attn_chunks(node, d_head)
+    return chunks if chunks else (0,)
 
 
 def linear_attn_heads(node: Node, d_head: int) -> int:
     """Attention-transport head demand of a standalone Linear: one head per
     live input chunk (:func:`linear_attn_chunks`), floor 1."""
     return len(linear_attn_chunks(node, d_head))
+
+
+def linear_attn_live_heads(node: Node, d_head: int) -> int:
+    """Post-compaction heads of an attention-transport Linear.
+
+    The scheduler charges a one-head floor for a zero-support Linear, but the
+    dense component's trim removes that head because its output block is zero.
+    ReplayPlan shape and artifact-resource accounting use this live count.
+    """
+    return len(_linear_live_attn_chunks(node, d_head))
 
 
 def class_heads(node: Node, cls: str, d_head: int) -> int:

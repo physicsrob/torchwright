@@ -1,3 +1,5 @@
+from typing import Optional
+
 import torch
 
 from torchwright.compiler.components.attn import AttnLayerComponent
@@ -14,11 +16,12 @@ class AttnSubLayer:
         self,
         d: int,
         d_head: int,
+        n_heads: Optional[int] = None,
     ):
         self.d = d
         self.in_state = ResidualStreamState(name="AttnSubLayer In State")
         self.out_state = ResidualStreamState(name="AttnSubLayer Out State")
-        self.attn = AttnLayerComponent(d, d_head, name="attn")
+        self.attn = AttnLayerComponent(d, d_head, name="attn", n_heads=n_heads)
 
     def forward(self, inp: torch.Tensor, return_states=False):
         states = {}

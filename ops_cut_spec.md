@@ -51,7 +51,7 @@ verifying against code rather than a static call graph:
 1. **`square_signed` — DEAD (audit implied live).** `ops_audit.md` line 69
    draws `multiply_integers → square_signed`. That edge is behind
    `if strategy == "shallow"`; `multiply_integers` defaults to `"deep"` and the
-   one live caller (`calculator_v2.py`) passes no strategy. `square_signed` is
+   one live caller (`calculator_simple.py`) passes no strategy. `square_signed` is
    reached **only** via the shallow branch of `multiply_integers` /
    `signed_multiply`, and `"shallow"` is passed nowhere. (Audit line 182 had
    this right; line 69 contradicts it.)

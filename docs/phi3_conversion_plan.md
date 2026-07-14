@@ -1,5 +1,9 @@
 # Phi-3 conversion — execution plan
 
+> **Historical/superseded:** the ONNX-to-HF direct compiler described here was
+> removed by `plan_compile_to_hf.md`. Current ground truth is the shared
+> compiler producer plus the direct HF sink in `compiler/hf/build.py`.
+
 Goal: a torchwright swish artifact (`bias=False`, `rms_norm`) becomes a
 checkpoint that loads as **stock `Phi3ForCausalLM`** — no custom
 modeling file, no `trust_remote_code`, no custom tokenizer code.
@@ -10,10 +14,10 @@ checkpoint additionally waits on the Phase D cutover
 (`docs/swiglu_step2_plan.md`).
 
 **Status (2026-07-04): P0–P2 landed.** The probes are
-`tests/hf/test_phi3_rope_parity.py`, the converter is the Phi-3 path in
+`tests/hf/test_phi3_rope_parity.py`, the direct compiler is the Phi-3 path in
 `compiler/hf/convert.py` (routing + `build_phi3_config` /
 `build_phi3_state_dict` / `build_fast_tokenizer`), and the parity gate
-is `tests/hf/test_phi3_convert.py` (1-digit adder fixture — swish,
+is `tests/hf/test_phi3_compile.py` (1-digit adder fixture — swish,
 `bias=False`, non-uniform heads (1,4,4,1,2,1,1), so padding is
 genuinely exercised — plus a partial-rotary offset-head artifact).
 P0/P2 findings folded into the sections below. **P3 remains blocked on
@@ -32,7 +36,7 @@ Stock Llama cannot express that, and it fails in the worst way:
 modeling code **ignores it** — measured on the pinned transformers
 (5.12.1): requesting factor 0.5 on a 16-dim head still builds a
 full-width frequency table (8 pairs where 4 were requested). A
-converted checkpoint would silently rotate the 64 dims the compiled
+direct_model checkpoint would silently rotate the 64 dims the compiled
 attention relies on being position-independent. Silent wrong model,
 not an error.
 
@@ -155,11 +159,11 @@ kernel-dependent — a wider matmul can regroup the reduction of the
 *real* terms by an ulp; measured on CPU torch, `Phi3MLP` at
 intermediate 5 vs 8 differs in the last ulp. The contributions are
 exactly zero; the regrouping sits inside the parity bound. Pinned by
-the padding repros in `test_phi3_convert.py`.) Cost is parameters
+the padding repros in `test_phi3_compile.py`.) Cost is parameters
 and KV cache only (measure at P3). **P0(c) settled:** `Phi3Config`
 accepts an explicit `head_dim`, persists it through `config.json`
 round trips, and the modeling code honors it (attention shapes and
-the rotary table both size from it) — so the converter pads heads to
+the rotary table both size from it) — so the direct compiler pads heads to
 the **per-layer max** with `head_dim` set explicitly, the cheaper
 alternative. Pinned by `test_head_dim_accepted_persisted_and_honored`;
 if a transformers upgrade drops the field, fall back to padding heads
@@ -167,7 +171,7 @@ to `d / d_head`.
 
 ## Numerical implications (stated upfront)
 
-The native-module converter's claim is bit-exactness. The Phi-3 claim
+The native-module direct compiler's claim is bit-exactness. The Phi-3 claim
 is **bounded-relative parity + token-exact decode**, from four rounding
 sources, none removable:
 
@@ -181,8 +185,8 @@ sources, none removable:
    should still give masked weights exactly 0.0 in fp32 — verify with
    our magnitudes at P0, don't assume. **Verified at P0(b)**: masked
    weights are exactly 0.0 at ±1e5..3e6 in isolation and through the
-   converted model's real eager path (`output_attentions` upper
-   triangle all == 0.0). Note the converter additionally pins the
+   direct_model model's real eager path (`output_attentions` upper
+   triangle all == 0.0). Note the direct compiler additionally pins the
    in-memory model to eager itself — plain `Phi3ForCausalLM(config)`
    silently defaults to SDPA on the pinned transformers.
 4. **Kernel choice**: parity gates pin `attn_implementation="eager"`;
@@ -221,7 +225,7 @@ the observed perturbation) is recorded in
     artifact (flagship at P3). Gate: recorded margin factor.
   - *(c) Config constraint check*: explicit `head_dim` support vs
     pad-to-`d/d_head`.
-- **P1 — the converter.** *(landed)* A Phi-3 path in `compiler/hf/convert.py`:
+- **P1 — the direct compiler.** *(landed)* A Phi-3 path in `compiler/hf/convert.py`:
   routing on meta (`swish` + `bias=False` + `rms_norm` → Phi-3; relu →
   the existing native module, unchanged; anything else refuses
   loudly — today's two `NotImplementedError`s become this routing).
@@ -229,9 +233,9 @@ the observed perturbation) is recorded in
   emitted as a `tokenizer.json` (WordLevel over the vocab,
   char-level pre-tokenization, specials registered) loaded by stock
   `PreTrainedTokenizerFast` — the current character-level
-  `TorchwrightTokenizer` semantics, zero custom code in the bundle.
+  `TorchwrightCustomTokenizer` semantics, zero custom code in the bundle.
   Unit scale: adder-size swish `bias=False` exports.
-- **P2 — parity gate.** *(landed — `tests/hf/test_phi3_convert.py`)* A Phi-3 mirror of `tests/hf/test_convert.py`:
+- **P2 — parity gate.** *(landed — `tests/hf/test_phi3_compile.py`)* A Phi-3 mirror of `tests/hf/test_direct_phi3_parity.py`:
   teacher-forced max-logit-diff under the derived bound, greedy decode
   token-exact against the `load_onnx` oracle, eager attention pinned;
   D6-scale repros for each mapping piece (fold, padding, norms,
@@ -245,8 +249,8 @@ the observed perturbation) is recorded in
 
 ## What dies / what stays
 
-- The custom trio (`modeling_torchwright.py`,
-  `configuration_torchwright.py`, `tokenization_torchwright.py`)
+- The custom trio (`modeling_torchwright_custom.py`,
+  `configuration_torchwright_custom.py`, `tokenization_torchwright_custom.py`)
   stays serving relu artifacts and `tests/hf` until relu retirement,
   then dies with it — the HF surface becomes Phi-3-only.
 - `build_config`'s swish and `bias=False` refusals die at P1 (they

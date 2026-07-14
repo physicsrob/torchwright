@@ -122,7 +122,10 @@ def store_assignment(
 
     Returns True when the entry was written.
 
-    The schedule ratchet is one-way (fewer layers only), but the entry's
+    The schedule ratchet is one-way by scale-independent realized objective
+    blocks when the caller supplies ``meta["realized_objective_blocks"]``.
+    Scaled totals are comparable only when both entries record the same scale;
+    legacy callers otherwise fall back to fewer layers. The entry's
     validated optimize level (``meta["optimize"]``) ratchets
     independently: when a higher-level solve fails to beat the cached
     schedule, that is proof the entry is as good as that level produces,
@@ -136,9 +139,41 @@ def store_assignment(
     prior_path = base / f"{fingerprint}.json"
     if prior_path.exists():
         prior = json.loads(prior_path.read_text(encoding="utf-8"))
-        if prior.get("n_layers", 1 << 30) <= assignment.n_layers:
+        prior_meta = prior.get("meta", {})
+        prior_blocks_raw = prior_meta.get("realized_objective_blocks")
+        new_blocks_raw = meta.get("realized_objective_blocks")
+        prior_blocks = (
+            tuple(int(value) for value in prior_blocks_raw)
+            if isinstance(prior_blocks_raw, (list, tuple))
+            and len(prior_blocks_raw) == 2
+            else None
+        )
+        new_blocks = (
+            tuple(int(value) for value in new_blocks_raw)
+            if isinstance(new_blocks_raw, (list, tuple))
+            and len(new_blocks_raw) == 2
+            else None
+        )
+        prior_objective = prior_meta.get("realized_objective")
+        new_objective = meta.get("realized_objective")
+        prior_scale = prior_meta.get("objective_scale")
+        new_scale = meta.get("objective_scale")
+        if prior_blocks is not None and new_blocks is not None:
+            prior_dominates = prior_blocks <= new_blocks
+        elif (
+            prior_objective is not None
+            and new_objective is not None
+            and prior_scale is not None
+            and new_scale is not None
+            and int(prior_scale) == int(new_scale)
+        ):
+            prior_dominates = int(prior_objective) <= int(new_objective)
+        else:
+            prior_dominates = (
+                prior.get("n_layers", 1 << 30) <= assignment.n_layers
+            )
+        if prior_dominates:
             new_level = int(meta.get("optimize", 0) or 0)
-            prior_meta = prior.get("meta", {})
             if new_level > int(prior_meta.get("optimize", 0) or 0):
                 prior_meta["optimize"] = new_level
                 prior["meta"] = prior_meta

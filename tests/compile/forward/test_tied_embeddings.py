@@ -4,7 +4,7 @@ import torch
 import pytest
 
 from torchwright.compiler.forward.compile import (
-    _run_heuristic_warm_start,
+    _build_heuristic_schedule_trace,
     forward_compile,
 )
 from torchwright.compiler.forward.cpsat_scheduler import (
@@ -231,9 +231,10 @@ def test_output_add_compiles_at_optimize_1_without_fallback():
 
 
 def _held_warm_start_hints(output, embedding, *, d, d_head, d_hidden, max_layers=12):
-    """Run the REAL warm-start seam (`compile._run_heuristic_warm_start`) on a
-    held-layout graph, mirroring forward_compile's setup: inputs allocated in
-    node_id order, the bank captured immediately after the source allocates."""
+    """Run the REAL warm-start seam (`compile._build_heuristic_schedule_trace`)
+    on a held-layout graph, mirroring forward_compile's setup: inputs allocated
+    in node_id order, the bank captured immediately after the source
+    allocates."""
     graph = GraphAnalyzer(output)
     nodes = graph.get_all_nodes()
     input_nodes = sorted(
@@ -248,10 +249,11 @@ def _held_warm_start_hints(output, embedding, *, d, d_head, d_hidden, max_layers
     table = RealizationTable.build(nodes).resolve_static(
         nodes, SchedulingPolicy(), usable_hidden_slots(d_hidden, True)
     )
-    hints = _run_heuristic_warm_start(
+    trace = _build_heuristic_schedule_trace(
         graph=graph,
         d=d,
         d_head=d_head,
+        n_heads=None,
         pos_encoding=None,
         d_hidden=d_hidden,
         residual_map=rmap,
@@ -264,7 +266,7 @@ def _held_warm_start_hints(output, embedding, *, d, d_head, d_hidden, max_layers
         output_node=output,
         max_layers=max_layers,
     )
-    return hints, layout
+    return trace, layout
 
 
 def _ffn_chain_graph():
@@ -285,12 +287,13 @@ def test_warm_start_holds_source_via_attention_at_reader_layer_plus_one():
     via an attention cancel at the last MLP reader's layer + 1 — never via an
     MLP cancel at the reader's own layer."""
     embedding, a, output = _ffn_chain_graph()
-    (hl, _hr, hc, hm, hint_n), _ = _held_warm_start_hints(
-        output, embedding, d=20, d_head=4, d_hidden=16
+    trace, _ = _held_warm_start_hints(output, embedding, d=20, d_head=4, d_hidden=16)
+    assert trace.n_layers > 0, "warm start deadlocked"
+    assert trace.observed_cancel_mech[embedding.node_id] == "attn"
+    assert (
+        trace.observed_cancel_layer[embedding.node_id]
+        == trace.node_to_layer[a.node_id] + 1
     )
-    assert hint_n > 0, "warm start deadlocked"
-    assert hm[embedding.node_id] == "attn"
-    assert hc[embedding.node_id] == hl[a.node_id] + 1
 
 
 def test_warm_start_held_hint_is_model_feasible_knob_off():
@@ -302,10 +305,11 @@ def test_warm_start_held_hint_is_model_feasible_knob_off():
     from ortools.sat.python import cp_model
 
     embedding, _a, output = _ffn_chain_graph()
-    (hl, _hr, hc, hm, hint_n), _ = _held_warm_start_hints(
-        output, embedding, d=20, d_head=4, d_hidden=16
-    )
-    assert hint_n > 0, "warm start deadlocked"
+    trace, _ = _held_warm_start_hints(output, embedding, d=20, d_head=4, d_hidden=16)
+    assert trace.n_layers > 0, "warm start deadlocked"
+    hl = trace.node_to_layer
+    hc = trace.observed_cancel_layer
+    hm = trace.observed_cancel_mech
     built = build_cpsat_model(
         output,
         d=20,
@@ -462,14 +466,18 @@ def test_cpsat_charges_direct_compute_and_cancel_in_same_layer():
     assert statically_routed is not None
     assert statically_routed.node_to_routing[output.node_id] == "attn"
 
+    from torchwright.compiler.forward.cpsat_scheduler import DiagnosticHint
+
     hinted, _ = solve_schedule(
         d=9,
         **common,
-        hint_layers={output.node_id: assignment.node_to_layer[output.node_id]},
-        hint_routing={output.node_id: "attn"},
-        hint_cancel={
-            embedding.node_id: assignment.node_to_cancel_layer[embedding.node_id]
-        },
+        _diagnostic_hint=DiagnosticHint(
+            layers={output.node_id: assignment.node_to_layer[output.node_id]},
+            routing={output.node_id: "attn"},
+            cancel={
+                embedding.node_id: assignment.node_to_cancel_layer[embedding.node_id]
+            },
+        ),
         strict_hint=True,
     )
     assert hinted is not None
@@ -690,7 +698,7 @@ def test_cpsat_no_incumbent_fallback_keeps_held_contract(monkeypatch):
 
     embedding = _embedding()
     output = _identity(embedding, "output")
-    with pytest.warns(RuntimeWarning, match="falling back"):
+    with pytest.warns(RuntimeWarning, match="retaining the"):
         net = forward_compile(
             d=16,
             d_head=4,

@@ -33,11 +33,14 @@ class AttnLayerComponent(Component):
         output_matrix: (n_heads, d_head, d)
     """
 
-    def __init__(self, d: int, d_head: int, name: str = ""):
+    def __init__(
+        self, d: int, d_head: int, name: str = "", n_heads: Optional[int] = None
+    ):
         super().__init__(d, name)
-        assert (d % d_head) == 0, "Invalid combination of d and d_head"
+        from torchwright.compiler.utils import resolve_n_heads
+
         self.d_head = d_head
-        self.n_heads = d // d_head
+        self.n_heads = resolve_n_heads(d, d_head, n_heads)
         self.used_heads = 0
 
         self.query_matrix = torch.zeros(self.n_heads, d, d_head)

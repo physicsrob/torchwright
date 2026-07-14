@@ -100,16 +100,16 @@ def _example_specs() -> Dict[str, Tuple[Callable, int, int]]:
     from examples import (
         binary_increment,
         caesar_cipher,
-        calculator_v2,
+        calculator_simple,
         fibonacci,
         sort_digits_v1,
     )
 
     return {
         "calculator": (
-            lambda: calculator_v2.create_network_parts()[0],
-            calculator_v2.D_MODEL,
-            calculator_v2.D_HEAD,
+            lambda: calculator_simple.create_network_parts()[0],
+            calculator_simple.D_MODEL,
+            calculator_simple.D_HEAD,
         ),
         "caesar": (
             lambda: caesar_cipher.create_network_parts()[0],

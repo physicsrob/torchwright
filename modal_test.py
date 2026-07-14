@@ -49,7 +49,7 @@ _MEDIUM_FILE_GROUPS: list[list[str]] = [
         "tests/compile/forward/test_forward_calculator.py",
     ],
     [
-        "tests/compile/forward/test_forward_calculator_v2.py",
+        "tests/compile/forward/test_forward_calculator_simple.py",
         "tests/compile/forward/test_kv_cache.py",
         "tests/compile/forward/test_batched_decode_with_past.py",
     ],

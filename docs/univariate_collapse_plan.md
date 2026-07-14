@@ -42,7 +42,7 @@ an opportunity the current optimizer does **not** already take:
 | graph                  | baseline | collapse (upper bound) | collapse (feasible only) |
 |------------------------|----------|------------------------|--------------------------|
 | adder_v2               | 25       | −9                     | −0                       |
-| calculator_v2          | 38       | −17                    | −0                       |
+| calculator_simple          | 38       | −17                    | −0                       |
 | sort_digits_v1         | 63       | −26                    | −26                      |
 | calculator_scratchpad  | 16       | −2                     | −2                       |
 | **doom (production)**  | **64**   | **−15**                | **−10**                  |
@@ -540,7 +540,7 @@ measured numbers below.
   its oracle sweep.  Set from measured margins — every realized take
   peaks at 0.4× its lane cap (scratchpad, 306 candidates @ cap 768)
   while the expensive declines run 45×–800× over (adder_v2 29,609 @
-  cap 256; calculator_v2 213,918 @ cap 256).  Without it the certify
+  cap 256; calculator_simple 213,918 @ cap 256).  Without it the certify
   walk doubled suite wall time (torchwright 314s → 653s); with it the
   flag-on suite runs at baseline (252s / doom 302s).
 - Runs inside `lower()` after the v1 pass, v1's rewiring skeleton

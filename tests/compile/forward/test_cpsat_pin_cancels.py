@@ -31,6 +31,7 @@ from ortools.sat.python import cp_model
 from torchwright.compiler.forward.compile import forward_compile
 from torchwright.compiler.forward.cpsat_scheduler import (
     ATTN,
+    DiagnosticHint,
     MLP,
     build_cpsat_model,
     solve_schedule,
@@ -67,15 +68,15 @@ def _example_specs():
     from examples import (
         binary_increment,
         caesar_cipher,
-        calculator_v2,
+        calculator_simple,
         fibonacci,
         sort_digits_v1,
     )
 
     return {
-        "calculator": (lambda: calculator_v2.create_network_parts()[0], 1024, 16),
+        "calculator": (lambda: calculator_simple.create_network_parts()[0], calculator_simple.D_MODEL, calculator_simple.D_HEAD),
         "caesar": (lambda: caesar_cipher.create_network_parts()[0], 512, 16),
-        "sort_digits": (lambda: sort_digits_v1.create_network_parts()[0], 384, 32),
+        "sort_digits": (lambda: sort_digits_v1.create_network_parts()[0], sort_digits_v1.D_MODEL, sort_digits_v1.D_HEAD),
         "fibonacci": (lambda: fibonacci.create_network_parts()[0], 512, 16),
         "binary_increment": (
             lambda: binary_increment.create_network_parts()[0], 256, 16
@@ -289,10 +290,7 @@ def test_full_hint_with_pin_passes_strict_validation():
     assert donor is not None, f"donor solve failed ({donor_stats.status_name})"
     asg, stats = solve_schedule(
         low,
-        hint_layers=donor.node_to_layer,
-        hint_routing=donor.node_to_routing,
-        hint_cancel=donor.node_to_cancel_layer,
-        hint_cancel_mech=donor.node_to_cancel_mech,
+        _diagnostic_hint=DiagnosticHint.from_assignment(donor),
         strict_hint=True,
         _pin_cancels=True,
         **cfg,

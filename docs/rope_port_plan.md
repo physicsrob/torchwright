@@ -163,7 +163,7 @@ absolute position. A head controls its behavior by *which planes it places energ
     out of an attention *weight* (RoPE rotates Q/K not V, so the phase lives only in the score).
     That weight is computed by an exact float softmax everywhere — `F.scaled_dot_product_attention`
     on the MATH backend in the in-process component (`components/attn.py`) and the production HF
-    model (`modeling_torchwright.py`), and an ONNX `Softmax` op in the export (`export.py`) — never
+    model (`modeling_torchwright_custom.py`), and an ONNX `Softmax` op in the export (`export.py`) — never
     the torchwright `exp`+`reciprocal` PL chain. So the weight is ~fp32-exact (~6e-8), and the
     readout's risk is its *shape*, not weight noise.
 
@@ -339,8 +339,8 @@ flag is removed at Phase 5.
 > it via `_write_compute_attn` → `component.rotary_width`. ONNX export emits `rotate_half` in-graph
 > (cos/sin from `cache_position` in the cached preamble, per-layer enable consts, `rope_freq`/
 > `rope_split` inits, `rope_base` in the sidecar meta) — the loaders need no change. HF:
-> `TorchwrightConfig.rope_base`/`rotary_enable_per_layer`, converter derives them from inits+meta,
-> shipped `modeling_torchwright.py` carries inline `rotate_half`.
+> `TorchwrightCustomConfig.rope_base`/`rotary_enable_per_layer`, direct compiler derives them from inits+meta,
+> shipped `modeling_torchwright_custom.py` carries inline `rotate_half`.
 >
 > **Decision the plan didn't anticipate — rotary grid width.** The oracle/in-process path rotates
 > over the node's `d_qk` (so *partial-width* rotary works), but **ONNX and HF require full-width
@@ -361,7 +361,7 @@ flag is removed at Phase 5.
 **Phase 0 — Rotary `Attn` capability, end to end.** Add an opt-in rotary mode across the graph
 node (`graph/attn.py`, **including its `compute()` oracle path**), compiler (`_write_compute_attn`,
 `forward/weight_writer.py`), ONNX emission (`export.py`), the onnxruntime loaders, and the
-production HF model (`modeling_torchwright.py`). **Teach the oracle RoPE first:** `Attn.compute`
+production HF model (`modeling_torchwright_custom.py`). **Teach the oracle RoPE first:** `Attn.compute`
 (attn.py:124) does plain attention with the shift baked into static weights; RoPE rotation is
 per-token (by row index) and cannot be a static weight, so `compute()` needs a rotary path
 keyed on row index — otherwise `probe_compiled` compares against a wrong reference and every
@@ -709,11 +709,11 @@ changes land in torchwright and are validated by the §9 confidence suite + the 
 >   fingerprint term dropped), `affine_rules.py` (`_pos_encoding_rule` + the `[0,100000]` counter
 >   bound deleted), `probe.py`, `onnx_debug.py`, `export.py` (the `pos_encoding_full` initializer +
 >   `Gather` + `_compute_pos_encoding` + the additive `pos` residual term deleted; const-1 rides the
->   existing `constant_values` seed), `hf/modeling_torchwright.py` + `convert.py` (the
+>   existing `constant_values` seed), `hf/modeling_torchwright_custom.py` + `convert.py` (the
 >   `pos_encoding_full` buffer removed). `graph/pos_encoding.py` and the `d_head ≥ trig_width`
 >   constraint are **gone**. The whole compiler imports clean and a `compile_headless` +
 >   `probe_compiled` run shows **oracle parity** on a compiled rotary content head.
-> - **ONNX/HF emission — ✅ VALIDATED.** The `export.py` / `modeling_torchwright.py` / `convert.py`
+> - **ONNX/HF emission — ✅ VALIDATED.** The `export.py` / `modeling_torchwright_custom.py` / `convert.py`
 >   changes are exercised end-to-end on Modal (token model through `compile_to_onnx` → HF; prefill ==
 >   cached decode; save→load round trip). A real save→load **NaN bug** was found and fixed: the rotary
 >   `rope_freq`/`rope_enable` buffers were `persistent=False` and computed in `__init__`, so
@@ -756,7 +756,7 @@ changes land in torchwright and are validated by the §9 confidence suite + the 
 >   multiply-add into an FMA, the other doesn't) that the topology change made onnxruntime's optimizer
 >   apply. **Not a compiler bug** (no I1–I4 invariant governs onnxruntime≡torch; meaningful logits and all
 >   tokens are bit-identical). The parity tests now compare **teacher-forced** (identical inputs to both
->   backends) and tolerate the denormal floor (`tests/hf/test_convert.py`, mirroring the already-robust
+>   backends) and tolerate the denormal floor (`tests/hf/test_direct_phi3_parity.py`, mirroring the already-robust
 >   `test_calculator_parity`). The earlier "the always-1 enable `Mul` blocked the FMA fusion" story was
 >   **wrong** — multiply-by-1.0 is the IEEE identity (`fma(x,1,y)==add(x,y)`); the cause is onnxruntime's
 >   topology-sensitive fusion, not the enable node. Follow-up: the rotation is now emitted **directly as
@@ -778,7 +778,7 @@ changes land in torchwright and are validated by the §9 confidence suite + the 
   the `_via_ramp` twin is the shape); `get_position_scalar` → `count_since_marker` (Phase 1). Decide
   the `prefix_*` demos: migrate to a RoPE-native OOB detector or retire (examples-only — §8 Phase 1).
 - **Delete `PosEncoding`** (the sin/cos block + counter): the host position table (`transformer.py`,
-  the `export.py` `pos_encoding_full` initializer + `Gather`, the HF `modeling_torchwright.py` gather),
+  the `export.py` `pos_encoding_full` initializer + `Gather`, the HF `modeling_torchwright_custom.py` gather),
   the input-node classification/reservation, and the self-match gatekeeper (`_current_pos_attn_matrices`,
   which simplifies once Δ=0 is rotary identity). Remove the per-head rotary flag (rotation becomes
   global), the `d_head ≥ trig_width` constraint, the counter affine bound, and the `len(pos_encoding)`
@@ -989,7 +989,7 @@ step on a separate `torchwright_doom` branch**, not a per-phase gate in this rep
 - **Delete the host position table (three sites).** `transformer.py:103-106` (writes
   `get_pos_encoding(...)` rows into reserved residual columns each forward); the `pos_encoding_full`
   ONNX initializer + `Gather(pos_encoding_full, cache_position)` in `export.py`; and the HF model
-  `compiler/hf/modeling_torchwright.py`, which gathers `pos_encoding_full[cache_position]`.
+  `compiler/hf/modeling_torchwright_custom.py`, which gathers `pos_encoding_full[cache_position]`.
 - **The compiler self-match gatekeeper.** `_current_pos_attn_matrices` (`weight_writer.py:338`) —
   every Linear/Add/Cancel/add_into self-match flows through it (Phase-2 blast radius; delta_transfer
   removed on `main`). Today it reads `counter_col` only to zero it out of the logit; under RoPE the Δ=0
@@ -1021,10 +1021,10 @@ step on a separate `torchwright_doom` branch**, not a per-phase gate in this rep
   the recency family is `attend_most_recent_matching` (`attention_ops.py:1383`) and
   `get_prev_value` (`pos_encoding.py:129`). The compiler self-match callers (now **four** —
   delta_transfer removed on `main`) flow through `_current_pos_attn_matrices` (`weight_writer.py`),
-  and the host-position-table sites are in `transformer.py`, `export.py`, `modeling_torchwright.py`.
+  and the host-position-table sites are in `transformer.py`, `export.py`, `modeling_torchwright_custom.py`.
   **All line numbers here predate the `main` merge — re-grep before per-site work** (the merge
-  refactored `export.py`/`modeling_torchwright.py`, e.g. the then-untied embedding (now tied in
-  token.v6) and removed headless
+  refactored `export.py`/`modeling_torchwright_custom.py`, e.g. the then-untied embedding (now
+  tied in token.v6) and removed headless
   export shifted those line numbers). ✅ **Executed in Phase 5 (this branch):** the per-class rewrite
   and the host-table deletion landed; `get_prev_value` is now a module function in `attention_ops.py`,
   and `_current_pos_attn_matrices` / `graph/pos_encoding.py` no longer exist.

@@ -56,6 +56,17 @@ from torchwright.compiler.forward.compile import (
     forward_compile,
     rms_norm_width_supported,
 )
+from torchwright.compiler.token_model import (
+    CompileHeader,
+    CompileProfile,
+    ReluLayerWeights,
+    SwishLayerWeights,
+    TokenModelSpec,
+    build_token_weights,
+    make_layer_callback,
+    schedule_provenance,
+)
+from torchwright.compiler.utils import resolve_n_heads
 from torchwright.graph import Concatenate, Embedding, LiteralValue, Node
 from torchwright.graph.attn import CAUSAL_MASK_SENTINEL
 from torchwright.graph.rope import ROPE_BASE
@@ -65,7 +76,9 @@ from torchwright.graph.misc import InputNode
 # output in the embedding's exact ordered residual bank, clears every folded
 # seed before readout, and the final MatMul transposes ``embed_table`` itself.
 # There is no ``lm_head`` initializer and no unembed mask.  The binary layout
-# is intentionally incompatible with every earlier token artifact.
+# is intentionally incompatible with every earlier token artifact.  (v5 was
+# the input-state constant-seed fold into ``embed_table`` rows; v4 the rotary
+# positional encoding plus the optional identity RMSNorm.)
 TOKEN_META_FORMAT = "torchwright.token.v6"
 DEBUG_META_FORMAT = "torchwright.debug.v1"
 
@@ -88,26 +101,8 @@ def _write_meta(onnx_path: str, meta: dict) -> str:
 
 
 def _schedule_provenance(compiled, optimize: int) -> dict:
-    """Solver provenance for the artifact meta.
-
-    ``compiled.cpsat_solve_stats`` carries the CP-SAT outcome (including the
-    synthetic CACHED stats on a schedule-cache hit) but was dropped at export,
-    so a heuristic-fallback artifact was indistinguishable from a real solve.
-    ``status`` values: OPTIMAL / FEASIBLE / CACHED mean the artifact runs a
-    CP-SAT schedule; UNKNOWN / INFEASIBLE with ``optimize > 0`` mean the
-    solver failed and the artifact ships the heuristic fallback; ``null``
-    means the solver never ran (``optimize == 0``).
-    """
-    stats = getattr(compiled, "cpsat_solve_stats", None)
-    if stats is None:
-        return {"optimize": int(optimize), "status": None}
-    return {
-        "optimize": int(optimize),
-        "status": stats.status_name,
-        "objective": stats.objective_value,
-        "best_bound": stats.best_objective_bound,
-        "is_optimal": stats.is_optimal,
-    }
+    """Selected-schedule provenance plus the independent solver attempt."""
+    return schedule_provenance(compiled, optimize).to_dict()
 
 
 def debug_meta_path_for(onnx_path: str) -> str:
@@ -179,7 +174,7 @@ class OnnxArtifact:
 
 # Axis labels per matrix kind: (axis0 = what rows index, axis1 = what cols
 # index).  The attention head and d_head dims are flattened into a single
-# "head" axis of width n_heads*d_head == d, so head ``h`` occupies columns
+# "head" axis of width n_heads*d_head, so head ``h`` occupies columns
 # (or rows, for W_O) ``range(h*d_head, (h+1)*d_head)``.
 _MATRIX_AXES = {
     "attn.W_Q": ("residual_in", "head"),
@@ -239,7 +234,9 @@ def _diag_rects(matrix_id, rows, cols):
     return rects
 
 
-def _build_matrix_occupancy(compiled, canon, d: int, d_head: int):
+def _build_matrix_occupancy(
+    compiled, canon, d: int, d_head: int, n_heads: Optional[int] = None
+):
     """Build the ``matrices`` table and ``placements`` map for the sidecar.
 
     Returns ``(matrices, placements, n_heads, d_hidden_per_layer)``.  All
@@ -250,8 +247,8 @@ def _build_matrix_occupancy(compiled, canon, d: int, d_head: int):
     ``_<op_type>`` / ``_unreachable`` buckets — they occupy real matrix
     area, so completeness needs them, but they are not user-graph nodes.
     """
-    n_heads = d // d_head
-    head_dim = n_heads * d_head  # == d
+    n_heads = resolve_n_heads(d, d_head, n_heads)
+    head_dim = n_heads * d_head
 
     matrices: Dict[str, dict] = {}
     d_hidden_per_layer: List[int] = []
@@ -304,6 +301,7 @@ def _write_debug_sidecar(
     output_node: Node,
     d: int,
     d_head: int,
+    n_heads: int,
     kind: str,
     input_specs: List[tuple],
     checked_nodes: List[Node],
@@ -395,7 +393,7 @@ def _write_debug_sidecar(
         }
     )
     matrices, placements, n_heads, d_hidden_per_layer = _build_matrix_occupancy(
-        compiled, canon, d, d_head
+        compiled, canon, d, d_head, n_heads
     )
 
     # Per-node metadata keyed by canonical id — the same key space as
@@ -722,6 +720,7 @@ def _add_rope_inits(
 def _make_stream_layer_weights_cb(
     d: int,
     d_head: int,
+    n_heads: int,
     dense_inits: list,
     sparse_inits: list,
     per_layer_n_heads: list,
@@ -748,125 +747,71 @@ def _make_stream_layer_weights_cb(
     model is emitted instead.
 
     After trimming, each layer's attention matrices have shape
-    ``(nh, d, d_head)`` where ``nh <= d // d_head``.  Weight matrices
+    ``(nh, d, d_head)`` where ``nh <= n_heads``.  Weight matrices
     are emitted at the trimmed size and per-layer reshape constants
     are added so the ONNX graph can reshape to the correct head count.
 
     Appends each layer's ``nh`` to ``per_layer_n_heads`` for Phase 2.
     """
 
-    def on_layer_compiled(i: int, layer) -> None:
-        attn = layer.attn.attn
-        mlp = layer.mlp
+    class OnnxLayerSink:
+        def begin(self, header):
+            assert header.d == d and header.d_head == d_head
+            assert header.n_heads == n_heads
+            assert header.trim_heads == trim_heads and header.bias == bias
 
-        # Trim each layer here, before its tensors are read and nulled
-        # below.  ``used_heads`` (attn) and the per-slot weight columns
-        # (mlp) were populated by write_attn_sublayer/write_mlp_sublayer
-        # during this layer's compile, so both trims see final counts.
-        if trim_heads:
-            attn.trim_unused_heads()  # n_heads -> used heads (KV cache + attn MatMuls)
-            mlp.trim_unused_slots()  # d_hidden -> used slots (MLP MatMuls)
+        def write_layer(self, i, weights):
+            attn = weights.attention
+            nh, hd = attn.n_heads, attn.n_heads * d_head
+            per_layer_n_heads.append(nh)
+            if per_layer_rotary is not None:
+                per_layer_rotary.append({"base": attn.rope_base, "d_rot": attn.d_rot})
 
-        nh = attn.n_heads  # post-trim head count
-        hd = nh * d_head
-        per_layer_n_heads.append(nh)
+            def emit(name: str, arr: np.ndarray) -> None:
+                dense_tp, sparse_tp = _tensor_to_proto(name, arr)
+                _append_proto(dense_tp, sparse_tp, dense_inits, sparse_inits)
 
-        # RoPE on the one global grid (rotate_half over the rotary front d_rot,
-        # rotation by absolute position).  Record the shared base and the
-        # partial-rotary width; the rotation is emitted unconditionally below
-        # (there is no per-head enable).  base/d_rot are asserted global in
-        # _add_rope_inits.
-        if per_layer_rotary is not None:
-            per_layer_rotary.append(
-                {
-                    "base": getattr(attn, "rope_base", None),
-                    "d_rot": getattr(attn, "rope_d_rot", None),
-                }
+            emit(f"l{i}_WQ", attn.wq)
+            emit(f"l{i}_WK", attn.wk)
+            emit(f"l{i}_WV", attn.wv)
+            emit(f"l{i}_WO", attn.wo)
+            _add_int64_init(
+                f"l{i}_qkv_view_shape",
+                np.array([0, nh, d_head], dtype=np.int64),
+                dense_inits,
+            )
+            _add_int64_init(
+                f"l{i}_ctx_flat_shape",
+                np.array([0, hd], dtype=np.int64),
+                dense_inits,
             )
 
-        def emit(name: str, arr: np.ndarray) -> None:
-            dense_tp, sparse_tp = _tensor_to_proto(name, arr)
-            _append_proto(dense_tp, sparse_tp, dense_inits, sparse_inits)
+            def emit_bias(name, value):
+                if value is not None:
+                    emit(name, value)
 
-        # (nh, d, d_head) → (d, nh, d_head) → (d, hd)
-        emit(
-            f"l{i}_WQ",
-            attn.query_matrix.permute(1, 0, 2)
-            .reshape(d, hd)
-            .contiguous()
-            .cpu()
-            .numpy(),
-        )
-        attn.query_matrix = None
-        emit(
-            f"l{i}_WK",
-            attn.key_matrix.permute(1, 0, 2).reshape(d, hd).contiguous().cpu().numpy(),
-        )
-        attn.key_matrix = None
-        emit(
-            f"l{i}_WV",
-            attn.value_matrix.permute(1, 0, 2)
-            .reshape(d, hd)
-            .contiguous()
-            .cpu()
-            .numpy(),
-        )
-        attn.value_matrix = None
-        # (nh, d_head, d) → (hd, d): canonical W_O layout that feeds
-        # one (t, hd) @ (hd, d) MatMul at inference time.
-        emit(
-            f"l{i}_WO",
-            attn.output_matrix.reshape(hd, d).contiguous().cpu().numpy(),
-        )
-        attn.output_matrix = None
-
-        # Per-layer reshape constants for the ONNX graph.
-        _add_int64_init(
-            f"l{i}_qkv_view_shape",
-            np.array([0, nh, d_head], dtype=np.int64),
-            dense_inits,
-        )
-        _add_int64_init(
-            f"l{i}_ctx_flat_shape",
-            np.array([0, hd], dtype=np.int64),
-            dense_inits,
-        )
-
-        def emit_bias(name: str, lin) -> None:
-            # bias=False: no bias initializers exist in the artifact.  The
-            # writer folded every bias into the matrices, so the in-process
-            # vectors must be exactly zero — assert it (defense in depth
-            # against a missed writer site) instead of emitting.
-            if bias:
-                emit(name, lin.output_bias.cpu().numpy())
+            if isinstance(weights, SwishLayerWeights):
+                emit(f"l{i}_Wgate", weights.wgate)
+                emit_bias(f"l{i}_bgate", weights.bgate)
+                emit(f"l{i}_Wup", weights.wup)
+                emit_bias(f"l{i}_bup", weights.bup)
+                emit(f"l{i}_Wdown", weights.wdown)
+                emit_bias(f"l{i}_bdown", weights.bdown)
             else:
-                assert (lin.output_bias == 0.0).all(), (
-                    f"{name}: nonzero bias vector under bias=False — a "
-                    f"writer site skipped the BiasFold redirect.  Compiler "
-                    f"bug."
-                )
-            lin.output_bias = None
+                assert isinstance(weights, ReluLayerWeights)
+                emit(f"l{i}_W1", weights.w1)
+                emit_bias(f"l{i}_b1", weights.b1)
+                emit(f"l{i}_W2", weights.w2)
+                emit_bias(f"l{i}_b2", weights.b2)
 
-        if getattr(mlp, "activation", "relu") == "swish":
-            # Gated (SwiGLU) sublayer: gate / up / down projections.
-            emit(f"l{i}_Wgate", mlp.gate_proj.output_matrix.cpu().numpy())
-            mlp.gate_proj.output_matrix = None
-            emit_bias(f"l{i}_bgate", mlp.gate_proj)
-            emit(f"l{i}_Wup", mlp.up_proj.output_matrix.cpu().numpy())
-            mlp.up_proj.output_matrix = None
-            emit_bias(f"l{i}_bup", mlp.up_proj)
-            emit(f"l{i}_Wdown", mlp.down_proj.output_matrix.cpu().numpy())
-            mlp.down_proj.output_matrix = None
-            emit_bias(f"l{i}_bdown", mlp.down_proj)
-        else:
-            emit(f"l{i}_W1", mlp.linear1.output_matrix.cpu().numpy())
-            mlp.linear1.output_matrix = None
-            emit_bias(f"l{i}_b1", mlp.linear1)
-            emit(f"l{i}_W2", mlp.linear2.output_matrix.cpu().numpy())
-            mlp.linear2.output_matrix = None
-            emit_bias(f"l{i}_b2", mlp.linear2)
+        def finalize(self, spec, weights):
+            # Graph assembly below consumes the finalized semantic values.
+            self.spec = spec
+            self.token_weights = weights
 
-    return on_layer_compiled
+    return make_layer_callback(
+        CompileHeader(d, d_head, trim_heads, bias, n_heads=n_heads), OnnxLayerSink()
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -1061,7 +1006,7 @@ def _emit_cached_layer_nodes(
         ``d_rot`` dims (``front*cos + rotate_half(front)*sin``) and pass the last
         ``d_head - d_rot`` dims (the NoPE tail) through unchanged.  Matches
         graph/rope.py (vanilla partial rotary, half-split over d_rot);
-        modeling_torchwright.py mirrors this op sequence.
+        modeling_torchwright_custom.py mirrors this op sequence.
 
         ``d_rot == d_head`` (full rotary) emits the exact pre-partial 6-node
         sequence — byte-for-byte the same graph, so the cancel-head denormal-ULP
@@ -1070,7 +1015,7 @@ def _emit_cached_layer_nodes(
         No ``src + (rot - src)`` reconstruction: cross-backend onnxruntime/torch
         agreement is not algebraic — the cancel-head rows that cancel to denormal
         magnitude differ by one denormal ULP regardless of the form (the
-        test_convert parity bound tolerates it; no token or meaningful logit
+        direct-HF parity bound tolerates it; no token or meaningful logit
         moves), and the full suite is bit-exact with the direct form, so the
         extra Sub/Add bought nothing.
         """
@@ -1342,6 +1287,8 @@ def compile_to_onnx(
     rms_norm_eps: float = 1e-5,
     rms_norm_const_exp: Optional[int] = None,
     bias: bool = True,
+    profile: Optional[Union[CompileProfile, str]] = None,
+    n_heads: Optional[int] = None,
     _solver_seed: Optional[int] = None,
     _force_resolve: bool = False,
 ) -> OnnxArtifact:
@@ -1354,6 +1301,10 @@ def compile_to_onnx(
     ``extra_metadata`` is a free-form dict written under the sidecar's
     ``"extra"`` key (surfaced via ``OnnxTokenModule.metadata``); top-level
     sidecar keys are unchanged.
+
+    ``n_heads`` is the attention-head capacity of each compiled layer. It
+    defaults to ``d // d_head``. When explicit, ``n_heads * d_head`` is the
+    flattened attention width and may differ from ``d``.
 
     Writes three files:
         ``<output_path>``     — the ONNX model
@@ -1412,7 +1363,7 @@ def compile_to_onnx(
     on the pinned coordinates, clearing them before tied readout without an
     unembed mask. This makes the artifact a stock Llama-style decoder (a
     skeptic can't say "no normalization"); it adds the gain weights as
-    initializers (mapped by ``convert.py``) and folds the constants into
+    initializers and folds the constants into
     ``embed_table`` (no new buffer).  The norm is **on by default**: ``None``
     enables it.  With the norm on, ``d`` must be a **supported width: any
     multiple of 1024 up to 16384, or any power of two** (the full table and
@@ -1437,6 +1388,13 @@ def compile_to_onnx(
     # (potentially very long) streaming compile would waste the whole run.
     cache_stride_resolved = _resolve_cache_stride(cache_stride, max_seq_len)
 
+    machine = None
+    if profile is not None:
+        resolved_profile = CompileProfile(profile)
+        machine = resolved_profile.machine
+        bias = resolved_profile.bias
+        rms_norm = resolved_profile.rms_norm
+
     # Resolve the norm policy.  RMSNorm is on by default (None -> True): every
     # shipped artifact should carry the real norm.  Refuse an unsupported
     # width with the norm on — fail fast and loudly here (before the long
@@ -1451,6 +1409,7 @@ def compile_to_onnx(
             f"Use a supported d, or pass rms_norm=False to export without "
             f"the norm."
         )
+    n_heads = resolve_n_heads(d, d_head, n_heads)
 
     # Attached-check coverage for the debug sidecar.  Collection order
     # doesn't matter: compilation never mutates the source graph, so its
@@ -1467,6 +1426,7 @@ def compile_to_onnx(
     on_layer_compiled = _make_stream_layer_weights_cb(
         d,
         d_head,
+        n_heads,
         dense_inits,
         sparse_inits,
         per_layer_n_heads,
@@ -1480,6 +1440,7 @@ def compile_to_onnx(
     compiled = forward_compile(
         d=d,
         d_head=d_head,
+        n_heads=n_heads,
         output_node=output_node,
         verbose=verbose,
         max_layers=max_layers,
@@ -1489,6 +1450,7 @@ def compile_to_onnx(
         optimize=optimize,
         bias=bias,
         output_layout_source=embedding,
+        machine=machine,
         d_hidden=d_hidden,
         # Measurement-only (§0): reproducible descent seed + fresh-solve for
         # the sound production draw.  Never set in production configs.
@@ -1507,7 +1469,7 @@ def compile_to_onnx(
     rms_spec = compiled.rms_norm_spec
     t_compile = time.perf_counter() - t0
     if verbose and per_layer_n_heads:
-        _max_heads = d // d_head
+        _max_heads = n_heads
         _total = _max_heads * len(per_layer_n_heads)
         _kept = sum(per_layer_n_heads)
         print(
@@ -1617,6 +1579,17 @@ def compile_to_onnx(
     for idx, val in literal_seeds:
         embed_table[:, idx] = val
 
+    # The backend-neutral builder is the contract for these semantic folds.
+    # Keep the local variables used by the mature graph emitter, but replace
+    # them with the shared builder's results and assert equivalence while this
+    # exporter assembly is incrementally moved behind the sink boundary.
+    # v6: there is no ``lm_head`` initializer — the tied readout transposes
+    # ``embed_table`` itself (the builder still materializes the compact
+    # untied projection for the stock-architecture HF target).
+    token_weights = build_token_weights(compiled, output_node, embedding, d)
+    assert np.array_equal(embed_table, token_weights.embed_table)
+    embed_table = token_weights.embed_table
+
     # Initializers
     _add_float_init("embed_table", embed_table, dense_inits, sparse_inits)
     # Pinned-constant RMSNorm gain weights (Llama3-named on the HF side): one
@@ -1624,7 +1597,8 @@ def compile_to_onnx(
     # uniform (d,) vector = 2^m, which cancels the forced rms = 2^m exactly.  A
     # single shared eps scalar feeds every norm.
     if rms_spec is not None:
-        gain_vec = np.full(d, rms_spec.gain, dtype=np.float32)
+        gain_vec = token_weights.norm_gain
+        assert gain_vec is not None
         for i in range(n_layers):
             _add_float_init(
                 f"l{i}_input_layernorm", gain_vec, dense_inits, sparse_inits
@@ -1665,6 +1639,29 @@ def compile_to_onnx(
     # emits cos/sin from cache_position when active (no-op otherwise).
     rope_base_val, rope_d_rot_val = _add_rope_inits(
         per_layer_rotary, d_head, dense_inits
+    )
+    on_layer_compiled.token_model_sink.finalize(
+        TokenModelSpec(
+            d=d,
+            d_head=d_head,
+            max_seq_len=max_seq_len,
+            vocab=tuple(embedding.tokenizer.vocab),
+            vocab_size=vocab_size,
+            activation=compiled.activation,
+            bias=bool(bias),
+            rms_norm=rms_spec is not None,
+            rms_norm_eps=float(rms_spec.eps if rms_spec else rms_norm_eps),
+            rope_base=rope_base_val,
+            d_rot=rope_d_rot_val,
+            n_layers=n_layers,
+            per_layer_n_heads=tuple(per_layer_n_heads),
+            per_layer_d_hidden=tuple(
+                int(getattr(layer.mlp, "d_hidden", d)) for layer in compiled.layers
+            ),
+            schedule_provenance=schedule_provenance(compiled, optimize),
+            extra_metadata=dict(extra_metadata or {}),
+        ),
+        token_weights,
     )
     _emit_cached_preamble(nodes)
     # the residual seed (no projection).  Position is a rotation applied inside
@@ -1745,13 +1742,12 @@ def compile_to_onnx(
         # The full static slot count S: with the symbolic cache_slots
         # first dim on past_K_i, loaders read S from here.
         "cache_stride": cache_stride_resolved,
-        # RoPE on the one global grid; the converter rebuilds the rotation from
-        # the base and the partial-rotary width d_rot (== d_head for full rotary).
+        # RoPE on one global grid; sibling backends rebuild the rotation from
+        # the base and partial-rotary width d_rot (== d_head for full rotary).
         "rope_base": rope_base_val,
         "d_rot": rope_d_rot_val,
         # Whether a real (identity) RMSNorm is emitted, and its epsilon — the HF
-        # converter needs the eps to build the config (the gain weights it reads
-        # from the initializers, but eps is not a tensor).
+        # Sibling backends need eps in their config; unlike gain, it is not a tensor.
         "rms_norm": rms_spec is not None,
         "rms_norm_eps": rms_spec.eps if rms_spec is not None else None,
         # Machine kind ("relu" | "swish"): which MLP-sublayer emission the
@@ -1787,6 +1783,7 @@ def compile_to_onnx(
             output_node=output_node,
             d=d,
             d_head=d_head,
+            n_heads=n_heads,
             kind="token",
             # The token graph reads its ids from the Embedding node's
             # input slot; one 1-wide column matches the convention
@@ -2259,6 +2256,7 @@ def compile_headless(
     *,
     d: int = 1024,
     d_head: int = 16,
+    n_heads: Optional[int] = None,
     max_layers: int = 400,
     verbose: bool = False,
     device: str = "cpu",
@@ -2283,6 +2281,10 @@ def compile_headless(
     ``d_hidden`` is the per-layer MLP hidden width.  Defaults to ``d``
     when omitted; pass an explicit value to decouple the MLP intermediate
     width from the residual stream width.
+
+    ``n_heads`` is the per-layer attention-head capacity. It defaults to
+    ``d // d_head``; pass it explicitly to decouple the flattened attention
+    width ``n_heads * d_head`` from ``d``.
 
     ``optimize``, ``bias``, and ``output_layout_source`` thread straight to
     ``forward_compile`` (same meaning as on :func:`compile_to_onnx`) — so
@@ -2312,6 +2314,7 @@ def compile_headless(
     net = forward_compile(
         d=d,
         d_head=d_head,
+        n_heads=n_heads,
         output_node=combined_output,
         verbose=verbose,
         max_layers=max_layers,

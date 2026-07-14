@@ -23,6 +23,7 @@ import torch
 from torchwright.compiler.forward.compile import forward_compile
 from torchwright.compiler.forward.cpsat_scheduler import (
     ATTN,
+    DiagnosticHint,
     MLP,
     ScheduleAssignment,
     SolveStats,
@@ -396,17 +397,24 @@ def test_eager_warm_start_hint_is_accepted_not_dropped():
     assert hint_n > 0, "eager warm start deadlocked"
     assert any(v == MLP for v in hint_mech.values()), "expected MLP-cancels in the hint"
 
+    hint = DiagnosticHint(
+        layers=hint_layers,
+        routing=hint_routing,
+        cancel=hint_cancel,
+        cancel_mech=hint_mech,
+    )
     built = build_cpsat_model(
         out,
         d=d,
         d_head=d_head,
         d_hidden=d_hidden,
         max_layers=max_layers,
-        hint_layers=hint_layers,
-        hint_cancel=hint_cancel,
+        diagnostic_hint=hint,
     )
     violations = _validate_hint(
-        built, hint_layers, hint_routing, hint_cancel, hint_mech, max_layers=max_layers
+        built,
+        hint,
+        max_layers=max_layers,
     )
     assert violations == [], f"eager warm-start hint has violations: {violations}"
 
@@ -418,10 +426,7 @@ def test_eager_warm_start_hint_is_accepted_not_dropped():
         d_head=d_head,
         d_hidden=d_hidden,
         max_layers=max_layers,
-        hint_layers=hint_layers,
-        hint_routing=hint_routing,
-        hint_cancel=hint_cancel,
-        hint_cancel_mech=hint_mech,
+        _diagnostic_hint=hint,
         strict_hint=True,
     )
     assert asg is not None, f"solver found no schedule ({stats.status_name})"
@@ -446,12 +451,24 @@ def test_validate_hint_flags_mlp_mechanism_on_input():
     hint_layers = {y.node_id: 0, out.node_id: 1}
 
     violations = _validate_hint(
-        built, hint_layers, None, {x.node_id: 1}, {x.node_id: MLP}, max_layers=6
+        built,
+        DiagnosticHint(
+            layers=hint_layers,
+            cancel={x.node_id: 1},
+            cancel_mech={x.node_id: MLP},
+        ),
+        max_layers=6,
     )
     assert any("MLP cancel mechanism" in v for v in violations), violations
 
     clean = _validate_hint(
-        built, hint_layers, None, {x.node_id: 1}, {x.node_id: ATTN}, max_layers=6
+        built,
+        DiagnosticHint(
+            layers=hint_layers,
+            cancel={x.node_id: 1},
+            cancel_mech={x.node_id: ATTN},
+        ),
+        max_layers=6,
     )
     assert clean == [], clean
 
@@ -474,11 +491,17 @@ def test_validate_hint_checks_add_consumer_free_gap():
     hint_layers = {u.node_id: 0, w.node_id: 0, add.node_id: 1, out.node_id: 2}
 
     violations = _validate_hint(
-        built, hint_layers, None, {u.node_id: 1}, None, max_layers=6
+        built,
+        DiagnosticHint(layers=hint_layers, cancel={u.node_id: 1}),
+        max_layers=6,
     )
     assert any("consumer's layer+1" in v for v in violations), violations
 
-    clean = _validate_hint(built, hint_layers, None, {u.node_id: 2}, None, max_layers=6)
+    clean = _validate_hint(
+        built,
+        DiagnosticHint(layers=hint_layers, cancel={u.node_id: 2}),
+        max_layers=6,
+    )
     assert clean == [], clean
 
 
@@ -504,7 +527,13 @@ def test_validate_hint_held_target_add_permits_gap_zero():
     )
     hint_layers = {left.node_id: 0, out.node_id: 1}
     clean = _validate_hint(
-        built, hint_layers, None, {src.node_id: 1}, {src.node_id: ATTN}, max_layers=6
+        built,
+        DiagnosticHint(
+            layers=hint_layers,
+            cancel={src.node_id: 1},
+            cancel_mech={src.node_id: ATTN},
+        ),
+        max_layers=6,
     )
     assert clean == [], clean
 

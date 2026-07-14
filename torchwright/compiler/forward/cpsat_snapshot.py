@@ -206,9 +206,9 @@ class FrozenHint:
     """The eager warm-start hint, frozen into the snapshot.
 
     A shared hint improves A/B matching across re-solves (every arm starts
-    from the identical incumbent), and it is exactly what a consumer passes to
-    ``solve_schedule`` as ``hint_layers`` / ``hint_routing`` / ``hint_cancel`` /
-    ``hint_cancel_mech``.
+    from the identical incumbent). Snapshot tooling converts it to the single
+    ``DiagnosticHint`` seam, or to a complete ``ScheduleAssignment`` when all
+    semantic fields are available.
     """
 
     layers: Dict[int, int]
@@ -466,6 +466,7 @@ class SchedulingProblem:
         output_node,
         d: int,
         d_head: int,
+        n_heads: Optional[int] = None,
         d_hidden: int,
         flex_routing: bool,
         cancel_slack: Optional[int],
@@ -517,6 +518,7 @@ class SchedulingProblem:
             output_node,
             d=d,
             d_head=d_head,
+            n_heads=n_heads,
             d_hidden=d_hidden if fingerprint_d_hidden is None else fingerprint_d_hidden,
             flex_routing=flex_routing,
             cancel_slack=cancel_slack,
@@ -526,7 +528,7 @@ class SchedulingProblem:
             held_output_source=held_source_node,
             held_output_target=held_target_node,
         )
-        geometry = {
+        geometry: Dict[str, object] = {
             "d": d,
             "d_head": d_head,
             "d_hidden": d_hidden,
@@ -538,6 +540,11 @@ class SchedulingProblem:
             "bias": bias,
             "policy": _asdict(policy) if policy is not None else None,
         }
+        from torchwright.compiler.utils import resolve_n_heads
+
+        resolved_n_heads = resolve_n_heads(d, d_head, n_heads, require_divisible=False)
+        if d % d_head != 0 or resolved_n_heads != d // d_head:
+            geometry["n_heads"] = resolved_n_heads
         identity = SnapshotIdentity(
             fingerprint=fingerprint,
             critical_path_layers=critical_path_layers,

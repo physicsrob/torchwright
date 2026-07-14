@@ -1,14 +1,14 @@
 """Layer scheduler for the forward compiler.
 
 Given the current residual stream state and graph metadata, decides what
-to compute/cancel in one transformer layer. Returns AttnHeadOp and MLPOp
-lists for the weight writer.
+to compute/cancel in one transformer layer. Mutable scheduler records stay
+private to this module and are frozen into ReplayPlan records at the boundary.
 
 Mutates residual_map (allocate, free, reassign) and computed_nodes (add).
 """
 
-from dataclasses import dataclass
-from typing import Dict, List, Optional, Set, Tuple
+from dataclasses import dataclass, field
+from typing import Dict, List, Literal, Optional, Set, Tuple
 
 from torchwright.compiler.realization import (
     RealizationTable,
@@ -17,6 +17,7 @@ from torchwright.compiler.realization import (
     linear_attn_heads,
     usable_hidden_slots,
 )
+from torchwright.compiler.utils import resolve_n_heads
 from torchwright.compiler.residual_assignment import flatten_concat_nodes
 from torchwright.compiler.forward.cpsat_scheduler import ScheduleAssignment
 from torchwright.compiler.forward.graph_analysis import GraphAnalyzer
@@ -26,10 +27,45 @@ from torchwright.compiler.forward.residual_map import (
 )
 from torchwright.compiler.forward.sibling_clusters import SiblingClusters
 from torchwright.compiler.forward.scheduling_policy import SchedulingPolicy
-from torchwright.compiler.forward.weight_writer import AttnHeadOp, MLPOp
 from torchwright.graph import Node, Linear, Attn, Add, Concatenate
 from torchwright.graph.misc import LiteralValue
 from torchwright.graph.ffn import FFN
+
+
+@dataclass
+class _AttentionOp:
+    """Mutable attention record used only during one scheduler walk."""
+
+    op_type: Literal[
+        "compute_attn",
+        "compute_linear",
+        "compute_add",
+        "cancel",
+        "add_into",
+    ]
+    node: Optional[Node]
+    target_cols: List[int]
+    source_cols: Optional[List[int]] = None
+    source_cols_b: Optional[List[int]] = None
+    q_source_cols: Optional[List[int]] = None
+    k_source_cols: Optional[List[int]] = None
+
+
+@dataclass
+class _MlpOp:
+    """Mutable MLP record used only during one scheduler walk."""
+
+    op_type: Literal[
+        "compute_ffn",
+        "compute_literal_value",
+        "compute_bias",
+        "compute_linear_bypass",
+        "cancel_bypass",
+    ]
+    node: Optional[Node]
+    target_cols: List[int]
+    mlp_slots: List[int] = field(default_factory=list)
+    source_cols: Optional[List[int]] = None
 
 
 @dataclass(frozen=True)
@@ -110,6 +146,7 @@ class LayerScheduler:
         realization_table: Optional[RealizationTable] = None,
         bias: bool = True,
         held_output_layout: Optional[HeldOutputLayout] = None,
+        n_heads: Optional[int] = None,
     ):
         self.graph = graph
         self.d = d
@@ -123,7 +160,7 @@ class LayerScheduler:
         # unpackable on replay.
         self.bias = bias
         self.usable_hidden_slots = usable_hidden_slots(self.d_hidden, bias)
-        self.n_heads = d // d_head
+        self.n_heads = resolve_n_heads(d, d_head, n_heads, require_divisible=False)
         self.pos_encoding = pos_encoding
         self.policy = policy if policy is not None else SchedulingPolicy()
         # The resolved realization table the walk reads (one artifact,
@@ -166,7 +203,7 @@ class LayerScheduler:
 
     def schedule_layer(
         self, residual_map: ResidualStreamMap, computed_nodes: Set[Node]
-    ) -> Tuple[List[AttnHeadOp], List[MLPOp], List[Node]]:
+    ) -> Tuple[List[_AttentionOp], List[_MlpOp], List[Node]]:
         """Schedule one transformer layer's worth of operations.
 
         Phases:
@@ -314,7 +351,7 @@ class LayerScheduler:
 
     def _schedule_layer_inner(
         self, residual_map: ResidualStreamMap, computed_nodes: Set[Node]
-    ) -> Tuple[List[AttnHeadOp], List[MLPOp], List[Node], bool]:
+    ) -> Tuple[List[_AttentionOp], List[_MlpOp], List[Node], bool]:
         # Skip reasons for THIS pass only.  ``schedule_layer`` may call this
         # twice (the admission-bypass retry), and it is the retry's skips that
         # explain a deadlock — the first pass's were provisional.
@@ -465,7 +502,7 @@ class LayerScheduler:
         # irrelevant (all heads run in parallel and sum into the residual
         # stream), so it's fine to append after compute ops.
         if cancel_cols:
-            attn_ops.append(AttnHeadOp("cancel", None, cancel_cols))
+            attn_ops.append(_AttentionOp("cancel", None, cancel_cols))
 
         # Caller (schedule_layer) handles the progress check after the
         # admission-retry pass.
@@ -490,7 +527,7 @@ class LayerScheduler:
 
         # The dead-node cancels in this layer (zeroing a dying node's columns
         # so they can be reused) are batched into a single
-        # AttnHeadOp("cancel", None, cancel_cols) emitted at the end.
+        # _AttentionOp("cancel", None, cancel_cols) emitted at the end.
         # Coalescing matters: one cancel head can zero d_head cols, so
         # scattering one cancel op per write-site burns heads that would
         # otherwise be shared.  ``heads_used`` tracks main-op heads
@@ -565,7 +602,7 @@ class LayerScheduler:
             target_cols = residual_map.get_indices(dead_addend)
             live_source_cols = residual_map.resolve_indices(live_addend)
             attn_ops.append(
-                AttnHeadOp(
+                _AttentionOp(
                     "add_into",
                     add_node,
                     target_cols,
@@ -895,7 +932,7 @@ class LayerScheduler:
                 )
                 return False
 
-            op = AttnHeadOp(op_type, node, target_cols)
+            op = _AttentionOp(op_type, node, target_cols)
             for attr, cols in sources.items():
                 setattr(op, attr, cols)
             attn_ops.append(op)
@@ -1077,7 +1114,7 @@ class LayerScheduler:
             )
             input_cols = residual_map.resolve_indices(ffn.inputs[0])
             mlp_ops.append(
-                MLPOp(
+                _MlpOp(
                     "compute_ffn",
                     ffn,
                     target_cols,
@@ -1149,7 +1186,7 @@ class LayerScheduler:
                 )
                 input_cols = residual_map.resolve_indices(node.inputs[0])
                 mlp_ops.append(
-                    MLPOp(
+                    _MlpOp(
                         "compute_linear_bypass",
                         node,
                         target_cols,
@@ -1193,7 +1230,7 @@ class LayerScheduler:
                 f"target_cols={len(target_cols)}, len(node)={len(node)}, "
                 f"value.numel()={node.value.numel()}."
             )
-            mlp_ops.append(MLPOp("compute_literal_value", node, target_cols, []))
+            mlp_ops.append(_MlpOp("compute_literal_value", node, target_cols, []))
             computed_nodes.add(node)
             self._mark_scheduled(node)
 
@@ -1202,7 +1239,7 @@ class LayerScheduler:
         # was scheduled in the attention sublayer, so no extra cancel here.
         for node in biased_linears:
             target_cols = residual_map.get_indices(node)
-            mlp_ops.append(MLPOp("compute_bias", node, target_cols, []))
+            mlp_ops.append(_MlpOp("compute_bias", node, target_cols, []))
 
         # 3e. MLP-cancel: zero dead nodes' columns via `cancel_bypass` while
         # hidden slots remain.  Emitted last so the freed columns are not reused
@@ -1219,7 +1256,7 @@ class LayerScheduler:
             mlp_slots = list(range(next_slot, next_slot + n_slots))
             next_slot += n_slots
             mlp_ops.append(
-                MLPOp(
+                _MlpOp(
                     "cancel_bypass",
                     None,
                     cols,
@@ -1744,7 +1781,7 @@ class LayerScheduler:
 
         Runs the I4 schedule-time liveness check (``_require_live``) at the
         capture site and returns exactly the attributes later copied onto the
-        emitted ``AttnHeadOp`` (the weight-writer reads sources from the op,
+        emitted ``_AttentionOp`` (the weight-writer reads sources from the op,
         never from the residual map at write time).  The heuristic calls this
         lazily at placement; the directed replay calls it for its complete
         attention batch before any release commits.  Either way the capture
@@ -1843,7 +1880,7 @@ class DirectedLayerScheduler(LayerScheduler):
       timing (load-bearing for the MLP sublayer's gap-0 cancels).
 
     What it preserves (by inheriting the parent's per-layer code path):
-    cancel coalescing into a single batched ``AttnHeadOp("cancel")``,
+    cancel coalescing into a single batched ``_AttentionOp("cancel")``,
     source-column capture via ``_require_live``, and the four allocator
     invariants I1–I4 (which run inside ``ResidualStreamMap`` and the
     weight-writer that this subclass doesn't touch).
@@ -1867,6 +1904,7 @@ class DirectedLayerScheduler(LayerScheduler):
         realization_table: Optional[RealizationTable] = None,
         bias: bool = True,
         held_output_layout: Optional[HeldOutputLayout] = None,
+        n_heads: Optional[int] = None,
     ):
         # The CP-SAT model does not represent the sibling-cluster admission
         # constraint (docs/cpsat_scheduler.md §3 Model preconditions), so a
@@ -1895,6 +1933,7 @@ class DirectedLayerScheduler(LayerScheduler):
             d,
             d_head,
             pos_encoding,
+            n_heads=n_heads,
             d_hidden=d_hidden,
             clusters=clusters,
             admission_budget_fraction=admission_budget_fraction,

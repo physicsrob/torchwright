@@ -92,8 +92,31 @@ fewer layers).
    └───────────────────────────────┘
               │
               ▼
+   immutable ReplayPlan
+     planned attention/MLP ops
+     exact physical resource counts
+     residual snapshots + layer shapes
+              │
+              ▼
+   streaming dense emission
+   (no scheduler or allocator access)
+              │
+              ▼
    HeadlessTransformer
 ```
+
+The directed scheduler/allocator walk occurs once per assignment considered.
+The selected plan is emitted without replaying its assignment. With weighted
+`Costs`, incumbent and solver-candidate plans are each built at most once and
+compared using realized head, bypass-slot, earliness, and residual-waste costs.
+
+`ScheduleResult` records the emitted assignment separately from the solver
+attempt. Its provenance names the selected origin (`heuristic` or `solver`),
+delivery (`fresh` or `cache`), realized objective, and selected-schedule
+optimality certificate. `SolveStats` remains attached as `solver_attempt`; an
+optimal solver candidate therefore never certifies a different heuristic plan
+that wins the realized replay comparison. The schedule cache persists both
+records and reconstructs the same distinction on a hit.
 
 ### `ScheduleAssignment`
 
@@ -509,14 +532,16 @@ Why it ships as the default (evidence, d=8192 production fixture,
 
 **The cancel-mechanism hint is load-bearing.**  Under the pin the
 warm start keeps the layer, routing, and `cancel_in_mlp` hints and
-drops only the cancel-layer values (`_solve_built` nulls
-`hint_cancel`; the values are forced by propagation once the
-mechanism is decided).  The mechanism bits carry the packing choice
+drops only the cancel-layer values (`_solve_built` derives a
+`DiagnosticHint.without_cancel_layers()` view; the values are forced by
+propagation once the mechanism is decided). The mechanism bits carry the
+packing choice
 at head-saturated layers — which cancels take the same-layer MLP tier
 where the attention-head budget is exactly full — and without them
 the pinned model completed the hint into ZERO incumbents in 5×600 s
-on the production fixture.  Any caller that hints a pinned solve must
-pass `hint_cancel_mech`.
+on the production fixture. Complete production warm starts carry this choice
+inside their `ScheduleAssignment`; diagnostic hints carry it in
+`DiagnosticHint.cancel_mech`.
 
 `_pin_cancels=False` is the escape hatch: it rebuilds the legacy
 window/parked/widening model byte-identically (the sections below
@@ -717,13 +742,16 @@ node:
   heuristic's cancel ran in (the same tracking-map `free(node, mech)`
   records it).  Hinted to `cancel_in_mlp[n]`.
 
-All four are passed to `solve_schedule`.  Under the pinned-cancel
-default the solver applies layers, routing, and mechanism as
+The four collections are frozen into one complete `ScheduleAssignment` and
+passed to `solve_schedule(incumbent=...)`. Under the pinned-cancel default the
+solver applies layers, routing, and mechanism as
 `AddHint` calls and drops the cancel-layer values before validation
 (they are forced by the pin; a captured cancel that disagreed would
 make CP-SAT silently discard the whole incumbent) — the mechanism
 bits are the load-bearing family there, see *Pinned cancel layers*
-in §3.  Under `_pin_cancels=False` all four families are hinted.  The
+in §3. Under `_pin_cancels=False` all four families are hinted. Tests and
+measurement tools that need partial or deliberately invalid values use one
+immutable `DiagnosticHint` behind the private `_diagnostic_hint` seam. The
 heuristic's layer count also tightens the search horizon
 (`max_layers = min(user_max, hint_n_layers + 1)`), which shrinks
 each `layer_var`'s domain.
@@ -823,9 +851,9 @@ against the same per-layer head budget as compute, and the heuristic
 returns `None` — the free retries next layer).  On the production
 DOOM graph ~385 nodes' frees land exactly one layer past the K=2
 window, making the entire warm-start hint infeasible (see the
-warm-start section below).  When `build_cpsat_model` receives
-`hint_layers`/`hint_cancel`, each hinted node's window is therefore
-widened by exactly the amount its hint needs:
+warm-start section below). When the diagnostic model builder receives a
+`DiagnosticHint`, each hinted node's window is widened by exactly the amount
+its `layers`/`cancel` mappings need:
 
 ```
 delta_n = max(0, hint_cancel[n] - (hint_last_consumer + 1 + K))

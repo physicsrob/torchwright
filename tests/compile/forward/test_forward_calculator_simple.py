@@ -4,13 +4,13 @@ decode (converted from ``forward_compile``; see ``_example_onnx``).
 
 import pytest
 
-from examples.calculator_v2 import D_HEAD
+from examples.calculator_simple import D_HEAD
 
 from ._example_onnx import load_example, run
 
 
 def _build(digits):
-    from examples.calculator_v2 import create_network_parts
+    from examples.calculator_simple import create_network_parts
 
     return create_network_parts(digits)
 

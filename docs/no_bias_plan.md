@@ -58,7 +58,7 @@ constant lane is cancelled in the final MLP update.
    fp32 arithmetic end to end (see Phase N2). ReLU machine: gate row
    1.0.
 
-5. **The HF converter refuses `bias=False` artifacts loudly** (as it
+5. **The HF direct compiler refuses `bias=False` artifacts loudly** (as it
    already refuses swish ones). A true `LlamaForCausalLM` emission is
    a follow-up, not part of this plan.
 
@@ -98,7 +98,7 @@ Fold `constant_values` into `embed_table` exactly the way the RMSNorm
 columns fold: every vocab row gets the constant at the literal's
 columns. Delete the Add node and the `constant_values` initializer
 from the ONNX graph; drop the HF module's buffer and update the
-converter. Bump `TOKEN_META_FORMAT` v4 → v5 (the format header is
+direct compiler. Bump `TOKEN_META_FORMAT` v4 → v5 (the format header is
 explicit that a changed initializer set requires a version bump; old
 artifacts re-export).
 
@@ -107,7 +107,7 @@ embedding's columns (residual allocation is pairwise disjoint, I1), so
 the folded table cells are exactly 0.0 today, and gathering a row that
 contains 1.0 equals gathering 0.0 then adding 1.0. Every numeric and
 parity test passes untouched; only structure-pinning expectations and
-the HF converter move.
+the HF direct compiler move.
 
 After this commit the `bias=False` feature has nothing seed-related
 left to do.
@@ -221,7 +221,7 @@ would silently under-report matrix occupancy in the sidecar.
   rides the sidecar payload), with `OnnxDebugSession` cross-checking
   it explicitly — the same treatment `activation` got in swiglu Phase
   A4.
-- HF converter: refuse `bias=False` artifacts loudly.
+- HF direct compiler: refuse `bias=False` artifacts loudly.
 
 With `bias=False` + `rms_norm=True` on the swish machine, the ONNX
 artifact is structurally a standard Llama-style decoder — Gather →

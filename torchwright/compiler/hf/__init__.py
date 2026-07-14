@@ -2,36 +2,51 @@
 models — the torch-native counterpart to ``compiler/onnx_load.py``'s ONNX
 runtime loaders.
 
-A compiled torchwright token artifact is a bona-fide standard transformer: a
-``token`` head (one table tied between lookup and unembed) over a uniform-width residual
-stream with causal ``scale=1.0`` attention, ``relu`` MLP blocks, and
-(optionally) identity RMSNorms. This package reimplements that exact forward
-path as real ``nn.Module``s so the artifact loads as an ordinary
-``AutoModelForCausalLM`` and runs under stock ``generate``.
+A compiled torchwright token graph targets stock ``Phi3ForCausalLM`` by
+default: SwiGLU, biasless projections, RMSNorm, and ordinary
+``AutoModelForCausalLM`` loading without remote code. The custom ReLU model is
+an explicit ``architecture="custom"`` escape hatch.  Either way the compiled
+token head is tied (token.v6): one table serves lookup and unembed, with the
+output written into the embedding's exact ordered residual bank.
 
-- :class:`TorchwrightConfig` / :class:`TorchwrightForCausalLM` — the shipped
-  config + model (torch/transformers only; safe to publish with
-  ``trust_remote_code``).
-- :class:`TorchwrightTokenizer` — a generic character-level tokenizer over a
+- :class:`TorchwrightCustomConfig` / :class:`TorchwrightCustomForCausalLM` —
+  the explicitly requested custom config + model.
+- :class:`TorchwrightCustomTokenizer` — a generic character-level tokenizer over a
   model's vocab (DOOM ships its own richer tokenizer).
-- ``convert`` (imported explicitly: ``from torchwright.compiler.hf.convert
-  import ...``) — the build-time ONNX → safetensors converter. Kept out of this
-  ``__init__`` because it imports ``onnx``; loading a published model never
-  needs it.
+- :func:`compile_to_hf` and :func:`compile_hf_bundle` — direct build-time
+  sinks over the compiler's backend-neutral streaming weight records.
 """
 
-from .configuration_torchwright import TorchwrightConfig
-from .modeling_torchwright import (
-    TorchwrightForCausalLM,
-    TorchwrightModel,
-    TorchwrightPreTrainedModel,
+from .configuration_torchwright_custom import TorchwrightCustomConfig
+from .modeling_torchwright_custom import (
+    TorchwrightCustomForCausalLM,
+    TorchwrightCustomModel,
+    TorchwrightCustomPreTrainedModel,
 )
-from .tokenization_torchwright import TorchwrightTokenizer
+from .tokenization_torchwright_custom import TorchwrightCustomTokenizer
+from .build import (
+    CompileProfile,
+    HFArchitecture,
+    HFBundleReport,
+    ScheduleProvenance,
+    build_fast_tokenizer,
+    compile_hf_bundle,
+    compile_to_hf,
+    save_hf_bundle,
+)
 
 __all__ = [
-    "TorchwrightConfig",
-    "TorchwrightModel",
-    "TorchwrightPreTrainedModel",
-    "TorchwrightForCausalLM",
-    "TorchwrightTokenizer",
+    "TorchwrightCustomConfig",
+    "TorchwrightCustomModel",
+    "TorchwrightCustomPreTrainedModel",
+    "TorchwrightCustomForCausalLM",
+    "TorchwrightCustomTokenizer",
+    "compile_to_hf",
+    "compile_hf_bundle",
+    "save_hf_bundle",
+    "build_fast_tokenizer",
+    "HFArchitecture",
+    "HFBundleReport",
+    "ScheduleProvenance",
+    "CompileProfile",
 ]

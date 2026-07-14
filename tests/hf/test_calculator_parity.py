@@ -1,8 +1,8 @@
-"""Flagship calculator parity: native model == ONNX oracle, token-for-token.
+"""Flagship calculator parity: stock Phi-3 == ONNX oracle, token-for-token.
 
-Compiles ``examples/calculator_v2.py`` to ONNX in-process (~6s on CPU; the
-artifact is gitignored, never committed), converts it to a native
-:class:`TorchwrightForCausalLM`, and asserts the native model reproduces the
+Compiles ``examples/calculator_simple.py`` to ONNX in-process (~6s on CPU; the
+artifact is gitignored, never committed), compiles it directly to stock
+:class:`Phi3ForCausalLM`, and asserts the HF model reproduces the
 ONNX runtime's behaviour on real arithmetic:
 
 * **token-identical** prefill (per-position argmax) versus :class:`OnnxTokenModule`,
@@ -39,15 +39,14 @@ CPU-only and deterministic, so the bar is exact-bit, not merely argmax.
 
 from __future__ import annotations
 
-import json
-
 import pytest
 
 torch = pytest.importorskip("torch")
 pytest.importorskip("transformers")
 pytest.importorskip("safetensors")
+pytest.importorskip("onnxruntime")
 
-from torchwright.compiler.hf.convert import convert_onnx_to_hf, read_vocab
+from torchwright.compiler.hf import compile_to_hf
 from torchwright.compiler.onnx_load import load_onnx
 
 from tests.hf._hf_parity import compile_example
@@ -94,12 +93,16 @@ _EXTREME = ["900*900\n", "950*950\n", "999*999\n"]
 
 @pytest.fixture(scope="module")
 def artifact_path():
-    return compile_example("calculator_v2")
+    return compile_example("calculator_simple")
 
 
 @pytest.fixture(scope="module")
 def model(artifact_path):
-    return convert_onnx_to_hf(artifact_path, bos_token=_BOS, eos_token=_EOS)
+    from examples import calculator_simple
+    out, emb = calculator_simple.create_network_parts()
+    return compile_to_hf(
+        out, emb, d=calculator_simple.D_MODEL, d_head=calculator_simple.D_HEAD
+    )
 
 
 @pytest.fixture(scope="module")
@@ -108,8 +111,8 @@ def oracle(artifact_path):
 
 
 @pytest.fixture(scope="module")
-def tok2id(artifact_path):
-    return {t: i for i, t in enumerate(read_vocab(artifact_path))}
+def tok2id(oracle):
+    return {t: i for i, t in enumerate(oracle.vocab)}
 
 
 def _prefill_logits(model, oracle, tok2id, text):
@@ -144,12 +147,12 @@ def _hf_gen(model, tok2id, vocab, text):
 @pytest.mark.parametrize("text", _GATE)
 def test_prefill_token_identical_within_fp_floor(model, oracle, tok2id, text):
     o, h = _prefill_logits(model, oracle, tok2id, text)
-    # Real bar: native HF and the ONNX oracle pick the same token at every
+    # Real bar: stock Phi-3 and the ONNX oracle pick the same token at every
     # teacher-forced position (no argmax flip).
     assert (
         o.argmax(-1) == h.argmax(-1)
     ).all(), (
-        f"{text!r}: native/oracle argmax differs at a prefill position (token flip)"
+        f"{text!r}: Phi-3/oracle argmax differs at a prefill position (token flip)"
     )
     # Residual logit divergence stays within the cross-backend fp floor (Phase-6
     # local-recency reshape) — a structural regression would blow past it.
@@ -158,7 +161,7 @@ def test_prefill_token_identical_within_fp_floor(model, oracle, tok2id, text):
 
 @pytest.mark.parametrize("text", _GATE)
 def test_greedy_token_identical_and_correct(model, oracle, tok2id, artifact_path, text):
-    vocab = read_vocab(artifact_path)
+    vocab = oracle.vocab
     expected = str(eval(text.strip()))
     o_out = _oracle_gen(oracle, text)
     h_out = _hf_gen(model, tok2id, vocab, text)
@@ -171,7 +174,7 @@ def test_extreme_multiply_at_most_one_digit_level_divergence(model, oracle, tok2
 
     A structural bug (wrong cache, mask, or weight map) would corrupt every
     expression by a free-floating amount.  Instead, on the largest-operand
-    multiplies the native model and the ONNX oracle either agree bit-for-bit or
+    multiplies the HF model and the ONNX oracle either agree bit-for-bit or
     differ by exactly one digit-quantization level (a ~1600 logit gap) — the
     fingerprint of a piecewise-linear boundary the two fp32 backends round to
     adjacent levels.
@@ -198,20 +201,17 @@ def test_extreme_multiply_at_most_one_digit_level_divergence(model, oracle, tok2
 
 def test_save_load_generate_round_trip(tmp_path, artifact_path, model, oracle, tok2id):
     """Save → reload (classes imported) → tokenizer-driven generate == '408'."""
-    from torchwright.compiler.hf.modeling_torchwright import TorchwrightForCausalLM
-    from torchwright.compiler.hf.tokenization_torchwright import TorchwrightTokenizer
+    from transformers import Phi3ForCausalLM
+    from torchwright.compiler.hf import build_fast_tokenizer
 
     save_dir = tmp_path / "calc"
     model.save_pretrained(save_dir)
-    vocab_path = tmp_path / "vocab.json"
-    vocab_path.write_text(json.dumps(read_vocab(artifact_path)))
-    tok = TorchwrightTokenizer(
-        vocab_file=str(vocab_path), bos_token=_BOS, eos_token=_EOS
-    )
+    tok = build_fast_tokenizer(oracle.vocab, bos_token=_BOS, eos_token=_EOS)
     tok.save_pretrained(save_dir)
 
-    reloaded = TorchwrightForCausalLM.from_pretrained(save_dir).eval()
-    reloaded_tok = TorchwrightTokenizer.from_pretrained(save_dir)
+    reloaded = Phi3ForCausalLM.from_pretrained(save_dir).eval()
+    from transformers import AutoTokenizer
+    reloaded_tok = AutoTokenizer.from_pretrained(save_dir)
 
     enc = reloaded_tok("12*34\n", return_tensors="pt")
     with torch.no_grad():

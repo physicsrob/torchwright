@@ -31,7 +31,9 @@ Pinned here, at flagship geometry (``head_dim=128``, ``d_rot=64`` ⇒ factor
 * P0(c): ``Phi3Config`` accepts an explicit ``head_dim``, persists it
   through a save/load round trip, and the modeling code honors it — the
   finding that selects pad-to-per-layer-max over pad-to-``d/d_head`` in the
-  converter — with the standard tied embedding/LM-head contract.
+  direct compiler — and ``tie_word_embeddings=False`` keeps the stock Phi3
+  ``lm_head`` untied (the torchwright tie is expressed by shipping the
+  compact projection over the same token.v6 output bank).
 
 CPU-only, no artifact compile — this is a pure modeling-code probe.
 """
@@ -147,7 +149,7 @@ def test_rotation_semantics_bit_exact_on_shared_tables(base):
 def test_nope_tail_bit_exact_through_hf_stack(base):
     """The unrotated tail ``[d_rot:d_head]`` passes through Phi-3's rotary
     application bit-exactly at every position, on HF's OWN tables — the
-    property the engineered content-equality heads rely on (a converted
+    property the engineered content-equality heads rely on (a direct_model
     checkpoint that rotated these dims would be silently wrong, not noisy)."""
     from transformers.models.phi3.modeling_phi3 import apply_rotary_pos_emb
 
@@ -193,8 +195,8 @@ def test_head_dim_accepted_persisted_and_honored(tmp_path):
     ``hidden_size / num_attention_heads``, persists it through a save/load
     round trip, and the modeling code honors it (attention projections and
     the rotary table are sized from it).  This finding selects the cheaper
-    pad-to-per-layer-max padding in the converter; if an upgrade drops the
-    field, the converter must fall back to padding heads to ``d/d_head``."""
+    pad-to-per-layer-max padding in the direct compiler; if an upgrade drops the
+    field, the direct compiler must fall back to padding heads to ``d/d_head``."""
     from transformers.models.phi3.modeling_phi3 import Phi3ForCausalLM
 
     cfg = _phi3_config(10_000.0, num_attention_heads=3)  # 3·128 ≠ hidden 512

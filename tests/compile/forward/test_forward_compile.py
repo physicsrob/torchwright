@@ -495,7 +495,7 @@ def test_compile_add_shared_inputs(width):
 def test_compile_three_adds_shared_inputs():
     """Three Add nodes sharing the same inputs — the calculator pattern.
 
-    This mirrors calculator_v2: number_a and number_b feed add, subtract,
+    This mirrors calculator_simple: number_a and number_b feed add, subtract,
     and multiply paths, each creating Add nodes on the shared operands.
     """
     x = create_input("x", 1)

@@ -106,6 +106,11 @@ def test_tripwire_fires_on_deeper_replay(monkeypatch):
         return mutated, stats
 
     monkeypatch.setattr(compile_mod, "solve_schedule", deeper)
+    monkeypatch.setattr(
+        compile_mod,
+        "choose_dominating_assignment",
+        lambda costs, incumbent, candidate: candidate,
+    )
 
     with pytest.raises(RuntimeError, match="Replay-depth tripwire"):
         forward_compile(

@@ -1,7 +1,7 @@
 """The shipped HF files are import-clean.
 
-``configuration_torchwright.py`` / ``modeling_torchwright.py`` /
-``tokenization_torchwright.py`` are copied verbatim into every saved model
+``configuration_torchwright_custom.py`` / ``modeling_torchwright_custom.py`` /
+``tokenization_torchwright_custom.py`` are copied verbatim into an explicitly custom saved model
 directory (by ``transformers``' ``custom_object_save``) and loaded on a
 stranger's machine via ``trust_remote_code`` with only ``torch`` +
 ``transformers`` installed — no ``torchwright``. That holds iff each file
@@ -19,6 +19,7 @@ present) and fail only on the stranger's machine; this catches it here.
 
 from __future__ import annotations
 
+import json
 import sys
 from pathlib import Path
 
@@ -35,10 +36,10 @@ _HF_DIR = (
 
 # (filename, extra non-relative imports allowed beyond stdlib, allowed relative imports)
 _SHIPPED = [
-    ("configuration_torchwright.py", {"transformers"}, []),
-    ("tokenization_torchwright.py", {"transformers"}, []),
+    ("configuration_torchwright_custom.py", {"transformers"}, []),
+    ("tokenization_torchwright_custom.py", {"transformers"}, []),
     # The model file may import torch and exactly one sibling: its config.
-    ("modeling_torchwright.py", {"transformers", "torch"}, ["configuration_torchwright"]),
+    ("modeling_torchwright_custom.py", {"transformers", "torch"}, ["configuration_torchwright_custom"]),
 ]
 
 
@@ -63,16 +64,35 @@ def test_shipped_file_imports_are_clean(filename, allowed_extra, allowed_rel):
     )
 
 
-def test_convert_is_not_shipped_but_imports_onnx():
-    """``convert.py`` is a build-time tool, not shipped — it may import onnx.
-
-    This pins the layering: the converter (which reads the ONNX artifact) is
-    explicitly the one file in the package allowed to depend on ``onnx``, so a
-    future accidental ``import onnx`` in a *shipped* file is caught by the test
-    above while the converter's legitimate use stays put.
-    """
+def test_direct_builder_does_not_import_onnx():
+    """The build-time HF sink consumes compiler records, not ONNX artifacts."""
     from transformers.dynamic_module_utils import get_imports
 
-    source = _HF_DIR / "convert.py"
+    assert not (_HF_DIR / "convert.py").exists()
+    source = _HF_DIR / "build.py"
     imports = set(get_imports(str(source)))
-    assert "onnx" in imports, "convert.py is expected to read ONNX artifacts"
+    assert "onnx" not in imports
+    assert "onnxruntime" not in imports
+
+
+def test_custom_architecture_is_explicit_and_renamed(tmp_path):
+    from transformers import AutoModelForCausalLM
+    from torchwright.compiler.hf import compile_hf_bundle
+    from torchwright.graph.rope import rotary_offset_head
+    from torchwright.ops.inout_nodes import create_onehot_embedding
+
+    vocab = ["<bos>", "<eos>", "a"]
+    embedding = create_onehot_embedding(vocab)
+    output = rotary_offset_head(embedding, delta_pos=-1, d_qk=16)
+    compile_hf_bundle(
+        output, embedding, tmp_path, d=256, d_head=16,
+        architecture="custom",
+    )
+    config = json.loads((tmp_path / "config.json").read_text())
+    assert config["model_type"] == "torchwright_custom"
+    assert config["architectures"] == ["TorchwrightCustomForCausalLM"]
+    assert config["auto_map"]["AutoModelForCausalLM"].endswith(
+        ".TorchwrightCustomForCausalLM"
+    )
+    loaded = AutoModelForCausalLM.from_pretrained(tmp_path, trust_remote_code=True)
+    assert type(loaded).__name__ == "TorchwrightCustomForCausalLM"

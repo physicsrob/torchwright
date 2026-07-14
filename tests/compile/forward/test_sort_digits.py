@@ -53,9 +53,6 @@ def sort_v1(tmp_path_factory):
         d=D_MODEL,
         d_head=D_HEAD,
         name="sortv1",
-        # D_MODEL (384) is outside the norm's supported-width contract
-        # (docs/rms_norm_dmodel.md), and the norm isn't what this exercises.
-        rms_norm=False,
     )
 
 

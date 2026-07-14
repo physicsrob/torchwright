@@ -13,6 +13,8 @@ Public API:
 - `Costs` — objective weights `(alpha, beta, gamma)`.
 - `ScheduleAssignment` — solver output contract: per-node layer,
   cancel layer, and routing.
+- `DiagnosticHint` — one immutable, explicitly non-production container for
+  partial/invalid warm starts used by tests and measurement tooling.
 - `SolveStats` — solver metadata (status, objective, LB, walltime,
   log) for diagnostics.
 - `solve_schedule(...)` — build and solve, return
@@ -32,7 +34,8 @@ import os
 import time
 import warnings
 from dataclasses import dataclass, field
-from typing import Dict, FrozenSet, List, Optional, Set, Tuple
+from types import MappingProxyType
+from typing import Dict, FrozenSet, List, Mapping, Optional, Set, Tuple
 
 from ortools.sat.python import cp_model
 
@@ -45,6 +48,7 @@ from torchwright.compiler.realization import (
     linear_attn_heads,
     static_flex_class,
 )
+from torchwright.compiler.utils import resolve_n_heads
 from torchwright.compiler.forward.scheduling_policy import (
     LEGACY_POLICY,
     SchedulingPolicy,
@@ -124,6 +128,52 @@ class Costs:
     waste: int = 0
 
 
+def lexicographic_objective_scale(max_secondary: int) -> int:
+    """Return the shared multiplier that makes the primary block dominant."""
+    return int(max_secondary) + 1 if max_secondary else 1
+
+
+def evaluate_objective_components(
+    costs: Costs,
+    *,
+    n_layers: int,
+    total_attn_heads: int,
+    total_mlp_bypass_slots: int,
+    earliness_sum: int,
+    waste_sum: int,
+    objective_scale: int,
+) -> int:
+    """Evaluate concrete counts with the same objective algebra as CP-SAT."""
+    primary, secondary = objective_blocks(
+        costs,
+        n_layers=n_layers,
+        total_attn_heads=total_attn_heads,
+        total_mlp_bypass_slots=total_mlp_bypass_slots,
+        earliness_sum=earliness_sum,
+        waste_sum=waste_sum,
+    )
+    return objective_scale * primary + secondary
+
+
+def objective_blocks(
+    costs: Costs,
+    *,
+    n_layers: int,
+    total_attn_heads: int,
+    total_mlp_bypass_slots: int,
+    earliness_sum: int,
+    waste_sum: int,
+) -> tuple[int, int]:
+    """Return the primary and secondary blocks before lexicographic scaling."""
+    primary = (
+        costs.alpha * n_layers
+        + costs.beta * total_attn_heads
+        + costs.gamma * total_mlp_bypass_slots
+    )
+    secondary = costs.earliness * earliness_sum + costs.waste * waste_sum
+    return int(primary), int(secondary)
+
+
 @dataclass(frozen=True)
 class ScheduleAssignment:
     """Per-node placement, cancellation, and routing decisions.
@@ -146,9 +196,9 @@ class ScheduleAssignment:
     cancel layer so the replay reclaims their columns once consumed.
     """
 
-    node_to_layer: Dict[int, int]
-    node_to_cancel_layer: Dict[int, int]
-    node_to_routing: Dict[int, str]
+    node_to_layer: Mapping[int, int]
+    node_to_cancel_layer: Mapping[int, int]
+    node_to_routing: Mapping[int, str]
     n_layers: int
     # Which sublayer each node's cancel runs in: "attn" (a batched attention
     # cancel head) or "mlp" (a ``cancel_bypass`` MLP op).  Keyed by the same
@@ -156,7 +206,186 @@ class ScheduleAssignment:
     # always attention-cancelled and are omitted (the replay defaults absent
     # nodes to "attn").  ``DirectedLayerScheduler`` routes each directed cancel
     # to its assigned mechanism.
-    node_to_cancel_mech: Dict[int, str] = field(default_factory=dict)
+    node_to_cancel_mech: Mapping[int, str] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        # ``frozen=True`` does not freeze nested dictionaries. Defensive,
+        # canonical copies keep validation, cache identity, and replay stable
+        # even if a caller later mutates the mappings used to construct us.
+        for name in (
+            "node_to_layer",
+            "node_to_cancel_layer",
+            "node_to_routing",
+            "node_to_cancel_mech",
+        ):
+            value = getattr(self, name)
+            object.__setattr__(
+                self, name, MappingProxyType(dict(sorted(value.items())))
+            )
+
+    @classmethod
+    def from_heuristic_trace(
+        cls,
+        output_node: Node,
+        *,
+        node_to_layer: Dict[int, int],
+        node_to_routing: Dict[int, str],
+        observed_cancel_layer: Dict[int, int],
+        observed_cancel_mech: Dict[int, str],
+        n_layers: int,
+    ) -> "ScheduleAssignment":
+        """Complete and validate a schedule-only heuristic trace."""
+        gm = build_graph_model(output_node)
+        sched_ids = {node.node_id for node in gm.schedulable}
+        input_ids = {node.node_id for node in gm.input_nodes}
+        layer_map = {
+            nid: layer for nid, layer in node_to_layer.items() if nid in sched_ids
+        }
+        if set(layer_map) != sched_ids:
+            missing = sorted(sched_ids - set(layer_map))
+            extra = sorted(set(layer_map) - sched_ids)
+            raise ValueError(
+                f"heuristic trace layer coverage mismatch: missing={missing}, extra={extra}"
+            )
+        if set(node_to_routing) != sched_ids:
+            missing = sorted(sched_ids - set(node_to_routing))
+            extra = sorted(set(node_to_routing) - sched_ids)
+            raise ValueError(
+                f"heuristic trace routing coverage mismatch: missing={missing}, extra={extra}"
+            )
+        cancel = {nid: int(n_layers) for nid in sched_ids | input_ids}
+        unknown_cancel = set(observed_cancel_layer) - (sched_ids | input_ids)
+        if unknown_cancel:
+            raise ValueError(
+                f"heuristic trace has cancellation for unknown nodes: {sorted(unknown_cancel)}"
+            )
+        cancel.update({int(k): int(v) for k, v in observed_cancel_layer.items()})
+        assignment = cls(
+            node_to_layer=layer_map,
+            node_to_cancel_layer=cancel,
+            node_to_routing=dict(node_to_routing),
+            n_layers=int(n_layers),
+            node_to_cancel_mech={
+                nid: mech
+                for nid, mech in observed_cancel_mech.items()
+                if nid in sched_ids
+            },
+        )
+        assignment.validate(output_node)
+        return assignment
+
+    def validate(self, output_node: Node) -> None:
+        gm = build_graph_model(output_node)
+        sched_ids = {node.node_id for node in gm.schedulable}
+        input_ids = {node.node_id for node in gm.input_nodes}
+        if set(self.node_to_layer) != sched_ids:
+            raise ValueError(
+                "assignment node_to_layer does not cover schedulable nodes"
+            )
+        if set(self.node_to_routing) != sched_ids:
+            raise ValueError(
+                "assignment node_to_routing does not cover schedulable nodes"
+            )
+        if not (sched_ids | input_ids) <= set(self.node_to_cancel_layer):
+            raise ValueError("assignment cancellation map is incomplete")
+        for nid, layer in self.node_to_layer.items():
+            if not 0 <= int(layer) < self.n_layers:
+                raise ValueError(f"node {nid} has invalid layer {layer}")
+            if self.node_to_routing[nid] not in (ATTN, MLP):
+                raise ValueError(
+                    f"node {nid} has invalid routing {self.node_to_routing[nid]!r}"
+                )
+            cancel = self.node_to_cancel_layer[nid]
+            if not int(layer) <= int(cancel) <= self.n_layers:
+                raise ValueError(
+                    f"node {nid} cancel layer {cancel} precedes birth {layer}"
+                )
+        if set(self.node_to_cancel_mech) - sched_ids:
+            raise ValueError(
+                "assignment has cancellation mechanisms for non-schedulable nodes"
+            )
+        if any(mech not in (ATTN, MLP) for mech in self.node_to_cancel_mech.values()):
+            raise ValueError("assignment has an invalid cancellation mechanism")
+
+    def canonical_key(self) -> tuple:
+        """Stable tie-break independent of mapping insertion order."""
+        return (
+            self.n_layers,
+            tuple(self.node_to_layer.items()),
+            tuple(self.node_to_routing.items()),
+            tuple(self.node_to_cancel_layer.items()),
+            tuple(self.node_to_cancel_mech.items()),
+        )
+
+
+@dataclass(frozen=True)
+class DiagnosticHint:
+    """Partial warm start for tests, snapshots, and solver experiments.
+
+    Production compilation passes a complete :class:`ScheduleAssignment` as
+    ``incumbent``.  This type deliberately isolates diagnostic cases that need
+    an incomplete or intentionally invalid hint without exposing four parallel
+    mappings on the production solver API.
+    """
+
+    layers: Mapping[int, int] = field(default_factory=dict)
+    routing: Mapping[int, str] = field(default_factory=dict)
+    cancel: Mapping[int, int] = field(default_factory=dict)
+    cancel_mech: Mapping[int, str] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        for name in ("layers", "routing", "cancel", "cancel_mech"):
+            value = getattr(self, name)
+            object.__setattr__(
+                self,
+                name,
+                MappingProxyType(dict(sorted(value.items()))),
+            )
+
+    @classmethod
+    def from_assignment(cls, assignment: ScheduleAssignment) -> "DiagnosticHint":
+        return cls(
+            layers=assignment.node_to_layer,
+            routing=assignment.node_to_routing,
+            cancel=assignment.node_to_cancel_layer,
+            cancel_mech=assignment.node_to_cancel_mech,
+        )
+
+    def without_cancel_layers(self) -> "DiagnosticHint":
+        return DiagnosticHint(
+            layers=self.layers,
+            routing=self.routing,
+            cancel_mech=self.cancel_mech,
+        )
+
+
+def choose_dominating_assignment(
+    costs: Costs,
+    incumbent: Optional[ScheduleAssignment],
+    candidate: Optional[ScheduleAssignment],
+) -> Optional[ScheduleAssignment]:
+    """Select a candidate only when its comparable objective dominates.
+
+    Pure-depth is the production default and is fully evaluable from an
+    assignment. Resource-weighted objectives also depend on concrete replay
+    choices (notably free-Add head cost), so CP-SAT's objective governs those
+    until ReplayPlan exposes the physical counts at this boundary.
+    """
+    if incumbent is None:
+        return candidate
+    if candidate is None:
+        return incumbent
+    pure_depth = (
+        costs.alpha > 0
+        and costs.beta == costs.gamma == costs.earliness == costs.waste == 0
+    )
+    if not pure_depth:
+        return candidate
+    if candidate.n_layers < incumbent.n_layers:
+        return candidate
+    if candidate.n_layers > incumbent.n_layers:
+        return incumbent
+    return min((incumbent, candidate), key=lambda item: item.canonical_key())
 
 
 @dataclass(frozen=True)
@@ -187,6 +416,29 @@ class SolveStats:
     # logged post-hoc so a null measurement result can be read as "no effect"
     # vs "no parked nodes to deduplicate."  -1 when no feasible solution.
     parked_count: int = -1
+
+
+@dataclass(frozen=True)
+class SchedulingProvenance:
+    """Orthogonal origin/delivery metadata for a selected assignment."""
+
+    origin: str  # "heuristic" or "solver"
+    delivery: str  # "fresh" or "cache"
+    selected_is_optimal: bool = False
+    selected_objective: Optional[int] = None
+    selected_objective_blocks: Optional[Tuple[int, int]] = None
+    solver_attempt: Optional[SolveStats] = None
+
+    @property
+    def is_optimal(self) -> bool:
+        """Compatibility alias for the selected schedule's certification."""
+        return self.selected_is_optimal
+
+
+@dataclass(frozen=True)
+class ScheduleResult:
+    assignment: ScheduleAssignment
+    provenance: SchedulingProvenance
 
 
 # Routing constants used both by this module and by the probe script.
@@ -669,6 +921,7 @@ def build_cpsat_model(
     *,
     d: int,
     d_head: int,
+    n_heads: Optional[int] = None,
     d_hidden: int,
     costs: Costs = Costs(),
     flex_routing: bool = True,
@@ -678,8 +931,7 @@ def build_cpsat_model(
     reserve_heads: int = 0,
     reserve_residual: int = 0,
     tighten_domains: bool = False,
-    hint_layers: Optional[Dict[int, int]] = None,
-    hint_cancel: Optional[Dict[int, int]] = None,
+    diagnostic_hint: Optional[DiagnosticHint] = None,
     held_source_id: Optional[int] = None,
     held_target_id: Optional[int] = None,
     _disabled_families: frozenset = frozenset(),
@@ -694,11 +946,9 @@ def build_cpsat_model(
     decision strategy, solves, and reads the variables back out of the
     returned :class:`BuiltModel`.
 
-    ``hint_layers`` / ``hint_cancel`` are used ONLY to size the per-node
-    cancel windows (see the widening comment at the cancel-layer section) —
-    hint *application* (``AddHint``) stays in :func:`solve_schedule`.  With
-    both left as None the model is byte-identical to the hint-less build,
-    so diagnostics, the probe script, and hint-less callers are unchanged.
+    ``diagnostic_hint.layers`` / ``diagnostic_hint.cancel`` are used only to
+    size per-node cancel windows; hint application stays in the solve path.
+    With no diagnostic hint the model is byte-identical to a hint-less build.
 
     ``_disabled_families`` is a diagnostic-only escape hatch: each name in
     :data:`CONSTRAINT_FAMILIES` gates one constraint family, and listing it
@@ -712,6 +962,7 @@ def build_cpsat_model(
         gm,
         d=d,
         d_head=d_head,
+        n_heads=n_heads,
         d_hidden=d_hidden,
         costs=costs,
         flex_routing=flex_routing,
@@ -721,8 +972,7 @@ def build_cpsat_model(
         reserve_heads=reserve_heads,
         reserve_residual=reserve_residual,
         tighten_domains=tighten_domains,
-        hint_layers=hint_layers,
-        hint_cancel=hint_cancel,
+        diagnostic_hint=diagnostic_hint,
         held_source_id=held_source_id,
         held_target_id=held_target_id,
         _disabled_families=_disabled_families,
@@ -736,6 +986,7 @@ def build_cpsat_model_from_gm(
     *,
     d: int,
     d_head: int,
+    n_heads: Optional[int] = None,
     d_hidden: int,
     costs: Costs = Costs(),
     flex_routing: bool = True,
@@ -745,8 +996,7 @@ def build_cpsat_model_from_gm(
     reserve_heads: int = 0,
     reserve_residual: int = 0,
     tighten_domains: bool = False,
-    hint_layers: Optional[Dict[int, int]] = None,
-    hint_cancel: Optional[Dict[int, int]] = None,
+    diagnostic_hint: Optional[DiagnosticHint] = None,
     held_source_id: Optional[int] = None,
     held_target_id: Optional[int] = None,
     _disabled_families: frozenset = frozenset(),
@@ -799,6 +1049,9 @@ def build_cpsat_model_from_gm(
             f"valid names: {sorted(CONSTRAINT_FAMILIES)}"
         )
 
+    hint_layers = diagnostic_hint.layers if diagnostic_hint is not None else None
+    hint_cancel = diagnostic_hint.cancel if diagnostic_hint is not None else None
+
     if policy is None:
         policy = LEGACY_POLICY
 
@@ -808,7 +1061,7 @@ def build_cpsat_model_from_gm(
     if (held_source_id is None) != (held_target_id is None):
         raise ValueError("held_source_id and held_target_id must be supplied together")
 
-    n_heads_per_layer = d // d_head
+    n_heads_per_layer = resolve_n_heads(d, d_head, n_heads, require_divisible=False)
     # ``pos_encoding`` is read by the attention sublayer at (nearly) every
     # layer, so it stays resident for the whole schedule — reserve its columns
     # permanently.  Every OTHER input node is *freeable*: the heuristic frees
@@ -1765,7 +2018,7 @@ def build_cpsat_model_from_gm(
         secondary_terms.append(costs.waste * sum(occupancy))
     objective_scale = 1
     if secondary_terms:
-        objective_scale = max_secondary + 1
+        objective_scale = lexicographic_objective_scale(max_secondary)
         model.Minimize(objective_scale * primary + sum(secondary_terms))
     else:
         model.Minimize(primary)
@@ -1939,6 +2192,7 @@ def build_model_from_snapshot(
     *,
     d: int,
     d_head: int,
+    n_heads: Optional[int] = None,
     d_hidden: int,
     costs: Costs = Costs(),
     flex_routing: bool = True,
@@ -1948,8 +2202,7 @@ def build_model_from_snapshot(
     reserve_heads: int = 0,
     reserve_residual: int = 0,
     tighten_domains: bool = False,
-    hint_layers: Optional[Dict[int, int]] = None,
-    hint_cancel: Optional[Dict[int, int]] = None,
+    diagnostic_hint: Optional[DiagnosticHint] = None,
     held_source_id: Optional[int] = None,
     held_target_id: Optional[int] = None,
     _disabled_families: frozenset = frozenset(),
@@ -1987,6 +2240,7 @@ def build_model_from_snapshot(
         graph_model_from_problem(problem),
         d=d,
         d_head=d_head,
+        n_heads=n_heads,
         d_hidden=d_hidden,
         costs=costs,
         flex_routing=flex_routing,
@@ -1996,8 +2250,7 @@ def build_model_from_snapshot(
         reserve_heads=reserve_heads,
         reserve_residual=reserve_residual,
         tighten_domains=tighten_domains,
-        hint_layers=hint_layers,
-        hint_cancel=hint_cancel,
+        diagnostic_hint=diagnostic_hint,
         held_source_id=held_source_id,
         held_target_id=held_target_id,
         _disabled_families=_disabled_families,
@@ -2130,10 +2383,7 @@ class _IncumbentTrace(cp_model.CpSolverSolutionCallback):
 
 def _validate_hint(
     built: BuiltModel,
-    hint_layers: Optional[Dict[int, int]],
-    hint_routing: Optional[Dict[int, str]],
-    hint_cancel: Optional[Dict[int, int]],
-    hint_cancel_mech: Optional[Dict[int, str]] = None,
+    hint: DiagnosticHint,
     *,
     max_layers: int,
     strict: bool = False,
@@ -2164,6 +2414,10 @@ def _validate_hint(
     naming the first violations; the default emits one ``RuntimeWarning``
     (production keeps its fall-back-don't-fail contract).
     """
+    hint_layers = hint.layers
+    hint_routing = hint.routing
+    hint_cancel = hint.cancel
+    hint_cancel_mech = hint.cancel_mech
     violations: List[str] = []
     gm = built.gm
     all_nodes: Dict[int, Node] = {n.node_id: n for n in gm.graph.get_all_nodes()}
@@ -2368,15 +2622,13 @@ def solve_schedule(
     *,
     d: int,
     d_head: int,
+    n_heads: Optional[int] = None,
     d_hidden: int,
     costs: Costs = Costs(),
     flex_routing: bool = True,
     time_budget_s: float = 60.0,
     max_layers: int = 60,
-    hint_layers: Optional[Dict[int, int]] = None,
-    hint_routing: Optional[Dict[int, str]] = None,
-    hint_cancel: Optional[Dict[int, int]] = None,
-    hint_cancel_mech: Optional[Dict[int, str]] = None,
+    incumbent: Optional[ScheduleAssignment] = None,
     held_source_id: Optional[int] = None,
     held_target_id: Optional[int] = None,
     cancel_slack: Optional[int] = 2,
@@ -2392,6 +2644,7 @@ def solve_schedule(
     _disabled_families: frozenset = frozenset(),
     _canonical_cancel_reps: bool = False,
     _pin_cancels: bool = True,
+    _diagnostic_hint: Optional[DiagnosticHint] = None,
 ) -> Tuple[Optional[ScheduleAssignment], SolveStats]:
     """Build and solve the CP-SAT scheduling model.
 
@@ -2407,9 +2660,10 @@ def solve_schedule(
             scheduler operates over.
         pos_encoding: vestigial — always ``None`` under RoPE; retained for
             call-site compatibility.
-        d, d_head, d_hidden: transformer geometry. ``n_heads_per_layer
-            = d // d_head``.  Residual budget is
+        d, d_head, d_hidden: transformer geometry. Residual budget is
             ``d - input_residual_cols``.
+        n_heads: Per-layer attention-head capacity. Defaults to
+            ``d // d_head``.
         costs: objective weights. See :class:`Costs`.
         flex_routing: if True, CP-SAT picks attention vs MLP for each
             standalone ``Linear``.  If False, standalone Linears use
@@ -2417,23 +2671,10 @@ def solve_schedule(
         time_budget_s: per-solve wall-clock cap.
         max_layers: search horizon.  Should be at least the heuristic's
             layer count.
-        hint_layers: optional warm-start mapping ``node_id -> layer``.
-        hint_routing: optional warm-start mapping
-            ``node_id -> "attn"|"mlp"`` for flex Linears.  When the
-            heuristic placed a standalone Linear in attention vs
-            MLP-bypass, hinting the same routing lets CP-SAT
-            reconstruct the heuristic's solution as a starting
-            incumbent.
-        hint_cancel: optional warm-start mapping ``node_id -> layer``
-            for the cancel layer.  Captures when the heuristic freed
-            each node's columns; combined with ``hint_layers`` this
-            gives a complete schedule the solver can verify and
-            improve from.  ``hint_layers``/``hint_cancel`` are also
-            forwarded to :func:`build_cpsat_model` to widen each hinted
-            node's cancel window just enough to admit the hint (the
-            heuristic defers a free when a layer's heads are full, which
-            otherwise lands past the uniform window and silently
-            invalidates the whole incumbent).
+        incumbent: complete semantic assignment used as the production warm
+            start. Tests and measurement tooling that require a partial or
+            intentionally invalid hint use the private ``_diagnostic_hint``
+            seam with one :class:`DiagnosticHint` value.
         cancel_slack: when not None, restrict each non-pinned node's
             cancel layer to ``[earliest_dead, earliest_dead + K]``
             where ``earliest_dead = max(layer[c] + 1)`` over consumers
@@ -2467,11 +2708,20 @@ def solve_schedule(
     handling (no-incumbent, FEASIBLE-not-OPTIMAL) is the caller's
     responsibility.
     """
+    if incumbent is not None and _diagnostic_hint is not None:
+        raise ValueError("pass either incumbent or _diagnostic_hint, not both")
+    if incumbent is not None:
+        incumbent.validate(output_node)
+        hint = DiagnosticHint.from_assignment(incumbent)
+    else:
+        hint = _diagnostic_hint
+
     built = build_cpsat_model(
         output_node,
         pos_encoding,
         d=d,
         d_head=d_head,
+        n_heads=n_heads,
         d_hidden=d_hidden,
         costs=costs,
         flex_routing=flex_routing,
@@ -2481,8 +2731,7 @@ def solve_schedule(
         reserve_heads=reserve_heads,
         reserve_residual=reserve_residual,
         tighten_domains=tighten_domains,
-        hint_layers=hint_layers,
-        hint_cancel=hint_cancel,
+        diagnostic_hint=hint,
         held_source_id=held_source_id,
         held_target_id=held_target_id,
         _disabled_families=_disabled_families,
@@ -2491,10 +2740,7 @@ def solve_schedule(
     )
     return _solve_built(
         built,
-        hint_layers=hint_layers,
-        hint_routing=hint_routing,
-        hint_cancel=hint_cancel,
-        hint_cancel_mech=hint_cancel_mech,
+        hint=hint,
         max_layers=max_layers,
         time_budget_s=time_budget_s,
         log_search_progress=log_search_progress,
@@ -2510,15 +2756,13 @@ def solve_schedule_from_snapshot(
     *,
     d: int,
     d_head: int,
+    n_heads: Optional[int] = None,
     d_hidden: int,
     costs: Costs = Costs(),
     flex_routing: bool = True,
     time_budget_s: float = 60.0,
     max_layers: int = 60,
-    hint_layers: Optional[Dict[int, int]] = None,
-    hint_routing: Optional[Dict[int, str]] = None,
-    hint_cancel: Optional[Dict[int, int]] = None,
-    hint_cancel_mech: Optional[Dict[int, str]] = None,
+    incumbent: Optional[ScheduleAssignment] = None,
     held_source_id: Optional[int] = None,
     held_target_id: Optional[int] = None,
     cancel_slack: Optional[int] = 2,
@@ -2534,6 +2778,7 @@ def solve_schedule_from_snapshot(
     _disabled_families: frozenset = frozenset(),
     _canonical_cancel_reps: bool = False,
     _pin_cancels: bool = True,
+    _diagnostic_hint: Optional[DiagnosticHint] = None,
 ) -> Tuple[Optional[ScheduleAssignment], SolveStats]:
     """Build and solve the model from a captured snapshot — no live graph.
 
@@ -2542,10 +2787,18 @@ def solve_schedule_from_snapshot(
     ``(assignment, stats)`` as :func:`solve_schedule`; the assignment is keyed
     by the snapshot's node-id space (canonical ids for a loaded fixture).
     """
+    if incumbent is not None and _diagnostic_hint is not None:
+        raise ValueError("pass either incumbent or _diagnostic_hint, not both")
+    hint = (
+        DiagnosticHint.from_assignment(incumbent)
+        if incumbent is not None
+        else _diagnostic_hint
+    )
     built = build_model_from_snapshot(
         problem,
         d=d,
         d_head=d_head,
+        n_heads=n_heads,
         d_hidden=d_hidden,
         costs=costs,
         flex_routing=flex_routing,
@@ -2555,8 +2808,7 @@ def solve_schedule_from_snapshot(
         reserve_heads=reserve_heads,
         reserve_residual=reserve_residual,
         tighten_domains=tighten_domains,
-        hint_layers=hint_layers,
-        hint_cancel=hint_cancel,
+        diagnostic_hint=hint,
         held_source_id=held_source_id,
         held_target_id=held_target_id,
         _disabled_families=_disabled_families,
@@ -2565,10 +2817,7 @@ def solve_schedule_from_snapshot(
     )
     return _solve_built(
         built,
-        hint_layers=hint_layers,
-        hint_routing=hint_routing,
-        hint_cancel=hint_cancel,
-        hint_cancel_mech=hint_cancel_mech,
+        hint=hint,
         max_layers=max_layers,
         time_budget_s=time_budget_s,
         log_search_progress=log_search_progress,
@@ -2582,10 +2831,7 @@ def solve_schedule_from_snapshot(
 def _solve_built(
     built: BuiltModel,
     *,
-    hint_layers: Optional[Dict[int, int]] = None,
-    hint_routing: Optional[Dict[int, str]] = None,
-    hint_cancel: Optional[Dict[int, int]] = None,
-    hint_cancel_mech: Optional[Dict[int, str]] = None,
+    hint: Optional[DiagnosticHint] = None,
     max_layers: int = 60,
     time_budget_s: float = 60.0,
     log_search_progress: bool = False,
@@ -2618,7 +2864,8 @@ def _solve_built(
         # with the mechanism hint also dropped, no seed completed the hint
         # into ANY incumbent in 600 s (0/5), vs first incumbents at 83-104 s
         # for the unpinned control.
-        hint_cancel = None
+        if hint is not None:
+            hint = hint.without_cancel_layers()
     if log_search_progress and built.cancel_window_delta:
         print(
             f"  cancel windows widened for {len(built.cancel_window_delta)} "
@@ -2643,33 +2890,24 @@ def _solve_built(
     # discard them and explore alternatives — which is exactly why a
     # bad hint is validated loudly here instead of vanishing behind
     # the `if nid in ...` guards below.
-    if any(
-        h is not None
-        for h in (hint_layers, hint_routing, hint_cancel, hint_cancel_mech)
-    ):
+    if hint is not None:
         _validate_hint(
             built,
-            hint_layers,
-            hint_routing,
-            hint_cancel,
-            hint_cancel_mech,
+            hint,
             max_layers=max_layers,
             strict=strict_hint,
         )
-    if hint_layers is not None:
-        for nid, L in hint_layers.items():
+    if hint is not None:
+        for nid, L in hint.layers.items():
             if nid in layer_var and 0 <= L < max_layers:
                 model.AddHint(layer_var[nid], L)
-    if hint_routing is not None:
-        for nid, route in hint_routing.items():
+        for nid, route in hint.routing.items():
             if nid in is_attn:
                 model.AddHint(is_attn[nid], 1 if route == ATTN else 0)
-    if hint_cancel_mech is not None:
-        for nid, mech in hint_cancel_mech.items():
+        for nid, mech in hint.cancel_mech.items():
             if nid in cancel_in_mlp:
                 model.AddHint(cancel_in_mlp[nid], 1 if mech == MLP else 0)
-    if hint_cancel is not None:
-        for nid, L in hint_cancel.items():
+        for nid, L in hint.cancel.items():
             if nid in cancel_layer and 0 <= L <= max_layers:
                 model.AddHint(cancel_layer[nid], L)
             elif nid in input_cancel_layer and 0 <= L <= max_layers:

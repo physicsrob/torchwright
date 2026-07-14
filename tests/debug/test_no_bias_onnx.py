@@ -5,7 +5,7 @@ initializers and no bias Adds (each projection is its bare MatMul), records
 the emission mode in the artifact / token meta / debug sidecar, and
 round-trips the debug surface — probe_compiled over the executing artifact
 is clean and its logits match the biased twin.  A sidecar/artifact pairing
-mismatch trips the explicit emission-mode cross-check, and the HF converter
+mismatch trips the explicit emission-mode cross-check, and the custom HF profile
 refuses biasless artifacts loudly.
 """
 
@@ -216,16 +216,11 @@ def test_sidecar_artifact_mode_mismatch_trips(artifacts, tmp_path):
         OnnxDebugSession(str(target), out2)
 
 
-def test_hf_converter_refuses_biasless_artifact(tmp_path):
-    """The native HF module hardcodes biased MLP linears; conversion of a
-    bias=False artifact must refuse loudly (relu machine, so the machine
-    check does not fire first)."""
-    from torchwright.compiler.hf.convert import convert_onnx_to_hf
+def test_custom_hf_profile_refuses_biasless_compile(tmp_path):
+    """The custom HF model has biased ReLU linears and refuses bias=False."""
+    from torchwright.compiler.hf import compile_to_hf
 
     out, emb = _build(machine="relu")
-    path = str(tmp_path / "relu_biasless.onnx")
-    compile_to_onnx(
-        out, emb, path, d=D, d_head=D_HEAD, max_seq_len=16, verbose=False, bias=False
-    )
-    with pytest.raises(NotImplementedError, match="bias=False artifact"):
-        convert_onnx_to_hf(path, bos_token="<bos>", eos_token="<eos>")
+    with pytest.raises(ValueError, match="requires bias=True"):
+        compile_to_hf(out, emb, d=D, d_head=D_HEAD, max_seq_len=16,
+            architecture="custom", bias=False)

@@ -15,6 +15,7 @@ import pytest
 import torch
 
 from torchwright.compiler.forward.cpsat_scheduler import (
+    DiagnosticHint,
     build_cpsat_model,
     build_graph_model,
     build_model_from_snapshot,
@@ -60,15 +61,15 @@ def _example_specs():
     from examples import (
         binary_increment,
         caesar_cipher,
-        calculator_v2,
+        calculator_simple,
         fibonacci,
         sort_digits_v1,
     )
 
     return {
-        "calculator": (lambda: calculator_v2.create_network_parts()[0], 1024, 16),
+        "calculator": (lambda: calculator_simple.create_network_parts()[0], calculator_simple.D_MODEL, calculator_simple.D_HEAD),
         "caesar": (lambda: caesar_cipher.create_network_parts()[0], 512, 16),
-        "sort_digits": (lambda: sort_digits_v1.create_network_parts()[0], 384, 32),
+        "sort_digits": (lambda: sort_digits_v1.create_network_parts()[0], sort_digits_v1.D_MODEL, sort_digits_v1.D_HEAD),
         "fibonacci": (lambda: fibonacci.create_network_parts()[0], 512, 16),
         "binary_increment": (
             lambda: binary_increment.create_network_parts()[0], 256, 16
@@ -149,16 +150,13 @@ def test_hinted_build_proto_identical():
     hint_layers = dict(asg.node_to_layer)
     hint_cancel = dict(asg.node_to_cancel_layer)
 
-    live = _proto_text(
-        build_cpsat_model(node, hint_layers=hint_layers, hint_cancel=hint_cancel, **cfg)
-    )
+    hint = DiagnosticHint(layers=hint_layers, cancel=hint_cancel)
+    live = _proto_text(build_cpsat_model(node, diagnostic_hint=hint, **cfg))
     problem = SchedulingProblem.loads(
         snapshot_from_graph_model(build_graph_model(node)).dumps()
     )
     snap = _proto_text(
-        build_model_from_snapshot(
-            problem, hint_layers=hint_layers, hint_cancel=hint_cancel, **cfg
-        )
+        build_model_from_snapshot(problem, diagnostic_hint=hint, **cfg)
     )
     assert snap == live
 

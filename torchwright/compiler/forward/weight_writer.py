@@ -1,18 +1,19 @@
 """Writes weight matrices into TransformerLayer components.
 
-Each operation directly sets matrix entries using column indices from the
-ResidualStreamMap. No strategies, no ResidualAssignment — just scatter writes.
+Each operation directly sets matrix entries using immutable column indices
+captured in a replay plan. No scheduler, allocator, or ResidualAssignment —
+just scatter writes.
 """
 
-from dataclasses import dataclass, field
-from typing import Dict, List, Literal, Optional, Set, Tuple
+from dataclasses import dataclass
+from typing import Dict, Iterable, List, Literal, Optional, Set, Tuple
 
 import torch
 import torch.nn.functional as F
 
 from torchwright.compiler.realization import linear_attn_chunks
 from torchwright.compiler.residual_assignment import flatten_concat_nodes
-from torchwright.compiler.forward.residual_map import ResidualStreamMap
+from torchwright.compiler.forward.replay_plan import PlannedAttentionOp, PlannedMlpOp
 from torchwright.compiler.groups.transformer_layer import TransformerLayer
 from torchwright.graph import Node, Linear, Attn, Add, Concatenate
 from torchwright.graph.misc import LiteralValue
@@ -94,60 +95,11 @@ class PlacementRecorder:
         )
 
 
-@dataclass
-class AttnHeadOp:
-    op_type: Literal[
-        "compute_attn",
-        "compute_linear",
-        "compute_add",
-        "cancel",
-        "add_into",
-    ]
-    node: Optional[Node]
-    target_cols: List[int]
-    # Primary source columns captured at schedule time.  Meaning depends on
-    # op_type:
-    #   compute_attn: V input columns
-    #   compute_linear: input columns
-    #   compute_add: first addend's columns
-    #   add_into: live addend's columns
-    source_cols: Optional[List[int]] = None
-    # compute_add: second addend's columns.
-    source_cols_b: Optional[List[int]] = None
-    # compute_attn: Q and K input columns (V is in source_cols).
-    q_source_cols: Optional[List[int]] = None
-    k_source_cols: Optional[List[int]] = None
-
-
-@dataclass
-class MLPOp:
-    op_type: Literal[
-        "compute_ffn",
-        "compute_literal_value",
-        "compute_bias",
-        "compute_linear_bypass",
-        "cancel_bypass",
-        "clear_literal_seed",
-    ]
-    # None for ``cancel_bypass`` — the op zeroes a dying node's columns but is
-    # not itself a graph node (like the attention ``cancel``, which is outside
-    # invariant I2's literal/bias scope).
-    node: Optional[Node]
-    target_cols: List[int]
-    mlp_slots: List[int] = field(default_factory=list)
-    # Input columns captured at schedule time.  Used by compute_ffn (the FFN's
-    # input), compute_linear_bypass (the Linear's input), and cancel_bypass
-    # (the dying node's own columns — it reads what it negates).
-    source_cols: Optional[List[int]] = None
-
-
 def write_attn_sublayer(
     layer: TransformerLayer,
-    ops: List[AttnHeadOp],
-    residual_map: ResidualStreamMap,
-    pos_encoding=None,
+    ops: Iterable[PlannedAttentionOp],
+    const_one_col: int,
     recorder: Optional[PlacementRecorder] = None,
-    const_one: Optional[Node] = None,
 ):
     """Write attention head operations into a layer's AttnLayerComponent.
 
@@ -157,32 +109,36 @@ def write_attn_sublayer(
     lets the runtime rotation place the softmax on the diagonal — the RoPE
     end-state self-match (``docs/rope_port_plan.md`` §3, Phase 5).  ``pos_encoding``
     is accepted for signature stability but is always ``None`` (position is no
-    longer a residual substrate).
+    longer a residual substrate). ``const_one_col`` is captured by planning;
+    the writer never reads allocator state.
     """
+    ops = tuple(ops)
+    if any(not isinstance(op, PlannedAttentionOp) for op in ops):
+        raise TypeError(
+            "attention writer requires immutable PlannedAttentionOp records"
+        )
     attn = layer.attn.attn
-    assert const_one is not None, "const_one required for the rotary self-match"
     for op in ops:
         if op.op_type == "compute_attn":
-            _write_compute_attn(attn, op, residual_map, recorder)
+            _write_compute_attn(attn, op, recorder)
         elif op.op_type == "compute_linear":
-            _write_compute_linear(attn, op, residual_map, recorder, const_one)
+            _write_compute_linear(attn, op, const_one_col, recorder)
         elif op.op_type == "cancel":
-            _write_cancel(attn, op, residual_map, recorder, const_one)
+            _write_cancel(attn, op, const_one_col, recorder)
         elif op.op_type == "compute_add":
-            _write_compute_add(attn, op, residual_map, recorder, const_one)
+            _write_compute_add(attn, op, const_one_col, recorder)
         elif op.op_type == "add_into":
-            _write_add_into(attn, op, residual_map, recorder, const_one)
+            _write_add_into(attn, op, const_one_col, recorder)
         else:
             raise ValueError(f"Unknown attn op_type: {op.op_type}")
 
 
 def write_mlp_sublayer(
     layer: TransformerLayer,
-    ops: List[MLPOp],
-    residual_map: ResidualStreamMap,
+    ops: Iterable[PlannedMlpOp],
+    const_one_col: int,
     biased_linears: Optional[Set[Node]] = None,
     recorder: Optional[PlacementRecorder] = None,
-    const_one: Optional[Node] = None,
     bias: bool = True,
 ):
     """Write MLP operations into a layer's MLPSubLayer components.
@@ -193,13 +149,14 @@ def write_mlp_sublayer(
     lane at hidden slot 0 (see :class:`BiasFold`).  ``const_one`` is required
     then; the scheduler must have reserved slot 0 (packing from slot 1).
     """
+    ops = tuple(ops)
+    if any(not isinstance(op, PlannedMlpOp) for op in ops):
+        raise TypeError("MLP writer requires immutable PlannedMlpOp records")
     if biased_linears is None:
         biased_linears = set()
     bias_fold: Optional[BiasFold] = None
     if not bias:
-        assert const_one is not None, "bias=False requires const_one"
-        const_col = residual_map.get_indices(const_one)[0]
-        bias_fold = BiasFold(layer.mlp, const_col, recorder)
+        bias_fold = BiasFold(layer.mlp, const_one_col, recorder)
         for op in ops:
             assert BiasFold.LANE_SLOT not in op.mlp_slots, (
                 f"{op.op_type} for {op.node!r} claims hidden slot "
@@ -209,16 +166,14 @@ def write_mlp_sublayer(
             )
     for op in ops:
         if op.op_type == "compute_ffn":
-            _write_compute_ffn(
-                layer.mlp, op, residual_map, biased_linears, recorder, bias_fold
-            )
+            _write_compute_ffn(layer.mlp, op, biased_linears, recorder, bias_fold)
         elif op.op_type == "compute_literal_value":
             _write_compute_literal_value(layer.mlp, op, bias_fold)
         elif op.op_type == "compute_bias":
             _write_compute_bias(layer.mlp, op, bias_fold)
         elif op.op_type == "compute_linear_bypass":
             _write_compute_linear_bypass(
-                layer.mlp, op, residual_map, biased_linears, recorder, bias_fold
+                layer.mlp, op, biased_linears, recorder, bias_fold
             )
         elif op.op_type == "cancel_bypass":
             _write_cancel_bypass(layer.mlp, op, recorder, bias_fold)
@@ -326,8 +281,7 @@ def _allocate_head(attn):
 
 def _write_compute_attn(
     attn,
-    op: AttnHeadOp,
-    rmap: ResidualStreamMap,
+    op: PlannedAttentionOp,
     recorder: Optional[PlacementRecorder] = None,
 ):
     """Copy an Attn node's Q/K/V/O matrices into attention heads.
@@ -430,7 +384,7 @@ def _write_compute_attn(
         )
 
 
-def _self_match_source(d_head, rmap, const_one):
+def _self_match_source(d_head: int, const_one_col: int):
     """Q/K source columns + matrices for a Δ=0 self-match head.
 
     Reads the single reserved constant-1 column and projects it to
@@ -445,7 +399,7 @@ def _self_match_source(d_head, rmap, const_one):
     Returns ``(qk_idx, q_mat, k_mat)`` where ``qk_idx`` is used for both the query
     and key source (Δ=0 self-match reads one source on both sides).
     """
-    const_idx = rmap.get_indices(const_one)  # width 1
+    const_idx = (const_one_col,)
     q_mat = _SELF_MATCH_HARDNESS * torch.ones(1, d_head)
     k_mat = torch.ones(1, d_head)
     return const_idx, q_mat, k_mat
@@ -453,10 +407,9 @@ def _self_match_source(d_head, rmap, const_one):
 
 def _write_compute_linear(
     attn,
-    op: AttnHeadOp,
-    rmap: ResidualStreamMap,
+    op: PlannedAttentionOp,
+    const_one_col: int,
     recorder: Optional[PlacementRecorder] = None,
-    const_one: Optional[Node] = None,
 ):
     """Compile a zero-bias Linear via current-position attention.
 
@@ -487,7 +440,7 @@ def _write_compute_linear(
     d_input = len(input_node)
 
     assert op.source_cols is not None, "compute_linear requires source_cols"
-    qk_idx, q_mat, k_mat = _self_match_source(d_head, rmap, const_one)
+    qk_idx, q_mat, k_mat = _self_match_source(d_head, const_one_col)
     v_idx = op.source_cols
     o_idx = op.target_cols
 
@@ -525,10 +478,9 @@ def _write_compute_linear(
 
 def _write_compute_add(
     attn,
-    op: AttnHeadOp,
-    rmap: ResidualStreamMap,
+    op: PlannedAttentionOp,
+    const_one_col: int,
     recorder: Optional[PlacementRecorder] = None,
-    const_one: Optional[Node] = None,
 ):
     """Compute Add(a, b) by copying both inputs to fresh columns via attention.
 
@@ -559,7 +511,7 @@ def _write_compute_add(
     d_head = attn.d_head
     d_output = len(node)
     o_idx = op.target_cols
-    qk_idx, q_mat, k_mat = _self_match_source(d_head, rmap, const_one)
+    qk_idx, q_mat, k_mat = _self_match_source(d_head, const_one_col)
 
     v_idx_a = op.source_cols
     v_idx_b = op.source_cols_b
@@ -647,10 +599,9 @@ def _write_compute_add(
 
 def _write_cancel(
     attn,
-    op: AttnHeadOp,
-    rmap: ResidualStreamMap,
+    op: PlannedAttentionOp,
+    const_one_col: int,
     recorder: Optional[PlacementRecorder] = None,
-    const_one: Optional[Node] = None,
 ):
     """Cancel target_cols: V=identity, O=-identity. Skip adds x + (-x) = 0.
 
@@ -664,7 +615,7 @@ def _write_cancel(
     d_width = len(op.target_cols)
 
     node_idx = op.target_cols
-    qk_idx, q_mat, k_mat = _self_match_source(d_head, rmap, const_one)
+    qk_idx, q_mat, k_mat = _self_match_source(d_head, const_one_col)
 
     for start in range(0, d_width, d_head):
         end = min(start + d_head, d_width)
@@ -696,10 +647,9 @@ def _write_cancel(
 
 def _write_add_into(
     attn,
-    op: AttnHeadOp,
-    rmap: ResidualStreamMap,
+    op: PlannedAttentionOp,
+    const_one_col: int,
     recorder: Optional[PlacementRecorder] = None,
-    const_one: Optional[Node] = None,
 ):
     """Add(dead, live): copy live's values to dead's columns via attention.
 
@@ -720,7 +670,7 @@ def _write_add_into(
     d_live = len(v_idx)
 
     o_idx = op.target_cols  # dead addend's columns
-    qk_idx, q_mat, k_mat = _self_match_source(d_head, rmap, const_one)
+    qk_idx, q_mat, k_mat = _self_match_source(d_head, const_one_col)
 
     for start in range(0, d_live, d_head):
         end = min(start + d_head, d_live)
@@ -885,8 +835,7 @@ def _mlp_in_out(mlp):
 
 def _write_compute_ffn(
     mlp,
-    op: MLPOp,
-    rmap: ResidualStreamMap,
+    op: PlannedMlpOp,
     biased_linears: Optional[Set[Node]] = None,
     recorder: Optional[PlacementRecorder] = None,
     bias_fold: Optional[BiasFold] = None,
@@ -1062,7 +1011,9 @@ def _write_compute_ffn(
         recorder.add("mlp.W_out", ffn, op.op_type, mlp_slots, out_idx, "dense")
 
 
-def _write_compute_literal_value(mlp, op: MLPOp, bias_fold: Optional[BiasFold] = None):
+def _write_compute_literal_value(
+    mlp, op: PlannedMlpOp, bias_fold: Optional[BiasFold] = None
+):
     """Write a constant value via MLP output bias (or the constant lane).
 
     Under ``bias=False`` the value rides the constant lane's down-projection
@@ -1088,7 +1039,7 @@ def _write_compute_literal_value(mlp, op: MLPOp, bias_fold: Optional[BiasFold] =
     out_lin.output_bias[cols_t] = node.value.to(target_dtype)
 
 
-def _write_compute_bias(mlp, op: MLPOp, bias_fold: Optional[BiasFold] = None):
+def _write_compute_bias(mlp, op: PlannedMlpOp, bias_fold: Optional[BiasFold] = None):
     """Add bias to MLP output bias (for biased Linear split).
 
     Under ``bias=False`` the deferred bias rides the constant lane's
@@ -1118,7 +1069,9 @@ def _write_compute_bias(mlp, op: MLPOp, bias_fold: Optional[BiasFold] = None):
     out_lin.output_bias[cols_t] += node.output_bias.to(target_dtype)
 
 
-def _write_clear_literal_seed(mlp, op: MLPOp, bias_fold: Optional[BiasFold] = None):
+def _write_clear_literal_seed(
+    mlp, op: PlannedMlpOp, bias_fold: Optional[BiasFold] = None
+):
     """Cancel a compiler-internal literal in the final MLP residual update.
 
     The literal remains live through final attention (self-match heads read
@@ -1231,7 +1184,7 @@ def _write_bypass_lane_pair(
 
 def _write_cancel_bypass(
     mlp,
-    op: MLPOp,
+    op: PlannedMlpOp,
     recorder: Optional[PlacementRecorder] = None,
     bias_fold: Optional[BiasFold] = None,
 ):
@@ -1265,8 +1218,7 @@ def _write_cancel_bypass(
 
 def _write_compute_linear_bypass(
     mlp,
-    op: MLPOp,
-    rmap: ResidualStreamMap,
+    op: PlannedMlpOp,
     biased_linears: Optional[Set[Node]] = None,
     recorder: Optional[PlacementRecorder] = None,
     bias_fold: Optional[BiasFold] = None,

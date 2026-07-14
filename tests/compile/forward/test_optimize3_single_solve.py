@@ -141,11 +141,12 @@ def test_optimize3_is_one_solve_with_the_full_budget_and_the_mech_hint(
     kw = calls[0]
     # The full production budget goes to the single solve.
     assert kw["time_budget_s"] == 600.0
-    # All four hint families are passed from the heuristic warm start; the
-    # mechanism bits are the load-bearing ones under the pin.
-    assert kw["hint_layers"], "no layer hint reached the solver"
-    assert kw["hint_routing"], "no routing hint reached the solver"
-    assert kw["hint_cancel"], "no cancel hint reached the solver"
-    assert kw["hint_cancel_mech"], "no cancel-mechanism hint reached the solver"
+    # One complete incumbent crosses the production boundary; solve_schedule
+    # translates it into the four OR-Tools hint families internally.
+    incumbent = kw["incumbent"]
+    assert incumbent.node_to_layer
+    assert incumbent.node_to_routing
+    assert incumbent.node_to_cancel_layer
+    assert incumbent.node_to_cancel_mech
     # Horizon is the heuristic depth + 1 slack layer (a soft ceiling).
-    assert kw["max_layers"] == max(kw["hint_layers"].values()) + 2
+    assert kw["max_layers"] == max(incumbent.node_to_layer.values()) + 2

@@ -6,12 +6,16 @@ All tests run on a small two-FFN repro graph — a handful of nodes, so
 each solve is sub-second.
 """
 
+import inspect
+
 import pytest
 import torch
 
 from torchwright.compiler.forward.cpsat_scheduler import (
     Costs,
+    DiagnosticHint,
     _compute_layer_bounds,
+    build_cpsat_model,
     build_graph_model,
     solve_schedule,
 )
@@ -47,6 +51,27 @@ def _repro_graph():
     L_out = Linear(block_c, torch.randn(8, 4), torch.zeros(4), name="L_out")
     fuse_consecutive_linears({L_out})
     return L_out
+
+
+def test_parallel_hint_api_is_isolated_behind_one_diagnostic_value():
+    solve_params = inspect.signature(solve_schedule).parameters
+    build_params = inspect.signature(build_cpsat_model).parameters
+    legacy = {"hint_layers", "hint_routing", "hint_cancel", "hint_cancel_mech"}
+
+    assert legacy.isdisjoint(solve_params)
+    assert legacy.isdisjoint(build_params)
+    assert "_diagnostic_hint" in solve_params
+    assert "diagnostic_hint" in build_params
+
+
+def test_diagnostic_hint_defensively_freezes_parallel_mappings():
+    layers = {2: 1}
+    hint = DiagnosticHint(layers=layers, routing={2: "attn"})
+    layers[2] = 9
+
+    assert hint.layers == {2: 1}
+    with pytest.raises(TypeError):
+        hint.layers[2] = 3
 
 
 _SOLVE_KW = dict(d=64, d_head=8, d_hidden=128, time_budget_s=10.0, max_layers=20)
@@ -206,6 +231,23 @@ def test_schedule_cache_round_trip(tmp_path, monkeypatch):
     net2 = forward_compile(output_node=out2, **kw)
     assert net2.cpsat_solve_stats.status_name == "CACHED"
     assert len(net2.layers) == len(net1.layers)
+    fresh_provenance = net1.schedule_result.provenance
+    cached_provenance = net2.schedule_result.provenance
+    assert fresh_provenance.delivery == "fresh"
+    assert cached_provenance.delivery == "cache"
+    assert cached_provenance.origin == fresh_provenance.origin
+    assert cached_provenance.selected_objective == fresh_provenance.selected_objective
+    assert (
+        cached_provenance.selected_objective_blocks
+        == fresh_provenance.selected_objective_blocks
+    )
+    assert cached_provenance.selected_is_optimal == fresh_provenance.selected_is_optimal
+    assert cached_provenance.solver_attempt is not None
+    assert fresh_provenance.solver_attempt is not None
+    assert (
+        cached_provenance.solver_attempt.status_name
+        == fresh_provenance.solver_attempt.status_name
+    )
 
     inputs = {"x": torch.randn(3, 8)}
     torch.testing.assert_close(
@@ -394,8 +436,6 @@ def test_deferred_cancel_hint_rejected_without_widening():
     past the uniform window) is INFEASIBLE under the hint-blind model — the
     root cause of the silent optimize=2 fallback — and becomes a model point
     once ``build_cpsat_model`` sees the hint and widens that node's window."""
-    from torchwright.compiler.forward.cpsat_scheduler import build_cpsat_model
-
     max_layers = _SOLVE_KW["max_layers"]
     out, (hint_layers, hint_routing, hint_cancel), target_id = _deferred_cancel_hint(
         max_layers
@@ -416,8 +456,10 @@ def test_deferred_cancel_hint_rejected_without_widening():
     )
 
     aware = build_cpsat_model(
-        out, hint_layers=hint_layers, hint_cancel=hint_cancel,
-        _pin_cancels=False, **build_kw
+        out,
+        diagnostic_hint=DiagnosticHint(layers=hint_layers, cancel=hint_cancel),
+        _pin_cancels=False,
+        **build_kw,
     )
     assert aware.cancel_window_delta == {target_id: 1}
     status = _hard_fix_and_solve(aware, hint_layers, hint_routing, hint_cancel)
@@ -435,9 +477,11 @@ def test_deferred_cancel_hint_accepted_by_solve_schedule():
     )
     assignment, stats = solve_schedule(
         out,
-        hint_layers=hint_layers,
-        hint_routing=hint_routing,
-        hint_cancel=hint_cancel,
+        _diagnostic_hint=DiagnosticHint(
+            layers=hint_layers,
+            routing=hint_routing,
+            cancel=hint_cancel,
+        ),
         strict_hint=True,
         _pin_cancels=False,
         **_SOLVE_KW,
@@ -470,8 +514,10 @@ def test_strict_hint_validation_raises_on_invalid_hint():
     with pytest.raises(ValueError, match="before birth"):
         solve_schedule(
             out,
-            hint_layers=hint_layers,
-            hint_cancel=bad_cancel,
+            _diagnostic_hint=DiagnosticHint(
+                layers=hint_layers,
+                cancel=bad_cancel,
+            ),
             strict_hint=True,
             _pin_cancels=False,
             **_SOLVE_KW,
@@ -479,8 +525,13 @@ def test_strict_hint_validation_raises_on_invalid_hint():
 
     with pytest.warns(RuntimeWarning, match="hint validation"):
         assignment2, _ = solve_schedule(
-            out, hint_layers=hint_layers, hint_cancel=bad_cancel,
-            _pin_cancels=False, **_SOLVE_KW
+            out,
+            _diagnostic_hint=DiagnosticHint(
+                layers=hint_layers,
+                cancel=bad_cancel,
+            ),
+            _pin_cancels=False,
+            **_SOLVE_KW,
         )
     # Default mode keeps the fall-back-don't-fail contract: still solves.
     assert assignment2 is not None
@@ -501,8 +552,10 @@ def test_strict_hint_validation_raises_on_keep_forever_cancel():
     with pytest.raises(ValueError, match="keep-forever"):
         solve_schedule(
             out,
-            hint_layers=dict(assignment.node_to_layer),
-            hint_cancel={keep.node_id: 1},
+            _diagnostic_hint=DiagnosticHint(
+                layers=assignment.node_to_layer,
+                cancel={keep.node_id: 1},
+            ),
             strict_hint=True,
             _pin_cancels=False,
             **_SOLVE_KW,

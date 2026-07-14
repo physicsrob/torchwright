@@ -7,13 +7,13 @@ buffers computed in ``__init__``; ``from_pretrained``'s meta-device
 (``low_cpu_mem_usage``) load path does NOT materialize a non-persistent buffer —
 it is absent from the checkpoint and never re-run — so the reloaded buffer held
 uninitialized memory (NaN on the A100 fp32 path) and the rotary multiply
-propagated NaN to every logit.  The freshly-converted model passed because
-``convert_onnx_to_hf`` builds it with a plain constructor (no meta path), which
+propagated NaN to every logit.  The freshly-direct_model model passed because
+``compile_to_hf`` builds it with a plain constructor (no meta path), which
 is exactly why the bug only showed up on save -> load.
 
 This pins the contract directly at the smallest layer — a tiny config built by
 hand, no compile / ONNX artifact — so it is fast and independent of the
-converter.  It asserts behaviour (finite, bit-identical logits before and after
+direct compiler.  It asserts behaviour (finite, bit-identical logits before and after
 the round trip), not a specific buffer, so it stays valid however the rotary
 constants are stored.
 """
@@ -21,13 +21,13 @@ constants are stored.
 import pytest
 import torch
 
-from torchwright.compiler.hf.configuration_torchwright import TorchwrightConfig
-from torchwright.compiler.hf.modeling_torchwright import TorchwrightForCausalLM
+from torchwright.compiler.hf.configuration_torchwright_custom import TorchwrightCustomConfig
+from torchwright.compiler.hf.modeling_torchwright_custom import TorchwrightCustomForCausalLM
 
 
 def _tiny_model(rope_base):
     torch.manual_seed(0)
-    cfg = TorchwrightConfig(
+    cfg = TorchwrightCustomConfig(
         d=48,
         d_head=12,
         vocab_size=13,
@@ -37,7 +37,7 @@ def _tiny_model(rope_base):
         max_position_embeddings=64,
         rope_base=rope_base,
     )
-    model = TorchwrightForCausalLM(cfg).eval()
+    model = TorchwrightCustomForCausalLM(cfg).eval()
     # A finite, non-zero embedding table so a broken rotary path can't hide
     # behind an all-zero residual (token.v6: const seeds ride the embedding
     # rows; there is no separate constant_values buffer to perturb).
@@ -57,7 +57,7 @@ def test_save_load_logits_identical(tmp_path, rope_base):
     assert torch.isfinite(before).all(), "fresh model already non-finite"
 
     model.save_pretrained(tmp_path)
-    reloaded = TorchwrightForCausalLM.from_pretrained(tmp_path).eval()
+    reloaded = TorchwrightCustomForCausalLM.from_pretrained(tmp_path).eval()
     with torch.no_grad():
         after = reloaded(input_ids=ids, use_cache=True).logits
 
@@ -73,7 +73,7 @@ def test_save_load_cached_decode_finite(tmp_path):
     the path generate() exercises."""
     model = _tiny_model(500000.0)
     model.save_pretrained(tmp_path)
-    reloaded = TorchwrightForCausalLM.from_pretrained(tmp_path).eval()
+    reloaded = TorchwrightCustomForCausalLM.from_pretrained(tmp_path).eval()
 
     ids = torch.tensor([[1, 2, 3, 4, 5, 6]])
     with torch.no_grad():

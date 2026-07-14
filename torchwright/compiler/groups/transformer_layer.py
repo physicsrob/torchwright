@@ -13,6 +13,7 @@ class TransformerLayer:
         d_head: int,
         d_hidden: Optional[int] = None,
         activation: str = "relu",
+        n_heads: Optional[int] = None,
     ):
         # The machine kind is uniform per network (all-ReLU or all-swish);
         # the compiler selects it from the graph's FFN nodes and threads it
@@ -26,7 +27,7 @@ class TransformerLayer:
                 f"TransformerLayer activation must be 'relu' or 'swish', "
                 f"got {activation!r}"
             )
-        self.attn = AttnSubLayer(d, d_head)
+        self.attn = AttnSubLayer(d, d_head, n_heads=n_heads)
 
     def to(self, device):
         self.attn.to(device)

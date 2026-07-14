@@ -43,6 +43,40 @@ Both examples can be compiled to ONNX for portable inference:
 make compile     # produces adder.onnx and calculator_simple.onnx
 ```
 
+Hugging Face is a sibling compile target and does not use ONNX as an
+intermediate artifact:
+
+```python
+from torchwright.compiler import compile_to_hf, compile_hf_bundle
+
+model = compile_to_hf(output_node, embedding, d=1024)
+report = compile_hf_bundle(output_node, embedding, "hf_bundle", d=1024)
+print(report.n_layers, report.schedule_provenance.selected_origin)
+```
+
+Attention geometry can be chosen independently of residual width:
+
+```python
+model = compile_to_hf(
+    output_node, embedding, d=512, d_head=128, n_heads=3
+)
+```
+
+Here the residual width is 512 and the flattened attention width is
+`3 * 128 = 384`. When `n_heads` is omitted it defaults to `d // d_head`,
+and `d` must then be divisible by `d_head`.
+
+The default is a stock `Phi3ForCausalLM` contract: SwiGLU graph, biasless
+projections, RMSNorm, no custom code, and no `trust_remote_code`. A legacy
+ReLU graph must opt in explicitly with `architecture="custom"`, which produces
+`TorchwrightCustomForCausalLM`. `compile_hf_bundle` writes sharded safetensors
+one layer at a time for large-model publishing. Publication is transactional:
+the destination is replaced only after the staged config, tensor manifest, and
+tokenizer validate. Its immutable `HFBundleReport` return value exposes the
+published layer count and selected-schedule provenance without retaining graph,
+weight, or private compiler state. Token artifacts currently require one graph
+`Embedding`, and the supplied `embedding` argument must be that exact node.
+
 
 ## Key Concepts
 
@@ -112,6 +146,10 @@ because they describe the compiler's internals.
   the circuits literature. Both names refer to the same thing.
 - **attention head** — One head within multi-head attention, parameterised
   by `W_Q`, `W_K`, `W_V`, `W_O`. Same meaning as in the circuits work.
+- **`d_head`** — Width of one attention head.
+- **`n_heads`** — Maximum attention heads available per compiled layer.
+  Defaults to `d // d_head`; it can be set explicitly to make the flattened
+  attention width (`n_heads * d_head`) independent of `d`.
 - **neuron** — One dimension of the MLP's hidden layer (the intermediate
   representation between `linear1` and `linear2`). Anthropic uses both
   *MLP neuron* and *ReLU unit* for this concept; we use **neuron**.

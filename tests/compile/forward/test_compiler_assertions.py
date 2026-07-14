@@ -17,9 +17,11 @@ from torchwright.compiler.forward.compile import (
 )
 from torchwright.compiler.forward.graph_analysis import GraphAnalyzer
 from torchwright.compiler.forward.residual_map import ResidualStreamMap
+from torchwright.compiler.forward.replay_plan import (
+    PlannedAttentionOp,
+    PlannedMlpOp,
+)
 from torchwright.compiler.forward.weight_writer import (
-    AttnHeadOp,
-    MLPOp,
     _write_compute_attn,
     _write_compute_literal_value,
 )
@@ -150,7 +152,7 @@ def test_C_literal_write_rejects_truncation():
     layer = TransformerLayer(D, D_HEAD)
     lit = LiteralValue(torch.tensor([1.0, 2.0, 3.0, 4.0]), name="lit")
     # Only 2 target cols, but value has 4 entries — would silently drop.
-    bogus = MLPOp(
+    bogus = PlannedMlpOp(
         op_type="compute_literal_value", node=lit, target_cols=[0, 1], mlp_slots=[]
     )
     with pytest.raises(AssertionError, match=r"Literal truncation would drop values"):
@@ -161,7 +163,7 @@ def test_C_literal_write_rejects_extra_target_cols():
     """Target cols wider than the literal would write uninitialized tail."""
     layer = TransformerLayer(D, D_HEAD)
     lit = LiteralValue(torch.tensor([1.0, 2.0]), name="lit")
-    bogus = MLPOp(
+    bogus = PlannedMlpOp(
         op_type="compute_literal_value",
         node=lit,
         target_cols=[0, 1, 2, 3],
@@ -198,7 +200,7 @@ def test_B_attn_rejects_v_source_cols_wrong_length():
     out_cols = rmap.allocate(node)
 
     layer = TransformerLayer(D, D_HEAD)
-    bogus = AttnHeadOp(
+    bogus = PlannedAttentionOp(
         op_type="compute_attn",
         node=node,
         target_cols=out_cols,
@@ -228,7 +230,7 @@ def test_B_attn_rejects_q_source_cols_wrong_length():
     out_cols = rmap.allocate(node)
 
     layer = TransformerLayer(D, D_HEAD)
-    bogus = AttnHeadOp(
+    bogus = PlannedAttentionOp(
         op_type="compute_attn",
         node=node,
         target_cols=out_cols,
@@ -366,7 +368,7 @@ def _no_bias_setup():
 
 
 def test_no_bias_slot0_claim_fires():
-    """An MLPOp claiming hidden slot 0 under bias=False is a scheduler bug:
+    """An PlannedMlpOp claiming hidden slot 0 under bias=False is a scheduler bug:
     slot 0 is the constant lane, packing must start at slot 1."""
     from torchwright.compiler.forward.weight_writer import write_mlp_sublayer
     from torchwright.graph import FFN
@@ -383,7 +385,7 @@ def test_no_bias_slot0_claim_fires():
         activation="relu",
     )
     cols = rmap.allocate(ffn)
-    op = MLPOp(
+    op = PlannedMlpOp(
         "compute_ffn",
         ffn,
         cols,
@@ -392,7 +394,7 @@ def test_no_bias_slot0_claim_fires():
     )
     layer = TransformerLayer(D, D_HEAD)
     with pytest.raises(AssertionError, match="constant lane"):
-        write_mlp_sublayer(layer, [op], rmap, const_one=const_one, bias=False)
+        write_mlp_sublayer(layer, [op], rmap.get_indices(const_one)[0], bias=False)
 
 
 def test_no_bias_const_column_aliasing_fires():
@@ -417,7 +419,9 @@ def test_no_bias_const_column_aliasing_fires():
     # by the allocator; the assert is the backstop).
     bad_source = list(rmap.get_indices(x))
     bad_source[0] = rmap.get_indices(const_one)[0]
-    op = MLPOp("compute_ffn", ffn, cols, mlp_slots=[1, 2, 3, 4], source_cols=bad_source)
+    op = PlannedMlpOp(
+        "compute_ffn", ffn, cols, mlp_slots=[1, 2, 3, 4], source_cols=bad_source
+    )
     layer = TransformerLayer(D, D_HEAD)
     with pytest.raises(AssertionError, match="constant-1 column"):
-        write_mlp_sublayer(layer, [op], rmap, const_one=const_one, bias=False)
+        write_mlp_sublayer(layer, [op], rmap.get_indices(const_one)[0], bias=False)

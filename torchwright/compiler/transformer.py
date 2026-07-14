@@ -26,6 +26,7 @@ class HeadlessTransformer:
     d: int
     d_hidden: int
     d_head: int
+    n_heads: int
     residual_assignment: Optional[ResidualAssignment]
     # 2-D weight-matrix occupancy recorded during weight writing (see
     # forward.weight_writer.PlacementRecorder).  ``None`` until compile sets it.
@@ -37,15 +38,19 @@ class HeadlessTransformer:
         d_head: int,
         d_hidden: Optional[int] = None,
         activation: str = "relu",
+        n_heads: Optional[int] = None,
     ):
         if activation not in ("relu", "swish"):
             raise ValueError(
                 f"HeadlessTransformer activation must be 'relu' or 'swish', "
                 f"got {activation!r}"
             )
+        from torchwright.compiler.utils import resolve_n_heads
+
         self.d = d
         self.d_hidden = d if d_hidden is None else d_hidden
         self.d_head = d_head
+        self.n_heads = resolve_n_heads(d, d_head, n_heads)
         # Machine kind, uniform across all layers: "relu" compiles MLP
         # sublayers as linear1->ReLU->linear2, "swish" as the gated
         # (SwiGLU) sublayer.  Chosen by the compiler from the graph's
@@ -68,7 +73,11 @@ class HeadlessTransformer:
 
     def add_layer(self, append: bool = False) -> TransformerLayer:
         layer = TransformerLayer(
-            self.d, self.d_head, d_hidden=self.d_hidden, activation=self.activation
+            self.d,
+            self.d_head,
+            d_hidden=self.d_hidden,
+            activation=self.activation,
+            n_heads=self.n_heads,
         )
         if append:
             self.layers.append(layer)

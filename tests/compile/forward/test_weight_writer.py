@@ -21,9 +21,11 @@ import torch.nn.functional as F
 
 import torchwright.compiler.device as device_mod
 from torchwright.compiler.forward.residual_map import ResidualStreamMap
+from torchwright.compiler.forward.replay_plan import (
+    PlannedAttentionOp,
+    PlannedMlpOp,
+)
 from torchwright.compiler.forward.weight_writer import (
-    AttnHeadOp,
-    MLPOp,
     write_attn_sublayer,
     write_mlp_sublayer,
 )
@@ -78,10 +80,10 @@ def _build_residual_stream(
 
 
 def _make_op(rmap: ResidualStreamMap, op_type: str, node, target_cols, **kwargs):
-    """Construct an AttnHeadOp with source_cols captured from ``rmap``.
+    """Construct an PlannedAttentionOp with source_cols captured from ``rmap``.
 
     The weight-writer requires source_cols to be populated at op-construction
-    time (see weight_writer.AttnHeadOp docstring).  This helper resolves
+    time (see weight_writer.PlannedAttentionOp docstring).  This helper resolves
     the right source indices for each op type so tests can be terse.
     """
     if op_type == "compute_attn":
@@ -104,7 +106,7 @@ def _make_op(rmap: ResidualStreamMap, op_type: str, node, target_cols, **kwargs)
                 kwargs["source_cols"] = rmap.resolve_indices(a0)
             else:
                 kwargs["source_cols"] = rmap.resolve_indices(a1)
-    return AttnHeadOp(
+    return PlannedAttentionOp(
         op_type=cast(
             Literal[
                 "compute_attn",
@@ -124,7 +126,7 @@ def _make_op(rmap: ResidualStreamMap, op_type: str, node, target_cols, **kwargs)
 def _make_mlp_op(
     rmap: ResidualStreamMap, op_type: str, node, target_cols, mlp_slots=None, **kwargs
 ):
-    """Construct an MLPOp with source_cols captured from ``rmap``."""
+    """Construct an PlannedMlpOp with source_cols captured from ``rmap``."""
     if mlp_slots is None:
         mlp_slots = []
     if op_type == "compute_ffn":
@@ -132,7 +134,7 @@ def _make_mlp_op(
         kwargs.setdefault("source_cols", rmap.resolve_indices(node.inputs[0]))
     elif op_type == "compute_linear_bypass":
         kwargs.setdefault("source_cols", rmap.resolve_indices(node.inputs[0]))
-    return MLPOp(
+    return PlannedMlpOp(
         op_type=cast(
             Literal[
                 "compute_ffn",
@@ -194,7 +196,7 @@ def test_attn_compute():
     layer = TransformerLayer(D, D_HEAD)
     op = _make_op(rmap, "compute_attn", attn_node, out_cols)
     const_one = _const_one(rmap)
-    write_attn_sublayer(layer, [op], rmap, const_one=const_one)
+    write_attn_sublayer(layer, [op], rmap.get_indices(const_one)[0])
     layer.to(device_mod.get_device(verbose=False))
 
     # Build input residual stream
@@ -237,7 +239,7 @@ def test_attn_compute_small_d_v():
     layer = TransformerLayer(D, D_HEAD)
     op = _make_op(rmap, "compute_attn", attn_node, out_cols)
     const_one = _const_one(rmap)
-    write_attn_sublayer(layer, [op], rmap, const_one=const_one)
+    write_attn_sublayer(layer, [op], rmap.get_indices(const_one)[0])
     layer.to(device_mod.get_device(verbose=False))
 
     v_values = torch.randn(N_POS, len(value_in))
@@ -277,7 +279,7 @@ def test_attn_compute_shared_inputs():
     layer = TransformerLayer(D, D_HEAD)
     op = _make_op(rmap, "compute_attn", attn_node, out_cols)
     const_one = _const_one(rmap)
-    write_attn_sublayer(layer, [op], rmap, const_one=const_one)
+    write_attn_sublayer(layer, [op], rmap.get_indices(const_one)[0])
     layer.to(device_mod.get_device(verbose=False))
 
     v_values = torch.randn(N_POS, len(value_in))
@@ -327,7 +329,7 @@ def test_attn_compute_multiposition():
     layer = TransformerLayer(D, D_HEAD)
     op = _make_op(rmap, "compute_attn", attn_node, out_cols)
     const_one = _const_one(rmap)
-    write_attn_sublayer(layer, [op], rmap, const_one=const_one)
+    write_attn_sublayer(layer, [op], rmap.get_indices(const_one)[0])
     layer.to(device_mod.get_device(verbose=False))
 
     v_values = torch.tensor(
@@ -378,7 +380,7 @@ def test_linear_zero_bias():
     layer = TransformerLayer(D, D_HEAD)
     op = _make_op(rmap, "compute_linear", linear_node, out_cols)
     const_one = _const_one(rmap)
-    write_attn_sublayer(layer, [op], rmap, const_one=const_one)
+    write_attn_sublayer(layer, [op], rmap.get_indices(const_one)[0])
     layer.to(device_mod.get_device(verbose=False))
 
     x_values = torch.randn(N_POS, 4)
@@ -418,7 +420,7 @@ def test_linear_large_input():
     layer = TransformerLayer(D, D_HEAD)
     op = _make_op(rmap, "compute_linear", linear_node, out_cols)
     const_one = _const_one(rmap)
-    write_attn_sublayer(layer, [op], rmap, const_one=const_one)
+    write_attn_sublayer(layer, [op], rmap.get_indices(const_one)[0])
     layer.to(device_mod.get_device(verbose=False))
 
     input_values = {f"x{i}": torch.randn(N_POS, 8) for i in range(4)}
@@ -450,7 +452,7 @@ def test_linear_different_dims():
     layer = TransformerLayer(D, D_HEAD)
     op = _make_op(rmap, "compute_linear", linear_node, out_cols)
     const_one = _const_one(rmap)
-    write_attn_sublayer(layer, [op], rmap, const_one=const_one)
+    write_attn_sublayer(layer, [op], rmap.get_indices(const_one)[0])
     layer.to(device_mod.get_device(verbose=False))
 
     x_values = torch.randn(N_POS, 8)
@@ -479,9 +481,9 @@ def test_cancel():
     x_cols = rmap.allocate(x)
 
     layer = TransformerLayer(D, D_HEAD)
-    op = AttnHeadOp(op_type="cancel", node=x, target_cols=x_cols)
+    op = PlannedAttentionOp(op_type="cancel", node=x, target_cols=x_cols)
     const_one = _const_one(rmap)
-    write_attn_sublayer(layer, [op], rmap, const_one=const_one)
+    write_attn_sublayer(layer, [op], rmap.get_indices(const_one)[0])
     layer.to(device_mod.get_device(verbose=False))
 
     x_values = torch.randn(N_POS, 4)
@@ -508,11 +510,11 @@ def test_cancel_multiple():
 
     layer = TransformerLayer(D, D_HEAD)
     ops = [
-        AttnHeadOp(op_type="cancel", node=a, target_cols=a_cols),
-        AttnHeadOp(op_type="cancel", node=b, target_cols=b_cols),
+        PlannedAttentionOp(op_type="cancel", node=a, target_cols=a_cols),
+        PlannedAttentionOp(op_type="cancel", node=b, target_cols=b_cols),
     ]
     const_one = _const_one(rmap)
-    write_attn_sublayer(layer, ops, rmap, const_one=const_one)
+    write_attn_sublayer(layer, ops, rmap.get_indices(const_one)[0])
     layer.to(device_mod.get_device(verbose=False))
 
     a_values = torch.randn(N_POS, 3)
@@ -555,8 +557,8 @@ def test_compute_linear_reuses_dying_input_columns():
     # cancel zeroes all 12.  Net after the summed attention sublayer: the 2
     # reused columns hold y, the other 10 hold 0.
     linear_op = _make_op(rmap, "compute_linear", y, target)  # source_cols = x_cols
-    cancel_op = AttnHeadOp(op_type="cancel", node=x, target_cols=x_cols)
-    write_attn_sublayer(layer, [linear_op, cancel_op], rmap, const_one=const_one)
+    cancel_op = PlannedAttentionOp(op_type="cancel", node=x, target_cols=x_cols)
+    write_attn_sublayer(layer, [linear_op, cancel_op], rmap.get_indices(const_one)[0])
     layer.to(device_mod.get_device(verbose=False))
 
     x_values = torch.randn(N_POS, 12)
@@ -598,7 +600,7 @@ def test_add_into():
     layer = TransformerLayer(D, D_HEAD)
     op = _make_op(rmap, "add_into", add_node, a_cols)
     const_one = _const_one(rmap)
-    write_attn_sublayer(layer, [op], rmap, const_one=const_one)
+    write_attn_sublayer(layer, [op], rmap.get_indices(const_one)[0])
     layer.to(device_mod.get_device(verbose=False))
 
     a_values = torch.randn(N_POS, 4)
@@ -640,7 +642,7 @@ def test_add_into_dead_at_inputs1():
     layer = TransformerLayer(D, D_HEAD)
     op = _make_op(rmap, "add_into", add_node, dead_cols)
     const_one = _const_one(rmap)
-    write_attn_sublayer(layer, [op], rmap, const_one=const_one)
+    write_attn_sublayer(layer, [op], rmap.get_indices(const_one)[0])
     layer.to(device_mod.get_device(verbose=False))
 
     live_values = torch.randn(N_POS, 4)
@@ -679,7 +681,7 @@ def test_compute_add():
     layer = TransformerLayer(D, D_HEAD)
     op = _make_op(rmap, "compute_add", add_node, out_cols)
     const_one = _const_one(rmap)
-    write_attn_sublayer(layer, [op], rmap, const_one=const_one)
+    write_attn_sublayer(layer, [op], rmap.get_indices(const_one)[0])
     layer.to(device_mod.get_device(verbose=False))
 
     a_values = torch.randn(N_POS, 4)
@@ -712,7 +714,7 @@ def test_compute_add_wide():
     layer = TransformerLayer(d_wide, D_HEAD)
     op = _make_op(rmap, "compute_add", add_node, out_cols)
     const_one = _const_one(rmap)
-    write_attn_sublayer(layer, [op], rmap, const_one=const_one)
+    write_attn_sublayer(layer, [op], rmap.get_indices(const_one)[0])
     layer.to(device_mod.get_device(verbose=False))
 
     a_values = torch.randn(N_POS, 20)
@@ -757,7 +759,7 @@ def test_compute_add_self_add():
     layer = TransformerLayer(D, D_HEAD)
     op = _make_op(rmap, "compute_add", add_node, out_cols)
     const_one = _const_one(rmap)
-    write_attn_sublayer(layer, [op], rmap, const_one=const_one)
+    write_attn_sublayer(layer, [op], rmap.get_indices(const_one)[0])
     layer.to(device_mod.get_device(verbose=False))
 
     a_values = torch.randn(N_POS, 4)
@@ -788,7 +790,7 @@ def test_compute_add_self_add_wide():
     layer = TransformerLayer(d_wide, D_HEAD)
     op = _make_op(rmap, "compute_add", add_node, out_cols)
     const_one = _const_one(rmap)
-    write_attn_sublayer(layer, [op], rmap, const_one=const_one)
+    write_attn_sublayer(layer, [op], rmap.get_indices(const_one)[0])
     layer.to(device_mod.get_device(verbose=False))
 
     a_values = torch.randn(N_POS, 20)
@@ -839,7 +841,7 @@ def test_mlp_block():
 
     layer = TransformerLayer(D, D_HEAD)
     op = _make_mlp_op(rmap, "compute_ffn", ffn, out_cols, mlp_slots=mlp_slots)
-    write_mlp_sublayer(layer, [op], rmap)
+    write_mlp_sublayer(layer, [op], 0)
     layer.to(device_mod.get_device(verbose=False))
 
     x_values = torch.randn(N_POS, 4)
@@ -888,7 +890,7 @@ def test_mlp_block_multiple():
             rmap, "compute_ffn", ffn2, out2_cols, mlp_slots=list(range(6, 11))
         ),
     ]
-    write_mlp_sublayer(layer, ops, rmap)
+    write_mlp_sublayer(layer, ops, 0)
     layer.to(device_mod.get_device(verbose=False))
 
     x_values = torch.randn(N_POS, 4)
@@ -917,10 +919,10 @@ def test_mlp_constant():
     out_cols = rmap.allocate(const)
 
     layer = TransformerLayer(D, D_HEAD)
-    op = MLPOp(
+    op = PlannedMlpOp(
         op_type="compute_literal_value", node=const, target_cols=out_cols, mlp_slots=[]
     )
-    write_mlp_sublayer(layer, [op], rmap)
+    write_mlp_sublayer(layer, [op], 0)
     device = device_mod.get_device(verbose=False)
     layer.to(device)
 
@@ -958,22 +960,21 @@ def test_compute_literal_value_clears_dirty_column():
     # Attn sublayer: dirty-cancel the recycled target columns.
     write_attn_sublayer(
         layer,
-        [AttnHeadOp(op_type="cancel", node=const, target_cols=const_cols)],
-        rmap,
-        const_one=const_one,
+        [PlannedAttentionOp(op_type="cancel", node=const, target_cols=const_cols)],
+        rmap.get_indices(const_one)[0],
     )
     # MLP sublayer: write the constant via output bias.
     write_mlp_sublayer(
         layer,
         [
-            MLPOp(
+            PlannedMlpOp(
                 op_type="compute_literal_value",
                 node=const,
                 target_cols=const_cols,
                 mlp_slots=[],
             )
         ],
-        rmap,
+        0,
     )
     layer.to(device_mod.get_device(verbose=False))
 
@@ -1016,13 +1017,13 @@ def test_biased_linear_split():
     # Attention writes Wx (zero-bias part)
     attn_op = _make_op(rmap, "compute_linear", linear_node, out_cols)
     const_one = _const_one(rmap)
-    write_attn_sublayer(layer, [attn_op], rmap, const_one=const_one)
+    write_attn_sublayer(layer, [attn_op], rmap.get_indices(const_one)[0])
 
     # MLP adds bias
-    mlp_op = MLPOp(
+    mlp_op = PlannedMlpOp(
         op_type="compute_bias", node=linear_node, target_cols=out_cols, mlp_slots=[]
     )
-    write_mlp_sublayer(layer, [mlp_op], rmap)
+    write_mlp_sublayer(layer, [mlp_op], 0)
     layer.to(device_mod.get_device(verbose=False))
 
     x_values = torch.randn(N_POS, 4)
@@ -1067,7 +1068,7 @@ def test_non_contiguous_columns():
     layer = TransformerLayer(D, D_HEAD)
     op = _make_op(rmap, "compute_linear", linear_node, out_cols)
     const_one = _const_one(rmap)
-    write_attn_sublayer(layer, [op], rmap, const_one=const_one)
+    write_attn_sublayer(layer, [op], rmap.get_indices(const_one)[0])
     layer.to(device_mod.get_device(verbose=False))
 
     x_values = torch.randn(N_POS, 4)
@@ -1110,16 +1111,16 @@ def test_mixed_layer():
     # Write attention ops
     attn_op = _make_op(rmap, "compute_linear", lin_attn, attn_out_cols)
     const_one = _const_one(rmap)
-    write_attn_sublayer(layer, [attn_op], rmap, const_one=const_one)
+    write_attn_sublayer(layer, [attn_op], rmap.get_indices(const_one)[0])
 
     # Write MLP ops
-    mlp_op = MLPOp(
+    mlp_op = PlannedMlpOp(
         op_type="compute_literal_value",
         node=const,
         target_cols=const_cols,
         mlp_slots=[],
     )
-    write_mlp_sublayer(layer, [mlp_op], rmap)
+    write_mlp_sublayer(layer, [mlp_op], 0)
     layer.to(device_mod.get_device(verbose=False))
 
     x_values = torch.randn(N_POS, 4)
@@ -1160,7 +1161,7 @@ def test_mlp_linear_bypass_zero_bias():
     op = _make_mlp_op(
         rmap, "compute_linear_bypass", linear_node, out_cols, mlp_slots=mlp_slots
     )
-    write_mlp_sublayer(layer, [op], rmap)
+    write_mlp_sublayer(layer, [op], 0)
     layer.to(device_mod.get_device(verbose=False))
 
     x_values = torch.randn(N_POS, 4)
@@ -1185,14 +1186,14 @@ def test_mlp_cancel_bypass_zeroes_columns():
         mlp_slots = list(range(0, 2 * 5))  # 2 slots per column
 
         layer = TransformerLayer(D, D_HEAD, activation=activation)
-        op = MLPOp(
+        op = PlannedMlpOp(
             op_type="cancel_bypass",
             node=None,
             target_cols=x_cols,
             source_cols=x_cols,
             mlp_slots=mlp_slots,
         )
-        write_mlp_sublayer(layer, [op], rmap)
+        write_mlp_sublayer(layer, [op], 0)
         layer.to(device_mod.get_device(verbose=False))
 
         x_values = torch.randn(N_POS, 5)
@@ -1220,7 +1221,7 @@ def test_mlp_linear_bypass_with_bias():
     op = _make_mlp_op(
         rmap, "compute_linear_bypass", linear_node, out_cols, mlp_slots=mlp_slots
     )
-    write_mlp_sublayer(layer, [op], rmap)
+    write_mlp_sublayer(layer, [op], 0)
     layer.to(device_mod.get_device(verbose=False))
 
     x_values = torch.randn(N_POS, 4)
@@ -1250,7 +1251,7 @@ def test_mlp_linear_bypass_different_dims():
     op = _make_mlp_op(
         rmap, "compute_linear_bypass", linear_node, out_cols, mlp_slots=mlp_slots
     )
-    write_mlp_sublayer(layer, [op], rmap)
+    write_mlp_sublayer(layer, [op], 0)
     layer.to(device_mod.get_device(verbose=False))
 
     x_values = torch.randn(N_POS, 8)
@@ -1279,7 +1280,7 @@ def test_mlp_linear_bypass_preserves_input():
     op = _make_mlp_op(
         rmap, "compute_linear_bypass", linear_node, out_cols, mlp_slots=mlp_slots
     )
-    write_mlp_sublayer(layer, [op], rmap)
+    write_mlp_sublayer(layer, [op], 0)
     layer.to(device_mod.get_device(verbose=False))
 
     x_values = torch.randn(N_POS, 4)
@@ -1307,7 +1308,7 @@ def test_mlp_linear_bypass_wide_output():
     op = _make_mlp_op(
         rmap, "compute_linear_bypass", linear_node, out_cols, mlp_slots=mlp_slots
     )
-    write_mlp_sublayer(layer, [op], rmap)
+    write_mlp_sublayer(layer, [op], 0)
     layer.to(device_mod.get_device(verbose=False))
 
     x_values = torch.randn(N_POS, 3)
@@ -1339,7 +1340,7 @@ def test_mlp_linear_bypass_matches_attention():
     layer_attn = TransformerLayer(D, D_HEAD)
     attn_op = _make_op(rmap_attn, "compute_linear", linear_node, attn_out_cols)
     const_one = _const_one(rmap_attn)
-    write_attn_sublayer(layer_attn, [attn_op], rmap_attn, const_one=const_one)
+    write_attn_sublayer(layer_attn, [attn_op], rmap_attn.get_indices(const_one)[0])
     layer_attn.to(device_mod.get_device(verbose=False))
 
     res_attn = _build_residual_stream(rmap_attn, {pos: pe_values, x: x_values})
@@ -1360,7 +1361,7 @@ def test_mlp_linear_bypass_matches_attention():
         mlp_out_cols,
         mlp_slots=mlp_slots,
     )
-    write_mlp_sublayer(layer_mlp, [mlp_op], rmap_mlp)
+    write_mlp_sublayer(layer_mlp, [mlp_op], 0)
     layer_mlp.to(device_mod.get_device(verbose=False))
 
     res_mlp = _build_residual_stream(rmap_mlp, {x: x_values})
@@ -1390,7 +1391,7 @@ def test_mlp_linear_bypass_concatenated_input():
     op = _make_mlp_op(
         rmap, "compute_linear_bypass", linear_node, out_cols, mlp_slots=mlp_slots
     )
-    write_mlp_sublayer(layer, [op], rmap)
+    write_mlp_sublayer(layer, [op], 0)
     layer.to(device_mod.get_device(verbose=False))
 
     a_values = torch.randn(N_POS, 3)
@@ -1442,7 +1443,7 @@ def test_swish_mlp_ffn_gated():
 
     layer = TransformerLayer(D, D_HEAD, activation="swish")
     op = _make_mlp_op(rmap, "compute_ffn", ffn, out_cols, mlp_slots=list(range(6)))
-    write_mlp_sublayer(layer, [op], rmap)
+    write_mlp_sublayer(layer, [op], 0)
     layer.to(device_mod.get_device(verbose=False))
 
     x_values = torch.randn(N_POS, 4)
@@ -1466,7 +1467,7 @@ def test_swish_mlp_ffn_degenerate():
 
     layer = TransformerLayer(D, D_HEAD, activation="swish")
     op = _make_mlp_op(rmap, "compute_ffn", ffn, out_cols, mlp_slots=slots)
-    write_mlp_sublayer(layer, [op], rmap)
+    write_mlp_sublayer(layer, [op], 0)
 
     # The degenerate up factor: bias 1, matrix column untouched (zero).
     assert (layer.mlp.up_proj.output_bias[slots] == 1.0).all()
@@ -1498,7 +1499,7 @@ def test_swish_mlp_ffn_deferred_bias_fold():
 
     layer = TransformerLayer(D, D_HEAD, activation="swish")
     op = _make_mlp_op(rmap, "compute_ffn", ffn, out_cols, mlp_slots=list(range(6)))
-    write_mlp_sublayer(layer, [op], rmap, biased_linears={leaf})
+    write_mlp_sublayer(layer, [op], 0, biased_linears={leaf})
     layer.to(device_mod.get_device(verbose=False))
 
     x_values = torch.randn(N_POS, 4)
@@ -1526,7 +1527,7 @@ def test_swish_mlp_linear_bypass():
     op = _make_mlp_op(
         rmap, "compute_linear_bypass", linear_node, out_cols, mlp_slots=list(range(6))
     )
-    write_mlp_sublayer(layer, [op], rmap)
+    write_mlp_sublayer(layer, [op], 0)
 
     # Both slot halves are degenerate lanes on the swish machine.
     assert (layer.mlp.up_proj.output_bias[list(range(6))] == 1.0).all()
@@ -1554,7 +1555,7 @@ def test_swish_mlp_linear_bypass_with_bias():
     op = _make_mlp_op(
         rmap, "compute_linear_bypass", linear_node, out_cols, mlp_slots=list(range(6))
     )
-    write_mlp_sublayer(layer, [op], rmap)
+    write_mlp_sublayer(layer, [op], 0)
     layer.to(device_mod.get_device(verbose=False))
 
     x_values = torch.randn(N_POS, 4)
@@ -1573,10 +1574,10 @@ def test_swish_mlp_constant_literal():
     out_cols = rmap.allocate(const)
 
     layer = TransformerLayer(D, D_HEAD, activation="swish")
-    op = MLPOp(
+    op = PlannedMlpOp(
         op_type="compute_literal_value", node=const, target_cols=out_cols, mlp_slots=[]
     )
-    write_mlp_sublayer(layer, [op], rmap)
+    write_mlp_sublayer(layer, [op], 0)
     device = device_mod.get_device(verbose=False)
     layer.to(device)
 
@@ -1602,7 +1603,7 @@ def test_machine_mismatch_asserts():
         rmap, "compute_ffn", ffn_swish, out_cols, mlp_slots=list(range(6))
     )
     with pytest.raises(AssertionError, match="machine mismatch"):
-        write_mlp_sublayer(TransformerLayer(D, D_HEAD), [op], rmap)
+        write_mlp_sublayer(TransformerLayer(D, D_HEAD), [op], 0)
 
     # relu FFN on the swish machine
     relu_ffn = linear_relu_linear(
@@ -1615,9 +1616,7 @@ def test_machine_mismatch_asserts():
         rmap2, "compute_ffn", relu_ffn, out_cols2, mlp_slots=list(range(6))
     )
     with pytest.raises(AssertionError, match="machine mismatch"):
-        write_mlp_sublayer(
-            TransformerLayer(D, D_HEAD, activation="swish"), [op2], rmap2
-        )
+        write_mlp_sublayer(TransformerLayer(D, D_HEAD, activation="swish"), [op2], 0)
 
     # gated relu FFN on the ReLU machine: activation matches but the machine
     # has no up projection to realize the gated lanes.
@@ -1640,7 +1639,7 @@ def test_machine_mismatch_asserts():
         rmap3, "compute_ffn", gated_relu, out_cols3, mlp_slots=list(range(6))
     )
     with pytest.raises(AssertionError, match="no up projection"):
-        write_mlp_sublayer(TransformerLayer(D, D_HEAD), [op3], rmap3)
+        write_mlp_sublayer(TransformerLayer(D, D_HEAD), [op3], 0)
 
 
 # ---------------------------------------------------------------------------
@@ -1681,7 +1680,7 @@ def test_no_bias_literal_bit_exact(activation):
 
     layer = TransformerLayer(D, D_HEAD, activation=activation)
     op = _make_mlp_op(rmap, "compute_literal_value", const, out_cols)
-    write_mlp_sublayer(layer, [op], rmap, const_one=c1, bias=False)
+    write_mlp_sublayer(layer, [op], rmap.get_indices(c1)[0], bias=False)
     _assert_bias_vectors_zero(layer)
 
     # The lane's input-side cells landed at the const column of slot 0.
@@ -1718,7 +1717,7 @@ def test_no_bias_swish_ffn_const_row(gated):
 
     layer = TransformerLayer(D, D_HEAD, activation="swish")
     op = _make_mlp_op(rmap, "compute_ffn", ffn, out_cols, mlp_slots=slots)
-    write_mlp_sublayer(layer, [op], rmap, const_one=c1, bias=False)
+    write_mlp_sublayer(layer, [op], rmap.get_indices(c1)[0], bias=False)
     _assert_bias_vectors_zero(layer)
 
     cc = _const_col(rmap, c1)
@@ -1765,7 +1764,7 @@ def test_no_bias_relu_ffn():
 
     layer = TransformerLayer(D, D_HEAD)
     op = _make_mlp_op(rmap, "compute_ffn", ffn, out_cols, mlp_slots=slots)
-    write_mlp_sublayer(layer, [op], rmap, const_one=c1, bias=False)
+    write_mlp_sublayer(layer, [op], rmap.get_indices(c1)[0], bias=False)
     _assert_bias_vectors_zero(layer)
 
     layer.to(device_mod.get_device(verbose=False))
@@ -1795,7 +1794,11 @@ def test_no_bias_deferred_bias_fold():
     layer = TransformerLayer(D, D_HEAD, activation="swish")
     op = _make_mlp_op(rmap, "compute_ffn", ffn, out_cols, mlp_slots=slots)
     write_mlp_sublayer(
-        layer, [op], rmap, biased_linears={leaf}, const_one=c1, bias=False
+        layer,
+        [op],
+        rmap.get_indices(c1)[0],
+        biased_linears={leaf},
+        bias=False,
     )
     _assert_bias_vectors_zero(layer)
 
@@ -1824,7 +1827,7 @@ def test_no_bias_compute_bias_via_lane(activation):
 
     layer = TransformerLayer(D, D_HEAD, activation=activation)
     op = _make_mlp_op(rmap, "compute_bias", node, out_cols)
-    write_mlp_sublayer(layer, [op], rmap, const_one=c1, bias=False)
+    write_mlp_sublayer(layer, [op], rmap.get_indices(c1)[0], bias=False)
     _assert_bias_vectors_zero(layer)
 
     layer.to(device_mod.get_device(verbose=False))
@@ -1854,7 +1857,7 @@ def test_no_bias_linear_bypass(activation):
 
     layer = TransformerLayer(D, D_HEAD, activation=activation)
     op = _make_mlp_op(rmap, "compute_linear_bypass", node, out_cols, mlp_slots=slots)
-    write_mlp_sublayer(layer, [op], rmap, const_one=c1, bias=False)
+    write_mlp_sublayer(layer, [op], rmap.get_indices(c1)[0], bias=False)
     _assert_bias_vectors_zero(layer)
 
     layer.to(device_mod.get_device(verbose=False))
@@ -1876,7 +1879,7 @@ def test_no_bias_zero_out_bias_leaves_lane_unwritten():
 
     layer = TransformerLayer(D, D_HEAD, activation="swish")
     op = _make_mlp_op(rmap, "compute_literal_value", const, out_cols)
-    write_mlp_sublayer(layer, [op], rmap, const_one=c1, bias=False)
+    write_mlp_sublayer(layer, [op], rmap.get_indices(c1)[0], bias=False)
 
     cc = _const_col(rmap, c1)
     assert layer.mlp.gate_proj.output_matrix[cc, 0].item() == 0.0
@@ -1910,7 +1913,7 @@ def test_compute_linear_duplicate_concat_leaf():
     layer = TransformerLayer(D, D_HEAD)
     op = _make_op(rmap, "compute_linear", node, out_cols)
     const_one = _const_one(rmap)
-    write_attn_sublayer(layer, [op], rmap, const_one=const_one)
+    write_attn_sublayer(layer, [op], rmap.get_indices(const_one)[0])
     layer.to(device_mod.get_device(verbose=False))
 
     x_values = torch.randn(N_POS, 2)
@@ -1944,7 +1947,7 @@ def test_compute_ffn_duplicate_concat_leaf():
 
     layer = TransformerLayer(D, D_HEAD)
     op = _make_mlp_op(rmap, "compute_ffn", ffn, out_cols, mlp_slots=list(range(6)))
-    write_mlp_sublayer(layer, [op], rmap)
+    write_mlp_sublayer(layer, [op], 0)
     layer.to(device_mod.get_device(verbose=False))
 
     x_values = torch.randn(N_POS, 2)
@@ -1976,7 +1979,7 @@ def test_mlp_linear_bypass_duplicate_concat_leaf():
     op = _make_mlp_op(
         rmap, "compute_linear_bypass", node, out_cols, mlp_slots=list(range(4))
     )
-    write_mlp_sublayer(layer, [op], rmap)
+    write_mlp_sublayer(layer, [op], 0)
     layer.to(device_mod.get_device(verbose=False))
 
     x_values = torch.randn(N_POS, 2)

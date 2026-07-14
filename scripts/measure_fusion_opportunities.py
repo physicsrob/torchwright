@@ -351,7 +351,7 @@ _EXAMPLES = [
     "examples.binary_increment",
     "examples.adder",
     "examples.adder_v2",
-    "examples.calculator_v2",
+    "examples.calculator_simple",
     "examples.caesar_cipher",
     "examples.fibonacci",
     "examples.sort_digits_v1",

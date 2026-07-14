@@ -89,7 +89,7 @@ _MAX_INPUT_SCALE = 2.0**20
 # emit admissibly; the factor is set from the measured margins — every
 # realized take peaks at 0.4x its lane cap (scratchpad, 306 @ cap
 # 768) while the expensive declines run 45x-800x over (adder_v2
-# 29,609 @ cap 256; calculator_v2 213,918 @ cap 256).  A subgraph
+# 29,609 @ cap 256; calculator_simple 213,918 @ cap 256).  A subgraph
 # whose candidates exceed the screen but would simplify below the cap
 # is a lost take by construction; nothing measured is in that class.
 _KINK_PRESCREEN_FACTOR = 4

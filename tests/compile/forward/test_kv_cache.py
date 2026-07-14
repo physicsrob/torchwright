@@ -10,12 +10,12 @@ import torch
 from torchwright.compiler.forward.compile import forward_compile
 
 D = 1024
-D_HEAD = 16
+from examples.calculator_simple import D_HEAD
 
 
 @pytest.fixture(scope="module")
 def compiled_calc():
-    from examples.calculator_v2 import create_network_parts
+    from examples.calculator_simple import create_network_parts
 
     output_node, embedding = create_network_parts(1)
     net = forward_compile(
