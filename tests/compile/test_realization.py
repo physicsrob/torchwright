@@ -294,14 +294,6 @@ def test_cost_summary_requires_resolved_table():
         lowered.cost_summary(d_head=8, realization_table=lowered.realization_table)
 
 
-@pytest.mark.xfail(
-    reason="precise root cause: Adds resolve statically to MLP_ADD under the "
-    "default policy, but the CP-SAT model still pins every Add to attention "
-    "(the routing()/is_flex bridges); will be fixed by Step 4 of "
-    "docs/plan_additional_mlp_routing.md (MLP-Add model support), which "
-    "deletes the bridges and reconciles the totals",
-    strict=True,
-)
 def test_cost_summary_reconciles_with_solver_totals():
     """Gate B3: the pre-schedule summary's totals agree with the finished
     solve's accounting (flex pinned so routing is the static table)."""
@@ -504,13 +496,6 @@ def test_cpsat_routing_agrees_with_resolve_static(bias):
 
     gm = build_graph_model(lowered.output_node)
     for n in gm.schedulable:
-        if isinstance(n, Add):
-            # Bridge until Step 4 of docs/plan_additional_mlp_routing.md:
-            # routing() pins Adds to attention while the model lacks
-            # MLP-Add intervals, so agreement with the static resolver is
-            # asserted for every other node type only.  Step 4 deletes this
-            # skip together with the routing()/is_flex bridges.
-            continue
         assert routing(n, gm, policy, usable) == CLASS_SUBLAYER[table.resolved_class(n)]
 
 

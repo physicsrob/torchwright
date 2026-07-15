@@ -1329,18 +1329,19 @@ def forward_compile(
             )
         direct_leaves = flatten_concat_nodes(list(output_node.inputs))
         direct_held_handoff = held_source in direct_leaves
+        if isinstance(output_node, Add):
+            # A held-target Add is pinned to the attention family with fresh
+            # placement under every policy and flex configuration — for a
+            # direct handoff (one atomic attention event: read the old
+            # embedding, cancel it, write the target into the reclaimed
+            # bank) and for an indirect one alike, because the held-bank
+            # claim has no MLP-phase executor
+            # (docs/plan_additional_mlp_routing.md, *Tied output*).
+            forced_realization_classes[output_node.node_id] = ATTN_ADD
         if direct_held_handoff:
             if isinstance(output_node, Linear):
                 forced_realization_classes[output_node.node_id] = ATTN_TRANSPORT
-            elif isinstance(output_node, Add):
-                # The direct held handoff is one atomic attention event
-                # (read the old embedding, cancel it, write the target into
-                # the reclaimed bank); a held-target Add is therefore pinned
-                # to the attention family under every policy and flex
-                # configuration (docs/plan_additional_mlp_routing.md, *Tied
-                # output*).
-                forced_realization_classes[output_node.node_id] = ATTN_ADD
-            elif not isinstance(output_node, Attn):
+            elif not isinstance(output_node, (Attn, Add)):
                 raise ValueError(
                     "held output layout has no direct MLP handoff: target "
                     f"{output_node!r} directly reads the tied Embedding but "

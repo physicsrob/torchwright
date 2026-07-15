@@ -620,6 +620,19 @@ class BuiltModel:
     # freeable inputs.  Retained for hint validation.
     keep_forever_ids: FrozenSet[int] = frozenset()
     input_keep_ids: FrozenSet[int] = frozenset()
+    # Per-occurrence Add placement literals, keyed (add_id, occurrence):
+    # `add_reusable` reifies the sublayer-order deadness predicate;
+    # `add_reuse` is the deterministic selector (occurrence 0 wins).
+    # Diagnostic/extraction state only — never copied into
+    # ScheduleAssignment; solution extraction recomputes the selectors from
+    # the extracted layers/routes (`add_placement.derive_add_placement`) and
+    # asserts they match while these literals still exist.  The held target
+    # has no entries (its is_free is pinned 0 without the biconditional).
+    add_reusable: Dict[Tuple[int, int], cp_model.IntVar] = field(default_factory=dict)
+    add_reuse: Dict[Tuple[int, int], cp_model.IntVar] = field(default_factory=dict)
+    # Old value id -> OR of the selectors that reassign it (an ownership
+    # handoff: no physical cancel, parked forced false).
+    reused_as_target: Dict[int, cp_model.IntVar] = field(default_factory=dict)
     # Hint-aware cancel-window widening actually applied: `node_id -> delta`
     # for every node whose window was widened past the uniform
     # `last_consumer + 1 + K` (only nonzero deltas appear).  None when the
@@ -779,14 +792,6 @@ def routing(
     `flex_routing=True` and no standalone Linears); routing a Linear
     without it raises rather than guessing a sublayer.
     """
-    if isinstance(node, Add):
-        # Bridge until the model grows MLP-Add support (Step 4 of
-        # docs/plan_additional_mlp_routing.md): the CP-SAT path pins every
-        # Add to attention.  The static resolver already honours the
-        # routing policy for Adds; once the model builds MLP-Add intervals
-        # this branch is deleted and Adds flow through static_flex_class
-        # below like any other flexible node.
-        return ATTN
     if has_flex_choice(node):
         # Standalone Linear: the policy pins the sublayer here, subject to
         # the MLP-bypass capacity check; with flex_routing=True the CP-SAT
@@ -810,16 +815,16 @@ def is_flex(node: Node, gm: GraphModel) -> bool:
     The nodes with a free realization choice
     (`realization.has_flex_choice`): a standalone Linear can run in
     attention (`heads = ⌈d_input/d_head⌉`) or in MLP bypass
-    (`slots = 2 · d_output`).  The heuristic picks one statically per
-    policy; CP-SAT can pick per-node.
+    (`slots = 2 · d_output`), and an Add can run in attention (reused or
+    fresh placement) or in the MLP bypass pair (`slots = 2 · d_output`,
+    docs/plan_additional_mlp_routing.md).  The heuristic picks one
+    statically per policy; CP-SAT can pick per-node.  A held-target Add
+    is not flex in effect: the routing loop pins its `is_attn` to 1
+    before this is consulted.
 
     `Attn` / `FFN` / `LiteralValue` stay locked (single candidate class).
-    `Add` has a free route choice in the realization table but is not yet
-    flex-eligible here — a bridge until the model builds MLP-Add intervals
-    (Step 4 of docs/plan_additional_mlp_routing.md), when the isinstance
-    exclusion below is deleted.
     """
-    return has_flex_choice(node) and not isinstance(node, Add)
+    return has_flex_choice(node)
 
 
 def heads_for(node: Node, d_head: int) -> int:
@@ -854,12 +859,16 @@ def slots_for(node: Node, gm: GraphModel) -> int:
 
     An FFN carries one hidden slot per lane (the composite's slot
     demand); a standalone Linear routed to MLP bypass needs `2 ·
-    d_output`; everything else costs no hidden slots.
+    d_output`; an MLP-routed Add needs `2 · d_output` (the bypass lane
+    pair, same demand for reused and fresh placement); everything else
+    costs no hidden slots.
     """
     if isinstance(node, FFN):
         return node.n_lanes
     if isinstance(node, Linear):
         return 2 * node.d_output  # MLP bypass
+    if isinstance(node, Add):
+        return 2 * node.d_output  # MLP Add bypass pair
     if isinstance(node, LiteralValue):
         return 0
     return 0
@@ -1259,17 +1268,32 @@ def build_cpsat_model_from_gm(
         and held_target in gm.consumers_eff.get(held_source, set())
     )
     for n in gm.schedulable:
-        if held_direct_handoff and n is held_target:
+        if n is held_target and (held_direct_handoff or isinstance(n, Add)):
             # A direct source->target handoff must execute in attention:
             # that sublayer reads the old source value, cancels it, and
             # writes the target into the reclaimed bank in one event.
-            # There is intentionally no MLP equivalent.
+            # There is intentionally no MLP equivalent.  A held-target Add
+            # is pinned to attention even for an INDIRECT handoff (the
+            # source cancelled by an earlier consumer, the bank claimed
+            # later): the tied contract keeps it on ATTN_ADD with fresh
+            # placement under every policy and flex configuration — there
+            # is no MLP-phase bank-claim executor
+            # (docs/plan_additional_mlp_routing.md, *Tied output*).
             v = model.NewBoolVar(f"is_attn_n{n.node_id}_held_pinned")
             model.Add(v == 1)
             static_routing[n.node_id] = ATTN
         elif flex_routing and is_flex(n, gm):
-            v = model.NewBoolVar(f"is_attn_n{n.node_id}")
-            static_routing[n.node_id] = "flex"
+            if slots_for(n, gm) > d_hidden:
+                # The MLP family is structurally infeasible at this geometry
+                # (its whole-layer slot demand exceeds the usable pool);
+                # constrain the route instead of presenting an infeasible
+                # MLP mode to the solver.  Mirrors realization.fits_mlp.
+                v = model.NewBoolVar(f"is_attn_n{n.node_id}_capacity_pinned")
+                model.Add(v == 1)
+                static_routing[n.node_id] = ATTN
+            else:
+                v = model.NewBoolVar(f"is_attn_n{n.node_id}")
+                static_routing[n.node_id] = "flex"
         else:
             r = routing(n, gm, policy, d_hidden)
             v = model.NewBoolVar(f"is_attn_n{n.node_id}_pinned")
@@ -1300,6 +1324,180 @@ def build_cpsat_model_from_gm(
             model.Add(layer_var[v.node_id] >= layer_var[u.node_id] + 1).OnlyEnforceIf(
                 same_ok.Not()
             )
+
+    # ---- Add reusable-placement classification ----
+    # (docs/plan_additional_mlp_routing.md, *Route-aware reusable placement*.)
+    # Per Add occurrence i, `reusable_i` reifies the sublayer-order deadness
+    # predicate: every OTHER effective consumer C of the occurrence satisfies
+    #     layer[C] < layer[A]
+    #     or (layer[C] == layer[A] and C attention-routed and A MLP-routed)
+    # — a same-layer attention consumer is complete by the MLP phase-start
+    # snapshot; every other same-layer consumer is not.  The occurrence's own
+    # birth needs no term: the dependency gaps above already order it before
+    # A's snapshot.  Target selection is deterministic, never a solver
+    # choice:
+    #     reuse_0 = reusable_0
+    #     reuse_1 = NOT reusable_0 AND reusable_1
+    #     is_free = reusable_0 OR reusable_1
+    # Graph inputs are legitimate targets (they own residual columns and the
+    # heuristic reassigns them); reuse is rejected only for a physically
+    # non-reassignable value (Concatenate, the held source — its columns end
+    # through the held-bank cancel/hold transition) or an unordered
+    # effective consumer (e.g. a terminal Concatenate).  The held target
+    # skips the construction entirely: its `is_free` is pinned 0 without the
+    # deadness biconditional (the 32983b0 contract).  Assignment-level
+    # mirror: `add_placement.derive_add_placement` — extraction asserts the
+    # two agree while the literals still exist.
+    is_free: Dict[int, cp_model.IntVar] = {}
+    add_reusable: Dict[Tuple[int, int], cp_model.IntVar] = {}
+    add_reuse: Dict[Tuple[int, int], cp_model.IntVar] = {}
+    # `add_attn_gap[A]` = OR(is_free[A], NOT is_attn[A]): the extra layer an
+    # ordinary source of A must stay alive under an ATTENTION-mechanism
+    # cancel — 1 for any reuse (gap #2 conservatism, both routes) and for an
+    # MLP-routed Add (its sources are read after the attention cancel would
+    # fire).  The MLP-mechanism term stays `is_free[A]` alone.
+    add_attn_gap: Dict[int, cp_model.IntVar] = {}
+    # Old value -> the selector literals that reassign it; mutually exclusive
+    # by construction (posted below) so one residual owner cannot be
+    # reassigned twice.
+    target_selectors: Dict[int, List[cp_model.IntVar]] = {}
+    # (selector, add_id, target node): the virtual-handoff equality
+    # `cancel == layer[A] + 1` is posted after the cancel vars exist.
+    target_cancel_specs: List[Tuple[cp_model.IntVar, int, Node]] = []
+    for A in gm.schedulable:
+        if not isinstance(A, Add):
+            continue
+        if A is held_target:
+            # The output must be a fresh write into the zeroed held bank — a
+            # free Add would reassign an addend's unrelated allocation
+            # instead — and the executors always compute it fresh
+            # (LayerScheduler._is_forced_fresh_add) regardless of addend
+            # deadness.  Pin is_free to 0 WITHOUT the deadness biconditional:
+            # posting both would (a) go hard-INFEASIBLE whenever an addend's
+            # only consumer is this Add (reusable is the constant 1, forcing
+            # is_free to 1 against the pin — the canonical
+            # `logits = transported_embedding + correction` shape), and
+            # (b) otherwise spuriously force every addend not-dead.  The
+            # pinned var still lands in `is_free`: every Add is indexed
+            # downstream (Add-consumer cancel bounds, residual start shift,
+            # attention head charge).
+            is_free_held = model.NewBoolVar(f"is_free_A{A.node_id}")
+            model.Add(is_free_held == 0)
+            is_free[A.node_id] = is_free_held
+            gap_held = model.NewBoolVar(f"add_src_attn_gap_A{A.node_id}")
+            model.AddBoolOr([is_free_held, is_attn[A.node_id].Not()]).OnlyEnforceIf(
+                gap_held
+            )
+            model.AddBoolAnd([is_free_held.Not(), is_attn[A.node_id]]).OnlyEnforceIf(
+                gap_held.Not()
+            )
+            add_attn_gap[A.node_id] = gap_held
+            continue
+        a_layer = layer_var[A.node_id]
+        a_attn = is_attn[A.node_id]
+        occurrence_literals: List[cp_model.IntVar] = []
+        for i, E in enumerate(A.inputs):
+            if i == 1 and E is A.inputs[0]:
+                # add(x, x): one node, one consumer set, one deadness value —
+                # share the occurrence-0 literal instead of rebuilding its
+                # reified constraints.
+                r = occurrence_literals[0]
+                occurrence_literals.append(r)
+                add_reusable[(A.node_id, i)] = r
+                continue
+            r = model.NewBoolVar(f"reusable_A{A.node_id}_i{i}")
+            add_reusable[(A.node_id, i)] = r
+            occurrence_literals.append(r)
+            if isinstance(E, Concatenate) or E.node_id == held_source_id:
+                model.Add(r == 0)
+                continue
+            if E.node_id not in layer_var and E not in gm.input_nodes:
+                # Neither schedulable nor a residual-owning graph input.
+                model.Add(r == 0)
+                continue
+            other_consumers = [c for c in gm.consumers_eff.get(E, set()) if c is not A]
+            if any(
+                isinstance(c, Concatenate) or c.node_id not in layer_var
+                for c in other_consumers
+            ):
+                # An unordered read (terminal Concatenate / non-schedulable
+                # consumer) can never be sequenced before A's snapshot.
+                model.Add(r == 0)
+                continue
+            complete_bools: List[cp_model.IntVar] = []
+            for C in sorted(other_consumers, key=lambda c: c.node_id):
+                c_layer = layer_var[C.node_id]
+                b_lt = model.NewBoolVar(
+                    f"lt_E{E.node_id}_C{C.node_id}_A{A.node_id}_i{i}"
+                )
+                model.Add(c_layer < a_layer).OnlyEnforceIf(b_lt)
+                model.Add(c_layer >= a_layer).OnlyEnforceIf(b_lt.Not())
+                b_gt = model.NewBoolVar(
+                    f"gt_E{E.node_id}_C{C.node_id}_A{A.node_id}_i{i}"
+                )
+                model.Add(c_layer > a_layer).OnlyEnforceIf(b_gt)
+                model.Add(c_layer <= a_layer).OnlyEnforceIf(b_gt.Not())
+                # eq_ok = same layer AND C attention-routed AND A MLP-routed.
+                eq_ok = model.NewBoolVar(
+                    f"eqok_E{E.node_id}_C{C.node_id}_A{A.node_id}_i{i}"
+                )
+                model.AddBoolAnd(
+                    [b_lt.Not(), b_gt.Not(), is_attn[C.node_id], a_attn.Not()]
+                ).OnlyEnforceIf(eq_ok)
+                model.AddBoolOr(
+                    [b_lt, b_gt, is_attn[C.node_id].Not(), a_attn]
+                ).OnlyEnforceIf(eq_ok.Not())
+                complete = model.NewBoolVar(
+                    f"complete_E{E.node_id}_C{C.node_id}_A{A.node_id}_i{i}"
+                )
+                model.AddBoolOr([b_lt, eq_ok]).OnlyEnforceIf(complete)
+                model.AddBoolAnd([b_lt.Not(), eq_ok.Not()]).OnlyEnforceIf(
+                    complete.Not()
+                )
+                complete_bools.append(complete)
+            if complete_bools:
+                model.AddBoolAnd(complete_bools).OnlyEnforceIf(r)
+                model.AddBoolOr([b.Not() for b in complete_bools]).OnlyEnforceIf(
+                    r.Not()
+                )
+            else:
+                model.Add(r == 1)  # E feeds only A
+        # Deterministic selector: occurrence 0 wins.
+        reuse_0 = occurrence_literals[0]
+        add_reuse[(A.node_id, 0)] = reuse_0
+        reuse_1 = model.NewBoolVar(f"reuse_A{A.node_id}_i1")
+        model.AddBoolAnd(
+            [occurrence_literals[0].Not(), occurrence_literals[1]]
+        ).OnlyEnforceIf(reuse_1)
+        model.AddBoolOr(
+            [occurrence_literals[0], occurrence_literals[1].Not()]
+        ).OnlyEnforceIf(reuse_1.Not())
+        add_reuse[(A.node_id, 1)] = reuse_1
+        is_free_A = model.NewBoolVar(f"is_free_A{A.node_id}")
+        model.AddBoolOr(occurrence_literals).OnlyEnforceIf(is_free_A)
+        model.AddBoolAnd([b.Not() for b in occurrence_literals]).OnlyEnforceIf(
+            is_free_A.Not()
+        )
+        is_free[A.node_id] = is_free_A
+        gap_A = model.NewBoolVar(f"add_src_attn_gap_A{A.node_id}")
+        model.AddBoolOr([is_free_A, a_attn.Not()]).OnlyEnforceIf(gap_A)
+        model.AddBoolAnd([is_free_A.Not(), a_attn]).OnlyEnforceIf(gap_A.Not())
+        add_attn_gap[A.node_id] = gap_A
+        for i, sel in ((0, reuse_0), (1, reuse_1)):
+            E = A.inputs[i]
+            target_selectors.setdefault(E.node_id, []).append(sel)
+            target_cancel_specs.append((sel, A.node_id, E))
+
+    # One residual owner is reassigned at most once; `reused_as_target[E]`
+    # is the OR of the selectors naming E (an ownership handoff, not a
+    # parked value or a cancel).
+    reused_as_target: Dict[int, cp_model.IntVar] = {}
+    for eid, sels in target_selectors.items():
+        model.AddAtMostOne(sels)
+        rat = model.NewBoolVar(f"reused_as_target_n{eid}")
+        model.AddBoolOr(sels).OnlyEnforceIf(rat)
+        model.AddBoolAnd([s.Not() for s in sels]).OnlyEnforceIf(rat.Not())
+        reused_as_target[eid] = rat
 
     # ---- Cancel layer per schedulable node ----
     # The natural lower bound on cancel_layer[n] is
@@ -1372,10 +1570,11 @@ def build_cpsat_model_from_gm(
     # fires after both sublayers' reads) and moves the cancel cost from the
     # attention-head cumulative to the MLP-slot cumulative.
     cancel_in_mlp: Dict[int, cp_model.IntVar] = {}
-    # Add-consumer cancel lower bounds are posted AFTER the `is_free` booleans
-    # exist (below): the gap between an addend's cancel and the Add's layer
-    # depends on whether the Add runs in the free (reassign) regime.
-    deferred_add_consumer_lbs: List[Tuple[cp_model.IntVar, int]] = []
+    # Add-consumer cancel lower bounds are posted with the mechanism-specific
+    # Add terms (below): the gap between a source's cancel and the Add's
+    # layer depends on the reuse regime, the Add's route, and the cancel
+    # mechanism.
+    deferred_add_consumer_lbs: List[Tuple[cp_model.IntVar, cp_model.IntVar, int]] = []
     # `_pin_cancels` equality pins are likewise deferred until `is_free`
     # exists (Add-consumer terms read it): per node, (node_id, cl, cim,
     # non-Add consumer ids with layer vars, Add consumer ids with layer vars).
@@ -1383,7 +1582,7 @@ def build_cpsat_model_from_gm(
         Tuple[int, cp_model.IntVar, cp_model.IntVar, List[int], List[int]]
     ] = []
 
-    def _canonicalize_cancel_reps(cl, parked, cim):
+    def _canonicalize_cancel_reps(cl, parked, cim, rat=None):
         # sym1 (MEASUREMENT-ONLY, gated by `_canonical_cancel_reps`; default OFF
         # posts nothing, keeping the proto byte-identical).  Removes two
         # encoding degeneracies where one physical schedule has multiple model
@@ -1397,12 +1596,16 @@ def build_cpsat_model_from_gm(
         #   the converse so "never freed in-horizon" has the single `parked`
         #   encoding, not also the duplicate `parked = 0, cancel = max_layers`
         #   (which additionally charges a phantom cancel-head column at the
-        #   virtual layer).
+        #   virtual layer).  A reused target is an ownership handoff, not a
+        #   parked value: its parked literal is forced false and its virtual
+        #   end may legitimately equal `max_layers` (a final-layer Add), so
+        #   the converse is gated off under `reused_as_target`.
         if not _canonical_cancel_reps:
             return
         if cim is not None:
             model.AddImplication(parked, cim.Not())
-        model.Add(cl <= max_layers - 1).OnlyEnforceIf(parked.Not())
+        enforce = [parked.Not()] if rat is None else [parked.Not(), rat.Not()]
+        model.Add(cl <= max_layers - 1).OnlyEnforceIf(enforce)
 
     for n in gm.schedulable:
         cl = model.NewIntVar(0, max_layers, f"cl_n{n.node_id}")
@@ -1441,7 +1644,7 @@ def build_cpsat_model_from_gm(
                     # their `cl >= layer[A] + is_free[A]` stays unconditional
                     # (decision #2) and already dominates the uniform MLP bound.
                     if isinstance(c, Add):
-                        deferred_add_consumer_lbs.append((cl, c.node_id))
+                        deferred_add_consumer_lbs.append((cl, cim, c.node_id))
                     else:
                         model.Add(
                             cl >= layer_var[c.node_id] + 1 - is_attn[c.node_id]
@@ -1467,6 +1670,7 @@ def build_cpsat_model_from_gm(
                     ],
                 )
             )
+        rat = reused_as_target.get(n.node_id)
         if eff_cancel_slack is not None and consumer_layer_vars:
             delta = _widen_delta(n.node_id, _hinted_last_consumer(consumer_ids))
             last_cons = model.NewIntVar(0, max_layers - 1, f"last_cons_n{n.node_id}")
@@ -1477,17 +1681,24 @@ def build_cpsat_model_from_gm(
             # cancel-head interval is gated absent when parked so no head is
             # charged in-horizon.  Without it the window would FORCE a paid
             # cancel near the last consumer, rejecting machine schedules whose
-            # pinch layers have no head slack.
+            # pinch layers have no head slack.  A reused target is an
+            # ownership handoff, not a parked value: its parked literal is
+            # forced false and the ordinary window is gated off — the
+            # selector posts the exact `layer[A] + 1` handoff instead.
             parked = model.NewBoolVar(f"parked_n{n.node_id}")
             parked_by_id[n.node_id] = parked
+            window_gate = [parked.Not()] if rat is None else [parked.Not(), rat.Not()]
             model.Add(cl <= last_cons + 1 + eff_cancel_slack + delta).OnlyEnforceIf(
-                parked.Not()
+                window_gate
             )
             model.Add(cl == max_layers).OnlyEnforceIf(parked)
-            _canonicalize_cancel_reps(cl, parked, cim)
+            if rat is not None:
+                model.AddImplication(rat, parked.Not())
+            _canonicalize_cancel_reps(cl, parked, cim, rat)
         elif eff_cancel_slack is not None and not consumer_layer_vars:
             # No layer-bound consumers — cancel can fire right after
-            # the node's own birth layer.
+            # the node's own birth layer.  (Such a node has no Add consumer,
+            # so it can never be a reuse target; no gating needed.)
             delta = _widen_delta(
                 n.node_id,
                 hint_layers.get(n.node_id) if hint_layers is not None else None,
@@ -1558,11 +1769,16 @@ def build_cpsat_model_from_gm(
             # The held source has its own equality/window treatment below,
             # after Add classification exists.
             continue
+        rat_in = reused_as_target.get(n.node_id)
         if _pin_cancels:
             # Inputs have no mechanism choice (always attention-cancelled), so
             # the earliest legal cancel is the uniform gap-1 bound the model
             # posts above: max(1, layer[c] + 1) over layer-bound consumers,
             # falling back to the birth-based earliest (layer 1) when none.
+            # A selected reuse target's pin evaluates to exactly the
+            # `layer[A] + 1` handoff (the Add is one of the consumers and
+            # every other consumer completes no later), so no gating is
+            # needed here — the selector's equality is consistent.
             if consumer_layer_vars:
                 model.AddMaxEquality(cl, [1] + [v + 1 for v in consumer_layer_vars])
             else:
@@ -1573,13 +1789,20 @@ def build_cpsat_model_from_gm(
             last_cons = model.NewIntVar(0, max_layers - 1, f"last_cons_in{n.node_id}")
             model.AddMaxEquality(last_cons, consumer_layer_vars)
             # Parked escape — see the schedulable-node cancel window above.
+            # A selected graph-input target is an ownership handoff: parked
+            # forced false, ordinary window gated off.
             parked = model.NewBoolVar(f"parked_in{n.node_id}")
             parked_input_by_id[n.node_id] = parked
+            window_gate = (
+                [parked.Not()] if rat_in is None else [parked.Not(), rat_in.Not()]
+            )
             model.Add(cl <= last_cons + 1 + eff_cancel_slack + delta).OnlyEnforceIf(
-                parked.Not()
+                window_gate
             )
             model.Add(cl == max_layers).OnlyEnforceIf(parked)
-            _canonicalize_cancel_reps(cl, parked, None)
+            if rat_in is not None:
+                model.AddImplication(rat_in, parked.Not())
+            _canonicalize_cancel_reps(cl, parked, None, rat_in)
         elif eff_cancel_slack is not None and not consumer_layer_vars:
             # Born at layer 0, so the hinted base is the fixed birth layer 0.
             delta = _widen_delta(n.node_id, 0)
@@ -1589,115 +1812,32 @@ def build_cpsat_model_from_gm(
             model.Add(cl == max_layers).OnlyEnforceIf(parked)
             _canonicalize_cancel_reps(cl, parked, None)
 
-    # ---- Add free/compute classification ----
-    # The heuristic schedules an `Add` via `add_into` (free regime)
-    # iff at least one addend is dead at the Add's layer — every
-    # other consumer of that addend has already computed in a strictly
-    # prior layer.  Free-add costs `⌈d_out/d_head⌉` heads (copy the
-    # live addend into the dead addend's already-allocated cols).
-    # Otherwise the heuristic falls back to `compute_add`: fresh cols,
-    # both inputs copied (≈ 2× heads) plus a BIRTH-layer dirty cancel
-    # for the fresh cols.
-    #
-    # Encode: `is_free[A]` is a boolean equal to OR over addends E of
-    # `E_dead_at_A` = AND over E's other consumers C of
-    # `layer_var[C] < layer_var[A]`.  Strict inequality matches the
-    # heuristic, which reads `computed_nodes` snapshotted at layer
-    # start, so a same-layer attention consumer doesn't count as
-    # making the addend dead at an MLP-routed Add (Adds always run in
-    # attention anyway, so this corner doesn't fire — but the strict
-    # form is the conservative/correct encoding).
-    is_free: Dict[int, cp_model.IntVar] = {}
-    for A in gm.schedulable:
-        if not isinstance(A, Add):
-            continue
-        if A is held_target:
-            # The output must be a fresh write into the zeroed held bank — a
-            # free Add would reassign an addend's unrelated allocation
-            # instead — and the executors always compute it fresh
-            # (LayerScheduler._is_forced_fresh_add) regardless of addend
-            # deadness.  Pin is_free to 0 WITHOUT the E_dead biconditional
-            # below: posting both would (a) go hard-INFEASIBLE whenever an
-            # addend's only consumer is this Add (E_dead is the constant 1,
-            # forcing is_free to 1 against the pin — the canonical
-            # `logits = transported_embedding + correction` shape), and
-            # (b) otherwise spuriously force every addend not-dead.  The
-            # pinned var still lands in `is_free`: every Add is indexed
-            # downstream (Add-consumer cancel bounds, residual start shift,
-            # attention head charge).
-            is_free_held = model.NewBoolVar(f"is_free_A{A.node_id}")
-            model.Add(is_free_held == 0)
-            is_free[A.node_id] = is_free_held
-            continue
-        addend_dead_bools: List[cp_model.IntVar] = []
-        for E in A.inputs:
-            E_dead = model.NewBoolVar(f"E_dead_A{A.node_id}_E{E.node_id}")
-            disqualifying = (
-                isinstance(E, Concatenate)
-                or E in gm.pinned_nodes
-                or E.node_id not in layer_var
-            )
-            if disqualifying:
-                model.Add(E_dead == 0)
-                addend_dead_bools.append(E_dead)
-                continue
-            other_consumers = [c for c in gm.consumers_eff.get(E, set()) if c is not A]
-            # Any consumer that lacks a layer_var (terminal Concatenate
-            # in the output cone, or any non-schedulable consumer) is
-            # "always alive" — E can never be dead at A.
-            has_unschedulable = any(
-                isinstance(c, Concatenate) or c.node_id not in layer_var
-                for c in other_consumers
-            )
-            if has_unschedulable:
-                model.Add(E_dead == 0)
-                addend_dead_bools.append(E_dead)
-                continue
-            before_bools: List[cp_model.IntVar] = []
-            for C in other_consumers:
-                b = model.NewBoolVar(f"before_E{E.node_id}_C{C.node_id}_A{A.node_id}")
-                model.Add(layer_var[C.node_id] < layer_var[A.node_id]).OnlyEnforceIf(b)
-                model.Add(layer_var[C.node_id] >= layer_var[A.node_id]).OnlyEnforceIf(
-                    b.Not()
-                )
-                before_bools.append(b)
-            if before_bools:
-                model.AddBoolAnd(before_bools).OnlyEnforceIf(E_dead)
-                model.AddBoolOr([b.Not() for b in before_bools]).OnlyEnforceIf(
-                    E_dead.Not()
-                )
-            else:
-                # E feeds only A — E_dead is constant True.
-                model.Add(E_dead == 1)
-            addend_dead_bools.append(E_dead)
-        is_free_A = model.NewBoolVar(f"is_free_A{A.node_id}")
-        if addend_dead_bools:
-            model.AddBoolOr(addend_dead_bools).OnlyEnforceIf(is_free_A)
-            model.AddBoolAnd([b.Not() for b in addend_dead_bools]).OnlyEnforceIf(
-                is_free_A.Not()
-            )
-        else:
-            model.Add(is_free_A == 0)
-        is_free[A.node_id] = is_free_A
+    # Every Add-consumer cancel bound below shares two mechanism-specific
+    # terms.  An Add A bounds an ordinary source's ATTENTION-mechanism
+    # cancel at `layer[A] + add_attn_gap[A]` (gap 1 for any reuse — known
+    # optimality gap #2, both routes — and for an MLP-routed Add, whose
+    # sources are read after a same-layer attention cancel would fire) and
+    # its MLP-mechanism cancel at `layer[A] + is_free[A]` (an MLP cancel
+    # fires after both sublayers' reads, so only the reuse conservatism
+    # remains).  The reused TARGET's exact `layer[A] + 1` handoff is posted
+    # separately under the selecting literal — `is_free` alone cannot
+    # distinguish the target from the live source.  The diagnostic-only
+    # "add_live_addend_gap" family relaxes both terms to `layer[A]` for a
+    # bindingness lower bound; a schedule solved with it disabled must NEVER
+    # be compiled/replayed.
+    def _add_consumer_cancel_expr_attn(add_id: int):
+        if "add_live_addend_gap" in _disabled_families:
+            return layer_var[add_id]
+        return layer_var[add_id] + add_attn_gap[add_id]
 
-    # Every Add-consumer cancel bound below shares one term: an Add A bounds
-    # its addends' cancels at `layer[A] + is_free[A]`.  The is_free part is a
-    # CONSERVATISM for the live addend (known optimality gap #2 — see
-    # docs/cpsat_scheduler.md): the dead addend genuinely rebirths through
-    # the Add's layer, but the live addend is only held to the same bound to
-    # match the scheduler's exclusion of add_into live addends from
-    # same-layer cancels (honored by every cancel path, held handoff
-    # included).  The diagnostic-only "add_live_addend_gap" family relaxes
-    # the term to `layer[A]` for a bindingness lower bound; a schedule solved
-    # with it disabled must NEVER be compiled/replayed.
-    def _add_consumer_cancel_expr(add_id: int):
+    def _add_consumer_cancel_expr_mlp(add_id: int):
         if "add_live_addend_gap" in _disabled_families:
             return layer_var[add_id]
         return layer_var[add_id] + is_free[add_id]
 
     if held_input_pin_spec is not None:
         cl, non_add_ids, add_ids = held_input_pin_spec
-        add_exprs = [_add_consumer_cancel_expr(a) for a in add_ids]
+        add_exprs = [_add_consumer_cancel_expr_attn(a) for a in add_ids]
         if "cancel_consumer_lb" not in _disabled_families:
             for expr in add_exprs:
                 model.Add(cl >= expr)
@@ -1708,28 +1848,57 @@ def build_cpsat_model_from_gm(
             )
 
     # ---- Deferred Add-consumer cancel lower bounds ----
-    # (See the cancel-layer section.)  The gap is `is_free[A]`: 1 for a
-    # free-add — the reused addend rebirths into its dead addend's columns
-    # via `reassign`, so the addend's interval must run through the Add's
-    # layer for the residual handoff to stay contiguous (the live addend is
-    # conservatively held to the same bound — known optimality gap #2, see
-    # `_add_consumer_cancel_expr` above); 0 for a compute-add — fresh
-    # columns, pre-sublayer reads, so a same-layer cancel is legal and the
-    # eager heuristic exploits it via `_freshly_dead_inputs`.
+    # (See the cancel-layer section.)  Mechanism-gated like the non-Add
+    # consumer bounds: the attention term carries `add_attn_gap[A]` (reuse
+    # conservatism OR the MLP-routed Add's post-cancel read), the MLP term
+    # carries `is_free[A]` alone.  For an attention-routed Add both terms
+    # equal the historical `layer[A] + is_free[A]`.
     if "cancel_consumer_lb" not in _disabled_families:
-        for cl, add_id in deferred_add_consumer_lbs:
-            model.Add(cl >= _add_consumer_cancel_expr(add_id))
+        for cl, cim, add_id in deferred_add_consumer_lbs:
+            model.Add(cl >= _add_consumer_cancel_expr_attn(add_id)).OnlyEnforceIf(
+                cim.Not()
+            )
+            model.Add(cl >= _add_consumer_cancel_expr_mlp(add_id)).OnlyEnforceIf(cim)
+
+    # ---- Reused-target ownership handoff ----
+    # Under the selecting literal, the old target's lifetime ends exactly at
+    # the boundary where the Add's shifted residual interval begins: a
+    # virtual cancel layer `layer[A] + 1` (bookkeeping only — no cancel op
+    # executes; ownership ends through `reassign`).  The physical cancel
+    # intervals and the parked machinery are gated off under
+    # `reused_as_target` where they are built, and `cancel_in_mlp` is forced
+    # to the canonical attention side.  Skipped under the
+    # "add_live_addend_gap" relaxation, whose lowered Add terms would
+    # contradict the exact handoff.
+    if "add_live_addend_gap" not in _disabled_families:
+        for sel, add_id, target in target_cancel_specs:
+            cl_target = cancel_layer.get(target.node_id)
+            if cl_target is None:
+                cl_target = input_cancel_layer.get(target.node_id)
+            if cl_target is None:
+                continue  # non-reassignable occurrence (selector is pinned 0)
+            model.Add(cl_target == layer_var[add_id] + 1).OnlyEnforceIf(sel)
+    for eid, rat in reused_as_target.items():
+        cim = cancel_in_mlp.get(eid)
+        if cim is not None:
+            # Canonical mechanism for a reassigned target: the attention
+            # side (never run — the cancel intervals are gated absent).
+            model.AddImplication(rat, cim.Not())
 
     # ---- Pinned cancel layers (_pin_cancels, the production default) ----
     # Equality-pin each non-keep-forever cancel to its earliest legal value
     # given the mechanism, mirroring the lower bounds above term for term:
     # under an attention cancel (cim = 0) the earliest is
     # max(layer[n] + 1, layer[c] + 1 - is_attn[c] per non-Add consumer,
-    # layer[A] + is_free[A] per Add consumer); under an MLP cancel (cim = 1)
-    # the non-Add term relaxes to the uniform gap-0 layer[c].  `cancel_in_mlp`
-    # stays free — it still chooses which budget pays.  The kept lower bounds
-    # make each pin an upper-bound-only addition, so the pinned model is a
-    # pure restriction of the legacy (knob-off) model.
+    # layer[A] + add_attn_gap[A] per Add consumer); under an MLP cancel
+    # (cim = 1) the non-Add term relaxes to the uniform gap-0 layer[c] and
+    # the Add term to layer[A] + is_free[A].  `cancel_in_mlp` stays free —
+    # it still chooses which budget pays.  The kept lower bounds make each
+    # pin an upper-bound-only addition, so the pinned model is a pure
+    # restriction of the legacy (knob-off) model.  For a selected reuse
+    # target the attention pin evaluates to exactly the `layer[A] + 1`
+    # handoff (the selecting Add's term dominates and cim is forced 0), so
+    # the selector's equality needs no gating here.
     if _pin_cancels:
         for nid, cl, cim, non_add_ids, add_ids in deferred_pin_specs:
             birth = layer_var[nid] + 1
@@ -1738,18 +1907,19 @@ def build_cpsat_model_from_gm(
                 # birth-based earliest.
                 model.Add(cl == birth)
                 continue
-            add_exprs = [_add_consumer_cancel_expr(a) for a in add_ids]
             pin_attn = model.NewIntVar(1, max_layers, f"pin_attn_n{nid}")
             model.AddMaxEquality(
                 pin_attn,
                 [birth]
                 + [layer_var[c] + 1 - is_attn[c] for c in non_add_ids]
-                + add_exprs,
+                + [_add_consumer_cancel_expr_attn(a) for a in add_ids],
             )
             pin_mlp = model.NewIntVar(1, max_layers, f"pin_mlp_n{nid}")
             model.AddMaxEquality(
                 pin_mlp,
-                [birth] + [layer_var[c] for c in non_add_ids] + add_exprs,
+                [birth]
+                + [layer_var[c] for c in non_add_ids]
+                + [_add_consumer_cancel_expr_mlp(a) for a in add_ids],
             )
             model.Add(cl == pin_attn).OnlyEnforceIf(cim.Not())
             model.Add(cl == pin_mlp).OnlyEnforceIf(cim)
@@ -1760,25 +1930,46 @@ def build_cpsat_model_from_gm(
     # bool is constant and CP-SAT presolve drops the unreachable
     # branch.
     #
-    # `Add` gets two optional intervals — one demand for the free-add
-    # regime (`⌈d_out/d_head⌉` heads), one for compute-add (`2 ·
-    # ⌈d_out/d_head⌉` heads), gated by `is_free[A]` and its negation
-    # respectively.  Adds are pinned to attention so we don't gate by
-    # `is_attn[A]` here.
+    # `Add` gets two optional intervals — one demand for the reused
+    # placement (`⌈d_out/d_head⌉` heads), one for fresh (`2 ·
+    # ⌈d_out/d_head⌉` heads) — each additionally gated by `is_attn[A]`:
+    # an MLP-routed Add charges no heads (its `2·d_out` hidden slots ride
+    # the MLP cumulative via `slots_for`).
     attn_intervals: List = []
     attn_demands: List[int] = []
+    # Reused/fresh presence bools per attention-routed Add, shared with the
+    # objective counters below.
+    add_attn_free_pres: Dict[int, cp_model.IntVar] = {}
+    add_attn_comp_pres: Dict[int, cp_model.IntVar] = {}
     for n in gm.schedulable:
         h = heads_for(n, d_head)
         if h <= 0:
             continue
         if isinstance(n, Add):
+            free_pres = model.NewBoolVar(f"add_attn_free_n{n.node_id}")
+            model.AddBoolAnd([is_attn[n.node_id], is_free[n.node_id]]).OnlyEnforceIf(
+                free_pres
+            )
+            model.AddBoolOr(
+                [is_attn[n.node_id].Not(), is_free[n.node_id].Not()]
+            ).OnlyEnforceIf(free_pres.Not())
+            add_attn_free_pres[n.node_id] = free_pres
+            comp_pres = model.NewBoolVar(f"add_attn_comp_n{n.node_id}")
+            model.AddBoolAnd(
+                [is_attn[n.node_id], is_free[n.node_id].Not()]
+            ).OnlyEnforceIf(comp_pres)
+            model.AddBoolOr(
+                [is_attn[n.node_id].Not(), is_free[n.node_id]]
+            ).OnlyEnforceIf(comp_pres.Not())
+            add_attn_comp_pres[n.node_id] = comp_pres
+
             free_end = model.NewIntVar(1, max_layers, f"aend_free_n{n.node_id}")
             model.Add(free_end == layer_var[n.node_id] + 1)
             iv_free = model.NewOptionalIntervalVar(
                 layer_var[n.node_id],
                 1,
                 free_end,
-                is_free[n.node_id],
+                free_pres,
                 f"aiv_free_n{n.node_id}",
             )
             attn_intervals.append(iv_free)
@@ -1790,7 +1981,7 @@ def build_cpsat_model_from_gm(
                 layer_var[n.node_id],
                 1,
                 comp_end,
-                is_free[n.node_id].Not(),
+                comp_pres,
                 f"aiv_comp_n{n.node_id}",
             )
             attn_intervals.append(iv_comp)
@@ -1823,19 +2014,28 @@ def build_cpsat_model_from_gm(
         model.Add(c_end == cancel_layer[n.node_id] + 1)
         parked = parked_by_id.get(n.node_id)
         cim = cancel_in_mlp.get(n.node_id)
+        rat = reused_as_target.get(n.node_id)
         if cim is not None:
-            # Non-keep-forever node: parked / attention-cancel / MLP-cancel are
-            # three mutually exclusive presences.  A dead value is either never
-            # freed in-horizon (parked, no cancel op runs), or its columns are
-            # zeroed by a batched attention cancel head (attention pool), or by
-            # a `cancel_bypass` MLP op (MLP-slot pool) — never two at once.  The
-            # gated intervals are pure COSTS; the boolean only moves the charge
-            # between pools, so even for a node whose death is actually a
-            # free-add `reassign` (no cancel op executes — a pre-existing
-            # phantom charge, see the residual-cumulative free-add note and
-            # plan §4b) the mechanism can never harvest an unreal saving.
+            # Non-keep-forever node: parked / reassigned-away / attention-
+            # cancel / MLP-cancel are mutually exclusive presences.  A dead
+            # value is never freed in-horizon (parked, no cancel op runs), or
+            # its ownership ends through an Add's `reassign`
+            # (`reused_as_target` — no cancel op runs and NO death cancel is
+            # charged; the virtual `layer[A] + 1` handoff is bookkeeping), or
+            # its columns are zeroed by a batched attention cancel head
+            # (attention pool), or by a `cancel_bypass` MLP op (MLP-slot
+            # pool).  The gated intervals are pure COSTS; the booleans only
+            # move the charge between pools or drop it where no physical
+            # cancel exists.
+            attn_literal = (
+                cim.Not()
+                if rat is None
+                else _and_presence(
+                    model, rat, cim.Not(), name=f"cpres_attn_rat_n{n.node_id}"
+                )
+            )
             attn_present = _and_presence(
-                model, parked, cim.Not(), name=f"cpres_attn_n{n.node_id}"
+                model, parked, attn_literal, name=f"cpres_attn_n{n.node_id}"
             )
             iv_attn = model.NewOptionalIntervalVar(
                 cancel_layer[n.node_id], 1, c_end, attn_present, f"civ_n{n.node_id}"
@@ -1843,8 +2043,13 @@ def build_cpsat_model_from_gm(
             cancel_intervals.append(iv_attn)
             cancel_demands.append(len(n))
 
+            mlp_literal = (
+                cim
+                if rat is None
+                else _and_presence(model, rat, cim, name=f"cpres_mlp_rat_n{n.node_id}")
+            )
             mlp_present = _and_presence(
-                model, parked, cim, name=f"cpres_mlp_n{n.node_id}"
+                model, parked, mlp_literal, name=f"cpres_mlp_n{n.node_id}"
             )
             iv_mlp = model.NewOptionalIntervalVar(
                 cancel_layer[n.node_id], 1, c_end, mlp_present, f"civ_mlp_n{n.node_id}"
@@ -1888,9 +2093,23 @@ def build_cpsat_model_from_gm(
         c_end = model.NewIntVar(1, max_layers + 2, f"cend_in{n.node_id}")
         model.Add(c_end == cl_in + 1)
         parked = parked_input_by_id.get(n.node_id)
-        if parked is not None:
+        rat_in = reused_as_target.get(n.node_id)
+        # A selected reuse target's ownership ends through `reassign` (the
+        # selector gates the physical cancel absent); a parked input never
+        # cancels in-horizon.
+        if parked is not None and rat_in is not None:
+            literal = _and_presence(
+                model, parked, rat_in.Not(), name=f"cpres_in{n.node_id}"
+            )
+        elif parked is not None:
+            literal = parked.Not()
+        elif rat_in is not None:
+            literal = rat_in.Not()
+        else:
+            literal = None
+        if literal is not None:
             iv = model.NewOptionalIntervalVar(
-                cl_in, 1, c_end, parked.Not(), f"civ_in{n.node_id}"
+                cl_in, 1, c_end, literal, f"civ_in{n.node_id}"
             )
         else:
             iv = model.NewIntervalVar(cl_in, 1, c_end, f"civ_in{n.node_id}")
@@ -2019,11 +2238,12 @@ def build_cpsat_model_from_gm(
         if h == 0:
             continue
         if isinstance(n, Add):
-            # Add always runs in attention; cost is h (free) or 2h
-            # (compute), gated by `is_free[A]`.  Always pay h, plus
-            # an extra h when not free.
-            fixed_attn_heads += h
-            attn_term.append(h * is_free[n.node_id].Not())
+            # Route-aware Add head cost: an MLP-routed Add contributes zero
+            # heads; an attention-routed one pays h (reused placement) or
+            # 2h (fresh) — h per attention presence plus another h when the
+            # fresh-placement presence holds.
+            attn_term.append(h * is_attn[n.node_id])
+            attn_term.append(h * add_attn_comp_pres[n.node_id])
         elif flex_routing and is_flex(n, gm):
             attn_term.append(h * is_attn[n.node_id])
         else:
@@ -2144,6 +2364,9 @@ def build_cpsat_model_from_gm(
         eff_cancel_slack=eff_cancel_slack,
         static_routing=static_routing,
         pin_cancels=_pin_cancels,
+        add_reusable=add_reusable,
+        add_reuse=add_reuse,
+        reused_as_target=reused_as_target,
     )
 
 
@@ -2560,47 +2783,68 @@ def _validate_hint(
                 f"{_desc(nid)} hint={route}"
             )
 
-    def _hinted_add_is_free(A: Add) -> Optional[bool]:
-        """Mirror the model's is_free derivation on the LAYER hints: is_free
-        is the OR over addends E of "E dead at A" — every consumer of E other
-        than A hinted strictly before A (see the Add free/compute
-        classification in the model builder; keep the two in sync).  Returns
-        None (check leniently) when a needed layer hint is missing.  The held
-        target is a forced fresh compute (is_free pinned 0), never derived.
+    def _hinted_add_placement(A: Add):
+        """Derive A's placement from the LAYER/ROUTING hints through the one
+        assignment-level definition (`add_placement.derive_add_placement` —
+        the same rule the model's per-occurrence literals reify; keep them
+        in sync).  Returns None (check leniently) when a needed hint is
+        missing.  The held target short-circuits inside the derivation
+        (is_free pinned 0, never derived).
         """
-        if A.node_id == built.held_target_id:
-            return False
-        a_hint = (hint_layers or {}).get(A.node_id)
-        if a_hint is None:
+        if hint_layers is None or A.node_id not in hint_layers:
             return None
-        saw_unknown = False
+        routing_map = dict(hint_routing or {})
+        if routing_map.get(A.node_id) is None:
+            # Layers-only diagnostic hints: assume the attention-route
+            # (strict-prior) predicate — exact for attention-routed Adds
+            # and conservative (never over-reuses) otherwise.  Consumers
+            # with missing route hints block same-layer completion inside
+            # the derivation for the same reason.
+            routing_map[A.node_id] = ATTN
+        try:
+            return derive_add_placement(
+                A,
+                effective_consumers=lambda x: gm.consumers_eff.get(x, ()),
+                node_to_layer=hint_layers,
+                node_to_routing=routing_map,
+                held_source_id=built.held_source_id,
+                held_target_id=built.held_target_id,
+            )
+        except ValueError:
+            return None
+
+    def _hinted_add_placement_complete(A: Add) -> bool:
+        """True when every hint the derivation read actually existed — a
+        missing consumer layer/route makes the derivation conservative
+        (not reusable), which must not be mistaken for a derived fresh."""
+        if hint_layers is None or A.node_id not in hint_layers:
+            return False
+        if (hint_routing or {}).get(A.node_id) is None:
+            return False
         for E in A.inputs:
-            if (
-                isinstance(E, Concatenate)
-                or E in gm.pinned_nodes
-                or E.node_id not in built.layer_var
-            ):
-                continue  # E_dead is the constant 0
-            others = [c for c in gm.consumers_eff.get(E, set()) if c is not A]
-            if any(
-                isinstance(c, Concatenate) or c.node_id not in built.layer_var
-                for c in others
-            ):
-                continue  # an always-alive consumer: E_dead is the constant 0
-            dead: Optional[bool] = True
-            for C in others:
-                c_hint = (hint_layers or {}).get(C.node_id)
-                if c_hint is None:
-                    dead = None
-                    break
-                if c_hint >= a_hint:
-                    dead = False
-                    break
-            if dead:
-                return True
-            if dead is None:
-                saw_unknown = True
-        return None if saw_unknown else False
+            for c in gm.consumers_eff.get(E, set()):
+                if c is A or isinstance(c, Concatenate):
+                    continue
+                if c.node_id not in built.layer_var:
+                    continue
+                if (hint_layers or {}).get(c.node_id) is None:
+                    return False
+                if (hint_routing or {}).get(c.node_id) is None:
+                    return False
+        return True
+
+    # The selected reuse target per the hints: target nid -> (add, placement).
+    hinted_target_of: Dict[int, Tuple[Add, object]] = {}
+    for _A in gm.schedulable:
+        if not isinstance(_A, Add):
+            continue
+        _p = _hinted_add_placement(_A)
+        if (
+            _p is not None
+            and _p.reuse_input_index is not None
+            and _hinted_add_placement_complete(_A)
+        ):
+            hinted_target_of[_A.inputs[_p.reuse_input_index].node_id] = (_A, _p)
 
     for nid, L in (hint_cancel or {}).items():
         in_sched = nid in built.cancel_layer
@@ -2634,6 +2878,28 @@ def _validate_hint(
             )
         node = all_nodes.get(nid)
         mech = (hint_cancel_mech or {}).get(nid, ATTN)
+        selected = hinted_target_of.get(nid)
+        if selected is not None:
+            # A selected reuse target's lifetime ends through the reassign
+            # handoff: its canonical virtual cancel is layer[A] + 1 with a
+            # non-MLP mechanism (bookkeeping only — the physical cancel is
+            # gated absent).  A different hint contradicts the model's
+            # selector constraints and would sink the incumbent.
+            sel_add, _sel_p = selected
+            sel_layer = (hint_layers or {}).get(sel_add.node_id)
+            if sel_layer is not None and L != sel_layer + 1:
+                violations.append(
+                    f"selected reuse target's cancel hint is not the "
+                    f"virtual handoff layer[A]+1={sel_layer + 1}: "
+                    f"{_desc(nid)} cancel={L} (Add {_desc(sel_add.node_id)})"
+                )
+            if (hint_cancel_mech or {}).get(nid) == MLP:
+                violations.append(
+                    f"selected reuse target hinted an MLP cancel mechanism "
+                    f"(a reassigned target has no physical cancel; its "
+                    f"canonical mechanism is attention): {_desc(nid)}"
+                )
+            continue
         if in_input and mech == MLP:
             # Inputs have no MLP cancel mechanism in the model (no
             # `cancel_in_mlp` var is created for freeable inputs), so an
@@ -2663,13 +2929,23 @@ def _validate_hint(
             # layer-after bound (gap 1).  Routing comes from the hint when
             # present, else the model's pinned routing; flex consumers without
             # a routing hint are checked leniently (gap 0).  An Add consumer's
-            # bound is `layer + is_free` regardless of mechanism (the model
-            # posts it unconditionally); is_free is a pure function of the
-            # layer assignment, so derive it from the layer hints
-            # (`_hinted_add_is_free` above), lenient (gap 0) when a needed
-            # layer hint is missing.
-            if isinstance(c, Add):
-                gap = 1 if _hinted_add_is_free(c) else 0
+            # bound mirrors the mechanism-specific model terms: the attention
+            # term is `layer + (is_free OR MLP-routed)` (reuse conservatism —
+            # gap #2 — or the MLP-routed Add's post-cancel read), the MLP term
+            # is `layer + is_free`.  Placement derives from the layer/route
+            # hints (`_hinted_add_placement`), lenient (gap 0) when a needed
+            # hint is missing.  Freeable non-held inputs keep the model's
+            # uniform gap-1 bound for every consumer.
+            if in_input and nid != built.held_source_id:
+                gap = 1
+            elif isinstance(c, Add):
+                placement = _hinted_add_placement(c)
+                add_free = placement.is_free if placement is not None else False
+                if mech == MLP:
+                    gap = 1 if add_free else 0
+                else:
+                    c_route = (hint_routing or {}).get(c.node_id)
+                    gap = 1 if (add_free or c_route == MLP) else 0
             elif mech == MLP:
                 gap = 0
             else:
@@ -3089,18 +3365,77 @@ def _solve_built(
         # layer, so adding inputs here makes the replay reclaim their columns.
         for nid, cl_in in input_cancel_layer.items():
             node_to_cancel_layer[nid] = solver.Value(cl_in)
+        # Extraction-time Add placement tripwire
+        # (docs/plan_additional_mlp_routing.md): recompute every Add's
+        # per-occurrence reusability and deterministic selector from the
+        # extracted layers/routes and assert they equal the solver's
+        # literals WHILE those literals still exist — this is the last
+        # moment a bad reification is distinguishable from a bad replay
+        # liveness calculation.
+        selected_target_ids: Set[int] = set()
+        for A in gm.schedulable:
+            if not isinstance(A, Add):
+                continue
+            derived = derive_add_placement(
+                A,
+                effective_consumers=lambda x: gm.consumers_eff.get(x, ()),
+                node_to_layer=node_to_layer,
+                node_to_routing=node_to_routing,
+                held_source_id=built.held_source_id,
+                held_target_id=built.held_target_id,
+            )
+            solver_free = bool(solver.Value(built.is_free[A.node_id]))
+            mismatches = []
+            if solver_free != derived.is_free:
+                mismatches.append(
+                    f"is_free solver={solver_free} derived={derived.is_free}"
+                )
+            for i, want in ((0, derived.reusable_0), (1, derived.reusable_1)):
+                lit = built.add_reusable.get((A.node_id, i))
+                if lit is not None and bool(solver.Value(lit)) != want:
+                    mismatches.append(
+                        f"reusable_{i} solver={bool(solver.Value(lit))} "
+                        f"derived={want}"
+                    )
+            for i in (0, 1):
+                lit = built.add_reuse.get((A.node_id, i))
+                if lit is not None and bool(solver.Value(lit)) != (
+                    derived.reuse_input_index == i
+                ):
+                    mismatches.append(
+                        f"reuse_{i} solver={bool(solver.Value(lit))} "
+                        f"derived={derived.reuse_input_index == i}"
+                    )
+            if mismatches:
+                raise AssertionError(
+                    f"CP-SAT Add placement extraction tripwire for {A!r} "
+                    f"(layer {node_to_layer[A.node_id]}, route "
+                    f"{node_to_routing[A.node_id]!r}): {'; '.join(mismatches)} "
+                    f"(derived reusable_0={derived.reusable_0}, "
+                    f"reusable_1={derived.reusable_1}, "
+                    f"occurrence={derived.reuse_input_index}) — a bad "
+                    f"reification in the model, caught before the literals "
+                    f"are discarded."
+                )
+            if derived.reuse_input_index is not None:
+                selected_target_ids.add(A.inputs[derived.reuse_input_index].node_id)
         # Count the parked (never-freed-in-horizon) nodes: non-keep-forever
         # nodes whose cancel landed at the virtual horizon.  Keyed off the
         # returned assignment so it holds under the sym1 knob and off it.
+        # A selected reuse target is an ownership handoff, not a parked
+        # value, even when its virtual end equals max_layers (a final-layer
+        # Add) — excluded on both sides.
         parked_count = sum(
             1
             for n in gm.schedulable
             if n.node_id not in built.keep_forever_ids
+            and n.node_id not in selected_target_ids
             and node_to_cancel_layer[n.node_id] == max_layers
         ) + sum(
             1
             for nid in input_cancel_layer
             if nid not in built.input_keep_ids
+            and nid not in selected_target_ids
             and node_to_cancel_layer[nid] == max_layers
         )
         n_layers = solver.Value(n_layers_var)
