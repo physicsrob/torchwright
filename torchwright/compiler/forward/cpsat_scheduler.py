@@ -39,6 +39,7 @@ from typing import Dict, FrozenSet, List, Mapping, Optional, Set, Tuple
 
 from ortools.sat.python import cp_model
 
+from torchwright.compiler.forward.add_placement import derive_add_placement
 from torchwright.compiler.forward.graph_analysis import GraphAnalyzer
 from torchwright.compiler.realization import (
     CLASS_SUBLAYER,
@@ -232,8 +233,23 @@ class ScheduleAssignment:
         observed_cancel_layer: Dict[int, int],
         observed_cancel_mech: Dict[int, str],
         n_layers: int,
+        observed_add_placement: Optional[Dict[int, Tuple[bool, Optional[int]]]] = None,
+        held_source_id: Optional[int] = None,
+        held_target_id: Optional[int] = None,
     ) -> "ScheduleAssignment":
-        """Complete and validate a schedule-only heuristic trace."""
+        """Complete and validate a schedule-only heuristic trace.
+
+        Before canonicalizing target metadata, each Add's expected placement
+        is derived from the completed layer/route maps
+        (``add_placement.derive_add_placement``) and compared with the
+        walk's ``observed_add_placement``; a mismatch raises rather than
+        silently replacing the physical observation with the derived value.
+        Every reused target then gets the canonical virtual cancel layer
+        ``layer[Add] + 1`` — bookkeeping only, no operation is emitted;
+        ownership ended through ``reassign`` — with an attention mechanism
+        recorded for schedulable targets (canonical, never run) and no
+        mechanism entry for graph-input targets.
+        """
         gm = build_graph_model(output_node)
         sched_ids = {node.node_id for node in gm.schedulable}
         input_ids = {node.node_id for node in gm.input_nodes}
@@ -252,6 +268,72 @@ class ScheduleAssignment:
             raise ValueError(
                 f"heuristic trace routing coverage mismatch: missing={missing}, extra={extra}"
             )
+
+        # Physical-versus-derived Add placement tripwire + reused-target
+        # canonicalization (docs/plan_additional_mlp_routing.md).
+        observed_add_placement = observed_add_placement or {}
+        canonical_cancel: Dict[int, int] = {}
+        canonical_mech: Dict[int, str] = {}
+        for node in gm.schedulable:
+            if not isinstance(node, Add):
+                continue
+            derived = derive_add_placement(
+                node,
+                effective_consumers=lambda n: gm.consumers_eff.get(n, ()),
+                node_to_layer=layer_map,
+                node_to_routing=node_to_routing,
+                held_source_id=held_source_id,
+                held_target_id=held_target_id,
+            )
+            observed = observed_add_placement.get(node.node_id)
+            if observed is None:
+                raise ValueError(
+                    f"heuristic trace has no observed placement for Add "
+                    f"{node.node_id} ({node!r}); every scheduled Add must "
+                    f"record (is_reused, reuse_input_index) from its emitted "
+                    f"operation"
+                )
+            observed_reused, observed_index = observed
+            if (
+                derived.is_free != observed_reused
+                or derived.reuse_input_index != observed_index
+            ):
+
+                def _consumer_summary(occ: Node) -> str:
+                    parts = [
+                        f"{c!r}@L{layer_map.get(c.node_id)}"
+                        f"/{node_to_routing.get(c.node_id)}"
+                        for c in sorted(
+                            gm.consumers_eff.get(occ, ()),
+                            key=lambda c: c.node_id,
+                        )
+                        if c.node_id != node.node_id
+                    ]
+                    return ", ".join(parts) or "none"
+
+                a0, a1 = node.inputs
+                raise ValueError(
+                    f"heuristic Add placement disagrees with the "
+                    f"assignment-level derivation for {node!r} (route "
+                    f"{node_to_routing.get(node.node_id)!r}, layer "
+                    f"{layer_map.get(node.node_id)}): observed "
+                    f"(reused={observed_reused}, occurrence={observed_index}) "
+                    f"but derived (reusable_0={derived.reusable_0}, "
+                    f"reusable_1={derived.reusable_1}, "
+                    f"occurrence={derived.reuse_input_index}).  Other "
+                    f"consumers of occurrence 0 {a0!r}: "
+                    f"{_consumer_summary(a0)}; of occurrence 1 {a1!r}: "
+                    f"{_consumer_summary(a1)}."
+                )
+            if derived.reuse_input_index is not None:
+                target = node.inputs[derived.reuse_input_index]
+                canonical_cancel[target.node_id] = int(layer_map[node.node_id]) + 1
+                if target.node_id in sched_ids:
+                    # Canonical bookkeeping only — the target selector gates
+                    # the physical cancel absent; graph-input targets carry
+                    # no mechanism entry (the assignment contract).
+                    canonical_mech[target.node_id] = ATTN
+
         cancel = {nid: int(n_layers) for nid in sched_ids | input_ids}
         unknown_cancel = set(observed_cancel_layer) - (sched_ids | input_ids)
         if unknown_cancel:
@@ -259,16 +341,22 @@ class ScheduleAssignment:
                 f"heuristic trace has cancellation for unknown nodes: {sorted(unknown_cancel)}"
             )
         cancel.update({int(k): int(v) for k, v in observed_cancel_layer.items()})
+        # A reassigned target never went through free(), so its observed
+        # entry is absent; the canonical virtual layer ends its occupancy
+        # exactly where the Add's shifted ownership begins.
+        cancel.update(canonical_cancel)
+        mech = {
+            nid: mech_
+            for nid, mech_ in observed_cancel_mech.items()
+            if nid in sched_ids
+        }
+        mech.update(canonical_mech)
         assignment = cls(
             node_to_layer=layer_map,
             node_to_cancel_layer=cancel,
             node_to_routing=dict(node_to_routing),
             n_layers=int(n_layers),
-            node_to_cancel_mech={
-                nid: mech
-                for nid, mech in observed_cancel_mech.items()
-                if nid in sched_ids
-            },
+            node_to_cancel_mech=mech,
         )
         assignment.validate(output_node)
         return assignment

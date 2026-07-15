@@ -22,6 +22,10 @@ from torchwright.compiler.realization import (
 )
 from torchwright.compiler.utils import resolve_n_heads
 from torchwright.compiler.residual_assignment import flatten_concat_nodes
+from torchwright.compiler.forward.add_placement import (
+    AddPlacement,
+    derive_add_placement,
+)
 from torchwright.compiler.forward.cpsat_scheduler import ScheduleAssignment
 from torchwright.compiler.forward.graph_analysis import GraphAnalyzer
 from torchwright.compiler.forward.residual_map import (
@@ -456,6 +460,7 @@ class LayerScheduler:
         ready = set()
         free_adds = []
         deferred_adds = []
+        mlp_adds = []
         # Iterate node sets in node_id order wherever the iteration
         # order can reach the schedule (list build order feeds stable
         # sorts and append-order scheduling below) — set iteration is
@@ -463,7 +468,15 @@ class LayerScheduler:
         for node in sorted(all_ready, key=lambda n: n.node_id):
             if isinstance(node, Add):
                 if self._is_forced_fresh_add(node):
+                    # The held target is pinned to the attention family with
+                    # fresh placement (its route is forced to ATTN_ADD).
                     deferred_adds.append(node)
+                    continue
+                if not self.realization_table.is_attention_routed(node):
+                    # MLP-routed Add: carried into the MLP phase; its
+                    # fresh/reused placement derives from the MLP
+                    # phase-start snapshot, not layer-start liveness.
+                    mlp_adds.append(node)
                     continue
                 a0, a1 = node.inputs
                 d0 = self._is_dead_for_add(a0, node, computed_nodes)
@@ -490,7 +503,9 @@ class LayerScheduler:
             else self._find_dead_nodes(residual_map, computed_nodes)
         )
 
-        had_schedulable = bool(ready) or bool(free_adds) or bool(deferred_adds)
+        had_schedulable = (
+            bool(ready) or bool(free_adds) or bool(deferred_adds) or bool(mlp_adds)
+        )
 
         # --- 2. Attention sublayer ---
         # An FFN reads its input's residual columns inline in linear1, but the
@@ -519,13 +534,14 @@ class LayerScheduler:
         newly_ready = self._get_ready_nodes(computed_nodes) - all_ready
         for node in newly_ready:
             if isinstance(node, Add):
-                if self._is_forced_fresh_add(node):
-                    continue  # attention pass is over; retry fresh next layer
-                a0, a1 = node.inputs
-                d0 = self._is_dead_for_add(a0, node, computed_nodes)
-                d1 = self._is_dead_for_add(a1, node, computed_nodes)
-                if not (d0 or d1):
-                    continue  # deferred add, skip
+                # An attention result may feed an MLP-routed Add in the same
+                # layer; attention-routed Adds wait for the next layer (the
+                # attention pass is over).
+                if not self._is_forced_fresh_add(
+                    node
+                ) and not self.realization_table.is_attention_routed(node):
+                    mlp_adds.append(node)
+                continue
             if isinstance(node, (Linear, LiteralValue, FFN)):
                 ready.add(node)
 
@@ -580,6 +596,7 @@ class LayerScheduler:
             computed_nodes,
             mlp_cancel_candidates,
             computed_before_layer,
+            mlp_adds,
         )
 
         # Emit the single batched death-cancel op (built in the attention
@@ -676,6 +693,7 @@ class LayerScheduler:
                     self.n_heads,
                 )
                 continue
+            self._check_add_placement(add_node, 0 if d0 else 1)
             self._require_live(
                 dead_addend,
                 residual_map,
@@ -1023,6 +1041,8 @@ class LayerScheduler:
                 )
                 return False
 
+            if op_type == "compute_add":
+                self._check_add_placement(node, None)
             op = _AttentionOp(op_type, node, target_cols)
             for attr, cols in sources.items():
                 setattr(op, attr, cols)
@@ -1104,11 +1124,32 @@ class LayerScheduler:
         computed_nodes,
         mlp_cancel_candidates=None,
         computed_before_layer=None,
+        mlp_adds=None,
     ):
         mlp_ops = []
         # Slot 0 is the constant lane under bias=False — see LayerScheduler
         # __init__ and weight_writer.BiasFold.
         next_slot = first_hidden_slot(self.bias)
+
+        # MLP phase-start snapshot: the deadness reference for MLP-routed
+        # Adds.  Everything from earlier layers plus this layer's attention
+        # results counts complete; nothing placed during this MLP phase
+        # does — so walker iteration order cannot change which addends are
+        # considered dead (docs/plan_additional_mlp_routing.md,
+        # *Layer-order semantics*).
+        mlp_snapshot = set(computed_nodes)
+        # Capture every compute_bias target column list before any MLP Add
+        # can reassign a newly born Linear's columns; get_indices after a
+        # reassignment would KeyError (or worse, resolve to the new owner).
+        bias_write_targets = [
+            (node, list(residual_map.get_indices(node))) for node in biased_linears
+        ]
+        # Live/source occurrences of add_into_bypass reuses placed this
+        # phase: excluded from same-layer cancellation on both routes (the
+        # add_into_live_addends contract extended to the MLP route — known
+        # optimality gap #2 stays open); their earliest cancel is the layer
+        # after the Add.
+        mlp_add_live_sources: Set[Node] = set()
 
         # Dead nodes to zero via `cancel_bypass` this layer (attention batch was
         # full, or the directed replay routed them here).  MLP-phase placements
@@ -1139,6 +1180,14 @@ class LayerScheduler:
                 if fresh in mlp_cancel_pending:
                     continue
                 if fresh not in computed_before_layer:
+                    continue
+                if fresh in mlp_add_live_sources:
+                    # Gap #2 conservatism: an add_into_bypass live source is
+                    # never same-layer cancelled; its earliest cancel is the
+                    # layer after the Add.  (On the directed path the model's
+                    # `cl >= layer[A] + is_free[A]` bound makes this filter
+                    # inert — the assigned-cancel-layer gate already excludes
+                    # it.)
                     continue
                 if not self._mlp_cancel_eligible(fresh):
                     continue
@@ -1290,6 +1339,150 @@ class LayerScheduler:
                 self._mark_scheduled(node)
                 _surface_mlp_freshly_dead(node)
 
+        # 3b-2. MLP-routed Adds (docs/plan_additional_mlp_routing.md).
+        # Fresh/reused placement derives from the MLP phase-start snapshot;
+        # the deterministic reuse selector is first-input priority (d0 wins).
+        # Reuse candidates place before fresh ones (they need no residual
+        # allocation); within each group the existing residual-pressure and
+        # critical-path priorities apply.  A slot or column shortfall
+        # records a skip and defers the Add without changing its route.
+        if mlp_adds:
+            reuse_candidates = []
+            fresh_candidates = []
+            selected_index: Dict[int, int] = {}
+            for add_node in sorted(mlp_adds, key=lambda n: n.node_id):
+                if add_node in computed_nodes:
+                    continue
+                a0, a1 = add_node.inputs
+                d0 = self._is_dead_for_add(
+                    a0, add_node, mlp_snapshot
+                ) and residual_map.is_allocated(a0)
+                d1 = self._is_dead_for_add(
+                    a1, add_node, mlp_snapshot
+                ) and residual_map.is_allocated(a1)
+                if d0 or d1:
+                    selected_index[add_node.node_id] = 0 if d0 else 1
+                    reuse_candidates.append(add_node)
+                else:
+                    fresh_candidates.append(add_node)
+            group_key = (
+                (
+                    lambda n: (
+                        self._net_column_cost(n, computed_nodes, residual_map),
+                        self._critical_path_key(n),
+                    )
+                )
+                if under_pressure
+                else self._critical_path_key
+            )
+            reuse_candidates.sort(key=group_key)
+            fresh_candidates.sort(key=group_key)
+
+            for add_node in reuse_candidates + fresh_candidates:
+                index = selected_index.get(add_node.node_id)
+                op_label = (
+                    "add_into_bypass" if index is not None else ("compute_add_bypass")
+                )
+                n_slots = 2 * len(add_node)
+                if next_slot + n_slots > self.d_hidden:
+                    # A structural skip here means an MLP_ADD was resolved
+                    # despite 2*width exceeding the usable pool —
+                    # realization.fits_mlp failed to fire, or the solve's
+                    # assignment contradicts it.  A transient skip defers the
+                    # Add to a later layer; it never spills to attention.
+                    self._record_skip(
+                        add_node,
+                        op_label,
+                        "MLP hidden slots",
+                        n_slots,
+                        self.d_hidden - next_slot,
+                        self.usable_hidden_slots,
+                    )
+                    continue
+                if not self._is_admissible(add_node):
+                    self._admission_deferred = True
+                    continue
+                a0, a1 = add_node.inputs
+                if index is not None:
+                    dead_addend = add_node.inputs[index]
+                    live_addend = add_node.inputs[1 - index]
+                    self._check_add_placement(add_node, index)
+                    self._require_live(
+                        dead_addend,
+                        residual_map,
+                        f"add_into_bypass target for {add_node!r}",
+                    )
+                    self._require_live(
+                        live_addend,
+                        residual_map,
+                        f"add_into_bypass source for {add_node!r}",
+                    )
+                    target_cols = residual_map.get_indices(dead_addend)
+                    source_cols = residual_map.resolve_indices(live_addend)
+                    mlp_slots = list(range(next_slot, next_slot + n_slots))
+                    next_slot += n_slots
+                    mlp_ops.append(
+                        _MlpOp(
+                            "add_into_bypass",
+                            add_node,
+                            target_cols,
+                            mlp_slots,
+                            source_cols=source_cols,
+                            reuse_input_index=index,
+                        )
+                    )
+                    # Ownership of the target ends through reassign — never
+                    # through a cancel path (its virtual cancel layer is
+                    # layer[A] + 1, bookkeeping only).
+                    residual_map.reassign(dead_addend, add_node)
+                    for leaf in (
+                        flatten_concat_nodes([live_addend])
+                        if isinstance(live_addend, Concatenate)
+                        else [live_addend]
+                    ):
+                        mlp_add_live_sources.add(leaf)
+                else:
+                    self._check_add_placement(add_node, None)
+                    self._require_live(
+                        a0, residual_map, f"compute_add_bypass a0 for {add_node!r}"
+                    )
+                    self._require_live(
+                        a1, residual_map, f"compute_add_bypass a1 for {add_node!r}"
+                    )
+                    source_cols = residual_map.resolve_indices(a0)
+                    source_cols_b = residual_map.resolve_indices(a1)
+                    target_cols = self._try_allocate(add_node, residual_map)
+                    if target_cols is None:
+                        self._record_skip(
+                            add_node,
+                            op_label,
+                            "residual columns",
+                            len(add_node),
+                            residual_map.get_free_count(),
+                            self.d,
+                        )
+                        continue
+                    mlp_slots = list(range(next_slot, next_slot + n_slots))
+                    next_slot += n_slots
+                    mlp_ops.append(
+                        _MlpOp(
+                            "compute_add_bypass",
+                            add_node,
+                            target_cols,
+                            mlp_slots,
+                            source_cols=source_cols,
+                            source_cols_b=source_cols_b,
+                        )
+                    )
+                computed_nodes.add(add_node)
+                self._mark_scheduled(add_node)
+                # An ordinary fresh source dying here flows through the same
+                # mid-MLP freshly-dead surfacing every other MLP consumer
+                # uses; the reused target is not allocated any more (the
+                # reassign ended its ownership) and the live source is in
+                # mlp_add_live_sources — both are skipped inside.
+                _surface_mlp_freshly_dead(add_node)
+
         # 3c. LiteralValues (no slot cost)
         constants = sorted(
             [n for n in ready if isinstance(n, LiteralValue)],
@@ -1325,11 +1518,13 @@ class LayerScheduler:
             computed_nodes.add(node)
             self._mark_scheduled(node)
 
-        # 3d. Bias writes for biased Linears scheduled in attention sublayer
-        # Biased Linear target cols were already cancelled when the Linear
-        # was scheduled in the attention sublayer, so no extra cancel here.
-        for node in biased_linears:
-            target_cols = residual_map.get_indices(node)
+        # 3d. Bias writes for biased Linears scheduled in attention sublayer.
+        # Target columns were captured at MLP phase start (bias_write_targets):
+        # an MLP Add may have reassigned a newly born Linear's columns above,
+        # and the direct bias write must land on the physical columns the
+        # Linear's value occupies — exactly once, even when those columns now
+        # belong to the Add.
+        for node, target_cols in bias_write_targets:
             mlp_ops.append(_MlpOp("compute_bias", node, target_cols, []))
 
         # 3e. MLP-cancel: zero dead nodes' columns via `cancel_bypass` while
@@ -1724,6 +1919,20 @@ class LayerScheduler:
             self.held_output_layout is not None
             and node is self.held_output_layout.target
         )
+
+    def _check_add_placement(self, add_node: Add, reuse_index: Optional[int]) -> None:
+        """Hook: verify the walk's fresh/reused decision for one Add just
+        before its operation is emitted.  ``reuse_index`` is the selected
+        target occurrence (0 or 1) for a reuse, ``None`` for fresh.
+
+        Base heuristic: no-op — the physical walk IS the decision, and
+        assignment completion (``ScheduleAssignment.from_heuristic_trace``)
+        verifies the whole trace against the assignment-level derivation
+        afterwards.  ``DirectedLayerScheduler`` overrides this to compare
+        the physical residual-map state with the derivation from the
+        solver's layer/route assignment, raising on disagreement rather
+        than silently emitting the other form.
+        """
 
     def _release_cancelled(
         self, node: Node, residual_map: ResidualStreamMap, *, mech: str
@@ -2147,6 +2356,53 @@ class DirectedLayerScheduler(LayerScheduler):
         # _assigned_attention_releases above always returns a list, so the
         # layer-start dead-list snapshot is never consumed on this scheduler.
         return True
+
+    def _expected_add_placement(self, add_node: Add) -> AddPlacement:
+        """The assignment-level derivation of this Add's placement — the
+        expectation the physical residual-map state must reproduce."""
+        layout = self.held_output_layout
+        return derive_add_placement(
+            add_node,
+            effective_consumers=self._get_effective_consumers,
+            node_to_layer=self._assignment.node_to_layer,
+            node_to_routing=self._assignment.node_to_routing,
+            held_source_id=None if layout is None else layout.source.node_id,
+            held_target_id=None if layout is None else layout.target.node_id,
+        )
+
+    def _check_add_placement(self, add_node: Add, reuse_index: Optional[int]) -> None:
+        expected = self._expected_add_placement(add_node)
+        if expected.reuse_input_index == reuse_index:
+            return
+        n2l = self._assignment.node_to_layer
+        n2r = self._assignment.node_to_routing
+
+        def _describe(occ: Node) -> str:
+            parts = []
+            for c in sorted(
+                self._get_effective_consumers(occ), key=lambda n: n.node_id
+            ):
+                if c.node_id == add_node.node_id:
+                    continue
+                parts.append(f"{c!r}@L{n2l.get(c.node_id)}/{n2r.get(c.node_id)}")
+            return ", ".join(parts) or "none"
+
+        def _form(index: Optional[int]) -> str:
+            return "fresh" if index is None else f"reused occurrence {index}"
+
+        a0, a1 = add_node.inputs
+        raise AssertionError(
+            f"Model/replay contract violation (Add placement) at layer "
+            f"{self._current_layer}: {add_node!r} (route "
+            f"{n2r.get(add_node.node_id)!r}, layer "
+            f"{n2l.get(add_node.node_id)}) realized {_form(reuse_index)} but "
+            f"the assignment-level derivation expects "
+            f"{_form(expected.reuse_input_index)} "
+            f"(reusable_0={expected.reusable_0}, "
+            f"reusable_1={expected.reusable_1}).  Other consumers of "
+            f"occurrence 0 {a0!r}: {_describe(a0)}; of occurrence 1 "
+            f"{a1!r}: {_describe(a1)}."
+        )
 
     def _literal_needed_now(self, node: Node, computed_nodes: Set[Node]) -> bool:
         # Assignment-driven: the CP-SAT layer assignment already places each

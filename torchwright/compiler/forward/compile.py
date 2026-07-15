@@ -10,7 +10,7 @@ import hashlib
 import os
 import time
 import warnings
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from typing import Callable, Dict, Optional, Set, Tuple
 
 import torch
@@ -343,8 +343,13 @@ class _TrackingResidualStreamMap(ResidualStreamMap):
     capture cancel-layer hints for CP-SAT.  The probe sets
     ``current_layer`` before each ``schedule_layer`` call; ``free``
     records that value for every node that gets freed.  Nodes
-    consumed via ``reassign`` (free-add path) don't go through
-    ``free`` and are correctly omitted from the cancel hint.
+    consumed via ``reassign`` (the Add reuse paths) don't go through
+    ``free`` and record nothing here; assignment completion
+    (``ScheduleAssignment.from_heuristic_trace``) later canonicalizes
+    each reused target's virtual cancel to ``layer[Add] + 1`` — the
+    handoff boundary where the Add's shifted ownership begins — so the
+    full hint is model-feasible.  No physical cancel is ever emitted
+    for a reassigned target.
 
     **Rollback-free correction.**  ``LayerScheduler`` speculatively
     allocates a node, then rolls the allocation back with ``free(node)``
@@ -411,6 +416,16 @@ class HeuristicScheduleTrace:
     observed_cancel_layer: Dict[int, int]
     observed_cancel_mech: Dict[int, str]
     n_layers: int
+    # Physical observation per Add: (is_reused, reuse_input_index) from the
+    # operation actually emitted on either route — add_into/add_into_bypass
+    # record (True, 0|1); compute_add/compute_add_bypass record (False,
+    # None).  Trace-only (never serialized into ScheduleAssignment): it
+    # exists so assignment completion can compare the physical walk against
+    # the independent derivation before the residual map has erased the old
+    # ownership, including for add(x, x).
+    observed_add_placement: Dict[int, Tuple[bool, Optional[int]]] = field(
+        default_factory=dict
+    )
 
     @property
     def is_complete(self) -> bool:
@@ -468,6 +483,7 @@ def _build_heuristic_schedule_trace(
     )
     hint_layers: dict = {}
     hint_routing: dict = {}
+    hint_add_placement: Dict[int, Tuple[bool, Optional[int]]] = {}
     for hi in range(max_layers):
         if output_node in hint_computed:
             break
@@ -479,13 +495,23 @@ def _build_heuristic_schedule_trace(
         attn_ops, mlp_ops, _ = hint_scheduler.schedule_layer(hint_rmap, hint_computed)
         # Record the complete routing contract. CP-SAT formerly needed hints
         # only for flexible Linears, but deterministic replay needs every
-        # schedulable node's chosen sublayer.
+        # schedulable node's chosen sublayer.  Every Add additionally records
+        # its physical placement observation — the emitted op says whether
+        # the walk reused a target occurrence or placed fresh.
         for op in attn_ops:
             if op.node is not None and op.op_type != "cancel":
                 hint_routing[op.node.node_id] = "attn"
+            if op.op_type == "add_into":
+                hint_add_placement[op.node.node_id] = (True, op.reuse_input_index)
+            elif op.op_type == "compute_add":
+                hint_add_placement[op.node.node_id] = (False, None)
         for op in mlp_ops:
             if op.node is not None and not op.op_type.startswith("cancel"):
                 hint_routing[op.node.node_id] = "mlp"
+            if op.op_type == "add_into_bypass":
+                hint_add_placement[op.node.node_id] = (True, op.reuse_input_index)
+            elif op.op_type == "compute_add_bypass":
+                hint_add_placement[op.node.node_id] = (False, None)
         for node in graph.get_all_nodes():
             if isinstance(node, Concatenate) and node not in hint_computed:
                 if all(leaf in hint_computed for leaf in flatten_concat_nodes([node])):
@@ -511,6 +537,7 @@ def _build_heuristic_schedule_trace(
         observed_cancel_layer=dict(hint_rmap.cancel_layer),
         observed_cancel_mech=dict(hint_rmap.cancel_mech),
         n_layers=hint_n_layers,
+        observed_add_placement=hint_add_placement,
     )
 
 
@@ -1567,6 +1594,17 @@ def forward_compile(
             observed_cancel_layer=heuristic_trace.observed_cancel_layer,
             observed_cancel_mech=heuristic_trace.observed_cancel_mech,
             n_layers=heuristic_trace.n_layers,
+            observed_add_placement=heuristic_trace.observed_add_placement,
+            held_source_id=(
+                None
+                if held_output_layout is None
+                else held_output_layout.source.node_id
+            ),
+            held_target_id=(
+                None
+                if held_output_layout is None
+                else held_output_layout.target.node_id
+            ),
         )
 
     if use_cpsat:

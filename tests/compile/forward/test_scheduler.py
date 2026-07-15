@@ -371,7 +371,7 @@ def test_schedule_free_add():
     rmap.allocate(live_node)
     computed = {pos, dead_node, live_node}
 
-    scheduler = LayerScheduler(graph, D, D_HEAD, pos)
+    scheduler = LayerScheduler(graph, D, D_HEAD, pos, policy=LEGACY_POLICY)
     attn_ops, mlp_ops, _biased = scheduler.schedule_layer(rmap, computed)
 
     add_ops = [op for op in attn_ops if op.op_type == "add_into"]
@@ -409,7 +409,7 @@ def test_schedule_deferred_add_via_compute():
     rmap.allocate(b)
     computed = {pos, a, b}
 
-    scheduler = LayerScheduler(graph, d_test, D_HEAD, pos)
+    scheduler = LayerScheduler(graph, d_test, D_HEAD, pos, policy=LEGACY_POLICY)
     attn_ops, mlp_ops, _biased = scheduler.schedule_layer(rmap, computed)
 
     add_ops = [op for op in attn_ops if op.node is add_node and op.op_type != "cancel"]
@@ -439,7 +439,7 @@ def test_schedule_add_into_preferred_over_compute_add():
     rmap.allocate(b)
     computed = {pos, a, b}
 
-    scheduler = LayerScheduler(graph, D, D_HEAD, pos)
+    scheduler = LayerScheduler(graph, D, D_HEAD, pos, policy=LEGACY_POLICY)
     attn_ops, mlp_ops, _biased = scheduler.schedule_layer(rmap, computed)
 
     add_ops = [op for op in attn_ops if op.node is add_node]
@@ -464,7 +464,7 @@ def test_schedule_add_both_addends_dead():
     rmap.allocate(b)
     computed = {pos, a, b}
 
-    scheduler = LayerScheduler(graph, D, D_HEAD, pos)
+    scheduler = LayerScheduler(graph, D, D_HEAD, pos, policy=LEGACY_POLICY)
     attn_ops, mlp_ops, _biased = scheduler.schedule_layer(rmap, computed)
 
     add_ops = [op for op in attn_ops if op.op_type == "add_into"]
@@ -783,7 +783,7 @@ def test_add_into_shared_addend_not_reassigned():
         rmap.allocate(dn)
     computed = {pos, shared} | set(dead_nodes)
 
-    scheduler = LayerScheduler(graph, D, D_HEAD, pos)
+    scheduler = LayerScheduler(graph, D, D_HEAD, pos, policy=LEGACY_POLICY)
     attn_ops, mlp_ops, _biased = scheduler.schedule_layer(rmap, computed)
 
     add_into_ops = [op for op in attn_ops if op.op_type == "add_into"]
@@ -843,3 +843,294 @@ def test_within_layer_freeing_surfaces_freshly_dead_intermediate():
     scheduler = LayerScheduler(graph, D, D_HEAD, pos)
 
     assert a in scheduler._freshly_dead_inputs(b, computed, rmap)
+
+
+# ---------------------------------------------------------------------------
+# MLP-routed Adds (docs/plan_additional_mlp_routing.md)
+#
+# Under the default policy (local_in_attention="never") a fitting Add
+# resolves to MLP_ADD; the walk carries it into the MLP phase and derives
+# fresh/reused placement from the MLP phase-start snapshot.
+# ---------------------------------------------------------------------------
+
+
+def test_mlp_add_reuses_dead_addend():
+    """A reusable MLP Add emits add_into_bypass and reassigns the dead
+    addend's columns; no attention Add op is emitted."""
+    pos = _make_reserved_block()
+    a = InputNode("a", 4, value_range=(-100.0, 100.0))
+    b = InputNode("b", 4, value_range=(-100.0, 100.0))
+    add_node = Add(a, b, name="add")
+    b_other = _make_linear(b, 4, "b_other")  # b stays live (pending consumer)
+    out = Concatenate([add_node, b_other])
+
+    graph = GraphAnalyzer(out)
+    rmap = ResidualStreamMap(D)
+    rmap.allocate(pos)
+    a_cols = rmap.allocate(a)
+    rmap.allocate(b)
+    computed = {pos, a, b}
+
+    scheduler = LayerScheduler(graph, D, D_HEAD, pos)
+    attn_ops, mlp_ops, _biased = scheduler.schedule_layer(rmap, computed)
+
+    assert not [op for op in attn_ops if op.op_type in ("add_into", "compute_add")]
+    add_ops = [op for op in mlp_ops if op.op_type == "add_into_bypass"]
+    assert len(add_ops) == 1
+    op = add_ops[0]
+    assert op.node is add_node
+    assert op.reuse_input_index == 0
+    assert op.target_cols == a_cols
+    assert op.mlp_slots and len(op.mlp_slots) == 2 * 4
+    # The dead addend's columns now belong to the Add.
+    assert rmap.get_indices(add_node) == a_cols
+    assert not rmap.is_allocated(a)
+
+
+def test_mlp_add_fresh_allocates_columns():
+    """A fresh MLP Add (both addends still live) emits compute_add_bypass
+    into freshly allocated columns."""
+    pos = _make_reserved_block()
+    a = InputNode("a", 4, value_range=(-100.0, 100.0))
+    b = InputNode("b", 4, value_range=(-100.0, 100.0))
+    add_node = Add(a, b, name="add")
+    a_other = _make_linear(a, 4, "a_other")
+    b_other = _make_linear(b, 4, "b_other")
+    out = Concatenate([add_node, a_other, b_other])
+
+    graph = GraphAnalyzer(out)
+    rmap = ResidualStreamMap(D)
+    rmap.allocate(pos)
+    a_cols = rmap.allocate(a)
+    b_cols = rmap.allocate(b)
+    computed = {pos, a, b}
+
+    scheduler = LayerScheduler(graph, D, D_HEAD, pos)
+    attn_ops, mlp_ops, _biased = scheduler.schedule_layer(rmap, computed)
+
+    add_ops = [op for op in mlp_ops if op.op_type == "compute_add_bypass"]
+    assert len(add_ops) == 1
+    op = add_ops[0]
+    assert op.reuse_input_index is None
+    assert op.source_cols == a_cols and op.source_cols_b == b_cols
+    assert set(op.target_cols).isdisjoint(set(a_cols) | set(b_cols))
+    assert rmap.is_allocated(a) and rmap.is_allocated(b)
+
+
+def test_mlp_add_both_dead_selects_input0():
+    """When both addends are reusable, occurrence 0 is the target on the
+    MLP route (same deterministic tie-break as attention)."""
+    pos = _make_reserved_block()
+    a = InputNode("a", 4, value_range=(-100.0, 100.0))
+    b = InputNode("b", 4, value_range=(-100.0, 100.0))
+    add_node = Add(a, b, name="add")
+
+    graph = GraphAnalyzer(add_node)
+    rmap = ResidualStreamMap(D)
+    rmap.allocate(pos)
+    a_cols = rmap.allocate(a)
+    rmap.allocate(b)
+    computed = {pos, a, b}
+
+    scheduler = LayerScheduler(graph, D, D_HEAD, pos)
+    attn_ops, mlp_ops, _biased = scheduler.schedule_layer(rmap, computed)
+
+    add_ops = [op for op in mlp_ops if op.op_type == "add_into_bypass"]
+    assert len(add_ops) == 1
+    assert add_ops[0].reuse_input_index == 0
+    assert add_ops[0].target_cols == a_cols
+    assert rmap.is_allocated(b)  # occurrence 1 is the source read
+
+
+def test_attention_producer_feeds_mlp_add_same_layer():
+    """An attention result (Attn node) may feed an MLP-routed Add in the
+    same layer: the Add joins the MLP candidates after the attention pass,
+    and the attention-born value is a legal reuse target at the MLP
+    phase-start snapshot."""
+    pos = _make_reserved_block()
+    v = InputNode("v", 4, value_range=(-100.0, 100.0))
+    attn_node = _make_attn(v)
+    other = InputNode("other", 4, value_range=(-100.0, 100.0))
+    other_keeper = _make_linear(other, 4, "keeper")  # other stays live
+    add_node = Add(attn_node, other, name="add")
+    out = Concatenate([add_node, other_keeper])
+
+    graph = GraphAnalyzer(out)
+    rmap = ResidualStreamMap(D)
+    rmap.allocate(pos)
+    rmap.allocate(v)
+    rmap.allocate(other)
+    computed = {pos, v, other}
+
+    scheduler = LayerScheduler(graph, D, D_HEAD, pos)
+    attn_ops, mlp_ops, _biased = scheduler.schedule_layer(rmap, computed)
+
+    assert [op for op in attn_ops if op.op_type == "compute_attn"]
+    add_ops = [
+        op
+        for op in mlp_ops
+        if op.op_type in ("add_into_bypass", "compute_add_bypass")
+    ]
+    assert len(add_ops) == 1, "the Add must place in the same layer's MLP phase"
+    # The attention output's only consumer is the Add, so it is dead at the
+    # MLP snapshot and its columns are reused.
+    assert add_ops[0].op_type == "add_into_bypass"
+    assert add_ops[0].reuse_input_index == 0
+    assert rmap.get_indices(add_node)
+
+
+def test_mlp_producer_defers_mlp_add_to_next_layer():
+    """An MLP-routed producer (FFN) cannot feed an MLP Add in the same
+    layer — the Add waits (one-layer dependency gap)."""
+    pos = _make_reserved_block()
+    x = InputNode("x", 4, value_range=(-100.0, 100.0))
+    ffn = _make_ffn(x, 6, 4, "ffn")
+    other = InputNode("other", 4, value_range=(-100.0, 100.0))
+    add_node = Add(ffn, other, name="add")
+
+    graph = GraphAnalyzer(add_node)
+    rmap = ResidualStreamMap(D)
+    rmap.allocate(pos)
+    rmap.allocate(x)
+    rmap.allocate(other)
+    computed = {pos, x, other}
+
+    scheduler = LayerScheduler(graph, D, D_HEAD, pos)
+    attn_ops0, mlp_ops0, _ = scheduler.schedule_layer(rmap, computed)
+    assert [op for op in mlp_ops0 if op.op_type == "compute_ffn"]
+    assert not [
+        op
+        for op in mlp_ops0
+        if op.op_type in ("add_into_bypass", "compute_add_bypass")
+    ]
+
+    attn_ops1, mlp_ops1, _ = scheduler.schedule_layer(rmap, computed)
+    assert [
+        op
+        for op in mlp_ops1
+        if op.op_type in ("add_into_bypass", "compute_add_bypass")
+    ]
+
+
+def test_same_layer_consumer_reusability_is_sublayer_aware():
+    """A same-layer attention consumer of an addend counts complete for an
+    MLP Add (the attention phase precedes the MLP snapshot); a same-layer
+    MLP consumer does not."""
+    # Attention peer: a is reusable.
+    pos = _make_reserved_block()
+    a = InputNode("a", 4, value_range=(-100.0, 100.0))
+    b = InputNode("b", 4, value_range=(-100.0, 100.0))
+    add_node = Add(a, b, name="add")
+    attn_peer = _make_attn(a)
+    b_keeper = _make_linear(b, 4, "b_keeper")
+    out = Concatenate([add_node, attn_peer, b_keeper])
+
+    graph = GraphAnalyzer(out)
+    rmap = ResidualStreamMap(D)
+    rmap.allocate(pos)
+    a_cols = rmap.allocate(a)
+    rmap.allocate(b)
+    computed = {pos, a, b}
+    scheduler = LayerScheduler(graph, D, D_HEAD, pos)
+    attn_ops, mlp_ops, _ = scheduler.schedule_layer(rmap, computed)
+    add_ops = [op for op in mlp_ops if op.op_type == "add_into_bypass"]
+    assert len(add_ops) == 1 and add_ops[0].reuse_input_index == 0
+    assert add_ops[0].target_cols == a_cols
+
+    # MLP peer: a is NOT reusable (and b is kept live), so the Add is fresh.
+    pos2 = _make_reserved_block()
+    a2 = InputNode("a2", 4, value_range=(-100.0, 100.0))
+    b2 = InputNode("b2", 4, value_range=(-100.0, 100.0))
+    add2 = Add(a2, b2, name="add2")
+    mlp_peer = _make_linear(a2, 4, "mlp_peer")  # default policy: MLP bypass
+    b2_keeper = _make_linear(b2, 4, "b2_keeper")
+    out2 = Concatenate([add2, mlp_peer, b2_keeper])
+
+    graph2 = GraphAnalyzer(out2)
+    rmap2 = ResidualStreamMap(D)
+    rmap2.allocate(pos2)
+    rmap2.allocate(a2)
+    rmap2.allocate(b2)
+    computed2 = {pos2, a2, b2}
+    scheduler2 = LayerScheduler(graph2, D, D_HEAD, pos2)
+    attn_ops2, mlp_ops2, _ = scheduler2.schedule_layer(rmap2, computed2)
+    add_ops2 = [
+        op
+        for op in mlp_ops2
+        if op.op_type in ("add_into_bypass", "compute_add_bypass")
+    ]
+    assert len(add_ops2) == 1
+    assert add_ops2[0].op_type == "compute_add_bypass"
+    assert rmap2.is_allocated(a2) and rmap2.is_allocated(b2)
+
+
+def test_mlp_add_slot_exhaustion_defers_without_spilling():
+    """When a layer's hidden slots cannot hold a second MLP Add, it defers
+    to the next layer and never spills to attention."""
+    pos = _make_reserved_block()
+    inputs = [
+        InputNode(f"i{k}", 4, value_range=(-100.0, 100.0)) for k in range(4)
+    ]
+    add_a = Add(inputs[0], inputs[1], name="add_a")
+    add_b = Add(inputs[2], inputs[3], name="add_b")
+    out = Concatenate([add_a, add_b])
+
+    graph = GraphAnalyzer(out)
+    rmap = ResidualStreamMap(D)
+    rmap.allocate(pos)
+    for i in inputs:
+        rmap.allocate(i)
+    computed = {pos, *inputs}
+
+    # Each reused Add needs 2*4 = 8 slots; d_hidden=12 holds only one.
+    scheduler = LayerScheduler(graph, D, D_HEAD, pos, d_hidden=12)
+    attn_ops0, mlp_ops0, _ = scheduler.schedule_layer(rmap, computed)
+    placed0 = [op for op in mlp_ops0 if op.op_type == "add_into_bypass"]
+    assert len(placed0) == 1
+    assert not [op for op in attn_ops0 if op.op_type in ("add_into", "compute_add")]
+
+    attn_ops1, mlp_ops1, _ = scheduler.schedule_layer(rmap, computed)
+    placed1 = [op for op in mlp_ops1 if op.op_type == "add_into_bypass"]
+    assert len(placed1) == 1
+    assert not [op for op in attn_ops1 if op.op_type in ("add_into", "compute_add")]
+
+
+def test_mlp_add_live_source_not_cancelled_same_layer():
+    """The live/source occurrence of an add_into_bypass is excluded from
+    same-layer cancellation (gap #2 conservatism, extended to the MLP
+    route): even when the Add is its final consumer, it stays allocated
+    through the Add's layer."""
+    pos = _make_reserved_block()
+    x = InputNode("x", 4, value_range=(-100.0, 100.0))
+    a = InputNode("a", 4, value_range=(-100.0, 100.0))
+    lin = _make_linear(x, 4, "lin")
+    add_node = Add(a, lin, name="add")  # a: reuse target; lin: live source
+
+    graph = GraphAnalyzer(add_node)
+    rmap = ResidualStreamMap(D)
+    rmap.allocate(pos)
+    rmap.allocate(x)
+    rmap.allocate(a)
+    computed = {pos, x, a}
+
+    scheduler = LayerScheduler(graph, D, D_HEAD, pos)
+    # Layer 0: lin places (MLP bypass under the default policy).
+    scheduler.schedule_layer(rmap, computed)
+    assert lin in computed and rmap.is_allocated(lin)
+    lin_cols = set(rmap.get_indices(lin))
+
+    # Layer 1: the Add reuses a's columns and reads lin as the live source.
+    attn_ops, mlp_ops, _ = scheduler.schedule_layer(rmap, computed)
+    add_ops = [op for op in mlp_ops if op.op_type == "add_into_bypass"]
+    assert len(add_ops) == 1 and add_ops[0].reuse_input_index == 0
+    cancel_cols = {
+        c
+        for op in mlp_ops
+        if op.op_type == "cancel_bypass"
+        for c in op.target_cols
+    }
+    assert not (cancel_cols & lin_cols), (
+        "the live source of an add_into_bypass must not be cancelled in the "
+        "Add's own layer"
+    )
+    assert rmap.is_allocated(lin)
