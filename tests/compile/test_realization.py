@@ -129,18 +129,24 @@ def test_resolve_static_both_policies():
 
     # a and b are 4->3 Linears: 2*3 = 6 bypass slots, well inside 64; the
     # add is 3 wide: 2*3 = 6 MLP-Add slots, also well inside 64.
-    bypass = table.resolve_static(nodes, SchedulingPolicy(), 64)  # "never"
+    bypass = table.resolve_static(nodes, SchedulingPolicy(add_in_attention="never"), 64)
     assert bypass.entries[ca.node_id].resolved == MLP_BYPASS
     assert bypass.entries[cb.node_id].resolved == MLP_BYPASS
     assert bypass.entries[cadd.node_id].resolved == MLP_ADD
     assert not bypass.is_attention_routed(ca)
     assert not bypass.is_attention_routed(cadd)
 
-    attn = table.resolve_static(nodes, LEGACY_POLICY, 64)  # "always"
+    attn = table.resolve_static(nodes, LEGACY_POLICY, 64)  # both "always"
     assert attn.entries[ca.node_id].resolved == ATTN_TRANSPORT
     assert attn.entries[cadd.node_id].resolved == ATTN_ADD
     assert attn.is_attention_routed(ca)
     assert attn.is_attention_routed(cadd)
+
+    # The shipping default splits by node type: Linears to MLP, Adds to
+    # attention (see SchedulingPolicy.add_in_attention).
+    default = table.resolve_static(nodes, SchedulingPolicy(), 64)
+    assert default.entries[ca.node_id].resolved == MLP_BYPASS
+    assert default.entries[cadd.node_id].resolved == ATTN_ADD
 
     # Single-candidate entries are untouched by resolution.
     for t in (bypass, attn):
@@ -248,13 +254,24 @@ def test_cost_summary_static_hand_computed():
     out, a, b, add, blk, lit = _test_graph()
     lowered = lower(out)
 
-    cs = lowered.cost_summary(d_head=8, usable_slots=64)  # default policy: MLP
-    assert cs.mlp_bypass_slots == 18  # 6 + 6 (Linears) + 6 (MLP Add)
+    # Default policy splits by node type: Linears to MLP, the Add to
+    # attention (SchedulingPolicy.add_in_attention).
+    cs = lowered.cost_summary(d_head=8, usable_slots=64)
+    assert cs.mlp_bypass_slots == 12  # 6 + 6 (Linears); the Add is attention
     assert cs.mlp_lanes == 6
-    assert cs.heads_by_class == {}  # nothing attention-routed
-    assert (cs.add_heads_if_all_reuse, cs.add_heads_if_all_copy) == (0, 0)
-    assert (cs.attn_heads_min, cs.attn_heads_max) == (0, 0)
-    assert cs.nodes_by_class[MLP_ADD] == 1
+    assert cs.heads_by_class == {}  # transports are MLP-routed
+    assert (cs.add_heads_if_all_reuse, cs.add_heads_if_all_copy) == (1, 2)
+    assert (cs.attn_heads_min, cs.attn_heads_max) == (1, 2)
+    assert cs.nodes_by_class[ATTN_ADD] == 1
+
+    cs_mlp = lowered.cost_summary(
+        d_head=8, policy=SchedulingPolicy(add_in_attention="never"), usable_slots=64
+    )
+    assert cs_mlp.mlp_bypass_slots == 18  # 6 + 6 (Linears) + 6 (MLP Add)
+    assert cs_mlp.heads_by_class == {}  # nothing attention-routed
+    assert (cs_mlp.add_heads_if_all_reuse, cs_mlp.add_heads_if_all_copy) == (0, 0)
+    assert (cs_mlp.attn_heads_min, cs_mlp.attn_heads_max) == (0, 0)
+    assert cs_mlp.nodes_by_class[MLP_ADD] == 1
 
     cs_attn = lowered.cost_summary(d_head=8, policy=LEGACY_POLICY, usable_slots=64)
     assert cs_attn.mlp_bypass_slots == 0
@@ -406,11 +423,14 @@ def _add_of_width(w: int) -> Add:
 
 
 @pytest.mark.parametrize("bias", [True, False])
-@pytest.mark.parametrize("policy", [SchedulingPolicy(), LEGACY_POLICY])
+@pytest.mark.parametrize(
+    "policy",
+    [SchedulingPolicy(add_in_attention="never"), SchedulingPolicy(), LEGACY_POLICY],
+)
 def test_static_flex_class_add_capacity_boundary(bias, policy):
     """Same boundary for the Add route family: 2*width against the usable
     hidden pool.  One column wider and only ATTN_ADD remains, whatever
-    ``local_in_attention`` says."""
+    ``add_in_attention`` says."""
     usable = usable_hidden_slots(64, bias)
     widest = usable // 2
     fits = _add_of_width(widest)
@@ -419,22 +439,26 @@ def test_static_flex_class_add_capacity_boundary(bias, policy):
     assert fits_mlp(fits, usable)
     assert not fits_mlp(too_wide, usable)
 
-    expected_fitting = MLP_ADD if policy.local_in_attention == "never" else ATTN_ADD
+    expected_fitting = MLP_ADD if policy.add_in_attention == "never" else ATTN_ADD
     assert static_flex_class(fits, policy, usable) == expected_fitting
     assert static_flex_class(too_wide, policy, usable) == ATTN_ADD
 
 
 def test_resolve_static_forced_held_target_add():
     """The tied direct-handoff contract: compile forces a held-target Add to
-    ATTN_ADD through ``forced_classes``, and the resolver honours it under
-    the MLP-preferring default policy."""
+    ATTN_ADD through ``forced_classes``, and the resolver honours it even
+    under an MLP-preferring Add policy (the shipping default already keeps
+    Adds on attention, which would make the force vacuous here)."""
     out, a, b, add, blk, lit = _test_graph()
     lowered = lower(out)
     nodes = get_ancestor_nodes({lowered.output_node})
     cadd = lowered.copy_of(add)
 
     forced = lowered.realization_table.resolve_static(
-        nodes, SchedulingPolicy(), 64, forced_classes={cadd.node_id: ATTN_ADD}
+        nodes,
+        SchedulingPolicy(add_in_attention="never"),
+        64,
+        forced_classes={cadd.node_id: ATTN_ADD},
     )
     assert forced.entries[cadd.node_id].resolved == ATTN_ADD
     # Everything else still follows the policy.

@@ -13,18 +13,32 @@ class SchedulingPolicy:
     and can use either mechanism.  This policy controls which they use.
     """
 
-    # Whether position-local compute ops (standalone Linears and Adds —
-    # add_into/compute_add on attention, add_into_bypass/compute_add_bypass
+    # Whether standalone Linears (attn_transport on attention, mlp_bypass
     # on MLP) use attention heads or MLP bypass.
     #   "always": use attention heads (legacy behavior)
     #   "never":  use MLP bypass, defer to next layer if MLP full
     # A node whose MLP demand (2*d_output) exceeds a layer's usable hidden
-    # pool goes to attention regardless; a tied compile's held-target Add
-    # is pinned to attention under every setting.  On CP-SAT paths the
-    # policy is consulted only under cpsat_flex_routing=False — the legacy
-    # attention-only Add configuration is LEGACY_POLICY *plus*
-    # cpsat_flex_routing=False (docs/plan_additional_mlp_routing.md).
+    # pool goes to attention regardless.  On CP-SAT paths the policy is
+    # consulted only under cpsat_flex_routing=False.
     local_in_attention: Literal["always", "never"] = "never"
+
+    # The same choice for Adds (add_into/compute_add on attention,
+    # add_into_bypass/compute_add_bypass on MLP), with the OPPOSITE
+    # default.  A static MLP default costs one layer for every Add wedged
+    # between two MLP-sublayer ops: an attention-routed Add rides the
+    # attention sublayer that sits idle between consecutive MLP sublayers
+    # (its output is readable by the same layer's MLP), while an
+    # MLP-routed Add pays the mlp->mlp one-layer gap on both sides.
+    # Measured 2026-07-14 (scripts/measure_add_routing_flip.py): a static
+    # MLP default cost calculator +5 and fibonacci +1 layers at
+    # optimize=0 while winning nothing.  Adds still reach MLP wherever a
+    # per-node chooser exists — CP-SAT flex routing decides regardless of
+    # this knob (docs/plan_additional_mlp_routing.md, *Policy and
+    # compatibility decision*).  Same carve-outs as local_in_attention:
+    # an Add too wide for the hidden pool goes to attention, and a tied
+    # compile's held-target Add is pinned to attention under every
+    # setting.
+    add_in_attention: Literal["always", "never"] = "always"
 
     # Residual stream occupancy fraction above which the scheduler switches
     # its sort order from "longest critical path first" to "free columns
@@ -35,9 +49,12 @@ class SchedulingPolicy:
     pressure_threshold: float = 0.75
 
 
-#: The historical attention-preferring routing.  For attention-only Adds on
-#: CP-SAT paths, pair it with ``cpsat_flex_routing=False`` — the policy alone
-#: cannot pin routes the solver is asked to choose.
+#: The historical attention-preferring routing.  ``add_in_attention`` is
+#: set explicitly (not left to its default) so LEGACY keeps meaning
+#: "everything on attention" even if a default moves.  For attention-only
+#: Adds on CP-SAT paths, pair it with ``cpsat_flex_routing=False`` — the
+#: policy alone cannot pin routes the solver is asked to choose.
 LEGACY_POLICY = SchedulingPolicy(
     local_in_attention="always",
+    add_in_attention="always",
 )

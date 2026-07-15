@@ -2164,10 +2164,11 @@ class DirectedLayerScheduler(LayerScheduler):
       ``assignment.node_to_layer[n] == current_layer`` are eligible to
       schedule this layer.  Other ready nodes stay deferred until their
       assigned layer.
-    - **Routing.** Each standalone ``Linear`` is forced into the attention
-      sublayer or the MLP bypass per the realization table resolved from
-      ``assignment.node_to_routing`` (the solve is the resolver).
-      ``policy.local_in_attention`` is ignored.
+    - **Routing.** Each standalone ``Linear`` and each ``Add`` is forced
+      into the attention sublayer or the MLP bypass per the realization
+      table resolved from ``assignment.node_to_routing`` (the solve is
+      the resolver).  The static policy knobs (``local_in_attention``,
+      ``add_in_attention``) are ignored.
     - **Cancellation.** Attention-mechanism cancels replay as ONE atomic
       batch per layer (``_assigned_attention_releases``): every value whose
       assigned cancel layer equals the current layer is released after all
@@ -2223,7 +2224,7 @@ class DirectedLayerScheduler(LayerScheduler):
             )
         # The directed path's resolver is the solve itself: its per-node
         # sublayer decisions (node_to_routing) resolve the table the walk
-        # reads.  policy.local_in_attention plays no part here.
+        # reads.  The static policy knobs play no part here.
         if realization_table is None:
             realization_table = RealizationTable.build(
                 graph.get_all_nodes()

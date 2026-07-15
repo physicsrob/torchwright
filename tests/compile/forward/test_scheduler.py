@@ -32,6 +32,10 @@ D = 64
 D_HEAD = 16
 N_HEADS = D // D_HEAD  # 4
 
+# The shipping default keeps Adds on attention (SchedulingPolicy.
+# add_in_attention); the MLP-Add tests opt in to the MLP route explicitly.
+MLP_ADD_POLICY = SchedulingPolicy(add_in_attention="never")
+
 
 def _make_reserved_block():
     # A generic always-allocated stand-in for the scheduler's pinned reserved
@@ -371,7 +375,7 @@ def test_schedule_free_add():
     rmap.allocate(live_node)
     computed = {pos, dead_node, live_node}
 
-    scheduler = LayerScheduler(graph, D, D_HEAD, pos, policy=LEGACY_POLICY)
+    scheduler = LayerScheduler(graph, D, D_HEAD, pos)
     attn_ops, mlp_ops, _biased = scheduler.schedule_layer(rmap, computed)
 
     add_ops = [op for op in attn_ops if op.op_type == "add_into"]
@@ -409,7 +413,7 @@ def test_schedule_deferred_add_via_compute():
     rmap.allocate(b)
     computed = {pos, a, b}
 
-    scheduler = LayerScheduler(graph, d_test, D_HEAD, pos, policy=LEGACY_POLICY)
+    scheduler = LayerScheduler(graph, d_test, D_HEAD, pos)
     attn_ops, mlp_ops, _biased = scheduler.schedule_layer(rmap, computed)
 
     add_ops = [op for op in attn_ops if op.node is add_node and op.op_type != "cancel"]
@@ -439,7 +443,7 @@ def test_schedule_add_into_preferred_over_compute_add():
     rmap.allocate(b)
     computed = {pos, a, b}
 
-    scheduler = LayerScheduler(graph, D, D_HEAD, pos, policy=LEGACY_POLICY)
+    scheduler = LayerScheduler(graph, D, D_HEAD, pos)
     attn_ops, mlp_ops, _biased = scheduler.schedule_layer(rmap, computed)
 
     add_ops = [op for op in attn_ops if op.node is add_node]
@@ -464,7 +468,7 @@ def test_schedule_add_both_addends_dead():
     rmap.allocate(b)
     computed = {pos, a, b}
 
-    scheduler = LayerScheduler(graph, D, D_HEAD, pos, policy=LEGACY_POLICY)
+    scheduler = LayerScheduler(graph, D, D_HEAD, pos)
     attn_ops, mlp_ops, _biased = scheduler.schedule_layer(rmap, computed)
 
     add_ops = [op for op in attn_ops if op.op_type == "add_into"]
@@ -783,7 +787,7 @@ def test_add_into_shared_addend_not_reassigned():
         rmap.allocate(dn)
     computed = {pos, shared} | set(dead_nodes)
 
-    scheduler = LayerScheduler(graph, D, D_HEAD, pos, policy=LEGACY_POLICY)
+    scheduler = LayerScheduler(graph, D, D_HEAD, pos)
     attn_ops, mlp_ops, _biased = scheduler.schedule_layer(rmap, computed)
 
     add_into_ops = [op for op in attn_ops if op.op_type == "add_into"]
@@ -848,9 +852,10 @@ def test_within_layer_freeing_surfaces_freshly_dead_intermediate():
 # ---------------------------------------------------------------------------
 # MLP-routed Adds (docs/plan_additional_mlp_routing.md)
 #
-# Under the default policy (local_in_attention="never") a fitting Add
-# resolves to MLP_ADD; the walk carries it into the MLP phase and derives
-# fresh/reused placement from the MLP phase-start snapshot.
+# Under an MLP-preferring Add policy (add_in_attention="never"; the
+# shipping default keeps Adds on attention) a fitting Add resolves to
+# MLP_ADD; the walk carries it into the MLP phase and derives fresh/reused
+# placement from the MLP phase-start snapshot.
 # ---------------------------------------------------------------------------
 
 
@@ -871,7 +876,7 @@ def test_mlp_add_reuses_dead_addend():
     rmap.allocate(b)
     computed = {pos, a, b}
 
-    scheduler = LayerScheduler(graph, D, D_HEAD, pos)
+    scheduler = LayerScheduler(graph, D, D_HEAD, pos, policy=MLP_ADD_POLICY)
     attn_ops, mlp_ops, _biased = scheduler.schedule_layer(rmap, computed)
 
     assert not [op for op in attn_ops if op.op_type in ("add_into", "compute_add")]
@@ -905,7 +910,7 @@ def test_mlp_add_fresh_allocates_columns():
     b_cols = rmap.allocate(b)
     computed = {pos, a, b}
 
-    scheduler = LayerScheduler(graph, D, D_HEAD, pos)
+    scheduler = LayerScheduler(graph, D, D_HEAD, pos, policy=MLP_ADD_POLICY)
     attn_ops, mlp_ops, _biased = scheduler.schedule_layer(rmap, computed)
 
     add_ops = [op for op in mlp_ops if op.op_type == "compute_add_bypass"]
@@ -932,7 +937,7 @@ def test_mlp_add_both_dead_selects_input0():
     rmap.allocate(b)
     computed = {pos, a, b}
 
-    scheduler = LayerScheduler(graph, D, D_HEAD, pos)
+    scheduler = LayerScheduler(graph, D, D_HEAD, pos, policy=MLP_ADD_POLICY)
     attn_ops, mlp_ops, _biased = scheduler.schedule_layer(rmap, computed)
 
     add_ops = [op for op in mlp_ops if op.op_type == "add_into_bypass"]
@@ -962,14 +967,12 @@ def test_attention_producer_feeds_mlp_add_same_layer():
     rmap.allocate(other)
     computed = {pos, v, other}
 
-    scheduler = LayerScheduler(graph, D, D_HEAD, pos)
+    scheduler = LayerScheduler(graph, D, D_HEAD, pos, policy=MLP_ADD_POLICY)
     attn_ops, mlp_ops, _biased = scheduler.schedule_layer(rmap, computed)
 
     assert [op for op in attn_ops if op.op_type == "compute_attn"]
     add_ops = [
-        op
-        for op in mlp_ops
-        if op.op_type in ("add_into_bypass", "compute_add_bypass")
+        op for op in mlp_ops if op.op_type in ("add_into_bypass", "compute_add_bypass")
     ]
     assert len(add_ops) == 1, "the Add must place in the same layer's MLP phase"
     # The attention output's only consumer is the Add, so it is dead at the
@@ -995,20 +998,16 @@ def test_mlp_producer_defers_mlp_add_to_next_layer():
     rmap.allocate(other)
     computed = {pos, x, other}
 
-    scheduler = LayerScheduler(graph, D, D_HEAD, pos)
+    scheduler = LayerScheduler(graph, D, D_HEAD, pos, policy=MLP_ADD_POLICY)
     attn_ops0, mlp_ops0, _ = scheduler.schedule_layer(rmap, computed)
     assert [op for op in mlp_ops0 if op.op_type == "compute_ffn"]
     assert not [
-        op
-        for op in mlp_ops0
-        if op.op_type in ("add_into_bypass", "compute_add_bypass")
+        op for op in mlp_ops0 if op.op_type in ("add_into_bypass", "compute_add_bypass")
     ]
 
     attn_ops1, mlp_ops1, _ = scheduler.schedule_layer(rmap, computed)
     assert [
-        op
-        for op in mlp_ops1
-        if op.op_type in ("add_into_bypass", "compute_add_bypass")
+        op for op in mlp_ops1 if op.op_type in ("add_into_bypass", "compute_add_bypass")
     ]
 
 
@@ -1031,7 +1030,7 @@ def test_same_layer_consumer_reusability_is_sublayer_aware():
     a_cols = rmap.allocate(a)
     rmap.allocate(b)
     computed = {pos, a, b}
-    scheduler = LayerScheduler(graph, D, D_HEAD, pos)
+    scheduler = LayerScheduler(graph, D, D_HEAD, pos, policy=MLP_ADD_POLICY)
     attn_ops, mlp_ops, _ = scheduler.schedule_layer(rmap, computed)
     add_ops = [op for op in mlp_ops if op.op_type == "add_into_bypass"]
     assert len(add_ops) == 1 and add_ops[0].reuse_input_index == 0
@@ -1052,12 +1051,10 @@ def test_same_layer_consumer_reusability_is_sublayer_aware():
     rmap2.allocate(a2)
     rmap2.allocate(b2)
     computed2 = {pos2, a2, b2}
-    scheduler2 = LayerScheduler(graph2, D, D_HEAD, pos2)
+    scheduler2 = LayerScheduler(graph2, D, D_HEAD, pos2, policy=MLP_ADD_POLICY)
     attn_ops2, mlp_ops2, _ = scheduler2.schedule_layer(rmap2, computed2)
     add_ops2 = [
-        op
-        for op in mlp_ops2
-        if op.op_type in ("add_into_bypass", "compute_add_bypass")
+        op for op in mlp_ops2 if op.op_type in ("add_into_bypass", "compute_add_bypass")
     ]
     assert len(add_ops2) == 1
     assert add_ops2[0].op_type == "compute_add_bypass"
@@ -1068,9 +1065,7 @@ def test_mlp_add_slot_exhaustion_defers_without_spilling():
     """When a layer's hidden slots cannot hold a second MLP Add, it defers
     to the next layer and never spills to attention."""
     pos = _make_reserved_block()
-    inputs = [
-        InputNode(f"i{k}", 4, value_range=(-100.0, 100.0)) for k in range(4)
-    ]
+    inputs = [InputNode(f"i{k}", 4, value_range=(-100.0, 100.0)) for k in range(4)]
     add_a = Add(inputs[0], inputs[1], name="add_a")
     add_b = Add(inputs[2], inputs[3], name="add_b")
     out = Concatenate([add_a, add_b])
@@ -1083,7 +1078,9 @@ def test_mlp_add_slot_exhaustion_defers_without_spilling():
     computed = {pos, *inputs}
 
     # Each reused Add needs 2*4 = 8 slots; d_hidden=12 holds only one.
-    scheduler = LayerScheduler(graph, D, D_HEAD, pos, d_hidden=12)
+    scheduler = LayerScheduler(
+        graph, D, D_HEAD, pos, d_hidden=12, policy=MLP_ADD_POLICY
+    )
     attn_ops0, mlp_ops0, _ = scheduler.schedule_layer(rmap, computed)
     placed0 = [op for op in mlp_ops0 if op.op_type == "add_into_bypass"]
     assert len(placed0) == 1
@@ -1113,7 +1110,7 @@ def test_mlp_add_live_source_not_cancelled_same_layer():
     rmap.allocate(a)
     computed = {pos, x, a}
 
-    scheduler = LayerScheduler(graph, D, D_HEAD, pos)
+    scheduler = LayerScheduler(graph, D, D_HEAD, pos, policy=MLP_ADD_POLICY)
     # Layer 0: lin places (MLP bypass under the default policy).
     scheduler.schedule_layer(rmap, computed)
     assert lin in computed and rmap.is_allocated(lin)
@@ -1124,10 +1121,7 @@ def test_mlp_add_live_source_not_cancelled_same_layer():
     add_ops = [op for op in mlp_ops if op.op_type == "add_into_bypass"]
     assert len(add_ops) == 1 and add_ops[0].reuse_input_index == 0
     cancel_cols = {
-        c
-        for op in mlp_ops
-        if op.op_type == "cancel_bypass"
-        for c in op.target_cols
+        c for op in mlp_ops if op.op_type == "cancel_bypass" for c in op.target_cols
     }
     assert not (cancel_cols & lin_cols), (
         "the live source of an add_into_bypass must not be cancelled in the "

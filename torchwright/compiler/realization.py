@@ -159,15 +159,21 @@ def static_flex_class(node: Node, policy: SchedulingPolicy, usable_slots: int) -
 
     Capacity is checked before policy.  A node too wide for its MLP family
     (:func:`fits_mlp`) has exactly one realization left, so it goes to its
-    attention family whatever ``local_in_attention`` says; routing it to a
-    sublayer that cannot hold it deadlocks the eager walk and makes the
-    CP-SAT model infeasible.  Otherwise the policy decides: attention
-    unless ``local_in_attention == "never"``.
+    attention family whatever the policy says; routing it to a sublayer
+    that cannot hold it deadlocks the eager walk and makes the CP-SAT
+    model infeasible.  Otherwise the node's own knob decides — Adds read
+    ``policy.add_in_attention``, standalone Linears read
+    ``policy.local_in_attention`` (the two default to opposite sides; see
+    :class:`SchedulingPolicy`): attention unless the knob says
+    ``"never"``.
     """
     attn_cls, mlp_cls = flex_route_classes(node)
     if not fits_mlp(node, usable_slots):
         return attn_cls
-    if policy.local_in_attention != "never":
+    knob = (
+        policy.add_in_attention if isinstance(node, Add) else policy.local_in_attention
+    )
+    if knob != "never":
         return attn_cls
     return mlp_cls
 
@@ -463,10 +469,10 @@ class RealizationTable:
         """The optimize=0 resolver: :func:`static_flex_class` picks every free
         choice.
 
-        ``policy.local_in_attention == "never"`` routes flexible nodes
-        (standalone Linears, Adds) to their MLP families and anything else
-        to their attention families — except that a node too wide for a
-        layer's usable hidden pool (``usable_slots``, from
+        :func:`static_flex_class` applies each flexible node's own knob
+        (``policy.local_in_attention`` for standalone Linears,
+        ``policy.add_in_attention`` for Adds) — except that a node too
+        wide for a layer's usable hidden pool (``usable_slots``, from
         :func:`usable_hidden_slots`) has no MLP realization and goes to
         attention regardless.
 

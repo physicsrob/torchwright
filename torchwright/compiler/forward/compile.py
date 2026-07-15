@@ -1133,9 +1133,11 @@ def forward_compile(
             Defaults to ``Costs()`` (alpha=1, beta=0, gamma=0 — pure
             layer minimization).  Ignored when ``optimize=0``.
         cpsat_flex_routing: When True (default), CP-SAT picks
-            attention vs MLP-bypass for each standalone ``Linear``.
-            When False, ``policy.local_in_attention`` pins routing.
-            Ignored when ``optimize=0``.
+            attention vs MLP for each standalone ``Linear`` and each
+            fitting ``Add``.  When False, the static policy pins routing
+            (``policy.local_in_attention`` for Linears,
+            ``policy.add_in_attention`` for Adds).  Ignored when
+            ``optimize=0``.
         require_solver: When True and ``optimize>0``, raise
             ``RuntimeError`` if CP-SAT returns no usable assignment
             instead of silently falling back to the heuristic.  Use it

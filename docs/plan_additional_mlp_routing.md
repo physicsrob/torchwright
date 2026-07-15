@@ -4,10 +4,14 @@
 
 Implemented 2026-07-14 on branch `mlp-add-routing` (five commits, one per
 implementation step).  The default-flip measurement below ran on the
-example graphs via `scripts/measure_add_routing_flip.py`; the DOOM
-flagship measurement is the remaining gate item before the umbrella
-pointer moves (it lives in torchwright_doom and is a separately budgeted
-Modal run).
+example graphs via `scripts/measure_add_routing_flip.py` and hit the
+material-regression gate at `optimize=0`; the fallback was adopted the
+same day — Adds keep an attention-preferring static default
+(`SchedulingPolicy.add_in_attention="always"`) while CP-SAT flex routing
+keeps the per-node MLP choice (see *Policy and compatibility decision*
+for the numbers and mechanism).  The DOOM flagship measurement is the
+remaining gate item before the umbrella pointer moves (it lives in
+torchwright_doom and is a separately budgeted Modal run).
 
 Revised 2026-07-14 against the worktree-tied landing (tied embeddings / the
 held output bank, atomic attention replay, and the ungated `optimize=0`
@@ -378,19 +382,22 @@ flexible node is a `Linear`:
    that pins a direct-handoff Linear to `ATTN_TRANSPORT`.
 2. Compute the candidate MLP slot demand.
 3. Pin to attention if the complete MLP operation cannot fit in a layer.
-4. Otherwise apply `policy.local_in_attention`.
+4. Otherwise apply `policy.add_in_attention` — Adds carry their own knob
+   (the adopted fallback; see *Policy and compatibility decision*), while
+   `local_in_attention` keeps its standalone-Linear scope.
 
-Under `local_in_attention="always"`, fitting Adds remain on attention. Under
-`local_in_attention="never"`, fitting Adds use MLP. `LEGACY_POLICY` therefore
-preserves the existing attention-only Add behavior on the heuristic/static
-path. The CP-SAT compatibility contract is stated separately below because
+Under `add_in_attention="always"` (the shipping default), fitting Adds
+remain on attention. Under `add_in_attention="never"`, fitting Adds use
+MLP. `LEGACY_POLICY` sets both knobs to `"always"` and therefore preserves
+the existing attention-only behavior on the heuristic/static path. The
+CP-SAT compatibility contract is stated separately below because
 `flex_routing=True` intentionally overrides static policy choices.
 
 ### CP-SAT routing
 
 Under `flex_routing=True`, a structurally fitting Add receives the same
-`is_attn` decision variable as a flexible standalone Linear. Static
-`local_in_attention` policy does not pin that variable. If `2 * w` exceeds
+`is_attn` decision variable as a flexible standalone Linear. The static
+policy (either knob) does not pin that variable. If `2 * w` exceeds
 usable MLP capacity, constrain `is_attn == 1` instead of presenting an
 infeasible MLP mode to the solver. A held-target Add is not flex-eligible:
 its `is_attn == 1` pin stays posted under `flex_routing=True`, and its
@@ -964,6 +971,30 @@ Recommended decision:
 - Update schedule-count tests that intend to test the default policy.
 - Change tests that intend to pin historical placement to pass
   `LEGACY_POLICY` explicitly and, on CP-SAT paths, disable flex routing.
+
+**Decision (2026-07-14).** The measurement ran
+(`scripts/measure_add_routing_flip.py`, cold schedule cache, against a
+main-worktree baseline) and hit the material-regression gate: at
+`optimize=0` the static MLP default cost calculator +5 layers (26→31)
+and fibonacci +1 (9→10), with zero depth or solve-time change at
+`optimize>=1` (the solver keeps calculator's five Adds on attention and
+moves fibonacci's two to MLP at equal depth). Mechanism, verified against
+the actual schedules: an attention-routed Add rides the attention
+sublayer that sits idle between consecutive MLP sublayers — its output is
+readable by the same layer's MLP, so it adds zero depth to an
+MLP→Add→MLP chain — while an MLP-routed Add pays the mlp→mlp one-layer
+gap on both sides, one full layer per Add on the critical path. Every
+Add sat at its dependency-earliest layer in both schedules
+(dependency-limited, not capacity-limited).
+
+The flagged fallback was adopted: `SchedulingPolicy` gains
+`add_in_attention` defaulting to `"always"` (Adds attention-preferring on
+static paths) while `local_in_attention` keeps its standalone-Linear
+scope and `"never"` default, and CP-SAT flex routing retains the per-node
+Add choice. The documentation obligation above is discharged by the
+`SchedulingPolicy` docstring. The static MLP route stays reachable via
+`SchedulingPolicy(add_in_attention="never")` — the `opt0-addmlp`
+measurement row and the heuristic-path tests use it.
 
 This compatibility decision must be called out in the implementation change
 and release notes. `LEGACY_POLICY` preserves the historical attention Add

@@ -1,11 +1,14 @@
 """End-to-end MLP Add routing (docs/plan_additional_mlp_routing.md).
 
 Step 3 gate: ``optimize=0`` compiles representative reused and fresh Adds
-with zero Add heads under the MLP-preferring default policy, while
-``LEGACY_POLICY`` retains the attention Add operations.  Because every
-``optimize=0`` emission replays through the directed scheduler, these
-compiles exercise the directed MLP-Add placement, the observed-versus-
-derived tripwire, and the reused-target canonicalization on every run.
+with zero Add heads under an MLP-preferring Add policy
+(``add_in_attention="never"``), while the shipping default and
+``LEGACY_POLICY`` retain the attention Add operations (the static default
+keeps Adds on attention — see ``SchedulingPolicy.add_in_attention``).
+Because every ``optimize=0`` emission replays through the directed
+scheduler, these compiles exercise the directed MLP-Add placement, the
+observed-versus-derived tripwire, and the reused-target canonicalization
+on every run.
 """
 
 import pytest
@@ -14,7 +17,10 @@ import torch
 from torchwright.compiler.export import compile_headless
 from torchwright.compiler.forward.compile import forward_compile
 from torchwright.compiler.forward.cpsat_scheduler import ScheduleAssignment
-from torchwright.compiler.forward.scheduling_policy import LEGACY_POLICY
+from torchwright.compiler.forward.scheduling_policy import (
+    LEGACY_POLICY,
+    SchedulingPolicy,
+)
 from torchwright.debug.probe import probe_compiled
 from torchwright.graph import Add, Concatenate, Linear
 from torchwright.ops.inout_nodes import create_input
@@ -66,9 +72,12 @@ def _op_types(plan):
     return attn, mlp
 
 
-def test_default_policy_routes_adds_to_mlp_with_zero_add_heads():
+MLP_ADD_POLICY = SchedulingPolicy(add_in_attention="never")
+
+
+def test_mlp_add_policy_routes_adds_to_mlp_with_zero_add_heads():
     out, x, add_reuse, add_fresh = _mixed_add_graph()
-    net, plan = _capture_plan(output_node=out)
+    net, plan = _capture_plan(output_node=out, policy=MLP_ADD_POLICY)
 
     attn_types, mlp_types = _op_types(plan)
     assert "add_into" not in attn_types and "compute_add" not in attn_types
@@ -95,9 +104,18 @@ def test_default_policy_routes_adds_to_mlp_with_zero_add_heads():
     assert x_id not in assignment.node_to_cancel_mech
 
 
-def test_legacy_policy_retains_attention_add_ops():
+@pytest.mark.parametrize(
+    "policy",
+    [None, LEGACY_POLICY],
+    ids=["default", "legacy"],
+)
+def test_default_and_legacy_policies_retain_attention_add_ops(policy):
+    """The shipping default keeps Adds on attention (the 2026-07-14 fallback
+    decision: a static MLP default costs one layer per Add wedged between
+    MLP-sublayer ops), as does LEGACY_POLICY."""
     out, *_ = _mixed_add_graph()
-    net, plan = _capture_plan(output_node=out, policy=LEGACY_POLICY)
+    kwargs = {} if policy is None else {"policy": policy}
+    net, plan = _capture_plan(output_node=out, **kwargs)
 
     attn_types, mlp_types = _op_types(plan)
     assert "add_into" in attn_types
@@ -112,7 +130,9 @@ def test_mlp_routed_adds_match_compute():
     coverage of the writers lives in test_weight_writer.py; the machine
     here is whatever the default compile selects.)"""
     out, *_ = _mixed_add_graph()
-    compiled = compile_headless(out, d=D, d_head=D_HEAD, d_hidden=64)
+    compiled = compile_headless(
+        out, d=D, d_head=D_HEAD, d_hidden=64, policy=MLP_ADD_POLICY
+    )
     torch.manual_seed(1)
     values = {
         "x": torch.rand(3, 4) * 2 - 1,

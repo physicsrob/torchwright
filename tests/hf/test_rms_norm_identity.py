@@ -61,10 +61,12 @@ def _compile(rms_norm: bool) -> str:
         # on the swish machine carry a schedule-dependent fp32 bypass
         # residue (~2^-41 on near-zero lanes), and the norm's pinned-column
         # reservation makes the two scheduling problems differ — so pin the
-        # historical attention Add routing here.  This test certifies the
-        # NORM; the MLP Add path has its own oracle-parity coverage
-        # (tests/compile/forward/test_mlp_add_routing.py and the HF parity
-        # suite).
+        # attention Add routing here.  (The shipping default also keeps
+        # Adds on attention; the pin makes this test's precondition
+        # explicit rather than inherited from a default.)  This test
+        # certifies the NORM; the MLP Add path has its own oracle-parity
+        # coverage (tests/compile/forward/test_mlp_add_routing.py and the
+        # HF parity suite).
         policy=LEGACY_POLICY,
     )
     return art.path

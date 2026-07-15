@@ -1309,10 +1309,11 @@ def compile_to_onnx(
     flattened attention width and may differ from ``d``.
 
     ``policy`` threads the scheduling policy to ``forward_compile``
-    (default: ``SchedulingPolicy()``).  Position-local ops — standalone
-    Linears and Adds — route to MLP under the default and to attention
-    under ``LEGACY_POLICY``; on ``optimize>0`` paths the solver's flex
-    routing overrides the static choice for eligible nodes.
+    (default: ``SchedulingPolicy()``).  Under the default, standalone
+    Linears route to MLP and Adds to attention; ``LEGACY_POLICY`` puts
+    both on attention, ``SchedulingPolicy(add_in_attention="never")``
+    both on MLP.  On ``optimize>0`` paths the solver's flex routing
+    overrides the static choice for eligible nodes.
 
     Writes three files:
         ``<output_path>``     — the ONNX model
@@ -2275,6 +2276,7 @@ def compile_headless(
     optimize: int = 0,
     bias: bool = True,
     output_layout_source: Optional[Node] = None,
+    policy: Optional[SchedulingPolicy] = None,
 ) -> CompiledHeadless:
     """Compile a graph to an in-process callable.
 
@@ -2295,10 +2297,11 @@ def compile_headless(
     ``d // d_head``; pass it explicitly to decouple the flattened attention
     width ``n_heads * d_head`` from ``d``.
 
-    ``optimize``, ``bias``, and ``output_layout_source`` thread straight to
-    ``forward_compile`` (same meaning as on :func:`compile_to_onnx`) — so
-    this in-process debug backend can reproduce a production ``optimize=2``
-    / ``bias=False`` schedule exactly.  ``compile_to_onnx`` always compiles
+    ``optimize``, ``bias``, ``output_layout_source``, and ``policy``
+    thread straight to ``forward_compile`` (same meaning as on
+    :func:`compile_to_onnx`) — so this in-process debug backend can
+    reproduce a production ``optimize=2`` / ``bias=False`` schedule
+    exactly.  ``compile_to_onnx`` always compiles
     with ``output_layout_source=<the graph's Embedding>`` (the tied
     token.v6 held-bank contract), so reproducing a token artifact's
     schedule requires passing the same Embedding here; leaving it ``None``
@@ -2333,6 +2336,7 @@ def compile_headless(
         optimize=optimize,
         bias=bias,
         output_layout_source=output_layout_source,
+        policy=policy,
     )
 
     assert net.residual_assignment is not None

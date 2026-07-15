@@ -793,9 +793,9 @@ def routing(
     without it raises rather than guessing a sublayer.
     """
     if has_flex_choice(node):
-        # Standalone Linear: the policy pins the sublayer here, subject to
-        # the MLP-bypass capacity check; with flex_routing=True the CP-SAT
-        # choice variable overrides this.
+        # Standalone Linear or Add: the policy pins the sublayer here
+        # (each node type's own knob), subject to the MLP capacity check;
+        # with flex_routing=True the CP-SAT choice variable overrides this.
         if usable_slots is None:
             raise ValueError(
                 f"routing() needs the layer's usable hidden-slot count to "
@@ -3035,8 +3035,10 @@ def solve_schedule(
             ``d // d_head``.
         costs: objective weights. See :class:`Costs`.
         flex_routing: if True, CP-SAT picks attention vs MLP for each
-            standalone ``Linear``.  If False, standalone Linears use
-            the static routing dictated by ``policy.local_in_attention``.
+            standalone ``Linear`` and each fitting ``Add``.  If False,
+            they use the static routing dictated by the policy
+            (``policy.local_in_attention`` for Linears,
+            ``policy.add_in_attention`` for Adds).
         time_budget_s: per-solve wall-clock cap.
         max_layers: search horizon.  Should be at least the heuristic's
             layer count.

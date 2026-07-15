@@ -178,9 +178,10 @@ What it overrides:
 - **Ready filter.** Only nodes with `assignment.node_to_layer[n] ==
   current_layer` are eligible to schedule this layer. Nodes whose
   layer has not arrived yet stay deferred.
-- **Routing.** Each `Linear` is forced into the attention sublayer or
-  the MLP bypass per `assignment.node_to_routing[n]`. The
-  `policy.local_in_attention` setting is ignored.
+- **Routing.** Each standalone `Linear` and each `Add` is forced into
+  the attention sublayer or the MLP bypass per
+  `assignment.node_to_routing[n]`. The static policy knobs
+  (`local_in_attention`, `add_in_attention`) are ignored.
 - **Cancellation.** At each layer `L`, cancels are queued for every
   node where `assignment.node_to_cancel_layer[n] == L`. The
   heuristic's eager freeing of dead nodes is suppressed.
@@ -691,14 +692,15 @@ sublayer choice (attention versus MLP-bypass) is a CP-SAT decision
 variable rather than fixed by the policy.
 
 When `True` (the default), each standalone `Linear` (a `Linear`
-outside any chain) gets its own `is_attn` decision variable and the
-solver picks attention versus MLP per node. When `False`, standalone
-Linears are pinned by `realization.static_flex_class` — normally per
-`policy.local_in_attention`, except that a Linear whose MLP-bypass
-demand (`2 * d_output` hidden slots) exceeds a layer's usable hidden
-pool has no MLP realization at all and is pinned to attention
-regardless — and only the placement and cancellation decisions are
-optimized.  That capacity check is what the eager `resolve_static`
+outside any chain) and each fitting `Add` gets its own `is_attn`
+decision variable and the solver picks attention versus MLP per node.
+When `False`, they are pinned by `realization.static_flex_class` —
+normally per the node type's policy knob (`policy.local_in_attention`
+for Linears, `policy.add_in_attention` for Adds), except that a node
+whose MLP demand (`2 * d_output` hidden slots) exceeds a layer's
+usable hidden pool has no MLP realization at all and is pinned to
+attention regardless — and only the placement and cancellation
+decisions are optimized.  That capacity check is what the eager `resolve_static`
 applies too; if the two ever disagree, `resolve_from_assignment`
 raises `UnresolvedRealizationError`.
 

@@ -1,22 +1,25 @@
-"""Default-flip measurement for MLP Add routing (plan Step 5 gate).
+"""Static-routing measurement for MLP Add routing (plan Step 5 gate).
 
 docs/plan_additional_mlp_routing.md, *Policy and compatibility decision*:
-before the documented default (``local_in_attention="never"`` now applying
-to Adds, and Add flex-eligibility on CP-SAT paths) ships, compile the
-example graphs under the historical configuration and the new defaults and
-compare layer counts, structural outcomes, Add operation composition, and
-solve wall time.  A material regression is a stop-and-discuss, not a
-silent acceptance.
+the 2026-07-14 sweep of these configurations found a static MLP-Add
+default costs one layer per Add wedged between MLP-sublayer ops
+(calculator +5, fibonacci +1 at ``optimize=0``) while ``optimize>=1``
+is unaffected (flex routing decides per node) — so the shipping default
+keeps Adds on attention (``SchedulingPolicy.add_in_attention="always"``)
+and the ``opt0-addmlp`` row documents the known static cost.
 
 Configurations per graph (natural width):
 
-- ``opt0-legacy`` — ``optimize=0``, ``LEGACY_POLICY`` (historical
-  heuristic: attention Adds).
-- ``opt0-default`` — ``optimize=0``, default policy (Adds to MLP).
+- ``opt0-legacy`` — ``optimize=0``, ``LEGACY_POLICY`` (everything on
+  attention, the historical heuristic).
+- ``opt0-default`` — ``optimize=0``, default policy (Linears to MLP,
+  Adds to attention).
+- ``opt0-addmlp`` — ``optimize=0``, ``add_in_attention="never"``
+  (the rejected static MLP-Add default).
 - ``opt1-legacy`` — ``optimize=1``, ``LEGACY_POLICY`` +
   ``cpsat_flex_routing=False`` (the documented legacy CP-SAT pair).
 - ``opt1-default`` — ``optimize=1``, default policy + flex routing (the
-  new production configuration: Add routes are solver decisions).
+  production configuration: Add routes are solver decisions).
 
 Each run reports ``n_layers``, the schedule origin (heuristic / solver /
 fallback), wall time, and the realized Add-op mix read off the replay plan
@@ -157,6 +160,14 @@ def _run_config(out, d, d_head, *, optimize, policy, flex):
 _CONFIGS = [
     ("opt0-legacy", dict(optimize=0, policy=LEGACY_POLICY, flex=True)),
     ("opt0-default", dict(optimize=0, policy=None, flex=True)),
+    (
+        "opt0-addmlp",
+        dict(
+            optimize=0,
+            policy=SchedulingPolicy(add_in_attention="never"),
+            flex=True,
+        ),
+    ),
     ("opt1-legacy", dict(optimize=1, policy=LEGACY_POLICY, flex=False)),
     ("opt1-default", dict(optimize=1, policy=None, flex=True)),
 ]

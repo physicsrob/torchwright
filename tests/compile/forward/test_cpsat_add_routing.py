@@ -15,7 +15,10 @@ from torchwright.compiler.forward.cpsat_scheduler import (
     build_cpsat_model,
     _solve_built,
 )
-from torchwright.compiler.forward.scheduling_policy import LEGACY_POLICY
+from torchwright.compiler.forward.scheduling_policy import (
+    LEGACY_POLICY,
+    SchedulingPolicy,
+)
 from torchwright.debug.probe import probe_compiled
 from torchwright.compiler.export import compile_headless
 from torchwright.graph import Add, Concatenate, Linear
@@ -150,10 +153,20 @@ def test_low_head_geometry_feasible_via_mlp_adds():
 
 
 def test_low_head_geometry_feasible_via_mlp_adds_heuristic_path():
-    """Same geometry at optimize=0: the static default policy routes the
-    Add to MLP and the heuristic + directed replay compile it."""
+    """Same geometry at optimize=0: an MLP-preferring Add policy routes the
+    Add to MLP and the heuristic + directed replay compile it.  (The
+    shipping default keeps Adds on attention statically — at optimize=0
+    this geometry needs the explicit knob; at optimize>0 the solver's flex
+    routing rescues it regardless, per the test above.)"""
     out = _head_starved_graph()
-    compiled = compile_headless(out, d=D, d_head=D_HEAD, d_hidden=64, n_heads=1)
+    compiled = compile_headless(
+        out,
+        d=D,
+        d_head=D_HEAD,
+        d_hidden=64,
+        n_heads=1,
+        policy=SchedulingPolicy(add_in_attention="never"),
+    )
     torch.manual_seed(3)
     inputs = {"a": torch.rand(3, 8) * 2 - 1}
     report = probe_compiled(compiled, out, inputs, n_pos=3, atol=1e-3)
