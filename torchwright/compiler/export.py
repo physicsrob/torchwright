@@ -56,6 +56,7 @@ from torchwright.compiler.forward.compile import (
     forward_compile,
     rms_norm_width_supported,
 )
+from torchwright.compiler.forward.scheduling_policy import SchedulingPolicy
 from torchwright.compiler.token_model import (
     CompileHeader,
     CompileProfile,
@@ -1289,6 +1290,7 @@ def compile_to_onnx(
     bias: bool = True,
     profile: Optional[Union[CompileProfile, str]] = None,
     n_heads: Optional[int] = None,
+    policy: Optional[SchedulingPolicy] = None,
     _solver_seed: Optional[int] = None,
     _force_resolve: bool = False,
 ) -> OnnxArtifact:
@@ -1305,6 +1307,12 @@ def compile_to_onnx(
     ``n_heads`` is the attention-head capacity of each compiled layer. It
     defaults to ``d // d_head``. When explicit, ``n_heads * d_head`` is the
     flattened attention width and may differ from ``d``.
+
+    ``policy`` threads the scheduling policy to ``forward_compile``
+    (default: ``SchedulingPolicy()``).  Position-local ops — standalone
+    Linears and Adds — route to MLP under the default and to attention
+    under ``LEGACY_POLICY``; on ``optimize>0`` paths the solver's flex
+    routing overrides the static choice for eligible nodes.
 
     Writes three files:
         ``<output_path>``     — the ONNX model
@@ -1452,6 +1460,7 @@ def compile_to_onnx(
         output_layout_source=embedding,
         machine=machine,
         d_hidden=d_hidden,
+        policy=policy,
         # Measurement-only (§0): reproducible descent seed + fresh-solve for
         # the sound production draw.  Never set in production configs.
         _solver_seed=_solver_seed,

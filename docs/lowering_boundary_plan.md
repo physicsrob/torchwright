@@ -248,17 +248,18 @@ Three constraints rev 1 left implicit:
 - **Cache compatibility.** `node_to_routing` is serialized in the schedule
   cache. The promoted table keeps that serialized shape, or the cache key
   is bumped in the same commit.
-- **Conditional ≠ unresolved.** Add's entry is an explicit conditional —
-  "`residual_reuse` if the addend is dead at schedule time, else
-  `attn_copy`". Deadness depends on layer assignment, which is exactly what
-  the solve co-decides (via reified consumer-ordering booleans) and what
-  the eager walk discovers as it goes. A conditional entry encodes a
-  *predicate on schedule state*; it can represent a choice the schedule
-  determines, but it cannot resolve a *free* choice — which is one reason
-  op-site candidates don't fit this table (see below).
+- **Placement is scheduler state, not a class.** (Historical note: Add's
+  entry used to be an explicit *conditional* — "`residual_reuse` if the
+  addend is dead at schedule time, else `attn_copy`".
+  docs/plan_additional_mlp_routing.md retired that state: Add now resolves
+  to a route family (`ATTN_ADD`/`MLP_ADD`) before the walk like any flex
+  node, and the reused-versus-fresh residual placement — the schedule-state
+  predicate the conditional entry used to encode — lives in the scheduler,
+  the per-occurrence CP-SAT literals, and the shared assignment-level
+  derivation `add_placement.derive_add_placement`.)
 
-A completeness check runs before the walk: every entry resolved or
-explicitly conditional. And because the table plus each class's resource
+A completeness check runs before the walk: every entry resolved. And
+because the table plus each class's resource
 signature determine hardware demand, `LoweredGraph.cost_summary()` — heads
 by class, bypass slot demand, lane counts — is readable *before*
 scheduling: the compile-metrics tuple stops being something only a finished
@@ -340,8 +341,10 @@ and it stays the operating mode.
   upstream of `lower()`. Its decisions are visible in the lowered graph (a
   folded Linear simply isn't there), which is enough.
 - **Hoisting Add's deadness decision out of the scheduler.** Impossible
-  without also hoisting layer assignment; the conditional entry is the
-  honest representation.
+  without also hoisting layer assignment; deadness stays a placement
+  predicate evaluated against the schedule (walker snapshots, CP-SAT
+  reified literals, and the assignment-level derivation — one rule in
+  three implementations, tripwired to agree).
 - **Op-site candidate machinery, until the trigger above fires.**
 
 ## Sequencing

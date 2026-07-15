@@ -2,7 +2,12 @@
 
 ## Status
 
-Proposed implementation plan. No code in this plan has been implemented yet.
+Implemented 2026-07-14 on branch `mlp-add-routing` (five commits, one per
+implementation step).  The default-flip measurement below ran on the
+example graphs via `scripts/measure_add_routing_flip.py`; the DOOM
+flagship measurement is the remaining gate item before the umbrella
+pointer moves (it lives in torchwright_doom and is a separately budgeted
+Modal run).
 
 Revised 2026-07-14 against the worktree-tied landing (tied embeddings / the
 held output bank, atomic attention replay, and the ungated `optimize=0`

@@ -219,7 +219,12 @@ Validate before allocating or solving:
 
 For a direct dependency:
 
-- `Attn` and `Add` targets are already attention operations;
+- an `Attn` target is already an attention operation;
+- an `Add` target is forced to `ATTN_ADD` (fresh placement) in both the
+  static resolver's forced classes and the CP-SAT routing pin — and, since
+  docs/plan_additional_mlp_routing.md made Adds flex-routable, that forcing
+  applies to an INDIRECT held-target Add too, under every policy and flex
+  configuration (there is no MLP-phase bank-claim executor);
 - a flex `Linear` target is forced to `ATTN_TRANSPORT` in both the static
   resolver and CP-SAT;
 - an MLP-only target such as an `FFN` fails early with a message explaining

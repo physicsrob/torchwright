@@ -225,24 +225,50 @@ Per schedulable node `n`:
   head with the routing-aware bound. See *Resource cumulatives →
   Within-layer reuse* for the mechanism and the `[layer, cancel + 1)`
   occupancy it implies.
-- `is_attn[n]` — boolean. Pinned to 1 for `Attn` and `Add`. Pinned to
-  0 for `LiteralValue` and `FFN` (the `FFN` composite always runs in the
-  MLP sublayer). For standalone `Linear` nodes the value is free under
-  `flex_routing=True` and pinned per `policy` under `flex_routing=False`
-  — the standalone `Linear` is the only flex-routed node. (The retired
-  chain model also had a flex "non-exclusive `L1`"; see the §2 historical
-  note.)
+- `is_attn[n]` — boolean. Pinned to 1 for `Attn`. Pinned to 0 for
+  `LiteralValue` and `FFN` (the `FFN` composite always runs in the MLP
+  sublayer). For standalone `Linear` and `Add` nodes the value is free
+  under `flex_routing=True` and pinned per `policy` under
+  `flex_routing=False` (docs/plan_additional_mlp_routing.md) — except
+  that a flex node whose MLP demand (`2·d_output`) exceeds the usable
+  hidden pool is capacity-pinned to attention, and a tied compile's
+  held-target `Add` is pinned to attention under every configuration
+  (direct or indirect handoff — there is no MLP-phase bank-claim
+  executor). (The retired chain model also had a flex "non-exclusive
+  `L1`"; see the §2 historical note.)
 
-For each `Add` node `A`:
+For each `Add` node `A` (docs/plan_additional_mlp_routing.md,
+*Route-aware reusable placement*):
 
-- `is_free[A]` — derived boolean (not a free decision variable).
-  `is_free[A]` is the OR over `A`'s addends `E` of "every other
-  consumer of `E` finishes strictly before `layer_var[A]`," each
-  consumer comparison itself reified into a `before[E, C, A]`
-  boolean. An addend that is a `Concatenate`, an input/`LiteralValue`
-  pinned node, or has any consumer outside the schedulable set
-  (terminal `Concatenate`) is forced not-dead, matching
-  `LayerScheduler._is_dead_for_add`.
+- `reusable_i[A]` (`i ∈ {0, 1}`, on `BuiltModel.add_reusable`) — derived
+  boolean per addend occurrence, reifying the sublayer-order deadness
+  predicate: every OTHER effective consumer `C` of the occurrence
+  satisfies `layer[C] < layer[A]`, or `layer[C] == layer[A]` with `C`
+  attention-routed and `A` MLP-routed (a same-layer attention consumer
+  is complete by the MLP phase-start snapshot).  An occurrence that is a
+  `Concatenate` or the held source, or that has an unordered effective
+  consumer (terminal `Concatenate` / non-schedulable), is forced
+  not-reusable.  Preallocated graph inputs ARE legitimate reuse targets
+  (they own residual columns; ownership transfers by `reassign`).
+  Matches `LayerScheduler._is_dead_for_add` at the MLP phase-start
+  snapshot and the assignment-level
+  `add_placement.derive_add_placement`.
+- `reuse_i[A]` (on `BuiltModel.add_reuse`) — the deterministic target
+  selector, never a solver choice: `reuse_0 = reusable_0`,
+  `reuse_1 = ¬reusable_0 ∧ reusable_1`.  For `add(x, x)` both
+  occurrences share one `reusable` literal and occurrence 0 wins.
+- `is_free[A]` — `reusable_0 ∨ reusable_1`.  The held target's
+  `is_free` is pinned 0 WITHOUT the deadness biconditional (the 32983b0
+  contract), and it gets no per-occurrence literals.
+- `reused_as_target[E]` — OR of the selectors naming old value `E`,
+  with an `AddAtMostOne` guard (one residual owner is reassigned at
+  most once).  Under it the value is an ownership handoff: its cancel
+  equals the virtual `layer[A] + 1` (no physical cancel interval, no
+  death-cancel charge, `cancel_in_mlp` forced to the canonical
+  attention side, parked forced false in the unpinned model).
+  Solution extraction recomputes all of these from the extracted
+  layers/routes and asserts equality before the literals are
+  discarded.
 
 The `FFN` composite (defined in §2) is a single node with one
 `layer_var`, scheduled in the MLP sublayer of its layer; there is no
@@ -288,14 +314,16 @@ layer.
   an optional unit-width interval at `layer_var[n]` gated by
   `is_attn[n]`. Demand `heads_for(n) · d_head` (the column footprint
   of those heads).
-- For each `Add` node `A` (always attention-routed): two optional
-  unit-width intervals at `layer_var[A]`. The free-add interval is
-  gated by `is_free[A]` with demand `heads_for(A) · d_head`; the
-  compute-add interval is gated by `is_free[A].Not()` with demand
-  `2 · heads_for(A) · d_head` (compute-add copies both addends into
-  fresh columns, so it costs roughly twice the free-add heads). The
-  two intervals are mutually exclusive — exactly one is active at
-  `layer_var[A]`.
+- For each `Add` node `A`: two optional unit-width intervals at
+  `layer_var[A]`, each ALSO gated by `is_attn[A]`.  The reused-placement
+  interval is present under `is_attn[A] ∧ is_free[A]` with demand
+  `heads_for(A) · d_head`; the fresh-placement interval under
+  `is_attn[A] ∧ ¬is_free[A]` with demand `2 · heads_for(A) · d_head`
+  (fresh placement copies both addends into fresh columns, so it costs
+  roughly twice the reused heads).  At most one is active; an
+  MLP-routed Add charges no heads at all — its `2·d_output` hidden
+  slots ride the MLP-slot cumulative via `slots_for`, same demand for
+  reused and fresh placement.
 - For each non-pinned residual-using schedulable node `n`: a
   unit-width DEATH-layer cancel interval at `cancel_layer[n]`,
   demand `len(n)` columns.
@@ -447,23 +475,31 @@ the end to `[layer, cancel)` for a lower bound, and compare layer
 counts); `scripts/intralayer_example_sweep.py` runs that measurement.
 
 **Known optimality gap #2 — the live-addend gap-1 bound.**  An `Add`
-consumer bounds its addends' cancels at `layer[A] + is_free[A]`,
-unconditionally of cancel mechanism.  For the **dead** addend of a free
-add the `+1` is genuine occupancy: its columns rebirth into the Add via
-`reassign`, so the interval must run through the Add's layer.  For the
+consumer bounds an ordinary source's cancel via two mechanism-specific
+terms: attention-mech `layer[A] + (is_free[A] ∨ ¬is_attn[A])` and
+MLP-mech `layer[A] + is_free[A]`.  The `¬is_attn` part is a
+*correctness* bound, not this gap: an MLP-routed Add reads after the
+attention sublayer's cancel would fire, so its source can never be
+attention-cancelled in the Add's own layer.  For the **selected
+target** of a reuse the `+1` is genuine occupancy: its columns rebirth
+into the Add via `reassign`, so the interval must run through the Add's
+layer (the selector posts the exact `layer[A] + 1` handoff).  For the
 **live** addend it is a conservatism: the value is only *read* by the
-add_into copy, and a same-layer cancel-after-read is physically the same
-transition every other attention read tolerates — but the eager
-scheduler excludes add_into live addends from same-layer cancels (the
-`add_into_live_addends` filters, honored by every cancel path including
+reuse copy, and a same-layer cancel-after-read is physically the same
+transition every other read of that sublayer tolerates — but the eager
+scheduler excludes reuse live sources from same-layer cancels on BOTH
+routes (the `add_into_live_addends` filters, extended to
+`add_into_bypass` live sources; honored by every cancel path including
 the held-bank handoff), and the model conservatively holds the live
-addend to the dead addend's bound to match.  Closing it would need the
-relaxed bound in the model **plus** the same-layer live-addend cancel in
-the heuristic and the directed replay — all or none.
+addend to the same bound to match.  Closing it would need the relaxed
+bound in the model **plus** the same-layer live-addend cancel in the
+heuristic and the directed replay — all or none.
 Bindingness-measurement recipe (same never-replay rule as gap #1):
 re-solve with the diagnostic-only
-`_disabled_families={"add_live_addend_gap"}` relaxation, which drops the
-term to `layer[A]` for a lower bound, and compare layer counts.
+`_disabled_families={"add_live_addend_gap"}` relaxation, which drops
+both terms to `layer[A]` for a lower bound (and skips the selector's
+handoff equality, which the lowered terms would contradict), and
+compare layer counts.
 
 **Atomic attention batch (the replay of this occupancy).**  The
 `[layer, cancel)` accounting for attention-cancel prices the layer as
@@ -501,9 +537,14 @@ Since 2026-07-10, every non-keep-forever node's `cancel_layer` is
 `solve_schedule`, and every model-build entry point).  Two
 `AddMaxEquality` aux vars per node mirror the lower bounds term for
 term — attention side `max(layer[n]+1, layer[c]+1−is_attn[c] per
-non-Add consumer, layer[A]+is_free[A] per Add consumer)`, MLP side the
-same with the non-Add term relaxed to the gap-0 `layer[c]` — and
+non-Add consumer, layer[A]+(is_free[A] ∨ ¬is_attn[A]) per Add
+consumer)`, MLP side the same with the non-Add term relaxed to the
+gap-0 `layer[c]` and the Add term to `layer[A]+is_free[A]` — and
 `cancel_layer` equals whichever the free `cancel_in_mlp[n]` selects.
+For a selected reuse target the attention pin evaluates to exactly the
+`layer[A]+1` handoff (the selecting Add's term dominates and
+`cancel_in_mlp` is forced 0), so the selector's equality is consistent
+with the pin.
 Freeable inputs pin to `max(1, layer[c]+1)`.  The `parked` booleans,
 the upper cancel window, and the hint-aware widening are not built:
 the model loses ~5,380 cancel decisions on the production DOOM graph
@@ -559,25 +600,31 @@ where:
 
 - `n_layers = max(layer_var) + 1`.
 - `total_attn_heads = Σ heads_for(n)` over attention-routed nodes.
-  For pinned-attention nodes this is a constant; for flex Linears
-  it depends on `is_attn[n]`.
+  For pinned-attention nodes this is a constant; for flex Linears it
+  depends on `is_attn[n]`; an Add contributes
+  `heads_for(A) · (is_attn[A] + (is_attn[A] ∧ ¬is_free[A]))` — zero
+  when MLP-routed, `1·h` reused, `2·h` fresh.
 - `total_mlp_bypass_slots = Σ 2 · n.d_output` over MLP-routed flex
-  Linears. Chain composite slots and standalone ReLU slots are
-  constants and therefore don't appear in the objective.
+  nodes (standalone Linears and Adds — Add slots belong to the same
+  bypass-slot cost, no new objective coefficient). Chain composite
+  slots and standalone ReLU slots are constants and therefore don't
+  appear in the objective.
 
 ### Model preconditions
 
-The heuristic `LayerScheduler` distinguishes two `Add` scheduling
-modes: **free_add** (one input is dead — the `Add` reuses the dead
-input's residual columns and only needs to copy the live input,
-costing `⌈len(n)/d_head⌉` heads) and **compute_add** (both inputs
-still alive, or one input is a `Concatenate` — the `Add` allocates
-fresh columns and copies both inputs, costing roughly twice that
-plus a dirty cancel for the fresh cols). The model encodes both
-regimes via a per-Add `is_free[A]` boolean derived from reified
-consumer-ordering booleans (see *Variables*), so the cumulative
-budget reflects the regime the heuristic will actually use at
-replay.
+The heuristic `LayerScheduler` distinguishes two `Add` residual
+placements per route: **reused** (one occurrence is dead at the
+placement snapshot — the `Add` takes that occurrence's residual
+columns via `reassign` and only reads the live occurrence:
+`add_into` on attention, `add_into_bypass` on MLP) and **fresh**
+(neither occurrence is reusable — fresh columns, both occurrences
+read: `compute_add` / `compute_add_bypass`). The model encodes
+placement via the per-occurrence `reusable_i`/`reuse_i` literals and
+their `is_free[A]` projection (see *Variables*), so the cumulative
+budgets reflect the operation the walk will actually emit at replay,
+and the deterministic input-0 target selection is shared by the
+heuristic, the model, and the directed replay
+(`add_placement.derive_add_placement`).
 
 The model is sound for graphs and configurations satisfying:
 
@@ -591,9 +638,15 @@ The model is sound for graphs and configurations satisfying:
   the model does not consider splitting it. (The retired chain model
   scheduled a `(L1, R, L2)` triple atomically — see the §2 historical
   note.)
-- Standalone `Linear` is the only flex-routing-eligible node type.
-  `Attn`, `Add`, `FFN`, and `LiteralValue` have routing fixed by their
-  type (`FFN` and `LiteralValue` to MLP, `Attn`/`Add` to attention).
+- Standalone `Linear` and `Add` are the flex-routing-eligible node
+  types (docs/plan_additional_mlp_routing.md). `Attn`, `FFN`, and
+  `LiteralValue` have routing fixed by their type (`FFN` and
+  `LiteralValue` to MLP, `Attn` to attention); a tied compile's
+  held-target `Add` is pinned to attention under every configuration.
+  The legacy attention-only Add configuration is
+  `policy=LEGACY_POLICY` with `cpsat_flex_routing=False` — the policy
+  alone cannot promise attention-only Adds while the solver is asked
+  to choose flexible routes.
 
 ## 4. API
 

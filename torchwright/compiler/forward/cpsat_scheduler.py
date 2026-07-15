@@ -830,13 +830,13 @@ def is_flex(node: Node, gm: GraphModel) -> bool:
 def heads_for(node: Node, d_head: int) -> int:
     """Heads consumed if attention-routed.
 
-    Mirrors `LayerScheduler._heads_*`. For `Add`, returns the free-
-    add unit count (`⌈d_out/d_head⌉` — one head per `d_head`-wide
+    Mirrors `LayerScheduler._heads_*`. For `Add`, returns the reused-
+    placement unit count (`⌈d_out/d_head⌉` — one head per `d_head`-wide
     chunk of the live addend, copied into the dead addend's cols);
-    the compute-add regime costs `2 ·` this. The CP-SAT model gates
-    free vs compute via a per-Add `is_free` boolean derived from
-    reified consumer-ordering booleans; see the helper inside
-    `solve_schedule` and `docs/cpsat_scheduler.md` §3.
+    fresh placement costs `2 ·` this and an MLP-routed Add costs no
+    heads at all. The model gates the two attention intervals on
+    `is_attn[A]` and the per-occurrence `is_free` projection; see
+    `docs/cpsat_scheduler.md` §3.
 
     A `Linear`'s charge is support-aware: one head per `d_head`-wide
     input chunk with any nonzero weight row, floor 1

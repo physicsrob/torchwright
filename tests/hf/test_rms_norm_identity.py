@@ -34,6 +34,7 @@ pytest.importorskip("transformers")
 pytest.importorskip("safetensors")
 
 from torchwright.compiler.export import compile_to_onnx
+from torchwright.compiler.forward.scheduling_policy import LEGACY_POLICY
 from torchwright.compiler.hf import compile_to_hf
 from torchwright.compiler.onnx_load import load_onnx
 
@@ -55,6 +56,16 @@ def _compile(rms_norm: bool) -> str:
         d=calculator_simple.D_MODEL,
         d_head=calculator_simple.D_HEAD,
         rms_norm=rms_norm,
+        # The bit-exact norm-on/norm-off comparison needs a value path that
+        # is bit-stable across the two compiles' layouts.  MLP-routed Adds
+        # on the swish machine carry a schedule-dependent fp32 bypass
+        # residue (~2^-41 on near-zero lanes), and the norm's pinned-column
+        # reservation makes the two scheduling problems differ — so pin the
+        # historical attention Add routing here.  This test certifies the
+        # NORM; the MLP Add path has its own oracle-parity coverage
+        # (tests/compile/forward/test_mlp_add_routing.py and the HF parity
+        # suite).
+        policy=LEGACY_POLICY,
     )
     return art.path
 
