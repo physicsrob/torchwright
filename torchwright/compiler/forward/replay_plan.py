@@ -49,6 +49,23 @@ def _freeze_node_indices(value, field_name: str, *, sort: bool) -> "NodeIndices"
     return tuple(frozen)
 
 
+def _check_reuse_input_index(op_type: str, index, reuse_op_types: tuple[str, ...]):
+    """A reuse operation carries exactly one valid target-occurrence index
+    (0 or 1); every fresh or unrelated operation carries None.  The index is
+    occurrence-level, not node-level — for ``add(x, x)`` both addends name
+    one node and only the index says which occurrence owns the reused
+    columns (docs/plan_additional_mlp_routing.md)."""
+    if op_type in reuse_op_types:
+        if index not in (0, 1):
+            raise ValueError(
+                f"{op_type} requires reuse_input_index 0 or 1, got {index!r}"
+            )
+    elif index is not None:
+        raise ValueError(
+            f"{op_type} must not carry a reuse_input_index (got {index!r})"
+        )
+
+
 @dataclass(frozen=True)
 class PlannedAttentionOp:
     op_type: Literal[
@@ -64,6 +81,11 @@ class PlannedAttentionOp:
     source_cols_b: Optional[tuple[int, ...]] = None
     q_source_cols: Optional[tuple[int, ...]] = None
     k_source_cols: Optional[tuple[int, ...]] = None
+    #: The reused target occurrence (0 or 1) of an ``add_into``; None on
+    #: every other op.  The attention writer does not read it — the physical
+    #: trace and the replay-plan validator preserve which input occurrence
+    #: was selected (node identity cannot express it for ``add(x, x)``).
+    reuse_input_index: Optional[int] = None
 
     def __post_init__(self) -> None:
         for name in (
@@ -86,6 +108,7 @@ class PlannedAttentionOp:
             raise ValueError(f"unknown planned attention op {self.op_type!r}")
         if self.node is not None and not isinstance(self.node, Node):
             raise TypeError("planned attention node must be a Node or None")
+        _check_reuse_input_index(self.op_type, self.reuse_input_index, ("add_into",))
 
     @classmethod
     def from_scheduler_op(cls, op) -> "PlannedAttentionOp":
@@ -100,6 +123,7 @@ class PlannedAttentionOp:
             freeze(op.source_cols_b),
             freeze(op.q_source_cols),
             freeze(op.k_source_cols),
+            reuse_input_index=op.reuse_input_index,
         )
 
     def emitted_heads(self, d_head: int) -> int:
@@ -133,6 +157,12 @@ class PlannedMlpOp:
         "compute_bias",
         "compute_linear_bypass",
         "cancel_bypass",
+        # MLP-routed Adds (docs/plan_additional_mlp_routing.md): the bypass
+        # lane pair adds the live addend into a reused dead addend's columns
+        # (add_into_bypass) or both addends into fresh columns
+        # (compute_add_bypass).
+        "add_into_bypass",
+        "compute_add_bypass",
         # v6 tied readout: zeroes the folded const-1 seed column on the
         # output's own layer (appended by _build_replay_plan, never by the
         # scheduler walk).
@@ -142,9 +172,16 @@ class PlannedMlpOp:
     target_cols: tuple[int, ...]
     mlp_slots: tuple[int, ...] = ()
     source_cols: Optional[tuple[int, ...]] = None
+    #: Second addend of ``compute_add_bypass``; None on every other op.
+    source_cols_b: Optional[tuple[int, ...]] = None
+    #: The reused target occurrence (0 or 1) of an ``add_into_bypass``; None
+    #: on every other op.  The live source occurrence is ``1 - index``; the
+    #: writer folds that occurrence's deferred bias and must not infer it
+    #: from node identity (``add(x, x)``) or post-reassignment ownership.
+    reuse_input_index: Optional[int] = None
 
     def __post_init__(self) -> None:
-        for name in ("target_cols", "mlp_slots", "source_cols"):
+        for name in ("target_cols", "mlp_slots", "source_cols", "source_cols_b"):
             value = getattr(self, name)
             if value is not None:
                 object.__setattr__(self, name, _freeze_ints(value, name))
@@ -154,11 +191,25 @@ class PlannedMlpOp:
             "compute_bias",
             "compute_linear_bypass",
             "cancel_bypass",
+            "add_into_bypass",
+            "compute_add_bypass",
             "clear_literal_seed",
         ):
             raise ValueError(f"unknown planned MLP op {self.op_type!r}")
         if self.node is not None and not isinstance(self.node, Node):
             raise TypeError("planned MLP node must be a Node or None")
+        _check_reuse_input_index(
+            self.op_type, self.reuse_input_index, ("add_into_bypass",)
+        )
+        if self.op_type == "compute_add_bypass":
+            if self.source_cols is None or self.source_cols_b is None:
+                raise ValueError(
+                    "compute_add_bypass requires source_cols and source_cols_b"
+                )
+        elif self.source_cols_b is not None:
+            raise ValueError(f"{self.op_type} must not carry source_cols_b")
+        if self.op_type == "add_into_bypass" and self.source_cols is None:
+            raise ValueError("add_into_bypass requires source_cols")
 
     @classmethod
     def from_scheduler_op(cls, op) -> "PlannedMlpOp":
@@ -168,13 +219,20 @@ class PlannedMlpOp:
             tuple(op.target_cols),
             tuple(op.mlp_slots),
             None if op.source_cols is None else tuple(op.source_cols),
+            None if op.source_cols_b is None else tuple(op.source_cols_b),
+            reuse_input_index=op.reuse_input_index,
         )
 
     @property
     def bypass_slot_count(self) -> int:
         # Production dominance uses realized physical pressure, including
         # cancellation bypass lanes that the CP-SAT estimate may omit.
-        if self.op_type not in ("compute_linear_bypass", "cancel_bypass"):
+        if self.op_type not in (
+            "compute_linear_bypass",
+            "cancel_bypass",
+            "add_into_bypass",
+            "compute_add_bypass",
+        ):
             return 0
         return len(self.mlp_slots)
 

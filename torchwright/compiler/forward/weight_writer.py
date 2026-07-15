@@ -177,6 +177,12 @@ def write_mlp_sublayer(
             )
         elif op.op_type == "cancel_bypass":
             _write_cancel_bypass(layer.mlp, op, recorder, bias_fold)
+        elif op.op_type == "add_into_bypass":
+            _write_add_into_bypass(layer.mlp, op, biased_linears, recorder, bias_fold)
+        elif op.op_type == "compute_add_bypass":
+            _write_compute_add_bypass(
+                layer.mlp, op, biased_linears, recorder, bias_fold
+            )
         elif op.op_type == "clear_literal_seed":
             _write_clear_literal_seed(layer.mlp, op, bias_fold)
         else:
@@ -1182,6 +1188,81 @@ def _write_bypass_lane_pair(
         recorder.add("mlp.W_out", node, op_type, neg_slots, out_idx, "diag")
 
 
+def _fold_deferred_source_bias(
+    mlp,
+    leaves: List[Node],
+    W: torch.Tensor,
+    mlp_slots,
+    biased_linears: Set[Node],
+    bias_fold: Optional[BiasFold],
+    *,
+    node: Optional[Node],
+    op_type: str,
+):
+    """Fold same-layer deferred attention-Linear biases into a bypass pair's
+    hidden-slot biases.
+
+    ``leaves`` is the flat source-leaf order the bypass pair reads (its
+    entries index ``W``'s rows by offset); a leaf in ``biased_linears`` was
+    born this layer in attention with its ``output_bias`` deferred to a
+    separate ``compute_bias``, so the pre-MLP residual the pair reads is
+    missing that bias — fold ``in_gain · (bias @ W[leaf rows])`` into the
+    positive slots and its negation into the negative slots.  A leaf
+    appearing k times folds k times (``add(x, x)`` contributes ``2·bias``).
+    """
+    if not biased_linears:
+        return
+    in_lin, _ = _mlp_in_out(mlp)
+    swish = mlp.activation == "swish"
+    in_gain = _SWISH_SCALE if swish else 1.0
+    d_output = len(mlp_slots) // 2
+    pos_slots = mlp_slots[:d_output]
+    neg_slots = mlp_slots[d_output:]
+    pos_slots_t = torch.as_tensor(pos_slots, dtype=torch.long)
+    neg_slots_t = torch.as_tensor(neg_slots, dtype=torch.long)
+    bias_dtype = in_lin.output_bias.dtype
+    offset = 0
+    for leaf in leaves:
+        if leaf in biased_linears:
+            assert isinstance(leaf, Linear)
+            # contrib[j] = in_gain * sum_i W[offset+i, j] * leaf.bias[i]
+            contrib = (
+                in_gain * (leaf.output_bias @ W[offset : offset + len(leaf), :])
+            ).to(bias_dtype)
+            if bias_fold is None:
+                in_lin.output_bias[pos_slots_t] += contrib
+                in_lin.output_bias[neg_slots_t] -= contrib
+            else:
+                bias_fold.hidden_bias(
+                    in_lin,
+                    "mlp.W_in",
+                    pos_slots,
+                    contrib,
+                    node=node,
+                    op_type=op_type,
+                    accumulate=True,
+                )
+                bias_fold.hidden_bias(
+                    in_lin,
+                    "mlp.W_in",
+                    neg_slots,
+                    -contrib,
+                    node=node,
+                    op_type=op_type,
+                    accumulate=True,
+                )
+        offset += len(leaf)
+
+
+def _flatten_input_leaves(input_node: Node) -> List[Node]:
+    """The flat leaf list a bypass pair's ``resolve_indices`` capture reads,
+    in column order — one entry per occurrence (a Concatenate holding the
+    same leaf twice yields it twice)."""
+    if isinstance(input_node, Concatenate):
+        return flatten_concat_nodes([input_node])
+    return [input_node]
+
+
 def _write_cancel_bypass(
     mlp,
     op: PlannedMlpOp,
@@ -1279,59 +1360,24 @@ def _write_compute_linear_bypass(
     )
 
     # Bias path (compute_linear-specific — cancel_bypass has no bias).
-    swish = mlp.activation == "swish"
-    in_gain = _SWISH_SCALE if swish else 1.0
-    pos_slots = mlp_slots[:d_output]
-    neg_slots = mlp_slots[d_output:]
-    pos_slots_t = torch.as_tensor(pos_slots, dtype=torch.long)
-    neg_slots_t = torch.as_tensor(neg_slots, dtype=torch.long)
-    out_idx_t = torch.as_tensor(out_idx, dtype=torch.long)
-
     # Fold deferred biased-Linear inputs into the input-side slot biases
     # (scaled with the gate rows; the up rows are zero, so no up-side fold).
     if biased_linears:
-        input_node = node.inputs[0]
-        leaves = (
-            flatten_concat_nodes([input_node])
-            if isinstance(input_node, Concatenate)
-            else [input_node]
+        _fold_deferred_source_bias(
+            mlp,
+            _flatten_input_leaves(node.inputs[0]),
+            W,
+            mlp_slots,
+            biased_linears,
+            bias_fold,
+            node=node,
+            op_type=op.op_type,
         )
-        bias_dtype = in_lin.output_bias.dtype
-        offset = 0
-        for leaf in leaves:
-            if leaf in biased_linears:
-                assert isinstance(leaf, Linear)
-                # contrib[j] = in_gain * sum_i W[offset+i, j] * leaf.bias[i]
-                contrib = (
-                    in_gain * (leaf.output_bias @ W[offset : offset + len(leaf), :])
-                ).to(bias_dtype)
-                if bias_fold is None:
-                    in_lin.output_bias[pos_slots_t] += contrib
-                    in_lin.output_bias[neg_slots_t] -= contrib
-                else:
-                    bias_fold.hidden_bias(
-                        in_lin,
-                        "mlp.W_in",
-                        pos_slots,
-                        contrib,
-                        node=node,
-                        op_type=op.op_type,
-                        accumulate=True,
-                    )
-                    bias_fold.hidden_bias(
-                        in_lin,
-                        "mlp.W_in",
-                        neg_slots,
-                        -contrib,
-                        node=node,
-                        op_type=op.op_type,
-                        accumulate=True,
-                    )
-            offset += len(leaf)
 
     # Output bias via the output-side projection's bias (or the constant lane).
     # The output-side value rows (±out_gain) and the placement records are
     # emitted by _write_bypass_lane_pair above.
+    out_idx_t = torch.as_tensor(out_idx, dtype=torch.long)
     if bias_fold is None:
         out_lin.output_bias[out_idx_t] += node.output_bias.to(target_dtype)
     else:
@@ -1342,4 +1388,124 @@ def _write_compute_linear_bypass(
             node=node,
             op_type=op.op_type,
             accumulate=True,
+        )
+
+
+def _write_add_into_bypass(
+    mlp,
+    op: PlannedMlpOp,
+    biased_linears: Optional[Set[Node]] = None,
+    recorder: Optional[PlacementRecorder] = None,
+    bias_fold: Optional[BiasFold] = None,
+):
+    """Add the live addend into a reused dead addend's columns from the MLP
+    sublayer via the bypass pair with ``W = I``.
+
+    The target columns are the dead addend's, reassigned to the Add; they
+    still hold the dead addend's value at MLP entry, and the pair's delta
+    adds the live addend, so the columns leave the sublayer holding
+    ``dead + live``.  ``op.reuse_input_index`` names the reused target
+    *occurrence*; the live source occurrence is ``1 - index`` and only that
+    occurrence's leaves fold a same-layer deferred Linear bias here — the
+    target occurrence's own bias arrives through its direct
+    ``compute_bias`` write (docs/plan_additional_mlp_routing.md,
+    *Deferred-bias semantics*).
+    """
+    node = op.node
+    assert isinstance(node, Add)
+    assert op.source_cols is not None, "add_into_bypass requires source_cols"
+    in_idx = op.source_cols
+    out_idx = op.target_cols
+    width = len(node)
+    assert len(in_idx) == width and len(out_idx) == width, (
+        f"add_into_bypass width mismatch for {node!r}: "
+        f"source={len(in_idx)}, target={len(out_idx)}, node={width}"
+    )
+
+    in_lin, _ = _mlp_in_out(mlp)
+    identity = torch.eye(width, dtype=in_lin.output_matrix.dtype)
+    _write_bypass_lane_pair(
+        mlp,
+        in_idx,
+        out_idx,
+        op.mlp_slots,
+        identity,
+        node=node,
+        op_type=op.op_type,
+        bias_fold=bias_fold,
+        recorder=recorder,
+    )
+
+    if biased_linears:
+        source_occurrence = node.inputs[1 - op.reuse_input_index]
+        _fold_deferred_source_bias(
+            mlp,
+            _flatten_input_leaves(source_occurrence),
+            identity,
+            op.mlp_slots,
+            biased_linears,
+            bias_fold,
+            node=node,
+            op_type=op.op_type,
+        )
+
+
+def _write_compute_add_bypass(
+    mlp,
+    op: PlannedMlpOp,
+    biased_linears: Optional[Set[Node]] = None,
+    recorder: Optional[PlacementRecorder] = None,
+    bias_fold: Optional[BiasFold] = None,
+):
+    """Compute both addends into fresh, zeroed columns from the MLP sublayer
+    via the bypass pair over the concatenated source rows with
+    ``W = [I; I]``.
+
+    Duplicate source columns coalesce by row-summing inside the lane pair,
+    so ``add(x, x)`` sums both copies instead of dropping one to a
+    last-write-wins scatter.  Both source occurrences fold same-layer
+    deferred Linear biases; duplicate sources fold twice, so biased
+    ``add(x, x)`` includes ``2 · bias(x)``.
+    """
+    node = op.node
+    assert isinstance(node, Add)
+    assert (
+        op.source_cols is not None and op.source_cols_b is not None
+    ), "compute_add_bypass requires source_cols and source_cols_b"
+    width = len(node)
+    assert len(op.source_cols) == width and len(op.source_cols_b) == width, (
+        f"compute_add_bypass width mismatch for {node!r}: "
+        f"a={len(op.source_cols)}, b={len(op.source_cols_b)}, node={width}"
+    )
+    assert len(op.target_cols) == width
+
+    in_idx = list(op.source_cols) + list(op.source_cols_b)
+    in_lin, _ = _mlp_in_out(mlp)
+    eye = torch.eye(width, dtype=in_lin.output_matrix.dtype)
+    stacked = torch.cat([eye, eye], dim=0)  # (2*width, width)
+    _write_bypass_lane_pair(
+        mlp,
+        in_idx,
+        op.target_cols,
+        op.mlp_slots,
+        stacked,
+        node=node,
+        op_type=op.op_type,
+        bias_fold=bias_fold,
+        recorder=recorder,
+    )
+
+    if biased_linears:
+        leaves = _flatten_input_leaves(node.inputs[0]) + _flatten_input_leaves(
+            node.inputs[1]
+        )
+        _fold_deferred_source_bias(
+            mlp,
+            leaves,
+            stacked,
+            op.mlp_slots,
+            biased_linears,
+            bias_fold,
+            node=node,
+            op_type=op.op_type,
         )

@@ -37,7 +37,14 @@ from torchwright.graph.ffn import FFN
 
 @dataclass
 class _AttentionOp:
-    """Mutable attention record used only during one scheduler walk."""
+    """Mutable attention record used only during one scheduler walk.
+
+    ``reuse_input_index`` is the reused target *occurrence* (0 or 1) of an
+    ``add_into`` — required there, forbidden elsewhere.  It is transient
+    physical-plan metadata (never serialized into ``ScheduleAssignment``):
+    node identity cannot distinguish the two occurrences of ``add(x, x)``,
+    and post-reassignment residual ownership cannot either.
+    """
 
     op_type: Literal[
         "compute_attn",
@@ -52,11 +59,18 @@ class _AttentionOp:
     source_cols_b: Optional[List[int]] = None
     q_source_cols: Optional[List[int]] = None
     k_source_cols: Optional[List[int]] = None
+    reuse_input_index: Optional[int] = None
 
 
 @dataclass
 class _MlpOp:
-    """Mutable MLP record used only during one scheduler walk."""
+    """Mutable MLP record used only during one scheduler walk.
+
+    ``source_cols_b`` carries the second addend of ``compute_add_bypass``.
+    ``reuse_input_index`` is the reused target occurrence (0 or 1) of an
+    ``add_into_bypass`` — required there, forbidden elsewhere; the live
+    source occurrence is ``1 - reuse_input_index``.
+    """
 
     op_type: Literal[
         "compute_ffn",
@@ -64,11 +78,15 @@ class _MlpOp:
         "compute_bias",
         "compute_linear_bypass",
         "cancel_bypass",
+        "add_into_bypass",
+        "compute_add_bypass",
     ]
     node: Optional[Node]
     target_cols: List[int]
     mlp_slots: List[int] = field(default_factory=list)
     source_cols: Optional[List[int]] = None
+    source_cols_b: Optional[List[int]] = None
+    reuse_input_index: Optional[int] = None
 
 
 @dataclass(frozen=True)
@@ -676,6 +694,10 @@ class LayerScheduler:
                     add_node,
                     target_cols,
                     source_cols=live_source_cols,
+                    # The selected occurrence, not the node: for add(x, x)
+                    # both addends are one node and d0 wins, so occurrence 0
+                    # is the reuse target and occurrence 1 the source read.
+                    reuse_input_index=0 if d0 else 1,
                 )
             )
             residual_map.reassign(dead_addend, add_node)

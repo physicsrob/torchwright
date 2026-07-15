@@ -99,13 +99,13 @@ def _make_op(rmap: ResidualStreamMap, op_type: str, node, target_cols, **kwargs)
         kwargs.setdefault("source_cols_b", rmap.resolve_indices(a1))
     elif op_type == "add_into":
         # Caller must specify which input is live via kwargs['source_cols']
-        # or we infer: whichever is currently allocated.
+        # or we infer: whichever is currently allocated.  The reused target
+        # occurrence is the other one (the scheduler reassigned it away).
+        a0, _a1 = node.inputs
+        a0_live = rmap.is_allocated(a0) or isinstance(a0, Concatenate)
         if "source_cols" not in kwargs:
-            a0, a1 = node.inputs
-            if rmap.is_allocated(a0) or isinstance(a0, Concatenate):
-                kwargs["source_cols"] = rmap.resolve_indices(a0)
-            else:
-                kwargs["source_cols"] = rmap.resolve_indices(a1)
+            kwargs["source_cols"] = rmap.resolve_indices(a0 if a0_live else _a1)
+        kwargs.setdefault("reuse_input_index", 1 if a0_live else 0)
     return PlannedAttentionOp(
         op_type=cast(
             Literal[
@@ -1990,3 +1990,414 @@ def test_mlp_linear_bypass_duplicate_concat_leaf():
 
     expected = node.compute(N_POS, {"x": x_values})
     assert torch.allclose(result.cpu(), expected, atol=1e-4)
+
+
+# ---------------------------------------------------------------------------
+# MLP — Add via the bypass pair (add_into_bypass / compute_add_bypass)
+#
+# docs/plan_additional_mlp_routing.md.  Direct writer tests: no scheduler,
+# the ops carry pre-captured columns and the reuse occurrence index.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("activation,atol", [("relu", 1e-5), ("swish", 1e-4)])
+def test_mlp_add_into_bypass(activation, atol):
+    """Add(dead, live): the pair reads the live addend and adds it into the
+    dead addend's reused columns — the residual leaves as dead + live."""
+    a = InputNode("a", 4, value_range=(-100.0, 100.0))
+    b = InputNode("b", 4, value_range=(-100.0, 100.0))
+    add_node = Add(a, b)
+
+    rmap = ResidualStreamMap(D)
+    a_cols = rmap.allocate(a)
+    rmap.allocate(b)
+    rmap.reassign(a, add_node)
+
+    layer = TransformerLayer(D, D_HEAD, activation=activation)
+    op = PlannedMlpOp(
+        op_type="add_into_bypass",
+        node=add_node,
+        target_cols=a_cols,
+        source_cols=rmap.resolve_indices(b),
+        mlp_slots=list(range(2 * 4)),
+        reuse_input_index=0,
+    )
+    write_mlp_sublayer(layer, [op], 0)
+    layer.to(device_mod.get_device(verbose=False))
+
+    a_values = torch.randn(N_POS, 4)
+    b_values = torch.randn(N_POS, 4)
+    res = _build_residual_stream(rmap, {add_node: a_values, b: b_values})
+
+    out = layer.mlp.forward(res)
+    expected = add_node.compute(N_POS, {"a": a_values, "b": b_values})
+    assert torch.allclose(out[:, a_cols].cpu(), expected, atol=atol)
+
+
+def test_mlp_add_into_bypass_dead_at_inputs1():
+    """Add(live, dead): reuse_input_index=1 selects the other orientation."""
+    live = InputNode("live", 3, value_range=(-100.0, 100.0))
+    dead = InputNode("dead", 3, value_range=(-100.0, 100.0))
+    add_node = Add(live, dead)
+
+    rmap = ResidualStreamMap(D)
+    rmap.allocate(live)
+    dead_cols = rmap.allocate(dead)
+    rmap.reassign(dead, add_node)
+
+    layer = TransformerLayer(D, D_HEAD)
+    op = PlannedMlpOp(
+        op_type="add_into_bypass",
+        node=add_node,
+        target_cols=dead_cols,
+        source_cols=rmap.resolve_indices(live),
+        mlp_slots=list(range(2 * 3)),
+        reuse_input_index=1,
+    )
+    write_mlp_sublayer(layer, [op], 0)
+    layer.to(device_mod.get_device(verbose=False))
+
+    live_values = torch.randn(N_POS, 3)
+    dead_values = torch.randn(N_POS, 3)
+    res = _build_residual_stream(rmap, {add_node: dead_values, live: live_values})
+
+    out = layer.mlp.forward(res)
+    expected = add_node.compute(N_POS, {"live": live_values, "dead": dead_values})
+    assert torch.allclose(out[:, dead_cols].cpu(), expected, atol=1e-4)
+
+
+@pytest.mark.parametrize("activation,atol", [("relu", 1e-5), ("swish", 1e-4)])
+def test_mlp_compute_add_bypass(activation, atol):
+    """Fresh MLP Add: W = [I; I] over the concatenated sources into zeroed
+    fresh columns."""
+    a = InputNode("a", 5, value_range=(-100.0, 100.0))
+    b = InputNode("b", 5, value_range=(-100.0, 100.0))
+    add_node = Add(a, b)
+
+    rmap = ResidualStreamMap(D)
+    rmap.allocate(a)
+    rmap.allocate(b)
+    out_cols = rmap.allocate(add_node)
+
+    layer = TransformerLayer(D, D_HEAD, activation=activation)
+    op = PlannedMlpOp(
+        op_type="compute_add_bypass",
+        node=add_node,
+        target_cols=out_cols,
+        source_cols=rmap.resolve_indices(a),
+        source_cols_b=rmap.resolve_indices(b),
+        mlp_slots=list(range(2 * 5)),
+    )
+    write_mlp_sublayer(layer, [op], 0)
+    layer.to(device_mod.get_device(verbose=False))
+
+    a_values = torch.randn(N_POS, 5)
+    b_values = torch.randn(N_POS, 5)
+    res = _build_residual_stream(rmap, {a: a_values, b: b_values})
+
+    out = layer.mlp.forward(res)
+    expected = add_node.compute(N_POS, {"a": a_values, "b": b_values})
+    assert torch.allclose(out[:, out_cols].cpu(), expected, atol=atol)
+
+
+def test_mlp_compute_add_bypass_self_add():
+    """add(x, x): duplicate source columns coalesce by row-summing, not
+    last-write-wins — the result is 2x."""
+    x = InputNode("x", 4, value_range=(-100.0, 100.0))
+    add_node = Add(x, x)
+
+    rmap = ResidualStreamMap(D)
+    rmap.allocate(x)
+    out_cols = rmap.allocate(add_node)
+
+    layer = TransformerLayer(D, D_HEAD)
+    op = PlannedMlpOp(
+        op_type="compute_add_bypass",
+        node=add_node,
+        target_cols=out_cols,
+        source_cols=rmap.resolve_indices(x),
+        source_cols_b=rmap.resolve_indices(x),
+        mlp_slots=list(range(2 * 4)),
+    )
+    write_mlp_sublayer(layer, [op], 0)
+    layer.to(device_mod.get_device(verbose=False))
+
+    x_values = torch.randn(N_POS, 4)
+    res = _build_residual_stream(rmap, {x: x_values})
+
+    out = layer.mlp.forward(res)
+    assert torch.allclose(out[:, out_cols].cpu(), 2 * x_values, atol=1e-4)
+
+
+def test_mlp_compute_add_bypass_concatenated_source():
+    """One addend is a Concatenate of two leaves at noncontiguous columns."""
+    p = InputNode("p", 2, value_range=(-100.0, 100.0))
+    q = InputNode("q", 2, value_range=(-100.0, 100.0))
+    other = InputNode("other", 4, value_range=(-100.0, 100.0))
+    cat = Concatenate([p, q])
+    add_node = Add(cat, other)
+
+    rmap = ResidualStreamMap(D)
+    rmap.allocate(p)
+    filler = InputNode("filler", 3, value_range=(-1.0, 1.0))
+    rmap.allocate(filler)  # makes q's columns noncontiguous with p's
+    rmap.allocate(q)
+    rmap.allocate(other)
+    out_cols = rmap.allocate(add_node)
+
+    layer = TransformerLayer(D, D_HEAD)
+    op = PlannedMlpOp(
+        op_type="compute_add_bypass",
+        node=add_node,
+        target_cols=out_cols,
+        source_cols=rmap.resolve_indices(cat),
+        source_cols_b=rmap.resolve_indices(other),
+        mlp_slots=list(range(2 * 4)),
+    )
+    write_mlp_sublayer(layer, [op], 0)
+    layer.to(device_mod.get_device(verbose=False))
+
+    p_values = torch.randn(N_POS, 2)
+    q_values = torch.randn(N_POS, 2)
+    other_values = torch.randn(N_POS, 4)
+    res = _build_residual_stream(rmap, {p: p_values, q: q_values, other: other_values})
+
+    out = layer.mlp.forward(res)
+    expected = torch.cat([p_values, q_values], dim=1) + other_values
+    assert torch.allclose(out[:, out_cols].cpu(), expected, atol=1e-4)
+
+
+@pytest.mark.parametrize("op_kind", ["add_into_bypass", "compute_add_bypass"])
+def test_mlp_add_bypass_bias_false(op_kind):
+    """Under bias=False the pair's swish up-lane constant and any folded
+    bias ride the reserved constant lane (hidden slot 0); packing starts at
+    slot 1."""
+    a = InputNode("a", 3, value_range=(-100.0, 100.0))
+    b = InputNode("b", 3, value_range=(-100.0, 100.0))
+    add_node = Add(a, b)
+
+    rmap = ResidualStreamMap(D)
+    const_one = _const_one(rmap)
+    a_cols = rmap.allocate(a)
+    rmap.allocate(b)
+
+    layer = TransformerLayer(D, D_HEAD, activation="swish")
+    if op_kind == "add_into_bypass":
+        rmap.reassign(a, add_node)
+        target_cols = a_cols
+        op = PlannedMlpOp(
+            op_type="add_into_bypass",
+            node=add_node,
+            target_cols=target_cols,
+            source_cols=rmap.resolve_indices(b),
+            mlp_slots=list(range(1, 1 + 2 * 3)),
+            reuse_input_index=0,
+        )
+    else:
+        target_cols = rmap.allocate(add_node)
+        op = PlannedMlpOp(
+            op_type="compute_add_bypass",
+            node=add_node,
+            target_cols=target_cols,
+            source_cols=rmap.resolve_indices(a),
+            source_cols_b=rmap.resolve_indices(b),
+            mlp_slots=list(range(1, 1 + 2 * 3)),
+        )
+    write_mlp_sublayer(layer, [op], rmap.get_indices(const_one)[0], bias=False)
+    layer.to(device_mod.get_device(verbose=False))
+
+    a_values = torch.randn(N_POS, 3)
+    b_values = torch.randn(N_POS, 3)
+    if op_kind == "add_into_bypass":
+        res = _build_residual_stream(rmap, {add_node: a_values, b: b_values})
+    else:
+        res = _build_residual_stream(rmap, {a: a_values, b: b_values})
+
+    out = layer.mlp.forward(res)
+    expected = add_node.compute(N_POS, {"a": a_values, "b": b_values})
+    assert torch.allclose(out[:, target_cols].cpu(), expected, atol=1e-4)
+
+
+def _biased_linear_missing_its_bias(rmap, name, d_in=4, d_out=3):
+    """A same-layer biased attention Linear as the MLP Add sees it: its
+    columns hold W·x only (the output_bias is deferred to compute_bias)."""
+    x = InputNode(f"{name}_x", d_in, value_range=(-100.0, 100.0))
+    lin = Linear(x, torch.randn(d_in, d_out), torch.randn(d_out), name=name)
+    rmap.allocate(lin)
+    return x, lin
+
+
+def test_mlp_compute_add_bypass_folds_biased_source():
+    """A fresh MLP Add reading a same-layer biased attention Linear folds
+    that Linear's deferred bias into its lanes: the result carries the full
+    W·x + b even though the residual holds only W·x."""
+    rmap = ResidualStreamMap(D)
+    x, lin = _biased_linear_missing_its_bias(rmap, "lin")
+    other = InputNode("other", 3, value_range=(-100.0, 100.0))
+    rmap.allocate(other)
+    add_node = Add(lin, other)
+    out_cols = rmap.allocate(add_node)
+
+    layer = TransformerLayer(D, D_HEAD)
+    op = PlannedMlpOp(
+        op_type="compute_add_bypass",
+        node=add_node,
+        target_cols=out_cols,
+        source_cols=rmap.resolve_indices(lin),
+        source_cols_b=rmap.resolve_indices(other),
+        mlp_slots=list(range(2 * 3)),
+    )
+    write_mlp_sublayer(layer, [op], 0, biased_linears={lin})
+    layer.to(device_mod.get_device(verbose=False))
+
+    x_values = torch.randn(N_POS, 4)
+    wx = x_values @ lin.output_matrix  # pre-bias attention write
+    other_values = torch.randn(N_POS, 3)
+    res = _build_residual_stream(rmap, {lin: wx, other: other_values})
+
+    out = layer.mlp.forward(res)
+    expected = (wx + lin.output_bias) + other_values
+    assert torch.allclose(out[:, out_cols].cpu(), expected, atol=1e-4)
+
+
+def test_mlp_add_into_bypass_folds_biased_live_source():
+    """The live/source occurrence of a reused MLP Add folds its deferred
+    bias into the Add delta."""
+    rmap = ResidualStreamMap(D)
+    x, lin = _biased_linear_missing_its_bias(rmap, "lin")
+    dead = InputNode("dead", 3, value_range=(-100.0, 100.0))
+    dead_cols = rmap.allocate(dead)
+    add_node = Add(dead, lin)
+    rmap.reassign(dead, add_node)
+
+    layer = TransformerLayer(D, D_HEAD)
+    op = PlannedMlpOp(
+        op_type="add_into_bypass",
+        node=add_node,
+        target_cols=dead_cols,
+        source_cols=rmap.resolve_indices(lin),
+        mlp_slots=list(range(2 * 3)),
+        reuse_input_index=0,
+    )
+    write_mlp_sublayer(layer, [op], 0, biased_linears={lin})
+    layer.to(device_mod.get_device(verbose=False))
+
+    x_values = torch.randn(N_POS, 4)
+    wx = x_values @ lin.output_matrix
+    dead_values = torch.randn(N_POS, 3)
+    res = _build_residual_stream(rmap, {add_node: dead_values, lin: wx})
+
+    out = layer.mlp.forward(res)
+    expected = dead_values + (wx + lin.output_bias)
+    assert torch.allclose(out[:, dead_cols].cpu(), expected, atol=1e-4)
+
+
+def test_mlp_add_into_bypass_biased_reused_target_applies_bias_once():
+    """A same-layer biased Linear as the reused TARGET occurrence: its bias
+    arrives through its own direct compute_bias write (target columns
+    captured before reassignment), and the Add must NOT also fold it —
+    occurrence-based, not node-based."""
+    rmap = ResidualStreamMap(D)
+    x, lin = _biased_linear_missing_its_bias(rmap, "lin")
+    live = InputNode("live", 3, value_range=(-100.0, 100.0))
+    rmap.allocate(live)
+    add_node = Add(lin, live)
+
+    # Capture the compute_bias target columns BEFORE the reassignment.
+    lin_cols = list(rmap.get_indices(lin))
+    rmap.reassign(lin, add_node)
+
+    layer = TransformerLayer(D, D_HEAD)
+    add_op = PlannedMlpOp(
+        op_type="add_into_bypass",
+        node=add_node,
+        target_cols=lin_cols,
+        source_cols=rmap.resolve_indices(live),
+        mlp_slots=list(range(2 * 3)),
+        reuse_input_index=0,
+    )
+    bias_op = PlannedMlpOp(
+        op_type="compute_bias",
+        node=lin,
+        target_cols=lin_cols,
+    )
+    write_mlp_sublayer(layer, [add_op, bias_op], 0, biased_linears={lin})
+    layer.to(device_mod.get_device(verbose=False))
+
+    x_values = torch.randn(N_POS, 4)
+    wx = x_values @ lin.output_matrix
+    live_values = torch.randn(N_POS, 3)
+    res = _build_residual_stream(rmap, {add_node: wx, live: live_values})
+
+    out = layer.mlp.forward(res)
+    expected = (wx + lin.output_bias) + live_values
+    assert torch.allclose(out[:, lin_cols].cpu(), expected, atol=1e-4)
+
+
+def test_mlp_add_into_bypass_biased_self_add():
+    """Biased add(x, x) reused: occurrence 0 gets one direct compute_bias,
+    occurrence 1 folds one bias into the delta — 2·(Wx + b) in total even
+    though both occurrences name the same node."""
+    rmap = ResidualStreamMap(D)
+    x, lin = _biased_linear_missing_its_bias(rmap, "lin")
+    add_node = Add(lin, lin)
+
+    lin_cols = list(rmap.get_indices(lin))
+    rmap.reassign(lin, add_node)
+
+    layer = TransformerLayer(D, D_HEAD)
+    add_op = PlannedMlpOp(
+        op_type="add_into_bypass",
+        node=add_node,
+        target_cols=lin_cols,
+        source_cols=lin_cols,  # occurrence 1 reads the same captured columns
+        mlp_slots=list(range(2 * 3)),
+        reuse_input_index=0,
+    )
+    bias_op = PlannedMlpOp(
+        op_type="compute_bias",
+        node=lin,
+        target_cols=lin_cols,
+    )
+    write_mlp_sublayer(layer, [add_op, bias_op], 0, biased_linears={lin})
+    layer.to(device_mod.get_device(verbose=False))
+
+    x_values = torch.randn(N_POS, 4)
+    wx = x_values @ lin.output_matrix
+    res = _build_residual_stream(rmap, {add_node: wx})
+
+    out = layer.mlp.forward(res)
+    expected = 2 * (wx + lin.output_bias)
+    assert torch.allclose(out[:, lin_cols].cpu(), expected, atol=1e-4)
+
+
+def test_mlp_compute_add_bypass_two_biased_sources():
+    """Two distinct same-layer biased Linears as the two fresh sources: each
+    occurrence's bias folds exactly once."""
+    rmap = ResidualStreamMap(D)
+    xa, lin_a = _biased_linear_missing_its_bias(rmap, "lin_a")
+    xb, lin_b = _biased_linear_missing_its_bias(rmap, "lin_b")
+    add_node = Add(lin_a, lin_b)
+    out_cols = rmap.allocate(add_node)
+
+    layer = TransformerLayer(D, D_HEAD)
+    op = PlannedMlpOp(
+        op_type="compute_add_bypass",
+        node=add_node,
+        target_cols=out_cols,
+        source_cols=rmap.resolve_indices(lin_a),
+        source_cols_b=rmap.resolve_indices(lin_b),
+        mlp_slots=list(range(2 * 3)),
+    )
+    write_mlp_sublayer(layer, [op], 0, biased_linears={lin_a, lin_b})
+    layer.to(device_mod.get_device(verbose=False))
+
+    xa_values = torch.randn(N_POS, 4)
+    xb_values = torch.randn(N_POS, 4)
+    wxa = xa_values @ lin_a.output_matrix
+    wxb = xb_values @ lin_b.output_matrix
+    res = _build_residual_stream(rmap, {lin_a: wxa, lin_b: wxb})
+
+    out = layer.mlp.forward(res)
+    expected = (wxa + lin_a.output_bias) + (wxb + lin_b.output_bias)
+    assert torch.allclose(out[:, out_cols].cpu(), expected, atol=1e-4)

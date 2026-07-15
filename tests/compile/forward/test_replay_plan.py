@@ -61,6 +61,147 @@ def test_planned_operations_reject_tensor_indices():
         PlannedAttentionOp("cancel", node, torch.tensor([0, 1]))
 
 
+def test_reuse_records_require_the_occurrence_index():
+    """Every reuse record (add_into, add_into_bypass) carries exactly one
+    valid target-occurrence index; every fresh or unrelated record rejects
+    one (docs/plan_additional_mlp_routing.md)."""
+    from torchwright.graph import Add
+
+    a = create_input("a", 2)
+    b = create_input("b", 2)
+    add = Add(a, b)
+
+    # add_into: required, 0 or 1 only.
+    with pytest.raises(ValueError, match="requires reuse_input_index"):
+        PlannedAttentionOp("add_into", add, (0, 1), source_cols=(2, 3))
+    with pytest.raises(ValueError, match="requires reuse_input_index"):
+        PlannedAttentionOp(
+            "add_into", add, (0, 1), source_cols=(2, 3), reuse_input_index=2
+        )
+    op = PlannedAttentionOp(
+        "add_into", add, (0, 1), source_cols=(2, 3), reuse_input_index=1
+    )
+    assert op.reuse_input_index == 1
+
+    # Fresh and unrelated attention records reject an index.
+    with pytest.raises(ValueError, match="must not carry"):
+        PlannedAttentionOp(
+            "compute_add",
+            add,
+            (0, 1),
+            source_cols=(2, 3),
+            source_cols_b=(4, 5),
+            reuse_input_index=0,
+        )
+    with pytest.raises(ValueError, match="must not carry"):
+        PlannedAttentionOp("cancel", None, (0, 1), reuse_input_index=0)
+
+    # add_into_bypass: required; source_cols required.
+    with pytest.raises(ValueError, match="requires reuse_input_index"):
+        PlannedMlpOp(
+            "add_into_bypass", add, (0, 1), mlp_slots=(2, 3, 4, 5), source_cols=(6, 7)
+        )
+    with pytest.raises(ValueError, match="requires source_cols"):
+        PlannedMlpOp(
+            "add_into_bypass", add, (0, 1), mlp_slots=(2, 3, 4, 5), reuse_input_index=0
+        )
+    mlp_op = PlannedMlpOp(
+        "add_into_bypass",
+        add,
+        (0, 1),
+        mlp_slots=(2, 3, 4, 5),
+        source_cols=(6, 7),
+        reuse_input_index=0,
+    )
+    assert mlp_op.reuse_input_index == 0
+
+    # Fresh and unrelated MLP records reject an index.
+    with pytest.raises(ValueError, match="must not carry"):
+        PlannedMlpOp(
+            "compute_add_bypass",
+            add,
+            (0, 1),
+            mlp_slots=(2, 3, 4, 5),
+            source_cols=(6, 7),
+            source_cols_b=(8, 9),
+            reuse_input_index=0,
+        )
+    with pytest.raises(ValueError, match="must not carry"):
+        PlannedMlpOp(
+            "compute_linear_bypass",
+            None,
+            (0, 1),
+            mlp_slots=(2, 3, 4, 5),
+            source_cols=(6, 7),
+            reuse_input_index=0,
+        )
+
+
+def test_compute_add_bypass_source_field_rules():
+    """compute_add_bypass requires both source lists; every other MLP record
+    rejects source_cols_b."""
+    from torchwright.graph import Add
+
+    a = create_input("a", 2)
+    b = create_input("b", 2)
+    add = Add(a, b)
+
+    with pytest.raises(ValueError, match="source_cols and source_cols_b"):
+        PlannedMlpOp(
+            "compute_add_bypass",
+            add,
+            (0, 1),
+            mlp_slots=(2, 3, 4, 5),
+            source_cols=(6, 7),
+        )
+    with pytest.raises(ValueError, match="must not carry source_cols_b"):
+        PlannedMlpOp(
+            "compute_linear_bypass",
+            None,
+            (0, 1),
+            mlp_slots=(2, 3, 4, 5),
+            source_cols=(6, 7),
+            source_cols_b=(8, 9),
+        )
+    op = PlannedMlpOp(
+        "compute_add_bypass",
+        add,
+        (0, 1),
+        mlp_slots=(2, 3, 4, 5),
+        source_cols=(6, 7),
+        source_cols_b=(8, 9),
+    )
+    assert op.source_cols_b == (8, 9)
+
+
+def test_add_bypass_ops_count_as_bypass_slot_consumers():
+    from torchwright.graph import Add
+
+    a = create_input("a", 2)
+    b = create_input("b", 2)
+    add = Add(a, b)
+    reused = PlannedMlpOp(
+        "add_into_bypass",
+        add,
+        (0, 1),
+        mlp_slots=(2, 3, 4, 5),
+        source_cols=(6, 7),
+        reuse_input_index=0,
+    )
+    fresh = PlannedMlpOp(
+        "compute_add_bypass",
+        add,
+        (0, 1),
+        mlp_slots=(2, 3, 4, 5),
+        source_cols=(6, 7),
+        source_cols_b=(8, 9),
+    )
+    bias = PlannedMlpOp("compute_bias", None, (0, 1))
+    assert reused.bypass_slot_count == 4
+    assert fresh.bypass_slot_count == 4
+    assert bias.bypass_slot_count == 0
+
+
 def test_replay_plan_rejects_missing_node_resolution():
     x = create_input("x", 1)
     assignment = ScheduleAssignment(
