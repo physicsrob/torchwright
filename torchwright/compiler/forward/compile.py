@@ -17,6 +17,7 @@ import torch
 
 from torchwright.compiler.device import get_device
 from torchwright.compiler.realization import (
+    ATTN_ADD,
     ATTN_TRANSPORT,
     CLASS_SUBLAYER,
     RealizationTable,
@@ -497,12 +498,11 @@ def _build_heuristic_schedule_trace(
     # Operation lists contain auxiliary work as well as the node's semantic
     # realization (notably a biased attention-routed Linear has an MLP bias
     # write, and an all-zero transport may have only that auxiliary op). Read
-    # every non-conditional routing decision from the resolved table; retain
-    # observed routing only for conditional Adds whose reuse/copy class is a
-    # schedule-time decision.
+    # every routing decision from the resolved table — every schedulable
+    # node, Adds included, has a resolved route family before the walk.
     for node in graph.get_all_nodes():
         entry = hint_scheduler.realization_table.entries.get(node.node_id)
-        if entry is not None and not entry.conditional:
+        if entry is not None:
             assert entry.resolved is not None
             hint_routing[node.node_id] = CLASS_SUBLAYER[entry.resolved]
     return HeuristicScheduleTrace(
@@ -1305,7 +1305,15 @@ def forward_compile(
         if direct_held_handoff:
             if isinstance(output_node, Linear):
                 forced_realization_classes[output_node.node_id] = ATTN_TRANSPORT
-            elif not isinstance(output_node, (Attn, Add)):
+            elif isinstance(output_node, Add):
+                # The direct held handoff is one atomic attention event
+                # (read the old embedding, cancel it, write the target into
+                # the reclaimed bank); a held-target Add is therefore pinned
+                # to the attention family under every policy and flex
+                # configuration (docs/plan_additional_mlp_routing.md, *Tied
+                # output*).
+                forced_realization_classes[output_node.node_id] = ATTN_ADD
+            elif not isinstance(output_node, Attn):
                 raise ValueError(
                     "held output layout has no direct MLP handoff: target "
                     f"{output_node!r} directly reads the tied Embedding but "

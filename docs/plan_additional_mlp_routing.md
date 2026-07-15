@@ -4,6 +4,14 @@
 
 Proposed implementation plan. No code in this plan has been implemented yet.
 
+Revised 2026-07-14 against the worktree-tied landing (tied embeddings / the
+held output bank, atomic attention replay, and the ungated `optimize=0`
+directed replay). The revision adds the tied-output constraints, rewrites
+the directed-replay requirements against the atomic attention batch,
+resequences the implementation steps, and descopes the same-layer
+live-addend cancel loosening to the `add_live_addend_gap` ledger entry
+(known optimality gap #2 in `docs/cpsat_scheduler.md`).
+
 This document uses `add_into`, the compiler's existing name for adding into
 the residual columns of a dead addend. The earlier name `add_input` is treated
 as a reference to `add_into`.
@@ -11,8 +19,10 @@ as a reference to `add_into`.
 ## Goal
 
 Allow every position-local `Add` node to use either attention heads or MLP
-hidden slots. Keep the existing choice between reusing a dead addend's
-residual columns and allocating fresh output columns.
+hidden slots — except the tied held target, which stays pinned to attention
+(see *Tied output* under *Scope and constraints*). Keep the existing choice
+between reusing a dead addend's residual columns and allocating fresh output
+columns.
 
 The resulting operation matrix is:
 
@@ -75,6 +85,45 @@ initial conservative fresh-placement model may charge
 route is structurally unschedulable and must produce a resource diagnostic;
 this change does not split it across layers.
 
+### Tied output (held bank)
+
+Tied compiles (token.v6) withhold the tied `Embedding`'s residual columns as
+a single transient held bank until the schedulable graph output — the held
+target — claims the entire bank, in order, via `allocate_at`, so one
+`(vocab, d)` table serves as both embedding and unembedding. In the
+canonical tied shape the held target is exactly an `Add`
+(`logits = transported_embedding + correction`). `compile_to_onnx` and the
+direct-HF path always compile tied, so the flagship's output Add is a held
+target on every production compile.
+
+The held-target Add is pinned to `ATTN_ADD` with fresh placement,
+unconditionally — regardless of `local_in_attention` and `flex_routing`:
+
+- The direct held handoff (the target directly consumes the tied Embedding)
+  is one atomic attention event — read the old embedding value, cancel it,
+  write the target into the reclaimed bank. There is intentionally no MLP
+  equivalent, and CP-SAT already pins `is_attn[held_target] == 1`. The
+  generalized static resolver must force a held-target Add to `ATTN_ADD`
+  through the forced-classes mechanism, exactly parallel to the existing
+  direct-handoff Linear forcing to `ATTN_TRANSPORT` — that forcing branch
+  currently lets an `Add` target through untouched, which is safe only
+  while Add is attention-only.
+- The held target's `is_free` stays pinned to 0 without the addend-deadness
+  biconditional (the 32983b0 fix; posting both went hard-INFEASIBLE for the
+  canonical tied shape). The per-occurrence selector construction below
+  must skip the held target entirely, as `_hinted_add_is_free` already does
+  on the hint-validation side.
+- An MLP-side bank claim for an *indirect* handoff (the source cancelled by
+  an earlier consumer, the bank claimed later) is explicitly out of scope:
+  no MLP-phase capture/cancel/claim executor exists, and the occupancy
+  timing would need new modeling.
+
+The held source (the tied Embedding) is never a reuse target and never a
+same-layer cancel candidate on either route: its columns pass through a
+physical cancel into the held state (`_is_dead_for_add` returns false for
+it), and it has no MLP cancel mechanism. The graph-input reuse modeling
+below must carve it out explicitly.
+
 Other non-goals:
 
 - Do not route a genuine `Attn` node to MLP. It communicates across positions.
@@ -87,6 +136,10 @@ Other non-goals:
   freshly-dead cancellation. Their reuse-target path still ends ownership
   through `reassign`, not through a cancel operation.
 - Do not opportunistically change an Add's route during directed replay.
+- Do not add an MLP-side held-bank claim; the held-target Add is pinned to
+  `ATTN_ADD` with fresh placement (see *Tied output* above).
+- Do not close known optimality gap #2 (the live-addend same-layer cancel
+  conservatism) as part of this feature; see *Cancellation timing* below.
 - Do not add a new public compile flag unless compatibility review rejects the
   existing documented policy behavior described below.
 
@@ -112,6 +165,28 @@ The compiler currently mixes the two Add decisions:
   cancel for a value whose ownership actually ends through `reassign`.
 - Existing same-layer MLP consumers fold deferred biases from attention-routed
   Linears. The new Add bypass writers must join that protocol.
+- Since the worktree-tied landing, `optimize=0` builds the heuristic trace
+  and assignment, then emits through a `DirectedLayerScheduler` replay of
+  that assignment (`clusters=None`). The base heuristic walker is a
+  trace/assignment producer at every optimize level, never the final
+  emitter.
+- The directed replay executes each layer's attention sublayer as one
+  atomic transition: capture every batch member's sources while all inputs
+  are live; preflight the exact head charge (contract check A3) and the
+  aggregate ordinary-column width with held-bank carve-outs (A4); release
+  every value whose assigned attention-mechanism cancel equals the current
+  layer in a single coalesced cancel; place outputs from the saved
+  captures. Contract check A2 requires every uncomputed consumer of a
+  released value to be inside the attention batch. (A2/A3/A4 are replay
+  contract checks, deliberately not canonized as compiler invariants.) The
+  MLP sublayer replay remains incremental; an assigned MLP op that cannot
+  fit records a structural skip and the replay-depth tripwire raises at end
+  of replay.
+- `_mlp_cancel_defers_live_addends` is already `False` on the directed
+  path; only the base heuristic keeps the conservative `True`.
+- Tied compiles pin the held-target Add (`is_attn == 1`, `is_free == 0`)
+  and exclude the held Embedding from reuse and MLP cancellation — see
+  *Tied output* above.
 
 This disagrees with `SchedulingPolicy`'s existing documentation, which says
 that standalone Linears, `add_into`, and `compute_add` are position-local and
@@ -177,6 +252,14 @@ consumer of `E`, provided `E` owns reassignable residual columns. A
 terminal output consumer is not reassignable. An effective consumer without a
 layer variable prevents reuse because its read cannot be ordered.
 
+The predicate deliberately has no term for `E`'s own birth layer. The
+existing route-aware dependency bounds on the edge `E -> A` (a zero-layer
+gap when an attention producer feeds an MLP consumer, one layer for every
+other route pair) already force `E` to be materialized by the time `A`'s
+placement snapshot is taken, on both routes. The assignment-level
+derivation and the physical-versus-derived tripwires may therefore rely on
+the layer and route maps alone.
+
 Preallocated graph inputs (`InputNode` and `Embedding`) are an intentional
 exception to the old CP-SAT shortcut: they own residual columns and the
 heuristic already permits those columns to become an `add_into` target. The
@@ -184,7 +267,10 @@ input itself has no layer variable, but its schedulable consumers do, which is
 enough to evaluate the predicate. CP-SAT must model input-target reassignment
 rather than rejecting an addend merely because the addend is in
 `gm.pinned_nodes` or lacks `layer_var[E]`. This preserves historical heuristic
-placement for direct input Adds.
+placement for direct input Adds. The held source is the exception to this
+exception: a tied compile's Embedding is never reusable on either route
+(`_is_dead_for_add` is false for it); its columns end through the held-bank
+cancel/hold transition only.
 
 That target exception does not turn graph inputs into ordinary same-layer
 cancel candidates. When a graph input is an ordinary source occurrence, retain
@@ -282,9 +368,12 @@ before placement is known.
 Generalize the existing static flex resolver so it does not assume every
 flexible node is a `Linear`:
 
-1. Compute the candidate MLP slot demand.
-2. Pin to attention if the complete MLP operation cannot fit in a layer.
-3. Otherwise apply `policy.local_in_attention`.
+1. Pin a held-target Add to attention (the tied direct-handoff contract;
+   see *Tied output*). This flows through the same forced-classes mechanism
+   that pins a direct-handoff Linear to `ATTN_TRANSPORT`.
+2. Compute the candidate MLP slot demand.
+3. Pin to attention if the complete MLP operation cannot fit in a layer.
+4. Otherwise apply `policy.local_in_attention`.
 
 Under `local_in_attention="always"`, fitting Adds remain on attention. Under
 `local_in_attention="never"`, fitting Adds use MLP. `LEGACY_POLICY` therefore
@@ -298,7 +387,9 @@ Under `flex_routing=True`, a structurally fitting Add receives the same
 `is_attn` decision variable as a flexible standalone Linear. Static
 `local_in_attention` policy does not pin that variable. If `2 * w` exceeds
 usable MLP capacity, constrain `is_attn == 1` instead of presenting an
-infeasible MLP mode to the solver.
+infeasible MLP mode to the solver. A held-target Add is not flex-eligible:
+its `is_attn == 1` pin stays posted under `flex_routing=True`, and its
+`is_free` stays pinned to 0 without the deadness biconditional.
 
 Under `flex_routing=False`, use the generalized static resolver and the
 existing policy.
@@ -408,11 +499,16 @@ biases for source occurrences that were born in attention in the same layer.
 
 ### Heuristic layer walk
 
+The base walker is a trace/assignment producer at every optimize level; the
+physical emission of every schedule, including `optimize=0`, happens in the
+directed replay of the completed assignment. The walk's job is to make
+placement decisions and record cancel layers, mechanisms, and routes that
+the directed replay (and its contract checks) will accept.
+
 Change Add handling as follows:
 
 1. Classify ready Adds by their already-resolved route.
-2. Keep attention-routed Adds on the existing writer and placement path, but
-   apply the explicit source-cancellation surfacing protocol below.
+2. Keep attention-routed Adds on the existing writer and placement path.
 3. Carry MLP-routed Adds into the MLP phase.
 4. After the attention phase, add newly-ready MLP-routed Adds to the MLP
    candidates. This permits an attention result to feed an MLP Add in the same
@@ -440,31 +536,15 @@ Keep MLP Add ordering deterministic and use the existing residual-pressure
 and critical-path priorities. Reuse candidates should remain higher priority
 than fresh candidates because they require no residual allocation.
 
-An attention `add_into` needs an explicit cancellation handoff; removing a
-candidate exclusion is not sufficient because its live source is not in the
-layer-start `dead` set. Execute it as follows:
-
-1. Capture the selected target and live source, perform `reassign`, and mark
-   the Add computed before evaluating source death.
-2. After the phase-start batch of reusable attention Adds, re-evaluate each
-   distinct live source. If it is now dead, was born before this layer, is
-   allocated, is not a graph input, and is assigned an attention cancel, add
-   it to the same layer's batched attention-cancel pool.
-3. Apply the same re-evaluation as later same-layer attention consumers are
-   placed. A source shared by an earlier `add_into` and a later attention
-   operation becomes known dead only when the later consumer is placed; the
-   earlier reuse must not suppress or prematurely schedule its cancel. This is
-   scheduler construction order only: the resulting compute and cancel heads
-   still execute in one parallel attention sublayer.
-4. If an ordinary non-input source is assigned an MLP cancel, or a heuristic
-   attention-cancel batch has no transient capacity, offer it to the existing
-   post-attention `cancel_bypass` path. Directed replay must fit the mechanism
-   recorded in the assignment; the heuristic may defer only when the relevant
-   transient pool is actually full. Retire the blanket
-   `_mlp_cancel_defers_live_addends` treatment for these sources.
-5. Never surface the selected target through either path. Its old ownership
-   ended through `reassign`. Never send an ordinary graph-input source through
-   these same-layer paths; its gap-one rule is defined below.
+Live addends keep the existing conservative treatment on both routes: the
+live/source occurrence of an `add_into` or `add_into_bypass` is excluded
+from same-layer cancellation (the `add_into_live_addends` filters, extended
+to cover `add_into_bypass`), and its earliest cancel stays at the layer
+after the Add. Loosening this is known optimality gap #2 and is out of
+scope (see *Cancellation timing* below). The selected target is never
+surfaced through any cancel path — its old ownership ends through
+`reassign`. An ordinary graph-input source never enters same-layer paths;
+its gap-one rule is defined below.
 
 ### Directed replay
 
@@ -479,13 +559,32 @@ invariant error that names the Add, its route, its layer, both per-addend
 reusability results, the selected target, and the other consumers that caused
 the disagreement. Do not silently emit the other form.
 
-Directed replay must also realize a same-layer attention cancel assigned to an
-attention `add_into` source. It must place that cancel into the open attention
-batch as soon as placement of the source's final same-layer consumer establishes
-death; this does not impose a physical order within the parallel sublayer.
-Waiting for the ordinary recovery scan is too late. This requirement applies
-only to ordinary schedulable sources. Graph-input sources cannot receive such
-an assignment because their lower bound remains `L + 1`.
+The atomic attention batch already delivers the read-before-cancel
+guarantee for any same-layer attention cancel the model assigns: every
+batch member's sources are captured before the single coalesced cancel
+releases anything, so no incremental cancel insertion exists or is needed.
+Contract check A2 — every uncomputed consumer of a released value must be
+inside the attention batch — is the runtime enforcement of the cancellation
+table below: the model's bounds must make it impossible for an MLP-routed
+Add to be the final consumer of a source assigned a same-layer attention
+cancel, and a corrupted assignment that violates this must raise A2 at
+replay rather than mis-execute.
+
+An MLP-routed Add replays in the incremental MLP phase; there is no atomic
+MLP transition and no MLP analogue of the A3/A4 preflights. A hidden-slot
+shortfall at the Add's assigned layer follows the existing assigned-MLP-op
+contract: the op records a structural skip, defers, and the replay-depth
+tripwire (`_check_replay_depth`) raises at end of replay naming the node,
+its assigned layer, and its realized layer. No new inline MLP preflight is
+required by this feature.
+
+The reused target's canonical virtual cancel layer `layer[A] + 1`
+(bookkeeping only — no operation is emitted; ownership ends through
+`reassign`) is compatible with the atomic batch: by layer `A + 1` the
+target's old columns have been reassigned, the old node is no longer
+allocated, and the release walk — which visits allocated nodes only —
+never sees it. Pin this with an explicit test rather than relying on the
+walk's current shape.
 
 Persist neither `is_free` nor the reuse-target selector in
 `ScheduleAssignment` unless replay cannot derive and verify them cheaply from
@@ -525,7 +624,9 @@ the physical observation with the derived value.
 Include Add in flex-routing eligibility. Update mode-aware earliest/latest
 layer bounds so an attention producer may feed an MLP-routed Add in the same
 layer, while every other route pair keeps the existing one-layer dependency
-gap.
+gap. The held-target Add is excluded from flex eligibility: its
+`is_attn == 1` pin stays posted (the single authoritative held-handoff pin
+in the routing loop must cover the Add case, not only Linears).
 
 ### Route-aware reusable placement
 
@@ -543,7 +644,11 @@ Do not make `reuse_0` versus `reuse_1` a solver choice. For graph inputs,
 derive `reusable_i` from their effective consumers even though the input has
 no node-layer variable. Only the consumers need layer variables. Reject reuse
 for a physically non-reassignable value or an unordered effective consumer,
-not merely for membership in `gm.pinned_nodes`.
+not merely for membership in `gm.pinned_nodes`. The held source is always
+rejected: it is not reassignable — its columns end through the held-bank
+cancel/hold transition. The held target skips this construction entirely:
+its `is_free` stays pinned to 0 without the deadness biconditional, exactly
+as today.
 
 Expose the per-occurrence maps on `BuiltModel` (for example,
 `add_reusable[(add_id, i)]` and `add_reuse[(add_id, i)]`) alongside `is_free`.
@@ -607,14 +712,23 @@ target-aware: under `reused_as_target[E]`, force the parked-presence literal
 false and gate the ordinary parked window, converse, and canonicalization
 constraints off. This includes the usual implication from "not parked" to a
 cancel layer inside the executable horizon, which is incompatible with a
-last-layer handoff. Exclude selected schedulable and graph-input targets from
-`SolveStats.parked_count` and from diagnostics that say a value was left
-forever. The successor Add may remain live; the old target did not.
+last-layer handoff. Scope note: the parked machinery exists only in the
+unpinned cancel model (`_pin_cancels=False`); the production pinned model
+builds none of it. Within the unpinned model the always-on constraint to
+gate is the cancel window bound posted under `parked.Not()`; the parked
+converse and the explicit not-parked implication to a cancel layer at most
+`max_layers - 1` are additionally gated behind the measurement-only
+`_canonical_cancel_reps` knob (default off) and must become target-aware
+wherever they are posted. Exclude selected schedulable and graph-input
+targets from `SolveStats.parked_count` and from diagnostics that say a
+value was left forever. The successor Add may remain live; the old target
+did not.
 
 ### Cancellation timing
 
-Rebuild the Add-consumer cancel lower bounds from physical read order rather
-than keeping the current blanket Add exception:
+Make the Add-consumer cancel lower bounds route-aware where the new MLP
+route requires it, and keep the existing conservative live-addend bound.
+The physical facts:
 
 - An attention cancel happens in the attention sublayer.
 - An MLP-routed Add reads after that cancel, so its source cannot be
@@ -625,6 +739,25 @@ than keeping the current blanket Add exception:
   columns can be reassigned; it cannot be treated like an ordinary copied
   source.
 
+Two separable concerns follow, and this plan takes only the first:
+
+- **Correctness tightening (this feature).** An ordinary source of an
+  MLP-routed Add cannot be attention-cancelled in the Add's layer; that
+  bound must rise to `L + 1`. This slots into the pinned-cancel model's
+  per-term maxima, which are already route-aware for non-Add consumers
+  (`layer[c] + 1 - is_attn[c]`).
+- **Optimality loosening (descoped).** Allowing the live source of a reused
+  Add to be cancelled in the Add's own layer is known optimality gap #2
+  (`docs/cpsat_scheduler.md`, diagnostic family `add_live_addend_gap`),
+  deliberately open, with an all-or-none closure rule — model, heuristic,
+  and directed replay must change together — and a bindingness-measurement
+  recipe. This plan keeps the conservative `layer[A] + is_free[A]` bound
+  for live addends on both routes and extends the `add_into_live_addends`
+  exclusion to `add_into_bypass` live sources. Run the ledger's measurement
+  before closing the gap as its own follow-up; the atomic attention batch
+  has made the replay side of that closure cheap, but nothing lands until
+  all three sides land together.
+
 For an Add at layer `L`, before applying the global no-cancel-at-birth lower
 bound, the truth table for ordinary schedulable values that have an
 attention/MLP cancel-mechanism choice is:
@@ -632,10 +765,10 @@ attention/MLP cancel-mechanism choice is:
 | Add route | Placement / operand role | Earliest attention cancel | Earliest MLP cancel | Physical action |
 | --- | --- | --- | --- | --- |
 | Attention | Fresh, ordinary source | `L` | `L` | Source read in attention |
-| Attention | Reused, ordinary live/source occurrence | `L` | `L` | Source read in attention |
+| Attention | Reused, ordinary live/source occurrence | `L + 1` | `L + 1` | Conservative (gap #2) |
 | Attention | Reused target occurrence | none | none | Reassign; retain through `L` |
 | MLP | Fresh, ordinary source | `L + 1` | `L` | MLP reads after attention |
-| MLP | Reused, ordinary live/source occurrence | `L + 1` | `L` | MLP reads after attention |
+| MLP | Reused, ordinary live/source occurrence | `L + 1` | `L + 1` | Conservative (gap #2) |
 | MLP | Reused target occurrence | none | none | Reassign; retain through `L` |
 
 “None” means no cancel op is emitted or charged; the old value's lifetime ends
@@ -668,17 +801,14 @@ the explicit gap-one exception above for input cancel bounds and input hint
 validation, with the selected-target override applied separately. The pinned
 and unpinned models must describe the same earliest legal physical action.
 
-Update heuristic and directed execution as well as the model. Merely removing
-the unconditional attention-cancel exclusion for an `add_into` live source is
-insufficient: that source was not dead at layer start. Explicitly surface it
-after the Add placement, or after its final later same-layer attention
-consumer, and insert an assigned same-layer attention cancel into the still-open
-batched pool. Continue to protect the selected target and graph inputs. An
-MLP-routed Add may surface an ordinary source to same-layer `cancel_bypass`, but
-an attention-mechanism cancel for that source must wait until the next layer
-because the attention phase has already passed. An attention-routed Add's
-ordinary non-input live source may likewise use same-layer `cancel_bypass` when
-its mechanism is MLP.
+No new heuristic cancel-surfacing machinery is needed for these bounds.
+Live/source occurrences of a reuse operation stay excluded from same-layer
+cancellation on both routes (the `add_into_live_addends` filters, extended
+to `add_into_bypass`), the selected target is protected by the reassign
+handoff, and graph inputs keep the gap-one rule. The one new same-layer
+case — an MLP-routed Add's fresh ordinary source dying at `L` with an
+MLP-mechanism cancel — flows through the existing mid-MLP-phase
+freshly-dead surfacing that every other MLP consumer already uses.
 
 ### Assignment derivation and warm-start cancellation metadata
 
@@ -686,13 +816,26 @@ Add one assignment-level placement derivation that accepts graph effective
 consumers plus complete `node_to_layer` and `node_to_routing` maps and returns,
 for every Add, `(reusable_0, reusable_1, reuse_input_index)`. It implements the
 physical-reassignability checks, sublayer-order predicate, and input-0 priority
-defined above. Use it in three places:
+defined above. The held target short-circuits to `(False, False, None)`,
+matching its pinned `is_free == 0`; the held source is never reusable. Use
+it in three places:
 
 - CP-SAT solution extraction, to check the still-live solver literals before
   discarding them.
 - Completion of a heuristic trace into `ScheduleAssignment`.
 - Directed replay, to establish the expected placement before comparing it
   with the residual map.
+
+This derivation is built in Step 2, with direct unit tests (including the
+held-target and held-source short-circuits), before the replay placement
+work consumes it. Coverage differs by call site: the directed-replay
+comparison runs on every compile, because all emission — including
+`optimize=0` — replays through the directed scheduler; the heuristic
+observed-versus-derived check runs whenever a heuristic trace is completed
+into an assignment; the extraction-time check needs live solver literals,
+so it runs only when CP-SAT actually solves — not at `optimize=0` and not
+on a schedule-cache hit. The replay-side tripwire is therefore a
+production check on every compile, not a test-only one.
 
 The heuristic tracking residual map must continue to omit a physical cancel
 when `reassign` ends an old value's ownership. After the heuristic trace has
@@ -714,7 +857,10 @@ occupancy end exactly where the Add's shifted ownership begins and makes the
 full heuristic hint feasible under both `_pin_cancels=True` and
 `_pin_cancels=False`. Do not leave a reassigned target at the generic
 `n_layers` default merely because `_TrackingResidualStreamMap.free` was never
-called.
+called. Update the `_TrackingResidualStreamMap` docstring in the same
+change: it currently says reassign-consumed nodes are "correctly omitted
+from the cancel hint," which stops being true once the canonical virtual
+layer is assigned.
 
 Make hint validation selector-aware. A complete layer/route hint determines
 the expected reuse target, so validate a target's virtual cancel layer against
@@ -754,6 +900,12 @@ metadata containing:
 - the selected attention placement's head demand once fresh versus reused is
   known.
 
+`SkipReason` now also carries the tied machinery's `"held output bank"`
+resource string; keep the Add-routing diagnostics distinguishable from a
+held-bank deadlock skip. The MLP-only held-handoff rejection (whose error
+names the identity-Linear workaround) must keep firing for MLP-only target
+*types*; a held-target Add is instead silently forced to `ATTN_ADD`.
+
 Classify a structural skip as a compiler misroute only when the selected route
 violates an eligibility constraint that its resolver was required to enforce,
 for example an MLP Add assigned despite `2 * width > usable_hidden_slots`.
@@ -785,9 +937,23 @@ are therefore:
 
 This uses existing public controls and does not add an Add-specific flag.
 
+The tied held-target pin is orthogonal to policy: under every configuration
+above, a held-target Add stays `ATTN_ADD` with fresh placement.
+
 Recommended decision:
 
 - Honor the existing documented policy instead of adding another flag.
+- Measure the flip before it ships (a Step 5 gate): compile the flagship
+  and representative example graphs under the historical configuration
+  (`LEGACY_POLICY`, plus `cpsat_flex_routing=False` on CP-SAT paths) and
+  under the new defaults, and compare layer counts, structural skips, and
+  CP-SAT solve wall time. A material regression is a stop-and-discuss
+  before the default lands, not a silent acceptance. If the flip is
+  rejected, the fallback — keep the static default attention-preferring
+  for Adds while retaining CP-SAT flex eligibility — keeps Add a policy
+  exception on the static path and therefore obligates changing the
+  `SchedulingPolicy` documentation in the same change; a silent
+  documentation-versus-implementation mismatch is not an option.
 - Document the two legacy configurations above wherever `LEGACY_POLICY` is
   advertised for Add routing.
 - Update schedule-count tests that intend to test the default policy.
@@ -797,10 +963,12 @@ Recommended decision:
 This compatibility decision must be called out in the implementation change
 and release notes. `LEGACY_POLICY` preserves the historical attention Add
 writers, deterministic first-reusable target selection, and graph-input reuse.
-It does not promise byte-identical cancellation micro-placement: the
-sublayer-correct cancellation rules in this plan intentionally replace the old
-blanket Add deferral where physical order permits an earlier cancel. CP-SAT may
-also choose different layers from the heuristic, as it already can today.
+It does not promise byte-identical whole schedules: CP-SAT may choose
+different layers from the heuristic, as it already can today. Cancellation
+micro-placement, however, is unchanged under `LEGACY_POLICY`: the
+conservative live-addend treatment stays (gap #2 remains open), and the new
+`L + 1` attention-cancel tightening applies only to MLP-routed Adds, which
+`LEGACY_POLICY` never produces.
 
 If byte-identical whole schedules are required, stop before implementation and
 introduce a separate compatibility mode that pins routing, placement, and
@@ -808,11 +976,13 @@ cancellation timing together; do not claim that `LEGACY_POLICY` alone provides
 that stronger guarantee.
 
 Schedule cache and graph fingerprints already include `flex_routing`, the
-scheduling policy, and a content hash of the compiler's Python sources. The
-implementation changes therefore invalidate old attention-only Add schedules
-without a manual generation bump; add a regression test for that assumption.
-Only bump the cache/schema format if the final design persists a new target
-field in `ScheduleAssignment` or otherwise changes serialized data.
+scheduling policy, a content hash of the compiler's Python sources, and the
+held source/target identities. The implementation changes therefore
+invalidate old attention-only Add schedules without a manual generation
+bump; add a regression test for that assumption. The CP-SAT snapshot schema
+is `FORMAT_VERSION = 2` (bumped for the held-bank contract); bump it to 3
+only if the final design persists a new target field in
+`ScheduleAssignment` or otherwise changes serialized data.
 
 ## Implementation sequence
 
@@ -823,19 +993,31 @@ only when heuristic and CP-SAT paths agree.
 
 - Add `ATTN_ADD` and `MLP_ADD` route families.
 - Remove Add's unresolved-but-complete conditional table entry.
-- Generalize static capacity-aware routing.
+- Generalize static capacity-aware routing, including the held-target Add
+  forcing to `ATTN_ADD` through the forced-classes mechanism. Order matters
+  inside this step: `resolve_static` rejects a forced class for a
+  conditional entry, so the conditional-entry removal must land before the
+  forcing can flow through `forced_classes`; the compile-side change is the
+  direct-handoff branch that currently lets `Attn` and `Add` targets
+  through untouched.
 - Retain per-route structural eligibility/elimination reasons for diagnostics;
   do not equate multiple candidates with a currently usable alternative.
 - Add Add demands to cost summaries.
-- Update realization-table and cost-summary unit tests.
+- Update realization-table and cost-summary unit tests, including tied
+  fixtures.
 
 Gate: realization tests prove that policy, geometry, and solver assignment
 admit the same Add route set; the static resolver and `flex_routing=False`
 model resolve the same route, while a flexible solve may choose either fitting
 candidate.
 
-### Step 2: MLP writer and replay records
+### Step 2: MLP writers, replay records, and directed replay placement
 
+- Build the assignment-level placement derivation (effective consumers plus
+  layer/route maps in, `(reusable_0, reusable_1, reuse_input_index)` out)
+  with direct unit tests, including the held-target and held-source
+  short-circuits. The replay placement below and the Step 3/4 tripwires all
+  consume it.
 - Add the two planned MLP operation types, second source field, and required
   occurrence-level `reuse_input_index` for `add_into_bypass`.
 - Add the same occurrence-level index to attention `add_into` records; require
@@ -845,6 +1027,11 @@ candidate.
   duplicate sources, while leaving a reused target occurrence's direct
   `compute_bias` write single-counted. For biased `add(x, x)`, use the reuse
   index to apply one direct target bias and one folded source bias.
+- Teach the directed replay to place both MLP Add operations in the
+  incremental MLP phase (slot packing, structural-skip recording); a
+  shortfall at the assigned layer surfaces through the replay-depth
+  tripwire. Because `optimize=0` replays every schedule, nothing in Step 3
+  ships without this.
 - Update slot counting, placement recording, and replay validation.
 - Test ReLU, Swish, self-add, noncontiguous source columns, biased sources,
   both reuse-index orientations, biased reused targets, and `bias=False`.
@@ -852,7 +1039,7 @@ candidate.
 Gate: direct writer tests match `a + b`, including deferred-bias contributions,
 without invoking the scheduler.
 
-### Step 3: Heuristic scheduling
+### Step 3: Heuristic scheduling (lands with Step 2's replay support)
 
 - Split ready Adds by resolved route.
 - Add MLP-phase placement and post-attention readiness.
@@ -861,22 +1048,29 @@ without invoking the scheduler.
   record every Add's observed placement in the heuristic trace, and assert
   that it matches assignment-level derivation before canonicalization.
 - Capture `compute_bias` targets before any MLP reassignment.
-- After an attention `add_into` source's final same-layer attention read,
-  explicitly surface an ordinary non-input source to its assigned attention or
-  MLP cancellation path; never surface the selected target.
+- Extend the `add_into_live_addends` same-layer cancel exclusion to
+  `add_into_bypass` live sources; never surface the selected target through
+  any cancel path.
 - Preserve graph-input reuse while retaining gap-one, attention-only
   cancellation for an ordinary graph-input source. Apply only the selected
-  target's no-cancel/virtual-`L + 1` exception.
+  target's no-cancel/virtual-`L + 1` exception. Keep the held source fully
+  excluded.
 - Execute the route-aware cancellation table for schedulable sources.
 - Preserve fixed-route deferral and structural fallback.
 - Add heuristic schedule and end-to-end parity tests.
 
 Gate: `optimize=0` compiles representative reused and fresh Adds with zero Add
 heads under the MLP policy, while `LEGACY_POLICY` retains attention Add ops.
+The gate exercises the directed replay implicitly — `optimize=0` emission
+runs through it, so the observed-versus-derived tripwire and the replay
+contract checks fire on every gate compile.
 
 ### Step 4: CP-SAT model and directed replay
 
 - Add route variables and capacity pins.
+- Preserve the held-target pins (`is_attn == 1`; `is_free == 0` without the
+  deadness biconditional) and the `_hinted_add_is_free` special case;
+  exclude the held source from every `reusable_i`.
 - Add per-addend reusable/target literals; make head capacity, MLP capacity,
   residual occupancy, physical cancel presence, and cancel timing route- and
   target-aware.
@@ -903,11 +1097,19 @@ and a low-`n_heads` graph becomes feasible by routing Adds to MLP.
 
 - Update `docs/cpsat_scheduler.md`, `docs/lowering_boundary_plan.md`, policy
   docstrings, and compile API descriptions.
+- Update the gap-#2 ledger entry in `docs/cpsat_scheduler.md` to note the
+  `add_into_live_addends` exclusion now also covers `add_into_bypass` live
+  sources, and update `docs/tied_embeddings_plan.md` for the held-target
+  Add forcing.
 - Update schedule diagnostics to distinguish Add heads and Add bypass slots,
   retain route-elimination reasons, and distinguish an actual resolver misroute
   from a fixed route that fits neither the selected placement nor its eliminated
   alternative.
 - Review schedule-count changes and label intentional default-policy changes.
+- Run the default-flip measurement from *Policy and compatibility decision*
+  (flagship and example graphs, historical versus new configuration; layer
+  counts, structural skips, solve wall time) and record the results in the
+  implementation change.
 - Run formatting and diff checks.
 - Run focused tests, then the full suite through `make test`.
 
@@ -950,20 +1152,21 @@ the documented legacy configurations.
 - Same-layer MLP consumer does not make an addend reusable.
 - When both addends are reusable, input 0 is the target on both routes.
 - A direct graph-input Add preserves historical target reuse.
+- A tied compile under the default MLP-preferring policy keeps the
+  held-target Add on `ATTN_ADD` with fresh placement into the bank.
+- The held Embedding is never selected as a reuse target on either route,
+  even when otherwise dead.
 - MLP slot exhaustion defers without spilling to attention.
 - `2 * width > usable_hidden_slots` resolves to attention.
 - An Add that fits neither MLP slots nor attention heads reports both structural
   resource failures.
 - `LEGACY_POLICY` emits the existing attention Add operations under
   `optimize=0`.
-- An attention-routed reusable Add whose ordinary non-input live source has no
-  later reader emits its assigned same-layer attention cancel, while the
-  selected target is never cancelled.
-- The same attention-routed reuse case emits same-layer `cancel_bypass` when
-  the live source is assigned an MLP cancel.
-- A live source shared with a later same-layer attention consumer is not
-  cancelled after the earlier `add_into`; it surfaces exactly after the final
-  read.
+- Live/source occurrences of `add_into` and `add_into_bypass` are excluded
+  from same-layer cancellation on both routes; the selected target is never
+  cancelled.
+- A fresh MLP-routed Add's ordinary source assigned a same-layer MLP cancel
+  flows through the existing mid-MLP freshly-dead surfacing.
 - Ordinary sources surface to attention or MLP cancellation without being
   freed before their final read.
 - A graph input used as an ordinary source of either attention- or MLP-routed
@@ -996,13 +1199,14 @@ the documented legacy configurations.
 - Verify an ordinary graph-input source has input cancel bound `L + 1` on both
   Add routes and in fresh and non-target-reused placements, while a selected
   graph-input target has no physical cancel and a virtual end at `L + 1`.
-- Force a reused attention Add's ordinary live source to an attention cancel
-  in the Add layer and verify directed replay emits it after the final
-  same-layer read without cancelling the target.
-- Repeat with that live source shared by a later same-layer attention consumer;
-  verify replay does not cancel it when the earlier `add_into` is placed and
-  does add it to the batch when placement of the later consumer establishes
-  death.
+- A corrupted assignment that gives an MLP-routed Add's source a same-layer
+  attention cancel trips contract check A2 at replay.
+- An assigned MLP Add facing a hidden-slot shortfall at its assigned layer
+  records a structural skip and trips the replay-depth tripwire.
+- The held-target Add stays `is_attn == 1`, `is_free == 0` under
+  `flex_routing=True`; the extraction tripwire and `_hinted_add_is_free`
+  both special-case it; the held source is rejected from every
+  `reusable_i`.
 - Verify a selected target has no physical cancel interval or cancel resource
   charge, has canonical non-MLP cancel metadata, has cancel bump zero, and its
   ownership interval hands off to the Add exactly at `layer[A] + 1`.
@@ -1036,7 +1240,9 @@ the documented legacy configurations.
   and show that MLP Add routing makes it feasible.
 - Compare recursive-oracle, heuristic, and directed-compile outputs.
 - Cover both ReLU and gated-Swish transformer machines.
-- Cover ONNX and HF export through the ordinary compile entry points.
+- Cover ONNX and HF export through the ordinary compile entry points — those
+  are always tied, so the output Add is the held target; route other Adds in
+  the graph to MLP.
 - Preserve historical attention Add writers, first-reusable target selection,
   and graph-input reuse under `LEGACY_POLICY` for `optimize=0`.
 - Preserve attention-only Add routing on CP-SAT with
@@ -1046,7 +1252,9 @@ the documented legacy configurations.
 
 The feature is complete when:
 
-1. Every fitting Add has attention and MLP route candidates.
+1. Every fitting Add has attention and MLP route candidates, except the tied
+   held target, which stays pinned to `ATTN_ADD` with fresh placement under
+   every policy and flex configuration.
 2. Route resolution happens before the layer walk and never changes during
    placement.
 3. Both MLP Add operations emit correct weights on ReLU and Swish machines.
@@ -1062,10 +1270,11 @@ The feature is complete when:
    its extracted layers/routes; every returned assignment then replays without
    route, fresh/reused, target, or cancellation disagreement.
 7. Resource accounting includes Add heads or Add MLP slots, never both, and
-   charges no phantom cancel for a reassigned target. Every ordinary non-input
-   `add_into` source can reach its assigned cancellation path after its final
-   same-layer read, while ordinary graph-input sources retain their gap-one,
-   attention-only cancellation contract.
+   charges no phantom cancel for a reassigned target. Live addends of either
+   route's reuse operation keep the conservative next-layer cancellation
+   contract (gap #2 stays open, its exclusion extended to
+   `add_into_bypass`), and ordinary graph-input sources retain their
+   gap-one, attention-only cancellation contract.
 8. Low-head configurations can use spare MLP capacity for Adds.
 9. An Add too wide for MLP routes to attention when that attention operation
    fits; a geometry where neither route fits fails with an explicit structural
@@ -1083,4 +1292,7 @@ The feature is complete when:
 13. An attention reuse result can feed an MLP reuse in the same layer with a
     zero-length intermediate residual interval and two verified ownership
     handoffs.
-14. Focused tests and the full `make test` suite pass.
+14. Tied compiles are untouched by Add routing: the held-target Add still
+    lands in the bank via `allocate_at` on the attention route with fresh
+    placement, and the held Embedding is never reassigned or MLP-cancelled.
+15. Focused tests and the full `make test` suite pass.

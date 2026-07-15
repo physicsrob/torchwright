@@ -12,7 +12,10 @@ from typing import Dict, List, Literal, Optional, Set, Tuple
 
 from torchwright.compiler.realization import (
     RealizationTable,
+    add_attn_heads,
+    class_hidden_slots,
     first_hidden_slot,
+    flex_route_classes,
     has_flex_choice,
     linear_attn_heads,
     usable_hidden_slots,
@@ -83,13 +86,15 @@ class SkipReason:
     amount of retrying helps.  A non-structural skip is an ordinary deadlock —
     this layer's budget is spent, or the residual stream is full right now.
 
-    Among structural skips, ``rerouteable`` separates the two causes.  When the
-    node has a second realization class (only a standalone ``Linear`` does
-    today: MLP bypass or attention transport), the resolver picked one that
-    cannot hold it and that is a compiler bug — the capacity check in
-    ``realization.static_flex_class`` exists to make this unreachable.  When it
-    does not, the node's only realization is too big for the geometry and the
-    graph cannot compile at this ``d`` / ``d_hidden``.
+    Among structural skips, ``misroute`` separates the two causes.  It is
+    True only when the *selected* realization violates the structural
+    eligibility bound its resolver was required to enforce — an
+    MLP-sublayer class wider than a whole layer's usable hidden pool
+    (``realization.fits_mlp`` exists to make that unreachable) — which is a
+    compiler bug.  Merely having another candidate family is not enough:
+    the alternative may be geometry-eliminated, or deliberately policy- or
+    solver-fixed.  ``alternative`` records the other route family's demand
+    and status so the deadlock message names both sides.
     """
 
     node: Node
@@ -100,7 +105,8 @@ class SkipReason:
     demand: int
     available: int  # free right now, this layer
     capacity: int  # the most a layer could ever supply
-    rerouteable: bool  # the node has a second realization class
+    misroute: bool  # the selected class violates resolver-enforced eligibility
+    alternative: Optional[str] = None  # the other route family's demand/status
 
     @property
     def structural(self) -> bool:
@@ -113,8 +119,12 @@ class SkipReason:
             f"via {self.op_label}: needs {self.demand} {self.resource}"
         )
         if not self.structural:
-            return f"{head}, {self.available} free this layer"
-        return f"{head}, but a layer holds at most {self.capacity}"
+            line = f"{head}, {self.available} free this layer"
+        else:
+            line = f"{head}, but a layer holds at most {self.capacity}"
+        if self.alternative:
+            line += f" [{self.alternative}]"
+        return line
 
 
 class LayerScheduler:
@@ -289,7 +299,7 @@ class LayerScheduler:
             seen.add(skip.node.node_id)
             if not skip.structural:
                 transient.append(skip)
-            elif skip.rerouteable:
+            elif skip.misroute:
                 misrouted.append(skip)
             else:
                 too_big.append(skip)
@@ -305,18 +315,18 @@ class LayerScheduler:
         # Structural skips are never truncated: each one is a distinct
         # unschedulable node, and the first is the one to act on.
         section(
-            "  COMPILER BUG — these nodes were routed to a sublayer that "
-            "cannot hold them, though another realization class could "
-            "(realization.static_flex_class should have made this "
-            "unreachable):",
+            "  COMPILER BUG — these nodes' resolved realization exceeds the "
+            "structural bound its resolver enforces "
+            "(realization.fits_mlp should have made this unreachable):",
             misrouted,
             limit=len(misrouted),
         )
         section(
-            f"  Too big for the geometry — these nodes have one realization "
-            f"class and it does not fit at d={self.d}, "
-            f"d_hidden={self.d_hidden}, d_head={self.d_head}. No schedule "
-            f"exists; the graph or the geometry has to change:",
+            f"  Too big for the geometry — no fitting realization remains "
+            f"for these nodes at d={self.d}, d_hidden={self.d_hidden}, "
+            f"d_head={self.d_head} (an alternative route's demand and "
+            f"status, where one exists, is bracketed). No schedule exists; "
+            f"the graph or the geometry has to change:",
             too_big,
             limit=len(too_big),
         )
@@ -337,6 +347,17 @@ class LayerScheduler:
         available: int,
         capacity: int,
     ) -> None:
+        # A structural skip is a resolver misroute only when the selected
+        # realization violates the bound its resolver had to enforce: an
+        # MLP-sublayer class needs its whole-layer slot demand to fit the
+        # usable pool (realization.fits_mlp).  A structural attention skip
+        # is a geometry/policy failure, never a misroute — no resolver
+        # enforces a per-node head bound.
+        misroute = (
+            demand > capacity
+            and resource == "MLP hidden slots"
+            and has_flex_choice(node)
+        )
         self._skips.append(
             SkipReason(
                 node,
@@ -345,9 +366,55 @@ class LayerScheduler:
                 demand,
                 available,
                 capacity,
-                rerouteable=has_flex_choice(node),
+                misroute=misroute,
+                alternative=self._route_alternative_note(node),
             )
         )
+
+    def _route_alternative_note(self, node: Node) -> Optional[str]:
+        """The other route family's demand and status, for skip diagnostics.
+
+        ``None`` for nodes without a route choice.  Never consults
+        liveness: an attention Add's head demand is reported as its
+        fresh/reused range because residual placement is not known at skip
+        time.
+        """
+        if not has_flex_choice(node):
+            return None
+        entry = self.realization_table.entries.get(node.node_id)
+        selected = entry.resolved if entry is not None else None
+        if selected is None:
+            return None
+        # The note states the alternative's demand and fit only; WHY it was
+        # not selected (geometry elimination, policy, solver choice, or a
+        # resolver bug) is the deadlock message's section classification.
+        attn_cls, mlp_cls = flex_route_classes(node)
+        if selected == attn_cls:
+            slots = class_hidden_slots(node, mlp_cls)
+            if slots > self.usable_hidden_slots:
+                return (
+                    f"alternative {mlp_cls} needs {slots} hidden slots, over "
+                    f"a layer's usable {self.usable_hidden_slots}"
+                )
+            return (
+                f"alternative {mlp_cls} fits: {slots} of "
+                f"{self.usable_hidden_slots} usable hidden slots"
+            )
+        if isinstance(node, Add):
+            lo = add_attn_heads(node, self.d_head, reused=True)
+            hi = add_attn_heads(node, self.d_head, reused=False)
+            demand = f"{lo}..{hi} heads"
+            over = lo > self.n_heads
+        else:
+            h = linear_attn_heads(node, self.d_head)
+            demand = f"{h} heads"
+            over = h > self.n_heads
+        if over:
+            return (
+                f"alternative {attn_cls} needs {demand}, over "
+                f"n_heads={self.n_heads}"
+            )
+        return f"alternative {attn_cls} fits: {demand} within n_heads={self.n_heads}"
 
     def _schedule_layer_inner(
         self, residual_map: ResidualStreamMap, computed_nodes: Set[Node]
@@ -578,8 +645,10 @@ class LayerScheduler:
             live_addend = a1 if d0 else a0
             n_heads = (len(live_addend) + self.d_head - 1) // self.d_head
             if heads_used + n_heads > self.n_heads:
-                # An add_into has no second realization class, so a structural
-                # skip here is terminal: nothing downstream can rescue it.
+                # The Add's route family is already resolved (attention); a
+                # structural skip here is terminal for this compile — the MLP
+                # family was geometry-eliminated or policy-/solver-fixed away,
+                # and the skip's alternative note records which.
                 self._record_skip(
                     add_node,
                     "add_into",

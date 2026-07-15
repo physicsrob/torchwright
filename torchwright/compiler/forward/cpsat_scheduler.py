@@ -44,7 +44,6 @@ from torchwright.compiler.realization import (
     CLASS_SUBLAYER,
     candidate_classes,
     has_flex_choice,
-    is_conditional,
     linear_attn_heads,
     static_flex_class,
 )
@@ -692,9 +691,13 @@ def routing(
     `flex_routing=True` and no standalone Linears); routing a Linear
     without it raises rather than guessing a sublayer.
     """
-    if is_conditional(node):
-        # Add: residual_reuse vs attn_copy is a schedule-state conditional,
-        # but both classes are attention-sublayer ops.
+    if isinstance(node, Add):
+        # Bridge until the model grows MLP-Add support (Step 4 of
+        # docs/plan_additional_mlp_routing.md): the CP-SAT path pins every
+        # Add to attention.  The static resolver already honours the
+        # routing policy for Adds; once the model builds MLP-Add intervals
+        # this branch is deleted and Adds flow through static_flex_class
+        # below like any other flexible node.
         return ATTN
     if has_flex_choice(node):
         # Standalone Linear: the policy pins the sublayer here, subject to
@@ -716,17 +719,19 @@ def is_flex(node: Node, gm: GraphModel) -> bool:
     """True iff this node's routing is a CP-SAT decision variable
     when `flex_routing=True`.
 
-    Exactly the nodes with a free realization choice
-    (`realization.has_flex_choice`) — today the standalone Linears: a
-    Linear can run in attention (`heads = ⌈d_input/d_head⌉`) or in MLP
-    bypass (`slots = 2 · d_output`).  The heuristic picks one statically
-    per policy; CP-SAT can pick per-node.
+    The nodes with a free realization choice
+    (`realization.has_flex_choice`): a standalone Linear can run in
+    attention (`heads = ⌈d_input/d_head⌉`) or in MLP bypass
+    (`slots = 2 · d_output`).  The heuristic picks one statically per
+    policy; CP-SAT can pick per-node.
 
-    `Attn` / `FFN` / `LiteralValue` stay locked (single candidate
-    class); `Add` is conditional, not flex — its class is decided by
-    schedule state (addend deadness), not by a free routing variable.
+    `Attn` / `FFN` / `LiteralValue` stay locked (single candidate class).
+    `Add` has a free route choice in the realization table but is not yet
+    flex-eligible here — a bridge until the model builds MLP-Add intervals
+    (Step 4 of docs/plan_additional_mlp_routing.md), when the isinstance
+    exclusion below is deleted.
     """
-    return has_flex_choice(node)
+    return has_flex_choice(node) and not isinstance(node, Add)
 
 
 def heads_for(node: Node, d_head: int) -> int:

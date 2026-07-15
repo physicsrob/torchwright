@@ -15,11 +15,11 @@ nothing keeping the two in agreement.
 
 The **realization table** is the one artifact recording every schedulable
 node's class.  Both resolvers write it; the layer walk only reads it.
-``Add`` gets an explicitly *conditional* entry — its class is determined
-by a predicate on schedule state (is an addend's column set dead when the
-walker reaches it?), which is discovered during placement (eager walk) or
-co-decided with layer assignment (the solve).  A conditional entry can
-represent that; it is not an unresolved entry.
+``Add`` resolves to a *route family* (``ATTN_ADD`` or ``MLP_ADD``) before
+the layer walk begins; the walk then chooses the operation within the
+family from addend liveness (a dead addend's columns are reused in place,
+or the output goes to fresh columns).  Residual placement is scheduler
+state, not a realization class (docs/plan_additional_mlp_routing.md).
 """
 
 from dataclasses import dataclass, replace
@@ -45,20 +45,21 @@ ATTN_HEADS = "attn_heads"
 MLP_COMPOSITE = "mlp_composite"
 #: A LiteralValue written by the MLP constant path.
 MLP_LITERAL = "mlp_literal"
-#: An Add reusing a dead addend's residual columns (add_into; one head for
-#: the live addend).
-RESIDUAL_REUSE = "residual_reuse"
-#: An Add copying both addends to fresh columns (compute_add; head(s) each).
-ATTN_COPY = "attn_copy"
+#: An Add on attention heads.  The layer walk picks the operation from
+#: addend liveness: reuse a dead addend's columns (add_into) or copy both
+#: addends to fresh columns (compute_add).
+ATTN_ADD = "attn_add"
+#: An Add in the MLP via the bypass identity (two hidden slots per output
+#: column).  Same liveness choice: add_into_bypass or compute_add_bypass.
+MLP_ADD = "mlp_add"
 
-#: Which sublayer each class occupies.  Both Add classes are attention ops
-#: (add_into and compute_add become planned attention operations).
+#: Which sublayer each class occupies.
 CLASS_SUBLAYER: Dict[str, str] = {
     ATTN_TRANSPORT: "attn",
     ATTN_HEADS: "attn",
-    RESIDUAL_REUSE: "attn",
-    ATTN_COPY: "attn",
+    ATTN_ADD: "attn",
     MLP_BYPASS: "mlp",
+    MLP_ADD: "mlp",
     MLP_COMPOSITE: "mlp",
     MLP_LITERAL: "mlp",
 }
@@ -69,7 +70,8 @@ def candidate_classes(node: Node) -> Tuple[str, ...]:
 
     THE single declaration of the option set.  A single-candidate result is
     the legitimate degenerate case (most node types have one obviously-right
-    hardware form); only the standalone ``Linear`` has a free choice today.
+    hardware form); the standalone ``Linear`` and the ``Add`` have a free
+    attention-versus-MLP route choice.
     """
     if isinstance(node, Attn):
         return (ATTN_HEADS,)
@@ -78,7 +80,7 @@ def candidate_classes(node: Node) -> Tuple[str, ...]:
     if isinstance(node, LiteralValue):
         return (MLP_LITERAL,)
     if isinstance(node, Add):
-        return (RESIDUAL_REUSE, ATTN_COPY)
+        return (ATTN_ADD, MLP_ADD)
     if isinstance(node, Linear):
         return (ATTN_TRANSPORT, MLP_BYPASS)
     raise TypeError(f"No realization classes for {type(node).__name__}")
@@ -89,18 +91,30 @@ def is_schedulable(node: Node) -> bool:
     return isinstance(node, (Attn, FFN, LiteralValue, Add, Linear))
 
 
-def is_conditional(node: Node) -> bool:
-    """True when the node's class is a predicate on schedule state, not a
-    free choice — exactly ``Add`` (residual_reuse iff an addend is dead at
-    schedule time)."""
-    return isinstance(node, Add)
-
-
 def has_flex_choice(node: Node) -> bool:
     """True when the node's class is a *free* choice a resolver must make
-    (a CP-SAT decision variable in the directed path) — exactly the
-    standalone ``Linear`` today."""
-    return not is_conditional(node) and len(candidate_classes(node)) > 1
+    (a CP-SAT decision variable in the directed path) — the standalone
+    ``Linear`` and the ``Add``."""
+    return len(candidate_classes(node)) > 1
+
+
+def flex_route_classes(node: Node) -> Tuple[str, str]:
+    """The (attention-family, MLP-family) candidate classes of a node with
+    a free routing choice.
+
+    Raises ``TypeError`` on nodes without exactly one candidate per
+    sublayer — the route resolvers and skip diagnostics may only call this
+    on :func:`has_flex_choice` nodes.
+    """
+    candidates = candidate_classes(node)
+    attn = [c for c in candidates if CLASS_SUBLAYER[c] == "attn"]
+    mlp = [c for c in candidates if CLASS_SUBLAYER[c] == "mlp"]
+    if len(attn) != 1 or len(mlp) != 1:
+        raise TypeError(
+            f"{type(node).__name__} has no attention/MLP route pair: "
+            f"candidates={candidates}"
+        )
+    return attn[0], mlp[0]
 
 
 def first_hidden_slot(bias: bool) -> int:
@@ -123,17 +137,19 @@ def usable_hidden_slots(d_hidden: int, bias: bool) -> int:
     return d_hidden - first_hidden_slot(bias)
 
 
-def fits_mlp_bypass(node: Node, usable_slots: int) -> bool:
-    """Whether *node* has an MLP-bypass realization at all under this geometry.
+def fits_mlp(node: Node, usable_slots: int) -> bool:
+    """Whether *node* has an MLP realization at all under this geometry.
 
-    The bypass identity ``act(z) − act(−z) = z`` spends two hidden slots per
-    output column, so a Linear whose ``2 · d_output`` exceeds a layer's entire
-    usable hidden pool can never be placed — not in this layer, not in any
-    layer, no matter how empty the MLP is.  That makes this a *structural*
-    property of the node and the geometry, unlike the scheduler's per-layer
-    "no slots left right now" check, which is transient.
+    Both MLP route families spend two hidden slots per output column (the
+    bypass identity ``act(z) − act(−z) = z``), so a node whose
+    ``2 · d_output`` exceeds a layer's entire usable hidden pool can never
+    be placed — not in this layer, not in any layer, no matter how empty
+    the MLP is.  That makes this a *structural* property of the node and
+    the geometry, unlike the scheduler's per-layer "no slots left right
+    now" check, which is transient.
     """
-    return class_hidden_slots(node, MLP_BYPASS) <= usable_slots
+    _, mlp_cls = flex_route_classes(node)
+    return class_hidden_slots(node, mlp_cls) <= usable_slots
 
 
 def static_flex_class(node: Node, policy: SchedulingPolicy, usable_slots: int) -> str:
@@ -141,22 +157,19 @@ def static_flex_class(node: Node, policy: SchedulingPolicy, usable_slots: int) -
     optimize=0 resolver and the CP-SAT model's pinned (``flex_routing=
     False``) routing apply.
 
-    Capacity is checked before policy.  A Linear too wide for the MLP bypass
-    (:func:`fits_mlp_bypass`) has exactly one realization left, so it goes to
-    attention transport whatever ``local_in_attention`` says; routing it to a
-    sublayer that cannot hold it deadlocks the eager walk and makes the CP-SAT
-    model infeasible.  Otherwise the policy decides: attention transport
+    Capacity is checked before policy.  A node too wide for its MLP family
+    (:func:`fits_mlp`) has exactly one realization left, so it goes to its
+    attention family whatever ``local_in_attention`` says; routing it to a
+    sublayer that cannot hold it deadlocks the eager walk and makes the
+    CP-SAT model infeasible.  Otherwise the policy decides: attention
     unless ``local_in_attention == "never"``.
     """
-    candidates = candidate_classes(node)
-    if not fits_mlp_bypass(node, usable_slots):
-        choice = ATTN_TRANSPORT
-    elif policy.local_in_attention != "never":
-        choice = ATTN_TRANSPORT
-    else:
-        choice = MLP_BYPASS
-    assert choice in candidates
-    return choice
+    attn_cls, mlp_cls = flex_route_classes(node)
+    if not fits_mlp(node, usable_slots):
+        return attn_cls
+    if policy.local_in_attention != "never":
+        return attn_cls
+    return mlp_cls
 
 
 # ---------------------------------------------------------------------------
@@ -262,27 +275,42 @@ def linear_attn_live_heads(node: Node, d_head: int) -> int:
     return len(_linear_live_attn_chunks(node, d_head))
 
 
+def add_attn_heads(node: Node, d_head: int, *, reused: bool) -> int:
+    """Attention-head demand of an ``ATTN_ADD`` at a known residual
+    placement.
+
+    Reused placement (``add_into``) copies the live addend into the dead
+    addend's columns: one head per ``d_head``-wide chunk.  Fresh placement
+    (``compute_add``) is charged the conservative model-level ``2 ×`` that;
+    the walk's emission can share one head when two chunks of the same Add
+    fit in a single ``d_head``.
+    """
+    h = (node.d_output + d_head - 1) // d_head
+    return h if reused else 2 * h
+
+
 def class_heads(node: Node, cls: str, d_head: int) -> int:
     """Attention-head demand of realizing *node* as *cls* (0 for MLP
-    classes).  Mirrors the CP-SAT model's accounting (``heads_for``): an
-    ``attn_copy`` Add is charged 2× the per-chunk unit count — the model-
-    level approximation; the walk's emission can share one head when two
-    chunks of the same Add fit in a single ``d_head``."""
+    classes).  ``ATTN_ADD`` demand depends on reused-versus-fresh residual
+    placement, which is scheduler state, not part of the class — callers
+    that know the placement use :func:`add_attn_heads`; callers that don't
+    report the range (see :func:`summarize_cost`)."""
     if cls == ATTN_HEADS:
         return (node.d_v + d_head - 1) // d_head
     if cls == ATTN_TRANSPORT:
         return linear_attn_heads(node, d_head)
-    if cls == RESIDUAL_REUSE:
-        return (node.d_output + d_head - 1) // d_head
-    if cls == ATTN_COPY:
-        return 2 * ((node.d_output + d_head - 1) // d_head)
+    if cls == ATTN_ADD:
+        raise ValueError(
+            "ATTN_ADD head demand depends on residual placement; call "
+            "add_attn_heads(node, d_head, reused=...) with the placement"
+        )
     return 0
 
 
 def class_hidden_slots(node: Node, cls: str) -> int:
     """MLP hidden-slot demand of realizing *node* as *cls* (0 for
     attention classes; a literal's constant write costs no hidden slot)."""
-    if cls == MLP_BYPASS:
+    if cls in (MLP_BYPASS, MLP_ADD):
         return 2 * node.d_output
     if cls == MLP_COMPOSITE:
         return node.n_lanes
@@ -294,15 +322,17 @@ class CostSummary:
     """Hardware demand read off a lowered graph *before* scheduling.
 
     Aggregated from the resolved realization table plus each class's
-    resource signature.  ``Add`` entries are conditional, so their head
-    demand is reported as the two bounds (every Add realized as
-    ``residual_reuse`` vs every Add as ``attn_copy``); the schedule lands
-    in between.  These are demand totals, not a layer count — placement
+    resource signature.  An attention-routed Add's head demand depends on
+    reused-versus-fresh residual placement (scheduler state), so it is
+    reported as the two bounds (every ``ATTN_ADD`` reused vs every
+    ``ATTN_ADD`` fresh); the schedule lands in between.  An MLP-routed Add
+    contributes hidden slots (2 per output column) to ``mlp_bypass_slots``
+    and no heads.  These are demand totals, not a layer count — placement
     (and the cancel heads it emits) is the scheduler's business.
     """
 
     nodes_by_class: Dict[str, int]
-    heads_by_class: Dict[str, int]  # resolved attention classes only
+    heads_by_class: Dict[str, int]  # fixed-demand attention classes only
     add_heads_if_all_reuse: int
     add_heads_if_all_copy: int
     mlp_bypass_slots: int
@@ -335,7 +365,7 @@ def summarize_cost(
     """Aggregate hardware demand over *nodes* under a resolved *table*.
 
     Raises :class:`UnresolvedRealizationError` if the table is incomplete
-    for the schedulable nodes (resolve first; conditional Adds are fine).
+    for the schedulable nodes (resolve first).
     """
     nodes = [n for n in nodes if is_schedulable(n)]
     table.check_complete(nodes)
@@ -344,20 +374,19 @@ def summarize_cost(
     add_reuse = add_copy = bypass_slots = lanes = 0
     for node in nodes:
         entry = table.entries[node.node_id]
-        if entry.conditional:
-            reuse_cls, copy_cls = entry.candidates
-            add_reuse += class_heads(node, reuse_cls, d_head)
-            add_copy += class_heads(node, copy_cls, d_head)
-            key = "|".join(entry.candidates)
-            nodes_by_class[key] = nodes_by_class.get(key, 0) + 1
-            continue
         cls = entry.resolved
         nodes_by_class[cls] = nodes_by_class.get(cls, 0) + 1
+        if cls == ATTN_ADD:
+            add_reuse += add_attn_heads(node, d_head, reused=True)
+            add_copy += add_attn_heads(node, d_head, reused=False)
+            continue
         h = class_heads(node, cls, d_head)
         if h:
             heads_by_class[cls] = heads_by_class.get(cls, 0) + h
-        bypass_slots += class_hidden_slots(node, cls) if cls == MLP_BYPASS else 0
-        lanes += class_hidden_slots(node, cls) if cls == MLP_COMPOSITE else 0
+        if cls in (MLP_BYPASS, MLP_ADD):
+            bypass_slots += class_hidden_slots(node, cls)
+        elif cls == MLP_COMPOSITE:
+            lanes += class_hidden_slots(node, cls)
     return CostSummary(
         nodes_by_class=nodes_by_class,
         heads_by_class=heads_by_class,
@@ -378,13 +407,10 @@ class Entry:
     """One node's realization record.
 
     ``resolved`` is the chosen class (None while unresolved).
-    ``conditional`` marks entries whose class is schedule-state-dependent
-    (Add); they are complete without being resolved.
     """
 
     candidates: Tuple[str, ...]
     resolved: Optional[str] = None
-    conditional: bool = False
 
 
 class UnresolvedRealizationError(RuntimeError):
@@ -411,17 +437,15 @@ class RealizationTable:
         """Unresolved table over the schedulable nodes of a graph.
 
         Single-candidate entries are born resolved (the degenerate case);
-        ``Add`` entries are born conditional; multi-candidate entries
-        (standalone Linears) are born unresolved.
+        multi-candidate entries (standalone Linears and Adds) are born
+        unresolved.
         """
         entries: Dict[int, Entry] = {}
         for node in nodes:
             if not is_schedulable(node):
                 continue
             candidates = candidate_classes(node)
-            if is_conditional(node):
-                entries[node.node_id] = Entry(candidates, conditional=True)
-            elif len(candidates) == 1:
+            if len(candidates) == 1:
                 entries[node.node_id] = Entry(candidates, resolved=candidates[0])
             else:
                 entries[node.node_id] = Entry(candidates)
@@ -439,10 +463,11 @@ class RealizationTable:
         """The optimize=0 resolver: :func:`static_flex_class` picks every free
         choice.
 
-        ``policy.local_in_attention == "never"`` routes standalone Linears to
-        the MLP bypass and anything else to attention transport — except that
-        a Linear too wide for a layer's usable hidden pool (``usable_slots``,
-        from :func:`usable_hidden_slots`) has no MLP realization and goes to
+        ``policy.local_in_attention == "never"`` routes flexible nodes
+        (standalone Linears, Adds) to their MLP families and anything else
+        to their attention families — except that a node too wide for a
+        layer's usable hidden pool (``usable_slots``, from
+        :func:`usable_hidden_slots`) has no MLP realization and goes to
         attention regardless.
 
         Takes *nodes* because the capacity check reads each unresolved node's
@@ -454,14 +479,13 @@ class RealizationTable:
         for node_id, entry in self.entries.items():
             forced = forced_classes.get(node_id)
             if forced is not None:
-                if entry.conditional or forced not in entry.candidates:
+                if forced not in entry.candidates:
                     raise UnresolvedRealizationError(
                         f"cannot force node {node_id} to realization {forced!r}; "
-                        f"candidates={entry.candidates}, "
-                        f"conditional={entry.conditional}"
+                        f"candidates={entry.candidates}"
                     )
                 resolved[node_id] = replace(entry, resolved=forced)
-            elif entry.resolved is None and not entry.conditional:
+            elif entry.resolved is None:
                 node = by_id.get(node_id)
                 if node is None:
                     raise UnresolvedRealizationError(
@@ -486,9 +510,6 @@ class RealizationTable:
         resolved: Dict[int, Entry] = {}
         for node_id, entry in self.entries.items():
             routing = node_to_routing.get(node_id)
-            if entry.conditional:
-                resolved[node_id] = entry
-                continue
             if entry.resolved is not None:
                 if routing is not None and CLASS_SUBLAYER[entry.resolved] != routing:
                     raise UnresolvedRealizationError(
@@ -534,8 +555,8 @@ class RealizationTable:
         return CLASS_SUBLAYER[self.resolved_class(node)] == "attn"
 
     def check_complete(self, nodes: Iterable[Node]) -> None:
-        """Every schedulable node has an entry that is resolved or
-        explicitly conditional.  Runs before the layer walk."""
+        """Every schedulable node has a resolved entry.  Runs before the
+        layer walk."""
         problems = []
         for node in nodes:
             if not is_schedulable(node):
@@ -543,7 +564,7 @@ class RealizationTable:
             entry = self.entries.get(node.node_id)
             if entry is None:
                 problems.append(f"{type(node).__name__} {node.node_id}: no entry")
-            elif entry.resolved is None and not entry.conditional:
+            elif entry.resolved is None:
                 problems.append(
                     f"{type(node).__name__} {node.node_id}: unresolved "
                     f"{entry.candidates}"

@@ -74,7 +74,7 @@ class NodeRecord:
     ``"Concatenate"``, ``"InputNode"``, ``"Embedding"``.  On reconstruction it
     selects the real graph class, so the builder's ``isinstance`` checks and
     the realization helpers (``candidate_classes`` / ``is_flex`` /
-    ``is_conditional``) resolve exactly as on the live node.
+    ``has_flex_choice``) resolve exactly as on the live node.
 
     The demand fields are what the builder reads off the node:
 

@@ -693,7 +693,9 @@ def _width_starved_out():
         li = Linear(x, torch.randn(4, 12), torch.zeros(12), name=f"L{i}")
         mas.append(Linear(li, torch.randn(12, 2), torch.zeros(2), name=f"Ma{i}"))
         mbs.append(Linear(li, torch.randn(12, 2), torch.zeros(2), name=f"Mb{i}"))
-    return Linear(Concatenate(mas + mbs), torch.randn(32, 4), torch.zeros(4), name="out")
+    return Linear(
+        Concatenate(mas + mbs), torch.randn(32, 4), torch.zeros(4), name="out"
+    )
 
 
 def test_no_progress_names_the_out_of_budget_nodes():
@@ -702,7 +704,10 @@ def test_no_progress_names_the_out_of_budget_nodes():
     many columns were actually free."""
     with pytest.raises(RuntimeError, match="No progress") as exc:
         forward_compile(
-            d=48, d_head=8, output_node=_width_starved_out(), device="cpu",
+            d=48,
+            d_head=8,
+            output_node=_width_starved_out(),
+            device="cpu",
             verbose=False,
         )
     msg = str(exc.value)
@@ -722,12 +727,21 @@ def test_no_progress_names_an_ffn_too_wide_for_the_mlp():
     torch.manual_seed(0)
     x = create_input("x", 4, value_range=(-1.0, 1.0))
     ffn = linear_relu_linear(
-        x, torch.randn(40, 4), torch.zeros(40),
-        torch.randn(40, 3), torch.zeros(3), name="fat",
+        x,
+        torch.randn(40, 4),
+        torch.zeros(40),
+        torch.randn(40, 3),
+        torch.zeros(3),
+        name="fat",
     )
     with pytest.raises(RuntimeError, match="No progress") as exc:
         forward_compile(
-            d=64, d_head=8, output_node=ffn, d_hidden=32, device="cpu", verbose=False,
+            d=64,
+            d_head=8,
+            output_node=ffn,
+            d_hidden=32,
+            device="cpu",
+            verbose=False,
         )
     msg = str(exc.value)
     assert "Too big for the geometry" in msg
@@ -743,12 +757,12 @@ def test_no_progress_calls_a_misrouted_linear_a_compiler_bug(monkeypatch):
     that is a compiler bug (D1), and the message has to say so rather than
     read like the geometry is too small.
 
-    Reached by defeating `fits_mlp_bypass`, the capacity check that makes this
+    Reached by defeating `fits_mlp`, the capacity check that makes this
     unreachable on the real code path.
     """
     from torchwright.compiler import realization
 
-    monkeypatch.setattr(realization, "fits_mlp_bypass", lambda node, usable: True)
+    monkeypatch.setattr(realization, "fits_mlp", lambda node, usable: True)
 
     torch.manual_seed(0)
     x = create_input("x", 4, value_range=(-1.0, 1.0))
@@ -757,7 +771,12 @@ def test_no_progress_calls_a_misrouted_linear_a_compiler_bug(monkeypatch):
 
     with pytest.raises(RuntimeError, match="No progress") as exc:
         forward_compile(
-            d=64, d_head=8, output_node=out, d_hidden=64, device="cpu", verbose=False,
+            d=64,
+            d_head=8,
+            output_node=out,
+            d_hidden=64,
+            device="cpu",
+            verbose=False,
         )
     msg = str(exc.value)
     assert "COMPILER BUG" in msg
@@ -771,7 +790,10 @@ def test_no_progress_truncation_says_how_many_it_dropped():
     transient section caps the list — and says what it left out."""
     with pytest.raises(RuntimeError, match="No progress") as exc:
         forward_compile(
-            d=48, d_head=8, output_node=_width_starved_out(), device="cpu",
+            d=48,
+            d_head=8,
+            output_node=_width_starved_out(),
+            device="cpu",
             verbose=False,
         )
     msg = str(exc.value)
