@@ -54,6 +54,7 @@ import torch
 from torchwright.graph import Attn, LiteralValue, Node, RopeConfig
 from torchwright.graph.asserts import assert_in_range
 from torchwright.ops._math import _N_BPS, _bisect_m, _theta_slow, _w_of_m
+from torchwright.ops.attention_ops import attend_causal_mean
 from torchwright.ops.relu.arithmetic_ops import piecewise_linear
 
 # ---------------------------------------------------------------------------
@@ -64,6 +65,8 @@ from torchwright.ops.relu.arithmetic_ops import piecewise_linear
 def global_position_from_bos(
     rope: RopeConfig,
     bos_indicator: Node,
+    *,
+    smoothed: bool = False,
 ) -> Node:
     """Approximate absolute position (0-indexed) via boosted-BOS attention.
 
@@ -75,18 +78,29 @@ def global_position_from_bos(
 
     A log-uniform PWL table (``_N_BPS`` entries) inverts w → m.
 
-    Precision: max error ~0.15 positions (PWL fitting ~0.009; fp32 softmax
-    ~0.006; fp32 ReLU accumulation in the PWL sum up to ~0.09 at small
-    positions — empirically measured in ``tests/ops/test_global_recency.py``),
-    still 3.3× below the 0.5 rounding threshold for integer recovery.
+    Precision: at SHORT rollouts (the lengths
+    ``tests/ops/test_global_recency.py`` measures) max error is ~0.15
+    positions (PWL fitting ~0.009; fp32 softmax ~0.006; fp32 ReLU
+    accumulation in the PWL sum up to ~0.09 at small positions).  At long
+    rollouts the fp32 evaluation of the PWL sum develops a deterministic
+    wander that grows with position — measured on the swiglu twin at
+    ±0.5 / ±9.2 / ±10.4 positions by 3.7k / 21k / 54k (see that module's
+    docstring) — so the "3.3× below the 0.5 rounding threshold" budget
+    holds only near the origin.  Pass ``smoothed=True`` (an exact uniform
+    causal mean of the recovery, ×2) when the position feeds ordering or
+    position-difference arithmetic at scale; it divides the wander by t at
+    the cost of one extra attention sublayer.
 
-    Compile cost: 1 attention head + 1 MLP sublayer (the PWL inversion).
+    Compile cost: 1 attention head + 1 MLP sublayer (the PWL inversion),
+    plus 1 attention head when ``smoothed=True``.
 
     Args:
         rope: RoPE config — ``d_head``, ``base``, ``max_positions``.
         bos_indicator: length-1 node; 1.0 at position 0 (BOS), 0.0 elsewhere.
             Derive from the BOS token's embedding one-hot or a graph-level
             indicator.
+        smoothed: return the mean-smoothed position instead of the raw
+            PWL recovery.
 
     Returns:
         length-1 node whose value at position m approximates m (float,
@@ -162,5 +176,17 @@ def global_position_from_bos(
         clamp=False,
         name="bos_weight_to_position",
     )
-    return assert_in_range(raw, 0.0, float(max_len), atol=0.1)
+    raw = assert_in_range(raw, 0.0, float(max_len), atol=0.1)
+    if not smoothed:
+        return raw
+
+    # 2 × exact uniform causal mean of the raw recovery — see the swiglu twin
+    # for the full rationale (the compiled PWL machine's fp32 wander grows
+    # with position; the mean divides it by t).  The generic convexity claim
+    # is skipped (raw's compiled values sit up to ~0.1 outside their claimed
+    # range at position 0); the closing atol covers the measured envelope.
+    smoothed_pos = attend_causal_mean(
+        rope, raw, output_scale=2.0, claim_range=False
+    )
+    return assert_in_range(smoothed_pos, 0.0, float(max_len), atol=8.0)
 

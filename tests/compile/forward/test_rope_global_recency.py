@@ -215,3 +215,61 @@ def test_partial_prefill_equals_cached_decode():
         full[:8],
         torch.tensor(decoded)[:8],
     )
+
+
+def test_smoothed_position_compiled_partial_rotary():
+    """``global_position_from_bos(smoothed=True)`` on the compiled path.
+
+    The smoothed position is 2 × an exact uniform causal mean of the raw
+    recovery (zero-Q/K head, ×2 folded into O).  It must track t and keep
+    its adjacent steps near 1 — the property the recency tiebreak's
+    softmax hardness rides on (the raw recovery's compiled fp32 wander
+    breaks this at long rollouts; see the op docstring).
+    """
+    rope = create_rope_config(
+        d_head=D_HEAD_PARTIAL, max_positions=CAP, d_rot=D_ROT_PARTIAL
+    )
+    bos_ind = create_input("bos", 1)
+    pos = global_position_from_bos(rope, bos_ind, smoothed=True)
+
+    n = 192
+    bos = torch.zeros(n, 1)
+    bos[0, 0] = 1.0
+    m = compile_headless(pos, d=2048, d_head=D_HEAD_PARTIAL, verbose=False)
+    out = m(_pack(m, {"bos": bos}, n).to(m._net.device)).reshape(-1).cpu()
+
+    t = torch.arange(n, dtype=out.dtype)
+    assert float((out - t).abs().max()) < 0.5, (
+        f"max |pos - t| = {float((out - t).abs().max()):.4f}"
+    )
+    steps = out[1:] - out[:-1]
+    assert float(steps.min()) > 0.8, f"min step {float(steps.min()):.4f}"
+    assert float(steps.max()) < 1.2, f"max step {float(steps.max()):.4f}"
+
+
+def test_smoothed_position_prefill_equals_cached_decode():
+    """Smoothed position parity between prefill and unbounded cached decode."""
+    rope = create_rope_config(
+        d_head=D_HEAD_PARTIAL, max_positions=CAP, d_rot=D_ROT_PARTIAL
+    )
+    bos_ind = create_input("bos", 1)
+    pos = global_position_from_bos(rope, bos_ind, smoothed=True)
+
+    n = 96
+    bos = torch.zeros(n, 1)
+    bos[0, 0] = 1.0
+    m = compile_headless(pos, d=2048, d_head=D_HEAD_PARTIAL, verbose=False)
+    device = m._net.device
+
+    full = m(_pack(m, {"bos": bos}, n).to(device)).reshape(-1).cpu()
+    past = m.empty_past()
+    decoded = []
+    for t in range(n):
+        row = _pack(m, {"bos": bos[t : t + 1]}, 1).to(device)
+        out_t, past = m.step(row, past)
+        decoded.append(out_t.reshape(-1).item())
+
+    assert torch.allclose(full, torch.tensor(decoded), atol=0.25), (
+        full[:8],
+        torch.tensor(decoded)[:8],
+    )

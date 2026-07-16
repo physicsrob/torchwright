@@ -31,6 +31,7 @@ from torchwright.ops.attention_ops import (
     attend_argmin_above_integer,
     attend_argmin_above_in_bucket,
     attend_argmin_unmasked,
+    attend_causal_mean,
     attend_mean_where,
     _QUERY_GAIN,
     _VALIDITY_BONUS,
@@ -365,6 +366,62 @@ def test_attend_mean_where_all_valid_uniform():
     assert abs(result[1].item() - 6.0) < 0.1
     assert abs(result[2].item() - 8.0) < 0.1
     assert abs(result[3].item() - 10.0) < 0.1
+
+
+# ---------------------------------------------------------------------------
+# attend_causal_mean
+# ---------------------------------------------------------------------------
+
+
+def test_attend_causal_mean_is_exact_cumulative_mean():
+    """Zero-Q/K logits make the softmax an exact uniform 1/(t+1)."""
+    rope = _rope()
+    value = InputNode("value", 2, value_range=(-100.0, 100.0))
+    out = attend_causal_mean(rope, value)
+
+    n_pos = 16
+    torch.manual_seed(3)
+    value_in = torch.randn(n_pos, 2) * 50.0
+    result = _run(out, n_pos, value=value_in)
+    expected = torch.cumsum(value_in, dim=0) / torch.arange(
+        1, n_pos + 1
+    ).unsqueeze(1)
+    assert torch.allclose(result, expected, atol=1e-4), (
+        f"max err {(result - expected).abs().max()}"
+    )
+
+
+def test_attend_causal_mean_exact_under_full_rotary():
+    """The exactness is layout-proof: rotating zero Q/K vectors is a no-op,
+    so full rotary gives the same exact uniform mean as partial (the
+    distinction that makes attend_mean_where only quasi-uniform there)."""
+    rope_full = create_rope_config(d_head=64, max_positions=4096)  # d_rot = d_head
+    value = InputNode("value", 1, value_range=(-100.0, 100.0))
+    out = attend_causal_mean(rope_full, value)
+
+    n_pos = 64
+    value_in = torch.linspace(-100.0, 100.0, n_pos).unsqueeze(1)
+    result = _run(out, n_pos, value=value_in)
+    expected = torch.cumsum(value_in, dim=0) / torch.arange(
+        1, n_pos + 1
+    ).unsqueeze(1)
+    assert torch.allclose(result, expected, atol=1e-4), (
+        f"max err {(result - expected).abs().max()}"
+    )
+
+
+def test_attend_causal_mean_output_scale_folds_into_o():
+    """output_scale multiplies the mean without an extra graph op."""
+    rope = _rope()
+    value = InputNode("value", 1, value_range=(0.0, 100.0))
+    out = attend_causal_mean(rope, value, output_scale=2.0)
+
+    n_pos = 8
+    value_in = torch.arange(n_pos, dtype=torch.float32).unsqueeze(1)
+    result = _run(out, n_pos, value=value_in)
+    # 2 * mean(0..t) = t exactly — the smoothed-position identity.
+    expected = torch.arange(n_pos, dtype=torch.float32).unsqueeze(1)
+    assert torch.allclose(result, expected, atol=1e-4), result.squeeze()
 
 
 # ---------------------------------------------------------------------------

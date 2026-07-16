@@ -24,6 +24,7 @@ import torch
 
 from torchwright.graph import Attn, LiteralValue, Node, RopeConfig
 from torchwright.graph.asserts import assert_in_range
+from torchwright.ops.attention_ops import attend_causal_mean
 from torchwright.ops.const import scale
 from torchwright.ops._math import (
     _N_BPS,
@@ -37,6 +38,8 @@ from torchwright.ops.swiglu.arithmetic_ops import piecewise_linear
 def global_position_from_bos(
     rope: RopeConfig,
     bos_indicator: Node,
+    *,
+    smoothed: bool = False,
 ) -> Node:
     """Approximate absolute position (0-indexed) via boosted-BOS attention.
 
@@ -51,10 +54,35 @@ def global_position_from_bos(
     w → m.  See the relu twin for the full mechanism notes; everything
     but the inversion's activation is identical.
 
+    **Raw error envelope at long positions.**  The inversion table's design
+    error is ≤ 0.01 positions, but the compiled fp32 evaluation of the PWL
+    machine develops a deterministic, bit-stable wander that grows with
+    position: measured ±0.5 at 3.7k, ±9.2 at 21k, ±10.4 at 54k positions
+    (GPU probe, d_head=128 / d_rot=64 / cap 65,536; identical across
+    packing widths and reruns).  The wander is locally smooth — adjacent
+    steps stay positive but dip to ~0.53 — so it cancels in short-baseline
+    position differences and preserves ordering, while long-baseline
+    differences and per-step margins degrade with rollout length.
+
+    **``smoothed=True``.**  Feeds the raw recovery through an exact uniform
+    causal mean (:func:`~torchwright.ops.attention_ops.attend_causal_mean`)
+    with the ×2 rescale folded into the O projection:
+
+        smoothed(t) = 2 · mean(raw[0..t]) ≈ t
+
+    The mean divides the wander by t: measured adjacent steps ≥ 0.965 at
+    54k positions (vs 0.53 raw), absolute error ~±1.7 (vs ±10.4), and the
+    head's own fp32 accumulation ≤ 0.03.  Costs one extra attention
+    sublayer on every consumer's dependency chain.  Prefer it whenever the
+    position feeds an ordering (recency tiebreaks) or position-difference
+    arithmetic at rollout lengths past a few thousand.
+
     Args:
         rope: RoPE config — ``d_head``, ``base``, ``max_positions``.
         bos_indicator: length-1 node; 1.0 at position 0 (BOS), 0.0
             elsewhere.
+        smoothed: return the mean-smoothed position instead of the raw
+            PWL recovery.
 
     Returns:
         length-1 node whose value at position m approximates m (float,
@@ -130,4 +158,18 @@ def global_position_from_bos(
         input_scale=input_scale,
         name="bos_weight_to_position",
     )
-    return assert_in_range(raw, 0.0, float(max_len), atol=0.1)
+    raw = assert_in_range(raw, 0.0, float(max_len), atol=0.1)
+    if not smoothed:
+        return raw
+
+    # 2 × exact uniform causal mean of the raw recovery: the fp32 wander is
+    # divided by t while the ideal value stays ≈ t (mean(0..t) = t/2).  The
+    # generic convexity claim is skipped (raw's compiled values sit up to
+    # ~0.1 outside their claimed range at position 0 — its own assert slack);
+    # the closing claim's atol covers the measured envelope: 2×|running-mean
+    # bias| ≈ ±1.7 at 54k plus the mean head's own fp32 error ≤ 0.03, and
+    # the top end exceeds max_len by 2×bias when the rollout fills the cap.
+    smoothed_pos = attend_causal_mean(
+        rope, raw, output_scale=2.0, claim_range=False
+    )
+    return assert_in_range(smoothed_pos, 0.0, float(max_len), atol=8.0)

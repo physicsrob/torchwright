@@ -756,6 +756,86 @@ def attend_mean_where(
     return attn
 
 
+def attend_causal_mean(
+    rope: RopeConfig,
+    value: Node,
+    *,
+    output_scale: float = 1.0,
+    claim_range: bool = True,
+) -> Node:
+    """Uniform mean of ``value`` over ALL causally-visible positions.
+
+    At each query position t, returns ``output_scale`` times the uniform
+    average of ``value`` over positions 0..t (the current position included).
+    Every position always participates — there is no validity signal; use
+    :func:`attend_mean_where` to average a subset.
+
+    **Exactly uniform on every rotary layout.**  The Q and K projection
+    matrices are entirely zero, so every pre-softmax logit is exactly 0 —
+    the rotation of a zero vector is zero — and the softmax is an exact
+    ``1/(t+1)`` under full rotary, partial rotary, and any ``d_rot``.  This
+    is stronger than :func:`attend_mean_where` with a constant-true
+    validity, whose relocated validity column is exactly position-free only
+    under partial rotary (on the NoPE tail) and merely quasi-static under
+    full rotary.
+
+    ``output_scale`` folds a scalar multiply into the O projection — e.g.
+    the smoothed global position (``global_position_from_bos(...,
+    smoothed=True)``) uses ``output_scale=2.0`` so ``2 × mean(0..t) ≈ t``
+    costs no extra sublayer.
+
+    Compile cost: one attention head (auto-split across multiple physical
+    heads when ``d_v > d_head``).  ``d_qk = rope.d_head``, ``d_v = len(value)``.
+
+    Args:
+        rope: RoPE config (``d_head`` / ``d_rot`` / ``base``) — fixes the
+            head geometry; the zero projections make the output independent
+            of it.
+        value: node to average.  No width constraint.
+        output_scale: scalar folded into the output projection.
+        claim_range: promote the value's (scaled) range claim onto the
+            output.  Pass ``False`` when the input's compiled values are
+            allowed to sit slightly outside their claimed range (an assert
+            slack the convexity claim cannot see) and attach a caller-side
+            claim with a justified tolerance instead.
+
+    Returns:
+        Attn node of width ``len(value)`` equal to ``output_scale`` times the
+        uniform causal mean of ``value``.
+
+    See also:
+        :func:`attend_mean_where` — validity-selected mean (one subset).
+    """
+    query_one = LiteralValue(torch.tensor([1.0]), name="causal_mean_query_one")
+    d_v = len(value)
+    attn = Attn(
+        query_in=query_one,
+        key_in=query_one,
+        value_in=value,
+        query_matrix=torch.zeros((1, rope.d_head)),
+        key_matrix=torch.zeros((1, rope.d_head)),
+        value_matrix=torch.eye(d_v),
+        output_matrix=output_scale * torch.eye(d_v),
+        rope_base=rope.base,
+        rope_d_rot=rope.d_rot,
+    )
+    # Convexity promotes the value's range claim, scaled by output_scale
+    # (positive scale assumed for the lo/hi order).  The atol scales with the
+    # output: the mean's own fp32 accumulation error grows with value
+    # magnitude and count (measured ~1.5e-2 on position-scale values at 54k
+    # positions), but the claim only binds at the range ends, where the mean
+    # sits only when nearly every averaged value does.
+    r = value.value_type.value_range
+    if claim_range and output_scale > 0 and math.isfinite(r.lo) and math.isfinite(r.hi):
+        return assert_in_range(
+            attn,
+            output_scale * r.lo,
+            output_scale * r.hi,
+            atol=_HARD_SELECTION_ATOL * max(1.0, output_scale),
+        )
+    return attn
+
+
 def attend_argmax_dot(
     rope: RopeConfig,
     query_vector: Node,
