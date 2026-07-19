@@ -1,13 +1,13 @@
 # Auto-discover compilable examples (those defining create_network_parts)
 COMPILABLE := $(shell grep -rl 'def create_network_parts' examples/*.py \
     | sed 's|examples/||; s|\.py||')
-ONNX_FILES := $(addsuffix .onnx, $(COMPILABLE))
+HF_BUNDLES := $(addsuffix _hf_bundle/model.safetensors.index.json, $(COMPILABLE))
 
 .PHONY: compile
-compile: $(ONNX_FILES)
+compile: $(HF_BUNDLES)
 
-%.onnx: examples/%.py examples/compile.py torchwright/compiler/*.py torchwright/graph/*.py
-	uv run python -m examples.compile $*
+%_hf_bundle/model.safetensors.index.json: examples/%.py examples/compile.py torchwright/compiler/*.py torchwright/graph/*.py
+	uv run python -m examples.compile $* --no-demo
 
 .PHONY: lint
 lint:

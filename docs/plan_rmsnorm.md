@@ -57,7 +57,8 @@ value is faithfulness/credibility: today the compiler emits "no normalization
 anywhere," and a skeptical reader sees that as skipping the hard parts.
 
 **This gap was shipped and explicit (the motivation for this work).**
-`examples/calculator_hf_export.py` publishes the compiled calculator as a
+The calculator HF export (then `examples/calculator_hf_export.py`, since
+generalized into `examples/compile.py`) publishes the compiled calculator as a
 HuggingFace model whose card claims it is "a *bona fide* standard transformer,
 not a bespoke runtime" — yet before this branch the shipped model code and config
 both documented **"No normalization anywhere; no final norm"** as a correctness

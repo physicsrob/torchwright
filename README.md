@@ -37,14 +37,16 @@ integers up to 3 digits. Subtraction handles negative results; multiplication
 uses long multiplication with partial product rows. Compiles to 38 layers with
 d=2048.
 
-Both examples can be compiled to ONNX for portable inference:
+Every example compiles into a published Hugging Face bundle — a stock Phi-3
+`transformers` model loadable with ordinary `AutoModelForCausalLM`, no custom
+code and no `trust_remote_code`, with ONNX nowhere in the pipeline:
 
 ```bash
-make compile     # produces adder.onnx and calculator_simple.onnx
+make compile     # every example -> <name>_hf_bundle/ with a model card
+uv run python -m examples.compile calculator_simple   # one bundle + clean-room demo
 ```
 
-Hugging Face is a sibling compile target and does not use ONNX as an
-intermediate artifact:
+The same target is available in-process:
 
 ```python
 from torchwright.compiler import compile_to_hf, compile_hf_bundle

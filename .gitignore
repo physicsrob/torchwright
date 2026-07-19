@@ -10,3 +10,4 @@ __pycache__
 .claude/worktrees/
 .python-version
 .codex
+*_hf_bundle/

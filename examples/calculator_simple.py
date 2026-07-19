@@ -62,6 +62,11 @@ __all__ = [
     "create_network_parts",
 ]
 
+# Model-card fields consumed by ``examples.compile`` when publishing this
+# example as a Hugging Face bundle.
+CARD_TASK = "a computation graph for integer arithmetic (`A op B` with `op` in `+ - *`)"
+DEMO_PROMPTS = ["12*34\n", "7+8\n", "100-99\n", "123*4\n"]
+
 
 # ---------------------------------------------------------------------------
 # The shared shape: a lookup table threaded by a state fold.
