@@ -6,11 +6,7 @@
       3,
       4,
       6,
-      8,
-      12,
-      16,
-      24,
-      32
+      8
     ],
     "model_digit_sweep": [
       1,
@@ -59,26 +55,6 @@
           "n": 8,
           "depth": 8,
           "neurons": 3000
-        },
-        {
-          "n": 12,
-          "depth": 12,
-          "neurons": 4600
-        },
-        {
-          "n": 16,
-          "depth": 16,
-          "neurons": 6200
-        },
-        {
-          "n": 24,
-          "depth": 24,
-          "neurons": 9400
-        },
-        {
-          "n": 32,
-          "depth": 32,
-          "neurons": 12600
         }
       ],
       "subtract": [
@@ -111,26 +87,6 @@
           "n": 8,
           "depth": 8,
           "neurons": 3000
-        },
-        {
-          "n": 12,
-          "depth": 12,
-          "neurons": 4600
-        },
-        {
-          "n": 16,
-          "depth": 16,
-          "neurons": 6200
-        },
-        {
-          "n": 24,
-          "depth": 24,
-          "neurons": 9400
-        },
-        {
-          "n": 32,
-          "depth": 32,
-          "neurons": 12600
         }
       ],
       "multiply": [
@@ -163,16 +119,6 @@
           "n": 8,
           "depth": 17,
           "neurons": 16704
-        },
-        {
-          "n": 12,
-          "depth": 25,
-          "neurons": 37536
-        },
-        {
-          "n": 16,
-          "depth": 33,
-          "neurons": 66688
         }
       ]
     },
@@ -207,26 +153,6 @@
           "n": 8,
           "depth": 5,
           "neurons": 2426
-        },
-        {
-          "n": 12,
-          "depth": 6,
-          "neurons": 3761
-        },
-        {
-          "n": 16,
-          "depth": 6,
-          "neurons": 5105
-        },
-        {
-          "n": 24,
-          "depth": 7,
-          "neurons": 7856
-        },
-        {
-          "n": 32,
-          "depth": 7,
-          "neurons": 10616
         }
       ],
       "subtract": [
@@ -259,26 +185,6 @@
           "n": 8,
           "depth": 5,
           "neurons": 2426
-        },
-        {
-          "n": 12,
-          "depth": 6,
-          "neurons": 3761
-        },
-        {
-          "n": 16,
-          "depth": 6,
-          "neurons": 5105
-        },
-        {
-          "n": 24,
-          "depth": 7,
-          "neurons": 7856
-        },
-        {
-          "n": 32,
-          "depth": 7,
-          "neurons": 10616
         }
       ],
       "multiply": [
@@ -311,16 +217,6 @@
           "n": 8,
           "depth": 9,
           "neurons": 30705
-        },
-        {
-          "n": 12,
-          "depth": 10,
-          "neurons": 51056
-        },
-        {
-          "n": 16,
-          "depth": 10,
-          "neurons": 87416
         }
       ]
     },
@@ -355,11 +251,6 @@
           "n": 8,
           "depth": 7,
           "neurons": 5396
-        },
-        {
-          "n": 12,
-          "depth": 7,
-          "neurons": 9660
         }
       ],
       "subtract": [
@@ -392,11 +283,6 @@
           "n": 8,
           "depth": 7,
           "neurons": 8819
-        },
-        {
-          "n": 12,
-          "depth": 7,
-          "neurons": 15479
         }
       ],
       "multiply": [
@@ -438,64 +324,64 @@
       {
         "n": 1,
         "depth": 13,
-        "neurons": 2229
+        "neurons": 2283
       },
       {
         "n": 2,
         "depth": 20,
-        "neurons": 5464
+        "neurons": 5528
       },
       {
         "n": 3,
         "depth": 27,
-        "neurons": 9748
+        "neurons": 9822
       },
       {
         "n": 4,
         "depth": 34,
-        "neurons": 15096
+        "neurons": 15180
       },
       {
         "n": 5,
         "depth": 41,
-        "neurons": 21508
+        "neurons": 21602
       },
       {
         "n": 6,
         "depth": 48,
-        "neurons": 28984
+        "neurons": 29088
       }
     ],
     "advanced": [
       {
         "n": 1,
         "depth": 13,
-        "neurons": 2461
+        "neurons": 2515
       },
       {
         "n": 2,
         "depth": 22,
-        "neurons": 7244
+        "neurons": 7308
       },
       {
         "n": 3,
         "depth": 29,
-        "neurons": 11992
+        "neurons": 12066
       },
       {
         "n": 4,
         "depth": 35,
-        "neurons": 17502
+        "neurons": 17586
       },
       {
         "n": 5,
         "depth": 42,
-        "neurons": 23774
+        "neurons": 23868
       },
       {
         "n": 6,
         "depth": 48,
-        "neurons": 30808
+        "neurons": 30912
       }
     ],
     "scratchpad": [
