@@ -3,10 +3,11 @@
 ``calculator_simple`` and ``calculator_advanced`` compute ``A op B`` (``+ - *``,
 one-hot digits) with the serial carry/borrow/comparison work folded *inside the
 graph*.  That fold is a chain of computed nodes, so the compiled model's depth
-grows linearly with ``max_digits`` — and a separate measurement showed the
-sliding-window operand parser (``NumericSequence``) is itself ``O(n)`` depth and
-dominates, so even ``calculator_advanced``'s ``O(log n)`` arithmetic does not
-make the *model* flat.
+grows linearly with ``max_digits``.  (The operand parse used to be a second
+``O(n)`` chain — the ``NumericSequence`` sliding window — stacked on top; the
+shared ``parse_expression`` is now a constant-depth pointer-gather parse, so
+what keeps those variants linear is their in-graph serial work: the
+arithmetic folds, the shared comparison, and the leading-zero trim.)
 
 This variant moves every serial recurrence off the *layer* axis and onto the
 *decode-step* axis: the carry sweep, the borrow sweep, the comparison, and the
@@ -28,11 +29,13 @@ token re-quantizes the state to an exact one-hot so approximation noise cannot
 accumulate across columns.  ``examples/fibonacci.py`` is the precedent that
 reads its own emitted tokens; this generalizes that pattern to three ops.
 
-**Operands must be fixed-width, zero-padded to ``max_digits``** (e.g.
-``007+013\\n``).  That is what makes the parse ``O(1)``: operand digit ``i`` sits
-at a fixed offset from the newline, read directly with ``attend_to_offset`` and
-latched — no sliding window.  Mirrors ``fibonacci``'s fixed-width-block
-discipline.
+Operands are variable-width — the same ``"A op B\\n"`` prompts the other two
+calculators accept, no zero-padding required.  The parse is the shared
+:func:`examples._calculator_common.parse_expression`: each prompt digit
+carries a one-hot key of its index within its operand, and each window slot
+reads the digit it needs with one pointer attention (an
+``IndexedRegion`` gather, defaulting to ``"0"`` for the pad columns), so the
+parse is ``O(1)`` depth at any operand width.
 
 The *answer* is trimmed (no leading zeros, MSB-first), even though the column
 arithmetic is fixed-width.  Each fixed-width answer digit is derived **once**
@@ -50,7 +53,7 @@ cheap attention off a region derived once.
 
 Token protocol (rendered)::
 
-    007*013\\n  <THINKING>⁰ ⁰ ... 9 1 ... ₀ ₁ ...</THINKING>91
+    7*13\\n  <THINKING>⁰ ⁰ ... 9 1 ... ₀ ₁ ...</THINKING>91
                          │       │       │             └ trimmed answer (MSB-first) ┘
                          │       │       └ normalization sweep (MSB-first count) ┘
                          │       └ scratch digits (fixed-width answer, MSB-first) ┘
@@ -91,7 +94,6 @@ from torchwright.ops.inout_nodes import (
 )
 from torchwright.ops.swiglu.logic_ops import (
     bool_all_true,
-    bool_any_true,
     bool_not,
     cond_gate,
     equals_vector,
@@ -115,6 +117,7 @@ from examples._calculator_common import (
     _LESS,
     _slice,
     _state,
+    parse_expression,
 )
 
 # The dispatch computes all three streamed ops in parallel; each carry/borrow
@@ -948,7 +951,10 @@ def create_network_parts(
 ) -> Tuple[Node, Embedding]:
     """Build the scratchpad calculator graph: parse, three streamed ops, dispatch.
 
-    Each op builds its own full token list; the lists are padded to a common
+    The parse is the shared constant-depth
+    :func:`examples._calculator_common.parse_expression` (variable-width
+    operands, same prompts as the other two calculators).  Each op builds its
+    own full token list; the lists are padded to a common
     length with ``<eos>`` and dispatched per-position by the latched operator
     flags (exactly ``_calculator_common.build_calculator``'s pattern).  The
     operator is latched, so the same op is selected at every decode position —
@@ -969,7 +975,9 @@ def create_network_parts(
     # pos.get_position_scalar()).  max_gap is the longest padded transcript.
     steps_since = _steps_since_newline(rope, embedding, max_gap=decode_steps(n) + 2)
 
-    A, B, is_plus, is_minus, is_times, saw_newline = _parse(rope, embedding, n)
+    A, B, is_plus, is_minus, is_times, saw_newline = parse_expression(
+        rope, embedding, n
+    )
 
     seqs = [
         _assemble(embedding, *op(rope, embedding, A, B, n, steps_since))
@@ -994,61 +1002,3 @@ def create_network_parts(
         embedding.get_embedding(" "),
     )
     return output_node, embedding
-
-
-# ---------------------------------------------------------------------------
-# Parse: fixed-offset operand read + operator latch (no NumericSequence)
-# ---------------------------------------------------------------------------
-
-
-def _parse(
-    rope: RopeConfig, embedding: Embedding, n: int
-) -> Tuple[List[Node], List[Node], Node, Node, Node, Node]:
-    """Parse a fixed-width ``"A op B\\n"`` prompt.
-
-    Returns ``(A, B, is_plus, is_minus, is_times, saw_newline)``: the two operand
-    digit windows (one-hot embeddings, MSB-first, length ``n``, latched and held
-    forward), three latched ±1 operator flags, and the newline trigger.
-
-    Input layout (``<bos>`` at position 0): ``A`` digits follow, then the
-    operator, then ``B`` digits, then the newline.  Every operand digit sits at a
-    fixed offset *from the newline* (``attend_to_offset`` is relative, so the BOS
-    prefix does not shift the offsets), read directly instead of through an
-    ``O(n)`` sliding window.
-    """
-    embed = embedding.get_embedding
-    saw_newline = equals_vector(embedding, embed("\n"))
-
-    # Operand digits, read at their fixed offset from the newline and latched at
-    # the newline so they persist through the whole decode.
-    A = [
-        get_prev_value(
-            rope,
-            attend_to_offset(rope, embedding, delta_pos=-(2 * n + 1) + i),
-            saw_newline,
-        )
-        for i in range(n)
-    ]
-    B = [
-        get_prev_value(
-            rope,
-            attend_to_offset(rope, embedding, delta_pos=-n + j),
-            saw_newline,
-        )
-        for j in range(n)
-    ]
-
-    # Operator latch (same idea as _calculator_common.parse_expression, minus the
-    # NumericSequence): capture which operator fired, but only *before* the
-    # newline, so a "-" emitted as a negative sign during decode cannot
-    # re-trigger operator parsing.
-    is_plus = equals_vector(embedding, embed("+"))
-    is_minus = equals_vector(embedding, embed("-"))
-    is_times = equals_vector(embedding, embed("*"))
-    is_operator = bool_any_true([is_plus, is_minus, is_times])
-    seen_newline = get_prev_value(rope, saw_newline, saw_newline)
-    is_input_operator = bool_all_true([is_operator, bool_not(seen_newline)])
-    which_plus = get_prev_value(rope, is_plus, is_input_operator)
-    which_minus = get_prev_value(rope, is_minus, is_input_operator)
-    which_times = get_prev_value(rope, is_times, is_input_operator)
-    return A, B, which_plus, which_minus, which_times, saw_newline

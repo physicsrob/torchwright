@@ -11,10 +11,21 @@ from typing import List
 
 import torch
 
-from torchwright.graph import Embedding, Node, RopeConfig
+from torchwright.graph import Embedding, Linear, Node, RopeConfig
 
-from torchwright.ops.attention_ops import attend_to_offset, get_prev_value
-from torchwright.ops.linear import bool_to_01, negate, sum_nodes
+from torchwright.ops.attention_ops import (
+    attend_argmax_dot,
+    attend_to_offset,
+    get_prev_value,
+)
+from torchwright.ops.linear import (
+    add,
+    add_const,
+    bool_to_01,
+    concat,
+    negate,
+    sum_nodes,
+)
 from torchwright.ops.inout_nodes import create_literal_value
 from torchwright.ops.swiglu.arithmetic_ops import compare
 from torchwright.ops.swiglu.logic_ops import (
@@ -23,7 +34,7 @@ from torchwright.ops.swiglu.logic_ops import (
     cond_gate,
     equals_vector,
 )
-from torchwright.ops.swiglu.map_select import map_to_table, select
+from torchwright.ops.swiglu.map_select import in_range, map_to_table, select
 from torchwright.ops.swiglu.marker_count import count_since_marker
 
 
@@ -96,6 +107,167 @@ class NumericSequence:
             get_prev_value(self.rope, digit, termination_event)
             for digit in reversed(self.digit_values)
         ]
+
+
+# Softmax sharpness for IndexedRegion's pointer gather.  Each region position's
+# key is a 0/1 index one-hot, so a query that has a match sees a dot of exactly
+# 1 against exactly one key and at most _SENTINEL_FLOOR against everything
+# else; the gain only sets how hard the softmax locks onto that gap.  Same
+# magnitude as the scratchpad calculator's answer gather — overwhelmingly
+# hard, and with the match dot at exactly 1 there is no fp32 precision concern.
+_INDEX_MATCH_GAIN = 2_000_000.0
+
+# The default sentinel's dot with any in-range index query.  The marker
+# position carries a key of [floor, ..., floor, 1] whose payload is the
+# region's default: a query whose member exists out-dots it 1 vs floor (the
+# member wins), a query whose member does not exist (index at or past the
+# region's actual length) sees floor vs 0 (the sentinel wins and the read is
+# the default), and the all-zero query of a negative index matches the
+# sentinel's dedicated last lane outright.  Any value strictly inside (0, 1)
+# works; 0.5 maximizes the smaller of the two margins.
+_SENTINEL_FLOOR = 0.5
+
+
+class IndexedRegion:
+    """Constant-depth random access into a marker-delimited run of tokens.
+
+    A *region* is a contiguous run of stream positions that starts immediately
+    after a single marker position and whose membership is decided by a
+    caller-supplied boolean (e.g. "is a digit and the operator has not appeared
+    yet").  Each member position is stamped with a one-hot key of its index
+    within the region (0 for the position right after the marker), computed
+    from the bounded marker-distance count.  :meth:`token_at` then reads the
+    region's token at a runtime-computed index with a single content-match
+    attention; an index outside ``[0, region length)`` reads the region's
+    ``default`` instead, via a sentinel key at the marker position whose
+    payload is the default (see ``_SENTINEL_FLOOR``) — no post-attention
+    boolean test, so an unconsumed read at a not-yet-meaningful position
+    yields bounded garbage without tripping any ±1-cond assert.
+
+    The depth of every read is constant in the region length — this is the
+    random-access alternative to :class:`NumericSequence`, whose sliding
+    window threads each position's value through the previous position's
+    *computed* node and therefore unrolls into a chain as deep as the window
+    is wide.
+
+    Caller contract:
+
+    * ``marker`` is true at exactly one stream position, and the region's
+      members occupy the positions immediately after it with no gaps —
+      member ``i`` sits at ``marker_pos + 1 + i``.  (The index keys are
+      derived purely from marker distance, so a gap would mislabel every
+      member after it.)
+    * ``in_region`` is true exactly at member positions.  Its real job is
+      killing lookalike positions elsewhere in the stream — e.g. digits of a
+      *different* operand, or digits the model itself emits later — whose
+      marker distance would otherwise land in ``[0, max_len)`` and collide
+      with a member's key.
+    * ``rope.max_positions`` must be large enough for a healthy recency-lobe
+      band (the production 512 is; at small values like 64 the band's
+      amplitudes collapse, ``get_prev_value``'s gate goes soft, and the
+      leaked validity skews the marker-distance count far past its ±0.5
+      contract).
+
+    Index scalars are marker-count-derived (accurate to well under ±0.5, not
+    exact), so — deliberately — nothing here carries an integer claim; the
+    one-hot encodings absorb the sub-integer error, the same idiom as the
+    scratchpad calculator's column pointer.
+
+    Args:
+        rope: RoPE config for the counting and gather heads.
+        embedding: the raw token embedding; :meth:`token_at` reads its rows.
+        marker: ±1 boolean node, true exactly at the marker position.
+        in_region: ±1 boolean node, true exactly at member positions; must be
+            a clean ±1 boolean at *every* position (it gates the payload).
+        max_len: maximum region length; sizes the count and the key width.
+            The gather's content match places ``max_len + 1`` columns on
+            slow rotary planes, so it must fit ``rope.d_head // 2 - 1``.
+        default: the embedding row an out-of-range :meth:`token_at` reads
+            (e.g. ``embedding.get_embedding("0")`` for implicit zero-padding).
+    """
+
+    def __init__(
+        self,
+        rope: RopeConfig,
+        embedding: Embedding,
+        *,
+        marker: Node,
+        in_region: Node,
+        max_len: int,
+        default: torch.Tensor,
+    ):
+        assert len(marker) == 1, "marker must be a 1-D boolean"
+        assert len(in_region) == 1, "in_region must be a 1-D boolean"
+        assert max_len >= 1, "max_len must be >= 1"
+        assert default.numel() == len(embedding), "default must be an embedding row"
+        self.rope = rope
+        self.max_len = max_len
+
+        # Distance to the marker, valid (to well under ±0.5) out to the last
+        # position that reads it: the event position one past the last member.
+        seen_marker = get_prev_value(rope, marker, marker)
+        self._count = count_since_marker(
+            rope, seen_marker, bool_to_01(marker), max_gap=max_len + 1
+        )
+
+        # Each member's key: the one-hot of its own region index (distance
+        # minus one), in the first max_len lanes.  Off-region positions are
+        # hard-zeroed by the gate — range alone cannot exclude them, because
+        # any position within max_len of the marker (the operator right after
+        # an operand, say) has an in-range distance.  The marker position
+        # itself carries the sentinel key: _SENTINEL_FLOOR in every index
+        # lane plus a 1 in the dedicated last lane, so it loses to a present
+        # member but beats an absent one (and catches the all-zero query).
+        own_index = add_const(self._count, -1.0)
+        own_onehot = bool_to_01(in_range(own_index, add_const(own_index, 1.0), max_len))
+        member_keys = concat(
+            [cond_gate(in_region, own_onehot), create_literal_value(torch.zeros(1))]
+        )
+        sentinel = torch.cat([torch.full((max_len,), _SENTINEL_FLOOR), torch.ones(1)])
+        self._keys = add(member_keys, cond_gate(marker, create_literal_value(sentinel)))
+
+        # The gather's payload: the member's token where in_region holds, the
+        # region default everywhere else — in particular at the marker, so a
+        # sentinel win reads the default.
+        self._value = select(in_region, embedding, create_literal_value(default))
+
+    def length_at(self, event: Node) -> Node:
+        """The region's length, latched where ``event`` fires.
+
+        ``event`` must fire at the position immediately after the region's
+        last member (the operator after an operand, the newline after the
+        second one) — the marker distance there is ``length + 1``.  The
+        latched scalar persists to every later position; positions before
+        the event read bounded garbage, as with any event latch.
+        """
+        assert len(event) == 1, "event must be a 1-D boolean"
+        return add_const(get_prev_value(self.rope, self._count, event), -1.0)
+
+    def token_at(self, index: Node) -> Node:
+        """The region's token at runtime ``index`` (0 = first member), or the
+        region's ``default`` where ``index`` falls outside ``[0, region
+        length)``.
+
+        One content-match attention.  The index becomes a one-hot query with
+        a computed "out of ``[0, max_len)``" last lane; at most one member
+        key can match it, and the marker's sentinel key catches every
+        no-member case — a negative index, an index past ``max_len``, and an
+        in-range index at or past the region's actual length.
+        """
+        assert len(index) == 1, "index must be a 1-D scalar"
+        onehot = bool_to_01(in_range(index, add_const(index, 1.0), self.max_len))
+        # 1 - sum(onehot): 1 exactly when no index lane is set.
+        no_lane = add_const(
+            Linear(onehot, -torch.ones(self.max_len, 1), name="region_no_lane"), 1.0
+        )
+        query = concat([onehot, no_lane])
+        return attend_argmax_dot(
+            self.rope,
+            query_vector=query,
+            key_vector=self._keys,
+            value=self._value,
+            match_gain=_INDEX_MATCH_GAIN,
+        )
 
 
 def output_sequence(

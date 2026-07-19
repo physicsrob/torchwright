@@ -20,10 +20,6 @@ is the depth-optimized peer (carry-lookahead add/subtract, carry-save multiply,
 each other.  Sequences are MSB-first (``seq[0]`` most significant); each
 function documents how wide the caller must size the inputs so the fixed-width
 result never drops a nonzero carry.
-
-``calculator_simple`` is the scalar-space alternative (digits → a number,
-thermometer-coded arithmetic); ``embedding_arithmetic`` is the older
-spherical-code / ``map_to_table`` version of these same algorithms.
 """
 
 from typing import Dict, List, Tuple

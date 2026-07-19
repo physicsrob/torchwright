@@ -1,4 +1,4 @@
-"""Shared scaffolding for the two standalone calculator examples.
+"""Shared scaffolding for the three calculator examples.
 
 ``calculator_simple`` and ``calculator_advanced`` are two *independent*
 implementations of the same calculator: they differ only in their arithmetic —
@@ -12,15 +12,29 @@ being duplicated or having one calculator import the other:
 * **comparison** — a lexicographic fold of a less/equal/greater verdict.  It is
   not a depth target (subtraction's sign just needs the answer), so both
   variants use this one verbatim;
-* the token-stream plumbing — sliding the digit window, latching operands,
-  dispatching on the operator, emitting the result autoregressively, trimming
-  leading zeros — quarantined behind :func:`parse_expression`,
-  :func:`emit_result`, and :func:`build_calculator` so each calculator file
-  reads as its three arithmetic algorithms in the foreground.
+* the token-stream plumbing — parsing the operands, dispatching on the
+  operator, emitting the result autoregressively, trimming leading zeros —
+  quarantined behind :func:`parse_expression`, :func:`emit_result`, and
+  :func:`build_calculator` so each calculator file reads as its three
+  arithmetic algorithms in the foreground.
 
 Each calculator supplies its own ``add_digit_seqs`` / ``subtract_digit_seqs`` /
 ``multiply_digit_seqs`` and hands them to :func:`build_calculator`; nothing here
 imports either calculator, and neither calculator imports the other.
+
+``calculator_scratchpad`` — the flat-depth variant that streams its serial
+work out as thinking tokens — shares :func:`parse_expression` too (all three
+calculators accept the same variable-width ``"A op B\\n"`` prompts) plus the
+small one-hot helpers, but replaces the rest of the plumbing: its emission,
+dispatch, and leading-zero trim live on the decode-step axis.  The parse is
+constant-depth in ``max_digits`` (an
+:class:`~torchwright.ops.swiglu.sequence_ops.IndexedRegion` pointer gather per
+operand digit), so it holds that variant's flat model depth and no longer adds
+an ``O(max_digits)`` chain of its own to the other two.  (``simple`` and
+``advanced`` still grow linearly end to end: beyond ``simple``'s serial
+arithmetic, the shared comparison fold and the chained-select
+``remove_leading_0s`` trim are each ``O(max_digits)`` deep — neither is a
+depth target here.)
 """
 
 from typing import Dict, List, Tuple
@@ -30,7 +44,7 @@ import torch
 from torchwright.graph import Embedding, Linear, Node, RopeConfig
 from torchwright.graph.embedding import bos_token
 from torchwright.ops.swiglu.arithmetic_ops import compare as _compare_scalar
-from torchwright.ops.linear import concat
+from torchwright.ops.linear import add_const, concat
 from torchwright.ops.attention_ops import get_prev_value
 from torchwright.ops.inout_nodes import (
     create_literal_value,
@@ -46,7 +60,8 @@ from torchwright.ops.swiglu.logic_ops import (
 from torchwright.ops.swiglu.map_select import select, switch
 from torchwright.ops.swiglu.onehot_table import onehot_lookup
 from torchwright.ops.swiglu.sequence_ops import (
-    NumericSequence,
+    IndexedRegion,
+    check_is_digit,
     output_sequence,
     remove_leading_0s,
 )
@@ -174,20 +189,31 @@ def parse_expression(
     embedding: Embedding,
     max_digits: int,
 ) -> Tuple[List[Node], List[Node], Node, Node, Node, Node]:
-    """Parse ``"A op B\\n"`` from the token stream.
+    """Parse ``"A op B\\n"`` from the token stream, at constant depth.
 
     Returns ``(first, second, is_plus, is_minus, is_times, saw_newline)``:
-    the two operand digit windows (MSB-first), three latched ±1 flags for which
-    operator appeared, and the ±1 newline trigger that ends the input and
-    starts result emission.
-    """
-    num_seq = NumericSequence(rope, embedding, max_digits)
+    the two operand digit windows (MSB-first, zero-padded to ``max_digits``),
+    three latched ±1 flags for which operator appeared, and the ±1 newline
+    trigger that ends the input and starts result emission.
 
-    is_plus = equals_vector(embedding, embedding.get_embedding("+"))
-    is_minus = equals_vector(embedding, embedding.get_embedding("-"))
-    is_times = equals_vector(embedding, embedding.get_embedding("*"))
+    Operands are variable-width — no zero-padding required in the prompt.
+    Each one is an :class:`~torchwright.ops.swiglu.sequence_ops.IndexedRegion`
+    (the first delimited by ``<bos>`` and the operator, the second by the
+    operator and the newline): every prompt digit carries a one-hot key of
+    its index within its operand, the operand length is latched at the
+    delimiter, and each window slot reads the digit it needs with one
+    pointer attention — ``index = length - max_digits + i`` — falling back
+    to the region default ``"0"`` where the index is negative.  That makes
+    the whole parse constant-depth in ``max_digits``, unlike the old
+    ``NumericSequence`` sliding window, whose slot-to-slot shift chained
+    through computed nodes and unrolled into ``O(max_digits)`` layers.
+    """
+    embed = embedding.get_embedding
+    is_plus = equals_vector(embedding, embed("+"))
+    is_minus = equals_vector(embedding, embed("-"))
+    is_times = equals_vector(embedding, embed("*"))
     is_operator = bool_any_true([is_plus, is_minus, is_times])
-    saw_newline = equals_vector(embedding, embedding.get_embedding("\n"))
+    saw_newline = equals_vector(embedding, embed("\n"))
 
     # Only treat an operator as such *before* the newline, so a "-" emitted as
     # a negative sign during decoding does not re-trigger operator parsing.
@@ -202,9 +228,45 @@ def parse_expression(
     which_minus = get_prev_value(rope, is_minus, is_input_operator)
     which_times = get_prev_value(rope, is_times, is_input_operator)
 
-    # First operand's window is complete at the operator; second's at newline.
-    first = num_seq.get_digits_at_event(is_input_operator)
-    second = num_seq.get_digits_at_event(saw_newline)
+    # The two operand regions.  The membership gates carry the region
+    # contract: only *prompt* digits qualify (a digit the model emits later
+    # sits after the newline and must not collide with an operand key), and
+    # the operator latch splits the prompt digits between the two operands.
+    saw_bos = equals_vector(embedding, embed(bos_token))
+    seen_operator = get_prev_value(rope, is_input_operator, is_input_operator)
+    is_digit = check_is_digit(embedding)
+    in_first = bool_all_true([is_digit, bool_not(seen_operator)])
+    in_second = bool_all_true([is_digit, seen_operator, bool_not(seen_newline)])
+    first_region = IndexedRegion(
+        rope,
+        embedding,
+        marker=saw_bos,
+        in_region=in_first,
+        max_len=max_digits,
+        default=embed("0"),
+    )
+    second_region = IndexedRegion(
+        rope,
+        embedding,
+        marker=is_input_operator,
+        in_region=in_second,
+        max_len=max_digits,
+        default=embed("0"),
+    )
+
+    # First operand's length is known at the operator; second's at newline.
+    # MSB-first window slot i holds the digit at index length - max_digits + i;
+    # a negative index (operand narrower than the window) reads the "0" default.
+    len_first = first_region.length_at(is_input_operator)
+    len_second = second_region.length_at(saw_newline)
+    first = [
+        first_region.token_at(add_const(len_first, float(i - max_digits)))
+        for i in range(max_digits)
+    ]
+    second = [
+        second_region.token_at(add_const(len_second, float(i - max_digits)))
+        for i in range(max_digits)
+    ]
     return first, second, which_plus, which_minus, which_times, saw_newline
 
 
@@ -251,7 +313,7 @@ def build_calculator(
     rope = create_rope_config(d_head=D_HEAD, max_positions=MAX_POSITIONS)
 
     # Recency ("most recent") is the intrinsic rotary lobe inside get_prev_value /
-    # NumericSequence / output_sequence — no rank node, no <ref> token, local-only.
+    # output_sequence — no rank node, no <ref> token, local-only.
     first, second, is_plus, is_minus, is_times, saw_newline = parse_expression(
         rope, embedding, max_digits
     )

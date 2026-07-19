@@ -4,11 +4,13 @@ The variant's claim is a flat *compiled* depth in ``max_digits`` while arbitrary
 operand sizes are handled by more decode steps; this checks the compiled
 artifact actually decodes the streamed scratchpad transcript correctly — carry
 ripple, borrow ripple, a negative difference, a tall multiply column whose carry
-exceeds 1, and — new with the leading-zero trim — that the post-``</THINKING>``
-region is the *exact* MSB-first answer (no zero pad).  Inputs are fixed-width
-zero-padded to ``max_digits`` (the protocol the ``O(1)`` parse requires).  The
-flat-depth invariant itself is guarded without a compile in
-``tests/examples/test_calculator_scratchpad.py``.
+exceeds 1, and — with the leading-zero trim — that the post-``</THINKING>``
+region is the *exact* MSB-first answer (no zero pad).  Inputs are the same
+variable-width prompts the other two calculators accept (the shared
+constant-depth pointer-gather parse zero-pads internally); one zero-padded
+prompt per op stays pinned, since padded input remains valid as the
+full-width special case.  The flat-depth invariant itself is guarded without
+a compile in ``tests/examples/test_calculator_scratchpad.py``.
 """
 
 import pytest
@@ -58,32 +60,35 @@ def _check(model, prompt, expected):
 
 def test_scratchpad_addition(calc3):
     model, _ = calc3
-    _check(model, "001+001\n", "2")
+    _check(model, "1+1\n", "2")
     _check(model, "123+456\n", "579")
-    _check(model, "999+001\n", "1000")  # carry ripples the whole width
+    _check(model, "999+1\n", "1000")  # carry ripples the whole width
     _check(model, "999+999\n", "1998")
-    _check(model, "000+000\n", "0")
+    _check(model, "0+0\n", "0")
+    _check(model, "001+001\n", "2")  # zero-padded input stays valid
 
 
 def test_scratchpad_subtraction(calc3):
     model, _ = calc3
-    _check(model, "005-003\n", "2")
+    _check(model, "5-3\n", "2")
     _check(model, "456-123\n", "333")
-    _check(model, "010-001\n", "9")  # borrow ripples up from the ones column
+    _check(model, "10-1\n", "9")  # borrow ripples up from the ones column
     _check(model, "100-100\n", "0")
+    _check(model, "005-003\n", "2")  # zero-padded input stays valid
 
 
 def test_scratchpad_subtraction_negative(calc3):
     model, _ = calc3
-    _check(model, "001-005\n", "-4")
+    _check(model, "1-5\n", "-4")
     _check(model, "100-999\n", "-899")
 
 
 def test_scratchpad_multiplication(calc3):
     model, _ = calc3
-    _check(model, "002*003\n", "6")
-    _check(model, "012*034\n", "408")
-    _check(model, "013*039\n", "507")  # a column carry exceeds 1
+    _check(model, "2*3\n", "6")
+    _check(model, "12*34\n", "408")
+    _check(model, "13*39\n", "507")  # a column carry exceeds 1
     _check(model, "123*456\n", "56088")
     _check(model, "100*100\n", "10000")
-    _check(model, "000*055\n", "0")
+    _check(model, "0*55\n", "0")
+    _check(model, "012*034\n", "408")  # zero-padded input stays valid

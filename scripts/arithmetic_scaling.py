@@ -40,10 +40,11 @@ On top of those per-op *kernel* metrics, a second pass measures **end-to-end
 model depth** — ``critical_path_depth`` of the whole ``create_network_parts(n)``
 graph (parse + all three ops + dispatch + emit), one number per implementation.
 This is the figure that makes the payoff visible: ``simple`` and ``advanced``
-grow ~linearly (the ``O(n)`` sliding-window parser dominates even ``advanced``'s
-``O(log n)`` arithmetic), while ``examples.calculator_scratchpad`` — which
-streams the serial carry/borrow/comparison work out as "thinking" tokens —
-stays **flat** in ``n`` and pays the cost in decode *steps* (``6n+3``) instead.
+grow ~linearly (their in-graph serial work — the arithmetic folds, the shared
+comparison, the leading-zero trim; the parse is the shared constant-depth
+pointer gather), while ``examples.calculator_scratchpad`` — which streams the
+serial carry/borrow/comparison work out as "thinking" tokens — stays **flat**
+in ``n`` and pays the cost in decode *steps* (``8n+3``) instead.
 
 Output: a JSON file (the data the blog/vizkit consumes), printed tables, and an
 optional matplotlib PNG (per-op kernel depth and end-to-end model depth, with a
@@ -95,9 +96,9 @@ VOCAB = [str(d) for d in range(10)]
 # End-to-end *model* depth (parse + all three ops + dispatch + emit), one number
 # per implementation per digit count — the figure that makes the scratchpad's
 # payoff visible.  All three modules expose ``create_network_parts(max_digits)``.
-# ``simple`` / ``advanced`` grow ~linearly (the O(n) sliding-window parser
-# dominates even ``advanced``'s O(log n) arithmetic); ``scratchpad`` stays flat
-# and pays in decode *steps* instead.
+# ``simple`` / ``advanced`` grow ~linearly (their in-graph serial folds,
+# comparison, and leading-zero trim; the shared parse is constant-depth);
+# ``scratchpad`` stays flat and pays in decode *steps* instead.
 MODEL_IMPLEMENTATIONS = {
     "simple": calculator_simple,
     "advanced": calculator_advanced,
@@ -346,7 +347,7 @@ def build_payload(results, model_results, digit_sweep, model_digit_sweep, multip
             "depth_metric": "critical-path length over neuron-producing nodes",
             "size_metric": "total neuron count (FFN lanes + ReLU widths; ~ params / 2d, gated lanes ~ params / 3d)",
             "model_depth_metric": "whole-model critical-path depth (parse + ops + dispatch + emit)",
-            "decode_steps_metric": "emitted tokens per query (scratchpad: 6n+3)",
+            "decode_steps_metric": "emitted tokens per query (scratchpad: 8n+3)",
         },
         "results": results,
         "model_results": model_results,

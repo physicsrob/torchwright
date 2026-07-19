@@ -57,6 +57,7 @@ from torchwright.ops.swiglu.scalar_encoding import (
     scalar_to_embedding,
 )
 from torchwright.ops.swiglu.sequence_ops import (
+    IndexedRegion,
     NumericSequence,
     check_is_digit,
     output_sequence,
