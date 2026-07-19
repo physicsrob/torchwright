@@ -14,9 +14,9 @@ contract-critical behaviors:
 * ``length_at`` latches the region length at the event position and holds it
   for the rest of the stream.
 
-The rope is built at the production ``max_positions=512``: below a healthy
-recency-lobe band (e.g. 64) ``get_prev_value``'s gate goes soft and the
-marker-distance count drifts past its ±0.5 contract — see the note on
+The rope is built at the production ``max_positions=512``: at a degenerate
+recency-lobe band (e.g. 64) ``get_prev_value`` refuses to build the latch
+(``tests/ops/test_local_recency.py`` pins that guard) — see the note on
 ``IndexedRegion``'s rope requirement.
 """
 

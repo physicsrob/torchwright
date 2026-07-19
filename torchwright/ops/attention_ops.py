@@ -127,8 +127,7 @@ def _wrap_hard_selection_output(
 # softmax weight ratio, i.e. ``≥ 99.9 %`` concentration. All current callers
 # produce integer-valued scores with gap ≥ 1, so 8 is sufficient; larger
 # gains (e.g. 80) are historical and bought only unused margin.  The compiled
-# path runs fp32 through the SDPA MATH backend with TF32 off (see the
-# precision-policy note on ``attend_most_recent_matching``), so the
+# path runs fp32 through the SDPA MATH backend with TF32 off, so the
 # discriminating gap resolves with ample headroom regardless — keeping the
 # gain modest is about not needing more, not a precision ceiling.
 _QUERY_GAIN = 8.0
@@ -217,7 +216,9 @@ _ABOVE_MATCH_BONUS = 256.0
 
 
 # Default coefficient on the intrinsic rotary recency lobe (the local "most
-# recent" tiebreak in ``get_prev_value`` / ``attend_most_recent_matching``).
+# recent" tiebreak in ``get_prev_value``, the lobe's only remaining caller since
+# ``attend_most_recent_matching`` was retired for
+# :func:`attend_most_recent_globally`).
 # The lobe peak is ``Σ amp_p ≈ 42.6`` (:func:`~torchwright.graph.rope.rope_lobe_band`
 # at the production config), so ``recency_gain · peak ≈ 2.5e4``.  Sized against
 # the *smallest* near-Δ step over the working window: the Hann taper rounds the
@@ -226,11 +227,26 @@ _ABOVE_MATCH_BONUS = 256.0
 # over the ~100-token target is ``≈ 7.5`` logits → ``exp(7.5) ≈ 1.8e3`` softmax
 # ratio (≥ 99.9 % concentration).  Unlike the old octant ramp's ``rank_gain ≈
 # 2e5``, the lobe is bounded (does not grow with sequence length), so the content
-# gate that must dominate it is small (``get_prev_value`` sets it automatically;
-# :func:`attend_most_recent_matching` callers size ``match_gain`` per the
-# content-dominance bound in its docstring — low-dot content needs a large
-# ``match_gain``, high-dot E8 content clears it at the default).
+# gate that must dominate it is small (``get_prev_value`` sets it automatically).
 _LOCAL_RECENCY_GAIN = 600.0
+
+# Ceiling on the summed softmax weight that false-cond keys may steal from a
+# true key in ``get_prev_value``, enforced at build time.  Each false key's
+# logit sits ``2·gate`` below any true key's (the ±1 cond swing through the
+# gate column; the slow-plane rotation keeps the factor ≈ 1), so its weight
+# against the winner is at most ``exp(−2·gate)`` and the total over at most
+# ``max_positions`` keys is ``max_positions · exp(−2·gate)``.  The tolerance
+# is sized for the harshest consumer: ``attend_mean_where`` multiplies a
+# latched validity by ``_VALIDITY_DIRECT`` (1000), so a leak-driven validity
+# wobble ``ε`` becomes a ``1000·ε`` per-key logit tilt that skews the
+# "uniform" mean (the failure mode that broke ``count_since_marker`` at
+# ``d_head=32, max_positions=64``: a 2-plane band Hann-tapers to its endpoint
+# zeros, leaving ``Σ amp ≈ 2e-3``, gate ≈ 4.8, leak ≈ 4e-3 — the count read
+# 2.8 at a true gap of 4).  At 1e-6 total leak the tilt is ≤ 2e-3 logits —
+# invisible — while every healthy config passes by hundreds of orders of
+# magnitude (gate ≥ ~2400 ⇒ the bound underflows to 0) and the observed
+# degenerate config fails by ~3600×.
+_MAX_RECENCY_LEAK = 1e-6
 
 # Per-position logit gain for the position tiebreak in attend_most_recent_globally.
 # Each unit of absolute position contributes recency_scale to the attention logit
@@ -976,6 +992,16 @@ def get_prev_value(
     value) — callers must ensure at least one true key exists in every consumed
     window, or gate the result.
 
+    **Degenerate lobe bands raise.**  The gate is sized from the lobe peak, so
+    a rope config whose band collapses (a ≤2-plane band Hann-tapers to its
+    endpoint zeros — e.g. ``d_head=32, max_positions=64``) would leave the
+    gate too weak to latch: false-cond keys leak softmax weight and the
+    latched value silently drifts (downstream, ``count_since_marker`` read
+    2.8 at a true gap of 4 before this guard existed).  This raises
+    ``ValueError`` when the worst-case leak exceeds ``_MAX_RECENCY_LEAK``;
+    increase ``max_positions`` or ``d_head`` (widening the lobe band), or
+    lower the rope ``base``.
+
     Args:
         rope: the RoPE config (``d_head`` / ``base`` / ``max_positions``).
         value: node to read at the selected position.
@@ -985,6 +1011,20 @@ def get_prev_value(
     _, amps = rope_lobe_band(rope.d_head, rope.base, rope.max_positions)
     lobe_peak = _LOCAL_RECENCY_GAIN * float(amps.sum())
     gate = 4.0 * lobe_peak  # cond dominates the bounded lobe swing
+
+    leak_bound = rope.max_positions * math.exp(-2.0 * gate)
+    if leak_bound > _MAX_RECENCY_LEAK:
+        raise ValueError(
+            f"get_prev_value: the recency-lobe cond gate is too weak to latch "
+            f"at d_head={rope.d_head} base={rope.base} "
+            f"max_positions={rope.max_positions}: the lobe band's Hann taper "
+            f"leaves amplitude sum {float(amps.sum()):.2e} (a <=2-plane band "
+            f"tapers to its endpoint zeros), gate {gate:.3g}, worst-case "
+            f"false-key softmax leak {leak_bound:.2e} > {_MAX_RECENCY_LEAK:g} "
+            f"— the latched value would silently drift.  Increase "
+            f"max_positions or d_head (widening the lobe band), or lower the "
+            f"rope base."
+        )
 
     # Content col: the cond gate, relocated onto the slowest plane.  The recency
     # lobe is added by rotary_recency_head on a disjoint faster-plane band.

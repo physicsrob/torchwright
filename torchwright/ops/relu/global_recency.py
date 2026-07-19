@@ -3,7 +3,8 @@
 docs/rope_port_plan.md Phase 7, candidate (d).
 
 **The problem Phase 6 left open.** The intrinsic rotary recency lobe
-(:func:`~torchwright.ops.attention_ops.attend_most_recent_matching`) is
+(:func:`~torchwright.graph.rope.rotary_recency_head`, via
+:func:`~torchwright.ops.attention_ops.get_prev_value`) is
 monotone within the lobe window W ≈ 415; past W a farther key can beat a
 nearer one.  DOOM clip look-backs can exceed W, so Phase 6 needs a global
 companion for unbounded "most recent matching."
@@ -185,8 +186,5 @@ def global_position_from_bos(
     # with position; the mean divides it by t).  The generic convexity claim
     # is skipped (raw's compiled values sit up to ~0.1 outside their claimed
     # range at position 0); the closing atol covers the measured envelope.
-    smoothed_pos = attend_causal_mean(
-        rope, raw, output_scale=2.0, claim_range=False
-    )
+    smoothed_pos = attend_causal_mean(rope, raw, output_scale=2.0, claim_range=False)
     return assert_in_range(smoothed_pos, 0.0, float(max_len), atol=8.0)
-

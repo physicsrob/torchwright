@@ -165,10 +165,9 @@ class IndexedRegion:
       marker distance would otherwise land in ``[0, max_len)`` and collide
       with a member's key.
     * ``rope.max_positions`` must be large enough for a healthy recency-lobe
-      band (the production 512 is; at small values like 64 the band's
-      amplitudes collapse, ``get_prev_value``'s gate goes soft, and the
-      leaked validity skews the marker-distance count far past its ±0.5
-      contract).
+      band (the production 512 is).  At small values like 64 the band's
+      amplitudes collapse and ``get_prev_value`` refuses to build the latch —
+      a loud ``ValueError`` at construction, not silent drift.
 
     Index scalars are marker-count-derived (accurate to well under ±0.5, not
     exact), so — deliberately — nothing here carries an integer claim; the

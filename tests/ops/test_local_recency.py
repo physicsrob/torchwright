@@ -11,14 +11,18 @@ These are the smallest-layer (oracle, ``node.compute``) confidence tests:
 
 - the lobe is strictly decreasing to ``W`` and **breaks down past it** (a farther
   key outscores a nearer one — the load-bearing limit, tested not footnoted);
-- ``attend_most_recent_matching`` picks the nearest content match within ``W``,
-  and **exhibits the inversion** when the only matches sit more than ``W`` apart;
-- ``get_prev_value`` latches the most-recent true position.
+- ``get_prev_value`` latches the most-recent true position;
+- ``get_prev_value`` **refuses to build on a degenerate lobe band** (a
+  ≤2-plane band Hann-tapers to its endpoint zeros, the gate sized from the
+  collapsed peak leaks softmax weight to false-cond keys, and the latch
+  silently drifts — the failure that once skewed ``count_since_marker`` by
+  1.2 counts at ``d_head=32, max_positions=64``).
 
 The compiled-path parity / prefill==decode checks are in
 ``tests/compile/forward/test_rope_local_recency.py``.
 """
 
+import pytest
 import torch
 
 from torchwright.graph import InputNode
@@ -115,3 +119,32 @@ def test_get_prev_value_latches_most_recent_true():
     # From position 3 onward, the latched value is value[3] = 13.
     for p in range(3, n):
         assert abs(out_v[p].item() - 13.0) < 1e-2, (p, out_v[p].item())
+
+
+# --------------------------------------------------------------------------- #
+# get_prev_value — degenerate lobe bands refuse to build                       #
+# --------------------------------------------------------------------------- #
+
+
+def test_get_prev_value_raises_on_degenerate_lobe_band():
+    """A rope config whose lobe band collapses (2 surviving planes both
+    Hann-tapered to the endpoint floor: d_head=32, max_positions=64) must fail
+    loudly at build time.  Before the guard this built a silently-leaky latch
+    whose validity wobble, amplified 1000x by attend_mean_where, skewed
+    count_since_marker by 1.2 counts at a gap of 4."""
+    rope = create_rope_config(d_head=32, max_positions=64)
+    value = InputNode("value", 1, value_range=(-1.0, 1.0))
+    cond = InputNode("cond", 1, value_range=(-1.0, 1.0))
+    with pytest.raises(ValueError, match="too weak to latch"):
+        get_prev_value(rope, value, cond)
+
+
+def test_get_prev_value_builds_on_healthy_bands():
+    """Every config the repo actually uses clears the leak bound with orders of
+    magnitude to spare — including the narrowest (d_head=16, max_positions=512,
+    a 3-plane band whose Hann midpoint survives)."""
+    for d_head, max_positions in [(16, 512), (32, 512), (64, 4096), (256, 61440)]:
+        rope = create_rope_config(d_head=d_head, max_positions=max_positions)
+        value = InputNode("value", 1, value_range=(-1.0, 1.0))
+        cond = InputNode("cond", 1, value_range=(-1.0, 1.0))
+        get_prev_value(rope, value, cond)  # must not raise

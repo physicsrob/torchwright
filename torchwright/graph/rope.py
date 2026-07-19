@@ -83,8 +83,8 @@ class RopeConfig:
 def require_full_rotary(d_rot: int, d_head: int, feature: str) -> None:
     """Raise unless the head is full rotary (``d_rot == d_head``).
 
-    The **local-recency lobe** (:func:`rotary_recency_head` /
-    :func:`~torchwright.ops.attention_ops.attend_most_recent_matching`) lays a
+    The **local-recency lobe** (:func:`rotary_recency_head`, reached via
+    :func:`~torchwright.ops.attention_ops.get_prev_value`) lays a
     constant feature across a *band* of planes of the full ``d_head``
     ``rotate_half`` grid (:func:`rope_lobe_band`).  Under partial rotary a band
     plane's ``rotate_half`` partner (paired by ``d_rot/2`` once the rotation runs
@@ -409,6 +409,14 @@ def rotary_recency_head(
     need the Phase-7 global mechanism.  ``W`` and the per-step resolution are
     properties of :func:`rope_lobe_band` (≈415 / ~2.4e-3 at distance 100 for the
     default config).
+
+    **The lobe amplitude can collapse.**  At a minimal band (2 surviving
+    planes — e.g. ``d_head=32, max_positions=64``) the Hann taper evaluates at
+    its two endpoint zeros and only the ``1e-3`` floor survives, so the peak
+    ``Σ amp_p`` drops ~1000×.  Callers that size a content gate from the lobe
+    peak must bound the resulting softmax leak —
+    :func:`~torchwright.ops.attention_ops.get_prev_value` enforces this with a
+    build-time ``ValueError`` (``_MAX_RECENCY_LEAK``).
 
     The recency band is **disjoint** from the content slow planes; this raises if
     the content width would reach into the band (content occupies planes

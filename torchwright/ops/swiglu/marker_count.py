@@ -35,7 +35,9 @@ def count_since_marker(
     Args:
         rope: the RoPE config.
         window_validity: length-1 boolean (+1 / -1) marking keys in the
-            window ``[marker, now]``.
+            window ``[marker, now]``.  Must be flat across keys to ~1e-4 —
+            the mean head's 1000× validity gain amplifies any per-key wobble
+            into a logit tilt (see the relu twin's Args note).
         marker_onehot: length-1 value, 1.0 at the single marker key
             inside the window, 0.0 elsewhere.
         max_gap: the worst-case gap bound; sizes the reciprocal's range

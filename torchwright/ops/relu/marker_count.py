@@ -54,7 +54,13 @@ def count_since_marker(
             stays uniform; ``rope.d_head`` / ``base`` size that plane.
         window_validity: length-1 boolean (+1 / -1).  +1 for keys in the window
             ``[marker, now]``, -1 outside.  The caller derives this from the
-            marker token (e.g. "at or after the most recent marker").
+            marker token (e.g. "at or after the most recent marker").  Must be
+            **flat across keys to ~1e-4**: ``attend_mean_where`` multiplies it
+            by 1000 into the logit, so a per-key validity wobble ``ε`` tilts
+            the "uniform" mean by ``1000·ε`` per key and silently corrupts the
+            count (a ``get_prev_value`` latch at a degenerate recency-lobe
+            band once produced exactly this; that path now raises at build
+            time, but the flatness requirement binds any validity source).
         marker_onehot: length-1 value, ``1.0`` at the single marker key inside
             the window and ``0.0`` at every other window key.  Exactly one
             window key must carry the 1.0 (the count's correctness contract).
