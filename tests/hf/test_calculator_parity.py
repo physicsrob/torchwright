@@ -1,40 +1,31 @@
 """Flagship calculator parity: stock Phi-3 == ONNX oracle, token-for-token.
 
-Compiles ``examples/calculator_simple.py`` to ONNX in-process (~6s on CPU; the
-artifact is gitignored, never committed), compiles it directly to stock
-:class:`Phi3ForCausalLM`, and asserts the HF model reproduces the
-ONNX runtime's behaviour on real arithmetic:
+Compiles ``examples/calculator_simple.py`` — the one-hot lookup-table
+calculator — to ONNX in-process (the artifact is gitignored, never
+committed), compiles it directly to stock :class:`Phi3ForCausalLM`, and
+asserts the HF model reproduces the ONNX runtime's behaviour on real
+arithmetic:
 
 * **token-identical** prefill (per-position argmax) versus :class:`OnnxTokenModule`,
   with logits within a small cross-backend fp floor, and
 * **token-identical** greedy generation that matches the correct answer,
 
-on a curated set spanning the calculator's reliable range (additions and
-subtractions at any magnitude; multiplications with comfortable digit margin).
+on a gate spanning all three ops at every operand magnitude the 3-digit
+build supports — the one-hot arithmetic is exact table lookup, so there is
+no reduced-precision edge to carve out (999*999 decodes exactly; a
+"reliable range" carve-out existed only for the retired scalar-space
+calculator, whose thermometer-coded squaring path saturated its noise
+budget at large operands).
 
 Why "within an fp floor" and not bit-exact: the RoPE local-recency port (Phase 6)
 reshaped the graph, and onnxruntime vs torch now round a few logits differently
 at the operator-latch positions — a cross-backend fp floor (~5 logits, amplitude-
-independent, *not* the squaring path; see ``docs/numerical_noise_findings.md``
-"local-recency cross-path fp floor"). It changes no argmax, so generation stays
-token-identical; the prefill check asserts per-position argmax-equality (the real
-token bar) plus a bounded logit floor.
+independent; see ``docs/numerical_noise_findings.md`` "local-recency cross-path
+fp floor"). It changes no argmax, so generation stays token-identical; the
+prefill check asserts per-position argmax-equality (the real token bar) plus a
+bounded logit floor.
 
-Why "reliable range": the multiply path computes ``a*b = ((a+b)^2 - (a-b)^2)/4``
-with a thermometer-coded piecewise-linear squaring whose intermediate reaches
-~4e6 for large operands. onnxruntime and torch can accumulate that fp32 matmul
-reduction in different orders (whether they actually differ depends on the
-backend builds); when they do and the difference exceeds a digit-quantization
-level's half-width (operands roughly >= 900), the two backends round one output
-digit to adjacent levels — a fixed ~1600 logit gap that flips a borderline
-argmax. There the compiled circuit is already at its numerical-noise budget
-(the ONNX oracle itself is wrong on e.g. 999*999). That is a property of the
-compiled arithmetic at the edge of its range, not of this reimplementation:
-additions/subtractions (no squaring) and smaller products are bit-identical, as
-the gate below asserts. See
-``test_extreme_multiply_at_most_one_digit_level_divergence``.
-
-CPU-only and deterministic, so the bar is exact-bit, not merely argmax.
+CPU-only and deterministic.
 """
 
 from __future__ import annotations
@@ -62,8 +53,9 @@ _EOS = "<eos>"
 # fails.  See docs/numerical_noise_findings.md.
 _PARITY_FP_FLOOR = 8.0
 
-# In-range gate: add/sub at any magnitude, mult with comfortable digit margin.
-# Every entry is bit-exact AND lands the correct answer (confirmed empirically).
+# All three ops at every magnitude the 3-digit build supports, largest-operand
+# multiplies included — the one-hot arithmetic is exact lookup, so nothing is
+# carved out.  Every entry lands the correct answer (confirmed empirically).
 _GATE = [
     "0+0\n",
     "7+8\n",
@@ -83,12 +75,10 @@ _GATE = [
     "100*7\n",
     "321*3\n",
     "123*4\n",
+    "900*900\n",
+    "950*950\n",
+    "999*999\n",
 ]
-
-# Documented edge cases: large-operand multiplies where the two fp32 backends
-# can land on opposite sides of a digit-quantization boundary (see module
-# docstring). Listed so the divergence is a tracked, explained property.
-_EXTREME = ["900*900\n", "950*950\n", "999*999\n"]
 
 
 @pytest.fixture(scope="module")
@@ -99,6 +89,7 @@ def artifact_path():
 @pytest.fixture(scope="module")
 def model(artifact_path):
     from examples import calculator_simple
+
     out, emb = calculator_simple.create_network_parts()
     return compile_to_hf(
         out, emb, d=calculator_simple.D_MODEL, d_head=calculator_simple.D_HEAD
@@ -151,9 +142,7 @@ def test_prefill_token_identical_within_fp_floor(model, oracle, tok2id, text):
     # teacher-forced position (no argmax flip).
     assert (
         o.argmax(-1) == h.argmax(-1)
-    ).all(), (
-        f"{text!r}: Phi-3/oracle argmax differs at a prefill position (token flip)"
-    )
+    ).all(), f"{text!r}: Phi-3/oracle argmax differs at a prefill position (token flip)"
     # Residual logit divergence stays within the cross-backend fp floor (Phase-6
     # local-recency reshape) — a structural regression would blow past it.
     assert (o - h).abs().max().item() <= _PARITY_FP_FLOOR
@@ -169,36 +158,6 @@ def test_greedy_token_identical_and_correct(model, oracle, tok2id, artifact_path
     assert h_out == expected, f"{text!r}: got {h_out!r}, want {expected!r}"
 
 
-def test_extreme_multiply_at_most_one_digit_level_divergence(model, oracle, tok2id):
-    """Extreme multiplies stay within one digit-level of the ONNX oracle.
-
-    A structural bug (wrong cache, mask, or weight map) would corrupt every
-    expression by a free-floating amount.  Instead, on the largest-operand
-    multiplies the HF model and the ONNX oracle either agree bit-for-bit or
-    differ by exactly one digit-quantization level (a ~1600 logit gap) — the
-    fingerprint of a piecewise-linear boundary the two fp32 backends round to
-    adjacent levels.
-
-    Whether the gap actually appears is backend-dependent: it turns on the order
-    the squaring-path fp32 reduction is accumulated, which differs across
-    onnxruntime/torch builds (e.g. the CPU pair on Modal agrees on the squaring
-    path even on 999*999, while other build pairs flip one level).  So we assert
-    the *bound*, not the gap's presence — within the cross-backend fp floor (the
-    Phase-6 local-recency reshape, ``_PARITY_FP_FLOOR``), or that floor plus
-    exactly one ~1600 digit-level — which distinguishes the squaring boundary
-    from a free-floating structural bug.
-    """
-    for text in _EXTREME:
-        o, h = _prefill_logits(model, oracle, tok2id, text)
-        d = (o - h).abs().max().item()
-        assert d <= _PARITY_FP_FLOOR or abs(d - 1600.0) <= _PARITY_FP_FLOOR, (
-            f"{text}: divergence {d} is neither within the cross-backend fp floor "
-            f"(~{_PARITY_FP_FLOOR}) nor a single digit-level (~1600) boundary flip "
-            f"— that signals free-floating noise or a structural bug, not the "
-            f"squaring-path quantization edge"
-        )
-
-
 def test_save_load_generate_round_trip(tmp_path, artifact_path, model, oracle, tok2id):
     """Save → reload (classes imported) → tokenizer-driven generate == '408'."""
     from transformers import Phi3ForCausalLM
@@ -211,6 +170,7 @@ def test_save_load_generate_round_trip(tmp_path, artifact_path, model, oracle, t
 
     reloaded = Phi3ForCausalLM.from_pretrained(save_dir).eval()
     from transformers import AutoTokenizer
+
     reloaded_tok = AutoTokenizer.from_pretrained(save_dir)
 
     enc = reloaded_tok("12*34\n", return_tensors="pt")

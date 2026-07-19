@@ -4,7 +4,9 @@ Structurally identical to the relu module — these patterns compose
 embedding-valued lookups, ±1 gates, and attention moves; the attention
 ops are machine-neutral hardware, and every MLP ingredient
 (map_to_table, select, cond_gate, the bool ops, equals_vector) is the
-swiglu version, inheriting its entry.
+swiglu version, inheriting its entry.  Exception: :class:`IndexedRegion`
+is swiglu-only — no relu twin exists because no relu user does (the
+calculators that need it are swiglu graphs).
 """
 
 from typing import List

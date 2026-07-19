@@ -187,11 +187,12 @@ def measure_op(arith, fn_name, n, embedding):
 
 
 # The scratchpad's per-op "kernel" is its streamed sweep, not a digit-seq
-# transform: it needs the scratch vocab and a position encoding and returns
-# emitted-token nodes, so it can't go through ``measure_op``.  These are its
-# private op builders ``(pos_encoding, embedding, A, B, n) -> (thinking,
-# answer)``; reaching for them keeps the kernel panel able to show all three
-# implementations without widening the scratchpad's public surface for a viz.
+# transform: it needs the scratch vocab, a rope config, and the decode-step
+# counter, and returns emitted-token nodes, so it can't go through
+# ``measure_op``.  These are its private op builders ``(rope, embedding, A, B,
+# n, steps_since) -> (thinking, answer)``; reaching for them keeps the kernel
+# panel able to show all three implementations without widening the
+# scratchpad's public surface for a viz.
 _SCRATCHPAD_OPS = {
     "add": calculator_scratchpad._add_op,
     "subtract": calculator_scratchpad._sub_op,
