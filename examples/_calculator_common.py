@@ -128,38 +128,38 @@ def _slice(node: Node, start: int, width: int, name: str = "slice") -> Node:
 def compare_digit_seqs(
     embedding: Embedding, seq1: List[Node], seq2: List[Node]
 ) -> Node:
-    """Lexicographic comparison at constant depth in the digit count.
+    """Lexicographic comparison at constant depth: weight the digit flags so
+    the first difference outweighs everything after it.
 
-    The verdict is the greater-flag at the first position where the digits
-    differ — or "equal" when none do, and equal counts as ``>=``.  Rather
-    than folding a 3-state verdict serially MSB-down (one lookup per digit
-    on the critical path), compute it positionally, the same
-    first-differing-position pattern as ``remove_leading_0s``:
+    This is how a person compares equal-width numbers — walk from the most
+    significant digit, and the first position where the digits differ
+    decides — encoded arithmetically in three FFN stages regardless of
+    digit count:
 
     1. one ``onehot_lookup`` per position maps the concatenated digit pair
-       to ``[equal (0/1), greater (±1)]`` flags — all positions in parallel;
-    2. a ``compare`` per position on a free prefix sum of the equal flags
-       tests "the first ``i+1`` pairs all agree"; those prefix flags are
-       monotone, so their free 0/1 sum is the first differing index ``d``
-       (``n`` when the sequences are identical);
-    3. ``in_range(d, d + 1, n + 1)`` one-hots ``d``, once;
-    4. a ``broadcast_select`` mux reads position ``d``'s greater flag, with
-       slot ``n`` wired to a ``+1`` literal (equal counts as ``>=``).
+       to a three-way flag: ``+1`` (a > b), ``0`` (equal), ``-1`` (a < b)
+       — all positions in parallel;
+    2. each flag is re-sharpened to an exact ``-1/0/+1`` (two saturated
+       ``compare`` ramps, combined for free).  This stage is load-bearing:
+       the position weights below multiply each flag by up to ``3^(n-1)``,
+       which would amplify the lookup's pass-through noise (proportional
+       to the gathered digits' one-hot deviation) far past any budget —
+       sharpened flags are bit-exact, so the weighted sum is exact integer
+       arithmetic;
+    3. a free ``Linear`` sums the flags with weights ``3^(n-1-i)`` (MSB
+       heaviest).  ``3^k`` strictly exceeds ``2·(3^{k-1}+...+1)``, so the
+       first nonzero flag dominates every later position combined and the
+       sign of the sum IS the verdict; a final ``compare`` at ``-0.5``
+       reads it off, with equal (sum exactly 0) counting as ``>=``.
 
-    Five FFN stages regardless of digit count (the retired fold paid one
-    per digit plus the sharpen — its score collapse keyed on a single
-    one-hot block, which onehot_lookup lowers to a free Linear).  Returns a ±1 boolean: ``+1`` if ``seq1 >= seq2``,
-    ``-1`` otherwise — the final sharpen keeps the cond clean for the
-    selects that consume it (the mux passes lookup noise and mask deviation
-    through proportionally).
+    Returns a ±1 boolean: ``+1`` if ``seq1 >= seq2``, ``-1`` otherwise —
+    the final compare keeps the cond clean for the selects that consume it.
     """
     assert len(seq1) == len(seq2)
     n = len(seq1)
 
-    # key = concat([a, b]) -> [equal (0/1), greater (±1)].  The default
-    # reads "equal, not greater" — the same deferral a non-digit pair got
-    # from the retired fold's _EQUAL default (its greater lane is only
-    # consumed at a position whose equal flag is 0, so the 0.0 is inert).
+    # key = concat([a, b]) -> three-way flag.  The default reads "equal"
+    # (0.0) — a non-digit pair defers the verdict to later positions.
     pair_table: Dict[torch.Tensor, torch.Tensor] = {}
     for a in range(10):
         for b in range(10):
@@ -167,36 +167,30 @@ def compare_digit_seqs(
                 [embedding.get_embedding(str(a)), embedding.get_embedding(str(b))]
             )
             pair_table[key] = torch.tensor(
-                [1.0 if a == b else 0.0, 1.0 if a > b else -1.0]
+                [0.0 if a == b else (1.0 if a > b else -1.0)]
             )
-    default_flags = torch.tensor([1.0, 0.0])
+    default_flag = torch.tensor([0.0])
 
     flags = [
-        onehot_lookup(concat([a, b]), pair_table, default_flags)
+        onehot_lookup(concat([a, b]), pair_table, default_flag)
         for a, b in zip(seq1, seq2)  # MSB-first
     ]
-    eq01 = [_slice(f, 0, 1, name="cmp_eq") for f in flags]
-    greater = [_slice(f, 1, 1, name="cmp_gt") for f in flags]
+    # Sharpen each flag to an exact three-level value: gt = 1 iff flag > 0.5,
+    # lt = 1 iff flag < -0.5 (both bit-exact in saturation; the flag sits
+    # 0.5 from either threshold, well clear of the 1/sharpness ramps).
+    sharpened = []
+    for f in flags:
+        gt = _compare_scalar(f, thresh=0.5, true_level=1.0, false_level=0.0)
+        lt = _compare_scalar(f, thresh=-0.5, true_level=0.0, false_level=1.0)
+        sharpened.extend([gt, lt])
 
-    prefix01 = [
-        bool_to_01(_compare_scalar(sum_nodes(eq01[: i + 1]), thresh=i + 0.5))
-        for i in range(n)
-    ]
-    first_diff = sum_nodes(prefix01)
-
-    one_hot = in_range(first_diff, add_const(first_diff, 1.0), n + 1)
-    candidates = concat(greater + [create_literal_value(torch.tensor([1.0]))])
-    masked = broadcast_select(
-        masks=one_hot,
-        true_value=candidates,
-        false_value=create_literal_value(torch.zeros(1), name="cmp_zero"),
-        n_slots=n + 1,
-        d_fill=1,
-    )
-    # Losing slots are exactly zero at clean masks, so the free sum
-    # degenerates to the selected position's flag.
-    score = Linear(masked, torch.ones(n + 1, 1), name="cmp_verdict_sum")
-    return _compare_scalar(score, thresh=0.0, true_level=1.0, false_level=-1.0)
+    stacked = concat(sharpened)
+    weights = torch.zeros(len(stacked), 1)
+    for i in range(n):
+        weights[2 * i, 0] = 3.0 ** (n - 1 - i)  # gt adds the position weight
+        weights[2 * i + 1, 0] = -(3.0 ** (n - 1 - i))  # lt subtracts it
+    score = Linear(stacked, weights, name="cmp_score")
+    return _compare_scalar(score, thresh=-0.5, true_level=1.0, false_level=-1.0)
 
 
 # ---------------------------------------------------------------------------
@@ -318,14 +312,16 @@ def parse_expression(
     return first, second, which_plus, which_minus, which_times, saw_newline
 
 
-def _format_result(
-    embedding: Embedding, digits: List[Node], seq_len: int
-) -> List[Node]:
-    """Pad a digit sequence to ``seq_len`` with ``<eos>``, then drop leading
-    zeros (keeping at least one digit) so ``"007"`` prints as ``"7"``."""
+def _pad_result(embedding: Embedding, digits: List[Node], seq_len: int) -> List[Node]:
+    """Align a digit sequence into the shared result frame (free literals):
+    leading ``"0"`` digits out to the widest answer width (``seq_len - 2``,
+    multiplication's ``2·max_digits``), then ``<eos>`` padding.  Every branch
+    then has the same digit width, so the one post-dispatch trim's
+    ``max_removals`` cap keeps exactly one digit of an all-zero answer no
+    matter which branch won."""
+    zero = create_literal_value(embedding.get_embedding("0"))
     eos = create_literal_value(embedding.get_embedding("<eos>"))
-    padded = digits + [eos] * (seq_len - len(digits))
-    return remove_leading_0s(embedding, padded, max_removals=len(digits) - 1)
+    return [zero] * (seq_len - 2 - len(digits)) + digits + [eos, eos]
 
 
 def emit_result(
@@ -372,29 +368,45 @@ def build_calculator(
     zero = create_literal_value(embedding.get_embedding("0"))
 
     # --- Addition: pad each operand by one digit so the top carry has a home. ---
-    add_digits = add_digit_seqs(embedding, [zero] + first, [zero] + second)
-    add_seq = _format_result(embedding, add_digits, seq_len)
+    add_seq = _pad_result(
+        embedding, add_digit_seqs(embedding, [zero] + first, [zero] + second), seq_len
+    )
 
     # --- Subtraction: |A - B| by a borrow fold, sign from the comparison. ---
     a_ge_b = compare_digit_seqs(embedding, first, second)
     bigger = [select(a_ge_b, a, b) for a, b in zip(first, second)]
     smaller = [select(a_ge_b, b, a) for a, b in zip(first, second)]
-    magnitude = _format_result(
+    sub_seq = _pad_result(
         embedding, subtract_digit_seqs(embedding, bigger, smaller), seq_len
     )
-    minus = create_literal_value(embedding.get_embedding("-"))
-    negative = [minus] + magnitude[: seq_len - 1]
-    sub_seq = [select(a_ge_b, magnitude[i], negative[i]) for i in range(seq_len)]
 
     # --- Multiplication: long multiplication, product fits in 2*max_digits. ---
-    mul_seq = _format_result(
+    mul_seq = _pad_result(
         embedding, multiply_digit_seqs(embedding, first, second), seq_len
     )
 
-    # --- Dispatch by operator, then emit. ---
-    result_digits = [
+    # --- Dispatch by operator, THEN format the one selected answer. ---
+    # Formatting after the dispatch instead of per branch runs one
+    # leading-zero trim instead of three.  The trim's mux materializes a
+    # whole formatted sequence on the residual stream, so three parallel
+    # trims were the graph's peak-width hotspot — wide enough to starve
+    # the d=1024 publish geometry.  Same depth either way: the operator
+    # switch, the trim, and the sign select below are serial in both
+    # orders.
+    answer = [
         switch([is_plus, is_minus, is_times], [add_seq[i], sub_seq[i], mul_seq[i]])
         for i in range(seq_len)
     ]
+    # A negative subtraction prepends the sign, shifting everything right
+    # one slot; the trim's signed variant folds that into its own mux, so
+    # the sign costs no extra stage.
+    is_negative = bool_all_true([is_minus, bool_not(a_ge_b)])
+    result_digits = remove_leading_0s(
+        embedding,
+        answer,
+        max_removals=2 * max_digits - 1,
+        sign_cond=is_negative,
+        sign_token=embedding.get_embedding("-"),
+    )
     output_node = emit_result(rope, embedding, saw_newline, result_digits)
     return output_node, embedding
