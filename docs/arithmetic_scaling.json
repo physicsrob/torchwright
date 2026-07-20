@@ -93,32 +93,32 @@
         {
           "n": 1,
           "depth": 3,
-          "neurons": 268
+          "neurons": 272
         },
         {
           "n": 2,
           "depth": 5,
-          "neurons": 1056
+          "neurons": 1080
         },
         {
           "n": 3,
           "depth": 7,
-          "neurons": 2364
+          "neurons": 2424
         },
         {
           "n": 4,
           "depth": 9,
-          "neurons": 4192
+          "neurons": 4304
         },
         {
           "n": 6,
           "depth": 13,
-          "neurons": 9408
+          "neurons": 9672
         },
         {
           "n": 8,
           "depth": 17,
-          "neurons": 16704
+          "neurons": 17184
         }
       ]
     },
@@ -324,32 +324,32 @@
       {
         "n": 1,
         "depth": 22,
-        "neurons": 2312
+        "neurons": 2316
       },
       {
         "n": 2,
         "depth": 27,
-        "neurons": 5073
+        "neurons": 5097
       },
       {
         "n": 3,
         "depth": 28,
-        "neurons": 8570
+        "neurons": 8630
       },
       {
         "n": 4,
         "depth": 29,
-        "neurons": 12875
+        "neurons": 12987
       },
       {
         "n": 5,
         "depth": 30,
-        "neurons": 17988
+        "neurons": 18168
       },
       {
         "n": 6,
         "depth": 31,
-        "neurons": 23909
+        "neurons": 24173
       }
     ],
     "advanced": [

@@ -29,7 +29,8 @@ import torch
 from torchwright.graph import Embedding, Node
 from torchwright.ops.linear import add, add_const, bool_to_01, concat, sum_nodes
 from torchwright.ops.inout_nodes import create_literal_value
-from torchwright.ops.swiglu.arithmetic_ops import compare
+from torchwright.ops.const import step_sharpness
+from torchwright.ops.swiglu.arithmetic_ops import piecewise_linear
 from torchwright.ops.swiglu.map_select import in_range
 from torchwright.ops.swiglu.onehot_table import onehot_lookup
 
@@ -255,7 +256,7 @@ def multiply_digit_seqs(
     # Step 3: one carry sweep, least-significant column first.  Turn each
     # column total (a number 0..20n) into a one-hot index and read off its
     # digit with a free selection-matrix lookup; the carry is "how many
-    # tens fit" — one threshold test per possible ten, summed for free.
+    # tens fit" — a 2n-step staircase over the total, one FFN.
     #
     # The carry is deliberately NOT read off the wide one-hot with a
     # 0..2n-valued selection row: a saturated in_range slot at index i
@@ -264,14 +265,21 @@ def multiply_digit_seqs(
     # and a selection row weighted up to 2n amplifies two adjacent slots'
     # jitter past the 1e-3 claim budget of the compiler's univariate
     # collapse pass — leaving the whole sweep at three compiled layers
-    # per column instead of one.  Threshold sums read the same staircase
-    # with unit weights, keeping the composed noise an order of magnitude
-    # under the budget.
+    # per column instead of one.  The staircase reads the same step
+    # structure with unit hinge weights, keeping the composed noise an
+    # order of magnitude under the budget.
     max_total = 20 * n
     digit_table = {
         _state(t, max_total + 1): embedding.get_embedding(str(t % 10))
         for t in range(max_total + 1)
     }
+    # Staircase knot pairs (one step per ten): carry k−1 up to 10k−0.5,
+    # carry k from 10k−0.4 — the standard 1/sharpness ramp width, so
+    # integer totals sit ≥ 0.4 from every knot (bit-exact reads).
+    carry_knots: Dict[float, float] = {}
+    for k in range(1, max_total // 10 + 1):
+        carry_knots[10.0 * k - 0.5] = float(k - 1)
+        carry_knots[10.0 * k - 0.4] = float(k)
 
     carry: Node = zero_scalar
     out_lsb_first: List[Node] = []
@@ -282,11 +290,12 @@ def multiply_digit_seqs(
         out_lsb_first.append(
             onehot_lookup(total_onehot, digit_table, embedding.get_embedding("0"))
         )
-        carry = sum_nodes(
-            [
-                bool_to_01(compare(total, thresh=10.0 * k - 0.5))
-                for k in range(1, max_total // 10 + 1)
-            ]
+        carry = piecewise_linear(
+            total,
+            sorted(carry_knots),
+            carry_knots.__getitem__,
+            input_scale=step_sharpness,
+            name="carry_staircase",
         )
     return list(reversed(out_lsb_first))
 
