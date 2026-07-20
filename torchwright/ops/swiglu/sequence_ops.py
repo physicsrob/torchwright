@@ -10,7 +10,7 @@ calculators that need it are swiglu graphs).
 """
 
 import math
-from typing import List
+from typing import List, Optional
 
 import torch
 
@@ -26,6 +26,7 @@ from torchwright.ops.linear import (
     add,
     add_const,
     bool_to_01,
+    multiply_const,
     concat,
     negate,
     sum_nodes,
@@ -402,7 +403,12 @@ def output_sequence(
 
 
 def remove_leading_0s(
-    embedding: Embedding, seq: List[Node], max_removals: int
+    embedding: Embedding,
+    seq: List[Node],
+    max_removals: int,
+    *,
+    sign_cond: Optional[Node] = None,
+    sign_token: Optional[torch.Tensor] = None,
 ) -> List[Node]:
     """Remove leading zeros from a digit sequence by shifting left.
 
@@ -436,12 +442,32 @@ def remove_leading_0s(
     number of leading slots against those ~0.5 bands — comfortable at
     digit-sequence widths; a much wider window would want the prefix
     sums re-sharpened.
+
+    **Signed variant** (``sign_cond`` + ``sign_token``, both or neither):
+    when the ±1 cond ``sign_cond`` is true, the output is instead
+    ``sign_token`` at slot 0 followed by the trimmed sequence — the
+    sign character prepended, everything shifted right one slot (the
+    slot that falls off the end is the caller's padding).  Costs no
+    extra depth: the mux scalar becomes ``k + (n_shifts+1)·sign01``,
+    so one ``in_range`` over twice the entries jointly keys (shift,
+    sign) and each slot's candidate list doubles.  ``sign_cond`` must be a
+    clean ±1 cond (``bool_to_01`` margins); it enters at stage 3, so it
+    may resolve later than the sequence without deepening the trim.
     """
+    if (sign_cond is None) != (sign_token is None):
+        raise ValueError(
+            "remove_leading_0s: sign_cond and sign_token must be passed together"
+        )
     n = len(seq)
     # Shifting by n-1 or more pins every slot to the last element, so
     # larger removal budgets are no-ops — cap the candidate table there.
     n_shifts = min(max_removals, n - 1)
     if n_shifts <= 0:
+        if sign_cond is not None:
+            raise ValueError(
+                "remove_leading_0s: the signed variant needs at least one "
+                "removable slot (n >= 2 and max_removals >= 1)"
+            )
         return seq
 
     d = len(seq[0])
@@ -458,18 +484,33 @@ def remove_leading_0s(
     shift = sum_nodes(prefix01)
 
     n_entries = n_shifts + 1
-    one_hot = in_range(shift, add_const(shift, 1.0), n_entries)
+    if sign_cond is not None:
+        # Joint (shift, sign) key: the negative half of the entry range.
+        shift = add(shift, multiply_const(bool_to_01(sign_cond), float(n_entries)))
+    n_slots = n_entries * (2 if sign_cond is not None else 1)
+    one_hot = in_range(shift, add_const(shift, 1.0), n_slots)
     zero_fill = create_literal_value(torch.zeros(d), name="remove_leading_0s_zero")
-    collapse = torch.eye(d).repeat(n_entries, 1)
+    collapse = torch.eye(d).repeat(n_slots, 1)
+    sign = (
+        create_literal_value(sign_token, name="remove_leading_0s_sign")
+        if sign_token is not None
+        else None
+    )
 
     out: List[Node] = []
     for i in range(n):
-        candidates = concat([seq[min(i + k, n - 1)] for k in range(n_entries)])
+        candidates = [seq[min(i + k, n - 1)] for k in range(n_entries)]
+        if sign_cond is not None:
+            # Negative half: the sign at slot 0, the trimmed sequence
+            # shifted right one everywhere else.
+            candidates += [
+                sign if i == 0 else seq[min(i - 1 + k, n - 1)] for k in range(n_entries)
+            ]
         masked = broadcast_select(
             masks=one_hot,
-            true_value=candidates,
+            true_value=concat(candidates),
             false_value=zero_fill,
-            n_slots=n_entries,
+            n_slots=n_slots,
             d_fill=d,
         )
         # Losing slots are exactly zero at clean masks, so the free sum
