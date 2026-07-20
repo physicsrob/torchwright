@@ -144,18 +144,21 @@ __all__ = [
 
 
 def decode_steps(max_digits: int) -> int:
-    """Decode steps (emitted tokens, incl. ``THINKING_START`` / ``RESULT`` /
-    ``<eos>``) for ``max_digits``-wide operands.
+    """**Worst-case** decode steps (emitted tokens, incl. ``THINKING_START`` /
+    ``RESULT`` / ``<eos>``) for ``max_digits``-wide operands.
 
-    All three ops are padded to a common length and the multiply transcript is
-    the longest (``8·max_digits + 3``: open, ``2n`` carry glyphs, ``2n`` scratch
-    digits, ``2n`` normalization glyphs, close, up to ``2n`` answer digits,
-    ``<eos>``).  This is the axis that grows with operand size — the serial work
-    the legible calculators put on the *layer* axis lives here, on the *step*
-    axis — while the layer depth stays flat.  The leading-zero trim adds one
-    scratch digit *and* one normalization glyph per answer column (``+2N``
-    steps), the price of an MSB-first variable-length answer with no
-    ``O(n)``-depth shift.
+    This is a max over the three per-op transcript lengths, and the multiply
+    transcript is the longest (``8·max_digits + 3``: open, ``2n`` carry glyphs,
+    ``2n`` scratch digits, ``2n`` normalization glyphs, close, up to ``2n``
+    answer digits, ``<eos>``) — an add or subtract query emits its own
+    ``<eos>`` at its shorter transcript length (``4n+7`` / ``5n+4``) and
+    generation stops there, so it is *not* the per-query emission count.  Use
+    it as the ceiling: the decode-buffer size a rollout must provision, and
+    the axis that grows with operand size — the serial work the legible
+    calculators put on the *layer* axis lives here, on the *step* axis —
+    while the layer depth stays flat.  The leading-zero trim adds one scratch
+    digit *and* one normalization glyph per answer column (``+2N`` steps), the
+    price of an MSB-first variable-length answer with no ``O(n)``-depth shift.
     """
     n = max_digits
     # open, carry, scratch, norm, close, ans, eos

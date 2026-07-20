@@ -44,7 +44,8 @@ grow ~linearly (their in-graph serial work — the arithmetic folds, the shared
 comparison, the leading-zero trim; the parse is the shared constant-depth
 pointer gather), while ``examples.calculator_scratchpad`` — which streams the
 serial carry/borrow/comparison work out as "thinking" tokens — stays **flat**
-in ``n`` and pays the cost in decode *steps* (``8n+3``) instead.
+in ``n`` and pays the cost in decode *steps* (worst case ``8n+3``, the
+multiply transcript) instead.
 
 Output: a JSON file (the data the blog/vizkit consumes), printed tables, and an
 optional matplotlib PNG (per-op kernel depth and end-to-end model depth, with a
@@ -293,7 +294,9 @@ def measure_model(impl, n):
 
 def run_models(digit_sweep):
     """End-to-end model depth/size for every implementation, plus the scratchpad
-    decode-step count (its O(n) cost, the axis that grows instead of depth)."""
+    worst-case decode-step count (its O(n) cost, the axis that grows instead of
+    depth — the multiply transcript's length; add/sub stop at their own <eos>
+    earlier)."""
     results = {}
     for name, impl in MODEL_IMPLEMENTATIONS.items():
         records = []
@@ -348,7 +351,11 @@ def build_payload(results, model_results, digit_sweep, model_digit_sweep, multip
             "depth_metric": "critical-path length over neuron-producing nodes",
             "size_metric": "total neuron count (FFN lanes + ReLU widths; ~ params / 2d, gated lanes ~ params / 3d)",
             "model_depth_metric": "whole-model critical-path depth (parse + ops + dispatch + emit)",
-            "decode_steps_metric": "emitted tokens per query (scratchpad: 8n+3)",
+            "decode_steps_metric": (
+                "worst-case decode steps per query (scratchpad: the multiply "
+                "transcript, 8n+3; add/sub transcripts hit their own <eos> "
+                "earlier and generation stops there)"
+            ),
         },
         "results": results,
         "model_results": model_results,
