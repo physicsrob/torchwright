@@ -109,7 +109,6 @@ from torchwright.ops.swiglu.marker_count import count_since_marker
 
 from examples._calculator_common import (
     CALC_VOCAB,
-    D_HEAD,
     MAX_POSITIONS,
     _CMP_W,
     _EQUAL,
@@ -119,6 +118,16 @@ from examples._calculator_common import (
     _state,
     parse_expression,
 )
+
+# Wider heads than the sibling calculators (which stay at the shared
+# ``_calculator_common.D_HEAD``): the multiply answer gather's content
+# one-hot spans ``2n+1`` columns and must fit ``d_head/2`` slow rotary
+# planes, so ``max_digits=10`` needs ``d_head >= 42``.  64 also lands the
+# deepest content column on plane 11 instead of plane 0 (``θ`` shrinks
+# from ``base^0 = 1`` to ``base^{-22/64} ≈ 0.011`` rad/token), easing —
+# not yet verifying — the transcript-length ``cos(Δ·θ)`` attenuation
+# concern flagged at d_head=32 (decode tests still run max_digits=3).
+D_HEAD = 64
 
 # The dispatch computes all three streamed ops in parallel; each carry/borrow
 # column carries a wide one-hot total.  The leading-zero trim derives each

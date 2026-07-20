@@ -67,18 +67,14 @@ from torchwright.ops.swiglu.sequence_ops import (
 )
 
 D_MODEL = 1024
-# Rotary width the calculator graph is built against; must equal the d_head the
-# token-example harness compiles at (whose default is 16).  32 leaves 16 slow
-# planes — the widest content head in the family is the scratchpad multiply's
-# pointer gather, whose width is 2n+1 (the answer-column one-hot plus the
-# recency tiebreak); the scratchpad depth test builds up to max_digits=6, where
-# that is 13, so the family needs d_head >= 26 (place_on_slow_planes runs at
-# build time).  32 is the next clean even width with margin.  Open question
-# (2026-07, unverified): "fits the slow planes" is the same incomplete
-# contract IndexedRegion's dominance guard closed — the scratchpad answer-trim
-# gather's fastest lanes are attenuated by cos(Δ·θ) over transcript-length
-# read distances, with a back-of-envelope decode break around n≥6 at d_head=32;
-# exposure today is build-only (decode tests run n=3).
+# Rotary width the simple/advanced calculator graphs are built against; must
+# equal the d_head the token-example harness compiles at.  32 leaves 16 slow
+# planes, comfortably above the widest content head the shared parse / compare
+# / emission plumbing builds (place_on_slow_planes checks at build time).
+# ``calculator_scratchpad`` overrides this with its own wider D_HEAD: its
+# multiply answer gather's content one-hot spans 2n+1 columns, which outgrows
+# 16 planes past max_digits=7 (see the comment there, including the standing
+# cos(Δ·θ) read-distance attenuation caveat on that gather's fastest lanes).
 D_HEAD = 32
 MAX_POSITIONS = 512
 
