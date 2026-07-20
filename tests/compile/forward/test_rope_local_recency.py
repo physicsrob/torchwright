@@ -1,15 +1,11 @@
 """Phase 6 — local recency on the compiled path.
 
 docs/rope_port_plan.md Phase 6.  The op-level lobe shape / breakdown / oracle
-selection live in ``tests/ops/test_local_recency.py``; this file proves the same
-intrinsic rotary-lobe recency on the **compiled** transformer:
-
-- ``attend_most_recent_matching`` picks the immediate predecessor over a prefill
-  (the nearest of many in-window candidates) with hard softmax concentration;
-- ``probe_compiled`` agrees with the graph oracle everywhere (no divergent node);
-- the recency selection is identical between a prefill and an unbounded cached
-  decode (BOS/K-rotation cache invariant);
-- ``get_prev_value`` latches the most-recent true position.
+selection and the build-time guards live in ``tests/ops/test_local_recency.py``;
+this file proves the same intrinsic rotary-lobe recency on the **compiled**
+transformer: ``get_prev_value`` latches the most-recent true position, with a
+single far trigger still latching (the content gate dominates the bounded lobe
+regardless of distance).
 
 Cost: the recency lobe rides real slow frequencies, so the head is full-width
 ``d_head=256`` rotary (the recency band 12..96 must be disjoint from the content

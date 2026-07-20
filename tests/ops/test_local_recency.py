@@ -21,7 +21,13 @@ These are the smallest-layer (oracle, ``node.compute``) confidence tests:
   gate past quasi-static** (the gate rides the slowest plane, so its ±gate
   swing is really ``±gate·cos(Δ·θ_slow)``; at ``max_positions·θ_slow ≥ π/2``
   a distant false key's contribution goes negative and the ordering inverts
-  outright — a healthy-band config can still fail this way).
+  outright — a healthy-band config can still fail this way);
+- ``get_prev_value`` **refuses to build when the lobe tiebreak erodes the
+  guaranteed gap** (the recency lobe favors near keys by up to
+  ``lobe_peak = gate/4``, so the provable true-over-false gap is
+  ``2·gate·cos_floor − lobe_peak``; a healthy-band, quasi-static config
+  with ``cos_floor ≤ 1/8`` leaves it non-positive and the bound proves
+  nothing — refused even though no misread was observed at such configs).
 
 The compiled-path parity / prefill==decode checks are in
 ``tests/compile/forward/test_rope_local_recency.py``.
@@ -157,6 +163,26 @@ def test_get_prev_value_raises_when_rotation_defeats_the_gate():
     value = InputNode("value", 1, value_range=(-1.0, 1.0))
     cond = InputNode("cond", 1, value_range=(-1.0, 1.0))
     with pytest.raises(ValueError, match="not.*quasi-static"):
+        get_prev_value(rope, value, cond)
+
+
+def test_get_prev_value_raises_when_lobe_tiebreak_erodes_the_gap():
+    """The leak bound must count the recency lobe's tiebreak, not just the
+    cond gate.  At d_head=32, max_positions=20, base=16 the band is healthy
+    (4 planes, gate ≈ 3.6e3) and quasi-static holds (20·θ_slow = 1.487 <
+    π/2, cos_floor = 0.084) — the pre-fix bound, which assumed the lobe
+    differential ≤ 0, passed by ~260 orders of magnitude.  But the lobe can
+    hand a false key up to lobe_peak = gate/4 ≈ 902 logits over the winning
+    true key, while the rotation floor leaves the cond gap at
+    2·gate·cos_floor ≈ 608: the guaranteed gap is negative and the bound
+    proves nothing.  Reference eval at this config showed no actual misread
+    (the lobe rides strictly faster planes than the gate, so its real decay
+    preserves ordering) — the config is refused because the ordering can no
+    longer be *proven*, not because a failure reproduced."""
+    rope = RopeConfig(d_head=32, max_positions=20, base=16.0)
+    value = InputNode("value", 1, value_range=(-1.0, 1.0))
+    cond = InputNode("cond", 1, value_range=(-1.0, 1.0))
+    with pytest.raises(ValueError, match="too weak to latch"):
         get_prev_value(rope, value, cond)
 
 
