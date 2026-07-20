@@ -73,7 +73,12 @@ D_MODEL = 1024
 # pointer gather, whose width is 2n+1 (the answer-column one-hot plus the
 # recency tiebreak); the scratchpad depth test builds up to max_digits=6, where
 # that is 13, so the family needs d_head >= 26 (place_on_slow_planes runs at
-# build time).  32 is the next clean even width with margin.
+# build time).  32 is the next clean even width with margin.  Open question
+# (2026-07, unverified): "fits the slow planes" is the same incomplete
+# contract IndexedRegion's dominance guard closed — the scratchpad answer-trim
+# gather's fastest lanes are attenuated by cos(Δ·θ) over transcript-length
+# read distances, with a back-of-envelope decode break around n≥6 at d_head=32;
+# exposure today is build-only (decode tests run n=3).
 D_HEAD = 32
 MAX_POSITIONS = 512
 
@@ -203,7 +208,11 @@ def parse_expression(
     its index within its operand, the operand length is latched at the
     delimiter, and each window slot reads the digit it needs with one
     pointer attention — ``index = length - max_digits + i`` — falling back
-    to the region default ``"0"`` where the index is negative.  That makes
+    to the region default ``"0"`` where the index is negative.  Each window
+    slot is latched at the newline, so every decode position reads the same
+    operand values and the gather's slow-plane content match only has to
+    survive the rotary attenuation over the prompt length (the regions'
+    ``max_read_distance`` contract), not the whole rollout.  That makes
     the whole parse constant-depth in ``max_digits``, unlike the old
     ``NumericSequence`` sliding window, whose slot-to-slot shift chained
     through computed nodes and unrolled into ``O(max_digits)`` layers.
@@ -237,12 +246,18 @@ def parse_expression(
     is_digit = check_is_digit(embedding)
     in_first = bool_all_true([is_digit, bool_not(seen_operator)])
     in_second = bool_all_true([is_digit, seen_operator, bool_not(seen_newline)])
+    # The gathers below are consumed only at the newline (the get_prev_value
+    # latch), so the farthest consumed read sits one prompt length from its
+    # marker: "<bos> A op B \n" is at most 2·max_digits + 3 tokens, giving
+    # the regions a max_read_distance bound of 2·max_digits + 4 with margin.
+    max_read_distance = 2 * max_digits + 4
     first_region = IndexedRegion(
         rope,
         embedding,
         marker=saw_bos,
         in_region=in_first,
         max_len=max_digits,
+        max_read_distance=max_read_distance,
         default=embed("0"),
     )
     second_region = IndexedRegion(
@@ -251,20 +266,38 @@ def parse_expression(
         marker=is_input_operator,
         in_region=in_second,
         max_len=max_digits,
+        max_read_distance=max_read_distance,
         default=embed("0"),
     )
 
     # First operand's length is known at the operator; second's at newline.
     # MSB-first window slot i holds the digit at index length - max_digits + i;
     # a negative index (operand narrower than the window) reads the "0" default.
+    # Each pointer gather is latched at the newline: every decode position then
+    # reads the value the gather computed *at the newline*, instead of
+    # re-running the gather per position.  Two effects: the operand windows
+    # cannot drift across the rollout, and the gather's content match only has
+    # to survive the rotation over the prompt length (query at the newline,
+    # keys at the prompt digits) rather than over the whole
+    # rope.max_positions rollout — that prompt-length bound is the
+    # max_read_distance contract the regions enforce above.  Cost: one extra
+    # constant-depth attention sublayer.
     len_first = first_region.length_at(is_input_operator)
     len_second = second_region.length_at(saw_newline)
     first = [
-        first_region.token_at(add_const(len_first, float(i - max_digits)))
+        get_prev_value(
+            rope,
+            first_region.token_at(add_const(len_first, float(i - max_digits))),
+            saw_newline,
+        )
         for i in range(max_digits)
     ]
     second = [
-        second_region.token_at(add_const(len_second, float(i - max_digits)))
+        get_prev_value(
+            rope,
+            second_region.token_at(add_const(len_second, float(i - max_digits))),
+            saw_newline,
+        )
         for i in range(max_digits)
     ]
     return first, second, which_plus, which_minus, which_times, saw_newline

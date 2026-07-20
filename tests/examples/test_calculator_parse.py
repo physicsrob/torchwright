@@ -15,6 +15,7 @@ GPU) over real token streams and pin its contract:
 """
 
 import pytest
+import torch
 
 from examples._calculator_common import (
     CALC_VOCAB,
@@ -86,3 +87,44 @@ def test_emitted_digits_do_not_pollute_operands(parse):
     # them out of the operand windows for the rest of the rollout.
     tokens = _prompt("12+7\n") + ["1", "9"]
     assert _run(parse, tokens) == ("012", "007", "+")
+
+
+def test_parse_refuses_max_digits_past_dominance_bound():
+    # Codex finding (2026-07): at d_head=32 a 14-digit window puts operand
+    # lanes on rotary planes fast enough that the pointer gather's dominance
+    # ordering breaks over a prompt-length read — a 14-digit operand
+    # mis-parsed at build-legal geometry.  The IndexedRegion guard must turn
+    # that into a build-time refusal.
+    embedding = create_onehot_embedding(CALC_VOCAB)
+    rope = create_rope_config(d_head=D_HEAD, max_positions=MAX_POSITIONS)
+    with pytest.raises(ValueError, match="dominance ordering"):
+        parse_expression(rope, embedding, max_digits=14)
+
+
+def test_wide_operands_parse_at_wider_d_head():
+    # The guard's remedy is real: at d_head=64 a 12-digit operand parse both
+    # builds and decodes exactly (reference eval at the newline, the position
+    # the latched windows are read at).
+    embedding = create_onehot_embedding(CALC_VOCAB)
+    rope = create_rope_config(d_head=64, max_positions=MAX_POSITIONS)
+    nodes = parse_expression(rope, embedding, max_digits=12)
+    tokens = _prompt("123456789012+987\n")
+    assert _run((embedding, nodes), tokens) == ("123456789012", "000000000987", "+")
+
+
+def test_operand_windows_latch_at_newline():
+    # The window gathers are latched at the newline: a much later decode
+    # position must read bit-identical operand values, not re-run the pointer
+    # gather at its own (farther, more attenuated) distance.
+    embedding = create_onehot_embedding(CALC_VOCAB)
+    rope = create_rope_config(d_head=D_HEAD, max_positions=MAX_POSITIONS)
+    first, second, *_ = parse_expression(rope, embedding, max_digits=3)
+    tokens = _prompt("12+7\n") + [" "] * 120
+    newline_pos = tokens.index("\n")
+    iv = {"embedding_input": tokens}
+    for slot in first + second:
+        value = slot.compute(n_pos=len(tokens), input_values=iv)
+        assert torch.allclose(value[newline_pos], value[-1], atol=1e-4), (
+            value[newline_pos],
+            value[-1],
+        )

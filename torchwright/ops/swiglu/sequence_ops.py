@@ -9,11 +9,13 @@ is swiglu-only — no relu twin exists because no relu user does (the
 calculators that need it are swiglu graphs).
 """
 
+import math
 from typing import List
 
 import torch
 
 from torchwright.graph import Embedding, Linear, Node, RopeConfig
+from torchwright.graph.rope import require_full_rotary, rope_inv_freq
 
 from torchwright.ops.attention_ops import (
     attend_argmax_dot,
@@ -129,6 +131,24 @@ _INDEX_MATCH_GAIN = 2_000_000.0
 # works; 0.5 maximizes the smaller of the two margins.
 _SENTINEL_FLOOR = 0.5
 
+# Cosine floor for the pointer gather's content match under the global
+# rotation.  The dominance ordering above (member 1 > sentinel 0.5 > zero 0)
+# is stated in bare dot products, but each content lane's Q·K contribution is
+# really multiplied by cos(Δ·θ_lane), where Δ is the distance from the query
+# to the key and θ_lane is the frequency of the slow plane that lane rides
+# (place_on_slow_planes: lane c → plane d_head/2 − 1 − c, so the *last* lane —
+# the sentinel's dedicated no-member lane — rides the fastest selected plane).
+# Requiring cos(max_read_distance · θ) ≥ 0.75 on every lane keeps the ordering
+# intact with margin: member-beats-sentinel needs worst-member cos 0.75 >
+# _SENTINEL_FLOOR · best-sentinel cos 1 (a 1.5× margin — and in fact the
+# sentinel sits at the marker, farther than every member, so its cosine on the
+# shared lane never exceeds the member's); sentinel-beats-zero needs cos > 0.
+# Measured against reference eval (d_head=32, base=5e5, prompt-length reads):
+# the parse is numerically exact through max_len=12, degrades at 13 (worst
+# window-slot error 6e-2), and misreads outright at 14; this floor admits
+# max_len ≤ 10 there — comfortably inside the break.
+_CONTENT_COS_FLOOR = 0.75
+
 
 class IndexedRegion:
     """Constant-depth random access into a marker-delimited run of tokens.
@@ -164,6 +184,20 @@ class IndexedRegion:
       *different* operand, or digits the model itself emits later — whose
       marker distance would otherwise land in ``[0, max_len)`` and collide
       with a member's key.
+    * Every position where a :meth:`token_at` read is *consumed* must sit
+      within ``max_read_distance`` of the marker.  The gather's content match
+      rides slow rotary planes, so each key lane's dot product is attenuated
+      by ``cos(Δ·θ_lane)`` at distance ``Δ``; past the guarded distance the
+      dominance ordering (member beats sentinel beats zero) breaks and the
+      read silently returns a wrong member or a blend.  The constructor
+      enforces ``cos(max_read_distance · θ) ≥ 0.75`` on the fastest selected
+      plane — a loud ``ValueError``, not silent drift.  Wide regions select
+      fast planes (``max_len + 1`` lanes reach down to plane
+      ``d_head/2 − max_len − 1``), so the practical remedy is raising
+      ``rope.d_head``; shrinking ``max_len`` or consuming reads closer to
+      the marker (e.g. latching them at a delimiter with
+      :func:`~torchwright.ops.attention_ops.get_prev_value`, the calculator
+      parse's pattern) also works.
     * ``rope.max_positions`` must be large enough for a healthy recency-lobe
       band (the production 512 is).  At small values like 64 the band's
       amplitudes collapse and ``get_prev_value`` refuses to build the latch —
@@ -175,14 +209,24 @@ class IndexedRegion:
     scratchpad calculator's column pointer.
 
     Args:
-        rope: RoPE config for the counting and gather heads.
+        rope: RoPE config for the counting and gather heads.  Must be full
+            rotary — the latches ride the recency lobe, which has no
+            partial-rotary form.
         embedding: the raw token embedding; :meth:`token_at` reads its rows.
         marker: ±1 boolean node, true exactly at the marker position.
         in_region: ±1 boolean node, true exactly at member positions; must be
             a clean ±1 boolean at *every* position (it gates the payload).
         max_len: maximum region length; sizes the count and the key width.
-            The gather's content match places ``max_len + 1`` columns on
-            slow rotary planes, so it must fit ``rope.d_head // 2 - 1``.
+            The gather's content match places ``max_len + 1`` columns on slow
+            rotary planes (they must fit ``rope.d_head // 2``), and how *fast*
+            the fastest of those planes is bounds the usable read distance —
+            see ``max_read_distance``.
+        max_read_distance: upper bound on ``query position − marker
+            position`` over every position where a :meth:`token_at` read is
+            consumed (unconsumed reads stay bounded garbage as documented on
+            :meth:`token_at`).  Raises ``ValueError`` when the rotation over
+            this distance would attenuate the fastest content lane below the
+            dominance floor (``_CONTENT_COS_FLOOR``).
         default: the embedding row an out-of-range :meth:`token_at` reads
             (e.g. ``embedding.get_embedding("0")`` for implicit zero-padding).
     """
@@ -195,12 +239,48 @@ class IndexedRegion:
         marker: Node,
         in_region: Node,
         max_len: int,
+        max_read_distance: int,
         default: torch.Tensor,
     ):
         assert len(marker) == 1, "marker must be a 1-D boolean"
         assert len(in_region) == 1, "in_region must be a 1-D boolean"
         assert max_len >= 1, "max_len must be >= 1"
+        assert max_read_distance >= 1, "max_read_distance must be >= 1"
         assert default.numel() == len(embedding), "default must be an embedding row"
+        require_full_rotary(rope.d_rot, rope.d_head, "IndexedRegion")
+
+        # Build-time dominance bound (see _CONTENT_COS_FLOOR): the gather's
+        # max_len + 1 content lanes land on planes d_head/2 − 1 (slowest)
+        # down to d_head/2 − max_len − 1 (fastest); cos is monotone on the
+        # guarded range, so checking the fastest plane at the farthest
+        # consumed distance covers every lane and every nearer key.
+        half = rope.d_head // 2
+        w_content = max_len + 1
+        if w_content > half:
+            raise ValueError(
+                f"IndexedRegion: max_len={max_len} needs {w_content} content "
+                f"lanes but only {half} rotary planes exist at "
+                f"d_head={rope.d_head}; raise d_head."
+            )
+        theta_fast = float(rope_inv_freq(rope.d_head, rope.base)[half - w_content])
+        angle = max_read_distance * theta_fast
+        if angle > math.acos(_CONTENT_COS_FLOOR):
+            raise ValueError(
+                f"IndexedRegion: the pointer gather cannot honor its dominance "
+                f"ordering at max_len={max_len}, "
+                f"max_read_distance={max_read_distance} with d_head="
+                f"{rope.d_head}, base={rope.base:g}: the fastest of its "
+                f"{w_content} content lanes rides plane {half - w_content} "
+                f"(θ={theta_fast:.3e}), and the rotation over the consumed "
+                f"read distance turns cos(Δ·θ) = cos({angle:.3f}) = "
+                f"{math.cos(angle):.3f} < {_CONTENT_COS_FLOOR}, so a member "
+                f"key can lose to the default sentinel (or both to the "
+                f"all-zero keys) and the read silently returns a wrong digit "
+                f"or a blend.  Raise d_head (more slow planes), shrink "
+                f"max_len, or consume the reads closer to the marker (latch "
+                f"them at a delimiter with get_prev_value)."
+            )
+
         self.rope = rope
         self.max_len = max_len
 

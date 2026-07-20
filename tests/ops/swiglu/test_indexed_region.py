@@ -53,6 +53,7 @@ def setup():
         marker=saw_bos,
         in_region=in_region,
         max_len=MAX_LEN,
+        max_read_distance=16,
         default=embed("0"),
     )
     return embedding, rope, region, is_plus
@@ -124,3 +125,45 @@ def test_msb_padded_window(setup):
     ]
     got = "".join(_decode_last(embedding, node, tokens) for node in window)
     assert got == "042"
+
+
+def test_wide_region_raises_past_dominance_bound():
+    # Codex finding (2026-07): a wide region's content lanes reach fast rotary
+    # planes, whose cos(Δ·θ) attenuation breaks the member/sentinel/zero
+    # dominance ordering — a 14-digit operand mis-parsed at d_head=32 even
+    # though max_len "fit the slow planes" per the old docstring.  The
+    # constructor must refuse the geometry, not build a silently-wrong gather.
+    embedding = create_onehot_embedding(vocab=VOCAB)
+    rope = create_rope_config(d_head=32, max_positions=512)
+    embed = embedding.get_embedding
+    saw_bos = equals_vector(embedding, embed(bos_token))
+    in_region = check_is_digit(embedding)
+    with pytest.raises(ValueError, match="dominance ordering"):
+        IndexedRegion(
+            rope,
+            embedding,
+            marker=saw_bos,
+            in_region=in_region,
+            max_len=14,
+            max_read_distance=2 * 14 + 4,
+            default=embed("0"),
+        )
+
+
+def test_wide_region_builds_at_wider_d_head():
+    # The same 14-lane region is healthy at d_head=64: every content lane
+    # stays on a quasi-static plane over the consumed read distance.
+    embedding = create_onehot_embedding(vocab=VOCAB)
+    rope = create_rope_config(d_head=64, max_positions=512)
+    embed = embedding.get_embedding
+    saw_bos = equals_vector(embedding, embed(bos_token))
+    in_region = check_is_digit(embedding)
+    IndexedRegion(  # must not raise
+        rope,
+        embedding,
+        marker=saw_bos,
+        in_region=in_region,
+        max_len=14,
+        max_read_distance=2 * 14 + 4,
+        default=embed("0"),
+    )
