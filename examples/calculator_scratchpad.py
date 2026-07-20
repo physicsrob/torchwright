@@ -747,8 +747,10 @@ def _sub_op(
     a_scalar = [_digit_scalar(embedding, d) for d in A]  # MSB-first
     b_scalar = [_digit_scalar(embedding, d) for d in B]
 
-    # --- comparison phase: MSB-first 3-state verdict fold (combine table is
-    # _calculator_common.compare_digit_seqs', built inline). ---
+    # --- comparison phase: MSB-first 3-state verdict fold — the serial form
+    # the graph calculators retired when compare_digit_seqs went
+    # constant-depth; here the recurrence rides the decode axis, where
+    # serial is the point. ---
     combine_table: Dict[torch.Tensor, torch.Tensor] = {}
     for v in range(_CMP_W):
         for a in range(10):

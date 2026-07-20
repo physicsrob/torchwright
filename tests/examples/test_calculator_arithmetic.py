@@ -89,11 +89,31 @@ def test_compare(arith):
         ("100", "100", 1.0),  # equal counts as >=
         ("190", "200", -1.0),  # decided at the most significant differing digit
         ("219", "210", 1.0),
+        ("321", "319", 1.0),  # first differing digit wins over later smaller ones
+        ("319", "321", -1.0),
     ]
     for a, b, expected in cases:
         out = arith.compare_digit_seqs(e, _digits(e, a, 3), _digits(e, b, 3))
         got = out.compute(n_pos=1, input_values={})[0, 0]
         assert torch.sign(got).item() == expected, (a, b, got.item())
+
+
+def test_compare_depth_constant(arith):
+    """The comparison's critical path must not grow with the digit count —
+    with the trim also flat, the calculators' end-to-end depth is set by
+    their arithmetic alone."""
+    from scripts.arithmetic_scaling import critical_path_depth
+
+    e = _embedding()
+
+    def depth(n):
+        out = arith.compare_digit_seqs(
+            e, _digits(e, "9" * n, n), _digits(e, "1" * n, n)
+        )
+        return critical_path_depth([out])
+
+    depths = {depth(3), depth(8), depth(12)}
+    assert len(depths) == 1, f"comparison depth grew with digit count: {depths}"
 
 
 # ---------------------------------------------------------------------------

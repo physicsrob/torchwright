@@ -9,9 +9,10 @@ being duplicated or having one calculator import the other:
 * the vocabulary and residual width (``CALC_VOCAB`` / ``D_MODEL``);
 * the one-hot helpers both arithmetics build on (``_state`` / ``_slice`` and the
   carry/borrow state constants);
-* **comparison** — a lexicographic fold of a less/equal/greater verdict.  It is
-  not a depth target (subtraction's sign just needs the answer), so both
-  variants use this one verbatim;
+* **comparison** — lexicographic, computed positionally at constant depth
+  (the verdict is the greater-flag at the first differing digit).
+  Subtraction's sign just needs the answer, so both variants use this one
+  verbatim;
 * the token-stream plumbing — parsing the operands, dispatching on the
   operator, emitting the result autoregressively, trimming leading zeros —
   quarantined behind :func:`parse_expression`, :func:`emit_result`, and
@@ -30,11 +31,10 @@ dispatch, and leading-zero trim live on the decode-step axis.  The parse is
 constant-depth in ``max_digits`` (an
 :class:`~torchwright.ops.swiglu.sequence_ops.IndexedRegion` pointer gather per
 operand digit), so it holds that variant's flat model depth and no longer adds
-an ``O(max_digits)`` chain of its own to the other two.  (``simple`` and
-``advanced`` still grow linearly end to end through ``simple``'s serial
-arithmetic and the shared ``O(max_digits)`` comparison fold — not a depth
-target here.  The ``remove_leading_0s`` trim no longer contributes a chain:
-the op is constant-depth in ``max_removals``.)
+an ``O(max_digits)`` chain of its own to the other two.  (``simple`` still
+grows linearly end to end through its serial arithmetic; ``advanced``'s
+end-to-end depth now tracks its carry-lookahead / carry-save arithmetic —
+the shared parse, comparison, and leading-zero trim are all constant-depth.)
 """
 
 from typing import Dict, List, Tuple
@@ -44,7 +44,7 @@ import torch
 from torchwright.graph import Embedding, Linear, Node, RopeConfig
 from torchwright.graph.embedding import bos_token
 from torchwright.ops.swiglu.arithmetic_ops import compare as _compare_scalar
-from torchwright.ops.linear import add_const, concat
+from torchwright.ops.linear import add_const, bool_to_01, concat, sum_nodes
 from torchwright.ops.attention_ops import get_prev_value
 from torchwright.ops.inout_nodes import (
     create_literal_value,
@@ -57,7 +57,7 @@ from torchwright.ops.swiglu.logic_ops import (
     bool_not,
     equals_vector,
 )
-from torchwright.ops.swiglu.map_select import select, switch
+from torchwright.ops.swiglu.map_select import broadcast_select, in_range, select, switch
 from torchwright.ops.swiglu.onehot_table import onehot_lookup
 from torchwright.ops.swiglu.sequence_ops import (
     IndexedRegion,
@@ -132,55 +132,74 @@ def _slice(node: Node, start: int, width: int, name: str = "slice") -> Node:
 def compare_digit_seqs(
     embedding: Embedding, seq1: List[Node], seq2: List[Node]
 ) -> Node:
-    """Lexicographic comparison via an MSB-first fold of a 3-state verdict.
+    """Lexicographic comparison at constant depth in the digit count.
 
-    The state is a one-hot over {less, equal, greater}.  Folding from the most
-    significant digit down, the first non-equal digit decides the verdict and
-    every later digit leaves it unchanged.  Returns a ±1 boolean: ``+1`` if
-    ``seq1 >= seq2`` (equal counts as ``>=``), ``-1`` otherwise.
+    The verdict is the greater-flag at the first position where the digits
+    differ — or "equal" when none do, and equal counts as ``>=``.  Rather
+    than folding a 3-state verdict serially MSB-down (one lookup per digit
+    on the critical path), compute it positionally, the same
+    first-differing-position pattern as ``remove_leading_0s``:
+
+    1. one ``onehot_lookup`` per position maps the concatenated digit pair
+       to ``[equal (0/1), greater (±1)]`` flags — all positions in parallel;
+    2. a ``compare`` per position on a free prefix sum of the equal flags
+       tests "the first ``i+1`` pairs all agree"; those prefix flags are
+       monotone, so their free 0/1 sum is the first differing index ``d``
+       (``n`` when the sequences are identical);
+    3. ``in_range(d, d + 1, n + 1)`` one-hots ``d``, once;
+    4. a ``broadcast_select`` mux reads position ``d``'s greater flag, with
+       slot ``n`` wired to a ``+1`` literal (equal counts as ``>=``).
+
+    Five FFN stages regardless of digit count (the retired fold paid one
+    per digit plus the sharpen — its score collapse keyed on a single
+    one-hot block, which onehot_lookup lowers to a free Linear).  Returns a ±1 boolean: ``+1`` if ``seq1 >= seq2``,
+    ``-1`` otherwise — the final sharpen keeps the cond clean for the
+    selects that consume it (the mux passes lookup noise and mask deviation
+    through proportionally).
     """
     assert len(seq1) == len(seq2)
+    n = len(seq1)
 
-    # combine: key = concat([state, a, b]) -> next verdict state.
-    combine_table: Dict[torch.Tensor, torch.Tensor] = {}
-    for verdict in range(_CMP_W):
-        for a in range(10):
-            for b in range(10):
-                key = torch.cat(
-                    [
-                        _state(verdict, _CMP_W),
-                        embedding.get_embedding(str(a)),
-                        embedding.get_embedding(str(b)),
-                    ]
-                )
-                if verdict != _EQUAL:
-                    nxt = verdict  # already decided at a more significant digit
-                elif a > b:
-                    nxt = _GREATER
-                elif a < b:
-                    nxt = _LESS
-                else:
-                    nxt = _EQUAL
-                combine_table[key] = _state(nxt, _CMP_W)
-    default_state = _state(_EQUAL, _CMP_W)
+    # key = concat([a, b]) -> [equal (0/1), greater (±1)].  The default
+    # reads "equal, not greater" — the same deferral a non-digit pair got
+    # from the retired fold's _EQUAL default (its greater lane is only
+    # consumed at a position whose equal flag is 0, so the 0.0 is inert).
+    pair_table: Dict[torch.Tensor, torch.Tensor] = {}
+    for a in range(10):
+        for b in range(10):
+            key = torch.cat(
+                [embedding.get_embedding(str(a)), embedding.get_embedding(str(b))]
+            )
+            pair_table[key] = torch.tensor(
+                [1.0 if a == b else 0.0, 1.0 if a > b else -1.0]
+            )
+    default_flags = torch.tensor([1.0, 0.0])
 
-    state: Node = create_literal_value(_state(_EQUAL, _CMP_W))
-    for a, b in zip(seq1, seq2):  # MSB-first
-        key = concat([state, a, b])
-        state = onehot_lookup(key, combine_table, default_state)
+    flags = [
+        onehot_lookup(concat([a, b]), pair_table, default_flags)
+        for a, b in zip(seq1, seq2)  # MSB-first
+    ]
+    eq01 = [_slice(f, 0, 1, name="cmp_eq") for f in flags]
+    greater = [_slice(f, 1, 1, name="cmp_gt") for f in flags]
 
-    # Collapse the 3-state verdict to a ±1 score, then sharpen to a clean ±1
-    # boolean (a fuzzy final one-hot would otherwise yield a slightly off-±1
-    # score that downstream selects amplify).
-    score = onehot_lookup(
-        state,
-        {
-            _state(_LESS, _CMP_W): torch.tensor([-1.0]),
-            _state(_EQUAL, _CMP_W): torch.tensor([1.0]),
-            _state(_GREATER, _CMP_W): torch.tensor([1.0]),
-        },
-        default=torch.tensor([1.0]),
+    prefix01 = [
+        bool_to_01(_compare_scalar(sum_nodes(eq01[: i + 1]), thresh=i + 0.5))
+        for i in range(n)
+    ]
+    first_diff = sum_nodes(prefix01)
+
+    one_hot = in_range(first_diff, add_const(first_diff, 1.0), n + 1)
+    candidates = concat(greater + [create_literal_value(torch.tensor([1.0]))])
+    masked = broadcast_select(
+        masks=one_hot,
+        true_value=candidates,
+        false_value=create_literal_value(torch.zeros(1), name="cmp_zero"),
+        n_slots=n + 1,
+        d_fill=1,
     )
+    # Losing slots are exactly zero at clean masks, so the free sum
+    # degenerates to the selected position's flag.
+    score = Linear(masked, torch.ones(n + 1, 1), name="cmp_verdict_sum")
     return _compare_scalar(score, thresh=0.0, true_level=1.0, false_level=-1.0)
 
 
