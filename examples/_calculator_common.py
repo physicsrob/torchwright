@@ -31,10 +31,10 @@ constant-depth in ``max_digits`` (an
 :class:`~torchwright.ops.swiglu.sequence_ops.IndexedRegion` pointer gather per
 operand digit), so it holds that variant's flat model depth and no longer adds
 an ``O(max_digits)`` chain of its own to the other two.  (``simple`` and
-``advanced`` still grow linearly end to end: beyond ``simple``'s serial
-arithmetic, the shared comparison fold and the chained-select
-``remove_leading_0s`` trim are each ``O(max_digits)`` deep — neither is a
-depth target here.)
+``advanced`` still grow linearly end to end through ``simple``'s serial
+arithmetic and the shared ``O(max_digits)`` comparison fold — not a depth
+target here.  The ``remove_leading_0s`` trim no longer contributes a chain:
+the op is constant-depth in ``max_removals``.)
 """
 
 from typing import Dict, List, Tuple

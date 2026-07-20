@@ -106,18 +106,64 @@ def test_check_is_digit(embedding):
         assert val.item() == pytest.approx(exp, abs=1e-3), tok
 
 
-def test_remove_leading_0s(embedding):
-    zero = digit_to_scaled_scalar(embedding, embedding, 1.0)  # unused warm-up
-    del zero
+def _literal_seq(embedding, tokens):
     from torchwright.ops.inout_nodes import create_literal_value
 
-    seq = [
-        create_literal_value(embedding.get_embedding("0")),
-        create_literal_value(embedding.get_embedding("4")),
-        create_literal_value(embedding.get_embedding("2")),
-    ]
-    out = remove_leading_0s(embedding, seq, max_removals=1)
-    v = [n.compute(1, {"embedding_input": ["0"]}) for n in out]
-    assert torch.allclose(v[0][0], embedding.get_embedding("4"), atol=1e-3)
-    assert torch.allclose(v[1][0], embedding.get_embedding("2"), atol=1e-3)
-    assert torch.allclose(v[2][0], embedding.get_embedding("2"), atol=1e-3)
+    return [create_literal_value(embedding.get_embedding(t)) for t in tokens]
+
+
+def _assert_trimmed(embedding, seq_tokens, max_removals, expected_tokens):
+    out = remove_leading_0s(
+        embedding, _literal_seq(embedding, seq_tokens), max_removals
+    )
+    assert len(out) == len(expected_tokens)
+    for i, (node, tok) in enumerate(zip(out, expected_tokens)):
+        v = node.compute(1, {"embedding_input": ["0"]})
+        assert torch.allclose(v[0], embedding.get_embedding(tok), atol=1e-3), (
+            i,
+            tok,
+        )
+
+
+def test_remove_leading_0s(embedding):
+    _assert_trimmed(embedding, ["0", "4", "2"], 1, ["4", "2", "2"])
+
+
+def test_remove_leading_0s_full_run_pads_with_last(embedding):
+    # The whole leading run drops in one shot; the tail replicates the
+    # last element.
+    _assert_trimmed(
+        embedding, ["0", "0", "7", "<eos>"], 3, ["7", "<eos>", "<eos>", "<eos>"]
+    )
+
+
+def test_remove_leading_0s_cap_limits_run(embedding):
+    # Run length 2, budget 1: exactly one zero is removed.
+    _assert_trimmed(embedding, ["0", "0", "3"], 1, ["0", "3", "3"])
+
+
+def test_remove_leading_0s_interior_zero_untouched(embedding):
+    _assert_trimmed(embedding, ["5", "0", "2"], 2, ["5", "0", "2"])
+
+
+def test_remove_leading_0s_all_zeros(embedding):
+    _assert_trimmed(embedding, ["0", "0", "0"], 2, ["0", "0", "0"])
+
+
+def test_remove_leading_0s_cap_beyond_length(embedding):
+    # A budget past n-1 is a no-op beyond pinning to the last element.
+    _assert_trimmed(embedding, ["0", "6"], 9, ["6", "6"])
+
+
+def test_remove_leading_0s_depth_constant(embedding):
+    """The trim's critical path must not grow with the removal budget —
+    the property that keeps the calculators' result formatting out of
+    their depth budgets."""
+    from scripts.arithmetic_scaling import critical_path_depth
+
+    def depth(n, max_removals):
+        seq = _literal_seq(embedding, ["0"] * (n - 1) + ["1"])
+        return critical_path_depth(remove_leading_0s(embedding, seq, max_removals))
+
+    depths = {depth(4, 3), depth(8, 7), depth(12, 11)}
+    assert len(depths) == 1, f"trim depth grew with max_removals: {depths}"

@@ -385,3 +385,31 @@ def test_remove_leading_0s_no_removal_needed():
     out1 = result[1].compute(n_pos=1, input_values={}).squeeze()
     assert (out0 - e4).norm().item() < 0.5, "first digit should remain '4'"
     assert (out1 - e2).norm().item() < 0.5, "second digit should remain '2'"
+
+
+def _assert_trimmed_relu(seq_tokens, max_removals, expected_tokens):
+    from torchwright.ops.relu.sequence_ops import remove_leading_0s
+
+    embedding = _make_digit_embedding()
+    seq = [create_literal_value(embedding.get_embedding(t)) for t in seq_tokens]
+    result = remove_leading_0s(embedding, seq, max_removals)
+    assert len(result) == len(expected_tokens)
+    for i, (node, tok) in enumerate(zip(result, expected_tokens)):
+        out = node.compute(n_pos=1, input_values={}).squeeze()
+        dist = (out - embedding.get_embedding(tok)).norm().item()
+        assert dist < 0.5, f"slot {i}: dist from '{tok}' = {dist:.4f}"
+
+
+def test_remove_leading_0s_cap_limits_run():
+    """Run length 2 with budget 1: exactly one zero is removed."""
+    _assert_trimmed_relu(["0", "0", "3"], 1, ["0", "3", "3"])
+
+
+def test_remove_leading_0s_interior_zero_untouched():
+    """A zero after a nonzero digit is not a leading zero."""
+    _assert_trimmed_relu(["5", "0", "2"], 2, ["5", "0", "2"])
+
+
+def test_remove_leading_0s_cap_beyond_length():
+    """A budget past n-1 is a no-op beyond pinning to the last element."""
+    _assert_trimmed_relu(["0", "6"], 9, ["6", "6"])

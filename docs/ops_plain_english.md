@@ -106,7 +106,8 @@ scalar_to_embedding, floor_int, table_lookup_2d.
 | dynamic_extract | in_range + broadcast_select |
 | digit_to_scaled_scalar, digits_to_number, number_to_digit_scalars | map_to_table, thermometer_floor_div |
 | sum_digits, sum_digit_seqs | map_to_table |
-| check_is_digit, output_sequence, remove_leading_0s | select / cond_gate / map_to_table / equals_vector |
+| check_is_digit, output_sequence | select / cond_gate / map_to_table / equals_vector |
+| remove_leading_0s | equals_vector + compare + in_range + broadcast_select (constant depth in max_removals) |
 | count_since_marker | reciprocal + attention |
 | attend_* family, get_prev_value, attend_most_recent_globally | attention hardware — untouched; MLP ingredients (min, compare) inherit those entries |
 

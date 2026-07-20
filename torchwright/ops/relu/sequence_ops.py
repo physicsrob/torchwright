@@ -19,8 +19,8 @@ from typing import List
 
 import torch
 
-from torchwright.graph import Node, Embedding, RopeConfig
-from torchwright.ops.linear import bool_to_01, negate, sum_nodes
+from torchwright.graph import Linear, Node, Embedding, RopeConfig
+from torchwright.ops.linear import add_const, bool_to_01, concat, negate, sum_nodes
 from torchwright.ops.attention_ops import attend_to_offset, get_prev_value
 from torchwright.ops.inout_nodes import create_literal_value
 from torchwright.ops.relu.arithmetic_ops import compare
@@ -30,7 +30,12 @@ from torchwright.ops.relu.logic_ops import (
     bool_not,
     bool_all_true,
 )
-from torchwright.ops.relu.map_select import map_to_table, select
+from torchwright.ops.relu.map_select import (
+    broadcast_select,
+    in_range,
+    map_to_table,
+    select,
+)
 from torchwright.ops.relu.marker_count import count_since_marker
 
 
@@ -193,24 +198,77 @@ def remove_leading_0s(
 ) -> List[Node]:
     """Remove leading zeros from a digit sequence by shifting left.
 
-    If seq[0] is embed("0"), shifts the entire sequence one position left
-    and pads with the last element. Applies recursively up to max_removals
-    times.
+    With ``k`` the length of the leading run of ``"0"`` tokens capped at
+    ``max_removals``, output slot ``i`` holds ``seq[min(i + k, n - 1)]``:
+    the sequence shifted left by ``k``, padded on the right with the last
+    element.  (Same semantics as the retired chained-select form, which
+    re-tested the shifted front once per removal and so cost two MLP
+    sublayers per removal on the critical path.)
+
+    Constant depth in ``max_removals`` — four sublayer stages:
+
+    1. An ``equals_vector`` zero flag per leading slot, all parallel.
+    2. A ``compare`` per leading slot on a free prefix sum of the 0/1
+       flags: slot ``i``'s prefix is all-"0" iff the sum is at least
+       ``i + 1`` (threshold ``i + 0.5``).  The prefix flags are monotone
+       (all-true then all-false), so the shift amount ``k`` is their
+       free 0/1 sum — a near-integer scalar.
+    3. ``in_range(k, k + 1, ...)`` — the shift-amount one-hot, computed
+       once and shared by every output slot.
+    4. A ``broadcast_select`` per output slot over that slot's shift
+       candidates, plus the free cross-slot collapse.  Steps 3–4 are
+       ``dynamic_extract`` with the index one-hot hoisted out of the
+       per-slot loop.
+
+    Margins: each prefix sum sits a half-integer from its threshold and
+    ``k`` sits near-integer between the ``in_range`` centers, so both
+    stages saturate.  Per-flag deviation accumulates linearly in the
+    number of leading slots against those ~0.5 bands — comfortable at
+    digit-sequence widths; a much wider window would want the prefix
+    sums re-sharpened.
 
     Args:
         embedding: Embedding table (must contain "0").
-        seq: List of embedding-valued digit nodes (MSB-first).
+        seq: List of embedding-valued digit nodes (MSB-first), all the
+            same width.
         max_removals: Maximum number of leading zeros to remove.
     """
-    if max_removals == 0:
+    n = len(seq)
+    # Shifting by n-1 or more pins every slot to the last element, so
+    # larger removal budgets are no-ops — cap the candidate table there.
+    n_shifts = min(max_removals, n - 1)
+    if n_shifts <= 0:
         return seq
 
-    is_leading_zero = equals_vector(inp=seq[0], vector=embedding.get_embedding("0"))
+    d = len(seq[0])
+    assert all(len(node) == d for node in seq)
 
-    out = []
-    seq = seq + [seq[-1]]
-    for i, _ in enumerate(seq[:-1]):
-        out.append(
-            select(cond=is_leading_zero, true_node=seq[i + 1], false_node=seq[i])
+    zero_vec = embedding.get_embedding("0")
+    z01 = [
+        bool_to_01(equals_vector(inp=seq[i], vector=zero_vec)) for i in range(n_shifts)
+    ]
+    prefix01 = [
+        bool_to_01(compare(sum_nodes(z01[: i + 1]), thresh=i + 0.5))
+        for i in range(n_shifts)
+    ]
+    shift = sum_nodes(prefix01)
+
+    n_entries = n_shifts + 1
+    one_hot = in_range(shift, add_const(shift, 1.0), n_entries)
+    zero_fill = create_literal_value(torch.zeros(d), name="remove_leading_0s_zero")
+    collapse = torch.eye(d).repeat(n_entries, 1)
+
+    out: List[Node] = []
+    for i in range(n):
+        candidates = concat([seq[min(i + k, n - 1)] for k in range(n_entries)])
+        masked = broadcast_select(
+            masks=one_hot,
+            true_value=candidates,
+            false_value=zero_fill,
+            n_slots=n_entries,
+            d_fill=d,
         )
-    return remove_leading_0s(embedding, out, max_removals - 1)
+        # Losing slots are exactly zero at clean masks, so the free sum
+        # degenerates to a copy of the selected candidate.
+        out.append(Linear(masked, collapse, name="remove_leading_0s_sum"))
+    return out
