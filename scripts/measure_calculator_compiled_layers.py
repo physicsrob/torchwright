@@ -22,6 +22,8 @@ import time
 
 from scripts.arithmetic_scaling import critical_path_depth
 from torchwright.compiler.export import compile_headless
+from torchwright.compiler.forward.cpsat_scheduler import critical_path_layers
+from torchwright.compiler.lower import lower
 
 # (d, d_hidden): the current publish default, then progressively doom-like
 # widths (the flagship runs d=8192, d_hidden=16384).  d_head is NOT swept:
@@ -32,6 +34,7 @@ DEFAULT_CONFIGS = [
     (1024, 1024),
     (2048, 4096),
     (4096, 8192),
+    (8192, 16384),
 ]
 DEFAULT_NS = [3, 6]
 
@@ -52,6 +55,18 @@ def main() -> None:
         print(f"[{args.impl} n={n}] critical-path floor: {floor}", flush=True)
         d_head = impl.D_HEAD
         for d, d_hidden in DEFAULT_CONFIGS:
+            # The width-independent DAG layer floor of the *lowered* graph at
+            # this config's collapse lane cap: no schedule can compile below
+            # it, so n_layers == layer_floor certifies the schedule optimal
+            # for the graph the scheduler was given.  (It exceeds the op-depth
+            # floor by whatever linear glue survives fusion + collapse.)
+            lowered = lower(
+                output_node,
+                collapse_univariate=True,
+                collapse_pl=True,
+                collapse_lane_cap=d_hidden // 4,
+            )
+            layer_floor = critical_path_layers(lowered.output_node)
             t0 = time.time()
             compiled = compile_headless(
                 output_node,
@@ -65,7 +80,8 @@ def main() -> None:
             dt = time.time() - t0
             print(
                 f"[{args.impl} n={n}] d={d} d_head={d_head} d_hidden={d_hidden}: "
-                f"n_layers={compiled.n_layers} (floor {floor}, "
+                f"n_layers={compiled.n_layers} (op-depth floor {floor}, "
+                f"lowered layer floor {layer_floor}, "
                 f"overhead {compiled.n_layers - floor}, {dt:.0f}s)",
                 flush=True,
             )
