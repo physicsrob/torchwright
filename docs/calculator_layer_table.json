@@ -1,0 +1,168 @@
+{
+  "config": {
+    "ns": [
+      2,
+      3,
+      4,
+      5,
+      6,
+      7,
+      8,
+      9,
+      10
+    ],
+    "lane_cap": 2048
+  },
+  "results": {
+    "calculator_simple": [
+      {
+        "n": 2,
+        "depth": 24,
+        "layers": 23
+      },
+      {
+        "n": 3,
+        "depth": 25,
+        "layers": 25
+      },
+      {
+        "n": 4,
+        "depth": 27,
+        "layers": 27
+      },
+      {
+        "n": 5,
+        "depth": 29,
+        "layers": 29
+      },
+      {
+        "n": 6,
+        "depth": 31,
+        "layers": 31
+      },
+      {
+        "n": 7,
+        "depth": 33,
+        "layers": 33
+      },
+      {
+        "n": 8,
+        "depth": 35,
+        "layers": 35
+      },
+      {
+        "n": 9,
+        "depth": 37,
+        "layers": 37
+      },
+      {
+        "n": 10,
+        "depth": 39,
+        "layers": 39
+      }
+    ],
+    "calculator_advanced": [
+      {
+        "n": 2,
+        "depth": 24,
+        "layers": 23
+      },
+      {
+        "n": 3,
+        "depth": 25,
+        "layers": 25
+      },
+      {
+        "n": 4,
+        "depth": 26,
+        "layers": 27
+      },
+      {
+        "n": 5,
+        "depth": 26,
+        "layers": 28
+      },
+      {
+        "n": 6,
+        "depth": 27,
+        "layers": 28
+      },
+      {
+        "n": 7,
+        "depth": 27,
+        "layers": 31
+      },
+      {
+        "n": 8,
+        "depth": 27,
+        "layers": 31
+      },
+      {
+        "n": 9,
+        "depth": 28,
+        "layers": 32
+      },
+      {
+        "n": 10,
+        "depth": 28,
+        "layers": 32
+      }
+    ],
+    "calculator_scratchpad": [
+      {
+        "n": 2,
+        "depth": 16,
+        "layers": 16,
+        "steps": 19
+      },
+      {
+        "n": 3,
+        "depth": 16,
+        "layers": 16,
+        "steps": 27
+      },
+      {
+        "n": 4,
+        "depth": 16,
+        "layers": 16,
+        "steps": 35
+      },
+      {
+        "n": 5,
+        "depth": 16,
+        "layers": 16,
+        "steps": 43
+      },
+      {
+        "n": 6,
+        "depth": 16,
+        "layers": 16,
+        "steps": 51
+      },
+      {
+        "n": 7,
+        "depth": 16,
+        "layers": 16,
+        "steps": 59
+      },
+      {
+        "n": 8,
+        "depth": 16,
+        "layers": 16,
+        "steps": 67
+      },
+      {
+        "n": 9,
+        "depth": 16,
+        "layers": 16,
+        "steps": 75
+      },
+      {
+        "n": 10,
+        "depth": 16,
+        "layers": 16,
+        "steps": 83
+      }
+    ]
+  }
+}

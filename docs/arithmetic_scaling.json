@@ -17,7 +17,7 @@
       6
     ],
     "multiply_cap": 16,
-    "scratchpad_multiply_plane_cap": 8,
+    "scratchpad_multiply_plane_cap": 16,
     "depth_metric": "critical-path length over neuron-producing nodes",
     "size_metric": "total neuron count (FFN lanes + ReLU widths; ~ params / 2d, gated lanes ~ params / 3d)",
     "model_depth_metric": "whole-model critical-path depth (parse + ops + dispatch + emit)",
@@ -323,65 +323,65 @@
     "simple": [
       {
         "n": 1,
-        "depth": 22,
-        "neurons": 2316
+        "depth": 21,
+        "neurons": 2173
       },
       {
         "n": 2,
-        "depth": 27,
-        "neurons": 5097
+        "depth": 24,
+        "neurons": 4771
       },
       {
         "n": 3,
-        "depth": 28,
-        "neurons": 8630
+        "depth": 25,
+        "neurons": 8193
       },
       {
         "n": 4,
-        "depth": 29,
-        "neurons": 12987
+        "depth": 27,
+        "neurons": 12439
       },
       {
         "n": 5,
-        "depth": 30,
-        "neurons": 18168
+        "depth": 29,
+        "neurons": 17509
       },
       {
         "n": 6,
         "depth": 31,
-        "neurons": 24173
+        "neurons": 23403
       }
     ],
     "advanced": [
       {
         "n": 1,
-        "depth": 22,
-        "neurons": 2544
+        "depth": 21,
+        "neurons": 2401
       },
       {
         "n": 2,
-        "depth": 27,
-        "neurons": 6853
+        "depth": 24,
+        "neurons": 6527
       },
       {
         "n": 3,
-        "depth": 28,
-        "neurons": 10814
+        "depth": 25,
+        "neurons": 10377
       },
       {
         "n": 4,
-        "depth": 29,
-        "neurons": 15281
+        "depth": 26,
+        "neurons": 14733
       },
       {
         "n": 5,
-        "depth": 29,
-        "neurons": 20254
+        "depth": 26,
+        "neurons": 19595
       },
       {
         "n": 6,
-        "depth": 30,
-        "neurons": 25733
+        "depth": 27,
+        "neurons": 24963
       }
     ],
     "scratchpad": [
