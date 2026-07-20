@@ -29,6 +29,7 @@ import torch
 from torchwright.graph import Embedding, Node
 from torchwright.ops.linear import add, add_const, bool_to_01, concat, sum_nodes
 from torchwright.ops.inout_nodes import create_literal_value
+from torchwright.ops.swiglu.arithmetic_ops import compare
 from torchwright.ops.swiglu.map_select import in_range
 from torchwright.ops.swiglu.onehot_table import onehot_lookup
 
@@ -252,15 +253,23 @@ def multiply_digit_seqs(
             columns[place + 1].append(tens)
 
     # Step 3: one carry sweep, least-significant column first.  Turn each
-    # column total (a number 0..20n) into a one-hot index, then read off its
-    # digit and its carry with two free selection-matrix lookups.
+    # column total (a number 0..20n) into a one-hot index and read off its
+    # digit with a free selection-matrix lookup; the carry is "how many
+    # tens fit" — one threshold test per possible ten, summed for free.
+    #
+    # The carry is deliberately NOT read off the wide one-hot with a
+    # 0..2n-valued selection row: a saturated in_range slot at index i
+    # carries fp32 rounding jitter of ulp(scale·sharpness·i)/scale (its
+    # hinge pair straddles a binade boundary at some off-integer inputs),
+    # and a selection row weighted up to 2n amplifies two adjacent slots'
+    # jitter past the 1e-3 claim budget of the compiler's univariate
+    # collapse pass — leaving the whole sweep at three compiled layers
+    # per column instead of one.  Threshold sums read the same staircase
+    # with unit weights, keeping the composed noise an order of magnitude
+    # under the budget.
     max_total = 20 * n
     digit_table = {
         _state(t, max_total + 1): embedding.get_embedding(str(t % 10))
-        for t in range(max_total + 1)
-    }
-    carry_table = {
-        _state(t, max_total + 1): torch.tensor([float(t // 10)])
         for t in range(max_total + 1)
     }
 
@@ -273,7 +282,12 @@ def multiply_digit_seqs(
         out_lsb_first.append(
             onehot_lookup(total_onehot, digit_table, embedding.get_embedding("0"))
         )
-        carry = onehot_lookup(total_onehot, carry_table, torch.tensor([0.0]))
+        carry = sum_nodes(
+            [
+                bool_to_01(compare(total, thresh=10.0 * k - 0.5))
+                for k in range(1, max_total // 10 + 1)
+            ]
+        )
     return list(reversed(out_lsb_first))
 
 
