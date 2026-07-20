@@ -68,15 +68,27 @@ def main() -> None:
             )
             layer_floor = critical_path_layers(lowered.output_node)
             t0 = time.time()
-            compiled = compile_headless(
-                output_node,
-                d=d,
-                d_head=d_head,
-                d_hidden=d_hidden,
-                optimize=args.optimize,
-                bias=False,
-                output_layout_source=embedding,
-            )
+            try:
+                compiled = compile_headless(
+                    output_node,
+                    d=d,
+                    d_head=d_head,
+                    d_hidden=d_hidden,
+                    optimize=args.optimize,
+                    bias=False,
+                    output_layout_source=embedding,
+                )
+            except RuntimeError as exc:
+                # A width-starved geometry can have no schedule the eager
+                # walk (or CP-SAT within budget) can find.  Report and keep
+                # sweeping the wider configs.
+                print(
+                    f"[{args.impl} n={n}] d={d} d_head={d_head} "
+                    f"d_hidden={d_hidden}: NO SCHEDULE "
+                    f"({time.time() - t0:.0f}s): {str(exc).splitlines()[0]}",
+                    flush=True,
+                )
+                continue
             dt = time.time() - t0
             print(
                 f"[{args.impl} n={n}] d={d} d_head={d_head} d_hidden={d_hidden}: "
