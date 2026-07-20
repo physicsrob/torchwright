@@ -16,7 +16,12 @@ These are the smallest-layer (oracle, ``node.compute``) confidence tests:
   ≤2-plane band Hann-tapers to its endpoint zeros, the gate sized from the
   collapsed peak leaks softmax weight to false-cond keys, and the latch
   silently drifts — the failure that once skewed ``count_since_marker`` by
-  1.2 counts at ``d_head=32, max_positions=64``).
+  1.2 counts at ``d_head=32, max_positions=64``);
+- ``get_prev_value`` **refuses to build when the rollout rotates the cond
+  gate past quasi-static** (the gate rides the slowest plane, so its ±gate
+  swing is really ``±gate·cos(Δ·θ_slow)``; at ``max_positions·θ_slow ≥ π/2``
+  a distant false key's contribution goes negative and the ordering inverts
+  outright — a healthy-band config can still fail this way).
 
 The compiled-path parity / prefill==decode checks are in
 ``tests/compile/forward/test_rope_local_recency.py``.
@@ -26,7 +31,7 @@ import pytest
 import torch
 
 from torchwright.graph import InputNode
-from torchwright.graph.rope import rope_lobe_band, rope_inv_freq
+from torchwright.graph.rope import RopeConfig, rope_lobe_band, rope_inv_freq
 from torchwright.ops.attention_ops import get_prev_value
 from torchwright.ops.inout_nodes import create_rope_config
 
@@ -136,6 +141,22 @@ def test_get_prev_value_raises_on_degenerate_lobe_band():
     value = InputNode("value", 1, value_range=(-1.0, 1.0))
     cond = InputNode("cond", 1, value_range=(-1.0, 1.0))
     with pytest.raises(ValueError, match="too weak to latch"):
+        get_prev_value(rope, value, cond)
+
+
+def test_get_prev_value_raises_when_rotation_defeats_the_gate():
+    """Codex finding (2026-07): the leak bound assumed the cond gate
+    contributes ±gate, but it really contributes ±gate·cos(Δ·θ_slow).  At
+    d_head=32, max_positions=20, base=10 the band is healthy (4 planes, gate
+    ~3.6e3) and the pre-fix leak bound passed by hundreds of orders of
+    magnitude — yet θ_slow ≈ 0.116 turns the gate's cosine negative by
+    Δ ≈ 14, inverting the cond ordering: the latch reads a false-cond
+    position by distance 15.  The quasi-static precondition
+    (max_positions · θ_slow < π/2) must refuse the config at build time."""
+    rope = RopeConfig(d_head=32, max_positions=20, base=10.0)
+    value = InputNode("value", 1, value_range=(-1.0, 1.0))
+    cond = InputNode("cond", 1, value_range=(-1.0, 1.0))
+    with pytest.raises(ValueError, match="not.*quasi-static"):
         get_prev_value(rope, value, cond)
 
 

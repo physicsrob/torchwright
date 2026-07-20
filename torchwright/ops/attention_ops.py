@@ -231,11 +231,19 @@ _ABOVE_MATCH_BONUS = 256.0
 _LOCAL_RECENCY_GAIN = 600.0
 
 # Ceiling on the summed softmax weight that false-cond keys may steal from a
-# true key in ``get_prev_value``, enforced at build time.  Each false key's
-# logit sits ``2·gate`` below any true key's (the ±1 cond swing through the
-# gate column; the slow-plane rotation keeps the factor ≈ 1), so its weight
-# against the winner is at most ``exp(−2·gate)`` and the total over at most
-# ``max_positions`` keys is ``max_positions · exp(−2·gate)``.  The tolerance
+# true key in ``get_prev_value``, enforced at build time.  The ±1 cond swing
+# rides the slowest rotated plane, so a key at distance ``Δ`` contributes
+# ``±gate·cos(Δ·θ_slow)`` — the bound therefore has two enforced inputs, not
+# one assumption: (1) ``max_positions · θ_slow < π/2`` (past that a distant
+# false key's cosine goes negative and the cond ordering can invert outright
+# — a separate build-time raise), and (2) with every cosine then at least
+# ``cos_floor = cos(max_positions·θ_slow) > 0``, each false key's logit sits
+# at least ``2·gate·cos_floor`` below any true key's, so its weight against
+# the winner is at most ``exp(−2·gate·cos_floor)`` and the total over at most
+# ``max_positions`` keys is ``max_positions · exp(−2·gate·cos_floor)``.
+# (Pre-2026-07 this bound used the bare ``2·gate``, silently assuming the
+# rotation factor ≈ 1; a config could pass it while the slow-plane rotation
+# flipped the gate's sign well inside the rollout.)  The tolerance
 # is sized for the harshest consumer: ``attend_mean_where`` multiplies a
 # latched validity by ``_VALIDITY_DIRECT`` (1000), so a leak-driven validity
 # wobble ``ε`` becomes a ``1000·ε`` per-key logit tilt that skews the
@@ -992,15 +1000,29 @@ def get_prev_value(
     value) — callers must ensure at least one true key exists in every consumed
     window, or gate the result.
 
-    **Degenerate lobe bands raise.**  The gate is sized from the lobe peak, so
-    a rope config whose band collapses (a ≤2-plane band Hann-tapers to its
-    endpoint zeros — e.g. ``d_head=32, max_positions=64``) would leave the
-    gate too weak to latch: false-cond keys leak softmax weight and the
-    latched value silently drifts (downstream, ``count_since_marker`` read
-    2.8 at a true gap of 4 before this guard existed).  This raises
-    ``ValueError`` when the worst-case leak exceeds ``_MAX_RECENCY_LEAK``;
-    increase ``max_positions`` or ``d_head`` (widening the lobe band), or
-    lower the rope ``base``.
+    **Degenerate configs raise.**  Two build-time guards, one per way the
+    cond gate can fail to latch:
+
+    * **Quasi-static precondition.**  The gate rides the slowest rotated
+      plane, so a key at distance ``Δ`` contributes ``±gate·cos(Δ·θ_slow)``.
+      If ``max_positions · θ_slow ≥ π/2`` a distant false key's cosine goes
+      negative and the cond *ordering* can invert outright — the latch reads
+      a false-cond position (the mechanism behind e.g. ``d_head=32,
+      max_positions=20, base=10``, which fails to latch by position 15).
+      Raises ``ValueError``; increase ``d_head`` (slowing the slowest plane)
+      or reduce ``max_positions``.  (Raising the rope ``base`` also slows
+      ``θ_slow``, but thins the lobe band the other guard needs — prefer
+      ``d_head``.)
+    * **Leak bound.**  The gate is sized from the lobe peak, so a rope
+      config whose band collapses (a ≤2-plane band Hann-tapers to its
+      endpoint zeros — e.g. ``d_head=32, max_positions=64``) leaves the gate
+      too weak: false-cond keys leak softmax weight and the latched value
+      silently drifts (downstream, ``count_since_marker`` read 2.8 at a true
+      gap of 4 before this guard existed).  The worst-case leak —
+      ``max_positions · exp(−2·gate·cos_floor)``, the gate attenuated by the
+      enforced cosine floor — raises ``ValueError`` when it exceeds
+      ``_MAX_RECENCY_LEAK``; increase ``max_positions`` or ``d_head``
+      (widening the lobe band).
 
     Args:
         rope: the RoPE config (``d_head`` / ``base`` / ``max_positions``).
@@ -1012,18 +1034,39 @@ def get_prev_value(
     lobe_peak = _LOCAL_RECENCY_GAIN * float(amps.sum())
     gate = 4.0 * lobe_peak  # cond dominates the bounded lobe swing
 
-    leak_bound = rope.max_positions * math.exp(-2.0 * gate)
+    # The cond gate's ±gate swing is attenuated to ±gate·cos(Δ·θ_slow) at key
+    # distance Δ (the gate column rides the slowest rotated plane).  Keep the
+    # whole rollout on the cosine's positive, quasi-static side; past π/2 a
+    # distant false key's contribution flips sign and the ordering the leak
+    # bound below protects can invert outright.  Mirrors the
+    # attend_most_recent_globally position-tiebreak guard.
+    theta_slow = _theta_slow(rope)
+    if rope.max_positions * theta_slow >= math.pi / 2:
+        raise ValueError(
+            f"get_prev_value: the cond gate's slow-plane rotation is not "
+            f"quasi-static at d_head={rope.d_head} base={rope.base:g} "
+            f"max_positions={rope.max_positions}: the slowest rotated plane "
+            f"(θ={theta_slow:.3e}) turns max_positions × θ = "
+            f"{rope.max_positions * theta_slow:.3f} ≥ π/2 ({math.pi / 2:.3f}), "
+            f"so a distant key's gate contribution goes negative and the "
+            f"cond ordering can invert — the latch would silently read a "
+            f"false-cond position.  Increase d_head (slowing the slowest "
+            f"plane) or reduce max_positions."
+        )
+    cos_floor = math.cos(rope.max_positions * theta_slow)
+
+    leak_bound = rope.max_positions * math.exp(-2.0 * gate * cos_floor)
     if leak_bound > _MAX_RECENCY_LEAK:
         raise ValueError(
             f"get_prev_value: the recency-lobe cond gate is too weak to latch "
-            f"at d_head={rope.d_head} base={rope.base} "
+            f"at d_head={rope.d_head} base={rope.base:g} "
             f"max_positions={rope.max_positions}: the lobe band's Hann taper "
             f"leaves amplitude sum {float(amps.sum()):.2e} (a <=2-plane band "
-            f"tapers to its endpoint zeros), gate {gate:.3g}, worst-case "
-            f"false-key softmax leak {leak_bound:.2e} > {_MAX_RECENCY_LEAK:g} "
-            f"— the latched value would silently drift.  Increase "
-            f"max_positions or d_head (widening the lobe band), or lower the "
-            f"rope base."
+            f"tapers to its endpoint zeros), gate {gate:.3g} (rotation floor "
+            f"cos={cos_floor:.3f}), worst-case false-key softmax leak "
+            f"{leak_bound:.2e} > {_MAX_RECENCY_LEAK:g} — the latched value "
+            f"would silently drift.  Increase max_positions or d_head "
+            f"(widening the lobe band)."
         )
 
     # Content col: the cond gate, relocated onto the slowest plane.  The recency
