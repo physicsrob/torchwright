@@ -323,65 +323,65 @@
     "simple": [
       {
         "n": 1,
-        "depth": 19,
-        "neurons": 2480
+        "depth": 21,
+        "neurons": 2500
       },
       {
         "n": 2,
         "depth": 25,
-        "neurons": 5712
+        "neurons": 5454
       },
       {
         "n": 3,
-        "depth": 31,
-        "neurons": 10024
+        "depth": 27,
+        "neurons": 9144
       },
       {
         "n": 4,
-        "depth": 37,
-        "neurons": 15416
+        "depth": 29,
+        "neurons": 13642
       },
       {
         "n": 5,
-        "depth": 43,
-        "neurons": 21888
+        "depth": 31,
+        "neurons": 18948
       },
       {
         "n": 6,
-        "depth": 49,
-        "neurons": 29440
+        "depth": 33,
+        "neurons": 25062
       }
     ],
     "advanced": [
       {
         "n": 1,
-        "depth": 19,
-        "neurons": 2712
+        "depth": 21,
+        "neurons": 2732
       },
       {
         "n": 2,
-        "depth": 26,
-        "neurons": 7492
+        "depth": 25,
+        "neurons": 7234
       },
       {
         "n": 3,
-        "depth": 31,
-        "neurons": 12268
+        "depth": 27,
+        "neurons": 11388
       },
       {
         "n": 4,
-        "depth": 35,
-        "neurons": 17822
+        "depth": 29,
+        "neurons": 16048
       },
       {
         "n": 5,
-        "depth": 40,
-        "neurons": 24154
+        "depth": 30,
+        "neurons": 21214
       },
       {
         "n": 6,
-        "depth": 44,
-        "neurons": 31264
+        "depth": 32,
+        "neurons": 26886
       }
     ],
     "scratchpad": [

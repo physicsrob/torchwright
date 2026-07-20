@@ -40,9 +40,9 @@ On top of those per-op *kernel* metrics, a second pass measures **end-to-end
 model depth** — ``critical_path_depth`` of the whole ``create_network_parts(n)``
 graph (parse + all three ops + dispatch + emit), one number per implementation.
 This is the figure that makes the payoff visible: ``simple`` and ``advanced``
-grow ~linearly (their in-graph serial work — the arithmetic folds, the shared
-comparison, the leading-zero trim; the parse is the shared constant-depth
-pointer gather), while ``examples.calculator_scratchpad`` — which streams the
+grow ~linearly (their in-graph serial work — the arithmetic folds and the
+shared comparison; the parse and the leading-zero trim are both
+constant-depth), while ``examples.calculator_scratchpad`` — which streams the
 serial carry/borrow/comparison work out as "thinking" tokens — stays **flat**
 in ``n`` and pays the cost in decode *steps* (worst case ``8n+3``, the
 multiply transcript) instead.
@@ -97,8 +97,8 @@ VOCAB = [str(d) for d in range(10)]
 # End-to-end *model* depth (parse + all three ops + dispatch + emit), one number
 # per implementation per digit count — the figure that makes the scratchpad's
 # payoff visible.  All three modules expose ``create_network_parts(max_digits)``.
-# ``simple`` / ``advanced`` grow ~linearly (their in-graph serial folds,
-# comparison, and leading-zero trim; the shared parse is constant-depth);
+# ``simple`` / ``advanced`` grow ~linearly (their in-graph serial folds and
+# comparison; the shared parse and leading-zero trim are constant-depth);
 # ``scratchpad`` stays flat and pays in decode *steps* instead.
 MODEL_IMPLEMENTATIONS = {
     "simple": calculator_simple,
