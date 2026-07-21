@@ -34,7 +34,12 @@ from scripts.arithmetic_scaling import critical_path_depth
 from torchwright.compiler.forward.cpsat_scheduler import critical_path_layers
 from torchwright.compiler.lower import lower
 
-IMPLS = ["calculator_simple", "calculator_advanced", "calculator_scratchpad"]
+IMPLS = [
+    "calculator_simple",
+    "calculator_advanced",
+    "calculator_scratchpad",
+    "calculator_memorize",
+]
 # Flagship-geometry collapse cap (d_hidden 8192 // 4); the synthesized
 # staircases top out well below it, so wider caps give the same floor.
 LANE_CAP = 2048
