@@ -1,28 +1,43 @@
-"""Layer-count table for the three calculators across digit counts.
+"""Layer / step / parameter table for the four calculators across digit counts.
 
-For each implementation and ``max_digits`` this prints the nonlinear-op
-depth (``scripts.arithmetic_scaling.critical_path_depth``) and the
-**lowered layer floor** — ``critical_path_layers`` of the graph after
-``lower()`` with both collapse passes, the exact width-independent DAG
-minimum.  At saturated width the compiled ``n_layers`` equals this floor
-(confirmed by ``optimize=2`` compiles at n=3 and n=6 across d=1024..8192),
-so the floor column IS the actual layer count without paying a CP-SAT
-solve per cell.
+One record per (implementation, ``max_digits``), three separate cost
+dimensions — never conflated:
 
-The scratchpad rows also print decode steps (its depth is flat because
-the serial work moves onto the decode axis), and a build that violates a
-structural cap (the multiply pointer gather's slow-plane budget bounds
-its ``max_digits``) is reported instead of crashing the sweep.
+* ``layers`` — the compiled layer count: ``critical_path_layers`` of the
+  graph after ``lower()`` with both collapse passes, the exact
+  width-independent DAG minimum, which ``optimize=2`` compiles land on
+  at saturated width (verified for calculator_simple at n=3 and n=6
+  across d=1024..8192, and for calculator_memorize at n=1,2).  This is
+  THE depth number; the nonlinear-op count it replaced both under- and
+  over-counted (attention→MLP pairing on one side, surviving linear
+  glue on the other).
+* ``steps`` — worst-case decode steps to finish the answer.  Direct
+  emitters pay up to 2n product digits plus the terminating <eos>
+  (``2n + 1``); the scratchpad additionally streams its serial work as
+  thinking tokens first (``decode_steps(n)`` = 8n + 3).
+* ``params`` — weight count of the lowered graph: every FFN / Attn /
+  Linear / literal tensor the compiled model actually carries, before
+  geometry zero-padding.  A build refused for a structural cap records
+  its ``build_error`` instead, plus ``params_extrapolated`` where the
+  module provides a validated closed form
+  (``calculator_memorize.n_params``).
 
-CPU only.  A quick look can run on Modal (stdout table only)::
+CPU only, and CPU-hungry — collection belongs on Modal.  Regenerate the
+committed ``docs/calculator_layer_table.json`` with::
 
-    make modal-run MODULE=scripts.calculator_layer_table CPU_ONLY=1
+    uv run modal run modal_layer_table.py
 
-but ``modal-run`` does not sync artifacts back, so regenerating the
-committed ``docs/calculator_layer_table.json`` needs a local run (~15
-min of CPU)::
-
-    uv run python -m scripts.calculator_layer_table
+which runs :func:`collect` remotely and only writes the JSON locally.
+Running this module directly computes everything on the local machine —
+fine for a single --ns cell, unkind for the full sweep.  It can also
+read differently: calculator_advanced's n=2,3 cells sit on a borderline
+collapse certification (a compress cascade whose measured deviation is
+within ~13% of the 1e-3 budget), and the oracle sweep's fp32 reduction
+order differs across BLAS environments — the local sweep collapses it
+(23/25 layers) where Modal declines it (25/27).  The committed numbers
+are the Modal environment's; the instability class is the same one
+``docs/numerical_noise_findings.md`` records for the staircase noise
+measurements.
 """
 
 import argparse
@@ -30,9 +45,9 @@ import importlib
 import json
 import time
 
-from scripts.arithmetic_scaling import critical_path_depth
 from torchwright.compiler.forward.cpsat_scheduler import critical_path_layers
 from torchwright.compiler.lower import lower
+from torchwright.compiler.utils import get_ancestor_nodes
 
 IMPLS = [
     "calculator_simple",
@@ -40,100 +55,116 @@ IMPLS = [
     "calculator_scratchpad",
     "calculator_memorize",
 ]
+DEFAULT_NS = "2,3,4,5,6,7,8,9,10"
 # Flagship-geometry collapse cap (d_hidden 8192 // 4); the synthesized
 # staircases top out well below it, so wider caps give the same floor.
 LANE_CAP = 2048
 
+# Weight-bearing tensor attributes per graph node type name.
+_WEIGHT_ATTRS = {
+    "FFN": ("gate_proj", "gate_bias", "up_proj", "up_bias", "out_proj", "out_bias"),
+    "Attn": ("query_matrix", "key_matrix", "value_matrix", "output_matrix"),
+    "Linear": ("output_matrix", "output_bias"),
+    "LiteralValue": ("value",),
+    "Embedding": ("table",),
+}
 
-def main() -> None:
-    ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    ap.add_argument("--ns", default="2,3,4,5,6,7,8,9,10")
-    ap.add_argument(
-        "--out",
-        default="docs/calculator_layer_table.json",
-        help="JSON output path (empty string to skip writing; note "
-        "modal-run does not sync artifacts back — run locally to commit)",
-    )
-    args = ap.parse_args()
-    ns = [int(x) for x in args.ns.split(",")]
 
-    rows: dict = {}
+def graph_params(output_node) -> int:
+    """Total weight count of the graph reachable from ``output_node``."""
+    total = 0
+    for node in get_ancestor_nodes({output_node}):
+        for attr in _WEIGHT_ATTRS.get(type(node).__name__, ()):
+            t = getattr(node, attr, None)
+            if t is not None:
+                total += t.numel()
+    return total
+
+
+def collect(ns) -> dict:
+    """Measure every (impl, n) cell; pure CPU, no artifacts."""
+    results: dict = {impl: [] for impl in IMPLS}
     for impl_name in IMPLS:
         impl = importlib.import_module(f"examples.{impl_name}")
         for n in ns:
             t0 = time.time()
             try:
                 out, _embedding = impl.create_network_parts(max_digits=n)
-            except Exception as exc:  # structural caps (slow-plane budget)
-                rows[(impl_name, n)] = (None, None, None, str(exc).splitlines()[0])
+            except Exception as exc:  # structural caps (slow planes, fact table)
+                row = {"n": n, "build_error": str(exc).splitlines()[0]}
+                if hasattr(impl, "n_params"):
+                    row["params_extrapolated"] = impl.n_params(n)
+                results[impl_name].append(row)
                 print(
-                    f"[{impl_name} n={n}] build failed: " f"{str(exc).splitlines()[0]}",
+                    f"[{impl_name} n={n}] build refused: " f"{row['build_error'][:80]}",
                     flush=True,
                 )
                 continue
-            depth = critical_path_depth([out])
             lowered = lower(
                 out,
                 collapse_univariate=True,
                 collapse_pl=True,
                 collapse_lane_cap=LANE_CAP,
             )
-            floor = critical_path_layers(lowered.output_node)
-            steps = None
-            if hasattr(impl, "decode_steps"):
-                steps = impl.decode_steps(n)
-            rows[(impl_name, n)] = (depth, floor, steps, None)
+            row = {
+                "n": n,
+                "layers": critical_path_layers(lowered.output_node),
+                "steps": (
+                    impl.decode_steps(n) if hasattr(impl, "decode_steps") else 2 * n + 1
+                ),
+                "params": graph_params(lowered.output_node),
+            }
+            results[impl_name].append(row)
             print(
-                f"[{impl_name} n={n}] depth={depth} floor={floor}"
-                + (f" steps={steps}" if steps is not None else "")
-                + f" ({time.time() - t0:.0f}s)",
+                f"[{impl_name} n={n}] layers={row['layers']} "
+                f"steps={row['steps']} params={row['params']:,} "
+                f"({time.time() - t0:.0f}s)",
                 flush=True,
             )
+    return {"config": {"ns": list(ns), "lane_cap": LANE_CAP}, "results": results}
 
-    print(
-        "\n=== layer count (lowered floor = compiled n_layers at "
-        "saturated width); op depth in parens ==="
+
+def render(payload: dict) -> str:
+    """Three tables — one per cost dimension."""
+    ns = payload["config"]["ns"]
+    results = payload["results"]
+    short = {impl: impl.split("_")[1] for impl in IMPLS}
+
+    def cell(impl, n, key, fmt=str):
+        row = next((r for r in results[impl] if r["n"] == n), None)
+        if row is None or key not in row:
+            if key == "params" and row is not None and "params_extrapolated" in row:
+                return f"({fmt(row['params_extrapolated'])})"
+            return "—"
+        return fmt(row[key])
+
+    lines = []
+    for key, title, fmt, width in (
+        ("layers", "compiled layers (lowered-graph floor)", str, 12),
+        ("steps", "worst-case decode steps", str, 12),
+        ("params", "lowered-graph parameters (() = extrapolated)", "{:,}".format, 26),
+    ):
+        lines.append(f"\n=== {title} ===")
+        lines.append(f"{'n':>3} " + "".join(f"{short[i]:>{width}}" for i in IMPLS))
+        for n in ns:
+            lines.append(
+                f"{n:>3} " + "".join(f"{cell(i, n, key, fmt):>{width}}" for i in IMPLS)
+            )
+    return "\n".join(lines)
+
+
+def main() -> None:
+    ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    ap.add_argument("--ns", default=DEFAULT_NS)
+    ap.add_argument(
+        "--out",
+        default="docs/calculator_layer_table.json",
+        help="JSON output path (empty string to skip writing)",
     )
-    header = f"{'n':>3} " + "".join(f"{name.split('_')[1]:>22}" for name in IMPLS)
-    print(header)
-    for n in ns:
-        cells = []
-        for impl_name in IMPLS:
-            depth, floor, steps, err = rows[(impl_name, n)]
-            if err is not None:
-                cells.append(f"{'—':>22}")
-                continue
-            cell = f"{floor} ({depth})"
-            if steps is not None:
-                cell += f" +{steps} steps"
-            cells.append(f"{cell:>22}")
-        print(f"{n:>3} " + "".join(cells))
-
+    args = ap.parse_args()
+    payload = collect([int(x) for x in args.ns.split(",")])
+    print(render(payload))
     if args.out:
-        payload = {
-            "config": {"ns": ns, "lane_cap": LANE_CAP},
-            "results": {
-                impl_name: [
-                    {
-                        "n": n,
-                        "depth": rows[(impl_name, n)][0],
-                        "layers": rows[(impl_name, n)][1],
-                        **(
-                            {"steps": rows[(impl_name, n)][2]}
-                            if rows[(impl_name, n)][2] is not None
-                            else {}
-                        ),
-                        **(
-                            {"build_error": rows[(impl_name, n)][3]}
-                            if rows[(impl_name, n)][3] is not None
-                            else {}
-                        ),
-                    }
-                    for n in ns
-                ]
-                for impl_name in IMPLS
-            },
-        }
         with open(args.out, "w") as f:
             json.dump(payload, f, indent=2)
             f.write("\n")

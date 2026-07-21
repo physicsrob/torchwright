@@ -17,151 +17,217 @@
     "calculator_simple": [
       {
         "n": 2,
-        "depth": 24,
-        "layers": 23
+        "layers": 23,
+        "steps": 5,
+        "params": 529157
       },
       {
         "n": 3,
-        "depth": 25,
-        "layers": 25
+        "layers": 25,
+        "steps": 7,
+        "params": 1325389
       },
       {
         "n": 4,
-        "depth": 27,
-        "layers": 27
+        "layers": 27,
+        "steps": 9,
+        "params": 2715091
       },
       {
         "n": 5,
-        "depth": 29,
-        "layers": 29
+        "layers": 29,
+        "steps": 11,
+        "params": 4871191
       },
       {
         "n": 6,
-        "depth": 31,
-        "layers": 31
+        "layers": 31,
+        "steps": 13,
+        "params": 7966761
       },
       {
         "n": 7,
-        "depth": 33,
-        "layers": 33
+        "layers": 33,
+        "steps": 15,
+        "params": 12174835
       },
       {
         "n": 8,
-        "depth": 35,
-        "layers": 35
+        "layers": 35,
+        "steps": 17,
+        "params": 17668409
       },
       {
         "n": 9,
-        "depth": 37,
-        "layers": 37
+        "layers": 37,
+        "steps": 19,
+        "params": 24620003
       },
       {
         "n": 10,
-        "depth": 39,
-        "layers": 39
+        "layers": 39,
+        "steps": 21,
+        "params": 33203558
       }
     ],
     "calculator_advanced": [
       {
         "n": 2,
-        "depth": 24,
-        "layers": 23
+        "layers": 25,
+        "steps": 5,
+        "params": 653676
       },
       {
         "n": 3,
-        "depth": 25,
-        "layers": 25
+        "layers": 27,
+        "steps": 7,
+        "params": 1497082
       },
       {
         "n": 4,
-        "depth": 26,
-        "layers": 27
+        "layers": 27,
+        "steps": 9,
+        "params": 2937344
       },
       {
         "n": 5,
-        "depth": 26,
-        "layers": 28
+        "layers": 28,
+        "steps": 11,
+        "params": 5193756
       },
       {
         "n": 6,
-        "depth": 27,
-        "layers": 28
+        "layers": 28,
+        "steps": 13,
+        "params": 8439390
       },
       {
         "n": 7,
-        "depth": 27,
-        "layers": 31
+        "layers": 31,
+        "steps": 15,
+        "params": 12956212
       },
       {
         "n": 8,
-        "depth": 27,
-        "layers": 31
+        "layers": 31,
+        "steps": 17,
+        "params": 19304026
       },
       {
         "n": 9,
-        "depth": 28,
-        "layers": 32
+        "layers": 32,
+        "steps": 19,
+        "params": 26449832
       },
       {
         "n": 10,
-        "depth": 28,
-        "layers": 32
+        "layers": 32,
+        "steps": 21,
+        "params": 35277047
       }
     ],
     "calculator_scratchpad": [
       {
         "n": 2,
-        "depth": 16,
         "layers": 16,
-        "steps": 19
+        "steps": 19,
+        "params": 570152
       },
       {
         "n": 3,
-        "depth": 16,
         "layers": 16,
-        "steps": 27
+        "steps": 27,
+        "params": 1050035
       },
       {
         "n": 4,
-        "depth": 16,
         "layers": 16,
-        "steps": 35
+        "steps": 35,
+        "params": 1714580
       },
       {
         "n": 5,
-        "depth": 16,
         "layers": 16,
-        "steps": 43
+        "steps": 43,
+        "params": 2592130
       },
       {
         "n": 6,
-        "depth": 16,
         "layers": 16,
-        "steps": 51
+        "steps": 51,
+        "params": 3710651
       },
       {
         "n": 7,
-        "depth": 16,
         "layers": 16,
-        "steps": 59
+        "steps": 59,
+        "params": 5098865
       },
       {
         "n": 8,
-        "depth": 16,
         "layers": 16,
-        "steps": 67
+        "steps": 67,
+        "params": 6784549
       },
       {
         "n": 9,
-        "depth": 16,
         "layers": 16,
-        "steps": 75
+        "steps": 75,
+        "params": 8794724
       },
       {
         "n": 10,
-        "depth": 16,
         "layers": 16,
-        "steps": 83
+        "steps": 83,
+        "params": 11159946
+      }
+    ],
+    "calculator_memorize": [
+      {
+        "n": 2,
+        "layers": 13,
+        "steps": 5,
+        "params": 5571457
+      },
+      {
+        "n": 3,
+        "build_error": "calculator_memorize: max_digits=3 needs 3,000,000 fact lanes (~726,004,080 parameters) \u2014 the table is exponential in the digit count and only max_digits <= 2 is buildable; use n_facts()/n_params() for the extrapolated numbers",
+        "params_extrapolated": 726004080
+      },
+      {
+        "n": 4,
+        "build_error": "calculator_memorize: max_digits=4 needs 300,000,000 fact lanes (~93,000,005,100 parameters) \u2014 the table is exponential in the digit count and only max_digits <= 2 is buildable; use n_facts()/n_params() for the extrapolated numbers",
+        "params_extrapolated": 93000005100
+      },
+      {
+        "n": 5,
+        "build_error": "calculator_memorize: max_digits=5 needs 30,000,000,000 fact lanes (~11,340,000,006,120 parameters) \u2014 the table is exponential in the digit count and only max_digits <= 2 is buildable; use n_facts()/n_params() for the extrapolated numbers",
+        "params_extrapolated": 11340000006120
+      },
+      {
+        "n": 6,
+        "build_error": "calculator_memorize: max_digits=6 needs 3,000,000,000,000 fact lanes (~1,338,000,000,007,140 parameters) \u2014 the table is exponential in the digit count and only max_digits <= 2 is buildable; use n_facts()/n_params() for the extrapolated numbers",
+        "params_extrapolated": 1338000000007140
+      },
+      {
+        "n": 7,
+        "build_error": "calculator_memorize: max_digits=7 needs 300,000,000,000,000 fact lanes (~154,200,000,000,008,160 parameters) \u2014 the table is exponential in the digit count and only max_digits <= 2 is buildable; use n_facts()/n_params() for the extrapolated numbers",
+        "params_extrapolated": 154200000000008160
+      },
+      {
+        "n": 8,
+        "build_error": "calculator_memorize: max_digits=8 needs 30,000,000,000,000,000 fact lanes (~17,460,000,000,000,009,180 parameters) \u2014 the table is exponential in the digit count and only max_digits <= 2 is buildable; use n_facts()/n_params() for the extrapolated numbers",
+        "params_extrapolated": 17460000000000009180
+      },
+      {
+        "n": 9,
+        "build_error": "calculator_memorize: max_digits=9 needs 3,000,000,000,000,000,000 fact lanes (~1,950,000,000,000,000,010,200 parameters) \u2014 the table is exponential in the digit count and only max_digits <= 2 is buildable; use n_facts()/n_params() for the extrapolated numbers",
+        "params_extrapolated": 1950000000000000010200
+      },
+      {
+        "n": 10,
+        "build_error": "calculator_memorize: max_digits=10 needs 300,000,000,000,000,000,000 fact lanes (~215,400,000,000,000,000,011,220 parameters) \u2014 the table is exponential in the digit count and only max_digits <= 2 is buildable; use n_facts()/n_params() for the extrapolated numbers",
+        "params_extrapolated": 215400000000000000011220
       }
     ]
   }
