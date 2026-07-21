@@ -34,7 +34,15 @@ pytest.importorskip("transformers")
 pytest.importorskip("safetensors")
 
 from torchwright.compiler.export import compile_to_onnx
-from torchwright.compiler.forward.scheduling_policy import LEGACY_POLICY
+from torchwright.compiler.forward.scheduling_policy import SchedulingPolicy
+
+# Everything on attention, cancels included: the layout-stable value path
+# the bit-exact norm-on/norm-off bar requires (see _compile's comment).
+_BIT_STABLE_POLICY = SchedulingPolicy(
+    local_in_attention="always",
+    add_in_attention="always",
+    cancel_in_attention="always",
+)
 from torchwright.compiler.hf import compile_to_hf
 from torchwright.compiler.onnx_load import load_onnx
 
@@ -58,16 +66,20 @@ def _compile(rms_norm: bool) -> str:
         rms_norm=rms_norm,
         # The bit-exact norm-on/norm-off comparison needs a value path that
         # is bit-stable across the two compiles' layouts.  MLP-routed Adds
-        # on the swish machine carry a schedule-dependent fp32 bypass
-        # residue (~2^-41 on near-zero lanes), and the norm's pinned-column
-        # reservation makes the two scheduling problems differ — so pin the
-        # attention Add routing here.  (The shipping default also keeps
-        # Adds on attention; the pin makes this test's precondition
-        # explicit rather than inherited from a default.)  This test
-        # certifies the NORM; the MLP Add path has its own oracle-parity
-        # coverage (tests/compile/forward/test_mlp_add_routing.py and the
-        # HF parity suite).
-        policy=LEGACY_POLICY,
+        # AND MLP bypass cancels on the swish machine carry a
+        # schedule-dependent fp32 residue (~2^-41 on near-zero lanes), and
+        # the norm's pinned-column reservation makes the two scheduling
+        # problems differ — so pin the attention Add routing and the
+        # attention cancel mechanism here.  (Adds stay on attention under
+        # the shipping default too; cancels do not — the eager walk
+        # MLP-cancels whatever overflows a layer's attention batch, and
+        # which nodes overflow is layout luck.  Measured: the 999*999
+        # rollout differs by exactly one 2^-40 crumb's column without the
+        # cancel pin.)  This test certifies the NORM; the MLP Add and
+        # cancel paths have their own oracle-parity coverage
+        # (tests/compile/forward/test_mlp_add_routing.py and the HF
+        # parity suite).
+        policy=_BIT_STABLE_POLICY,
     )
     return art.path
 

@@ -1688,8 +1688,11 @@ class LayerScheduler:
         """May this dead node be zeroed by an MLP ``cancel_bypass`` op?
 
         The eager heuristic MLP-cancels any dead node the attention batch could
-        not fit (fall-back), so the base returns True — with one exception:
-        the held source.  The CP-SAT model gives inputs no MLP cancel
+        not fit (fall-back), so the base returns True — unless the policy pins
+        cancels to attention (``cancel_in_attention="always"``: the MLP bypass
+        cancel's ~2^-41 near-zero-lane residue is schedule-dependent, so
+        bit-exact cross-compile comparisons pin it away) — and with one further
+        exception: the held source.  The CP-SAT model gives inputs no MLP cancel
         mechanism (no ``cancel_in_mlp`` var is created for freeable inputs),
         and its held-source bound demands ``cl >= layer[c] + 1`` for MLP
         readers, so an MLP hold at the last reader's own layer is a schedule
@@ -1701,6 +1704,8 @@ class LayerScheduler:
         ``DirectedLayerScheduler`` overrides this to MLP-cancel only the nodes
         the solver assigned to the MLP mechanism (never an input).
         """
+        if self.policy.cancel_in_attention == "always":
+            return False
         if (
             self.held_output_layout is not None
             and node is self.held_output_layout.source

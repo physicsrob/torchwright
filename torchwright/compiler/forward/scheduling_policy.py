@@ -40,6 +40,21 @@ class SchedulingPolicy:
     # setting.
     add_in_attention: Literal["always", "never"] = "always"
 
+    # Whether dead nodes may be zeroed by the MLP ``cancel_bypass``
+    # mechanism when the layer's batched attention cancel is full.
+    #   "auto":   attention batch first, MLP fall-back (the default walk)
+    #   "always": attention only — a cancel that does not fit waits for a
+    #             later layer's batch
+    # An MLP bypass cancel on the swish machine deposits a
+    # schedule-dependent fp32 residue (~2^-41) on near-zero lanes of the
+    # reused columns, so two compiles of the same graph whose layouts
+    # differ (e.g. the RMSNorm pinned-column reservation) can disagree at
+    # that magnitude on lanes an MLP cancel touched.  Pin to "always"
+    # where a bit-exact cross-compile comparison is the point (the norm
+    # identity certification); production compiles keep "auto".  Eager
+    # path only — CP-SAT's per-node cancel mechanism is a solver choice.
+    cancel_in_attention: Literal["always", "auto"] = "auto"
+
     # Residual stream occupancy fraction above which the scheduler switches
     # its sort order from "longest critical path first" to "free columns
     # first."  Under pressure, freeing residual columns (cancels and ops
