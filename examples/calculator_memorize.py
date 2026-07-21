@@ -38,7 +38,10 @@ splits into two regimes, both measured (2026-07-20, optimize=0 via
 and the residual stream must additionally carry the table's read-out —
 the 30 partitions' ``d_answer``-wide outputs are all alive at the sum,
 so ``d`` below ~4096 has no schedule at all (measured: n=1 and n=2 both
-deadlock at d=2048).  The parameter/fact formulas are validated against
+deadlock at d=2048).  Because the capacity term binds at EVERY geometry,
+:func:`compiled_layers` — not the 13-layer floor — is what a compile
+produces, and it is what the committed layer table reports (at the
+``d_hidden=16384`` flagship reference).  The parameter/fact formulas are validated against
 the built graph's actual lane and weight counts in
 ``tests/examples/test_calculator_memorize.py``, which also verifies all
 300 n=1 facts end to end.  ``max_digits <= 2`` is enforced at build
@@ -80,6 +83,7 @@ __all__ = [
     "MAX_POSITIONS",
     "n_facts",
     "n_params",
+    "compiled_layers",
     "create_network_parts",
 ]
 
@@ -100,6 +104,20 @@ def n_params(max_digits: int) -> int:
     d_key = 34 * n + 3
     d_answer = (2 * n + 2) * 17
     return n_facts(n) * (d_key + d_answer + 1) + 30 * d_answer
+
+
+def compiled_layers(max_digits: int, d_hidden: int = 16384) -> int:
+    """The layer count a compile at width ``d_hidden`` produces.
+
+    Unlike the computing calculators — whose compiled layer count equals
+    their dependency floor once width saturates — memorize is always
+    capacity-bound: an FFN bank packs ~``d_hidden`` fact lanes per layer,
+    so the table's ``ceil(facts / d_hidden)`` sublayers are paid at every
+    geometry and the 13-layer dependency floor is never attained.
+    Measured (optimize=0): n=1 d_hidden=8192 -> 15, n=2 8192 -> 18,
+    n=2 16384 -> 16 — exact at all three points.
+    """
+    return 14 + -(-n_facts(max_digits) // d_hidden)
 
 
 def _format_answer(embedding: Embedding, value: int, seq_len: int) -> torch.Tensor:

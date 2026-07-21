@@ -3,14 +3,19 @@
 One record per (implementation, ``max_digits``), three separate cost
 dimensions — never conflated:
 
-* ``layers`` — the compiled layer count: ``critical_path_layers`` of the
-  graph after ``lower()`` with both collapse passes, the exact
-  width-independent DAG minimum, which ``optimize=2`` compiles land on
-  at saturated width (verified for calculator_simple at n=3 and n=6
-  across d=1024..8192, and for calculator_memorize at n=1,2).  This is
-  THE depth number; the nonlinear-op count it replaced both under- and
-  over-counted (attention→MLP pairing on one side, surviving linear
-  glue on the other).
+* ``layers`` — the compiled layer count at saturated width.  For the
+  computing variants that equals ``critical_path_layers`` of the graph
+  after ``lower()`` with both collapse passes — the exact DAG minimum,
+  which ``optimize=2`` compiles land on once width saturates (verified
+  for calculator_simple at n=3 and n=6 across d=1024..8192).  A module
+  that is capacity-bound at every geometry instead declares its own
+  measured ``compiled_layers(n)`` law (calculator_memorize: ``14 +
+  ceil(facts / d_hidden)`` at the d_hidden=16384 flagship reference —
+  its 13-layer dependency floor is never attainable), and refused rows
+  extend it as ``layers_extrapolated``.  This is THE depth number; the
+  nonlinear-op count it replaced both under- and over-counted
+  (attention→MLP pairing on one side, surviving linear glue on the
+  other).
 * ``steps`` — worst-case decode steps to finish the answer.  Direct
   emitters pay up to 2n product digits plus the terminating <eos>
   (``2n + 1``); the scratchpad additionally streams its serial work as
@@ -94,6 +99,8 @@ def collect(ns) -> dict:
                 row = {"n": n, "build_error": str(exc).splitlines()[0]}
                 if hasattr(impl, "n_params"):
                     row["params_extrapolated"] = impl.n_params(n)
+                if hasattr(impl, "compiled_layers"):
+                    row["layers_extrapolated"] = impl.compiled_layers(n)
                 results[impl_name].append(row)
                 print(
                     f"[{impl_name} n={n}] build refused: " f"{row['build_error'][:80]}",
@@ -108,7 +115,13 @@ def collect(ns) -> dict:
             )
             row = {
                 "n": n,
-                "layers": critical_path_layers(lowered.output_node),
+                # A capacity-bound module's own measured law wins over the
+                # dependency floor (see the docstring's layers entry).
+                "layers": (
+                    impl.compiled_layers(n)
+                    if hasattr(impl, "compiled_layers")
+                    else critical_path_layers(lowered.output_node)
+                ),
                 "steps": (
                     impl.decode_steps(n) if hasattr(impl, "decode_steps") else 2 * n + 1
                 ),
@@ -132,15 +145,17 @@ def render(payload: dict) -> str:
 
     def cell(impl, n, key, fmt=str):
         row = next((r for r in results[impl] if r["n"] == n), None)
-        if row is None or key not in row:
-            if key == "params" and row is not None and "params_extrapolated" in row:
-                return f"({fmt(row['params_extrapolated'])})"
+        if row is None:
             return "—"
-        return fmt(row[key])
+        if key in row:
+            return fmt(row[key])
+        if f"{key}_extrapolated" in row:
+            return f"({fmt(row[f'{key}_extrapolated'])})"
+        return "—"
 
     lines = []
     for key, title, fmt, width in (
-        ("layers", "compiled layers (lowered-graph floor)", str, 12),
+        ("layers", "compiled layers (() = extrapolated)", "{:,}".format, 26),
         ("steps", "worst-case decode steps", str, 12),
         ("params", "lowered-graph parameters (() = extrapolated)", "{:,}".format, 26),
     ):

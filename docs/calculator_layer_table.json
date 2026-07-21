@@ -185,49 +185,57 @@
     "calculator_memorize": [
       {
         "n": 2,
-        "layers": 13,
+        "layers": 16,
         "steps": 5,
         "params": 5571457
       },
       {
         "n": 3,
         "build_error": "calculator_memorize: max_digits=3 needs 3,000,000 fact lanes (~726,004,080 parameters) \u2014 the table is exponential in the digit count and only max_digits <= 2 is buildable; use n_facts()/n_params() for the extrapolated numbers",
-        "params_extrapolated": 726004080
+        "params_extrapolated": 726004080,
+        "layers_extrapolated": 198
       },
       {
         "n": 4,
         "build_error": "calculator_memorize: max_digits=4 needs 300,000,000 fact lanes (~93,000,005,100 parameters) \u2014 the table is exponential in the digit count and only max_digits <= 2 is buildable; use n_facts()/n_params() for the extrapolated numbers",
-        "params_extrapolated": 93000005100
+        "params_extrapolated": 93000005100,
+        "layers_extrapolated": 18325
       },
       {
         "n": 5,
         "build_error": "calculator_memorize: max_digits=5 needs 30,000,000,000 fact lanes (~11,340,000,006,120 parameters) \u2014 the table is exponential in the digit count and only max_digits <= 2 is buildable; use n_facts()/n_params() for the extrapolated numbers",
-        "params_extrapolated": 11340000006120
+        "params_extrapolated": 11340000006120,
+        "layers_extrapolated": 1831069
       },
       {
         "n": 6,
         "build_error": "calculator_memorize: max_digits=6 needs 3,000,000,000,000 fact lanes (~1,338,000,000,007,140 parameters) \u2014 the table is exponential in the digit count and only max_digits <= 2 is buildable; use n_facts()/n_params() for the extrapolated numbers",
-        "params_extrapolated": 1338000000007140
+        "params_extrapolated": 1338000000007140,
+        "layers_extrapolated": 183105483
       },
       {
         "n": 7,
         "build_error": "calculator_memorize: max_digits=7 needs 300,000,000,000,000 fact lanes (~154,200,000,000,008,160 parameters) \u2014 the table is exponential in the digit count and only max_digits <= 2 is buildable; use n_facts()/n_params() for the extrapolated numbers",
-        "params_extrapolated": 154200000000008160
+        "params_extrapolated": 154200000000008160,
+        "layers_extrapolated": 18310546889
       },
       {
         "n": 8,
         "build_error": "calculator_memorize: max_digits=8 needs 30,000,000,000,000,000 fact lanes (~17,460,000,000,000,009,180 parameters) \u2014 the table is exponential in the digit count and only max_digits <= 2 is buildable; use n_facts()/n_params() for the extrapolated numbers",
-        "params_extrapolated": 17460000000000009180
+        "params_extrapolated": 17460000000000009180,
+        "layers_extrapolated": 1831054687514
       },
       {
         "n": 9,
         "build_error": "calculator_memorize: max_digits=9 needs 3,000,000,000,000,000,000 fact lanes (~1,950,000,000,000,000,010,200 parameters) \u2014 the table is exponential in the digit count and only max_digits <= 2 is buildable; use n_facts()/n_params() for the extrapolated numbers",
-        "params_extrapolated": 1950000000000000010200
+        "params_extrapolated": 1950000000000000010200,
+        "layers_extrapolated": 183105468750014
       },
       {
         "n": 10,
         "build_error": "calculator_memorize: max_digits=10 needs 300,000,000,000,000,000,000 fact lanes (~215,400,000,000,000,000,011,220 parameters) \u2014 the table is exponential in the digit count and only max_digits <= 2 is buildable; use n_facts()/n_params() for the extrapolated numbers",
-        "params_extrapolated": 215400000000000000011220
+        "params_extrapolated": 215400000000000000011220,
+        "layers_extrapolated": 18310546875000014
       }
     ]
   }
