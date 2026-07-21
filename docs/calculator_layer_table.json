@@ -11,7 +11,13 @@
       9,
       10
     ],
-    "lane_cap": 2048
+    "geometry": {
+      "d": 8192,
+      "d_hidden": 16384,
+      "d_head": 64,
+      "optimize": 2
+    },
+    "lane_cap": 4096
   },
   "results": {
     "calculator_simple": [
@@ -19,55 +25,64 @@
         "n": 2,
         "layers": 23,
         "steps": 5,
-        "params": 529157
+        "params": 531909,
+        "floor": 23
       },
       {
         "n": 3,
         "layers": 25,
         "steps": 7,
-        "params": 1325389
+        "params": 1329165,
+        "floor": 25
       },
       {
         "n": 4,
         "layers": 27,
         "steps": 9,
-        "params": 2715091
+        "params": 2720147,
+        "floor": 27
       },
       {
         "n": 5,
         "layers": 29,
         "steps": 11,
-        "params": 4871191
+        "params": 4877783,
+        "floor": 29
       },
       {
         "n": 6,
         "layers": 31,
         "steps": 13,
-        "params": 7966761
+        "params": 7975145,
+        "floor": 31
       },
       {
         "n": 7,
-        "layers": 33,
+        "layers": 34,
         "steps": 15,
-        "params": 12174835
+        "params": 12185267,
+        "floor": 33
       },
       {
         "n": 8,
-        "layers": 35,
+        "layers": 36,
         "steps": 17,
-        "params": 17668409
+        "params": 17681145,
+        "floor": 35
       },
       {
         "n": 9,
-        "layers": 37,
+        "layers": 39,
         "steps": 19,
-        "params": 24620003
+        "params": 24635299,
+        "floor": 37
       },
       {
         "n": 10,
-        "layers": 39,
+        "layers": 41,
         "steps": 21,
-        "params": 33203558
+        "params": 33221670,
+        "floor": 39
       }
     ],
     "calculator_advanced": [
@@ -75,55 +90,64 @@
         "n": 2,
         "layers": 25,
         "steps": 5,
-        "params": 653676
+        "params": 656428,
+        "floor": 25
       },
       {
         "n": 3,
         "layers": 27,
         "steps": 7,
-        "params": 1497082
+        "params": 1500858,
+        "floor": 27
       },
       {
         "n": 4,
         "layers": 27,
         "steps": 9,
-        "params": 2937344
+        "params": 2942400,
+        "floor": 27
       },
       {
         "n": 5,
         "layers": 28,
         "steps": 11,
-        "params": 5193756
+        "params": 5136237,
+        "floor": 28
       },
       {
         "n": 6,
         "layers": 28,
         "steps": 13,
-        "params": 8439390
+        "params": 8447774,
+        "floor": 28
       },
       {
         "n": 7,
-        "layers": 31,
+        "layers": 32,
         "steps": 15,
-        "params": 12956212
+        "params": 12966644,
+        "floor": 31
       },
       {
         "n": 8,
-        "layers": 31,
+        "layers": 32,
         "steps": 17,
-        "params": 19304026
+        "params": 19316762,
+        "floor": 31
       },
       {
         "n": 9,
-        "layers": 32,
+        "layers": 34,
         "steps": 19,
-        "params": 26449832
+        "params": 26465128,
+        "floor": 32
       },
       {
         "n": 10,
-        "layers": 32,
+        "layers": 34,
         "steps": 21,
-        "params": 35277047
+        "params": 35295159,
+        "floor": 32
       }
     ],
     "calculator_scratchpad": [
@@ -131,63 +155,73 @@
         "n": 2,
         "layers": 16,
         "steps": 19,
-        "params": 570152
+        "params": 570152,
+        "floor": 16
       },
       {
         "n": 3,
         "layers": 16,
         "steps": 27,
-        "params": 1050035
+        "params": 1050035,
+        "floor": 16
       },
       {
         "n": 4,
         "layers": 16,
         "steps": 35,
-        "params": 1714580
+        "params": 1714580,
+        "floor": 16
       },
       {
         "n": 5,
         "layers": 16,
         "steps": 43,
-        "params": 2592130
+        "params": 2592130,
+        "floor": 16
       },
       {
         "n": 6,
         "layers": 16,
         "steps": 51,
-        "params": 3710651
+        "params": 3710651,
+        "floor": 16
       },
       {
         "n": 7,
         "layers": 16,
         "steps": 59,
-        "params": 5098865
+        "params": 5098865,
+        "floor": 16
       },
       {
         "n": 8,
-        "layers": 16,
+        "layers": 19,
         "steps": 67,
-        "params": 6784549
+        "params": 6784549,
+        "floor": 16
       },
       {
         "n": 9,
-        "layers": 16,
         "steps": 75,
-        "params": 8794724
+        "params": 8794724,
+        "floor": 16,
+        "compile_error": "No progress: 664 nodes remaining, 6 free columns."
       },
       {
         "n": 10,
-        "layers": 16,
         "steps": 83,
-        "params": 11159946
+        "params": 11159946,
+        "floor": 16,
+        "compile_error": "No progress: 896 nodes remaining, 0 free columns."
       }
     ],
     "calculator_memorize": [
       {
         "n": 2,
-        "layers": 16,
+        "layers": 14,
         "steps": 5,
-        "params": 5571457
+        "params": 5574209,
+        "floor": 13
       },
       {
         "n": 3,

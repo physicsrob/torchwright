@@ -124,10 +124,13 @@ def compiled_layers(max_digits: int, d_hidden: int = 16384) -> int:
     Measured (optimize=0, the eager walk): n=1 d_hidden=8192 -> 15,
     n=2 8192 -> 18, n=2 16384 -> 16 — exact at all three points.  An
     ``optimize=2`` compile can land below the law at small n (witnessed:
-    n=2 at d=4096/d_hidden=8192 -> 16, two under the law's 18 — CP-SAT
-    finds a tighter packing than the eager walk); at large n the
-    ``ceil(facts / d_hidden)`` capacity term dominates either schedule,
-    so the law is what the refused rows extrapolate with.
+    n=2 at d=4096/d_hidden=8192 -> 16, two under the law's 18, and at
+    the canonical d=8192/d_hidden=16384 -> 14, two under the law's 16 —
+    CP-SAT packs the bank into fewer layers than the eager walk, by a
+    mechanism not traced further); at large n the ``ceil(facts /
+    d_hidden)`` capacity term dominates either schedule, so the law is
+    what the refused rows extrapolate with — asymptotically right,
+    conservative by ~2 at small n.
     """
     return 14 + -(-n_facts(max_digits) // d_hidden)
 
