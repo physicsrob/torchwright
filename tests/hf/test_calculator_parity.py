@@ -81,9 +81,16 @@ _GATE = [
 ]
 
 
+# ONNX + HF compiled at the same pinned export width (parity is between the
+# two backends, so they must share a geometry).  1024 keeps both artifacts
+# test-sized; the family's canonical publish width (D_MODEL=8192) is witnessed
+# by the layer table, not here.
+_EXPORT_D = 1024
+
+
 @pytest.fixture(scope="module")
 def artifact_path():
-    return compile_example("calculator_simple")
+    return compile_example("calculator_simple", d=_EXPORT_D)
 
 
 @pytest.fixture(scope="module")
@@ -92,7 +99,7 @@ def model(artifact_path):
 
     out, emb = calculator_simple.create_network_parts()
     return compile_to_hf(
-        out, emb, d=calculator_simple.D_MODEL, d_head=calculator_simple.D_HEAD
+        out, emb, d=_EXPORT_D, d_head=calculator_simple.D_HEAD
     )
 
 

@@ -66,16 +66,30 @@ from torchwright.ops.swiglu.sequence_ops import (
     remove_leading_0s,
 )
 
-D_MODEL = 1024
-# Rotary width the simple/advanced calculator graphs are built against; must
-# equal the d_head the token-example harness compiles at.  32 leaves 16 slow
-# planes, comfortably above the widest content head the shared parse / compare
-# / emission plumbing builds (place_on_slow_planes checks at build time).
-# ``calculator_scratchpad`` overrides this with its own wider D_HEAD: its
-# multiply answer gather's content one-hot spans 2n+1 columns, which outgrows
-# 16 planes past max_digits=7 (see the comment there, including the standing
-# cos(Δ·θ) read-distance attenuation caveat on that gather's fastest lanes).
-D_HEAD = 32
+# The ONE calculator geometry: every module in the chain (simple, advanced,
+# scratchpad, memorize), the publish path, and the layer-table measurement
+# all compile at these three numbers (compile-heavy test fixtures pin their
+# own smaller export widths — a d=8192 ONNX artifact is multi-GB dense fp32).
+# d=8192 (the doom-flagship width) is set by the widest schedulable demand
+# in the family: calculator_memorize's 30-partition read-out needs d >= ~4096
+# and calculator_scratchpad's ~n³ live width deadlocks at d=4096 by n=6
+# (witnessed 2026-07-20, "0 free columns").  No fixed d covers scratchpad at
+# every n — the same measurement shows n=10 deadlocking at 8192 too; the
+# layer table records those cells as witnessed schedule refusals.
+D_MODEL = 8192
+# Rotary width every calculator graph is built against; must equal the d_head
+# the compile passes (each Attn's d_qk is baked at build time).  64 covers the
+# widest content head in the family — calculator_scratchpad's multiply answer
+# gather, whose content one-hot spans 2n+1 columns and needs d_head >= 42 at
+# max_digits=10 (d_head/2 slow planes) — with ample planes for the shared
+# parse / compare / emission plumbing (place_on_slow_planes checks at build
+# time).  The standing cos(Δ·θ) read-distance attenuation caveat on that
+# gather's fastest lanes is noted in calculator_scratchpad.
+D_HEAD = 64
+# FFN hidden width the family compiles at.  Bounds the collapse passes' lane
+# cap (d_hidden // 4) and, for calculator_memorize, sets the capacity term
+# ceil(facts / d_hidden) that dominates its layer count.
+D_HIDDEN = 16384
 MAX_POSITIONS = 512
 
 # Compact, calculator-only vocabulary: 10 digits, 3 operators, the newline that
@@ -390,7 +404,8 @@ def build_calculator(
     # leading-zero trim instead of three.  The trim's mux materializes a
     # whole formatted sequence on the residual stream, so three parallel
     # trims were the graph's peak-width hotspot — wide enough to starve
-    # the d=1024 publish geometry.  Same depth either way: the operator
+    # a d=1024 schedule (the pre-unification publish geometry).  Same
+    # depth either way: the operator
     # switch, the trim, and the sign select below are serial in both
     # orders.
     answer = [

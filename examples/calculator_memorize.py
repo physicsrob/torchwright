@@ -38,10 +38,13 @@ splits into two regimes, both measured (2026-07-20, optimize=0 via
 and the residual stream must additionally carry the table's read-out —
 the 30 partitions' ``d_answer``-wide outputs are all alive at the sum,
 so ``d`` below ~4096 has no schedule at all (measured: n=1 and n=2 both
-deadlock at d=2048).  Because the capacity term binds at EVERY geometry,
+deadlock at d=2048 and schedule at d=4096; the family's canonical
+``d=8192`` clears it with margin).  Because the capacity term binds at
+EVERY geometry,
 :func:`compiled_layers` — not the 13-layer floor — is what a compile
-produces, and it is what the committed layer table reports (at the
-``d_hidden=16384`` flagship reference).  The parameter/fact formulas are validated against
+produces; the committed layer table reports the witnessed ``optimize=2``
+compile at the canonical geometry for the buildable row and extends the
+law to the refused rows.  The parameter/fact formulas are validated against
 the built graph's actual lane and weight counts in
 ``tests/examples/test_calculator_memorize.py``, which also verifies all
 300 n=1 facts end to end.  ``max_digits <= 2`` is enforced at build
@@ -68,6 +71,7 @@ from torchwright.ops.swiglu.onehot_table import onehot_lookup
 from examples._calculator_common import (
     CALC_VOCAB,
     D_HEAD,
+    D_HIDDEN,
     D_MODEL,
     MAX_POSITIONS,
     _slice,
@@ -80,6 +84,7 @@ __all__ = [
     "CALC_VOCAB",
     "D_MODEL",
     "D_HEAD",
+    "D_HIDDEN",
     "MAX_POSITIONS",
     "n_facts",
     "n_params",
@@ -113,9 +118,16 @@ def compiled_layers(max_digits: int, d_hidden: int = 16384) -> int:
     their dependency floor once width saturates — memorize is always
     capacity-bound: an FFN bank packs ~``d_hidden`` fact lanes per layer,
     so the table's ``ceil(facts / d_hidden)`` sublayers are paid at every
-    geometry and the 13-layer dependency floor is never attained.
-    Measured (optimize=0): n=1 d_hidden=8192 -> 15, n=2 8192 -> 18,
-    n=2 16384 -> 16 — exact at all three points.
+    geometry and the 13-layer dependency floor is never attained.  The
+    default is the family's canonical ``D_HIDDEN``.
+
+    Measured (optimize=0, the eager walk): n=1 d_hidden=8192 -> 15,
+    n=2 8192 -> 18, n=2 16384 -> 16 — exact at all three points.  An
+    ``optimize=2`` compile can land below the law at small n (witnessed:
+    n=2 at d=4096/d_hidden=8192 -> 16, two under the law's 18 — CP-SAT
+    finds a tighter packing than the eager walk); at large n the
+    ``ceil(facts / d_hidden)`` capacity term dominates either schedule,
+    so the law is what the refused rows extrapolate with.
     """
     return 14 + -(-n_facts(max_digits) // d_hidden)
 

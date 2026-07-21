@@ -18,11 +18,17 @@ from typing import List, Tuple
 import torch
 
 
-def compile_example(name: str) -> str:
+def compile_example(name: str, d: int | None = None) -> str:
     """Compile ``examples/<name>.py`` to a fresh ONNX artifact; return its path.
 
     In-process via ``compile_to_onnx`` (no committed artifact — ``*.onnx`` is
     gitignored). Small examples compile in a few seconds on CPU.
+
+    ``d`` overrides the module's ``D_MODEL`` — the calculator family's
+    canonical publish width (8192) would make the parity artifact multi-GB
+    dense fp32; parity is about token behaviour, so its caller pins a small
+    export width instead.  ``d_head`` always comes from the module: it is
+    baked into the graph at build time.
     """
     from torchwright.compiler.export import compile_to_onnx
 
@@ -33,7 +39,7 @@ def compile_example(name: str) -> str:
         output_node,
         embedding,
         os.path.join(out_dir, f"{name}.onnx"),
-        d=module.D_MODEL,
+        d=d if d is not None else module.D_MODEL,
         d_head=getattr(module, "D_HEAD", 16),
         bias=False,
     )

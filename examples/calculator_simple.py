@@ -37,6 +37,7 @@ from torchwright.ops.swiglu.onehot_table import onehot_lookup
 from examples._calculator_common import (
     CALC_VOCAB,
     D_HEAD,
+    D_HIDDEN,
     D_MODEL,
     MAX_POSITIONS,
     _CARRY_W,
@@ -52,6 +53,7 @@ __all__ = [
     "CALC_VOCAB",
     "D_MODEL",
     "D_HEAD",
+    "D_HIDDEN",
     "MAX_POSITIONS",
     "add_digit_seqs",
     "subtract_digit_seqs",

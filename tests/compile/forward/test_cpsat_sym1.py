@@ -71,7 +71,10 @@ def _example_specs():
     )
 
     return {
-        "calculator": (lambda: calculator_simple.create_network_parts()[0], calculator_simple.D_MODEL, calculator_simple.D_HEAD),
+        # calculator: d pinned at the pre-unification test width (the canonical
+        # publish D_MODEL=8192 would make this schedule test enormous for
+        # nothing); d_head follows the module — it is baked into the graph.
+        "calculator": (lambda: calculator_simple.create_network_parts()[0], 1024, calculator_simple.D_HEAD),
         "caesar": (lambda: caesar_cipher.create_network_parts()[0], 512, 16),
         "sort_digits": (lambda: sort_digits_v1.create_network_parts()[0], sort_digits_v1.D_MODEL, sort_digits_v1.D_HEAD),
         "fibonacci": (lambda: fibonacci.create_network_parts()[0], 512, 16),

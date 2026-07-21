@@ -18,13 +18,8 @@ onnxruntime = pytest.importorskip("onnxruntime")
 from torchwright.compiler.export import compile_to_onnx
 from torchwright.compiler.onnx_load import load_onnx
 
-D = 1024
-D_HEAD = 16
 
-
-def load_example(
-    build_fn, out_dir, *, d=D, d_head=D_HEAD, name="example", rms_norm=None
-):
+def load_example(build_fn, out_dir, *, d, d_head, name="example", rms_norm=None):
     """Compile a token example to ONNX; return ``(model, artifact)``.
 
     ``build_fn()`` returns ``(output_node, embedding)`` — the RoPE-era
@@ -32,6 +27,16 @@ def load_example(
     a rotation inside attention now, so there is no ``pos_encoding`` to pass).
     ``out_dir`` is a directory the model + sidecars may be written to (a
     ``tmp_path_factory.mktemp(...)`` result works).
+
+    ``d`` and ``d_head`` are required, and every caller passes them
+    explicitly.  ``d_head`` must equal the width the example's rope was
+    built at (each Attn's d_qk is baked at build time).  ``d`` is a free
+    per-artifact compile knob: these tests certify token-I/O decode
+    correctness, so they compile at the smallest width that schedules —
+    the calculator family's canonical publish width (d=8192,
+    examples/_calculator_common.py) would put multi-GB dense MLP matrices
+    in every ONNX artifact for nothing; the canonical-geometry compiles
+    are witnessed by scripts/calculator_layer_table.py instead.
 
     ``rms_norm`` threads to :func:`compile_to_onnx` (default ``None`` = on, the
     production default).  Pass ``rms_norm=False`` for an example whose ``d`` is

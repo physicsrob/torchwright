@@ -94,9 +94,11 @@ def test_parse_refuses_max_digits_past_dominance_bound():
     # lanes on rotary planes fast enough that the pointer gather's dominance
     # ordering breaks over a prompt-length read — a 14-digit operand
     # mis-parsed at build-legal geometry.  The IndexedRegion guard must turn
-    # that into a build-time refusal.
+    # that into a build-time refusal.  d_head=32 is pinned here (the repro
+    # geometry): the family constant is 64 now, where a 14-digit window
+    # legitimately builds (see the next test).
     embedding = create_onehot_embedding(CALC_VOCAB)
-    rope = create_rope_config(d_head=D_HEAD, max_positions=MAX_POSITIONS)
+    rope = create_rope_config(d_head=32, max_positions=MAX_POSITIONS)
     with pytest.raises(ValueError, match="dominance ordering"):
         parse_expression(rope, embedding, max_digits=14)
 

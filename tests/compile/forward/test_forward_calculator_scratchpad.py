@@ -15,27 +15,31 @@ a compile in ``tests/examples/test_calculator_scratchpad.py``.
 
 import pytest
 
-from examples.calculator_scratchpad import D_HEAD, D_MODEL, RESULT, create_network_parts
+from examples.calculator_scratchpad import D_HEAD, RESULT, create_network_parts
 
 from ._example_onnx import load_example, run
+
+# The smallest width that schedules the n=3 dispatched graph with margin (it
+# needs ~2560 live columns; see the D_MODEL geometry note in the module).  The
+# family's canonical publish width (D_MODEL=8192) would make this ONNX fixture
+# a multi-GB artifact for nothing; the canonical-geometry compile is witnessed
+# by the layer table instead.
+_EXPORT_D = 3072
 
 
 @pytest.fixture(scope="module")
 def calc3(tmp_path_factory):
-    # D_MODEL (not the _example_onnx default 1024): the dispatched graph's peak
-    # live width exceeds 1024 — the three streamed ops run in parallel and each
-    # carries wide one-hot column totals (see calculator_scratchpad.D_MODEL).
-    # d_head=D_HEAD (32): the family's rope width (the multiply pointer gather is
-    # the widest content head); the compile d_head must match the rope.
+    # d_head=D_HEAD: the family's canonical head width, baked into the graph
+    # (this module's multiply pointer gather is what sets it — see the
+    # geometry note above).  d=3072 is inside the norm's supported-width
+    # contract (3·2^10; docs/rms_norm_dmodel.md), so the norm stays on,
+    # matching the publish path.
     return load_example(
         lambda: create_network_parts(max_digits=3),
         tmp_path_factory.mktemp("scratch3"),
         name="scratch3",
-        d=D_MODEL,
+        d=_EXPORT_D,
         d_head=D_HEAD,
-        # D_MODEL is outside the norm's supported-width contract
-        # (docs/rms_norm_dmodel.md), and the norm isn't what this exercises.
-        rms_norm=False,
     )
 
 

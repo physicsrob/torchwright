@@ -6,7 +6,7 @@ Converted from ``forward_compile``; see ``_example_onnx``.
 
 import pytest
 
-from examples.binary_increment import D_HEAD, create_network_parts
+from examples.binary_increment import D_HEAD, D_MODEL, create_network_parts
 
 from ._example_onnx import load_example, run
 
@@ -16,6 +16,7 @@ def binary_increment(tmp_path_factory):
     return load_example(
         create_network_parts,
         tmp_path_factory.mktemp("binc"),
+        d=D_MODEL,
         d_head=D_HEAD,
         name="binc",
     )

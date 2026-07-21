@@ -71,9 +71,12 @@ def _example_specs():
     )
 
     return {
+        # calculator: d pinned at the geometry the committed measurements ran
+        # at (the canonical publish D_MODEL=8192 would change the measurement
+        # context); d_head follows the module — baked into the graph.
         "calculator": (
             lambda: calculator_simple.create_network_parts()[0],
-            calculator_simple.D_MODEL,
+            1024,
             calculator_simple.D_HEAD,
         ),
         "caesar": (

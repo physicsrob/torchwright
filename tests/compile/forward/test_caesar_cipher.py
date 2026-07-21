@@ -6,7 +6,7 @@ Tests various shift amounts and letter combinations.  Converted from
 
 import pytest
 
-from examples.caesar_cipher import D_HEAD, create_network_parts
+from examples.caesar_cipher import D_HEAD, D_MODEL, create_network_parts
 
 from ._example_onnx import load_example, run
 
@@ -16,6 +16,7 @@ def caesar(tmp_path_factory):
     return load_example(
         create_network_parts,
         tmp_path_factory.mktemp("caesar"),
+        d=D_MODEL,
         d_head=D_HEAD,
         name="caesar",
     )

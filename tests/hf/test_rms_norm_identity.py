@@ -1,7 +1,9 @@
 """The identity RMSNorm is bit-exact on the shipping graph, end to end.
 
-Compiles ``examples/calculator_simple.py`` (the production HF-export graph, d=1024)
-both with the RMSNorm forced on and with it off, and asserts:
+Compiles ``examples/calculator_simple.py`` (the production HF-export graph,
+built at the family's canonical ``D_HEAD``; exported at the smaller
+``_EXPORT_D`` — see its comment) both with the RMSNorm forced on and with it
+off, and asserts:
 
 * the ONNX oracle (real onnxruntime execution) produces **bit-identical** logits
   with and without the norm — i.e. the emitted RMSNorm is exactly the identity,
@@ -47,6 +49,14 @@ from torchwright.compiler.hf import compile_to_hf
 from torchwright.compiler.onnx_load import load_onnx
 
 _BOS, _EOS = "<bos>", "<eos>"
+
+# Export width for the calculator compiles below.  The bar here is the norm's
+# bit-exact identity, not the publish geometry: the family's canonical
+# D_MODEL=8192 would make each of the two ONNX artifacts tens of GB of dense
+# fp32 for nothing (d=1024 exercises the same pinned-column layout class —
+# one constant column).  d_head must stay the family D_HEAD: it is baked into
+# the graph at build time.
+_EXPORT_D = 1024
 # squaring-path expressions whose residual energy (~2.6e13) exceeded the
 # original q=30 bound and silently broke the identity; plus easy ones.
 _EXPRS = ["12*34\n", "999+1\n", "0-7\n", "999*999\n", "321*3\n"]
@@ -61,7 +71,7 @@ def _compile(rms_norm: bool) -> str:
         out_node,
         emb,
         os.path.join(d_dir, "m.onnx"),
-        d=calculator_simple.D_MODEL,
+        d=_EXPORT_D,
         d_head=calculator_simple.D_HEAD,
         rms_norm=rms_norm,
         # The bit-exact norm-on/norm-off comparison needs a value path that
@@ -117,7 +127,7 @@ def _compile_hf(rms_norm):
     return compile_to_hf(
         out,
         emb,
-        d=calculator_simple.D_MODEL,
+        d=_EXPORT_D,
         d_head=calculator_simple.D_HEAD,
         rms_norm=rms_norm,
     )

@@ -127,7 +127,9 @@ def test_n3_is_stated_as_unbuildable():
 
 def test_compiled_layers_law_matches_measured_compiles():
     """Pin the capacity law to the three witnessed optimize=0 compiles
-    (2026-07-20, scripts.measure_calculator_compiled_layers on Modal)."""
+    (2026-07-20, scripts.measure_calculator_compiled_layers on Modal).
+    The default d_hidden is the family's canonical D_HIDDEN."""
     assert cm.compiled_layers(1, d_hidden=8192) == 15
     assert cm.compiled_layers(2, d_hidden=8192) == 18
     assert cm.compiled_layers(2, d_hidden=16384) == 16
+    assert cm.compiled_layers(2) == cm.compiled_layers(2, d_hidden=cm.D_HIDDEN)

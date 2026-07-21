@@ -163,7 +163,9 @@ def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("--impl", default="calculator_simple")
     ap.add_argument("--n", type=int, default=6)
-    ap.add_argument("--d-hidden", type=int, default=8192)
+    from examples._calculator_common import D_HIDDEN
+
+    ap.add_argument("--d-hidden", type=int, default=D_HIDDEN)
     ap.add_argument(
         "--no-collapse",
         action="store_true",

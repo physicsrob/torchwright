@@ -109,6 +109,9 @@ from torchwright.ops.swiglu.marker_count import count_since_marker
 
 from examples._calculator_common import (
     CALC_VOCAB,
+    D_HEAD,
+    D_HIDDEN,
+    D_MODEL,
     MAX_POSITIONS,
     _CMP_W,
     _EQUAL,
@@ -119,31 +122,34 @@ from examples._calculator_common import (
     parse_expression,
 )
 
-# Wider heads than the sibling calculators (which stay at the shared
-# ``_calculator_common.D_HEAD``): the multiply answer gather's content
-# one-hot spans ``2n+1`` columns and must fit ``d_head/2`` slow rotary
-# planes, so ``max_digits=10`` needs ``d_head >= 42``.  64 also lands the
-# deepest content column on plane 11 instead of plane 0 (``θ`` shrinks
-# from ``base^0 = 1`` to ``base^{-22/64} ≈ 0.011`` rad/token), easing —
-# not yet verifying — the transcript-length ``cos(Δ·θ)`` attenuation
-# concern flagged at d_head=32 (decode tests still run max_digits=3).
-D_HEAD = 64
-
-# The dispatch computes all three streamed ops in parallel; each carry/borrow
-# column carries a wide one-hot total.  The leading-zero trim derives each
-# answer digit *once* into a scratch-digit region and each answer slot reads the
-# one it needs with a single pointer (runtime-index) attention — a width-``N``
-# one-hot match — instead of re-materializing all ``N`` column digits per slot.
-# That drops the per-slot ``N``-wide digit table (the old ``dynamic_extract``
-# ~``N²`` width term) so the peak live residual is back to ~``n³`` and a much
-# smaller ``D_MODEL`` schedules.  Depth stays flat in ``max_digits``; the width
-# (and the decode-step count) is the axis that grows with operand size.  At
-# ``max_digits=3`` the dispatched graph schedules from ~2560 columns; 3072 is the
-# comfortable margin (the old ``dynamic_extract`` trim needed 8192).
-D_MODEL = 3072
+# Geometry notes (the constants themselves are the family-wide set in
+# ``_calculator_common``):
+#
+# * ``D_HEAD`` — this module is why the family runs 64-wide heads: the
+#   multiply answer gather's content one-hot spans ``2n+1`` columns and must
+#   fit ``d_head/2`` slow rotary planes, so ``max_digits=10`` needs
+#   ``d_head >= 42``.  64 also lands the deepest content column on plane 11
+#   instead of plane 0 (``θ`` shrinks from ``base^0 = 1`` to
+#   ``base^{-22/64} ≈ 0.011`` rad/token), easing — not yet verifying — the
+#   transcript-length ``cos(Δ·θ)`` attenuation concern flagged at d_head=32
+#   (decode tests still run max_digits=3).
+#
+# * ``D_MODEL`` — the dispatch computes all three streamed ops in parallel;
+#   each carry/borrow column carries a wide one-hot total.  The leading-zero
+#   trim derives each answer digit *once* into a scratch-digit region and each
+#   answer slot reads the one it needs with a single pointer (runtime-index)
+#   attention — a width-``N`` one-hot match — instead of re-materializing all
+#   ``N`` column digits per slot.  That drops the per-slot ``N``-wide digit
+#   table (the old ``dynamic_extract`` ~``N²`` width term) so the peak live
+#   residual is back to ~``n³``.  Depth stays flat in ``max_digits``; the
+#   width (and the decode-step count) is the axis that grows with operand
+#   size.  At ``max_digits=3`` the dispatched graph schedules from ~2560
+#   columns (the old ``dynamic_extract`` trim needed 8192).
 
 __all__ = [
     "D_MODEL",
+    "D_HEAD",
+    "D_HIDDEN",
     "THINKING_START",
     "RESULT",
     "scratch_vocab",

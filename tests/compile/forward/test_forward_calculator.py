@@ -10,6 +10,12 @@ from examples._calculator_common import D_HEAD
 
 from ._example_onnx import load_example, run
 
+# The smallest width that schedules these graphs comfortably (measured: even
+# n=6 schedules at d=1024, optimize=0).  The family's canonical publish width
+# (D_MODEL=8192) would make each ONNX fixture a multi-GB artifact for nothing;
+# the canonical-geometry compiles are witnessed by the layer table instead.
+_EXPORT_D = 1024
+
 # One entry per calculator implementation; every test below runs once per module
 # (the legible variant and the depth-optimized advanced variant must decode
 # identically).
@@ -25,15 +31,16 @@ def _build(calc_module, digits):
     return calc_module.create_network_parts(max_digits=digits)
 
 
-# d_head=D_HEAD (32): the family's rope is built at this width, and the compile
-# d_head must match it (the scratchpad multiply's pointer gather is the widest
-# content head — see examples._calculator_common.D_HEAD).
+# d_head=D_HEAD: the family's canonical head width, baked into the graphs at
+# build time (the compile d_head must match the rope; see
+# examples._calculator_common for what sets it).
 @pytest.fixture(scope="module")
 def calc_1digit(calc_module, tmp_path_factory):
     return load_example(
         lambda: _build(calc_module, 1),
         tmp_path_factory.mktemp("calc1"),
         name="calc1",
+        d=_EXPORT_D,
         d_head=D_HEAD,
     )
 
@@ -44,6 +51,7 @@ def calc_3digit(calc_module, tmp_path_factory):
         lambda: _build(calc_module, 3),
         tmp_path_factory.mktemp("calc3"),
         name="calc3",
+        d=_EXPORT_D,
         d_head=D_HEAD,
     )
 

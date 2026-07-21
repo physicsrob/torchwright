@@ -14,8 +14,8 @@ Usage:
 
 Optional attributes on the example module:
 
-* ``D_MODEL`` / ``D_HEAD`` / ``N_HEADS`` — compile dimensions
-  (defaults 1024 / 16 / None).
+* ``D_MODEL`` / ``D_HEAD`` / ``N_HEADS`` / ``D_HIDDEN`` — compile dimensions
+  (defaults 1024 / 16 / None / None = d).
 * ``DEMO_PROMPTS`` — list of prompt strings.  Drives the clean-room demo
   and the model card's usage snippet; without it the demo is skipped and
   the card carries no usage section.
@@ -169,6 +169,7 @@ def main() -> None:
         d=getattr(module, "D_MODEL", 1024),
         d_head=getattr(module, "D_HEAD", 16),
         n_heads=getattr(module, "N_HEADS", None),
+        d_hidden=getattr(module, "D_HIDDEN", None),
     )
     prompts = getattr(module, "DEMO_PROMPTS", None)
     card = model_card(

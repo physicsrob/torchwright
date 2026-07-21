@@ -51,6 +51,8 @@ from torchwright.ops.swiglu.onehot_table import onehot_lookup
 
 from examples._calculator_common import (
     CALC_VOCAB,
+    D_HEAD,
+    D_HIDDEN,
     D_MODEL,
     _CARRY_W,
     _NO,
@@ -64,6 +66,8 @@ from examples._calculator_common import (
 __all__ = [
     "CALC_VOCAB",
     "D_MODEL",
+    "D_HEAD",
+    "D_HIDDEN",
     "add_digit_seqs",
     "subtract_digit_seqs",
     "compare_digit_seqs",
