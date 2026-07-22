@@ -1,6 +1,6 @@
 """Calculator compiled into a transformer: ``+``, ``-``, ``*`` on integers up
 to ``max_digits`` digits, parsed from ``"A op B\\n"`` and emitted digit by
-digit.  This is the *legible* variant — the one the blog explains line by line.
+digit.  This is the *legible* variant, built to be read line by line.
 
 Every operation is the same two ideas — an exhaustive **lookup table** over
 digit combinations (:func:`torchwright.ops.swiglu.onehot_table.onehot_lookup`), and a

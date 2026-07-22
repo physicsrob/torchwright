@@ -6,15 +6,14 @@ compiler are small and readable (`torchwright/compiler/forward/`);
 read the source when a detail matters.
 
 This guide is deliberately light on specific numbers — the graph and
-compiler evolve, and quantitative snapshots go stale. References below
-to `make graph-stats` describe a per-annotation/per-stage diagnostic
-that was removed from this repo in Step E (it shipped together with
-the DOOM renderer and now lives in the sibling `torchwright_doom`
-repo). The principles still apply to any compiled graph; replicate
-the diagnostic from the verbose `compile_headless` output, or pull the
-original implementation from the sibling repo if you need it. The
-DOOM-anchored worked examples in this doc are illustrative — they
-preserve the original numbers that informed each rule of thumb.
+compiler evolve, and quantitative snapshots go stale. Several sections
+refer to a **graph-stats diagnostic**: a per-annotation stats pass
+over the compiled graph — node and param counts per annotation, the
+compiled layer count, and the longest critical-path chains — which
+you can replicate from `compile_headless(..., verbose=True)` output
+plus a walk over the graph's annotations. The DOOM-anchored worked
+examples in this doc are illustrative — they preserve the original
+numbers that informed each rule of thumb.
 
 ---
 
@@ -41,8 +40,10 @@ The two highest-leverage optimizations, in order:
 
 1. **Reduce layer count** — each layer is a substantial fixed cost
    shared across every token position.
-2. **Reduce distinct Linear/Attn nodes** in hot annotations — each one
-   consumes a whole head-block regardless of how tiny its matrix is.
+2. **Reduce distinct Linear/Attn nodes** in hot annotations — each
+   `Attn` consumes a whole head-block regardless of how tiny its
+   matrix is, and every node is another schedulable unit competing
+   for layer capacity.
 
 Density (`graph / allocated`) is a diagnostic for wasted head-width,
 not a target. Low density in a big annotation is a compression
@@ -58,13 +59,17 @@ Each `TransformerLayer` has two sublayers
     attn_sublayer:  out = attn(x) + x       # n_heads parallel heads
     mlp_sublayer:   out = W2 · ReLU(W1·x) + x
 
+(The MLP activation is ReLU or swish, per the graph's op library;
+this guide's cost model uses the ReLU form throughout.)
+
 The scheduler (`scheduler.py:schedule_layer`) processes a layer in
 phases:
 
 1. **Attention sublayer** — packs up to `n_heads = d / d_head` heads.
-   Candidates: `Attn` nodes, standalone `Linear` nodes (input isn't a
-   ReLU), deferred `Add`s, free adds (`add_into`), and cancellations.
-   All compete for the same head budget.
+   Candidates: `Attn` nodes, `Add`s (deferred adds and free adds via
+   `add_into`), cancellations of dead nodes, and any standalone
+   `Linear` the scheduling policy routes here (not the default — see
+   §3). All compete for the same head budget.
 
 2. **Attention→MLP handoff** — after the attention sublayer adds its
    result into the residual stream, the MLP sublayer reads
@@ -73,16 +78,19 @@ phases:
    This is load-bearing: a `Attn → linear_relu_linear` pattern fits in
    one layer, not two.
 
-3. **MLP sublayer** — packs chains (`L1 → ReLU → L2`), standalone
-   ReLUs, constants, and bias writes into `d_hidden` slots. Each slot
-   costs `2d + 2` params — **orders of magnitude cheaper per unit of
-   work than an attention head**.
+3. **MLP sublayer** — packs FFNs (the `L → ReLU → L` composite,
+   which `linear_relu_linear` builds as a single first-class `FFN`
+   node), standalone `Linear`s via the MLP bypass, constants, and
+   bias writes into `d_hidden` slots. Each slot costs `2d + 2`
+   params — **orders of magnitude cheaper per unit of work than an
+   attention head**.
 
-Key consequence: **attention-sublayer ops in the same layer run in
-parallel with each other**. Two standalone Linears where one reads
-the other's output cannot share a layer. The second has to wait for
-the next layer — unless it's the L1 of an L→R→L chain, in which case
-it goes into the same layer's MLP.
+Key consequence: **ops in the same sublayer run in parallel with each
+other**. Two ops where one reads the other's output cannot share a
+sublayer — the second waits for the next layer. The attention→MLP
+handoff is the only within-layer sequencing: an op scheduled into a
+layer's MLP sublayer can read that layer's attention outputs, never
+the other way around.
 
 ---
 
@@ -93,39 +101,40 @@ What each graph node compiles to:
 | Graph node | Sublayer | Cost model |
 |---|---|---|
 | `Attn` | attention | `ceil(d_v / d_head)` heads. |
-| Standalone `Linear` (input ≠ ReLU) | attention | `ceil(d_input / d_head)` heads. Even scalar (`d_input = 1`) ops take a full head. |
-| L1 of an L→ReLU→L chain | MLP | Shared with L2 as one `MLPOp`. |
-| L2 of chain | MLP | `d_hidden × (2d + 2)` slot params. |
-| Chain ReLU | MLP | Absorbed in L2. |
-| Standalone ReLU | MLP | `d_relu × (2d + 2)` slot params. Rare. |
+| Standalone `Linear` | MLP (default) | `2 × d_output` hidden slots via the MLP bypass. Under the eager scheduler, routes to attention (`ceil(d_input / d_head)` heads) only when `2 × d_output` exceeds the layer's usable hidden pool, or under the legacy `local_in_attention="always"` policy; under CP-SAT scheduling the default `cpsat_flex_routing=True` lets the solver pick attention vs MLP per node. |
+| `FFN` (`linear_relu_linear`) | MLP | One hidden slot per lane, `2d + 2` params each. A packable unit — many FFNs share one MLP sublayer's hidden pool. |
 | `Add` (one addend dead) | attention | 1 head (`add_into`). |
-| `Add` (neither dead) | attention | `2 × ceil(d_out / d_head)` heads — copies both inputs. |
+| `Add` (neither dead) | attention | 1 head when `2 × d_out ≤ d_head` (both addends share a combined head); otherwise 2 heads per `d_head`-wide output chunk. |
 | `Concatenate` | — | 0. Never allocated; compiler resolves through it. Children still need simultaneous residency. |
 | `LiteralValue` | MLP | Bias entries only — effectively free. |
-| `InputNode` / `PosEncoding` / `Embedding` | — | 0 cost; sits in residual stream for its lifetime. |
+| `InputNode` / `Embedding` | — | 0 cost; sits in residual stream for its lifetime. (Position is not a node at all — it's a rotation applied inside attention, configured by `RopeConfig`.) |
 
 Confirmed at source: `_allocate_head` in
-`compiler/forward/weight_writer.py` is a bump-allocator — each Linear
-and each Attn node gets its own head-block, no cross-op head sharing.
+`compiler/forward/weight_writer.py` is a bump-allocator — each
+attention-routed op gets its own head-block, no cross-op head
+sharing. Routing itself lives in `SchedulingPolicy`
+(`compiler/forward/scheduling_policy.py`): `local_in_attention`
+defaults to `"never"`, so standalone Linears go to the MLP bypass.
 
 ### Op-level shapes
 
 The library ops compose primitives above. Principles:
 
-- **Every `piecewise_linear` / `piecewise_linear_2d` / `clamp` /
-  `reciprocal` / `floor_int` / `compare` / `select` / `cond_gate`
-  is one MLP chain** — i.e. one layer of MLP-sublayer work, regardless
-  of output width. Their hidden-slot usage scales with the number of
-  breakpoints / cases.
+- **Every `piecewise_linear` / `clamp` / `reciprocal` / `floor_int` /
+  `compare` / `select` / `cond_gate` is one MLP-sublayer step** —
+  regardless of output width. Their hidden-slot usage scales with the
+  number of breakpoints / cases.
 - **Every affine Linear (`negate`, `add_const`, `multiply_const`,
-  `add_scaled_nodes`) is one attention head**, scaled by
-  `ceil(d_input / d_head)`.
-- **`subtract` is `add(a, negate(b))`** — one Linear head plus an Add;
-  the Add is free when `negate_b` has no other consumers.
-- **`signed_multiply` / `multiply_integers` / `multiply_2d` compose
-  several chains**. See their docstrings for the current layer cost
-  and precision tradeoffs — the `shallow` / `deep` choices really
-  matter. Don't take the name "deep" as "better"; read the docstring.
+  `add_scaled_nodes`) is a standalone Linear** — `2 × d_output` MLP
+  hidden slots via the bypass under the default policy.
+- **`subtract` is `add(a, negate(b))`** — one standalone Linear plus
+  an Add; the Add is free when the negation has no other consumers.
+- **`multiply_2d` is one MLP-sublayer step; `multiply_integers` is a
+  three-sublayer chain.** `multiply_2d` builds the product as a
+  single ReLU bank (O(n) neurons in the breakpoint count) with grid
+  precision `step1 · step2 / 4`; `multiply_integers` is exact on
+  integer inputs but three MLP sublayers deep. See their docstrings
+  for the precision tradeoffs.
 - **Attention primitives (`attend_mean_where`, `attend_argmin_*`,
   etc.) are one attention head** when the value fits in `d_head`.
 
@@ -152,8 +161,8 @@ Two things to keep straight:
 2. **DAG depth is a lower bound, not the compiled depth.** The
    scheduler inflates beyond this bound when per-layer capacity
    (heads/slots) or residual-stream pressure forces ops into separate
-   layers. In DOOM today the compiled layer count is roughly 2× the
-   DAG critical-path depth, so DAG-depth work and packing/capacity
+   layers. On the DOOM graph the compiled layer count was roughly 2×
+   the DAG critical-path depth, so DAG-depth work and packing/capacity
    work are both worth doing — a 1-layer DAG-depth win is a 1-layer
    floor reduction, but actual N only drops if scheduling slack exists
    at that depth.
@@ -176,34 +185,39 @@ passes, not about giving any single output slack within a pass.
 Rules of thumb for counting layers along a path:
 
 - `Attn` node: **+1 layer** (attention sublayer).
-- Standalone `Linear` (input not a ReLU): **+1 layer** (attention
-  sublayer). Two standalone Linears in sequence = 2 layers.
+- Standalone `Linear`: **+1 layer** (MLP bypass). Two standalone
+  Linears in sequence = 2 layers.
 - `L1 → ReLU → L2` chain: **+1 layer** (MLP sublayer).
 - `Attn → L1 → ReLU → L2`: **+1 layer** (attn-sublayer + same-layer
   MLP).
 - Two sequential L→R→L chains: **+2 layers**.
 - `Concatenate`, `Add`, `LiteralValue`, `InputNode`: **+0 layers**.
 
-`make graph-stats` reports the actual compiled layer count and lists
-the longest contiguous annotation-runs on the critical path — these
-are the ops whose depth most directly drives layer count.
+The graph-stats diagnostic (see intro) reports the actual compiled
+layer count and lists the longest contiguous annotation-runs on the
+critical path — these are the ops whose depth most directly drives
+layer count.
 
 ### How to shorten the critical path
 
 1. **Hoist loop-invariant work out of unrolled loops.** Any
    computation whose inputs don't vary across loop iterations should
    be computed once upstream and shared. The per-iteration code then
-   collapses to cheap affine Linears — which, after the optional
-   fusion pass (see §8), become free.
+   collapses to cheap affine Linears — which, after the fusion pass
+   (see §8), become free.
 
-2. **Replace nested `select` trees with `piecewise_linear_2d`.** A
-   depth-`k` select tree is `k` chain layers. A 2-input
-   `piecewise_linear_2d` over a dense function is 1 chain layer.
+2. **Replace nested `select` trees with a table lookup.** A
+   depth-`k` select tree is `k` chain layers. When the function is a
+   compile-time constant table over two integer indices,
+   `table_lookup_2d` (`ops/relu/map_select.py`) computes it as a
+   shallow row-select-then-column-gate pipeline instead of `k`
+   chained selects.
 
 3. **Avoid expensive multipliers when a coarse grid suffices.** A
-   `piecewise_linear_2d` on a small breakpoint grid is one chain; a
-   full `signed_multiply` is several. Trade precision for depth
-   deliberately.
+   `multiply_2d` on a small breakpoint grid is one MLP-sublayer step
+   with grid precision `step1 · step2 / 4`; the exact
+   `multiply_integers` chain is three sublayers. Trade precision for
+   depth deliberately.
 
 4. **Pack independent chains into one layer.** The scheduler packs
    chains into the MLP sublayer up to `d_hidden` slots. If two chains
@@ -239,19 +253,28 @@ Use attention for what it's uniquely good at (cross-position
 content-addressable reads), not for work it's merely capable of
 (acting as a 1-to-1 projection).
 
-### Hidden "uses attention" costs
+### When a Linear still lands on attention
 
-These are ops that silently compile to attention heads because their
-input isn't a ReLU:
+Standalone Linears default to the MLP bypass
+(`SchedulingPolicy.local_in_attention="never"`), so `negate`,
+`add_const`, `multiply_const`, and the small helper Linears ops emit
+internally (the base and normalization Linears inside `multiply_2d`,
+the sum-collapse `Linear` at the tail of `dynamic_extract`) cost
+`2 × d_output` hidden slots, not a head — when the fusion pass (§8)
+hasn't folded them away first. Under the eager scheduler, two cases
+still route a Linear to an attention head:
 
-- `negate`, `add_const`, `multiply_const`, chained scalar affine
-  transforms.
-- The base-term `Linear` that `piecewise_linear_2d` emits when the
-  fit's linear coefficients are non-zero.
-- The sum-collapse `Linear` at the tail of `dynamic_extract`.
+- The legacy policy (`local_in_attention="always"`).
+- A Linear whose MLP demand (`2 × d_output`) exceeds the layer's
+  usable hidden pool — it goes to attention regardless of policy.
 
-Each costs a full attention head, even at `d_input = 1`. Long chains
-of these are the biggest single-node-type waste to look for.
+Under CP-SAT scheduling the default `cpsat_flex_routing=True` lets
+the solver pick attention vs MLP per node; the policy is consulted
+only with `cpsat_flex_routing=False`.
+
+Long chains of scalar Linears are still worth hunting: cheap in
+params now, but each un-fused link on the critical path is a layer
+of depth (§4).
 
 ---
 
@@ -341,8 +364,9 @@ The most damaging shape: **N parallel chains feeding a common
 Concatenate**, where each chain has a wide intermediate that's much
 wider than the chain's terminal output. Classic example: an unrolled
 loop where each iteration computes a one-hot select and produces a
-narrow result (DOOM's tex_sample loop produced a 192-col `masked_i`
-intermediate per row, then narrowed to 3 cols).
+narrow result (DOOM's tex_sample loop produced a 192-col masked-table
+intermediate per row inside `dynamic_extract`, then narrowed to
+3 cols).
 
 The scheduler is greedy. With N independent chains all simultaneously
 ready, it admits as many as fit. Each in-flight chain pins its wide
@@ -354,11 +378,11 @@ compiled N inflates well beyond DAG critical path.
 
 **How to recognise this pattern:**
 
-- `make graph-stats` shows DAG critical path much shorter than
-  compiled `N`.
+- The graph-stats diagnostic (see intro) shows DAG critical path much
+  shorter than compiled `N`.
 - Verbose compile log shows a long stretch of high-occupancy layers
   with low op counts.
-- `modal_inspect_residual.py` (or its local variant) breaks per-layer
+- A per-annotation occupancy probe (see §11) breaks per-layer
   occupancy down by annotation; one annotation will dominate the
   plateau (e.g., `render/column_fill/tex_sample` was 63% of the
   plateau for DOOM at d=2048).
@@ -405,7 +429,8 @@ but always sweep — the optimum has a sharp basin.
   linearly.
 - **`peak_intermediate_width`** — the largest live width per chain.
   This is graph-structure-dependent; for tex_sample it was 192 (the
-  `masked_i` intermediate inside `dynamic_extract`).
+  width-`n_entries × d_fill` masked table `broadcast_select` produces
+  inside `dynamic_extract`).
 - **`chunk_size` / number of chains** — the loop unroll count. More
   chains means the plateau lasts longer if not gated, but the optimal
   `K` is determined by peak width, not chain count.
@@ -446,50 +471,65 @@ hurt — do the measurement first.
 
 ## 8. Graph-level fusion pass
 
-There is an optional pre-compile optimization pass
+There is a fusion pass
 (`torchwright/graph/optimize.py:fuse_consecutive_linears`) that
-merges `Linear → Linear` pairs in-place, computing the product matrix
-and combined bias. It fires when:
+fuses adjacent linear maps in place, FFN-aware. Five folds, each
+gated so it never grows the parameter count (the sibling merge needs
+no gate — it is parameter-neutral):
 
-- L1's only consumer is L2.
-- L1's input is not a `Concatenate` (the pass skips these).
-- The fused matrix has ≤ the params of the separate pair (no
-  bottleneck-inflation fusions).
+- **Linear → Linear** — L1's sole consumer is L2; L2 absorbs L1
+  (product matrix, combined bias).
+- **Linear → FFN** — the Linear's sole consumer is the FFN; the
+  Linear folds into the FFN's gate (and up) projection.
+- **FFN → Linear** — the FFN's sole consumer is the Linear; the
+  FFN's output projection absorbs it (declined when the Linear is a
+  caller-held output).
+- **Linear leaves through Concatenate** — when a Concatenate's sole
+  consumer is a Linear, single-consumer Linear leaves are absorbed
+  into the downstream matrix and LiteralValue leaves fold into its
+  bias.
+- **Sibling Linear leaves of a Concatenate** — a contiguous run of
+  same-input, sole-consumer Linear leaves merges into one wide
+  Linear.
 
 When it runs, chains of `multiply_const`, `add_const`, `negate`, and
-other scalar affine Linears collapse into one Linear — saving heads
-and layers automatically. Whether it's wired into your compile
-entrypoint is worth checking; DOOM's `compile_game` calls it before
-`compile_headless`.
+other scalar affine Linears collapse into one Linear — including
+through Concatenates — saving ops and layers automatically. It runs
+automatically: `lower()`, the compiler's lowering boundary, applies
+it to the compiler-private copy of the graph before scheduling, so
+every compile entry point gets it without caller action. A fold that
+would erase a checked value (`node.checks`) is declined, so asserted
+values stay materialized.
 
 Manual fusion (writing `Linear(x, combined_matrix, combined_bias)`
 directly) remains worthwhile when:
 
-- The input is a `Concatenate` (pass skips these).
-- The intermediate has fanout (pass skips these, and the duplicate
-  computation dominates).
-- You're using a raw `compile_headless` call that doesn't invoke the
-  optimization pass.
+- The intermediate has fanout (every fold requires a sole consumer,
+  and the duplicate computation dominates).
+- The fused matrix would grow the parameter count (the pass declines
+  bottleneck-inflating fusions you might still want for depth).
 
 ---
 
 ## 9. Optimization techniques
 
-`make graph-stats` gives a prioritised list of critical-path
-annotations and their contiguous chain lengths — start there. For
-each hot annotation, the levers are:
+The graph-stats diagnostic (see intro) gives a prioritised list of
+critical-path annotations and their contiguous chain lengths — start
+there. For each hot annotation, the levers are:
 
 ### Reduce depth (highest leverage)
 
 - Hoist loop-invariant work out of unrolled loops.
-- Replace `select` trees with table-valued `piecewise_linear_2d`.
+- Replace `select` trees with `table_lookup_2d` lookups (§4).
 - Collapse sequences of standalone affine Linears into one
   `Linear(input, combined_matrix, combined_bias)` — the fusion pass
   handles some of this automatically; the rest is manual.
 - Merge cross-position reads with shared validity/mask into a single
   bundled attention call.
-- Choose the shallower variant of composite multiplier ops when
-  `d_hidden` permits.
+- Prefer `multiply_2d` (one MLP-sublayer step) over the
+  `multiply_integers` chain (three) when its grid precision
+  `step1 · step2 / 4` is acceptable and `d_hidden` has slots to
+  spare.
 
 ### Reduce node count (medium leverage)
 
@@ -498,14 +538,15 @@ each hot annotation, the levers are:
   in parallel on disjoint data are good candidates for a wider
   variant — but this usually requires extending the op library, not
   just the caller.
-- Combine bool expressions: prefer `bool_all_true` to chains of
-  `bool_and`; flip negations to use `bool_all_true` in place of
-  `bool_any_true` when possible.
+- Combine bool expressions: one `bool_all_true` over the whole list
+  beats a tree of pairwise combines; flip negations to use
+  `bool_all_true` in place of `bool_any_true` when possible.
 
 ### Tighten bounds (low leverage but pays off)
 
-- `signed_multiply`, `reciprocal`, `piecewise_linear*` all scale
-  hidden-slot count linearly with their bounds. Loose bounds waste
+- `multiply_2d`, `reciprocal`, and `piecewise_linear` all scale
+  hidden-slot count linearly with their bounds (the breakpoint grid
+  spans the declared range at a fixed step). Loose bounds waste
   precision AND width.
 
 ### `d_head` (limited)
@@ -520,13 +561,14 @@ more heads per layer). It doesn't typically buy layer reduction.
 
 - **Long sequences of scalar standalone Linears** (`negate`,
   `add_const`, `multiply_const`) on the critical path. Fuse by hand
-  if the optimization pass doesn't (Concatenate inputs, fanout).
+  if the optimization pass doesn't (fanout-bearing intermediates).
 - **`bool_any_true([a, b])` when the negations already exist.**
   `bool_any_true` costs one more chain than `bool_all_true`.
 - **Computing a value per-consumer that could be computed once
   upstream and read via attention.**
-- **Unbounded `max_abs` on `signed_multiply`.** Burns precision and
-  neurons simultaneously.
+- **Loose `max_abs1` / `max_abs2` bounds on `multiply_2d`.** The breakpoint grid
+  spans the declared range, so slack bounds burn hidden slots (at a
+  fixed `step`) or precision (at a fixed slot count).
 - **Concatenating values with different natural lifetimes.** Pins
   both until the concat is consumed.
 
@@ -534,22 +576,23 @@ more heads per layer). It doesn't typically buy layer reduction.
 
 ## 11. Debugging strategies
 
-### Start with graph-stats
+### Start with per-annotation stats
 
-`make graph-stats` is the primary diagnostic. It reports:
+The graph-stats diagnostic (see intro) is the primary measurement.
+What to measure:
 
 - Per-annotation node counts, graph params, allocated params, and
   density.
-- Actual compiled layer count (it runs the compiler).
+- Actual compiled layer count (this requires running the compiler).
 - Critical path length and annotation breakdown.
 - Longest contiguous annotation-runs on the critical path, ordered
   by length — these are the biggest depth-reduction targets.
 
 Two caveats when reading the critical-path output:
 
-- The tool prints **one example chain** of maximum DAG depth. If
-  multiple chains are tied at that depth (common in non-trivial
-  graphs), shortening only the displayed one may not reduce N
+- A critical-path trace surfaces **one example chain** of maximum DAG
+  depth. If multiple chains are tied at that depth (common in
+  non-trivial graphs), shortening only that one may not reduce N
   because another tied chain still binds the lower bound.
 - The **DAG depth reported is a lower bound**; the compiled layer
   count may be substantially larger (roughly 2× in DOOM) because the
@@ -562,13 +605,13 @@ Two caveats when reading the critical-path output:
   constraint.
 
 Add `with annotate("subsystem"):` blocks liberally in your graph
-construction code; annotations are free at runtime and make
-`graph-stats` output meaningful.
+construction code; annotations are free at runtime and make the
+per-annotation breakdowns meaningful.
 
 ### Isolate a subsystem
 
 Temporarily return an intermediate node as the graph output and
-re-run `graph-stats`. Ancestors collapse to just what feeds that
+re-run the stats pass. Ancestors collapse to just what feeds that
 node, so you can measure a subsystem in isolation.
 
 ### Read the verbose compile log
@@ -583,10 +626,10 @@ layers indicate a wide intermediate living too long.
 ### Correctness checks after structural changes
 
 `torchwright/debug/probe.py` runs the compiled module side-by-side
-with a recursive oracle evaluator for a single position and reports
-the first divergence. Run it after any graph restructuring. For
-multi-position / autoregressive behaviour, the test suite (`make
-test`) is the authoritative check.
+with a recursive oracle evaluator over all `n_pos` prefill positions
+and reports the first divergence. Run it after any graph
+restructuring. For autoregressive decode behaviour, the test suite
+(`make test`) is the authoritative check.
 
 ### Attribute layer count to a subsystem
 
@@ -599,11 +642,13 @@ more than its allocated-params share suggests.
 
 When the verbose compile log shows a residual-occupancy plateau (many
 consecutive layers at 90%+), figure out *which subsystem* is pinning
-columns before reaching for any heuristic tweak. The pattern: monkey-
-patch `write_mlp_sublayer` to snapshot
-`residual_map._node_to_indices` after each layer, then group by
-`node.annotation` and report avg cols per annotation across plateau
-layers. See `modal_inspect_residual.py` for a working template.
+columns before reaching for any heuristic tweak. No instrumentation
+needed: the compiler already materializes a per-layer snapshot of
+node → residual columns (each planned layer's `residual_snapshot` in
+the replay plan, carried onto the compiled module as
+`residual_assignment` — one mapping per post-MLP sublayer state).
+Group each layer's columns by `node.annotation` and report avg cols
+per annotation across plateau layers.
 
 A plateau dominated (≥50%) by one annotation means
 `sequential_scope` on that subsystem is the right lever (see §7). A
@@ -618,8 +663,10 @@ biggest contributor.
 1. **Layer count is critical-path-bound**, not capacity-bound. Saves
    come from shortening the critical path, not from shaving heads
    inside a layer.
-2. **Each `Linear` / `Attn` node consumes a whole head-block**, so
-   node count in an annotation is often the real cost.
+2. **Each `Attn` node consumes a whole head-block; standalone
+   `Linear`s default to the MLP bypass** (`2 × d_output` hidden
+   slots). Node count in an annotation is still often the real cost
+   — every node is a schedulable unit with depth implications.
 3. **MLP slots are orders of magnitude cheaper than attention
    heads** per unit of work — push per-position work into
    `linear_relu_linear` chains.
@@ -628,15 +675,16 @@ biggest contributor.
 5. **Autoregression lets earlier tokens precompute for later tokens.**
    Upstream work read via a bundled attention head often beats
    duplicating work at the consumer.
-6. **The compiler fuses some but not all adjacent Linears.**
-   Bottleneck-inflating fusions, Concatenate-fed Linears, and
-   fanout-bearing Linears are skipped. Fuse manually where the pass
-   doesn't.
-7. **`Concatenate` is free; non-dead `Add` costs 2 heads.** Fused
-   `Linear(Concatenate([a, b]), [[1],[-1]])` is 1 head and 1 layer;
-   `subtract(a, b)` as `negate + add` is typically 1 negate head plus
-   1 free-add head.
-8. **Bound everything as tightly as possible.** `signed_multiply`,
+6. **The compiler fuses most adjacent linear maps — including through
+   Concatenates and into/out of FFNs.** Bottleneck-inflating fusions,
+   fanout-bearing intermediates, checked values, and caller-held
+   outputs are declined. Fuse manually where the pass doesn't.
+7. **`Concatenate` is free; a non-dead `Add` costs 1 head when
+   `2 × d_out ≤ d_head`, 2 per chunk beyond that.** Fused
+   `Linear(Concatenate([a, b]), [[1],[-1]])` is one op and one layer;
+   `subtract(a, b)` as `negate + add` is typically a negate Linear
+   plus 1 free-add head.
+8. **Bound everything as tightly as possible.** `multiply_2d`,
    `reciprocal`, and the piecewise ops scale width AND precision with
    their input bounds.
 9. **N parallel chains feeding a join can plateau the residual stream.**

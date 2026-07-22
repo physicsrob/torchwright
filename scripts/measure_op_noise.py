@@ -856,9 +856,9 @@ def _distributions() -> Dict[str, InputDistribution]:
         ),
         "radix_floor_native_uniform": _uniform_1d(
             "radix_floor_native_uniform",
-            "Uniform continuous samples on [-1023, 1023] — the DOOM native "
-            "texture-coordinate range (`render_ops.FLOOR_NATIVE`, the "
-            "production `radix_floor_int` call site, sharpness=10^4).",
+            "Uniform continuous samples on [-1023, 1023] — the native "
+            "texture-coordinate range used by the d8192 DOOM graph "
+            "(sharpness=10^4).",
             -1023.0,
             1023.0,
         ),
@@ -1004,7 +1004,7 @@ def _distributions() -> Dict[str, InputDistribution]:
         ),
         "table_lookup_2d_int_8x6": _table_lookup_2d_distribution(
             "table_lookup_2d_int_8x6",
-            "Integer (i, j) over an 8×6 table with 25%% out-of-range "
+            "Integer (i, j) over an 8×6 table with 25% out-of-range "
             "(clamped) indices — every indicator saturated, the value "
             "path is the delta telescoping's fp32 accumulation.",
         ),
@@ -1145,7 +1145,7 @@ def _target_ops() -> List[TargetOp]:
                 "integer breakpoints, x²): error is zero at breakpoints and "
                 "bounded by per-segment interpolation error. The staircase "
                 "distributions measure the univariate-collapse "
-                "configuration (docs/univariate_collapse_plan.md): step "
+                "configuration: step "
                 "pairs at half-integers, input_scale = step_sharpness, "
                 "in-contract inputs — the axis that grows with lane count "
                 "is fp32 accumulation across the lane sum."
@@ -1619,8 +1619,7 @@ def _target_ops() -> List[TargetOp]:
                 "Swish(−scale·cond)·b/scale`. The losing branch contributes "
                 "exactly zero at clean conds; the winner passes with ~1 ulp "
                 "relative rounding. (The relu-machine select was never "
-                "measured — its additive-cancellation error class, half an "
-                "ulp of M, is documented in the findings doc instead.)"
+                "measured.)"
             ),
         ),
         TargetOp(
@@ -1699,12 +1698,10 @@ def _target_ops() -> List[TargetOp]:
             distribution_names=("broadcast_select_pm1_masks_4x1",),
             notes=(
                 "Per slot, select's complementary gated pair with mask_i "
-                "as the cond — one form for every caller (the approximate "
-                "flag, the (M+v)−M offsets, and the two-sublayer exact "
-                "path all died). Junk-mask safe with no ±1 assert; a mask "
-                "off ±1 by δ mis-scales the winner by δ·|value|. (The relu "
-                "broadcast_select was never measured; its offset class is "
-                "the findings doc's (M+v)−M entry.)"
+                "as the cond — one form for every caller. Junk-mask safe "
+                "with no ±1 assert; a mask off ±1 by δ mis-scales the "
+                "winner by δ·|value|. (The relu broadcast_select was "
+                "never measured.)"
             ),
         ),
         TargetOp(
@@ -2009,8 +2006,7 @@ def _target_ops() -> List[TargetOp]:
                 "last range-coupled offset). On the integer grid every "
                 "indicator is exactly 0/1, so the error is the delta "
                 "telescoping's fp32 accumulation. (The relu table_lookup_2d "
-                "was never measured; its offset-gate error class is the "
-                "(M+v)−M findings entry.)"
+                "was never measured.)"
             ),
         ),
     ]
@@ -2145,11 +2141,10 @@ def render_markdown(data: Dict) -> str:
     lines.append("named input distributions characterising its expected input ranges.")
     lines.append("The canonical data lives in `docs/op_noise_data.json`; this file is")
     lines.append("regenerated from that JSON by `make measure-noise`.")
-    lines.append("")
     lines.append(
-        "For commentary on the numbers — which are expected, which warrant "
-        "investigation — see the hand-written "
-        "`docs/numerical_noise_findings.md`."
+        "*Machine* is the activation family the op library targets: "
+        "`relu` (`torchwright/ops/relu/`) or `swiglu` "
+        "(`torchwright/ops/swiglu/`)."
     )
     lines.append("")
     lines.append("## Summary")
@@ -2196,11 +2191,7 @@ def render_markdown(data: Dict) -> str:
         "have structural gains > 1. An upstream deviation of magnitude `1/gain`"
     )
     lines.append("can push the gated op outside its published bound, and the bias")
-    lines.append("propagates multiplicatively downstream. See")
-    lines.append(
-        "`docs/numerical_noise_findings.md` for the worked Phase E example and"
-    )
-    lines.append("the list of known amplification hazards.")
+    lines.append("propagates multiplicatively downstream.")
     lines.append("")
     lines.append(
         "To reason about a specific chain, don't try to compose per-op bounds."

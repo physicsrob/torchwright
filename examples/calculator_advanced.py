@@ -3,10 +3,10 @@ with the logarithmic-depth arithmetic a hardware multiplier uses.
 
 This is one of two standalone calculator implementations.  It computes the same
 functions as ``calculator_simple`` but trades the legible serial folds for
-``O(log n)``-deep structures; it is **correctness only** — never explained
-line-by-line in the blog, so its intricacy costs nothing against the
-approachability budget, and the only contract is that it decodes identically to
-the simple variant.  It defines its own ``add`` / ``subtract`` / ``multiply``
+``O(log n)``-deep structures; it is **correctness only** — not written to be
+read line by line, so its intricacy costs nothing against the approachability
+budget, and the only contract is that it decodes identically to the simple
+variant.  It defines its own ``add`` / ``subtract`` / ``multiply``
 and hands them to :func:`examples._calculator_common.build_calculator`, which
 supplies the token plumbing and the shared comparison fold (comparison is not a
 depth target, so both variants use it verbatim).

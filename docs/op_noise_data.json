@@ -1,7 +1,7 @@
 {
   "schema_version": 2,
-  "commit": "e4fd771",
-  "measured_at": "2026-07-06",
+  "commit": "a39e4c6",
+  "measured_at": "2026-07-22",
   "ops": [
     {
       "name": "abs",
@@ -369,7 +369,7 @@
       "name": "piecewise_linear",
       "machine": "relu",
       "module": "torchwright.ops.relu.arithmetic_ops",
-      "notes": "Foundation 1D piecewise-linear primitive. The parabola distribution measures the interpolation configuration (11 integer breakpoints, x²): error is zero at breakpoints and bounded by per-segment interpolation error. The staircase distributions measure the univariate-collapse configuration (docs/univariate_collapse_plan.md): step pairs at half-integers, input_scale = step_sharpness, in-contract inputs — the axis that grows with lane count is fp32 accumulation across the lane sum.",
+      "notes": "Foundation 1D piecewise-linear primitive. The parabola distribution measures the interpolation configuration (11 integer breakpoints, x²): error is zero at breakpoints and bounded by per-segment interpolation error. The staircase distributions measure the univariate-collapse configuration: step pairs at half-integers, input_scale = step_sharpness, in-contract inputs — the axis that grows with lane count is fp32 accumulation across the lane sum.",
       "distributions": [
         {
           "name": "parabola_0_10_step1",
@@ -617,7 +617,7 @@
       "name": "broadcast_select",
       "machine": "swiglu",
       "module": "torchwright.ops.swiglu.map_select",
-      "notes": "Per slot, select's complementary gated pair with mask_i as the cond — one form for every caller (the approximate flag, the (M+v)−M offsets, and the two-sublayer exact path all died). Junk-mask safe with no ±1 assert; a mask off ±1 by δ mis-scales the winner by δ·|value|. (The relu broadcast_select was never measured; its offset class is the findings doc's (M+v)−M entry.)",
+      "notes": "Per slot, select's complementary gated pair with mask_i as the cond — one form for every caller. Junk-mask safe with no ±1 assert; a mask off ±1 by δ mis-scales the winner by δ·|value|. (The relu broadcast_select was never measured.)",
       "distributions": [
         {
           "name": "broadcast_select_pm1_masks_4x1",
@@ -1133,7 +1133,7 @@
         },
         {
           "name": "radix_floor_native_uniform",
-          "description": "Uniform continuous samples on [-1023, 1023] — the DOOM native texture-coordinate range (`render_ops.FLOOR_NATIVE`, the production `radix_floor_int` call site, sharpness=10^4).",
+          "description": "Uniform continuous samples on [-1023, 1023] — the native texture-coordinate range used by the d8192 DOOM graph (sharpness=10^4).",
           "n_samples": 4096,
           "max_abs_error": 1.0,
           "mean_abs_error": 0.000244141,
@@ -1175,7 +1175,7 @@
       "name": "select",
       "machine": "swiglu",
       "module": "torchwright.ops.swiglu.map_select",
-      "notes": "Complementary gated pair: `Swish(scale·cond)·a/scale + Swish(−scale·cond)·b/scale`. The losing branch contributes exactly zero at clean conds; the winner passes with ~1 ulp relative rounding. (The relu-machine select was never measured — its additive-cancellation error class, half an ulp of M, is documented in the findings doc instead.)",
+      "notes": "Complementary gated pair: `Swish(scale·cond)·a/scale + Swish(−scale·cond)·b/scale`. The losing branch contributes exactly zero at clean conds; the winner passes with ~1 ulp relative rounding. (The relu-machine select was never measured.)",
       "distributions": [
         {
           "name": "select_signed_bool_two_values",
@@ -1238,11 +1238,11 @@
       "name": "table_lookup_2d",
       "machine": "swiglu",
       "module": "torchwright.ops.swiglu.map_select",
-      "notes": "Both axes floor_int's two-stage staircase; the column stage is one gated lane per boundary (up row = the live row vector's adjacent difference) — the ReLU machine's mask staircase and offset-cancellation gate collapse into it, deleting the offset·0.005 guard term (the family's last range-coupled offset). On the integer grid every indicator is exactly 0/1, so the error is the delta telescoping's fp32 accumulation. (The relu table_lookup_2d was never measured; its offset-gate error class is the (M+v)−M findings entry.)",
+      "notes": "Both axes floor_int's two-stage staircase; the column stage is one gated lane per boundary (up row = the live row vector's adjacent difference) — the ReLU machine's mask staircase and offset-cancellation gate collapse into it, deleting the offset·0.005 guard term (the family's last range-coupled offset). On the integer grid every indicator is exactly 0/1, so the error is the delta telescoping's fp32 accumulation. (The relu table_lookup_2d was never measured.)",
       "distributions": [
         {
           "name": "table_lookup_2d_int_8x6",
-          "description": "Integer (i, j) over an 8×6 table with 25%% out-of-range (clamped) indices — every indicator saturated, the value path is the delta telescoping's fp32 accumulation.",
+          "description": "Integer (i, j) over an 8×6 table with 25% out-of-range (clamped) indices — every indicator saturated, the value path is the delta telescoping's fp32 accumulation.",
           "n_samples": 4096,
           "max_abs_error": 0.0,
           "mean_abs_error": 0.0,

@@ -1,7 +1,7 @@
-"""Compiled-calculator statistics for the blog piece (read, don't edit).
+"""Compiled-calculator statistics (read, don't edit).
 
-Prints the numbers the eventual "a calculator compiled into a transformer"
-post will cite, all derived from a real compile of ``examples.calculator_simple``:
+Prints the headline numbers for the compiled calculator, all derived from a
+real compile of ``examples.calculator_simple``:
 
 * the whole calculator's depth / width / residual occupancy (from the ONNX
   debug sidecar);

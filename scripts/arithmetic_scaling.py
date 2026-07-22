@@ -23,7 +23,7 @@ De-serializing it would need a ``d`` large enough to exceed memory.  The
 critical-path depth is ``d``-independent, instant, and OOM-free, so the full
 sweep — multiply included — runs with no width caps.
 
-The two implementations tell the asymptotic story the blog's payoff figure
+The two implementations tell the asymptotic story the scaling figure
 makes visible:
 
 * ``simple`` (``examples.calculator_simple``) — legible serial carry/borrow
@@ -48,7 +48,7 @@ serial carry/borrow/comparison work out as "thinking" tokens — stays **flat**
 in ``n`` and pays the cost in decode *steps* (worst case ``8n+3``, the
 multiply transcript) instead.
 
-Output: a JSON file (the data the blog/vizkit consumes), printed tables, and an
+Output: a JSON file (docs/arithmetic_scaling.json), printed tables, and an
 optional matplotlib PNG (per-op kernel depth and end-to-end model depth, with a
 colour per implementation shared across both panels).  Decode steps stay in the
 JSON (``decode_steps``) but are no longer a plotted panel.

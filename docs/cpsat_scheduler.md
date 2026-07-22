@@ -32,8 +32,9 @@ Two scheduler implementations exist:
   inherits the parent's allocator and op-emission code, every
   micro-decision and every runtime invariant the parent enforces
   (cancel batching, source column capture, dirty-bit tracking, the
-  four allocator invariants I1–I4 documented in `CLAUDE.md`) holds
-  unchanged.
+  four allocator invariants I1–I4 — runtime assertions in
+  `torchwright/compiler/forward/residual_map.py` and the
+  weight-writer) holds unchanged.
 
 The CP-SAT scheduler exists because the heuristic's local decisions —
 which `Linear` goes to attention versus MLP, when to cancel a dead
@@ -52,26 +53,26 @@ fewer layers).
 - `torchwright/compiler/forward/cpsat_scheduler.py` — the solver.
   Exports `solve_schedule()`, `ScheduleAssignment`, `Costs`, and
   `SolveStats`.
-- `torchwright/compiler/forward/scheduler.py` — adds
-  `DirectedLayerScheduler` next to the existing `LayerScheduler`.
-- `torchwright/compiler/forward/compile.py` — adds the `optimize`
-  level kwarg to `forward_compile` and the warm-start probe that
+- `torchwright/compiler/forward/scheduler.py` — defines both
+  `LayerScheduler` and `DirectedLayerScheduler`.
+- `torchwright/compiler/forward/compile.py` — defines the `optimize`
+  level kwarg on `forward_compile` and the warm-start probe that
   feeds CP-SAT a complete heuristic hint.
 
 ### Data flow
 
 ```
    computation graph
-   (output_node, pos_encoding)
+   (output_node)
               │
               ▼
    ┌───────────────────────────────┐
    │  cpsat_scheduler.py           │
    │    solve_schedule(            │
-   │      graph, d, d_head,        │
+   │      output_node, d, d_head,  │
    │      d_hidden, costs,         │
    │      flex_routing,            │
-   │      time_budget,             │
+   │      time_budget_s,           │
    │    )                          │
    └───────────────────────────────┘
               │
@@ -80,10 +81,11 @@ fewer layers).
      node_to_layer
      node_to_cancel_layer
      node_to_routing
+     node_to_cancel_mech
               │
               ▼
    ┌───────────────────────────────┐
-   │  forward_compile(use_cpsat=…) │
+   │  forward_compile(optimize=…)  │
    │    │                          │
    │    ▼                          │
    │  DirectedLayerScheduler       │
@@ -125,14 +127,16 @@ The contract between the solver and the replay. A frozen dataclass:
 ```python
 @dataclass(frozen=True)
 class ScheduleAssignment:
-    node_to_layer: Dict[int, int]
-    node_to_cancel_layer: Dict[int, int]
-    node_to_routing: Dict[int, str]   # "attn" or "mlp"
+    node_to_layer: Mapping[int, int]
+    node_to_cancel_layer: Mapping[int, int]
+    node_to_routing: Mapping[int, str]   # "attn" or "mlp"
     n_layers: int
+    node_to_cancel_mech: Mapping[int, str] = field(default_factory=dict)
 ```
 
 Every schedulable node — every non-`Concatenate`, non-input node in the
-ancestor cone of `output_node` — appears in all three dicts.
+ancestor cone of `output_node` — appears in `node_to_layer`,
+`node_to_cancel_layer`, and `node_to_routing`.
 (`Concatenate` is the graph's "view" op: it has no value of its own and
 is never placed in the residual stream; consumers reference its leaves
 directly.) When the solver returns `OPTIMAL` or `FEASIBLE`, the
@@ -148,15 +152,21 @@ The solver guarantees:
   (inputs, output, output-cone leaves).
 - `node_to_routing[n]` is either `"attn"` or `"mlp"` — which sublayer
   of `node_to_layer[n]` runs the op.
+- `node_to_cancel_mech[n]` is which sublayer `n`'s cancel runs in:
+  `"attn"` (a batched attention cancel head) or `"mlp"` (a
+  `cancel_bypass` MLP op — see *Resource cumulatives → Within-layer
+  reuse* in §3).  Freeable inputs are always attention-cancelled and
+  are omitted; the replay defaults absent nodes to `"attn"`.
 
 The MLP composite is a single **`FFN`** node (`torchwright/graph/ffn.py`)
 — a feed-forward unit with `n_lanes` hidden lanes: a gate projection, an
-optional up projection, and an output projection, with `act` either
-`"relu"` or `"swish"`. Graph lowering builds the `FFN` before scheduling,
+optional up projection, and an output projection, with `activation`
+either `"relu"` or `"swish"`. Graph lowering builds the `FFN` before
+scheduling,
 so the solver sees one schedulable node, not a triple. It always runs in
 the MLP sublayer (`is_attn` pinned to `0`) and carries routing `"mlp"`;
 its `n_lanes` hidden lanes live in the MLP hidden-slot pool
-(`demand_hidden_slots(FFN) == n_lanes`) while its output uses residual
+(`slots_for(FFN) == n_lanes`) while its output uses residual
 columns like any other node.
 
 > **Historical note.** Earlier revisions detected a `(L1, R, L2)` chain
@@ -189,14 +199,14 @@ What it overrides:
 What it preserves (by inheriting the parent's per-layer code path):
 
 - Cancel coalescing into a single batched
-  `AttnHeadOp("cancel", None, cancel_cols)`. Cancels queued by the
+  `_AttentionOp("cancel", None, cancel_cols)`. Cancels queued by the
   override flow into the parent's existing batching machinery, which
   emits one cancel op per layer.
 - Dirty-bit tracking and same-batch cancellation of dirty target
   columns from fresh allocations.
 - Source column capture (`q_source_cols`, `k_source_cols`, etc.) via
   `_require_live` at schedule time.
-- All four allocator invariants I1–I4 (see `CLAUDE.md`). These are
+- All four allocator invariants I1–I4. These are
   runtime assertions inside `ResidualStreamMap` and the
   weight-writer, which `DirectedLayerScheduler` doesn't touch.
 
@@ -230,7 +240,7 @@ Per schedulable node `n`:
   `LiteralValue` and `FFN` (the `FFN` composite always runs in the MLP
   sublayer). For standalone `Linear` and `Add` nodes the value is free
   under `flex_routing=True` and pinned per `policy` under
-  `flex_routing=False` (docs/plan_additional_mlp_routing.md) — except
+  `flex_routing=False` — except
   that a flex node whose MLP demand (`2·d_output`) exceeds the usable
   hidden pool is capacity-pinned to attention, and a tied compile's
   held-target `Add` is pinned to attention under every configuration
@@ -238,8 +248,7 @@ Per schedulable node `n`:
   executor). (The retired chain model also had a flex "non-exclusive
   `L1`"; see the §2 historical note.)
 
-For each `Add` node `A` (docs/plan_additional_mlp_routing.md,
-*Route-aware reusable placement*):
+For each `Add` node `A`:
 
 - `reusable_i[A]` (`i ∈ {0, 1}`, on `BuiltModel.add_reusable`) — derived
   boolean per addend occurrence, reifying the sublayer-order deadness
@@ -259,14 +268,18 @@ For each `Add` node `A` (docs/plan_additional_mlp_routing.md,
   `reuse_1 = ¬reusable_0 ∧ reusable_1`.  For `add(x, x)` both
   occurrences share one `reusable` literal and occurrence 0 wins.
 - `is_free[A]` — `reusable_0 ∨ reusable_1`.  The held target's
-  `is_free` is pinned 0 WITHOUT the deadness biconditional (the 32983b0
-  contract), and it gets no per-occurrence literals.
+  `is_free` is pinned 0 WITHOUT the deadness biconditional — the held
+  target must never be treated as free even when its deadness
+  predicate would hold, because its output must be a fresh write into
+  the zeroed held bank — and it gets no per-occurrence literals.
 - `reused_as_target[E]` — OR of the selectors naming old value `E`,
   with an `AddAtMostOne` guard (one residual owner is reassigned at
   most once).  Under it the value is an ownership handoff: its cancel
   equals the virtual `layer[A] + 1` (no physical cancel interval, no
   death-cancel charge, `cancel_in_mlp` forced to the canonical
-  attention side, parked forced false in the unpinned model).
+  attention side, and — in the unpinned model — its `parked` boolean
+  forced false; "parked" means the cancel is left at the `max_layers`
+  horizon and the node stays allocated forever).
   Solution extraction recomputes all of these from the extracted
   layers/routes and asserts equality before the literals are
   discarded.
@@ -336,7 +349,7 @@ layer.
   while compute-add allocates fresh cols and pays the dirty cancel.
   The heuristic combines DEATH-layer dead-node cancels and BIRTH-
   layer dirty-allocation cancels into one batched
-  `AttnHeadOp("cancel", ...)` per layer, so they share the
+  `_AttentionOp("cancel", ...)` per layer, so they share the
   attention head budget.
 
 The combined-column form `H_a · d_head + cancel_cols + dirty_cols
@@ -357,23 +370,21 @@ schedulable node. (Under the retired chain model an exclusive `L1` and
 the chain-internal `ReLU` lived only in MLP hidden slots and had no
 residual columns to cancel; those node kinds no longer exist.)
 
-**BIRTH-dirty is over-conservative under `assume_zero_init=False`.**
-The model charges a full-width BIRTH-dirty cancel to *every* fresh
-allocation, but the heuristic only clears the *dirty subset* of the
-allocated columns — columns recycled from a previously-cancelled node
-are already clean (`ResidualStreamMap.dirty_subset`).  Under width
-pressure columns recycle constantly, so the model charges hundreds of
-columns of phantom cancels the replay never pays, and the pooled
-attention cumulative rejects schedules the heuristic compiles.  The
-exact dirty cost is allocation-order-dependent (a property of replay,
-not of the layer assignment), so a sound tight per-layer bound is not
-easily expressible.  The practical resolution: `compile_to_onnx`
-defaults `assume_zero_init=True`, because the ONNX runtime always
-builds the residual stream from zeros (`get_input_res_stream`), making
-every BIRTH-dirty cancel unnecessary — both the model and the replay
-then skip them and agree.  `assume_zero_init=False` stays the
-conservative default of `forward_compile` for callers that may pass a
-non-zero residual stream to `forward()` directly.
+**BIRTH-dirty cancels are retired — zero-init is universal.**  The
+runtime always builds the residual stream from zeros (the ONNX
+embed-table zero-scatter + `get_input_res_stream` contract), so a
+fresh allocation's columns start clean, its first additive write needs
+no prior cancel, and recycled columns are cleaned by the death-cancel
+that freed them.  Neither the model nor the replay charges a
+BIRTH-dirty cancel; the BIRTH-dirty passages above describe the
+retired pre-zero-init model.  (That model supported a non-zero initial
+residual stream behind an `assume_zero_init` flag and charged a
+full-width BIRTH-dirty cancel to *every* fresh allocation —
+over-conservative, since only the dirty subset of the allocated
+columns ever needed clearing and the exact dirty cost is
+allocation-order-dependent, a property of replay rather than of the
+layer assignment.  The flag was retired 2026-07 when zero-init became
+universal.)
 
 **MLP slot budget.** Capacity `d_hidden` per layer.
 
@@ -383,12 +394,16 @@ non-zero residual stream to `forward()` directly.
 - For each `FFN` `n`: a unit-width interval at `layer_var[n]`, demand
   `n.n_lanes` (its hidden lanes). The `FFN` is pinned to MLP
   (`is_attn = 0`), so the interval is unconditional. Its per-node hidden
-  demand is `demand_hidden_slots(FFN) = n_lanes`
+  demand is `slots_for(FFN) = n_lanes`
   (`cpsat_scheduler.py`).
 
-**Residual column budget.** Capacity `d − len(pos_encoding)`.  Only
-`pos_encoding` is reserved for the whole schedule (the attention
-sublayer reads it at nearly every layer); every other input node is
+**Residual column budget.** Capacity `d` minus the permanently
+reserved columns: one constant-1 column that stays resident for the
+whole schedule (the rotary-position end state — position is a
+rotation, so there is no positional-encoding input node, and the
+`pos_encoding` parameter threaded through the solver is vestigial,
+always `None`), plus any `reserve_residual` columns withheld before
+scheduling (the RMSNorm pinned constant).  Every input node is
 *freeable*.
 
 - For each residual-using scheduled node `n`: a regular interval
@@ -400,7 +415,7 @@ sublayer reads it at nearly every layer); every other input node is
   mechanism section above — leaving MLP-cancel at `[layer, cancel)`
   would let the model free columns during the cancel layer's attention
   sublayer where the replay still holds them (an unreplayable schedule).
-- For each freeable input node `n` (every input except `pos_encoding`):
+- For each freeable input node `n` (every input node):
   a regular interval `[0, input_cancel_layer[n])`, demand `len(n)`.
   Inputs are pre-allocated at layer 0, so their birth is fixed at 0;
   `input_cancel_layer[n]` obeys the same consumer lower bound and
@@ -429,12 +444,12 @@ exclusive `L1`; those node kinds no longer exist as separate
 schedulable nodes.
 
 **Within-layer (intra-layer) reuse IS modelled — the two cancel
-mechanisms (Units 1–2).**  Freeing a dead node's columns and reusing
+mechanisms.**  Freeing a dead node's columns and reusing
 them in the *same* layer a consumer read the node (gap-0 reuse) is a
 density the model now represents, via a per-node choice of *which
 sublayer the cancel runs in*:
 
-- **attention-cancel** — a batched attention head (`AttnHeadOp("cancel")`)
+- **attention-cancel** — a batched attention head (`_AttentionOp("cancel")`)
   that reads the column's pre-sublayer value and adds its negation.
   Every attention head reads the same layer-entry residual, so a reader
   of X, the cancel of X, and a new writer into X's columns all compose
@@ -468,12 +483,11 @@ column handoff* (an MLP-born successor taking the cancelled columns in
 the same MLP sublayer — composition `x + (−x) + new = new`).  Closing
 that would need the sublayer-resolution axis in the model **plus** an
 MLP-phase capture→cancel→free→allocate executor in the directed replay
-— both or neither.  This is recorded as **known optimality gap #1** in
-the derisk doc's 2026-07-08 correction (with a bindingness-measurement
-recipe: re-solve with the diagnostic-only
+— both or neither.  This is **known optimality gap #1**; to measure
+whether it binds, re-solve with the diagnostic-only
 `_disabled_families={"mlp_cancel_occupancy"}` relaxation, which reverts
 the end to `[layer, cancel)` for a lower bound, and compare layer
-counts); `scripts/intralayer_example_sweep.py` runs that measurement.
+counts; `scripts/intralayer_example_sweep.py` runs that measurement.
 
 **Known optimality gap #2 — the live-addend gap-1 bound.**  An `Add`
 consumer bounds an ordinary source's cancel via two mechanism-specific
@@ -508,8 +522,7 @@ ONE aggregate transition — all heads read the layer-entry residual and
 their deltas sum, so only `free + released ≥ allocated` matters, and no
 per-output ordering (each output allocating after releasing at most one
 input) need exist for an admitted layer (the deterministic
-counterexample: one source with two simultaneous same-layer readers,
-docs/cpsat_atomic_attention_replay_plan.md §5.1).  The
+counterexample: one source with two simultaneous same-layer readers).  The
 `DirectedLayerScheduler` therefore replays the assigned attention
 sublayer **atomically**: it captures every batch member's source
 columns while all inputs are live (I4's check relocated with the
@@ -546,8 +559,10 @@ For a selected reuse target the attention pin evaluates to exactly the
 `layer[A]+1` handoff (the selecting Add's term dominates and
 `cancel_in_mlp` is forced 0), so the selector's equality is consistent
 with the pin.
-Freeable inputs pin to `max(1, layer[c]+1)`.  The `parked` booleans,
-the upper cancel window, and the hint-aware widening are not built:
+Freeable inputs pin to `max(1, layer[c]+1)`.  The `parked` booleans
+(the never-freed-in-horizon escape — cancel left at `max_layers`, the
+node allocated forever), the upper cancel window, and the hint-aware
+widening are not built:
 the model loses ~5,380 cancel decisions on the production DOOM graph
 (−14.6% proto variables, −11.5% constraints, presolve roughly halved).
 
@@ -559,8 +574,7 @@ of the legacy model.  Every schedule it emits is a valid legacy-model
 solution by construction.
 
 Why it ships as the default (evidence, d=8192 production fixture,
-600 s single solves; details in the umbrella
-`cpsat_pinned_cancel_plan.md`):
+600 s single solves):
 
 - **Audit:** real legacy-model solutions already have zero cancel
   slack on 84.5–91.9% of nodes, and moving every slacked cancel to
@@ -586,10 +600,17 @@ inside their `ScheduleAssignment`; diagnostic hints carry it in
 `DiagnosticHint.cancel_mech`.
 
 `_pin_cancels=False` is the escape hatch: it rebuilds the legacy
-window/parked/widening model byte-identically (the sections below
-describing windows, widening, and the parked escape apply to that
-model).  The legacy machinery is a candidate for deletion once the
-pinned default has soaked.
+window/parked/widening model byte-identically.  In that model each
+non-keep-forever node's cancel is a free decision inside a bounded
+window, with a `parked` boolean as the escape that leaves the cancel
+at the `max_layers` horizon so the node stays allocated forever
+(`SolveStats.parked_count` counts, post-hoc, the nodes a returned
+solution parks); the *Cancel-domain restriction* section in §5
+describes the windows and widening and applies only to that model.
+The legacy machinery is retained for comparison and may be removed in
+a future release.
+
+### Objective
 
 ```
 minimize  alpha · n_layers
@@ -607,9 +628,18 @@ where:
   when MLP-routed, `1·h` reused, `2·h` fresh.
 - `total_mlp_bypass_slots = Σ 2 · n.d_output` over MLP-routed flex
   nodes (standalone Linears and Adds — Add slots belong to the same
-  bypass-slot cost, no new objective coefficient). Chain composite
-  slots and standalone ReLU slots are constants and therefore don't
-  appear in the objective.
+  bypass-slot cost, no new objective coefficient). `FFN` slots are
+  constants and therefore don't appear in the objective.
+
+With `earliness` or `waste` above zero (see *Costs* in §4), a strictly
+lexicographic secondary block is added: the three-term primary above
+is multiplied by a scale larger than the secondary's maximum possible
+value — so no amount of secondary improvement can trade against the
+primary — and `earliness · Σ layer_var + waste · Σ occupancy` is added
+on top.  `SolveStats.objective_scale` records the multiplier;
+`objective_value // objective_scale` recovers the primary value.  Both
+default to zero, which leaves the objective exactly the three-term
+form above.
 
 ### Model preconditions
 
@@ -640,7 +670,7 @@ The model is sound for graphs and configurations satisfying:
   scheduled a `(L1, R, L2)` triple atomically — see the §2 historical
   note.)
 - Standalone `Linear` and `Add` are the flex-routing-eligible node
-  types (docs/plan_additional_mlp_routing.md). `Attn`, `FFN`, and
+  types. `Attn`, `FFN`, and
   `LiteralValue` have routing fixed by their type (`FFN` and
   `LiteralValue` to MLP, `Attn` to attention); a tied compile's
   held-target `Add` is pinned to attention under every configuration.
@@ -659,11 +689,14 @@ class Costs:
     alpha: int = 1
     beta: int = 0
     gamma: int = 0
+    earliness: int = 0
+    waste: int = 0
 ```
 
-The objective is
-`alpha · n_layers + beta · total_attn_heads + gamma · total_mlp_bypass_slots`.
-All three are non-negative integers.
+The primary objective is
+`alpha · n_layers + beta · total_attn_heads + gamma · total_mlp_bypass_slots`;
+`earliness` and `waste` add a strictly lexicographic secondary block
+(see *Objective* in §3).  All five are non-negative integers.
 
 `alpha` weights the layer count. The default `alpha=1` always
 penalizes adding a layer.
@@ -685,14 +718,37 @@ costs the full `d × d_hidden` regardless of how many slots are used
 Provided so that deployments with deployment-time slot pruning can
 express a non-trivial slot cost.
 
+`earliness` weights the secondary term `earliness · Σ layer_var` —
+the alpha/beta/gamma block is scaled so no amount of earliness can
+trade against it.  A pure-depth objective is a staircase: vast
+plateaus of schedules tie at the same layer count and local-search
+workers get zero reward for compacting moves until one happens to
+drop the max layer.  Earliness rewards every move that shifts any
+node earlier, pulling incumbents toward states one move away from a
+layer-count drop.  `earliness=0` (the default) leaves the objective
+byte-identical to the three-term form.  (Measured 2026-06-09 on the
+d=8192 DOOM graph: earliness SLOWED layer descent — the gradient
+mostly rewards irrelevant early-region shuffling.  Kept for
+comparison; prefer `waste`.)
+
+`waste` is a lexicographic secondary like `earliness`, but aimed at
+the binding resource instead of raw position: it minimizes total
+residual occupancy area `Σ len(n) · (cancel_layer[n] − layer[n])` —
+the column-layers a value sits in the stream — over every node with a
+real cancel window, plus `len(n) · cancel` for freeable inputs (born
+at layer 0).  Keep-forever nodes are excluded: their lifetime is
+unavoidable and the term would reward scheduling them LATER.
+Shrinking producer-to-last-reader spans frees width at the pinch
+layers that gate layer-count drops.
+
 ### `flex_routing`
 
 Short for "flexible routing" — whether the standalone-`Linear`
 sublayer choice (attention versus MLP-bypass) is a CP-SAT decision
 variable rather than fixed by the policy.
 
-When `True` (the default), each standalone `Linear` (a `Linear`
-outside any chain) and each fitting `Add` gets its own `is_attn`
+When `True` (the default), each standalone `Linear` (a `Linear` not
+folded into an `FFN`) and each fitting `Add` gets its own `is_attn`
 decision variable and the solver picks attention versus MLP per node.
 When `False`, they are pinned by `realization.static_flex_class` —
 normally per the node type's policy knob (`policy.local_in_attention`
@@ -715,7 +771,7 @@ CP-SAT against a specific heuristic policy's routing choice.
 
 ```python
 forward_compile(
-    d, d_head, output_node, pos_encoding,
+    d, d_head, output_node,
     ...,
     optimize: int = 0,                # 0=heuristic,1=60s,2=330s,3=600s
     cpsat_costs: Costs = Costs(),     # advanced: Pareto navigator
@@ -725,7 +781,7 @@ forward_compile(
 
 `optimize` is the user-facing knob.  Every CP-SAT level is one
 continuous warm-start solve of the pinned-cancel model (see *Pinned
-cancel layers* below); the levels differ only in budget:
+cancel layers* in §3); the levels differ only in budget:
 
 | level | scheduler | budget |
 |------:|-----------|--------|
@@ -761,9 +817,12 @@ At `optimize > 0` the flow is:
    regardless of which scheduler ran — the schedule is a placement
    decision, not a value-changing transformation.
 
-The `policy` argument is honored only when `cpsat_flex_routing=False`,
-where it pins the routing of standalone Linears.  With
-`cpsat_flex_routing=True` (the default), `policy` is ignored.
+The `policy` argument pins the routing of standalone Linears only
+when `cpsat_flex_routing=False`.  With `cpsat_flex_routing=True`
+(the default), `policy` no longer pins routing — but it still shapes
+the warm-start heuristic probe (and therefore the hint) and fully
+determines the schedule whenever the compile falls back to the
+heuristic.
 
 `cpsat_costs` is the Pareto navigator (see *Costs* above); ignored
 when `optimize=0`.
@@ -781,7 +840,7 @@ run during the layer loop.  The layer loop is then deterministic:
 
 Before invoking CP-SAT, `forward_compile` runs the heuristic
 `LayerScheduler` in schedule-only mode (no weight writes) on a
-clone of the residual map.  The probe captures three things per
+clone of the residual map.  The probe captures four things per
 node:
 
 - `hint_layers[n]` — the layer where the heuristic placed `n`.
@@ -816,7 +875,8 @@ heuristic frees a node's columns *within* its consumer's layer and
 reuses them the same layer (within-layer reuse).  Historically this
 eager density was not model-representable, so the warm start ran with
 freeing disabled (`eager_free=False`) and handed CP-SAT the deeper but
-feasible no-eager schedule.  Units 1–2 taught the model that density —
+feasible no-eager schedule.  The within-layer-reuse model extension
+taught the model that density —
 the gap-0 attention cancels and the MLP-cancel mechanism (see *Resource
 cumulatives → Within-layer reuse*) — so the eager schedule is now a
 **feasible** hint, and `eager_free` has been removed entirely
@@ -835,15 +895,15 @@ optimize=2 fallback; this was the second.  The heuristic defers a
 node's free to the next layer when the current layer's attention
 heads are exhausted (`try_add_cancel` returns `None`), so its
 captured `hint_cancel` can land past the model's uniform
-`last_consumer + 1 + K` cancel window.  Since the block-IR refactor
-this happened for ~385 nodes on the production e1m1 hud-on graph —
+`last_consumer + 1 + K` cancel window.  On a ~13K-node production
+graph this happened for ~385 nodes —
 every violation exactly one layer over — so CP-SAT silently dropped
 the hint, cold-searched a model too hard for its 180 s budget,
 returned UNKNOWN, and every cold `optimize=2` compile shipped the
 61-layer heuristic fallback instead of the ~51-layer CP-SAT schedule.
-Diagnosed with `torchwright_doom/scripts/cpsat_hint_audit.py`
-(hard-fix the hint → INFEASIBLE in presolve; family bisect →
-`cancel_slack` is the sole rejector).  Fixed by the hint-aware
+Diagnosed by hard-fixing the hint into the model (→ INFEASIBLE in
+presolve) and bisecting constraint families (→ `cancel_slack` is the
+sole rejector).  Fixed by the hint-aware
 per-node window widening described under *Cancel-domain restriction*.
 
 **The hint-validation tripwire.**  Both incidents were invisible: a
@@ -932,14 +992,14 @@ mechanism-dependent occupancy.)
 ### Determinism
 
 CP-SAT runs with `num_search_workers=16` by default (override with the
-`TW_CPSAT_WORKERS` env var — e.g. the 64-CPU Modal compile container
+`TW_CPSAT_WORKERS` env var — e.g. a 64-CPU compile host
 sets it to 64) and uses parallel worker strategies. Different runs may produce different `ScheduleAssignment`
 values for the same model — different worker discovery orders find
 different optima of equal objective value. The compiled
 `HeadlessTransformer` differs across runs only in scheduling: token
-outputs are bitwise identical (modulo float-point ordering effects
-that already affect every compile, see *FP nondeterminism at
-tolerance boundaries* in `CLAUDE.md`).
+outputs are bitwise identical (modulo float-point ordering effects —
+GPU matmul is non-deterministic run-to-run at the 1e-5–1e-6 level —
+which already affect every compile).
 
 ### Failure modes
 
@@ -981,8 +1041,8 @@ heuristic fallback.
 
 The win-size from CP-SAT versus heuristic depends on residual-stream
 slack.  The first three rows were measured on an earlier headless DOOM
-graph (~4.4K nodes); the last row is the post-J graph (~13K nodes,
-the flat pass roughly doubled depth).  Each row records the
+graph (~4.4K nodes); the last row is the later ~13K-node graph (the
+flat pass roughly doubled depth).  Each row records the
 ``optimize`` level (and corresponding budget) used:
 
 | geometry                       | -O / budget | heuristic | CP-SAT | Δ    | first incumbent | OPTIMAL at |
@@ -990,16 +1050,17 @@ the flat pass roughly doubled depth).  Each row records the
 | d=2048, d_h=8192               | -O 1 (60s)  | 61        | (none) | n/a  | not in 60s      | not in 60s |
 | d=3072, d_h=8192               | -O 2 (180s) | 58        | 46     | -21% | ~27s            | ~80s       |
 | d=4096, d_h=4096               | -O 1 (60s)  | 59        | 46     | -22% | ~17s            | ~31s       |
-| post-J d=4096, d_h=4096, dh=32 | -O 2 (180s) | 85        | 81–82  | -4%  | ~70–80s         | never (LB 50) |
+| later d=4096, d_h=4096, dh=32  | -O 2 (180s) | 85        | 81–82  | -4%  | ~70–80s         | never (LB 50) |
 
-These rows predate Units 1–2 and the eager warm start; the
+These rows predate the within-layer-reuse model extension (the two
+cancel mechanisms) and the eager warm start; the
 "feasible (no-eager) hint vs eager hint" distinction below is
 historical — the eager schedule is now the feasible hint (see *Warm-start
-hints*), and the current expected DOOM d=4096 figure is re-measured by
-the step-9 acceptance run.  At d=2048 the residual cumulative is the
+hints*), and the current expected DOOM d=4096 figure has not been
+re-measured here.  At d=2048 the residual cumulative is the
 binding constraint and CP-SAT struggles to close the LB gap within
 budget.  At d=3072+ CP-SAT converges optimally inside the budget.  On
-the much larger post-J graph CP-SAT no longer proves optimality (the
+the much larger ~13K-node graph CP-SAT no longer proves optimality (the
 lower bound sticks at 50) but still beats the heuristic — historically
 only once the warm-start fed a *feasible* (then no-eager) hint.  The
 heuristic-fallback behavior (when CP-SAT can't find an incumbent) is the
@@ -1024,9 +1085,7 @@ the CP-SAT one.
   only paid on seeds whose rung-0 draw stalled shallow — insurance
   against bad draws, not a deeper tail.  Replaced by one continuous
   600 s solve; `_solve_budget_s` (formerly `_descent_budget_s`)
-  remains the measurement-only budget override.  Evidence: umbrella
-  `cpsat_pinned_cancel_plan.md` step 3 and
-  `cpsat_single_vs_descent_600s.md`.
+  remains the measurement-only budget override.
 - **Symmetry breaking on equivalent sibling chains.** Detected
   parallel chains feeding common `Concatenate` joins via
   `SiblingClusterAnalyzer`, grouped them by structural
@@ -1051,7 +1110,8 @@ the CP-SAT one.
   setup into a parallel worker mid-search).  (An earlier note here
   claimed it merely "conflicts with `AddDecisionStrategy`"; that was
   wrong — removing the strategy does not avoid the crash.)  And it
-  would not have helped regardless: measured on the post-J DOOM graph,
+  would not have helped regardless: measured on the ~13K-node DOOM
+  graph,
   the ~70 s to first incumbent is **genuine model-size search**
   (≈23 s presolve + ≈45 s LB/feasibility search on a ~80 k-variable
   model with three coupled `AddCumulative` constraints), not a blocked
@@ -1061,5 +1121,6 @@ the CP-SAT one.
   so the cancel artifacts were a correctness curiosity, not the
   performance lever.  The lever is feeding a *feasible* hint at all
   (historically the no-eager schedule; now the eager schedule, which
-  Units 1–2 made feasible — see *Warm-start hints*) plus an `optimize≥2`
+  the within-layer-reuse model extension made feasible — see
+  *Warm-start hints*) plus an `optimize≥2`
   budget; CP-SAT then improves from it.

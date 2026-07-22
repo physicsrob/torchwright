@@ -1,7 +1,7 @@
-"""Range printer: two-level autoregressive loop derisking example.
+"""Range printer: two-level autoregressive loop example.
 
-Demonstrates the core pattern for wall-column render tokens: a transformer
-iterates through items in order, and for each item iterates through a range
+Demonstrates a nested-iteration pattern: a transformer iterates through
+items in order, and for each item iterates through a range
 of column values [lo, hi).  The outer loop uses attend_argmin_unmasked with
 a mask that advances only when the inner loop completes.
 
