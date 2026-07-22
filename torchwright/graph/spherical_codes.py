@@ -17,13 +17,12 @@ def load_spherical_codes(filename):
     return tensor
 
 
-# Locate E8.8.1024.txt regardless of cwd. The repo-root path (parent.parent.parent
-# from this file) covers workspace and standalone clones; the bare filename
-# fallback covers Modal, where the file is staged at cwd via add_local_file.
+# The code table lives next to this module, so one package-relative path
+# covers workspace, standalone clones, and Modal (where modal_image.py
+# stages it at the same package-relative destination).
 _E8_FILENAME = "E8.8.1024.txt"
-_E8_AT_SOURCE = Path(__file__).resolve().parent.parent.parent / _E8_FILENAME
 spherical_codes = 10.0 * load_spherical_codes(
-    str(_E8_AT_SOURCE) if _E8_AT_SOURCE.exists() else _E8_FILENAME
+    str(Path(__file__).resolve().parent / _E8_FILENAME)
 )
 
 

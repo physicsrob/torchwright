@@ -12,7 +12,11 @@ IMAGE = (
     # out-of-workspace whenever these groups change (run `make modal-lock`);
     # `make test` runs `check-modal-lock` first to catch drift.
     .uv_sync(groups=["dev", "test-onnx"], extra_options="--no-install-project")
-    .add_local_file("E8.8.1024.txt", "/root/E8.8.1024.txt")
+    # add_local_python_source ships only .py files, so the spherical-code
+    # table is staged separately at its package-relative path.
+    .add_local_file(
+        "torchwright/graph/E8.8.1024.txt", "/root/torchwright/graph/E8.8.1024.txt"
+    )
     .add_local_dir("docs", "/root/docs")
     .add_local_python_source(
         "torchwright", "examples", "tests", "scripts", "modal_image"

@@ -1611,7 +1611,7 @@ class LayerScheduler:
         its *non-constant* inputs computed — the same layer that consumer's
         last such input lands.  The consumer is then ready next layer exactly
         as if the constant had been pre-placed (no added latency to the
-        consumer), and the column is held only briefly.  See constants_plan.md.
+        consumer), and the column is held only briefly.  See docs/constants_plan.md.
 
         Under the deadlock-retry bypass (``_admission_bypass``) the gate is
         lifted so a stalled layer can always make progress (see

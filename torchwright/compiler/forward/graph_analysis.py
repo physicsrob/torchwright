@@ -99,7 +99,7 @@ class GraphAnalyzer:
         # first-class *schedulable* nodes, materialized just-in-time via the
         # compute_literal_value op near their consumer and freed after use —
         # not residual columns pre-allocated at layer 0 and held for the whole
-        # network.  See constants_plan.md.
+        # network.  See docs/constants_plan.md.
         return isinstance(node, (Embedding, InputNode))
 
     def is_ready(self, node: Node, available: Set[Node]) -> bool:

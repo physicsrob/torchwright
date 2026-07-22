@@ -5,7 +5,7 @@ residual-stream column at layer 0 and held across the whole network, even
 when consumed only deep in the graph (the ``select(cond, x, literal)``
 case).  Now a constant is a first-class *schedulable* node, materialized via
 ``compute_literal_value`` only in the layer(s) around its consumer and freed
-after use.  See ``constants_plan.md``.
+after use.  See ``docs/constants_plan.md``.
 
 The end-to-end *correctness* of literal-bearing graphs is covered by
 ``test_forward_compile.py`` (``test_compile_constant``,
