@@ -2,11 +2,14 @@ import functools
 import os
 from contextlib import contextmanager
 from contextvars import ContextVar
-from typing import List, Dict, Optional, Set
+from typing import TYPE_CHECKING, List, Dict, Optional, Set, Tuple
 
 import torch
 
 from torchwright.graph.value_type import NodeValueType, Range
+
+if TYPE_CHECKING:
+    from torchwright.graph.affine_bound import AffineBound
 
 global_node_id = 0
 
@@ -183,6 +186,17 @@ class Node:
     checks: List
     claimed_type: Optional[NodeValueType]
     integer_claim: bool
+    # Derived caches, set eagerly in ``__init__`` and recomputed only via
+    # ``affine_rules.refresh_node_caches`` (the claim-application choke point).
+    _structural_type: NodeValueType
+    _affine_bound: "AffineBound"
+    # Semantic affine override installed by an op via
+    # ``affine_rules._apply_semantic_override`` (None for most nodes).
+    _semantic_affine_override: Optional["AffineBound"]
+    # Weight-support cache attached lazily by
+    # ``compiler.realization.live_weight_row_ranges`` (and injected directly
+    # onto CP-SAT snapshot stand-in nodes); absent until first query.
+    _live_weight_row_ranges: Tuple[Tuple[int, int], ...]
 
     def __init_subclass__(cls, **kwargs):
         super().__init_subclass__(**kwargs)

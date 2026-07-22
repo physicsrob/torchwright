@@ -49,6 +49,7 @@ window" head — is machine-neutral attention hardware and lives in
 """
 
 import math
+from typing import cast
 
 import torch
 
@@ -141,7 +142,7 @@ def global_position_from_bos(
     #   K: bos_indicator (1 at BOS, 0 elsewhere) → A·bos_ind on that plane
     #   V: bos_indicator (so output = w_BOS · 1 + Σ_others w_i · 0 = w_BOS)
     query_one = LiteralValue(torch.tensor([1.0]), name="bos_weight_query_one")
-    plane = rope.d_rot // 2 - 1
+    plane = cast(int, rope.d_rot) // 2 - 1
     query_matrix = torch.zeros((1, rope.d_head))
     query_matrix[0, plane] = A
     key_matrix = torch.zeros((1, rope.d_head))

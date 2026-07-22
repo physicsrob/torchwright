@@ -9,6 +9,7 @@ what makes them machine-neutral: they contain no activation choice.
 
 import math
 import numbers
+from typing import cast
 
 from torchwright.graph import RopeConfig
 from torchwright.graph.rope import rope_inv_freq
@@ -80,7 +81,7 @@ def _theta_slow(rope: RopeConfig) -> float:
     this is the slowest plane of the ``d_head`` grid — byte-identical to the
     pre-partial form.  This is the plane the BOS-weight feature must ride so its
     ``cos(m·θ_slow)`` attenuation matches the PWL inversion table."""
-    return float(rope_inv_freq(rope.d_rot, rope.base)[-1])
+    return float(rope_inv_freq(cast(int, rope.d_rot), rope.base)[-1])
 
 
 def _w_of_m(m: float, max_len: int, theta: float) -> float:

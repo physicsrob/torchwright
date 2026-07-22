@@ -25,7 +25,7 @@ sequence — stock ``generate(do_sample=False)`` over an unbounded
 
 from __future__ import annotations
 
-from typing import Optional
+from typing import Optional, cast
 
 import torch
 import torch.nn as nn
@@ -176,10 +176,10 @@ class TorchwrightCustomDecoderLayer(nn.Module):
         # Norm weights exist in the checkpoint only when rms_norm is on;
         # Identity keeps the no-norm state dict free of stray parameters.
         if config.rms_norm:
-            self.input_layernorm = TorchwrightCustomRMSNorm(
+            self.input_layernorm: nn.Module = TorchwrightCustomRMSNorm(
                 config.d, config.rms_norm_eps
             )
-            self.post_attention_layernorm = TorchwrightCustomRMSNorm(
+            self.post_attention_layernorm: nn.Module = TorchwrightCustomRMSNorm(
                 config.d, config.rms_norm_eps
             )
         else:
@@ -304,9 +304,15 @@ class TorchwrightCustomModel(TorchwrightCustomPreTrainedModel):
                 # the rotary rotation and the causal mask both key off
                 # cache_position, so map position_ids onto it rather than
                 # silently ignoring it.
-                cache_position = position_ids[0].to(device=device, dtype=torch.long)
+                cache_position = cast(
+                    torch.LongTensor,
+                    position_ids[0].to(device=device, dtype=torch.long),
+                )
             else:
-                cache_position = torch.arange(past_seen, past_seen + T, device=device)
+                cache_position = cast(
+                    torch.LongTensor,
+                    torch.arange(past_seen, past_seen + T, device=device),
+                )
 
         # Causal mask over absolute positions: key j is visible to query p iff
         # j <= p.
@@ -415,7 +421,7 @@ class TorchwrightCustomForCausalLM(TorchwrightCustomPreTrainedModel, GenerationM
             )
 
         return CausalLMOutputWithPast(
-            loss=loss,
+            loss=cast(Optional[torch.FloatTensor], loss),
             logits=logits,
             past_key_values=outputs.past_key_values,
         )

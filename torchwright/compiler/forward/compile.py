@@ -11,7 +11,7 @@ import os
 import time
 import warnings
 from dataclasses import dataclass, field, replace
-from typing import Callable, Dict, Optional, Set, Tuple
+from typing import Any, Callable, Dict, Optional, Set, Tuple, cast
 
 import torch
 
@@ -498,6 +498,7 @@ def _build_heuristic_schedule_trace(
         # schedulable node's chosen sublayer.  Every Add additionally records
         # its physical placement observation — the emitted op says whether
         # the walk reused a target occurrence or placed fresh.
+        op: Any  # heterogeneous loops: _AttentionOp records, then _MlpOp
         for op in attn_ops:
             if op.node is not None and op.op_type != "cancel":
                 hint_routing[op.node.node_id] = "attn"
@@ -873,7 +874,7 @@ def _build_replay_plan(
                 attn_ops,
                 mlp_ops,
                 previous,
-                previous_allocated,
+                cast(Set[Node], previous_allocated),
                 planned_computed,
                 planned_rmap,
                 layer_idx,
@@ -1701,8 +1702,10 @@ def forward_compile(
                 )
             net.cpsat_solve_stats = SolveStats(
                 status_name="CACHED",
-                objective_value=float(
-                    _cached_meta.get("realized_objective", assignment.n_layers)
+                # Pre-existing runtime value is a float; SolveStats declares int.
+                objective_value=cast(
+                    int,
+                    float(_cached_meta.get("realized_objective", assignment.n_layers)),
                 ),
                 best_objective_bound=float(
                     _cached_meta.get("best_objective_bound", -1)
@@ -1900,7 +1903,7 @@ def forward_compile(
                 )
                 print(
                     f"  solve-only measurement ({mode}): {claim}, "
-                    f"bound={net.cpsat_solve_stats.best_objective_bound}"
+                    f"bound={cast(SolveStats, net.cpsat_solve_stats).best_objective_bound}"
                 )
             return net
 
@@ -1997,7 +2000,7 @@ def forward_compile(
 
             incumbent_plan = _plan_candidate(heuristic_assignment)
             candidate_plan = _plan_candidate(solver_candidate)
-            objective_scale = net.cpsat_solve_stats.objective_scale
+            objective_scale = cast(SolveStats, net.cpsat_solve_stats).objective_scale
             prebuilt_replay_plan, diagnostics = _choose_dominating_replay_plan(
                 cpsat_costs,
                 incumbent_plan,
@@ -2009,7 +2012,7 @@ def forward_compile(
         if assignment is not None:
             if (
                 verbose
-                and net.cpsat_solve_stats.status_name != "CACHED"
+                and cast(SolveStats, net.cpsat_solve_stats).status_name != "CACHED"
                 and assignment is not heuristic_assignment
             ):
                 solve_time = time.perf_counter() - t_solve_start
@@ -2111,7 +2114,7 @@ def forward_compile(
     # pure consumer of this immutable plan and never touches allocator state.
     if prebuilt_replay_plan is None:
         replay_plan = _build_replay_plan(
-            assignment=assignment,
+            assignment=cast(ScheduleAssignment, assignment),
             scheduler=scheduler,
             graph=graph,
             residual_map=residual_map,
@@ -2138,15 +2141,15 @@ def forward_compile(
         realized_objective = _replay_plan_objective(
             replay_plan,
             cpsat_costs,
-            objective_scale=net.cpsat_solve_stats.objective_scale,
+            objective_scale=cast(SolveStats, net.cpsat_solve_stats).objective_scale,
         )
         realized_objective_blocks = _replay_plan_objective_blocks(
             replay_plan, cpsat_costs
         )
-        provenance = net.schedule_result.provenance
+        provenance = cast(ScheduleResult, net.schedule_result).provenance
         if cached is None:
             selected_is_optimal = bool(
-                net.cpsat_solve_stats.is_optimal
+                cast(SolveStats, net.cpsat_solve_stats).is_optimal
                 and cpsat_costs.alpha > 0
                 and cpsat_costs.beta
                 == cpsat_costs.gamma
@@ -2162,17 +2165,21 @@ def forward_compile(
             selected_objective=realized_objective,
             selected_objective_blocks=realized_objective_blocks,
         )
-        net.schedule_result = ScheduleResult(assignment, provenance)
+        net.schedule_result = ScheduleResult(
+            cast(ScheduleAssignment, assignment), provenance
+        )
 
     if use_cpsat and cached is None and solver_candidate is not None:
-        provenance = net.schedule_result.provenance
+        provenance = cast(ScheduleResult, net.schedule_result).provenance
         solver_attempt = provenance.solver_attempt
         stored = store_assignment(
             schedule_fp,
-            assignment,
+            cast(ScheduleAssignment, assignment),
             {
-                "status_name": net.cpsat_solve_stats.status_name,
-                "best_objective_bound": net.cpsat_solve_stats.best_objective_bound,
+                "status_name": cast(SolveStats, net.cpsat_solve_stats).status_name,
+                "best_objective_bound": cast(
+                    SolveStats, net.cpsat_solve_stats
+                ).best_objective_bound,
                 "is_optimal": provenance.selected_is_optimal,
                 "origin": provenance.origin,
                 "optimize": optimize,
@@ -2181,7 +2188,9 @@ def forward_compile(
                 "d_hidden": d_hidden if d_hidden else d,
                 "realized_objective": realized_objective,
                 "realized_objective_blocks": realized_objective_blocks,
-                "objective_scale": net.cpsat_solve_stats.objective_scale,
+                "objective_scale": cast(
+                    SolveStats, net.cpsat_solve_stats
+                ).objective_scale,
                 "costs": weighted_cost_key,
                 "selected": {
                     "origin": provenance.origin,
@@ -2207,7 +2216,7 @@ def forward_compile(
         if stored and verbose:
             print(
                 f"  CP-SAT schedule cached ({schedule_fp[:12]}...): "
-                f"n_layers={assignment.n_layers}"
+                f"n_layers={cast(ScheduleAssignment, assignment).n_layers}"
             )
     on_replay_plan = getattr(on_layer_compiled, "on_replay_plan", None)
     if on_replay_plan is not None:

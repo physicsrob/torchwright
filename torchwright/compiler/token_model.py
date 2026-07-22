@@ -9,7 +9,17 @@ from __future__ import annotations
 
 from dataclasses import asdict, dataclass, field, replace
 from enum import Enum
-from typing import Callable, Literal, Mapping, Optional, Protocol, TypeAlias, Union
+from typing import (
+    Any,
+    Callable,
+    Literal,
+    Mapping,
+    Optional,
+    Protocol,
+    TypeAlias,
+    Union,
+    cast,
+)
 
 import numpy as np
 
@@ -213,8 +223,8 @@ def make_layer_callback(header: CompileHeader, sink: TokenModelSink) -> Callable
             record = ReluLayerWeights(aw, w1, b1, w2, b2)
         sink.write_layer(index, record)
 
-    callback.token_model_sink = sink
-    callback.on_replay_plan = on_replay_plan
+    cast(Any, callback).token_model_sink = sink
+    cast(Any, callback).on_replay_plan = on_replay_plan
     return callback
 
 
@@ -254,7 +264,7 @@ def build_token_weights(compiled, output_node: Node, embedding: Embedding, d: in
     in_state = compiled.layers[0].attn.in_state
     out_state = compiled.layers[-1].mlp.out_state
     embedding_indices = None
-    literal_seeds = []
+    literal_seeds: list[tuple[int, float]] = []
     for node in assignment.get_nodes(in_state):
         indices = assignment.get_node_indices(in_state, node)
         if isinstance(node, Embedding):

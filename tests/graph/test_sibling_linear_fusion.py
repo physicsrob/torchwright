@@ -142,6 +142,7 @@ def _build_merged_attn(n: int):
 
 def _census(*outs) -> dict:
     """Count nodes reachable from ``outs`` by class name."""
+    kinds: dict
     seen, kinds = set(), {}
 
     def visit(node):

@@ -30,7 +30,7 @@ Phase A instrument; synthesis is Phase B, gated on Rob's GO.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple, cast
 
 import torch
 
@@ -205,9 +205,9 @@ class V2Report:
             lines.append(
                 f"modeled layer floor: {self.floor_off} off, "
                 f"{self.floor_strict} strict "
-                f"(delta {self.floor_strict - self.floor_off:+d}), "
+                f"(delta {cast(int, self.floor_strict) - self.floor_off:+d}), "
                 f"{self.floor_banded} banded "
-                f"(delta {self.floor_banded - self.floor_off:+d})"
+                f"(delta {cast(int, self.floor_banded) - self.floor_off:+d})"
             )
         lines.append(
             f"S2 stage-1 residual columns, simultaneous: "

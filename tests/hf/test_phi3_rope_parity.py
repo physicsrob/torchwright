@@ -40,6 +40,8 @@ CPU-only, no artifact compile — this is a pure modeling-code probe.
 
 from __future__ import annotations
 
+from typing import Any
+
 import pytest
 
 torch = pytest.importorskip("torch")
@@ -56,7 +58,7 @@ BASES = [10_000.0, 500_000.0]  # Phi-3 default; torchwright ROPE_BASE
 
 
 def _phi3_config(base: float, **overrides) -> Phi3Config:
-    kwargs = dict(
+    kwargs: dict[str, Any] = dict(
         vocab_size=64,
         hidden_size=D_HEAD * 4,
         intermediate_size=64,

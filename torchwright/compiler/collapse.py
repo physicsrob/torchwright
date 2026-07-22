@@ -57,7 +57,7 @@ decline is recorded with its reason in the :class:`CollapseReport`.
 """
 
 from dataclasses import dataclass
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple, cast
 
 import torch
 
@@ -144,7 +144,8 @@ def scalar_sources(order: List[Node]) -> Dict[Node, Optional[Node]]:
         else:
             raw[n] = acc
     return {
-        n: (s if (s is not None and s is not _TOP) else None) for n, s in raw.items()
+        n: (cast(Node, s) if (s is not None and s is not _TOP) else None)
+        for n, s in raw.items()
     }
 
 

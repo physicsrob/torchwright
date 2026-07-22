@@ -29,7 +29,7 @@ compared under the same scheduler mode by construction here.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Callable, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional, cast
 
 import torch
 
@@ -151,7 +151,7 @@ def schedule_metrics(
         if output_node in computed:
             break
         attn_ops, mlp_ops, _biased = sched.schedule_layer(rmap, computed)
-        heads = sum(_count_heads_by_type(attn_ops, d_head).values())
+        heads = sum(_count_heads_by_type(cast(Any, attn_ops), d_head).values())
         per_layer_heads.append(heads)
         slots = sum(len(op.mlp_slots) for op in mlp_ops if op.mlp_slots)
         peak_hidden = max(peak_hidden, slots)
@@ -207,10 +207,10 @@ def schedule_trace(
             if op.op_type == "compute_ffn":
                 composites.append(
                     (
-                        op.node.annotation,
-                        op.node.d_output,
+                        cast(Node, op.node).annotation,
+                        cast(Node, op.node).d_output,
                         len(op.mlp_slots),
-                        op.node.node_id,
+                        cast(Node, op.node).node_id,
                     )
                 )
         trace.append({"layer": i, "hidden": hidden, "composites": composites})

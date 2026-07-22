@@ -10,7 +10,7 @@ calculators that need it are swiglu graphs).
 """
 
 import math
-from typing import List, Optional
+from typing import List, Optional, cast
 
 import torch
 
@@ -253,7 +253,7 @@ class IndexedRegion:
         assert max_len >= 1, "max_len must be >= 1"
         assert max_read_distance >= 1, "max_read_distance must be >= 1"
         assert default.numel() == len(embedding), "default must be an embedding row"
-        require_full_rotary(rope.d_rot, rope.d_head, "IndexedRegion")
+        require_full_rotary(cast(int, rope.d_rot), rope.d_head, "IndexedRegion")
 
         # Build-time dominance bound (see _CONTENT_COS_FLOOR): the gather's
         # max_len + 1 content lanes land on planes d_head/2 − 1 (slowest)
@@ -504,7 +504,8 @@ def remove_leading_0s(
             # Negative half: the sign at slot 0, the trimmed sequence
             # shifted right one everywhere else.
             candidates += [
-                sign if i == 0 else seq[min(i - 1 + k, n - 1)] for k in range(n_entries)
+                cast(Node, sign) if i == 0 else seq[min(i - 1 + k, n - 1)]
+                for k in range(n_entries)
             ]
         masked = broadcast_select(
             masks=one_hot,

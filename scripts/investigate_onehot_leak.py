@@ -38,6 +38,7 @@ import torch
 
 import torchwright.ops.swiglu.map_select as _map_select
 import torchwright.ops.swiglu.onehot_table as _onehot_table
+from torchwright.graph import Node
 from torchwright.graph.node import suppress_checks
 from torchwright.ops._math import _lookup_numeric_slack
 from torchwright.ops.inout_nodes import create_input
@@ -76,7 +77,7 @@ def _patched_scale(value: Optional[float]):
     return _Ctx()
 
 
-def build_carry_chain(scale_override: Optional[float]) -> Dict[str, object]:
+def build_carry_chain(scale_override: Optional[float]) -> Dict[str, Node]:
     """total -> in_range(total, total+1, 61) -> bool_to_01 -> lookups.
 
     The exact shape of calculator_simple.multiply_digit_seqs' carry sweep,
@@ -110,7 +111,7 @@ def build_carry_chain(scale_override: Optional[float]) -> Dict[str, object]:
     }
 
 
-def build_times_table(scale_override: Optional[float]) -> Dict[str, object]:
+def build_times_table(scale_override: Optional[float]) -> Dict[str, Node]:
     """Two machine-built one-hot digits -> two-block times-table lookup.
 
     The multi-block (swiglu-lane) path of onehot_lookup, fed by the same
@@ -141,7 +142,7 @@ def build_times_table(scale_override: Optional[float]) -> Dict[str, object]:
 
 
 def sweep_carry(
-    nodes: Dict[str, object], deltas: List[float], device: torch.device
+    nodes: Dict[str, Node], deltas: List[float], device: torch.device
 ) -> Dict[str, torch.Tensor]:
     ts, dvals = [], []
     for t in range(N_SLOTS):
@@ -180,7 +181,7 @@ def sweep_carry(
 
 
 def sweep_times_table(
-    nodes: Dict[str, object], deltas: List[float], device: torch.device
+    nodes: Dict[str, Node], deltas: List[float], device: torch.device
 ) -> Dict[str, torch.Tensor]:
     rows: List[Tuple[int, int, float]] = []
     for da in range(10):

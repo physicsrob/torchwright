@@ -46,7 +46,7 @@ import argparse
 import importlib
 import json
 from collections import Counter
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple, cast
 
 from torchwright.compiler.collapse import scalar_sources
 from torchwright.compiler.graph_clone import topological_order
@@ -170,7 +170,7 @@ def _subgraph_details(
         if s is not None and s is not n:
             by_src.setdefault(s, []).append(n)
 
-    reports = []
+    reports: List[Dict[str, Any]] = []
     for s, members in by_src.items():
         mset = set(members)
         # Longest chain inside the subgraph, overall and critical-only.
@@ -271,7 +271,9 @@ def analyze(
     members = [n for n in order if src[n] is not None and src[n] is not n]
     lv2 = _collapsed_levels(order, src)
     depth2 = lv2[out]
-    subgraph_sizes = Counter(src[n].name or type(src[n]).__name__ for n in members)
+    subgraph_sizes = Counter(
+        cast(Node, src[n]).name or type(src[n]).__name__ for n in members
+    )
 
     # Feasibility-filtered variant: a collapsed univariate subgraph is one
     # FFN whose breakpoint grid must resolve the composed function over
@@ -304,7 +306,7 @@ def analyze(
     ]
 
     # Families 1+2 combined.
-    lv12 = {}
+    lv12: Dict[Node, int] = {}
     for n in order:
         s = src[n]
         if s is not None and s is not n:

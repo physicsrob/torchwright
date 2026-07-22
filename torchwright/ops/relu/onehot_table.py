@@ -120,7 +120,7 @@ def onehot_lookup(
         for key, value in key_to_value.items():
             row = int((key > 0.5).nonzero(as_tuple=False)[0].item())
             weight[row] = value.to(torch.float32)
-        result = Linear(inp, weight, name="onehot_lookup_select")
+        result: Node = Linear(inp, weight, name="onehot_lookup_select")
     else:
         # One hidden unit per row.  match(row) = inp · key (agreeing blocks);
         # bias -(n_blocks - 0.5) leaves only the exact-match unit positive, at

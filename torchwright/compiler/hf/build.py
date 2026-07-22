@@ -10,7 +10,7 @@ import tempfile
 from contextlib import contextmanager
 from dataclasses import dataclass, replace
 from pathlib import Path
-from typing import Optional, Union
+from typing import Any, List, Literal, Optional, Union, cast
 
 import numpy as np
 
@@ -520,14 +520,15 @@ def _compile_hf_bundle_into(
         token = build_token_weights(compiled, output_node, embedding, d)
         heads = [m[1] for m in sink.meta]
         hidden = [m[2] for m in sink.meta]
-        proxy_layers = []
+        proxy_layers: List[Any] = []
         for kind, nh, dh, base, drot in sink.meta:
             # Only RoPE metadata is inspected by resolve_rope.
             class A:
-                pass
+                rope_base: Any
+                d_rot: Any
 
             class L:
-                pass
+                attention: Any
 
             a, layer = A(), L()
             a.rope_base, a.d_rot = base, drot
@@ -541,7 +542,7 @@ def _compile_hf_bundle_into(
             max_seq_len,
             vocab,
             token.embed_table.shape[0],
-            compiled.activation,
+            cast(Literal["relu", "swish"], compiled.activation),
             bool(bias),
             compiled.rms_norm_spec is not None,
             float(
@@ -590,7 +591,7 @@ def _compile_hf_bundle_into(
             from transformers import Phi3Config
 
             max_heads, inter = max(heads), max(hidden)
-            config = Phi3Config(
+            config = cast(Any, Phi3Config)(
                 vocab_size=spec.vocab_size,
                 hidden_size=d,
                 intermediate_size=inter,
@@ -640,7 +641,7 @@ def _compile_hf_bundle_into(
             # the tied readout never sees the folded RMS constants — the
             # same fold the ONNX exporter's final_norm carries.
             final_gain = gain.copy()
-            final_gain[list(compiled.rms_norm_spec.reserved_cols)] = 0.0
+            final_gain[list(cast(Any, compiled.rms_norm_spec).reserved_cols)] = 0.0
             final_sd["model.norm.weight"] = _torch(final_gain)
             for i in range(spec.n_layers):
                 p = f"model.layers.{i}"
@@ -755,6 +756,7 @@ def compile_to_hf(
         )
         with open(os.path.join(directory, "config.json")) as f:
             model_type = json.load(f)["model_type"]
+        model: Any
         if model_type == "phi3":
             from transformers import Phi3ForCausalLM
 

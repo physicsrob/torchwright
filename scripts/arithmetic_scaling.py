@@ -153,7 +153,7 @@ def critical_path_depth(outputs) -> int:
     Computed with an explicit stack (iterative post-order) so deep graphs do
     not overflow Python's recursion limit.
     """
-    memo = {}
+    memo: dict = {}
     for root in outputs:
         stack = [(root, False)]
         while stack:

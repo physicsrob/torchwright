@@ -20,7 +20,7 @@ here because they are easy to get wrong:
   FFN.
 """
 
-from typing import Optional
+from typing import Optional, cast
 
 import torch
 
@@ -100,9 +100,9 @@ class FFN(Node):
                 n_lanes,
                 d_input,
             ), f"up_proj shape {tuple(up_proj.shape)} != ({n_lanes}, {d_input})"
-            assert up_bias.shape == (
+            assert cast(torch.Tensor, up_bias).shape == (
                 n_lanes,
-            ), f"up_bias shape {tuple(up_bias.shape)} != ({n_lanes},)"
+            ), f"up_bias shape {tuple(cast(torch.Tensor, up_bias).shape)} != ({n_lanes},)"
 
         self.gate_proj = gate_proj
         self.gate_bias = gate_bias
@@ -137,7 +137,7 @@ class FFN(Node):
         gate = torch.matmul(x, self.gate_proj.t()) + self.gate_bias
         lane = self._activate(gate)
         if self.up_proj is not None:
-            up = torch.matmul(x, self.up_proj.t()) + self.up_bias
+            up = torch.matmul(x, self.up_proj.t()) + cast(torch.Tensor, self.up_bias)
             lane = lane * up
         return torch.matmul(lane, self.out_proj) + self.out_bias
 

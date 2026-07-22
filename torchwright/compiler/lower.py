@@ -37,10 +37,11 @@ Constructing a :class:`LoweredGraph` does three things:
 """
 
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Dict, List, Optional, Set, Tuple
+from typing import TYPE_CHECKING, Dict, List, Optional, Set, Tuple, cast
 
 if TYPE_CHECKING:
     from torchwright.compiler.collapse import CollapseReport
+    from torchwright.compiler.forward.scheduling_policy import SchedulingPolicy
 
 from torchwright.compiler.graph_clone import (
     build_clone_dispatch,
@@ -396,7 +397,7 @@ def lower(
 
         copy_output, collapse_report = collapse_univariate_subgraphs(
             copy_output,
-            lane_cap=collapse_lane_cap,
+            lane_cap=cast(int, collapse_lane_cap),
             fold_log=fold_log,
             verbose=verbose,
         )
@@ -407,7 +408,7 @@ def lower(
 
         copy_output, collapse_pl_report = collapse_pl_subgraphs(
             copy_output,
-            lane_cap=collapse_lane_cap,
+            lane_cap=cast(int, collapse_lane_cap),
             fold_log=fold_log,
             verbose=verbose,
         )
@@ -417,6 +418,7 @@ def lower(
     copy_nodes = get_ancestor_nodes({copy_output})
 
     slice_map: Dict[Node, tuple] = {}
+    node_map: Dict[Node, Node]
     if not n_fused and not n_collapsed:
         node_map = dict(copy.node_map)
     else:
@@ -427,7 +429,7 @@ def lower(
         # that survives as a column slice of a widened sibling-merge
         # survivor goes to slice_map instead — node_map has no way to say
         # "columns [off, off+w) of that node".
-        node_map: Dict[Node, Node] = {}
+        node_map = {}
         for src, clone in copy.node_map.items():
             # Slice records take precedence over moves: a merge-widened
             # survivor that a later fold moves onto an FFN has both, and the

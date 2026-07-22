@@ -24,7 +24,7 @@ Pure CPU, seconds per config::
 import argparse
 import importlib
 from collections import Counter
-from typing import Dict, List, Tuple
+from typing import Any, Callable, Dict, List, Tuple, cast
 
 from torchwright.compiler.lower import lower
 from torchwright.compiler.forward.cpsat_scheduler import (
@@ -57,13 +57,13 @@ def longest_chain(gm, es: Dict[int, int]) -> List:
         if u.node_id in preds and v.node_id in preds:
             preds[v.node_id].append(u.node_id)
 
-    cur = max(es, key=es.get)
+    cur = max(es, key=cast(Callable[[int], int], es.get))
     chain = [cur]
     while True:
         candidates = [u for u in preds[cur] if es[u] >= es[cur] - 1]
         if not candidates:
             break
-        cur = max(candidates, key=es.get)
+        cur = max(candidates, key=cast(Callable[[int], int], es.get))
         chain.append(cur)
     return [by_id[i] for i in reversed(chain)]
 
@@ -196,7 +196,7 @@ def main() -> None:
     print(f"[{args.impl} n={args.n}] nonlinear-op depth: {depth}")
 
     if args.forensic:
-        lowered = lower(
+        lowered: Any = lower(
             out,
             collapse_univariate=True,
             collapse_pl=False,

@@ -70,7 +70,7 @@ reader that lands on a carry glyph returns its default ``0``, not a
 wrong-but-valid number.
 """
 
-from typing import Callable, Dict, List, Tuple
+from typing import Callable, Dict, List, Optional, Tuple, Union, cast
 
 import torch
 
@@ -580,7 +580,7 @@ def _emit_gathered_answer(
     col_onehot: Node,
     N: int,
     *,
-    sign_at: Callable[[int], Node] = None,
+    sign_at: Optional[Callable[[int], Node]] = None,
 ) -> List[Node]:
     """The trimmed, MSB-first answer, one slot per ``layout.n_answer``.
 
@@ -624,7 +624,7 @@ def _emit_gathered_answer(
             match_gain=_MATCH_GAIN,
         )
         if t == 0 and sign_at is not None:
-            answer.append(select(ge, picked, minus))
+            answer.append(select(cast(Node, ge), picked, minus))
         else:
             answer.append(select(compare(idx, thresh=N - 0.5), eos, picked))
     return answer
@@ -767,6 +767,7 @@ def _sub_op(
     # constant-depth; here the recurrence rides the decode axis, where
     # serial is the point. ---
     combine_table: Dict[torch.Tensor, torch.Tensor] = {}
+    nxt: Union[int, Node]
     for v in range(_CMP_W):
         for a in range(10):
             for b in range(10):

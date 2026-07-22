@@ -54,7 +54,7 @@ input rather than synthesising the step function inside the attention op.
 """
 
 import math
-from typing import Optional
+from typing import Optional, cast
 
 import torch
 
@@ -1217,7 +1217,8 @@ def attend_most_recent_globally(
     key_in = Concatenate([key_vector, global_position])
 
     d_head = rope.d_head
-    if rope.d_rot < d_head:
+    attn: Node
+    if cast(int, rope.d_rot) < d_head:
         # --- Partial rotary ---
         # Content (W match dims) rides the unrotated NoPE tail [d_rot:d_rot+W]: an
         # EXACT, position-free content dot product at any distance.  The position
@@ -1228,14 +1229,14 @@ def attend_most_recent_globally(
         # cannot delegate to rotary_content_head, which would route ALL columns
         # uniformly (content to the tail AND the position column to the tail, where
         # there is no rotation to order keys at distance — wrong).
-        tail = d_head - rope.d_rot
+        tail = d_head - cast(int, rope.d_rot)
         if W > tail:
             raise ValueError(
                 f"attend_most_recent_globally: content width W={W} exceeds the "
                 f"{tail}-wide NoPE tail (d_head={d_head}, d_rot={rope.d_rot}); "
                 f"raise d_head or lower d_rot."
             )
-        pos_plane = rope.d_rot // 2 - 1
+        pos_plane = cast(int, rope.d_rot) // 2 - 1
         theta_pos = _theta_slow(rope)
         if rope.max_positions * theta_pos >= math.pi / 2:
             raise ValueError(
@@ -1249,8 +1250,10 @@ def attend_most_recent_globally(
         query_matrix = torch.zeros((W + 1, d_head))
         key_matrix = torch.zeros((W + 1, d_head))
         for c in range(W):
-            query_matrix[c, rope.d_rot + c] = match_gain  # content on the tail
-            key_matrix[c, rope.d_rot + c] = 1.0
+            query_matrix[c, cast(int, rope.d_rot) + c] = (
+                match_gain  # content on the tail
+            )
+            key_matrix[c, cast(int, rope.d_rot) + c] = 1.0
         query_matrix[W, pos_plane] = alpha  # position tiebreak on a rotated plane
         key_matrix[W, pos_plane] = 1.0  # global_position passes through identity
         d_v = len(value)

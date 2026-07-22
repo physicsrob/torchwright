@@ -19,6 +19,7 @@ Run locally (CPU is fine, no GPU needed)::
 import json
 import os
 import tempfile
+from typing import cast
 
 import torch
 
@@ -63,7 +64,7 @@ def whole_calculator_stats() -> None:
             d_head=D_HEAD,
             verbose=False,
         )
-        sidecar = json.load(open(artifact.debug_path))
+        sidecar = json.load(open(cast(str, artifact.debug_path)))
 
     peak = _peak_residual_occupancy(sidecar)
     print(f"  layers              : {artifact.n_layers}")

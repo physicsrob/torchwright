@@ -44,7 +44,7 @@ schedule-cache key.
 
 from __future__ import annotations
 
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import torch
 
@@ -264,7 +264,7 @@ def collapse_pl_subgraphs(
         skels: Dict[Node, PLFunction] = {}
         fail = None
         for m in synthesized:
-            c = cert.members[m]
+            c: Any = cert.members[m]
             m_name = m.name or f"{type(m).__name__}#{topo_index[m]}"
             if not c.linear(budget):
                 fail = (

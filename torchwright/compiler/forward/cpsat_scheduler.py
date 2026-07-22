@@ -35,7 +35,7 @@ import time
 import warnings
 from dataclasses import dataclass, field
 from types import MappingProxyType
-from typing import Dict, FrozenSet, List, Mapping, Optional, Set, Tuple
+from typing import Any, Dict, FrozenSet, List, Mapping, Optional, Set, Tuple, cast
 
 from ortools.sat.python import cp_model
 
@@ -932,10 +932,10 @@ def _compute_layer_bounds(
     input_ids = {n.node_id for n in gm.input_nodes}
     node_modes = {n.node_id: modes(n) for n in gm.schedulable}
     edges: List[Tuple[int, int]] = []
-    for u, v in gm.edges:
-        if u.node_id in input_ids:
+    for nu, nv in gm.edges:
+        if nu.node_id in input_ids:
             continue
-        edges.append((u.node_id, v.node_id))
+        edges.append((nu.node_id, nv.node_id))
 
     ids = [n.node_id for n in gm.schedulable]
     es = {i: {m: 0 for m in node_modes[i]} for i in ids}
@@ -1011,9 +1011,9 @@ def _and_presence(model, parked, other, *, name):
     """
     if parked is None:
         return other
-    aux = model.NewBoolVar(name)
-    model.AddBoolAnd([parked.Not(), other]).OnlyEnforceIf(aux)
-    model.AddBoolOr([parked, other.Not()]).OnlyEnforceIf(aux.Not())
+    aux = model.new_bool_var(name)
+    model.add_bool_and([parked.Not(), other]).OnlyEnforceIf(aux)
+    model.add_bool_or([parked, other.Not()]).OnlyEnforceIf(aux.Not())
     return aux
 
 
@@ -1192,7 +1192,7 @@ def build_cpsat_model_from_gm(
     if held_source_id is not None:
         by_id = {n.node_id: n for n in gm.graph.get_all_nodes()}
         held_source = by_id.get(held_source_id)
-        held_target = by_id.get(held_target_id)
+        held_target = by_id.get(cast(int, held_target_id))
         if held_source is None:
             raise ValueError(
                 f"held_source_id {held_source_id} does not name a node in "
@@ -1256,7 +1256,7 @@ def build_cpsat_model_from_gm(
         layer_var_lo[n.node_id] = lo
         if layer_bounds is not None:
             layer_bounds[n.node_id] = (lo, hi)
-        layer_var[n.node_id] = model.NewIntVar(lo, hi, f"L_n{n.node_id}")
+        layer_var[n.node_id] = model.new_int_var(lo, hi, f"L_n{n.node_id}")
 
     # ---- Routing: is_attn[n] BoolVar (or fixed literal) per node ----
     # is_attn[n] == 1 means the node runs in the attention sublayer
@@ -1279,8 +1279,8 @@ def build_cpsat_model_from_gm(
             # placement under every policy and flex configuration — there
             # is no MLP-phase bank-claim executor
             # (docs/plan_additional_mlp_routing.md, *Tied output*).
-            v = model.NewBoolVar(f"is_attn_n{n.node_id}_held_pinned")
-            model.Add(v == 1)
+            av = model.new_bool_var(f"is_attn_n{n.node_id}_held_pinned")
+            model.add(av == 1)
             static_routing[n.node_id] = ATTN
         elif flex_routing and is_flex(n, gm):
             if slots_for(n, gm) > d_hidden:
@@ -1288,21 +1288,21 @@ def build_cpsat_model_from_gm(
                 # (its whole-layer slot demand exceeds the usable pool);
                 # constrain the route instead of presenting an infeasible
                 # MLP mode to the solver.  Mirrors realization.fits_mlp.
-                v = model.NewBoolVar(f"is_attn_n{n.node_id}_capacity_pinned")
-                model.Add(v == 1)
+                av = model.new_bool_var(f"is_attn_n{n.node_id}_capacity_pinned")
+                model.add(av == 1)
                 static_routing[n.node_id] = ATTN
             else:
-                v = model.NewBoolVar(f"is_attn_n{n.node_id}")
+                av = model.new_bool_var(f"is_attn_n{n.node_id}")
                 static_routing[n.node_id] = "flex"
         else:
-            r = routing(n, gm, policy, d_hidden)
-            v = model.NewBoolVar(f"is_attn_n{n.node_id}_pinned")
-            if r == ATTN:
-                model.Add(v == 1)
+            route = routing(n, gm, policy, d_hidden)
+            av = model.new_bool_var(f"is_attn_n{n.node_id}_pinned")
+            if route == ATTN:
+                model.add(av == 1)
             else:
-                model.Add(v == 0)
-            static_routing[n.node_id] = r
-        is_attn[n.node_id] = v
+                model.add(av == 0)
+            static_routing[n.node_id] = route
+        is_attn[n.node_id] = av
 
     # ---- Dependency constraints ----
     # Edge u->v: same-layer ok iff u is_attn AND v is mlp (i.e., NOT
@@ -1315,13 +1315,13 @@ def build_cpsat_model_from_gm(
             u_attn = is_attn[u.node_id]
             v_attn = is_attn[v.node_id]
             # same_layer_ok = u_attn AND (NOT v_attn)
-            same_ok = model.NewBoolVar(f"so_n{u.node_id}_n{v.node_id}")
-            model.AddBoolAnd([u_attn, v_attn.Not()]).OnlyEnforceIf(same_ok)
-            model.AddBoolOr([u_attn.Not(), v_attn]).OnlyEnforceIf(same_ok.Not())
-            model.Add(layer_var[v.node_id] >= layer_var[u.node_id]).OnlyEnforceIf(
+            same_ok = model.new_bool_var(f"so_n{u.node_id}_n{v.node_id}")
+            model.add_bool_and([u_attn, v_attn.Not()]).OnlyEnforceIf(same_ok)
+            model.add_bool_or([u_attn.Not(), v_attn]).OnlyEnforceIf(same_ok.Not())
+            model.add(layer_var[v.node_id] >= layer_var[u.node_id]).OnlyEnforceIf(
                 same_ok
             )
-            model.Add(layer_var[v.node_id] >= layer_var[u.node_id] + 1).OnlyEnforceIf(
+            model.add(layer_var[v.node_id] >= layer_var[u.node_id] + 1).OnlyEnforceIf(
                 same_ok.Not()
             )
 
@@ -1381,14 +1381,14 @@ def build_cpsat_model_from_gm(
             # pinned var still lands in `is_free`: every Add is indexed
             # downstream (Add-consumer cancel bounds, residual start shift,
             # attention head charge).
-            is_free_held = model.NewBoolVar(f"is_free_A{A.node_id}")
-            model.Add(is_free_held == 0)
+            is_free_held = model.new_bool_var(f"is_free_A{A.node_id}")
+            model.add(is_free_held == 0)
             is_free[A.node_id] = is_free_held
-            gap_held = model.NewBoolVar(f"add_src_attn_gap_A{A.node_id}")
-            model.AddBoolOr([is_free_held, is_attn[A.node_id].Not()]).OnlyEnforceIf(
+            gap_held = model.new_bool_var(f"add_src_attn_gap_A{A.node_id}")
+            model.add_bool_or([is_free_held, is_attn[A.node_id].Not()]).OnlyEnforceIf(
                 gap_held
             )
-            model.AddBoolAnd([is_free_held.Not(), is_attn[A.node_id]]).OnlyEnforceIf(
+            model.add_bool_and([is_free_held.Not(), is_attn[A.node_id]]).OnlyEnforceIf(
                 gap_held.Not()
             )
             add_attn_gap[A.node_id] = gap_held
@@ -1405,15 +1405,15 @@ def build_cpsat_model_from_gm(
                 occurrence_literals.append(r)
                 add_reusable[(A.node_id, i)] = r
                 continue
-            r = model.NewBoolVar(f"reusable_A{A.node_id}_i{i}")
+            r = model.new_bool_var(f"reusable_A{A.node_id}_i{i}")
             add_reusable[(A.node_id, i)] = r
             occurrence_literals.append(r)
             if isinstance(E, Concatenate) or E.node_id == held_source_id:
-                model.Add(r == 0)
+                model.add(r == 0)
                 continue
             if E.node_id not in layer_var and E not in gm.input_nodes:
                 # Neither schedulable nor a residual-owning graph input.
-                model.Add(r == 0)
+                model.add(r == 0)
                 continue
             other_consumers = [c for c in gm.consumers_eff.get(E, set()) if c is not A]
             if any(
@@ -1422,66 +1422,66 @@ def build_cpsat_model_from_gm(
             ):
                 # An unordered read (terminal Concatenate / non-schedulable
                 # consumer) can never be sequenced before A's snapshot.
-                model.Add(r == 0)
+                model.add(r == 0)
                 continue
             complete_bools: List[cp_model.IntVar] = []
             for C in sorted(other_consumers, key=lambda c: c.node_id):
                 c_layer = layer_var[C.node_id]
-                b_lt = model.NewBoolVar(
+                b_lt = model.new_bool_var(
                     f"lt_E{E.node_id}_C{C.node_id}_A{A.node_id}_i{i}"
                 )
-                model.Add(c_layer < a_layer).OnlyEnforceIf(b_lt)
-                model.Add(c_layer >= a_layer).OnlyEnforceIf(b_lt.Not())
-                b_gt = model.NewBoolVar(
+                model.add(c_layer < a_layer).OnlyEnforceIf(b_lt)
+                model.add(c_layer >= a_layer).OnlyEnforceIf(b_lt.Not())
+                b_gt = model.new_bool_var(
                     f"gt_E{E.node_id}_C{C.node_id}_A{A.node_id}_i{i}"
                 )
-                model.Add(c_layer > a_layer).OnlyEnforceIf(b_gt)
-                model.Add(c_layer <= a_layer).OnlyEnforceIf(b_gt.Not())
+                model.add(c_layer > a_layer).OnlyEnforceIf(b_gt)
+                model.add(c_layer <= a_layer).OnlyEnforceIf(b_gt.Not())
                 # eq_ok = same layer AND C attention-routed AND A MLP-routed.
-                eq_ok = model.NewBoolVar(
+                eq_ok = model.new_bool_var(
                     f"eqok_E{E.node_id}_C{C.node_id}_A{A.node_id}_i{i}"
                 )
-                model.AddBoolAnd(
+                model.add_bool_and(
                     [b_lt.Not(), b_gt.Not(), is_attn[C.node_id], a_attn.Not()]
                 ).OnlyEnforceIf(eq_ok)
-                model.AddBoolOr(
+                model.add_bool_or(
                     [b_lt, b_gt, is_attn[C.node_id].Not(), a_attn]
                 ).OnlyEnforceIf(eq_ok.Not())
-                complete = model.NewBoolVar(
+                complete = model.new_bool_var(
                     f"complete_E{E.node_id}_C{C.node_id}_A{A.node_id}_i{i}"
                 )
-                model.AddBoolOr([b_lt, eq_ok]).OnlyEnforceIf(complete)
-                model.AddBoolAnd([b_lt.Not(), eq_ok.Not()]).OnlyEnforceIf(
+                model.add_bool_or([b_lt, eq_ok]).OnlyEnforceIf(complete)
+                model.add_bool_and([b_lt.Not(), eq_ok.Not()]).OnlyEnforceIf(
                     complete.Not()
                 )
                 complete_bools.append(complete)
             if complete_bools:
-                model.AddBoolAnd(complete_bools).OnlyEnforceIf(r)
-                model.AddBoolOr([b.Not() for b in complete_bools]).OnlyEnforceIf(
+                model.add_bool_and(complete_bools).OnlyEnforceIf(r)
+                model.add_bool_or([b.Not() for b in complete_bools]).OnlyEnforceIf(
                     r.Not()
                 )
             else:
-                model.Add(r == 1)  # E feeds only A
+                model.add(r == 1)  # E feeds only A
         # Deterministic selector: occurrence 0 wins.
         reuse_0 = occurrence_literals[0]
         add_reuse[(A.node_id, 0)] = reuse_0
-        reuse_1 = model.NewBoolVar(f"reuse_A{A.node_id}_i1")
-        model.AddBoolAnd(
+        reuse_1 = model.new_bool_var(f"reuse_A{A.node_id}_i1")
+        model.add_bool_and(
             [occurrence_literals[0].Not(), occurrence_literals[1]]
         ).OnlyEnforceIf(reuse_1)
-        model.AddBoolOr(
+        model.add_bool_or(
             [occurrence_literals[0], occurrence_literals[1].Not()]
         ).OnlyEnforceIf(reuse_1.Not())
         add_reuse[(A.node_id, 1)] = reuse_1
-        is_free_A = model.NewBoolVar(f"is_free_A{A.node_id}")
-        model.AddBoolOr(occurrence_literals).OnlyEnforceIf(is_free_A)
-        model.AddBoolAnd([b.Not() for b in occurrence_literals]).OnlyEnforceIf(
+        is_free_A = model.new_bool_var(f"is_free_A{A.node_id}")
+        model.add_bool_or(occurrence_literals).OnlyEnforceIf(is_free_A)
+        model.add_bool_and([b.Not() for b in occurrence_literals]).OnlyEnforceIf(
             is_free_A.Not()
         )
         is_free[A.node_id] = is_free_A
-        gap_A = model.NewBoolVar(f"add_src_attn_gap_A{A.node_id}")
-        model.AddBoolOr([is_free_A, a_attn.Not()]).OnlyEnforceIf(gap_A)
-        model.AddBoolAnd([is_free_A.Not(), a_attn]).OnlyEnforceIf(gap_A.Not())
+        gap_A = model.new_bool_var(f"add_src_attn_gap_A{A.node_id}")
+        model.add_bool_or([is_free_A, a_attn.Not()]).OnlyEnforceIf(gap_A)
+        model.add_bool_and([is_free_A.Not(), a_attn]).OnlyEnforceIf(gap_A.Not())
         add_attn_gap[A.node_id] = gap_A
         for i, sel in ((0, reuse_0), (1, reuse_1)):
             E = A.inputs[i]
@@ -1493,10 +1493,11 @@ def build_cpsat_model_from_gm(
     # parked value or a cancel).
     reused_as_target: Dict[int, cp_model.IntVar] = {}
     for eid, sels in target_selectors.items():
-        model.AddAtMostOne(sels)
-        rat = model.NewBoolVar(f"reused_as_target_n{eid}")
-        model.AddBoolOr(sels).OnlyEnforceIf(rat)
-        model.AddBoolAnd([s.Not() for s in sels]).OnlyEnforceIf(rat.Not())
+        model.add_at_most_one(sels)
+        rat: Optional[cp_model.IntVar]
+        rat = model.new_bool_var(f"reused_as_target_n{eid}")
+        model.add_bool_or(sels).OnlyEnforceIf(rat)
+        model.add_bool_and([s.Not() for s in sels]).OnlyEnforceIf(rat.Not())
         reused_as_target[eid] = rat
 
     # ---- Cancel layer per schedulable node ----
@@ -1554,7 +1555,7 @@ def build_cpsat_model_from_gm(
         hinted = [hint_layers.get(cid) for cid in consumer_ids]
         if any(L is None for L in hinted):
             return None
-        return max(hinted)
+        return max(cast(List[int], hinted))
 
     cancel_layer: Dict[int, cp_model.IntVar] = {}
     keep_forever_ids: Set[int] = set()
@@ -1603,26 +1604,27 @@ def build_cpsat_model_from_gm(
         if not _canonical_cancel_reps:
             return
         if cim is not None:
-            model.AddImplication(parked, cim.Not())
+            model.add_implication(parked, cim.Not())
         enforce = [parked.Not()] if rat is None else [parked.Not(), rat.Not()]
-        model.Add(cl <= max_layers - 1).OnlyEnforceIf(enforce)
+        model.add(cl <= max_layers - 1).OnlyEnforceIf(enforce)
 
     for n in gm.schedulable:
-        cl = model.NewIntVar(0, max_layers, f"cl_n{n.node_id}")
+        cl = model.new_int_var(0, max_layers, f"cl_n{n.node_id}")
         cancel_layer[n.node_id] = cl
-        model.Add(cl >= layer_var[n.node_id] + 1)
+        model.add(cl >= layer_var[n.node_id] + 1)
         if n in gm.pinned_nodes:
-            model.Add(cl == max_layers)
+            model.add(cl == max_layers)
             keep_forever_ids.add(n.node_id)
             continue
         consumers = gm.consumers_eff.get(n, set())
         if any(isinstance(c, Concatenate) for c in consumers):
             # Consumed by a terminal Concatenate (output cone) — keep forever.
-            model.Add(cl == max_layers)
+            model.add(cl == max_layers)
             keep_forever_ids.add(n.node_id)
             continue
         # Non-keep-forever: this node gets a mechanism choice.
-        cim = model.NewBoolVar(f"cancel_in_mlp_n{n.node_id}")
+        cim: Optional[cp_model.IntVar]
+        cim = model.new_bool_var(f"cancel_in_mlp_n{n.node_id}")
         cancel_in_mlp[n.node_id] = cim
         consumer_layer_vars: List[cp_model.IntVar] = []
         consumer_ids: List[int] = []
@@ -1646,10 +1648,10 @@ def build_cpsat_model_from_gm(
                     if isinstance(c, Add):
                         deferred_add_consumer_lbs.append((cl, cim, c.node_id))
                     else:
-                        model.Add(
+                        model.add(
                             cl >= layer_var[c.node_id] + 1 - is_attn[c.node_id]
                         ).OnlyEnforceIf(cim.Not())
-                        model.Add(cl >= layer_var[c.node_id]).OnlyEnforceIf(cim)
+                        model.add(cl >= layer_var[c.node_id]).OnlyEnforceIf(cim)
                 consumer_layer_vars.append(layer_var[c.node_id])
                 consumer_ids.append(c.node_id)
         if _pin_cancels:
@@ -1673,8 +1675,8 @@ def build_cpsat_model_from_gm(
         rat = reused_as_target.get(n.node_id)
         if eff_cancel_slack is not None and consumer_layer_vars:
             delta = _widen_delta(n.node_id, _hinted_last_consumer(consumer_ids))
-            last_cons = model.NewIntVar(0, max_layers - 1, f"last_cons_n{n.node_id}")
-            model.AddMaxEquality(last_cons, consumer_layer_vars)
+            last_cons = model.new_int_var(0, max_layers - 1, f"last_cons_n{n.node_id}")
+            model.add_max_equality(last_cons, consumer_layer_vars)
             # Parked escape: the machine may leave a dead value's columns
             # allocated forever when every layer's head budget is too full
             # to pay the cancel.  cl == max_layers models exactly that; the
@@ -1685,15 +1687,16 @@ def build_cpsat_model_from_gm(
             # ownership handoff, not a parked value: its parked literal is
             # forced false and the ordinary window is gated off — the
             # selector posts the exact `layer[A] + 1` handoff instead.
-            parked = model.NewBoolVar(f"parked_n{n.node_id}")
+            parked: Optional[cp_model.IntVar]
+            parked = model.new_bool_var(f"parked_n{n.node_id}")
             parked_by_id[n.node_id] = parked
             window_gate = [parked.Not()] if rat is None else [parked.Not(), rat.Not()]
-            model.Add(cl <= last_cons + 1 + eff_cancel_slack + delta).OnlyEnforceIf(
+            model.add(cl <= last_cons + 1 + eff_cancel_slack + delta).OnlyEnforceIf(
                 window_gate
             )
-            model.Add(cl == max_layers).OnlyEnforceIf(parked)
+            model.add(cl == max_layers).OnlyEnforceIf(parked)
             if rat is not None:
-                model.AddImplication(rat, parked.Not())
+                model.add_implication(rat, parked.Not())
             _canonicalize_cancel_reps(cl, parked, cim, rat)
         elif eff_cancel_slack is not None and not consumer_layer_vars:
             # No layer-bound consumers — cancel can fire right after
@@ -1703,12 +1706,12 @@ def build_cpsat_model_from_gm(
                 n.node_id,
                 hint_layers.get(n.node_id) if hint_layers is not None else None,
             )
-            parked = model.NewBoolVar(f"parked_n{n.node_id}")
+            parked = model.new_bool_var(f"parked_n{n.node_id}")
             parked_by_id[n.node_id] = parked
-            model.Add(
+            model.add(
                 cl <= layer_var[n.node_id] + 1 + eff_cancel_slack + delta
             ).OnlyEnforceIf(parked.Not())
-            model.Add(cl == max_layers).OnlyEnforceIf(parked)
+            model.add(cl == max_layers).OnlyEnforceIf(parked)
             _canonicalize_cancel_reps(cl, parked, cim)
 
     # ---- Freeable input cancel layers ----
@@ -1721,17 +1724,17 @@ def build_cpsat_model_from_gm(
     parked_input_by_id: Dict[int, cp_model.IntVar] = {}
     held_input_pin_spec = None
     for n in freeable_inputs:
-        cl = model.NewIntVar(0, max_layers, f"cl_in{n.node_id}")
+        cl = model.new_int_var(0, max_layers, f"cl_in{n.node_id}")
         input_cancel_layer[n.node_id] = cl
         is_held_source = n is held_source
         if not is_held_source:
-            model.Add(cl >= 1)  # ordinary input lives through layer 0
+            model.add(cl >= 1)  # ordinary input lives through layer 0
         keep_forever = False
         consumer_layer_vars = []
         consumer_ids = []
         for c in gm.consumers_eff.get(n, set()):
             if isinstance(c, Concatenate):
-                model.Add(cl == max_layers)
+                model.add(cl == max_layers)
                 keep_forever = True
                 break
             if c.node_id in layer_var:
@@ -1742,11 +1745,11 @@ def build_cpsat_model_from_gm(
                         # Add's free/compute-dependent term is deferred until
                         # is_free exists below.
                         if not isinstance(c, Add):
-                            model.Add(
+                            model.add(
                                 cl >= layer_var[c.node_id] + 1 - is_attn[c.node_id]
                             )
                     else:
-                        model.Add(cl >= layer_var[c.node_id] + 1)
+                        model.add(cl >= layer_var[c.node_id] + 1)
                 consumer_layer_vars.append(layer_var[c.node_id])
                 consumer_ids.append(c.node_id)
         if keep_forever:
@@ -1765,7 +1768,7 @@ def build_cpsat_model_from_gm(
             ]
             held_input_pin_spec = (cl, non_add_ids, add_ids)
             # The bank is held from this physical cancel until target birth.
-            model.Add(cl <= layer_var[held_target.node_id])
+            model.add(cl <= layer_var[cast(Node, held_target).node_id])
             # The held source has its own equality/window treatment below,
             # after Add classification exists.
             continue
@@ -1780,36 +1783,36 @@ def build_cpsat_model_from_gm(
             # every other consumer completes no later), so no gating is
             # needed here — the selector's equality is consistent.
             if consumer_layer_vars:
-                model.AddMaxEquality(cl, [1] + [v + 1 for v in consumer_layer_vars])
+                model.add_max_equality(cl, [1] + [v + 1 for v in consumer_layer_vars])
             else:
-                model.Add(cl == 1)
+                model.add(cl == 1)
             continue
         if eff_cancel_slack is not None and consumer_layer_vars:
             delta = _widen_delta(n.node_id, _hinted_last_consumer(consumer_ids))
-            last_cons = model.NewIntVar(0, max_layers - 1, f"last_cons_in{n.node_id}")
-            model.AddMaxEquality(last_cons, consumer_layer_vars)
+            last_cons = model.new_int_var(0, max_layers - 1, f"last_cons_in{n.node_id}")
+            model.add_max_equality(last_cons, consumer_layer_vars)
             # Parked escape — see the schedulable-node cancel window above.
             # A selected graph-input target is an ownership handoff: parked
             # forced false, ordinary window gated off.
-            parked = model.NewBoolVar(f"parked_in{n.node_id}")
+            parked = model.new_bool_var(f"parked_in{n.node_id}")
             parked_input_by_id[n.node_id] = parked
             window_gate = (
                 [parked.Not()] if rat_in is None else [parked.Not(), rat_in.Not()]
             )
-            model.Add(cl <= last_cons + 1 + eff_cancel_slack + delta).OnlyEnforceIf(
+            model.add(cl <= last_cons + 1 + eff_cancel_slack + delta).OnlyEnforceIf(
                 window_gate
             )
-            model.Add(cl == max_layers).OnlyEnforceIf(parked)
+            model.add(cl == max_layers).OnlyEnforceIf(parked)
             if rat_in is not None:
-                model.AddImplication(rat_in, parked.Not())
+                model.add_implication(rat_in, parked.Not())
             _canonicalize_cancel_reps(cl, parked, None, rat_in)
         elif eff_cancel_slack is not None and not consumer_layer_vars:
             # Born at layer 0, so the hinted base is the fixed birth layer 0.
             delta = _widen_delta(n.node_id, 0)
-            parked = model.NewBoolVar(f"parked_in{n.node_id}")
+            parked = model.new_bool_var(f"parked_in{n.node_id}")
             parked_input_by_id[n.node_id] = parked
-            model.Add(cl <= 1 + eff_cancel_slack + delta).OnlyEnforceIf(parked.Not())
-            model.Add(cl == max_layers).OnlyEnforceIf(parked)
+            model.add(cl <= 1 + eff_cancel_slack + delta).OnlyEnforceIf(parked.Not())
+            model.add(cl == max_layers).OnlyEnforceIf(parked)
             _canonicalize_cancel_reps(cl, parked, None)
 
     # Every Add-consumer cancel bound below shares two mechanism-specific
@@ -1840,9 +1843,9 @@ def build_cpsat_model_from_gm(
         add_exprs = [_add_consumer_cancel_expr_attn(a) for a in add_ids]
         if "cancel_consumer_lb" not in _disabled_families:
             for expr in add_exprs:
-                model.Add(cl >= expr)
+                model.add(cl >= expr)
         if _pin_cancels:
-            model.AddMaxEquality(
+            model.add_max_equality(
                 cl,
                 [0] + [layer_var[c] + 1 - is_attn[c] for c in non_add_ids] + add_exprs,
             )
@@ -1855,10 +1858,10 @@ def build_cpsat_model_from_gm(
     # equal the historical `layer[A] + is_free[A]`.
     if "cancel_consumer_lb" not in _disabled_families:
         for cl, cim, add_id in deferred_add_consumer_lbs:
-            model.Add(cl >= _add_consumer_cancel_expr_attn(add_id)).OnlyEnforceIf(
+            model.add(cl >= _add_consumer_cancel_expr_attn(add_id)).OnlyEnforceIf(
                 cim.Not()
             )
-            model.Add(cl >= _add_consumer_cancel_expr_mlp(add_id)).OnlyEnforceIf(cim)
+            model.add(cl >= _add_consumer_cancel_expr_mlp(add_id)).OnlyEnforceIf(cim)
 
     # ---- Reused-target ownership handoff ----
     # Under the selecting literal, the old target's lifetime ends exactly at
@@ -1877,13 +1880,13 @@ def build_cpsat_model_from_gm(
                 cl_target = input_cancel_layer.get(target.node_id)
             if cl_target is None:
                 continue  # non-reassignable occurrence (selector is pinned 0)
-            model.Add(cl_target == layer_var[add_id] + 1).OnlyEnforceIf(sel)
+            model.add(cl_target == layer_var[add_id] + 1).OnlyEnforceIf(sel)
     for eid, rat in reused_as_target.items():
         cim = cancel_in_mlp.get(eid)
         if cim is not None:
             # Canonical mechanism for a reassigned target: the attention
             # side (never run — the cancel intervals are gated absent).
-            model.AddImplication(rat, cim.Not())
+            model.add_implication(rat, cim.Not())
 
     # ---- Pinned cancel layers (_pin_cancels, the production default) ----
     # Equality-pin each non-keep-forever cancel to its earliest legal value
@@ -1905,24 +1908,24 @@ def build_cpsat_model_from_gm(
             if not non_add_ids and not add_ids:
                 # No layer-bound consumers: both mechanisms share the
                 # birth-based earliest.
-                model.Add(cl == birth)
+                model.add(cl == birth)
                 continue
-            pin_attn = model.NewIntVar(1, max_layers, f"pin_attn_n{nid}")
-            model.AddMaxEquality(
+            pin_attn = model.new_int_var(1, max_layers, f"pin_attn_n{nid}")
+            model.add_max_equality(
                 pin_attn,
                 [birth]
                 + [layer_var[c] + 1 - is_attn[c] for c in non_add_ids]
                 + [_add_consumer_cancel_expr_attn(a) for a in add_ids],
             )
-            pin_mlp = model.NewIntVar(1, max_layers, f"pin_mlp_n{nid}")
-            model.AddMaxEquality(
+            pin_mlp = model.new_int_var(1, max_layers, f"pin_mlp_n{nid}")
+            model.add_max_equality(
                 pin_mlp,
                 [birth]
                 + [layer_var[c] for c in non_add_ids]
                 + [_add_consumer_cancel_expr_mlp(a) for a in add_ids],
             )
-            model.Add(cl == pin_attn).OnlyEnforceIf(cim.Not())
-            model.Add(cl == pin_mlp).OnlyEnforceIf(cim)
+            model.add(cl == pin_attn).OnlyEnforceIf(cim.Not())
+            model.add(cl == pin_mlp).OnlyEnforceIf(cim)
 
     # ---- Combined attn-heads + cancel-cols cumulative ----
     # Per-node attn interval is OPTIONAL (gated by is_attn[n]) when
@@ -1946,26 +1949,26 @@ def build_cpsat_model_from_gm(
         if h <= 0:
             continue
         if isinstance(n, Add):
-            free_pres = model.NewBoolVar(f"add_attn_free_n{n.node_id}")
-            model.AddBoolAnd([is_attn[n.node_id], is_free[n.node_id]]).OnlyEnforceIf(
+            free_pres = model.new_bool_var(f"add_attn_free_n{n.node_id}")
+            model.add_bool_and([is_attn[n.node_id], is_free[n.node_id]]).OnlyEnforceIf(
                 free_pres
             )
-            model.AddBoolOr(
+            model.add_bool_or(
                 [is_attn[n.node_id].Not(), is_free[n.node_id].Not()]
             ).OnlyEnforceIf(free_pres.Not())
             add_attn_free_pres[n.node_id] = free_pres
-            comp_pres = model.NewBoolVar(f"add_attn_comp_n{n.node_id}")
-            model.AddBoolAnd(
+            comp_pres = model.new_bool_var(f"add_attn_comp_n{n.node_id}")
+            model.add_bool_and(
                 [is_attn[n.node_id], is_free[n.node_id].Not()]
             ).OnlyEnforceIf(comp_pres)
-            model.AddBoolOr(
+            model.add_bool_or(
                 [is_attn[n.node_id].Not(), is_free[n.node_id]]
             ).OnlyEnforceIf(comp_pres.Not())
             add_attn_comp_pres[n.node_id] = comp_pres
 
-            free_end = model.NewIntVar(1, max_layers, f"aend_free_n{n.node_id}")
-            model.Add(free_end == layer_var[n.node_id] + 1)
-            iv_free = model.NewOptionalIntervalVar(
+            free_end = model.new_int_var(1, max_layers, f"aend_free_n{n.node_id}")
+            model.add(free_end == layer_var[n.node_id] + 1)
+            iv_free = model.new_optional_interval_var(
                 layer_var[n.node_id],
                 1,
                 free_end,
@@ -1975,9 +1978,9 @@ def build_cpsat_model_from_gm(
             attn_intervals.append(iv_free)
             attn_demands.append(h * d_head)
 
-            comp_end = model.NewIntVar(1, max_layers, f"aend_comp_n{n.node_id}")
-            model.Add(comp_end == layer_var[n.node_id] + 1)
-            iv_comp = model.NewOptionalIntervalVar(
+            comp_end = model.new_int_var(1, max_layers, f"aend_comp_n{n.node_id}")
+            model.add(comp_end == layer_var[n.node_id] + 1)
+            iv_comp = model.new_optional_interval_var(
                 layer_var[n.node_id],
                 1,
                 comp_end,
@@ -1987,9 +1990,9 @@ def build_cpsat_model_from_gm(
             attn_intervals.append(iv_comp)
             attn_demands.append(2 * h * d_head)
             continue
-        end = model.NewIntVar(1, max_layers, f"aend_n{n.node_id}")
-        model.Add(end == layer_var[n.node_id] + 1)
-        iv = model.NewOptionalIntervalVar(
+        end = model.new_int_var(1, max_layers, f"aend_n{n.node_id}")
+        model.add(end == layer_var[n.node_id] + 1)
+        iv = model.new_optional_interval_var(
             layer_var[n.node_id], 1, end, is_attn[n.node_id], f"aiv_n{n.node_id}"
         )
         attn_intervals.append(iv)
@@ -2010,8 +2013,8 @@ def build_cpsat_model_from_gm(
             # schedulable node writes its output to the stream) has no
             # columns to cancel.
             continue
-        c_end = model.NewIntVar(1, max_layers + 1, f"cend_n{n.node_id}")
-        model.Add(c_end == cancel_layer[n.node_id] + 1)
+        c_end = model.new_int_var(1, max_layers + 1, f"cend_n{n.node_id}")
+        model.add(c_end == cancel_layer[n.node_id] + 1)
         parked = parked_by_id.get(n.node_id)
         cim = cancel_in_mlp.get(n.node_id)
         rat = reused_as_target.get(n.node_id)
@@ -2037,7 +2040,7 @@ def build_cpsat_model_from_gm(
             attn_present = _and_presence(
                 model, parked, attn_literal, name=f"cpres_attn_n{n.node_id}"
             )
-            iv_attn = model.NewOptionalIntervalVar(
+            iv_attn = model.new_optional_interval_var(
                 cancel_layer[n.node_id], 1, c_end, attn_present, f"civ_n{n.node_id}"
             )
             cancel_intervals.append(iv_attn)
@@ -2051,7 +2054,7 @@ def build_cpsat_model_from_gm(
             mlp_present = _and_presence(
                 model, parked, mlp_literal, name=f"cpres_mlp_n{n.node_id}"
             )
-            iv_mlp = model.NewOptionalIntervalVar(
+            iv_mlp = model.new_optional_interval_var(
                 cancel_layer[n.node_id], 1, c_end, mlp_present, f"civ_mlp_n{n.node_id}"
             )
             mlp_cancel_intervals.append(iv_mlp)
@@ -2061,7 +2064,7 @@ def build_cpsat_model_from_gm(
             # var; a parked var without a cancel_in_mlp var cannot occur (both
             # are built for exactly the non-keep-forever set), but keep the
             # branch structurally for safety.
-            iv = model.NewOptionalIntervalVar(
+            iv = model.new_optional_interval_var(
                 cancel_layer[n.node_id], 1, c_end, parked.Not(), f"civ_n{n.node_id}"
             )
             cancel_intervals.append(iv)
@@ -2070,7 +2073,7 @@ def build_cpsat_model_from_gm(
             # Keep-forever-via-Concatenate (cl == max_layers): no mechanism
             # choice; its cancel-head interval piles at the virtual layer
             # max_layers like the pinned keep-forever nodes always have.
-            iv = model.NewIntervalVar(
+            iv = model.new_interval_var(
                 cancel_layer[n.node_id], 1, c_end, f"civ_n{n.node_id}"
             )
             cancel_intervals.append(iv)
@@ -2090,8 +2093,8 @@ def build_cpsat_model_from_gm(
     # after the input is freed lands on already-clean columns.
     for n in freeable_inputs:
         cl_in = input_cancel_layer[n.node_id]
-        c_end = model.NewIntVar(1, max_layers + 2, f"cend_in{n.node_id}")
-        model.Add(c_end == cl_in + 1)
+        c_end = model.new_int_var(1, max_layers + 2, f"cend_in{n.node_id}")
+        model.add(c_end == cl_in + 1)
         parked = parked_input_by_id.get(n.node_id)
         rat_in = reused_as_target.get(n.node_id)
         # A selected reuse target's ownership ends through `reassign` (the
@@ -2108,11 +2111,11 @@ def build_cpsat_model_from_gm(
         else:
             literal = None
         if literal is not None:
-            iv = model.NewOptionalIntervalVar(
+            iv = model.new_optional_interval_var(
                 cl_in, 1, c_end, literal, f"civ_in{n.node_id}"
             )
         else:
-            iv = model.NewIntervalVar(cl_in, 1, c_end, f"civ_in{n.node_id}")
+            iv = model.new_interval_var(cl_in, 1, c_end, f"civ_in{n.node_id}")
         cancel_intervals.append(iv)
         cancel_demands.append(len(n))
 
@@ -2123,7 +2126,7 @@ def build_cpsat_model_from_gm(
     if "attn_cumulative" not in _disabled_families and (
         attn_intervals or cancel_intervals
     ):
-        model.AddCumulative(
+        model.add_cumulative(
             attn_intervals + cancel_intervals,
             attn_demands + cancel_demands,
             effective_capacity,
@@ -2139,9 +2142,9 @@ def build_cpsat_model_from_gm(
         s = slots_for(n, gm)
         if s <= 0:
             continue
-        end = model.NewIntVar(1, max_layers, f"mend_n{n.node_id}")
-        model.Add(end == layer_var[n.node_id] + 1)
-        iv = model.NewOptionalIntervalVar(
+        end = model.new_int_var(1, max_layers, f"mend_n{n.node_id}")
+        model.add(end == layer_var[n.node_id] + 1)
+        iv = model.new_optional_interval_var(
             layer_var[n.node_id], 1, end, is_attn[n.node_id].Not(), f"miv_n{n.node_id}"
         )
         mlp_intervals.append(iv)
@@ -2152,7 +2155,7 @@ def build_cpsat_model_from_gm(
     if "mlp_cumulative" not in _disabled_families and (
         mlp_intervals or mlp_cancel_intervals
     ):
-        model.AddCumulative(
+        model.add_cumulative(
             mlp_intervals + mlp_cancel_intervals,
             mlp_demands + mlp_cancel_demands,
             d_hidden,
@@ -2174,8 +2177,8 @@ def build_cpsat_model_from_gm(
         # where the replay still holds them — an unreplayable (I4) schedule.
         cim = cancel_in_mlp.get(n.node_id)
         if cim is not None and "mlp_cancel_occupancy" not in _disabled_families:
-            rend = model.NewIntVar(1, max_layers + 1, f"rend_n{n.node_id}")
-            model.Add(rend == cancel_layer[n.node_id] + cim)
+            rend = model.new_int_var(1, max_layers + 1, f"rend_n{n.node_id}")
+            model.add(rend == cancel_layer[n.node_id] + cim)
         else:
             # Either a keep-forever node (no cim) or the diagnostic relaxation:
             # occupy only `[layer, cancel)` (unsound to execute — lower bound).
@@ -2197,15 +2200,15 @@ def build_cpsat_model_from_gm(
             # the residual over-count that rejected schedules the heuristic
             # compiles (the dead addend and its Add never occupy two distinct
             # columns at the add layer).
-            start = model.NewIntVar(0, max_layers, f"rstart_n{n.node_id}")
-            model.Add(start == layer_var[n.node_id] + is_free[n.node_id])
-            size = model.NewIntVar(0, max_layers + 1, f"rsz_n{n.node_id}")
-            model.Add(size == rend - start)
-            iv = model.NewIntervalVar(start, size, rend, f"riv_n{n.node_id}")
+            start = model.new_int_var(0, max_layers, f"rstart_n{n.node_id}")
+            model.add(start == layer_var[n.node_id] + is_free[n.node_id])
+            size = model.new_int_var(0, max_layers + 1, f"rsz_n{n.node_id}")
+            model.add(size == rend - start)
+            iv = model.new_interval_var(start, size, rend, f"riv_n{n.node_id}")
         else:
-            size = model.NewIntVar(1, max_layers + 1, f"rsz_n{n.node_id}")
-            model.Add(size == rend - layer_var[n.node_id])
-            iv = model.NewIntervalVar(
+            size = model.new_int_var(1, max_layers + 1, f"rsz_n{n.node_id}")
+            model.add(size == rend - layer_var[n.node_id])
+            iv = model.new_interval_var(
                 layer_var[n.node_id],
                 size,
                 rend,
@@ -2222,12 +2225,14 @@ def build_cpsat_model_from_gm(
         # A held source's physical value dies at cl_in, but its columns remain
         # unavailable to ordinary allocation until target birth.  Model that
         # ownership gap by extending residual occupancy to layer[target].
-        rend_in = layer_var[held_target.node_id] if n is held_source else cl_in
-        iv = model.NewIntervalVar(0, rend_in, rend_in, f"riv_in{n.node_id}")
+        rend_in = (
+            layer_var[cast(Node, held_target).node_id] if n is held_source else cl_in
+        )
+        iv = model.new_interval_var(0, rend_in, rend_in, f"riv_in{n.node_id}")
         resid_intervals.append(iv)
         resid_demands.append(len(n))
     if "residual_cumulative" not in _disabled_families and resid_intervals:
-        model.AddCumulative(resid_intervals, resid_demands, available_residual)
+        model.add_cumulative(resid_intervals, resid_demands, available_residual)
 
     # ---- Aggregate counters for the objective ----
     attn_term: List = []
@@ -2247,18 +2252,18 @@ def build_cpsat_model_from_gm(
         elif flex_routing and is_flex(n, gm):
             attn_term.append(h * is_attn[n.node_id])
         else:
-            r = static_routing[n.node_id]
-            if r == ATTN:
+            route = static_routing[n.node_id]
+            if route == ATTN:
                 fixed_attn_heads += h
-    total_attn_heads = model.NewIntVar(
+    total_attn_heads = model.new_int_var(
         0,
         fixed_attn_heads + 2 * sum(heads_for(n, d_head) for n in gm.schedulable),
         "total_attn_heads",
     )
     if attn_term:
-        model.Add(total_attn_heads == fixed_attn_heads + sum(attn_term))
+        model.add(total_attn_heads == fixed_attn_heads + sum(attn_term))
     else:
-        model.Add(total_attn_heads == fixed_attn_heads)
+        model.add(total_attn_heads == fixed_attn_heads)
 
     fixed_mlp_bypass = 0
     for n in gm.schedulable:
@@ -2267,30 +2272,30 @@ def build_cpsat_model_from_gm(
         if flex_routing:
             mlp_bypass_term.append((2 * n.d_output) * is_attn[n.node_id].Not())
         else:
-            r = static_routing[n.node_id]
-            if r == MLP:
+            route = static_routing[n.node_id]
+            if route == MLP:
                 fixed_mlp_bypass += 2 * n.d_output
-    total_mlp_bypass = model.NewIntVar(
+    total_mlp_bypass = model.new_int_var(
         0,
         fixed_mlp_bypass
         + sum(2 * n.d_output for n in gm.schedulable if is_flex(n, gm)),
         "total_mlp_bypass",
     )
     if mlp_bypass_term:
-        model.Add(total_mlp_bypass == fixed_mlp_bypass + sum(mlp_bypass_term))
+        model.add(total_mlp_bypass == fixed_mlp_bypass + sum(mlp_bypass_term))
     else:
-        model.Add(total_mlp_bypass == fixed_mlp_bypass)
+        model.add(total_mlp_bypass == fixed_mlp_bypass)
 
     # ---- Objective ----
-    makespan_layer = model.NewIntVar(0, max_layers, "makespan_layer")
+    makespan_layer = model.new_int_var(0, max_layers, "makespan_layer")
     if gm.schedulable:
-        model.AddMaxEquality(
+        model.add_max_equality(
             makespan_layer, [layer_var[n.node_id] for n in gm.schedulable]
         )
     else:
-        model.Add(makespan_layer == 0)
-    n_layers_var = model.NewIntVar(0, max_layers + 1, "n_layers")
-    model.Add(n_layers_var == makespan_layer + 1)
+        model.add(makespan_layer == 0)
+    n_layers_var = model.new_int_var(0, max_layers + 1, "n_layers")
+    model.add(n_layers_var == makespan_layer + 1)
 
     primary = (
         costs.alpha * n_layers_var
@@ -2322,7 +2327,7 @@ def build_cpsat_model_from_gm(
             occupancy.append(
                 len(n)
                 * (
-                    layer_var[held_target.node_id]
+                    layer_var[cast(Node, held_target).node_id]
                     if n is held_source
                     else input_cancel_layer[n.node_id]
                 )
@@ -2332,9 +2337,9 @@ def build_cpsat_model_from_gm(
     objective_scale = 1
     if secondary_terms:
         objective_scale = lexicographic_objective_scale(max_secondary)
-        model.Minimize(objective_scale * primary + sum(secondary_terms))
+        model.minimize(objective_scale * primary + sum(secondary_terms))
     else:
-        model.Minimize(primary)
+        model.minimize(primary)
 
     return BuiltModel(
         model=model,
@@ -2442,7 +2447,7 @@ def _stand_in_node(rec) -> Node:
             f"snapshot node {rec.node_id} has unknown kind {rec.kind!r}; the "
             f"CP-SAT builder only knows {sorted(_KIND_TO_CLASS)}"
         )
-    node = object.__new__(cls)
+    node: Any = object.__new__(cls)
     node.node_id = rec.node_id
     node.d_output = rec.d_output
     node.name = rec.name
@@ -2492,10 +2497,13 @@ def graph_model_from_problem(problem: SchedulingProblem) -> GraphModel:
         {rec.node_id: rec.critical_path_len for rec in problem.nodes.values()},
     )
     return GraphModel(
-        graph=graph,
+        # The stand-in implements exactly the GraphAnalyzer slice the builder
+        # reads; the ordered-tuple consumer values are likewise duck-typed
+        # (the builder only iterates them) — see the docstrings above.
+        graph=cast(GraphAnalyzer, graph),
         schedulable=[by_id[i] for i in problem.schedulable_ids],
         edges=[(by_id[u], by_id[v]) for u, v in problem.edges],
-        consumers_eff=consumers_eff,
+        consumers_eff=cast(Dict[Node, Set[Node]], consumers_eff),
         output_node=by_id[problem.output_id],
         pos_encoding=None,
         input_nodes=[by_id[i] for i in problem.input_ids],
@@ -2648,7 +2656,7 @@ def resolve_model_proto(
     has_solution = status in (cp_model.OPTIMAL, cp_model.FEASIBLE)
     n_layers = None
     if has_solution:
-        nlv = model.GetIntVarFromProtoIndex(int(meta["n_layers_var_index"]))
+        nlv = model.get_int_var_from_proto_index(int(meta["n_layers_var_index"]))
         n_layers = solver.Value(nlv)
     return {
         "status_name": solver.StatusName(status),
@@ -2772,6 +2780,7 @@ def _validate_hint(
                 f"{_desc(nid)} hint={L}"
             )
 
+    route: Optional[str]
     for nid, route in (hint_routing or {}).items():
         if route not in (ATTN, MLP):
             violations.append(
@@ -2913,7 +2922,7 @@ def _validate_hint(
             mech = ATTN
         hinted_cons: List[int] = []
         all_cons_hinted = True
-        for c in gm.consumers_eff.get(node, set()):
+        for c in gm.consumers_eff.get(cast(Node, node), set()):
             if c.node_id not in built.layer_var:
                 continue
             c_hint = (hint_layers or {}).get(c.node_id)
@@ -3081,6 +3090,7 @@ def solve_schedule(
     """
     if incumbent is not None and _diagnostic_hint is not None:
         raise ValueError("pass either incumbent or _diagnostic_hint, not both")
+    hint: Optional[DiagnosticHint]
     if incumbent is not None:
         incumbent.validate(output_node)
         hint = DiagnosticHint.from_assignment(incumbent)
@@ -3271,23 +3281,23 @@ def _solve_built(
     if hint is not None:
         for nid, L in hint.layers.items():
             if nid in layer_var and 0 <= L < max_layers:
-                model.AddHint(layer_var[nid], L)
+                model.add_hint(layer_var[nid], L)
         for nid, route in hint.routing.items():
             if nid in is_attn:
-                model.AddHint(is_attn[nid], 1 if route == ATTN else 0)
+                model.add_hint(is_attn[nid], 1 if route == ATTN else 0)
         for nid, mech in hint.cancel_mech.items():
             if nid in cancel_in_mlp:
-                model.AddHint(cancel_in_mlp[nid], 1 if mech == MLP else 0)
+                model.add_hint(cancel_in_mlp[nid], 1 if mech == MLP else 0)
         for nid, L in hint.cancel.items():
             if nid in cancel_layer and 0 <= L <= max_layers:
-                model.AddHint(cancel_layer[nid], L)
+                model.add_hint(cancel_layer[nid], L)
             elif nid in input_cancel_layer and 0 <= L <= max_layers:
                 # The warm-start's tracking residual map records `free()`
                 # for input nodes too, so route their captured cancel layer
                 # to the input cancel vars — without this the input cancels
                 # are unhinted and CP-SAT cannot accept the heuristic
                 # schedule as a ready-made feasible incumbent.
-                model.AddHint(input_cancel_layer[nid], L)
+                model.add_hint(input_cancel_layer[nid], L)
 
     # ---- Decision strategy: schedule by critical path first ----
     # MEASUREMENT-ONLY: dropping it (C1 arm ``no_decision_strategy``) leaves
@@ -3297,7 +3307,7 @@ def _solve_built(
             gm.schedulable,
             key=lambda n: -gm.graph.get_critical_path_length(n),
         )
-        model.AddDecisionStrategy(
+        model.add_decision_strategy(
             [layer_var[n.node_id] for n in nodes_by_cp],
             cp_model.CHOOSE_FIRST,
             cp_model.SELECT_MIN_VALUE,

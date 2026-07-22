@@ -15,6 +15,8 @@ layer floor is pinned constant across n — the two regimes the module
 docstring states.
 """
 
+from typing import cast
+
 import pytest
 import torch
 
@@ -41,7 +43,9 @@ def _check_expr(out_node, embedding, expr: str, expected: str) -> None:
     """Teacher-forced check: the model's argmax at the newline and every
     answer position predicts the expected next token."""
     tokens = [bos_token] + list(expr) + ["\n"] + list(expected) + ["<eos>"]
-    cache = reference_eval(out_node, {"embedding_input": tokens}, len(tokens))
+    cache = reference_eval(
+        out_node, cast(dict, {"embedding_input": tokens}), len(tokens)
+    )
     logits = cache[out_node]
     vocab = embedding.tokenizer.vocab
     start = 1 + len(expr)  # the newline's position predicts the first digit

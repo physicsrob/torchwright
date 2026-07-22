@@ -14,7 +14,7 @@ import math
 
 import torch
 
-from torchwright.ops.relu.arithmetic_ops import log
+from torchwright.ops.relu.arithmetic_ops import log  # type: ignore[attr-defined]
 from torchwright.ops.inout_nodes import create_input
 
 

@@ -135,7 +135,7 @@ def collect_cell(impl_name: str, n: int) -> dict:
     try:
         out, embedding = impl.create_network_parts(max_digits=n)
     except Exception as exc:  # structural caps (slow planes, fact table)
-        row = {"n": n, "build_error": str(exc).splitlines()[0]}
+        row: dict = {"n": n, "build_error": str(exc).splitlines()[0]}
         if hasattr(impl, "n_params"):
             row["params_extrapolated"] = impl.n_params(n)
         if hasattr(impl, "compiled_layers"):

@@ -42,7 +42,18 @@ import json
 import os
 import time
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Callable, Dict, List, Optional, Tuple, Union
+from typing import (
+    TYPE_CHECKING,
+    Any,
+    Callable,
+    Dict,
+    List,
+    Literal,
+    Optional,
+    Tuple,
+    Union,
+    cast,
+)
 
 if TYPE_CHECKING:
     from torchwright.compiler.residual_assignment import ResidualAssignment
@@ -442,7 +453,7 @@ def _write_debug_sidecar(
         weight_params = 0
         weight_shapes: List[list] = []
         for attr in baked_attrs:
-            t = getattr(node, attr, None)
+            t: Any = getattr(node, attr, None)
             shape = getattr(t, "shape", None)
             if shape is None:
                 continue
@@ -997,7 +1008,7 @@ def _emit_cached_layer_nodes(
             node,
             current_res,
             f"{p}_input_layernorm",
-            rms_eps_name,
+            cast(str, rms_eps_name),
             attn_in,
             f"{p}_attn_norm",
         )
@@ -1137,7 +1148,7 @@ def _emit_cached_layer_nodes(
             node,
             f"{p}_res_attn",
             f"{p}_post_attention_layernorm",
-            rms_eps_name,
+            cast(str, rms_eps_name),
             mlp_in,
             f"{p}_mlp_norm",
         )
@@ -1470,10 +1481,13 @@ def compile_to_onnx(
         rms_norm_eps=rms_norm_eps,
         # None -> forward_compile's default q; an explicit value tunes the
         # pinned constant for a graph whose deepest-layer energy needs it.
-        **(
-            {}
-            if rms_norm_const_exp is None
-            else {"rms_norm_const_exp": rms_norm_const_exp}
+        **cast(
+            Dict[str, Any],
+            (
+                {}
+                if rms_norm_const_exp is None
+                else {"rms_norm_const_exp": rms_norm_const_exp}
+            ),
         ),
     )
     rms_spec = compiled.rms_norm_spec
@@ -1650,14 +1664,14 @@ def compile_to_onnx(
     rope_base_val, rope_d_rot_val = _add_rope_inits(
         per_layer_rotary, d_head, dense_inits
     )
-    on_layer_compiled.token_model_sink.finalize(
+    cast(Any, on_layer_compiled).token_model_sink.finalize(
         TokenModelSpec(
             d=d,
             d_head=d_head,
             max_seq_len=max_seq_len,
             vocab=tuple(embedding.tokenizer.vocab),
             vocab_size=vocab_size,
-            activation=compiled.activation,
+            activation=cast(Literal["relu", "swish"], compiled.activation),
             bias=bool(bias),
             rms_norm=rms_spec is not None,
             rms_norm_eps=float(rms_spec.eps if rms_spec else rms_norm_eps),

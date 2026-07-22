@@ -24,6 +24,7 @@ import hashlib
 import json
 from dataclasses import asdict
 from functools import lru_cache
+from typing import cast
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
@@ -196,7 +197,9 @@ def graph_fingerprint(
     if held_output_source is not None:
         try:
             payload["held_output_source"] = canon[held_output_source.node_id]
-            payload["held_output_target"] = canon[held_output_target.node_id]
+            payload["held_output_target"] = canon[
+                cast("Node", held_output_target).node_id
+            ]
         except KeyError as exc:
             raise ValueError(
                 "held output endpoint is not reachable from output"

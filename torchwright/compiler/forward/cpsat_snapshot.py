@@ -44,7 +44,7 @@ import json
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, FrozenSet, Optional, Tuple
+from typing import Dict, FrozenSet, Optional, Tuple, cast
 
 from torchwright.compiler.graph_identity import (
     canonical_ids,
@@ -506,7 +506,7 @@ class SchedulingProblem:
                 by_key = {n.node_id: n for n in by_key.values()}
             try:
                 held_source_node = by_key[self.held_source_id]
-                held_target_node = by_key[self.held_target_id]
+                held_target_node = by_key[cast(int, self.held_target_id)]
             except KeyError as exc:
                 raise ValueError(
                     f"held endpoint id {exc.args[0]} not found in the "

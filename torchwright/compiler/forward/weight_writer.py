@@ -6,7 +6,7 @@ just scatter writes.
 """
 
 from dataclasses import dataclass
-from typing import Dict, Iterable, List, Literal, Optional, Set, Tuple
+from typing import Dict, Iterable, List, Literal, Optional, Sequence, Set, Tuple, cast
 
 import torch
 import torch.nn.functional as F
@@ -57,7 +57,7 @@ class PlacementEntry:
     layer: int
     matrix_kind: str
     node: Optional[Node]
-    op_type: str
+    op_type: Optional[str]
     rows: List[int]
     cols: List[int]
     mode: Literal["dense", "diag"]
@@ -83,9 +83,9 @@ class PlacementRecorder:
         self,
         matrix_kind: str,
         node: Optional[Node],
-        op_type: str,
-        rows: List[int],
-        cols: List[int],
+        op_type: Optional[str],
+        rows: Sequence[int],
+        cols: Sequence[int],
         mode: Literal["dense", "diag"],
     ) -> None:
         self.entries.append(
@@ -195,8 +195,8 @@ def write_mlp_sublayer(
 
 
 def _coalesce_source_rows(
-    idx: List[int], mat: torch.Tensor
-) -> "Tuple[List[int], torch.Tensor]":
+    idx: Sequence[int], mat: torch.Tensor
+) -> "Tuple[Sequence[int], torch.Tensor]":
     """Sum matrix rows that share a source column index.
 
     Weight scatters assign rows by advanced indexing, which is
@@ -748,11 +748,11 @@ class BiasFold:
         self,
         lin,
         matrix_kind: str,
-        slots: List[int],
+        slots: Sequence[int],
         values: torch.Tensor,
         *,
-        node: Node,
-        op_type: str,
+        node: Optional[Node],
+        op_type: Optional[str],
         accumulate: bool = False,
     ) -> None:
         """Fold 1: write ``values`` at ``lin.output_matrix[const_col, slots]``."""
@@ -770,11 +770,11 @@ class BiasFold:
     def out_bias(
         self,
         out_lin,
-        cols: List[int],
+        cols: Sequence[int],
         values: torch.Tensor,
         *,
-        node: Node,
-        op_type: str,
+        node: Optional[Node],
+        op_type: Optional[str],
         accumulate: bool = False,
     ) -> None:
         """Fold 2: write ``values`` at the constant lane's down-projection row."""
@@ -794,7 +794,7 @@ class BiasFold:
                 "mlp.W_out", node, op_type, [self.LANE_SLOT], list(cols), "dense"
             )
 
-    def _ensure_lane(self, node: Node, op_type: str) -> None:
+    def _ensure_lane(self, node: Optional[Node], op_type: Optional[str]) -> None:
         """Write the lane's gate/up rows once per layer, on first use."""
         if self._lane_written:
             return
@@ -935,7 +935,7 @@ def _write_compute_ffn(
             up_bias = torch.ones(len(mlp_slots))
         else:
             up_matrix = ffn.up_proj.t()
-            up_bias = ffn.up_bias
+            up_bias = cast(torch.Tensor, ffn.up_bias)
             _, up_rows = _coalesce_source_rows(in_idx, up_matrix)
             mlp.up_proj.output_matrix[
                 scatter_idx_t.unsqueeze(1), slots_t.unsqueeze(0)
@@ -1106,9 +1106,9 @@ def _write_clear_literal_seed(
 
 def _write_bypass_lane_pair(
     mlp,
-    in_idx: List[int],
-    out_idx: List[int],
-    mlp_slots: List[int],
+    in_idx: Sequence[int],
+    out_idx: Sequence[int],
+    mlp_slots: Sequence[int],
     W: torch.Tensor,
     *,
     node: Optional[Node],
@@ -1437,7 +1437,7 @@ def _write_add_into_bypass(
     )
 
     if biased_linears:
-        source_occurrence = node.inputs[1 - op.reuse_input_index]
+        source_occurrence = node.inputs[1 - cast(int, op.reuse_input_index)]
         _fold_deferred_source_bias(
             mlp,
             _flatten_input_leaves(source_occurrence),

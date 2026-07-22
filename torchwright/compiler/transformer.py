@@ -1,10 +1,10 @@
-from typing import Any, List, Dict, Optional, Tuple, Union
+from typing import TYPE_CHECKING, Any, List, Dict, Optional, Tuple, Union
 
 import torch
 
 from torchwright.compiler.residual_assignment import ResidualAssignment
 from torchwright.compiler.groups.attn_sublayer import AttnSubLayer
-from torchwright.compiler.groups.mlp_sublayer import MLPSubLayer
+from torchwright.compiler.groups.mlp_sublayer import GatedMLPSubLayer, MLPSubLayer
 from torchwright.compiler.groups.transformer_layer import TransformerLayer
 from torchwright.graph import (
     Node,
@@ -13,6 +13,15 @@ from torchwright.graph import (
     Concatenate,
     Embedding,
 )
+
+if TYPE_CHECKING:
+    from torchwright.compiler.forward.compile import RmsNormSpec
+    from torchwright.compiler.forward.cpsat_scheduler import (
+        ScheduleAssignment,
+        ScheduleResult,
+        SolveStats,
+    )
+    from torchwright.compiler.realization import RealizationTable
 
 
 class HeadlessTransformer:
@@ -31,6 +40,23 @@ class HeadlessTransformer:
     # 2-D weight-matrix occupancy recorded during weight writing (see
     # forward.weight_writer.PlacementRecorder).  ``None`` until compile sets it.
     placements: Optional[Any]
+    # --- Attributes attached by ``forward_compile`` (forward/compile.py) ---
+    # Emission mode: False means no physical bias parameters.
+    bias: bool
+    # Solver provenance, populated only when CP-SAT runs (optimize>0); stays
+    # None for the heuristic path.
+    cpsat_solve_stats: Optional["SolveStats"]
+    schedule_result: Optional["ScheduleResult"]
+    # Solve-only measurement output (None when no feasible incumbent).
+    cpsat_assignment: Optional["ScheduleAssignment"]
+    # Diagnostics from the dominating-replay-plan choice.
+    replay_candidate_diagnostics: Dict[str, object]
+    # Pinned-constant RMSNorm layout; None when the norm is off.
+    rms_norm_spec: Optional["RmsNormSpec"]
+    # Resolved realization table the compile scheduled against.
+    realization_table: "RealizationTable"
+    # Per-layer attention-head usage by op type (observability only).
+    per_layer_head_counts: List[Dict[str, int]]
 
     def __init__(
         self,
@@ -131,7 +157,9 @@ class HeadlessTransformer:
         res = inp
         all_states = {}
         for i, layer in enumerate(self.layers):
-            sublayer_pairs: List[tuple[Union[AttnSubLayer, MLPSubLayer], str]] = [
+            sublayer_pairs: List[
+                tuple[Union[AttnSubLayer, MLPSubLayer, GatedMLPSubLayer], str]
+            ] = [
                 (layer.attn, "attn"),
                 (layer.mlp, "mlp"),
             ]

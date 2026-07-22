@@ -444,7 +444,7 @@ class LayerScheduler:
         # Skip reasons for THIS pass only.  ``schedule_layer`` may call this
         # twice (the admission-bypass retry), and it is the retry's skips that
         # explain a deadlock — the first pass's were provisional.
-        self._skips: List[SkipReason] = []
+        self._skips = []
         # Nodes already computed before this layer.  A node born THIS layer must
         # not be MLP-cancelled this layer even if a same-layer MLP consumer
         # makes it dead: the model requires every cancel at birth+1 or later

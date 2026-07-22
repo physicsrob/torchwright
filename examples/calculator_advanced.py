@@ -294,7 +294,7 @@ def _make_compressor(embedding: Embedding):
     }
 
     def compress(digits: List[Node]):
-        values = [Linear(d, value_proj, name="digit_value") for d in digits]
+        values: List[Node] = [Linear(d, value_proj, name="digit_value") for d in digits]
         total = sum_nodes(values)  # plain-number add of up to 11 digits, 0..99
         bucket = bool_to_01(in_range(total, add_const(total, 1.0), n_buckets))
         sum_digit = onehot_lookup(bucket, sum_table, zero_digit)

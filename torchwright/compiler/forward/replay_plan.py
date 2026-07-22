@@ -2,13 +2,16 @@
 
 from dataclasses import dataclass
 from numbers import Integral
-from typing import Literal, Mapping, Optional
+from typing import TYPE_CHECKING, Literal, Mapping, Optional, Union, cast
 
 from torchwright.compiler.forward.cpsat_scheduler import ScheduleAssignment
 from torchwright.compiler.realization import linear_attn_live_heads
 from torchwright.compiler.token_model import LayerShape
 from torchwright.compiler.utils import resolve_n_heads
 from torchwright.graph import Node
+
+if TYPE_CHECKING:
+    from torchwright.graph import Attn
 
 
 def _freeze_ints(value, field_name: str) -> tuple[int, ...]:
@@ -130,8 +133,13 @@ class PlannedAttentionOp:
         if self.op_type == "compute_attn":
             assert self.node is not None
             return sum(
-                bool(self.node.output_matrix[start : start + d_head].ne(0).any())
-                for start in range(0, self.node.d_v, d_head)
+                bool(
+                    cast("Attn", self.node)
+                    .output_matrix[start : start + d_head]
+                    .ne(0)
+                    .any()
+                )
+                for start in range(0, cast("Attn", self.node).d_v, d_head)
             )
         if self.op_type == "compute_linear":
             assert self.node is not None
@@ -239,6 +247,7 @@ class PlannedMlpOp:
 
 ResidualSnapshot = tuple[tuple[int, tuple[int, ...]], ...]
 NodeIndices = tuple[tuple[int, tuple[int, ...]], ...]
+PlannedOp = Union[PlannedAttentionOp, PlannedMlpOp]
 
 
 @dataclass(frozen=True)
@@ -354,14 +363,19 @@ class ReplayPlan:
             referenced_ids.update(node_id for node_id, _ in layer.residual_snapshot)
             referenced_ids.update(
                 op.node.node_id
-                for op in (*layer.attention_ops, *layer.mlp_ops)
+                for op in cast(
+                    "tuple[PlannedOp, ...]",
+                    (*layer.attention_ops, *layer.mlp_ops),
+                )
                 if op.node is not None
             )
         missing = sorted(referenced_ids - resolver_ids)
         if missing:
             raise ValueError(f"nodes_by_id does not resolve node IDs {missing}")
         for layer in layers:
-            for op in (*layer.attention_ops, *layer.mlp_ops):
+            for op in cast(
+                "tuple[PlannedOp, ...]", (*layer.attention_ops, *layer.mlp_ops)
+            ):
                 if (
                     op.node is not None
                     and resolver_by_id[op.node.node_id] is not op.node

@@ -1,4 +1,4 @@
-from typing import Optional
+from typing import Optional, Union
 
 from torchwright.compiler.groups.attn_sublayer import AttnSubLayer
 from torchwright.compiler.groups.mlp_sublayer import GatedMLPSubLayer, MLPSubLayer
@@ -6,6 +6,7 @@ from torchwright.compiler.groups.mlp_sublayer import GatedMLPSubLayer, MLPSubLay
 
 class TransformerLayer:
     attn: AttnSubLayer
+    mlp: Union[MLPSubLayer, GatedMLPSubLayer]
 
     def __init__(
         self,

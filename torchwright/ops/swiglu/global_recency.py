@@ -19,6 +19,7 @@ exact math on a full rollout, the same way the relu op is validated.
 """
 
 import math
+from typing import cast
 
 import torch
 
@@ -110,7 +111,7 @@ def global_position_from_bos(
     # feature rides the slowest *rotated* plane so its cos(m·θ_slow)
     # attenuation matches the inversion table.
     query_one = LiteralValue(torch.tensor([1.0]), name="bos_weight_query_one")
-    plane = rope.d_rot // 2 - 1
+    plane = cast(int, rope.d_rot) // 2 - 1
     query_matrix = torch.zeros((1, rope.d_head))
     query_matrix[0, plane] = A
     key_matrix = torch.zeros((1, rope.d_head))

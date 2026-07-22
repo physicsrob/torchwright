@@ -23,7 +23,7 @@ state, not a realization class (docs/plan_additional_mlp_routing.md).
 """
 
 from dataclasses import dataclass, replace
-from typing import Dict, Iterable, Optional, Tuple
+from typing import Any, Dict, Iterable, Mapping, Optional, Tuple, cast
 
 from torchwright.compiler.forward.scheduling_policy import SchedulingPolicy
 from torchwright.graph import Add, Attn, Linear, Node
@@ -209,7 +209,7 @@ def live_weight_row_ranges(node: Node) -> Tuple[Tuple[int, int], ...]:
     cached = getattr(node, "_live_weight_row_ranges", None)
     if cached is not None:
         return cached
-    live = node.output_matrix.ne(0).any(dim=1)
+    live = cast(Any, node).output_matrix.ne(0).any(dim=1)
     runs = []
     start = None
     for i, flag in enumerate(live.tolist()):
@@ -302,7 +302,7 @@ def class_heads(node: Node, cls: str, d_head: int) -> int:
     that know the placement use :func:`add_attn_heads`; callers that don't
     report the range (see :func:`summarize_cost`)."""
     if cls == ATTN_HEADS:
-        return (node.d_v + d_head - 1) // d_head
+        return (cast(Any, node).d_v + d_head - 1) // d_head
     if cls == ATTN_TRANSPORT:
         return linear_attn_heads(node, d_head)
     if cls == ATTN_ADD:
@@ -319,7 +319,7 @@ def class_hidden_slots(node: Node, cls: str) -> int:
     if cls in (MLP_BYPASS, MLP_ADD):
         return 2 * node.d_output
     if cls == MLP_COMPOSITE:
-        return node.n_lanes
+        return cast(int, cast(Any, node).n_lanes)
     return 0
 
 
@@ -380,7 +380,7 @@ def summarize_cost(
     add_reuse = add_copy = bypass_slots = lanes = 0
     for node in nodes:
         entry = table.entries[node.node_id]
-        cls = entry.resolved
+        cls = cast(str, entry.resolved)
         nodes_by_class[cls] = nodes_by_class.get(cls, 0) + 1
         if cls == ATTN_ADD:
             add_reuse += add_attn_heads(node, d_head, reused=True)
@@ -506,7 +506,7 @@ class RealizationTable:
         return RealizationTable(resolved)
 
     def resolve_from_assignment(
-        self, node_to_routing: Dict[int, str]
+        self, node_to_routing: Mapping[int, str]
     ) -> "RealizationTable":
         """The directed-path resolver: the CP-SAT solve's per-node sublayer
         decisions (``ScheduleAssignment.node_to_routing``) pick every free

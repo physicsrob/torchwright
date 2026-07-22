@@ -5,7 +5,7 @@ layer count and parameter overhead.
 """
 
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Set, Tuple
+from typing import Dict, List, Optional, Set, Tuple, cast
 
 import torch
 
@@ -216,7 +216,7 @@ def _fold_linear_into_ffn_gate(u: Linear, b: FFN) -> None:
     b.gate_bias = u.output_bias @ b.gate_proj.t() + b.gate_bias
     b.gate_proj = b.gate_proj @ m_u.t()
     if b.up_proj is not None:
-        b.up_bias = u.output_bias @ b.up_proj.t() + b.up_bias
+        b.up_bias = u.output_bias @ b.up_proj.t() + cast(torch.Tensor, b.up_bias)
         b.up_proj = b.up_proj @ m_u.t()
     b.inputs = [u.inputs[0]]
     b.d_input = m_u.shape[0]
@@ -618,7 +618,7 @@ def _merge_sibling_linear_leaves(
             and inputs[j].inputs[0] is shared_input
         ):
             j += 1
-        run: List[Linear] = inputs[i:j]
+        run: List[Linear] = cast(List[Linear], inputs[i:j])
 
         # A leaf occurring both inside and outside the run cannot merge: the
         # outside slot would read the widened survivor.
