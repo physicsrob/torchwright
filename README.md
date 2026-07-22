@@ -3,14 +3,15 @@
 torchwright is a compiler that transforms computation graphs into the weights of a
 transformer. The output is a standard decoder-only transformer — causal softmax
 attention, rotary position embeddings, RMSNorm, a KV cache — and its weights are
-emitted by the compiler, not trained. Compiled models are fp32-only, decode
-greedily, and need no GPU.
+emitted by the compiler, not trained. Compiled models are packaged, by default,
+as ordinary `transformers` checkpoints in the Phi-3 architecture:
+`AutoModelForCausalLM` loads them with no custom code and no `trust_remote_code`.
 
 ## Example
 
 The graph in `examples/binary_increment.py` parses a binary string and increments
 it, carry propagation included. Compiling it produces an ordinary Hugging Face
-model directory:
+model:
 
 ```python
 from examples.binary_increment import create_network_parts, D_MODEL, D_HEAD
@@ -21,9 +22,8 @@ compile_hf_bundle(output_node, embedding, "binary_increment_hf_bundle",
                   d=D_MODEL, d_head=D_HEAD)
 ```
 
-The bundle is a stock Phi-3 `transformers` checkpoint — safetensors, config,
-tokenizer — and loads with `AutoModelForCausalLM`, no custom code, no
-`trust_remote_code`:
+The result — safetensors, config, tokenizer — loads like any `transformers`
+checkpoint:
 
 ```python
 import torch
@@ -54,30 +54,24 @@ root. `examples/adder_1digit.py` is a 99-line worked example.
 Ops come in three groups: linear ops (`add`, `subtract`, `concat`, …), attention
 ops (latch a value at a marker position, read a fixed offset back,
 argmax/argmin/mean over positions), and nonlinear ops (`compare`, `select`,
-`multiply`, table lookups, `floor_int`, `mod_const`, …). The nonlinear ops are
-built from the transformer's MLP activation function and exist in two parallel
-libraries, `torchwright.ops.relu` and `torchwright.ops.swiglu`: the import path
-decides which activation the compiled model uses, a graph uses exactly one, and
-the compiler rejects a mix.
+`multiply`, table lookups, `floor_int`, `mod_const`, …).
+
+The nonlinear ops are built from the transformer's MLP activation function, so
+choosing an activation means choosing an op library. `torchwright.ops.relu`
+constructs every nonlinear op from ReLU sublayers; `torchwright.ops.swiglu`
+constructs the same ops from gated SwiGLU sublayers, and is what the Phi-3
+output uses. A graph imports from exactly one — the compiler rejects a graph
+that mixes them.
 
 Every op compiles down to concrete weights — attention heads, rows of MLP
-sublayers. A constraint-programming scheduler (CP-SAT, from Google OR-Tools) assigns every
-node to a layer, minimizing layer count; `optimize=0`, the default, uses a
-heuristic instead, and `optimize=1`–`3` buy increasing solver budgets (60 to 600
-seconds). Weights stream into the artifact layer by layer, so peak memory during
-compilation stays near one layer's worth regardless of depth.
-
-## Output formats
-
-`compile_hf_bundle`, shown above, is the primary output: a stock Phi-3 checkpoint
-any `transformers` code can load. Two alternates cover other consumers:
-
-- `compile_to_onnx` emits a KV-cached ONNX decoder (opset 14) plus two companion
-  files: a metadata file the loader reads to run the artifact as a token LM, and
-  a debug file that maps compiled tensors back to graph nodes. `load_onnx` wraps
-  the artifact in a tokenizer and a greedy generate loop under onnxruntime.
-- `compile_headless` builds an in-process torch module, used for tests and
-  debugging.
+sublayers. A scheduler assigns every node to a layer: `optimize=0`, the default,
+places nodes with a heuristic, and `optimize=1`–`3` hand placement to a
+constraint-programming solver (CP-SAT, from Google OR-Tools) that minimizes layer
+count under growing time budgets (60 to 600 seconds). Weights stream into the
+artifact layer by layer, so peak memory during
+compilation stays near one layer's worth regardless of depth. The same compile
+can also target ONNX: `compile_to_onnx` emits the transformer as a KV-cached
+ONNX artifact runnable outside `transformers`.
 
 ## Install
 
@@ -96,20 +90,19 @@ for CPU, or the `gpu` extra for `onnxruntime-gpu`.
 
 ## Verification
 
-Correctness is checked at four levels. Every approximate op is measured against
-its exact-math reference, and the per-op error bounds are committed to the repo
-(`docs/op_noise_data.json`); the test suite fails if the committed numbers drift
-from what the code measures. The compiler asserts its own structural invariants
-while compiling — no two live values share a residual column, writes never
-truncate, attention head widths match their declarations, values stay allocated
-until their last consumer — and each invariant is pinned by a negative test.
-Assert predicates can be attached to graph nodes; they run on exact values during
-reference evaluation and again on compiled values during debug forward passes, so
-an assert that passes in exact math but fires compiled pinpoints where
-approximation error exceeded its budget. Finally,
+torchwright checks that a compiled transformer faithfully executes its source
+graph. Many ops are implemented as piecewise-linear approximations, so
+correctness is measured and enforced rather than assumed, at four levels. Every
+approximate op is measured against its exact-math reference, and the per-op
+error bounds are committed to the repo (`docs/op_noise_data.json`); the test
+suite fails if the committed numbers drift from what the code measures. The
+compiler asserts its own structural invariants while compiling, each pinned by a
+negative test. Assert predicates can be attached to graph nodes; they run on
+exact values during reference evaluation and again on compiled values during
+debug forward passes, so an assert that passes in exact math but fires compiled
+pinpoints where approximation error exceeded its budget. Finally,
 `torchwright.debug.probe.probe_compiled` diffs a compiled transformer
-node-by-node against direct evaluation of the source graph — on the in-process
-backend or on the exported ONNX artifact.
+node-by-node against direct evaluation of the source graph.
 
 Per-op bounds are measured on each op's intended input ranges and are not
 additive through chains of ops; chain-level questions go to `probe_compiled`.
@@ -120,10 +113,10 @@ Twelve example graphs live in `examples/`:
 
 - `adder_1digit` — parses `"A+B\n"`, single-digit addition; the smallest
   complete program.
-- `adder` — 3-digit addition, computed digit-by-digit in embedding space with
-  carry propagation.
-- `adder_v2` — the same adder in scalar space: digits become numbers, one add,
-  digits again.
+- `adder` — 3-digit addition: each digit pair goes through a lookup table and
+  carries propagate right-to-left, pencil-and-paper style.
+- `adder_v2` — the same adder a different way: digits become numbers, one add,
+  numbers become digits.
 - `binary_increment` — the example above.
 - `caesar_cipher` — shift cipher; the shift amount is a runtime input digit.
 - `sort_digits_v1` — sorts a digit string ascending, one digit per
@@ -145,17 +138,12 @@ Examples that define `create_network_parts()` compile to a bundle with
 
 ## Limitations
 
-- fp32 only: the compiled attention relies on exact cancellations that a
-  fp16/bf16 downcast breaks.
-- Greedy decoding only (`do_sample=False`).
-- One activation per graph; the ReLU and SwiGLU op libraries cannot mix.
-- The KV cache is static: sequence length is fixed at export, and overrunning it
-  raises.
-- With RMSNorm on (the default for the Hugging Face and ONNX paths), supported
-  hidden sizes (`d`) are any multiple of 1024 up to 16384, or any power of two;
-  other widths raise. See `docs/rms_norm_dmodel.md`.
-- `optimize>0` compiles run for minutes by design; the budgets are ceilings, not
-  proofs of optimality.
+- Only fp32 is supported.
+- The KV cache is static: sequence length is fixed at export (`max_seq_len`,
+  default 512), and overrunning it raises.
+- With RMSNorm on (the default), supported hidden sizes (`d`) are any multiple
+  of 1024 up to 16384, or any power of two; other widths raise. See
+  `docs/rms_norm_dmodel.md`.
 
 ## Further reading
 
