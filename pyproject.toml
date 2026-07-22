@@ -2,6 +2,7 @@
 name = "torchwright"
 version = "0.1.0"
 description = "A compiler that transforms computation graphs into transformer neural network weights"
+license = "Apache-2.0"
 requires-python = ">=3.10"
 dependencies = [
     "torch",

@@ -37,7 +37,7 @@ from torchwright.compiler.hf import compile_hf_bundle
 
 _CARD_HEADER = """\
 ---
-license: mit
+license: apache-2.0
 library_name: transformers
 tags:
   - torchwright
