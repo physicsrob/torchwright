@@ -48,9 +48,7 @@ def test_direct_phi3_is_stock_fp32_eval(direct):
     assert {p.dtype for p in model.parameters()} == {torch.float32}
     # token.v6: stock Phi-3 ties lm_head to embed_tokens (one token table).
     assert model.config.tie_word_embeddings is True
-    assert (
-        model.lm_head.weight.data_ptr() == model.model.embed_tokens.weight.data_ptr()
-    )
+    assert model.lm_head.weight.data_ptr() == model.model.embed_tokens.weight.data_ptr()
     assert model.config.head_dim > 0
 
 
@@ -80,9 +78,9 @@ def test_stock_streaming_bundle_loads_without_custom_code(tmp_path, monkeypatch)
     assert not any(name.startswith("layer-") for name in files)
     assert not any(name.endswith(".py") for name in files)
     # token.v6 tied: the streamed bundle serializes one token table.
-    weight_map = json.loads(
-        (tmp_path / "model.safetensors.index.json").read_text()
-    )["weight_map"]
+    weight_map = json.loads((tmp_path / "model.safetensors.index.json").read_text())[
+        "weight_map"
+    ]
     assert "model.embed_tokens.weight" in weight_map
     assert "lm_head.weight" not in weight_map
     config = json.loads((tmp_path / "config.json").read_text())

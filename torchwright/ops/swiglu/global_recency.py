@@ -169,7 +169,5 @@ def global_position_from_bos(
     # the closing claim's atol covers the measured envelope: 2×|running-mean
     # bias| ≈ ±1.7 at 54k plus the mean head's own fp32 error ≤ 0.03, and
     # the top end exceeds max_len by 2×bias when the rollout fills the cap.
-    smoothed_pos = attend_causal_mean(
-        rope, raw, output_scale=2.0, claim_range=False
-    )
+    smoothed_pos = attend_causal_mean(rope, raw, output_scale=2.0, claim_range=False)
     return assert_in_range(smoothed_pos, 0.0, float(max_len), atol=8.0)

@@ -35,7 +35,6 @@ from torchwright.compiler.forward.cpsat_scheduler import (
 from torchwright.compiler.forward.scheduling_policy import SchedulingPolicy
 from torchwright.compiler.lower import lower
 
-
 # ---------------------------------------------------------------------------
 # The six example graphs (matches scripts/intralayer_example_sweep.py and
 # test_cpsat_snapshot.py).
@@ -57,7 +56,13 @@ def _build_bucketed_argmin():
     value = InputNode("baib_value", vw, value_range=(-100.0, 100.0))
     return attend_argmin_above_in_bucket(
         create_rope_config(d_head=d_head, max_positions=512),
-        score, validity, kb, above, qb, th, value,
+        score,
+        validity,
+        kb,
+        above,
+        qb,
+        th,
+        value,
     )
 
 
@@ -74,12 +79,22 @@ def _example_specs():
         # calculator: d pinned at the pre-unification test width (the canonical
         # publish D_MODEL=8192 would make this schedule test enormous for
         # nothing); d_head follows the module — it is baked into the graph.
-        "calculator": (lambda: calculator_simple.create_network_parts()[0], 1024, calculator_simple.D_HEAD),
+        "calculator": (
+            lambda: calculator_simple.create_network_parts()[0],
+            1024,
+            calculator_simple.D_HEAD,
+        ),
         "caesar": (lambda: caesar_cipher.create_network_parts()[0], 512, 16),
-        "sort_digits": (lambda: sort_digits_v1.create_network_parts()[0], sort_digits_v1.D_MODEL, sort_digits_v1.D_HEAD),
+        "sort_digits": (
+            lambda: sort_digits_v1.create_network_parts()[0],
+            sort_digits_v1.D_MODEL,
+            sort_digits_v1.D_HEAD,
+        ),
         "fibonacci": (lambda: fibonacci.create_network_parts()[0], 512, 16),
         "binary_increment": (
-            lambda: binary_increment.create_network_parts()[0], 256, 16
+            lambda: binary_increment.create_network_parts()[0],
+            256,
+            16,
         ),
         "bucketed_argmin": (_build_bucketed_argmin, 512, 32),
     }
@@ -120,7 +135,10 @@ def test_knob_off_is_byte_identical(name):
     """With the knob off the proto equals the plain legacy build."""
     node, d, d_head = _build(name)
     cfg = dict(
-        d=d, d_head=d_head, d_hidden=d, max_layers=_MAX_LAYERS,
+        d=d,
+        d_head=d_head,
+        d_hidden=d,
+        max_layers=_MAX_LAYERS,
         _pin_cancels=False,
     )
     default = _proto_text(build_cpsat_model(node, **cfg))
@@ -138,7 +156,10 @@ def test_knob_on_changes_proto(name):
     D-2 converse ``cancel_layer <= max_layers - 1`` under ``parked.Not()``."""
     node, d, d_head = _build(name)
     cfg = dict(
-        d=d, d_head=d_head, d_hidden=d, max_layers=_MAX_LAYERS,
+        d=d,
+        d_head=d_head,
+        d_hidden=d,
+        max_layers=_MAX_LAYERS,
         _pin_cancels=False,
     )
     off = _proto_text(build_cpsat_model(node, _canonical_cancel_reps=False, **cfg))
@@ -166,14 +187,19 @@ def test_canonical_form_on_solved_model(name, d):
     torch.manual_seed(0)
     low = _lower(build(), d)
     asg, stats = solve_schedule(
-        low, d=d, d_head=d_head, d_hidden=d, max_layers=100,
-        time_budget_s=60.0, policy=SchedulingPolicy(),
-        tighten_domains=True, _canonical_cancel_reps=True,
+        low,
+        d=d,
+        d_head=d_head,
+        d_hidden=d,
+        max_layers=100,
+        time_budget_s=60.0,
+        policy=SchedulingPolicy(),
+        tighten_domains=True,
+        _canonical_cancel_reps=True,
         _pin_cancels=False,
     )
     assert asg is not None and stats.is_optimal, (
-        f"{name} d={d}: expected a proven-optimal solve (got "
-        f"{stats.status_name})"
+        f"{name} d={d}: expected a proven-optimal solve (got " f"{stats.status_name})"
     )
     max_layers = 100
     # node_to_cancel_mech is keyed by exactly the non-keep-forever schedulable
@@ -205,15 +231,23 @@ def test_depth_invariance_on_vs_off(name, d):
         torch.manual_seed(0)
         low = _lower(build(), d)
         return solve_schedule(
-            low, d=d, d_head=d_head, d_hidden=d, max_layers=100,
-            time_budget_s=60.0, policy=SchedulingPolicy(),
-            tighten_domains=True, _canonical_cancel_reps=canonical,
+            low,
+            d=d,
+            d_head=d_head,
+            d_hidden=d,
+            max_layers=100,
+            time_budget_s=60.0,
+            policy=SchedulingPolicy(),
+            tighten_domains=True,
+            _canonical_cancel_reps=canonical,
             _pin_cancels=False,
         )
 
     off_asg, off_stats = _solve(False)
     on_asg, on_stats = _solve(True)
-    assert off_asg is not None and off_stats.is_optimal, f"{name} d={d}: off not optimal"
+    assert (
+        off_asg is not None and off_stats.is_optimal
+    ), f"{name} d={d}: off not optimal"
     assert on_asg is not None and on_stats.is_optimal, f"{name} d={d}: on not optimal"
     assert on_asg.n_layers == off_asg.n_layers, (
         f"{name} d={d}: canonicalization changed the optimal depth "
@@ -235,9 +269,15 @@ def test_knob_on_compile_replays_clean():
     def _compile(canonical):
         torch.manual_seed(0)
         net = forward_compile(
-            d=d, d_head=d_head, output_node=build(), device="cpu",
-            verbose=False, optimize=1, _canonical_cancel_reps=canonical,
-            _pin_cancels=False, _force_resolve=True,
+            d=d,
+            d_head=d_head,
+            output_node=build(),
+            device="cpu",
+            verbose=False,
+            optimize=1,
+            _canonical_cancel_reps=canonical,
+            _pin_cancels=False,
+            _force_resolve=True,
         )
         return len(net.layers)
 
@@ -245,6 +285,6 @@ def test_knob_on_compile_replays_clean():
     # error); a clean return is the tripwire staying silent.
     off_layers = _compile(False)
     on_layers = _compile(True)
-    assert on_layers == off_layers, (
-        f"caesar: knob-on compile depth {on_layers} != knob-off {off_layers}"
-    )
+    assert (
+        on_layers == off_layers
+    ), f"caesar: knob-on compile depth {on_layers} != knob-off {off_layers}"

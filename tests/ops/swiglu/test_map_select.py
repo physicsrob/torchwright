@@ -220,9 +220,7 @@ def test_in_range_structure_and_integer_bounds():
     val = out.compute(
         2, {"lo": torch.tensor([[2.0], [0.0]]), "hi": torch.tensor([[5.0], [8.0]])}
     )
-    ref = torch.tensor(
-        [[-1.0, -1.0, 1.0, 1.0, 1.0, -1.0, -1.0, -1.0], [1.0] * 8]
-    )
+    ref = torch.tensor([[-1.0, -1.0, 1.0, 1.0, 1.0, -1.0, -1.0, -1.0], [1.0] * 8])
     assert torch.allclose(val, ref, atol=1e-5, rtol=0.0)
 
 
@@ -299,7 +297,10 @@ def test_broadcast_select_zero_literal_branch_drops_lanes():
     out = broadcast_select(m, t, zero, n_slots=3, d_fill=1)
     ffn = _unwrap(out)
     assert ffn.n_lanes == 3  # false lanes dropped: per-slot cond_gate
-    inputs = {"m": torch.tensor([[1.0, -1.0, 1.0]]), "t": torch.tensor([[2.0, 3.0, 4.0]])}
+    inputs = {
+        "m": torch.tensor([[1.0, -1.0, 1.0]]),
+        "t": torch.tensor([[2.0, 3.0, 4.0]]),
+    }
     val = out.compute(1, inputs)
     # losing slots exactly zero (sigma(-scale) = 0)
     assert val[0, 1].item() == 0.0
@@ -352,9 +353,7 @@ def test_dynamic_extract_picks_row_and_out_of_range_zeros():
     tt = torch.arange(1.0, 9.0).unsqueeze(0).repeat(5, 1)
     ii = torch.tensor([[0.0], [1.0], [2.0], [3.0], [9.0]])
     val = out.compute(5, {"table": tt, "idx": ii})
-    ref = torch.tensor(
-        [[1.0, 2.0], [3.0, 4.0], [5.0, 6.0], [7.0, 8.0], [0.0, 0.0]]
-    )
+    ref = torch.tensor([[1.0, 2.0], [3.0, 4.0], [5.0, 6.0], [7.0, 8.0], [0.0, 0.0]])
     assert torch.allclose(val, ref, rtol=1e-5, atol=1e-5)
 
 

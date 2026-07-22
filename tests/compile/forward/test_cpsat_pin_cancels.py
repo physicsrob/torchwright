@@ -39,7 +39,6 @@ from torchwright.compiler.forward.cpsat_scheduler import (
 from torchwright.compiler.forward.scheduling_policy import SchedulingPolicy
 from torchwright.compiler.lower import lower
 
-
 # ---------------------------------------------------------------------------
 # The six example graphs (matches test_cpsat_sym1.py / test_cpsat_snapshot.py).
 # ---------------------------------------------------------------------------
@@ -60,7 +59,13 @@ def _build_bucketed_argmin():
     value = InputNode("baib_value", vw, value_range=(-100.0, 100.0))
     return attend_argmin_above_in_bucket(
         create_rope_config(d_head=d_head, max_positions=512),
-        score, validity, kb, above, qb, th, value,
+        score,
+        validity,
+        kb,
+        above,
+        qb,
+        th,
+        value,
     )
 
 
@@ -77,12 +82,22 @@ def _example_specs():
         # calculator: d pinned at the pre-unification test width (the canonical
         # publish D_MODEL=8192 would make this schedule test enormous for
         # nothing); d_head follows the module — it is baked into the graph.
-        "calculator": (lambda: calculator_simple.create_network_parts()[0], 1024, calculator_simple.D_HEAD),
+        "calculator": (
+            lambda: calculator_simple.create_network_parts()[0],
+            1024,
+            calculator_simple.D_HEAD,
+        ),
         "caesar": (lambda: caesar_cipher.create_network_parts()[0], 512, 16),
-        "sort_digits": (lambda: sort_digits_v1.create_network_parts()[0], sort_digits_v1.D_MODEL, sort_digits_v1.D_HEAD),
+        "sort_digits": (
+            lambda: sort_digits_v1.create_network_parts()[0],
+            sort_digits_v1.D_MODEL,
+            sort_digits_v1.D_HEAD,
+        ),
         "fibonacci": (lambda: fibonacci.create_network_parts()[0], 512, 16),
         "binary_increment": (
-            lambda: binary_increment.create_network_parts()[0], 256, 16
+            lambda: binary_increment.create_network_parts()[0],
+            256,
+            16,
         ),
         "bucketed_argmin": (_build_bucketed_argmin, 512, 32),
     }
@@ -129,9 +144,9 @@ def test_default_build_is_pinned(name):
     on = _proto_text(build_cpsat_model(node, _pin_cancels=True, **cfg))
     assert default == on, f"{name}: default proto differs from pinned build"
     assert "parked" not in default, f"{name}: default build has parked vars"
-    assert "pin_attn" in default or "pin_mlp" in default, (
-        f"{name}: default build posts no pin aux vars (pin is dead)"
-    )
+    assert (
+        "pin_attn" in default or "pin_mlp" in default
+    ), f"{name}: default build posts no pin aux vars (pin is dead)"
 
 
 @pytest.mark.parametrize("name", _NAMES)
@@ -147,9 +162,9 @@ def test_knob_off_reproduces_legacy_model(name):
     off = _proto_text(build_cpsat_model(node, _pin_cancels=False, **cfg))
     assert off != default, f"{name}: knob-off proto identical to default"
     assert "parked" in off, f"{name}: legacy build has no parked vars"
-    assert "pin_attn" not in off and "pin_mlp" not in off, (
-        f"{name}: legacy build still posts pin aux vars"
-    )
+    assert (
+        "pin_attn" not in off and "pin_mlp" not in off
+    ), f"{name}: legacy build still posts pin aux vars"
 
 
 # ---------------------------------------------------------------------------
@@ -168,8 +183,13 @@ _SOLVE_CELLS = [
 
 def _solve_cfg(d, d_head):
     return dict(
-        d=d, d_head=d_head, d_hidden=d, max_layers=100,
-        time_budget_s=60.0, policy=SchedulingPolicy(), tighten_domains=True,
+        d=d,
+        d_head=d_head,
+        d_hidden=d,
+        max_layers=100,
+        time_budget_s=60.0,
+        policy=SchedulingPolicy(),
+        tighten_domains=True,
     )
 
 
@@ -190,8 +210,13 @@ def test_pinned_solution_valid_in_unpinned_model(name, d):
     )
 
     built = build_cpsat_model(
-        low, d=d, d_head=d_head, d_hidden=d, max_layers=100,
-        policy=SchedulingPolicy(), tighten_domains=True,
+        low,
+        d=d,
+        d_head=d_head,
+        d_hidden=d,
+        max_layers=100,
+        policy=SchedulingPolicy(),
+        tighten_domains=True,
         _pin_cancels=False,  # the legacy model is the verification target
     )
     for nid, L in asg.node_to_layer.items():
@@ -228,12 +253,12 @@ def test_pinned_optimum_no_shallower_than_unpinned(name, d):
 
     off_asg, off_stats = _solve(False)
     on_asg, on_stats = _solve(True)
-    assert off_asg is not None and off_stats.is_optimal, (
-        f"{name} d={d}: unpinned not optimal in budget ({off_stats.status_name})"
-    )
-    assert on_asg is not None and on_stats.is_optimal, (
-        f"{name} d={d}: pinned not optimal in budget ({on_stats.status_name})"
-    )
+    assert (
+        off_asg is not None and off_stats.is_optimal
+    ), f"{name} d={d}: unpinned not optimal in budget ({off_stats.status_name})"
+    assert (
+        on_asg is not None and on_stats.is_optimal
+    ), f"{name} d={d}: pinned not optimal in budget ({on_stats.status_name})"
     assert on_asg.n_layers >= off_asg.n_layers, (
         f"{name} d={d}: pinned optimum {on_asg.n_layers} beats unpinned "
         f"{off_asg.n_layers} — impossible for a pure restriction"
@@ -267,9 +292,9 @@ def test_pin_reaches_snapshot_path():
     )
     live_default = _proto_text(build_cpsat_model(node, **cfg))
     assert snap_default != snap_off, "knob dead on the snapshot path"
-    assert snap_default == live_default, (
-        "default (pinned) snapshot proto differs from default live"
-    )
+    assert (
+        snap_default == live_default
+    ), "default (pinned) snapshot proto differs from default live"
 
 
 # ---------------------------------------------------------------------------
@@ -298,9 +323,9 @@ def test_full_hint_with_pin_passes_strict_validation():
         _pin_cancels=True,
         **cfg,
     )
-    assert asg is not None, (
-        f"pinned solve with full hint found nothing ({stats.status_name})"
-    )
+    assert (
+        asg is not None
+    ), f"pinned solve with full hint found nothing ({stats.status_name})"
 
 
 # ---------------------------------------------------------------------------
@@ -315,8 +340,12 @@ def test_default_pinned_compile_replays_clean():
     build, d, d_head = _example_specs()["caesar"]
     torch.manual_seed(0)
     net = forward_compile(
-        d=d, d_head=d_head, output_node=build(), device="cpu",
-        verbose=False, optimize=1,
+        d=d,
+        d_head=d_head,
+        output_node=build(),
+        device="cpu",
+        verbose=False,
+        optimize=1,
     )
     # A raise above would be the replay-depth tripwire (or any compile error)
     # firing; a clean return with real layers is the tripwire staying silent.
@@ -327,7 +356,13 @@ def test_knob_off_compile_replays_clean():
     build, d, d_head = _example_specs()["caesar"]
     torch.manual_seed(0)
     net = forward_compile(
-        d=d, d_head=d_head, output_node=build(), device="cpu",
-        verbose=False, optimize=1, _pin_cancels=False, _force_resolve=True,
+        d=d,
+        d_head=d_head,
+        output_node=build(),
+        device="cpu",
+        verbose=False,
+        optimize=1,
+        _pin_cancels=False,
+        _force_resolve=True,
     )
     assert len(net.layers) > 0

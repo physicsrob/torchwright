@@ -50,7 +50,9 @@ def _emit(n, total_value, kind):
     else:
         table = {cs._state(t, W): embed(str(t % 10)) for t in range(W)}
         default = embed("0")
-    node = cs._emit_from_total(embedding, cs._scalar(float(total_value)), table, default, W)
+    node = cs._emit_from_total(
+        embedding, cs._scalar(float(total_value)), table, default, W
+    )
     value = node.compute(n_pos=1, input_values={})[0]
     return embedding.tokenizer.vocab[int(value.argmax())]
 
@@ -88,7 +90,9 @@ def _norm_step(n, m, prev_count, digit_value):
     embedding = cs.create_onehot_embedding(cs.scratch_vocab(n))
     embed = embedding.get_embedding
     n_state = cs._n_thinking(n)
-    count_table = {cs._state(k, n_state): embed(cs._count_text(k)) for k in range(n_state)}
+    count_table = {
+        cs._state(k, n_state): embed(cs._count_text(k)) for k in range(n_state)
+    }
     count_default = embed(cs._count_text(0))
 
     prev = cs._scalar(float(prev_count))
@@ -97,7 +101,9 @@ def _norm_step(n, m, prev_count, digit_value):
     in_run = cs.compare(prev, thresh=m - 0.5)
     still_zero = cs.bool_all_true([in_run, is_zero])
     this_count = cs.add(prev, cs.bool_to_01(still_zero))
-    node = cs._emit_from_total(embedding, this_count, count_table, count_default, n_state)
+    node = cs._emit_from_total(
+        embedding, this_count, count_table, count_default, n_state
+    )
     value = node.compute(n_pos=1, input_values={})[0]
     return embedding.tokenizer.vocab[int(value.argmax())]
 
@@ -122,5 +128,9 @@ def test_normalization_step_freezes_after_run():
     # interior zero, not a leading one.
     for m in range(1, 2 * n):
         for prev in range(m):  # prev_count < m: run already ended
-            assert _norm_step(n, m, prev_count=prev, digit_value=0) == cs._count_text(prev)
-            assert _norm_step(n, m, prev_count=prev, digit_value=7) == cs._count_text(prev)
+            assert _norm_step(n, m, prev_count=prev, digit_value=0) == cs._count_text(
+                prev
+            )
+            assert _norm_step(n, m, prev_count=prev, digit_value=7) == cs._count_text(
+                prev
+            )

@@ -150,17 +150,14 @@ def test_watches_cost_nothing_compiled():
 def test_auto_collection_asserts():
     _, out = _build_graph(with_assert=True)
     mod = _compile(out)
-    assert any(
-        c.kind == "assert" for n in mod._checked_nodes for c in n.checks
-    )
+    assert any(c.kind == "assert" for n in mod._checked_nodes for c in n.checks)
 
 
 def test_auto_collection_watches():
     _, out = _build_graph(with_watch=True)
     mod = _compile(out)
     assert (
-        sum(1 for n in mod._checked_nodes for c in n.checks if c.kind == "watch")
-        == 1
+        sum(1 for n in mod._checked_nodes for c in n.checks if c.kind == "watch") == 1
     )
 
 

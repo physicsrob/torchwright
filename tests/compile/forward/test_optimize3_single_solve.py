@@ -46,13 +46,21 @@ def _ffn_chain_graph():
     torch.manual_seed(0)
     x = create_input("x", 8)
     block_a = linear_relu_linear(
-        x, torch.randn(16, 8), torch.zeros(16),
-        torch.randn(16, 12), torch.zeros(12), name="a",
+        x,
+        torch.randn(16, 8),
+        torch.zeros(16),
+        torch.randn(16, 12),
+        torch.zeros(12),
+        name="a",
     )
     L_mid = Linear(block_a, torch.randn(12, 16), torch.zeros(16), name="L_mid")
     block_c = linear_relu_linear(
-        L_mid, torch.randn(16, 16), torch.zeros(16),
-        torch.randn(16, 8), torch.zeros(8), name="c",
+        L_mid,
+        torch.randn(16, 16),
+        torch.zeros(16),
+        torch.randn(16, 8),
+        torch.zeros(8),
+        name="c",
     )
     return Linear(block_c, torch.randn(8, 4), torch.zeros(4), name="L_out")
 
@@ -65,8 +73,12 @@ def test_optimize3_compiles_replays_and_is_no_worse_than_optimize1():
         d=80, d_head=80, output_node=graph, device="cpu", verbose=False, optimize=3
     )
     net1 = forward_compile(
-        d=80, d_head=80, output_node=_width_graph(), device="cpu",
-        verbose=False, optimize=1,
+        d=80,
+        d_head=80,
+        output_node=_width_graph(),
+        device="cpu",
+        verbose=False,
+        optimize=1,
     )
     assert len(net3.layers) <= len(net1.layers)
 
@@ -81,8 +93,15 @@ def test_solve_budget_override_is_accepted():
     (production default 600s stays put) and still yields a valid solve."""
     graph = _width_graph()
     net = forward_compile(
-        d=80, d_head=80, output_node=graph, device="cpu", verbose=False,
-        optimize=3, _solve_only=True, _force_resolve=True, _solve_budget_s=5.0,
+        d=80,
+        d_head=80,
+        output_node=graph,
+        device="cpu",
+        verbose=False,
+        optimize=3,
+        _solve_only=True,
+        _force_resolve=True,
+        _solve_budget_s=5.0,
     )
     assert net.cpsat_assignment is not None
     assert net.cpsat_assignment.n_layers >= 1
@@ -129,8 +148,14 @@ def test_optimize3_is_one_solve_with_the_full_budget_and_the_mech_hint(
     monkeypatch.setattr(cmod, "solve_schedule", fake_solve)
 
     net = forward_compile(
-        d=64, d_head=8, output_node=_ffn_chain_graph(), device="cpu",
-        verbose=False, optimize=3, _solve_only=True, _force_resolve=True,
+        d=64,
+        d_head=8,
+        output_node=_ffn_chain_graph(),
+        device="cpu",
+        verbose=False,
+        optimize=3,
+        _solve_only=True,
+        _force_resolve=True,
     )
 
     # One continuous solve; a non-optimal FEASIBLE result is accepted as-is

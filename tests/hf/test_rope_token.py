@@ -65,7 +65,9 @@ def test_hf_rope_prefill_equals_cached_decode():
         rows = []
         for t in range(ids.shape[1]):
             out = hf(
-                ids[:, t : t + 1], past_key_values=cache, use_cache=True,
+                ids[:, t : t + 1],
+                past_key_values=cache,
+                use_cache=True,
                 cache_position=torch.arange(t, t + 1),
             )
             cache = out.past_key_values

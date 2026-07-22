@@ -44,9 +44,7 @@ def main() -> None:
     b = create_input("b", 1)
     tracemalloc.start()
     t0 = time.perf_counter()
-    node = multiply_2d(
-        a, b, max_abs1=max_abs, max_abs2=max_abs, step1=step, step2=step
-    )
+    node = multiply_2d(a, b, max_abs1=max_abs, max_abs2=max_abs, step1=step, step2=step)
     elapsed = time.perf_counter() - t0
     _cur, peak = tracemalloc.get_traced_memory()
     tracemalloc.stop()

@@ -150,8 +150,7 @@ def store_assignment(
         )
         new_blocks = (
             tuple(int(value) for value in new_blocks_raw)
-            if isinstance(new_blocks_raw, (list, tuple))
-            and len(new_blocks_raw) == 2
+            if isinstance(new_blocks_raw, (list, tuple)) and len(new_blocks_raw) == 2
             else None
         )
         prior_objective = prior_meta.get("realized_objective")
@@ -169,9 +168,7 @@ def store_assignment(
         ):
             prior_dominates = int(prior_objective) <= int(new_objective)
         else:
-            prior_dominates = (
-                prior.get("n_layers", 1 << 30) <= assignment.n_layers
-            )
+            prior_dominates = prior.get("n_layers", 1 << 30) <= assignment.n_layers
         if prior_dominates:
             new_level = int(meta.get("optimize", 0) or 0)
             if new_level > int(prior_meta.get("optimize", 0) or 0):

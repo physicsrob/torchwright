@@ -132,8 +132,10 @@ def _node_field_matches(key, sval, cval, node_map):
     if key == "checks":
         # Fresh list object per clone; Check entries shared by reference.
         return (
-            cval is not sval or not sval
-        ) and all(c is s for c, s in zip(cval, sval)) and len(cval) == len(sval)
+            (cval is not sval or not sval)
+            and all(c is s for c, s in zip(cval, sval))
+            and len(cval) == len(sval)
+        )
     if key == "_structural_type":
         return cval.value_range == sval.value_range
     if key == "_affine_bound":

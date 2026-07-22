@@ -44,8 +44,15 @@ def test_named_example_widths_are_rmsnorm_compatible():
         sort_digits_v1,
     )
 
-    modules = [adder, binary_increment, caesar_cipher, calculator_scratchpad,
-               calculator_simple, fibonacci, sort_digits_v1]
+    modules = [
+        adder,
+        binary_increment,
+        caesar_cipher,
+        calculator_scratchpad,
+        calculator_simple,
+        fibonacci,
+        sort_digits_v1,
+    ]
     unsupported = {
         module.__name__: module.D_MODEL
         for module in modules
@@ -62,7 +69,11 @@ def test_onnx_accepts_the_same_phi3_profile(tmp_path):
     embedding = create_onehot_embedding(["<bos>", "<eos>", "a"])
     output = rotary_offset_head(embedding, delta_pos=-1, d_qk=16)
     artifact = compile_to_onnx(
-        output, embedding, str(tmp_path / "profile.onnx"), d=256, d_head=16,
+        output,
+        embedding,
+        str(tmp_path / "profile.onnx"),
+        d=256,
+        d_head=16,
         profile=CompileProfile.PHI3,
     )
     assert artifact.activation == "swish"

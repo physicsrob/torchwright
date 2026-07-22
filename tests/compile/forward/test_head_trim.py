@@ -94,7 +94,9 @@ def test_compiled_zero_support_floor_head_is_compacted():
     y = create_input("y", D_HEAD, value_range=(-1.0, 1.0))
     # Zero weights, nonzero bias: the value is written by compute_bias (MLP),
     # so the value check stays nontrivial while the floor head's O == 0.
-    lin = Linear(x, torch.zeros(2 * D_HEAD, 3), torch.tensor([1.5, -0.5, 0.25]), name="allzero")
+    lin = Linear(
+        x, torch.zeros(2 * D_HEAD, 3), torch.tensor([1.5, -0.5, 0.25]), name="allzero"
+    )
     other = Linear(y, torch.randn(D_HEAD, 2) * 0.2, name="other")
     out = Concatenate([lin, other])
 

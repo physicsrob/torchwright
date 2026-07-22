@@ -27,19 +27,18 @@ import pytest
 
 pytest.importorskip("transformers")
 
-_HF_DIR = (
-    Path(__file__).resolve().parents[2]
-    / "torchwright"
-    / "compiler"
-    / "hf"
-)
+_HF_DIR = Path(__file__).resolve().parents[2] / "torchwright" / "compiler" / "hf"
 
 # (filename, extra non-relative imports allowed beyond stdlib, allowed relative imports)
 _SHIPPED = [
     ("configuration_torchwright_custom.py", {"transformers"}, []),
     ("tokenization_torchwright_custom.py", {"transformers"}, []),
     # The model file may import torch and exactly one sibling: its config.
-    ("modeling_torchwright_custom.py", {"transformers", "torch"}, ["configuration_torchwright_custom"]),
+    (
+        "modeling_torchwright_custom.py",
+        {"transformers", "torch"},
+        ["configuration_torchwright_custom"],
+    ),
 ]
 
 
@@ -85,7 +84,11 @@ def test_custom_architecture_is_explicit_and_renamed(tmp_path):
     embedding = create_onehot_embedding(vocab)
     output = rotary_offset_head(embedding, delta_pos=-1, d_qk=16)
     compile_hf_bundle(
-        output, embedding, tmp_path, d=256, d_head=16,
+        output,
+        embedding,
+        tmp_path,
+        d=256,
+        d_head=16,
         architecture="custom",
     )
     config = json.loads((tmp_path / "config.json").read_text())

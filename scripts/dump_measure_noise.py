@@ -5,22 +5,27 @@ venv is broken or we need A100-specific measurements.  Usage:
 
     make modal-run MODULE=scripts.dump_measure_noise > docs/op_noise_data.json
 """
+
 import sys
 from pathlib import Path
 
 from scripts.measure_op_noise import _measure_all, render_json
-from torchwright.compiler.forward.compile import forward_compile  # noqa: F401 pre-import
+from torchwright.compiler.forward.compile import (
+    forward_compile,
+)  # noqa: F401 pre-import
 
 
 def main():
     measurements = _measure_all()
     # Get commit SHA from env or fallback
     import subprocess
+
     try:
         sha = subprocess.check_output(["git", "rev-parse", "HEAD"]).decode().strip()
     except Exception:
         sha = "unknown"
     import datetime
+
     now = datetime.datetime.utcnow().isoformat() + "Z"
     json_text = render_json(measurements, commit=sha, measured_at=now)
     # Print a separator so we can grep out the real JSON block

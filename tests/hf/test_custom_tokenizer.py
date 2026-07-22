@@ -14,7 +14,9 @@ import pytest
 
 pytest.importorskip("transformers")
 
-from torchwright.compiler.hf.tokenization_torchwright_custom import TorchwrightCustomTokenizer
+from torchwright.compiler.hf.tokenization_torchwright_custom import (
+    TorchwrightCustomTokenizer,
+)
 
 _VOCAB = ["<unk>", "<bos>", "<eos>"] + list("0123456789+-*\n")
 

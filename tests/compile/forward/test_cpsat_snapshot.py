@@ -32,7 +32,6 @@ from torchwright.compiler.forward.cpsat_snapshot import (
 )
 from torchwright.compiler.forward.scheduling_policy import SchedulingPolicy
 
-
 # ---------------------------------------------------------------------------
 # The six example graphs (matches scripts/intralayer_example_sweep.py)
 # ---------------------------------------------------------------------------
@@ -53,7 +52,13 @@ def _build_bucketed_argmin():
     value = InputNode("baib_value", vw, value_range=(-100.0, 100.0))
     return attend_argmin_above_in_bucket(
         create_rope_config(d_head=d_head, max_positions=512),
-        score, validity, kb, above, qb, th, value,
+        score,
+        validity,
+        kb,
+        above,
+        qb,
+        th,
+        value,
     )
 
 
@@ -70,12 +75,22 @@ def _example_specs():
         # calculator: d pinned at the pre-unification test width (the canonical
         # publish D_MODEL=8192 would make this schedule test enormous for
         # nothing); d_head follows the module — it is baked into the graph.
-        "calculator": (lambda: calculator_simple.create_network_parts()[0], 1024, calculator_simple.D_HEAD),
+        "calculator": (
+            lambda: calculator_simple.create_network_parts()[0],
+            1024,
+            calculator_simple.D_HEAD,
+        ),
         "caesar": (lambda: caesar_cipher.create_network_parts()[0], 512, 16),
-        "sort_digits": (lambda: sort_digits_v1.create_network_parts()[0], sort_digits_v1.D_MODEL, sort_digits_v1.D_HEAD),
+        "sort_digits": (
+            lambda: sort_digits_v1.create_network_parts()[0],
+            sort_digits_v1.D_MODEL,
+            sort_digits_v1.D_HEAD,
+        ),
         "fibonacci": (lambda: fibonacci.create_network_parts()[0], 512, 16),
         "binary_increment": (
-            lambda: binary_increment.create_network_parts()[0], 256, 16
+            lambda: binary_increment.create_network_parts()[0],
+            256,
+            16,
         ),
         "bucketed_argmin": (_build_bucketed_argmin, 512, 32),
     }
@@ -128,8 +143,12 @@ def test_canonicalized_snapshot_rebuilds_a_valid_model():
     node, d, d_head = _build("caesar")
     cfg = dict(d=d, d_head=d_head, d_hidden=d, max_layers=40)
     problem = snapshot_from_graph_model(build_graph_model(node)).canonicalized(node)
-    a = _proto_text(build_model_from_snapshot(SchedulingProblem.loads(problem.dumps()), **cfg))
-    b = _proto_text(build_model_from_snapshot(SchedulingProblem.loads(problem.dumps()), **cfg))
+    a = _proto_text(
+        build_model_from_snapshot(SchedulingProblem.loads(problem.dumps()), **cfg)
+    )
+    b = _proto_text(
+        build_model_from_snapshot(SchedulingProblem.loads(problem.dumps()), **cfg)
+    )
     assert a == b  # canonical rebuild is deterministic across loads
 
 
@@ -144,7 +163,11 @@ def test_hinted_build_proto_identical():
     # would make this proto comparison vacuous on the widening path.
     node, d, d_head = _build("caesar")
     cfg = dict(
-        d=d, d_head=d_head, d_hidden=d, max_layers=40, tighten_domains=True,
+        d=d,
+        d_head=d_head,
+        d_hidden=d,
+        max_layers=40,
+        tighten_domains=True,
         _pin_cancels=False,
     )
     # A feasible schedule -> hint dicts that exercise the cancel-window widening.
@@ -158,9 +181,7 @@ def test_hinted_build_proto_identical():
     problem = SchedulingProblem.loads(
         snapshot_from_graph_model(build_graph_model(node)).dumps()
     )
-    snap = _proto_text(
-        build_model_from_snapshot(problem, diagnostic_hint=hint, **cfg)
-    )
+    snap = _proto_text(build_model_from_snapshot(problem, diagnostic_hint=hint, **cfg))
     assert snap == live
 
 
@@ -186,8 +207,13 @@ def test_frozen_hint_roundtrips():
 def test_solve_from_snapshot_matches_live_solve():
     node, d, d_head = _build("caesar")
     kw = dict(
-        d=d, d_head=d_head, d_hidden=d, max_layers=40, time_budget_s=30.0,
-        tighten_domains=True, policy=SchedulingPolicy(),
+        d=d,
+        d_head=d_head,
+        d_hidden=d,
+        max_layers=40,
+        time_budget_s=30.0,
+        tighten_domains=True,
+        policy=SchedulingPolicy(),
         solver_params={"random_seed": 1},
     )
     live_asg, live_stats = solve_schedule(node, **kw)
@@ -208,8 +234,13 @@ def test_solve_from_snapshot_matches_live_solve():
 def test_save_load_with_fingerprint_gate(tmp_path):
     node, d, d_head = _build("binary_increment")
     geom = dict(
-        d=d, d_head=d_head, d_hidden=d, flex_routing=True, cancel_slack=2,
-        policy=SchedulingPolicy(), max_layers=60,
+        d=d,
+        d_head=d_head,
+        d_hidden=d,
+        flex_routing=True,
+        cancel_slack=2,
+        policy=SchedulingPolicy(),
+        max_layers=60,
     )
     cp = 5  # arbitrary stand-in for the lowered critical path in this unit test
     problem = (

@@ -21,8 +21,12 @@ constants are stored.
 import pytest
 import torch
 
-from torchwright.compiler.hf.configuration_torchwright_custom import TorchwrightCustomConfig
-from torchwright.compiler.hf.modeling_torchwright_custom import TorchwrightCustomForCausalLM
+from torchwright.compiler.hf.configuration_torchwright_custom import (
+    TorchwrightCustomConfig,
+)
+from torchwright.compiler.hf.modeling_torchwright_custom import (
+    TorchwrightCustomForCausalLM,
+)
 
 
 def _tiny_model(rope_base):

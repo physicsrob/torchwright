@@ -45,7 +45,9 @@ def _build_direct(tmpdir):
 
 
 def test_torchwright_config_validates_d_rot():
-    from torchwright.compiler.hf.configuration_torchwright_custom import TorchwrightCustomConfig
+    from torchwright.compiler.hf.configuration_torchwright_custom import (
+        TorchwrightCustomConfig,
+    )
 
     # All-zero defaults (HF instantiates configs this way) must not raise.
     TorchwrightCustomConfig()
@@ -62,7 +64,10 @@ def test_hf_partial_rope_config_carried():
     with tempfile.TemporaryDirectory() as tmp:
         hf = _build_direct(tmp)
     assert hf.config.rope_parameters["rope_theta"] == ROPE_BASE
-    assert int(hf.config.head_dim * hf.config.rope_parameters["partial_rotary_factor"]) == D_ROT
+    assert (
+        int(hf.config.head_dim * hf.config.rope_parameters["partial_rotary_factor"])
+        == D_ROT
+    )
     assert hf.config.head_dim == D_HEAD
 
 
@@ -126,7 +131,10 @@ def test_hf_partial_content_head_selects_by_content():
     ids = torch.tensor([[_VOCAB.index(t) for t in seq]])
     with tempfile.TemporaryDirectory() as tmp:
         hf = _build_content_model(tmp)
-        assert int(hf.config.head_dim * hf.config.rope_parameters["partial_rotary_factor"]) == D_ROT
+        assert (
+            int(hf.config.head_dim * hf.config.rope_parameters["partial_rotary_factor"])
+            == D_ROT
+        )
         with torch.no_grad():
             logits = hf(ids).logits[0]
     pred = [_VOCAB[i] for i in logits.argmax(-1).tolist()]

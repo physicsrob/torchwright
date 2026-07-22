@@ -426,7 +426,9 @@ def test_ceil_int_wide_range_large_magnitude():
     c = ceil_int(x, min_value=0, max_value=65535)
     for v in (10.4, 1000.4, 40000.4, 62195.98):
         r = c.compute(n_pos=1, input_values={"x": torch.tensor([[v]])}).item()
-        assert abs(r - math.ceil(v)) < 0.01, f"ceil_int({v}) should be {math.ceil(v)}, got {r}"
+        assert (
+            abs(r - math.ceil(v)) < 0.01
+        ), f"ceil_int({v}) should be {math.ceil(v)}, got {r}"
 
 
 def test_ceil_int_high_sharpness_screen_y():

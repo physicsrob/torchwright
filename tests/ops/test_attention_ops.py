@@ -383,12 +383,10 @@ def test_attend_causal_mean_is_exact_cumulative_mean():
     torch.manual_seed(3)
     value_in = torch.randn(n_pos, 2) * 50.0
     result = _run(out, n_pos, value=value_in)
-    expected = torch.cumsum(value_in, dim=0) / torch.arange(
-        1, n_pos + 1
-    ).unsqueeze(1)
-    assert torch.allclose(result, expected, atol=1e-4), (
-        f"max err {(result - expected).abs().max()}"
-    )
+    expected = torch.cumsum(value_in, dim=0) / torch.arange(1, n_pos + 1).unsqueeze(1)
+    assert torch.allclose(
+        result, expected, atol=1e-4
+    ), f"max err {(result - expected).abs().max()}"
 
 
 def test_attend_causal_mean_exact_under_full_rotary():
@@ -402,12 +400,10 @@ def test_attend_causal_mean_exact_under_full_rotary():
     n_pos = 64
     value_in = torch.linspace(-100.0, 100.0, n_pos).unsqueeze(1)
     result = _run(out, n_pos, value=value_in)
-    expected = torch.cumsum(value_in, dim=0) / torch.arange(
-        1, n_pos + 1
-    ).unsqueeze(1)
-    assert torch.allclose(result, expected, atol=1e-4), (
-        f"max err {(result - expected).abs().max()}"
-    )
+    expected = torch.cumsum(value_in, dim=0) / torch.arange(1, n_pos + 1).unsqueeze(1)
+    assert torch.allclose(
+        result, expected, atol=1e-4
+    ), f"max err {(result - expected).abs().max()}"
 
 
 def test_attend_causal_mean_output_scale_folds_into_o():

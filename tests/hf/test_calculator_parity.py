@@ -98,9 +98,7 @@ def model(artifact_path):
     from examples import calculator_simple
 
     out, emb = calculator_simple.create_network_parts()
-    return compile_to_hf(
-        out, emb, d=_EXPORT_D, d_head=calculator_simple.D_HEAD
-    )
+    return compile_to_hf(out, emb, d=_EXPORT_D, d_head=calculator_simple.D_HEAD)
 
 
 @pytest.fixture(scope="module")

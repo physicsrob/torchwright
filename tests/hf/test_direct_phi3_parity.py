@@ -231,9 +231,7 @@ def test_direct_model_is_storage_tied(direct_model):
     equal copies — the token.v6 tie survives the from_pretrained load path."""
     model, _ = direct_model
     assert model.config.tie_word_embeddings
-    assert (
-        model.lm_head.weight.data_ptr() == model.model.embed_tokens.weight.data_ptr()
-    )
+    assert model.lm_head.weight.data_ptr() == model.model.embed_tokens.weight.data_ptr()
 
 
 def test_save_load_round_trip(tmp_path, direct_model):

@@ -239,9 +239,9 @@ def test_smoothed_position_compiled_partial_rotary():
     out = m(_pack(m, {"bos": bos}, n).to(m._net.device)).reshape(-1).cpu()
 
     t = torch.arange(n, dtype=out.dtype)
-    assert float((out - t).abs().max()) < 0.5, (
-        f"max |pos - t| = {float((out - t).abs().max()):.4f}"
-    )
+    assert (
+        float((out - t).abs().max()) < 0.5
+    ), f"max |pos - t| = {float((out - t).abs().max()):.4f}"
     steps = out[1:] - out[:-1]
     assert float(steps.min()) > 0.8, f"min step {float(steps.min()):.4f}"
     assert float(steps.max()) < 1.2, f"max step {float(steps.max()):.4f}"

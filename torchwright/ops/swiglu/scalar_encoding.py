@@ -91,6 +91,7 @@ def scalar_to_embedding(inp: Node, embedding: Embedding) -> Node:
         name="scalar_to_embedding",
     )
 
+
 def digit_to_scaled_scalar(
     embedding: Embedding, digit_node: Node, place_value: float
 ) -> Node:
@@ -148,4 +149,3 @@ def number_to_digit_scalars(inp: Node, num_digits: int, max_value: int) -> List[
             )
             max_value = place - 1
     return digits
-

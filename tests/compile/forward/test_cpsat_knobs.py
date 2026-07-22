@@ -650,9 +650,7 @@ def test_schedule_cache_not_written_when_replay_fails(tmp_path, monkeypatch):
     assert list(tmp_path.glob("*.json")) == []
 
 
-def test_schedule_cache_stores_once_after_replay_and_not_on_hit(
-    tmp_path, monkeypatch
-):
+def test_schedule_cache_stores_once_after_replay_and_not_on_hit(tmp_path, monkeypatch):
     """The positive mirror: a successful non-cached solve stores exactly once
     (after replay), and a cache hit does not store again."""
     from torchwright.compiler.forward import compile as compile_mod

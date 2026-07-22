@@ -153,4 +153,3 @@ def test_ready_nodes_progression():
         assert iterations < 100, "Too many iterations"
 
     assert out in available
-

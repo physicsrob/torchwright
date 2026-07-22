@@ -222,5 +222,12 @@ def test_custom_hf_profile_refuses_biasless_compile(tmp_path):
 
     out, emb = _build(machine="relu")
     with pytest.raises(ValueError, match="requires bias=True"):
-        compile_to_hf(out, emb, d=D, d_head=D_HEAD, max_seq_len=16,
-            architecture="custom", bias=False)
+        compile_to_hf(
+            out,
+            emb,
+            d=D,
+            d_head=D_HEAD,
+            max_seq_len=16,
+            architecture="custom",
+            bias=False,
+        )
