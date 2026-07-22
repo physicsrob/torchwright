@@ -26,18 +26,10 @@ The result — safetensors, config, tokenizer — loads like any `transformers`
 checkpoint:
 
 ```python
-import torch
-from transformers import AutoModelForCausalLM, AutoTokenizer
+from transformers import pipeline
 
-model = AutoModelForCausalLM.from_pretrained("binary_increment_hf_bundle").eval()
-tok = AutoTokenizer.from_pretrained("binary_increment_hf_bundle")
-
-enc = tok("1011\n", return_tensors="pt")
-with torch.no_grad():
-    out = model.generate(enc["input_ids"], attention_mask=enc["attention_mask"],
-                         max_new_tokens=16, do_sample=False,
-                         eos_token_id=tok.eos_token_id, pad_token_id=tok.eos_token_id)
-print(tok.decode(out[0, enc["input_ids"].shape[1]:], skip_special_tokens=True))
+generate = pipeline("text-generation", model="binary_increment_hf_bundle")
+print(generate("1011\n", return_full_text=False)[0]["generated_text"])
 # 1100
 ```
 

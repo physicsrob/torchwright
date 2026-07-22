@@ -112,6 +112,16 @@ def _staged_bundle_directory(output_dir):
         raise
 
 
+def _write_generation_config(output_dir, bos_id, eos_id) -> None:
+    """Compiled vocabs carry no pad token: alias pad to eos so
+    ``generate()`` and ``pipeline()`` run without an explicit pad_token_id."""
+    from transformers import GenerationConfig
+
+    GenerationConfig(
+        bos_token_id=bos_id, eos_token_id=eos_id, pad_token_id=eos_id
+    ).save_pretrained(output_dir)
+
+
 def _validate_staged_bundle(directory, *, expect_tokenizer: bool) -> None:
     """Validate bundle structure and tensor manifests without loading weights."""
     from safetensors import safe_open
@@ -258,6 +268,9 @@ def _save_hf_bundle_into(
 ):
     os.makedirs(output_dir, exist_ok=True)
     model.save_pretrained(output_dir)
+    _write_generation_config(
+        output_dir, model.config.bos_token_id, model.config.eos_token_id
+    )
     if not write_tokenizer:
         return
     bos_id, eos_id = model.config.bos_token_id, model.config.eos_token_id
@@ -608,6 +621,7 @@ def _compile_hf_bundle_into(
             )
             config.architectures = ["Phi3ForCausalLM"]
         config.save_pretrained(output_dir)
+        _write_generation_config(output_dir, bos_id, eos_id)
 
         shard_count = spec.n_layers + 1
         weight_map, total_size = sink.weight_map, sink.total_size

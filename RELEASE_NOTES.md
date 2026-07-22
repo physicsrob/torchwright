@@ -1,5 +1,11 @@
 # Unreleased
 
+## Bundles ship a generation config
+
+- `compile_hf_bundle` and `save_hf_bundle` now write
+  `generation_config.json` (pad token aliased to eos), so `generate()`
+  and `pipeline()` run without an explicit `pad_token_id`.
+
 ## Breaking: Hugging Face compilation is Phi-3-first
 
 - `compile_to_hf` and `compile_hf_bundle` now default to the typed
