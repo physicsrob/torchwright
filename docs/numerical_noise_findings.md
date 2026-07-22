@@ -34,11 +34,18 @@ a property of the summation order — which differs between local CPU BLAS
 and A100 cuBLAS — and the op's real defect is catastrophic cancellation in
 its lane decomposition.
 
-**Status: decision pending (spans_plan.md decision 2).** Either pin the
-probe's device and reduction so the committed number means something, or
-restructure the lane decomposition so contributions don't blow up.  Do
-**not** re-run `make measure-noise` on whichever machine is to hand — that
-re-pins one device's reduction order and papers over the defect again.
+**Status: decided 2026-07-22 (Rob) — the drift gate tolerates both
+reduction orders.** `test_numerical_noise_drift.py` now applies a targeted
+factor-of-8 ratio guard to the `staircase_*` rows of `piecewise_linear`
+(both machines) instead of the global 40% tolerance: the observed
+CPU-sequential vs A100-blocked swing is 2–4x and ULP-quantized, and a
+genuine decomposition regression moves these numbers by orders of
+magnitude, so the wider guard still catches it.  The committed numbers
+remain the sequential-order row.  Restructuring the lane decomposition so
+contributions don't blow up remains open as the principled fix.  The
+warning still stands: do **not** re-run `make measure-noise` on whichever
+machine is to hand to "fix" a staircase diff — that just re-pins the other
+reduction order.
 
 ### MLP-side cancel on the swish machine: worst residue 1.5e-8, gate passes (2026-07-07)
 

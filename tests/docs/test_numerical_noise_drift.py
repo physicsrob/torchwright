@@ -60,6 +60,21 @@ _RTOL = 0.40
 # exact on every kernel. Absolute moves above 5e-4 are genuine drift; tight
 # per-op budgets live in the ops' unit tests, not here.
 _ATOL = 5e-4
+# The staircase rows measure fp32 GEMM reduction order, not the op: the
+# decomposition sums lanes whose contributions reach ~6.4e5 and cancel to
+# ~4.0, so the surviving error is a small multiple of the fp32 ulp at the
+# partial-sum magnitude — quantized in powers of two, and one to two binades
+# apart between sequential (local CPU BLAS) and blocked (A100 cuBLAS)
+# reduction orders (largest observed swing: p99_abs_error 4x, 0.03125 ->
+# 0.125). A factor-of-8 ratio guard covers both orders with one binade of
+# headroom while still catching a genuine decomposition regression, which
+# moves these numbers by orders of magnitude. See
+# docs/numerical_noise_findings.md § staircase.
+_STAIRCASE_RATIO = 8.0
+
+
+def _is_staircase(op_key: tuple, dist_name: str) -> bool:
+    return op_key[1] == "piecewise_linear" and dist_name.startswith("staircase_")
 
 
 def _close_enough(a: float, b: float) -> bool:
@@ -70,6 +85,21 @@ def _close_enough(a: float, b: float) -> bool:
     if a == b:
         return True
     return abs(a - b) <= _ATOL + _RTOL * max(abs(a), abs(b))
+
+
+def _ratio_close(a: float, b: float, factor: float) -> bool:
+    """True when the two magnitudes are within ``factor`` of each other —
+    the machine-dependent-row guard (see _STAIRCASE_RATIO)."""
+    if a is None and b is None:
+        return True
+    if a is None or b is None:
+        return False
+    if a == b:
+        return True
+    lo, hi = sorted((abs(a), abs(b)))
+    if lo == 0.0:
+        return hi <= _ATOL
+    return hi / lo <= factor
 
 
 def _compare_ops(committed: dict, regenerated: dict) -> List[str]:
@@ -116,7 +146,11 @@ def _compare_ops(committed: dict, regenerated: dict) -> List[str]:
 
             for key in _ERROR_METRIC_KEYS:
                 cv, rv = cd[key], rd[key]
-                if not _close_enough(cv, rv):
+                if _is_staircase(op_key, dist_name):
+                    ok = _ratio_close(cv, rv, _STAIRCASE_RATIO)
+                else:
+                    ok = _close_enough(cv, rv)
+                if not ok:
                     failures.append(f"{op_name}/{dist_name}: {key} " f"{cv} -> {rv}")
 
     return failures
