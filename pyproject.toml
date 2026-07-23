@@ -107,6 +107,18 @@ ignore = [
     "N802", "N803", "N806",
     # Lazy imports of heavy deps (torch/onnx/modal) are deliberate
     "PLC0415", # import-outside-top-level
+    # Wide keyword-only signatures are how this codebase does configuration:
+    # the compile entry points and ops library take many knobs by design,
+    # and much of that surface is called by torchwright_doom (2026-07 survey:
+    # 122 sites, tail to 26 args, all classified honest or public API)
+    "PLR0913", # too-many-arguments
+    # "token" in this codebase means vocabulary token (bos_token/eos_token/
+    # unk_token, format-version tags), never a credential
+    "S105", "S106", "S107",
+    # Advisory subprocess rules with no satisfying code change: the Modal
+    # launchers and git-provenance helpers build argv lists, never shell=True
+    "S603",    # subprocess-without-shell-equals-true
+    "S607",    # start-process-with-partial-path
 ]
 
 [tool.ruff.lint.pydocstyle]
@@ -117,7 +129,61 @@ convention = "google"
     "PLR2004",  # magic values allowed in tests
     "ANN",      # type annotations optional in tests
     "SLF001",   # private-member access allowed in tests
+    "E402",     # pytest.importorskip must precede the imports it guards
+    "ARG001",   # pytest fixtures/hooks are resolved by parameter name
 ]
+# Complexity leaves (2026-07 wave-2 review): functions where helper
+# extraction would move code across the I1-I4 assertion points, plus
+# if/elif dispatch tables where splitting only relocates the table.
+"torchwright/compiler/forward/add_placement.py" = ["C901"]
+"torchwright/compiler/forward/compile.py" = ["C901", "PLR0912", "PLR0915"]
+"torchwright/compiler/forward/cpsat_scheduler.py" = [
+    "C901", "PLR0912", "PLR0915",
+    "SLF001",  # documented cache injection into Node._live_weight_row_ranges
+]
+"torchwright/compiler/forward/residual_map.py" = [
+    "C901",    # _check_invariants IS the I1 assertion body
+    "ARG002",  # free/hold's `mech` is a documented subclass interface slot
+]
+"torchwright/compiler/forward/scheduler.py" = ["C901", "PLR0912", "PLR0915"]
+"torchwright/compiler/forward/weight_writer.py" = ["C901", "PLR0912", "PLR0915"]
+"torchwright/graph/affine_rules.py" = [
+    "C901",    # compute_affine_bound is a node-type dispatch table
+    "SLF001",  # refresh_node_caches is the designated cache-write choke point
+]
+"scripts/measure_op_noise.py" = ["PLR0915"]  # render_markdown doc-table pipeline
+"tests/compile/forward/test_cpsat_intralayer.py" = ["C901"]  # mirrors production warm-start loop
+"tests/compile/test_graph_clone.py" = [
+    "C901",    # per-field comparator dispatch table
+    "BLE001",  # generic field comparator's deliberate fallback
+]
+# Interface slots and recorded design decisions
+"torchwright/compiler/export.py" = [
+    "ARG002",  # empty_past's max_len: call-site symmetry with ONNX runtime
+    "ANN401",  # **attrs at ONNX make_node emission is genuinely dynamic
+]
+"torchwright/compiler/forward/cpsat_snapshot.py" = [
+    "BLE001",  # _git_commit is best-effort provenance by contract
+    "ANN401",  # SchedulingProblem._replace passthrough
+]
+"torchwright/compiler/hf/build.py" = ["PTH100"]  # abspath: symlink semantics differ from resolve()
+"torchwright/compiler/hf/modeling_torchwright_custom.py" = ["ARG002"]  # HF forward() interface kwargs
+"torchwright/compiler/hf/tokenization_torchwright_custom.py" = ["FBT001", "FBT002"]  # transformers override signature
+"torchwright/compiler/realization.py" = ["SLF001"]  # live_weight_row_ranges owns its memo cache
+"torchwright/compiler/transformer.py" = ["ARG002"]  # past_len: accepted-and-ignored interface slot
+"torchwright/debug/probe.py" = ["ANN401"]  # past_kvs differs structurally per backend
+"torchwright/graph/misc.py" = ["ARG002"]  # Node.compute keyword contract on constant nodes
+"torchwright/graph/node.py" = ["PLW0603"]  # module-level node-id counter, reset by tests
+# Op names deliberately mirror the builtins they implement for graph nodes
+"torchwright/ops/relu/arithmetic_ops.py" = ["A001"]
+"torchwright/ops/swiglu/arithmetic_ops.py" = ["A001"]
+"torchwright/ops/swiglu/__init__.py" = ["A004"]
+"tests/hf/test_calculator_parity.py" = ["S307"]  # eval() of arithmetic expressions is the oracle
+"scripts/arithmetic_scaling.py" = [
+    "SLF001",  # recorded reach-in: scratchpad private ops for the viz panel
+    "FBT003",  # matplotlib ax.grid(True)
+]
+"scripts/calculator_layer_table.py" = ["BLE001"]  # records any build refusal as a data row
 
 [tool.ruff.format]
 docstring-code-format = true

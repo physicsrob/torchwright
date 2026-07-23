@@ -44,7 +44,7 @@ from torchwright.ops.linear import add, multiply_const
 
 onnxruntime = pytest.importorskip("onnxruntime")
 
-from torchwright.debug.onnx_debug import OnnxDebugSession  # noqa: E402
+from torchwright.debug.onnx_debug import OnnxDebugSession
 
 D = 1024
 D_HEAD = 16

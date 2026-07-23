@@ -39,7 +39,7 @@ import pytest
 
 ort = pytest.importorskip("onnxruntime")
 
-from onnx import TensorProto, helper  # noqa: E402
+from onnx import TensorProto, helper
 
 #: The module hinge-sharpening constant (test_swish_constants.SCALE).
 SCALE = 128.0

@@ -24,7 +24,7 @@ from torchwright.ops.relu.linear_relu_linear import linear_relu_linear
 
 onnxruntime = pytest.importorskip("onnxruntime")
 
-from torchwright.debug.onnx_debug import OnnxDebugSession  # noqa: E402
+from torchwright.debug.onnx_debug import OnnxDebugSession
 
 D = 256
 D_HEAD = 16
