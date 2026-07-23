@@ -38,9 +38,9 @@ def test_compiled_headless_step_matches_call():
         full = module(inputs)
         step_out, _ = module.step(inputs, module.empty_past())
 
-    assert torch.allclose(
-        full, step_out, atol=1e-4
-    ), f"step diff: {(full - step_out).abs().max().item():.6f}"
+    assert torch.allclose(full, step_out, atol=1e-4), (
+        f"step diff: {(full - step_out).abs().max().item():.6f}"
+    )
 
 
 def test_compiled_headless_step_prefill_decode_matches_full():
@@ -58,12 +58,12 @@ def test_compiled_headless_step_prefill_decode_matches_full():
         prefill_out, past = module.step(inputs[:4], past)
         decode_out, past = module.step(inputs[4:5], past)
 
-    assert torch.allclose(
-        full[:4], prefill_out, atol=1e-4
-    ), f"prefill diff: {(full[:4] - prefill_out).abs().max().item():.6f}"
-    assert torch.allclose(
-        full[4], decode_out[0], atol=1e-4
-    ), f"decode diff: {(full[4] - decode_out[0]).abs().max().item():.6f}"
+    assert torch.allclose(full[:4], prefill_out, atol=1e-4), (
+        f"prefill diff: {(full[:4] - prefill_out).abs().max().item():.6f}"
+    )
+    assert torch.allclose(full[4], decode_out[0], atol=1e-4), (
+        f"decode diff: {(full[4] - decode_out[0]).abs().max().item():.6f}"
+    )
     # past_K should have grown to n_total = 5
     past_K, _ = past
     assert past_K[0].shape[1] == 5

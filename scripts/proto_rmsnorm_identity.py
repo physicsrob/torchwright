@@ -109,7 +109,7 @@ def run_case(d, max_digits, prompt):
     else:
         verdict = "DRIFT"
     print(
-        f" d={d:<5} b={d.bit_length()-1} cols={n_const} rms=2^{m} gain={gain:.2e} "
+        f" d={d:<5} b={d.bit_length() - 1} cols={n_const} rms=2^{m} gain={gain:.2e} "
         f"layers={len(net.layers):3} free_cols={len(free):4}  "
         f"rms_spread={rms_spread:.0e} max|Δ|={max_abs:.0e} "
         f"decode_ok={decode_ok}  [{verdict}]"

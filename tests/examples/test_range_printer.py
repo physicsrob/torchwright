@@ -157,15 +157,15 @@ def test_oracle(items):
 
     for k, expected in enumerate(expected_cols):
         got = out[N + k, idx_col].item()
-        assert (
-            abs(got - expected) < 0.5
-        ), f"step {k}: active_col={got:.2f}, expected {expected}"
+        assert abs(got - expected) < 0.5, (
+            f"step {k}: active_col={got:.2f}, expected {expected}"
+        )
 
     # Last print position should have done_flag > 0
     last_pos = N + len(expected_cols) - 1
-    assert (
-        out[last_pos, idx_done].item() > 0.0
-    ), f"expected done_flag > 0 at last step, got {out[last_pos, idx_done].item():.2f}"
+    assert out[last_pos, idx_done].item() > 0.0, (
+        f"expected done_flag > 0 at last step, got {out[last_pos, idx_done].item():.2f}"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -267,6 +267,6 @@ def test_probe_parity():
         verbose=False,
         atol=1.0,
     )
-    assert (
-        report.first_divergent is None
-    ), f"Probe diverged at node: {report.first_divergent}"
+    assert report.first_divergent is None, (
+        f"Probe diverged at node: {report.first_divergent}"
+    )

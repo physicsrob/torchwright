@@ -73,9 +73,9 @@ def test_lo_ramp_stays_within_one_step():
         for frac in (0.2, 0.5, 0.9):
             v = float(k) - frac / NATIVE_S
             got = _eval(f, v)
-            assert (
-                (k - 1) - 1e-3 < got < k + 1e-3
-            ), f"floor({v}) in the lo ramp: {got} outside ({k - 1}, {k})"
+            assert (k - 1) - 1e-3 < got < k + 1e-3, (
+                f"floor({v}) in the lo ramp: {got} outside ({k - 1}, {k})"
+            )
 
 
 def test_negative_range_and_default_divisor():
@@ -107,7 +107,7 @@ def test_lane_cost_is_sqrtn_class():
     ffns = [nd for nd in get_ancestor_nodes({f}) if isinstance(nd, FFN)]
     lanes = sum(nd.n_lanes for nd in ffns)
     assert lanes <= 12 * math.isqrt(n) + 24, f"{lanes} lanes: radix split missing?"
-    assert lanes < 3 * n / 4, f"{lanes} lanes: not meaningfully below flat (3N={3*n})"
+    assert lanes < 3 * n / 4, f"{lanes} lanes: not meaningfully below flat (3N={3 * n})"
     widest = max(len(nd) for nd in ffns)
     assert widest <= 2 * max(-(-n // 64), 65), f"widest FFN intermediate {widest}"
 

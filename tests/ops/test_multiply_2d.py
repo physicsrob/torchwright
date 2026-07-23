@@ -194,9 +194,9 @@ def test_multiply_2d_probe():
     expected = torch.tensor(
         [a_vals[i, 0].item() * b_vals[i, 0].item() for i in range(n_pos)]
     )
-    assert torch.allclose(
-        oracle, expected, atol=0.01
-    ), f"oracle: {oracle.tolist()}\nexpected: {expected.tolist()}"
+    assert torch.allclose(oracle, expected, atol=0.01), (
+        f"oracle: {oracle.tolist()}\nexpected: {expected.tolist()}"
+    )
 
     # Compiled check
     report = probe_graph(
@@ -259,9 +259,9 @@ def test_multiply_2d_build_is_linear_in_breakpoints():
         ).item()
         expected = x * y
         # Bilinear interpolation error bound is step²/4 at this grid.
-        assert (
-            abs(result - expected) < step * step / 4 + 1.0
-        ), f"{x}*{y} = {expected}, got {result}"
+        assert abs(result - expected) < step * step / 4 + 1.0, (
+            f"{x}*{y} = {expected}, got {result}"
+        )
 
 
 def test_multiply_2d_chunks_across_d_max():

@@ -41,9 +41,9 @@ def _table_rows():
 
 def test_doc_exists_and_table_is_the_full_contract():
     rows = _table_rows()
-    assert [r[0] for r in rows] == [
-        n * 1024 for n in range(1, 17)
-    ], "the table must list exactly the sixteen multiples of 1024, in order"
+    assert [r[0] for r in rows] == [n * 1024 for n in range(1, 17)], (
+        "the table must list exactly the sixteen multiples of 1024, in order"
+    )
 
 
 def test_table_rows_match_compiler_layout():
@@ -53,8 +53,7 @@ def test_table_rows_match_compiler_layout():
         assert rms_norm_width_supported(d), f"row {d}: outside the contract"
         col_exps, _m = _rms_norm_pinned_layout(d, _RMS_NORM_CONST_EXP)
         assert len(col_exps) == n_cols, (
-            f"row {d}: doc says {n_cols} reserved columns, "
-            f"layout has {len(col_exps)}"
+            f"row {d}: doc says {n_cols} reserved columns, layout has {len(col_exps)}"
         )
 
 

@@ -54,9 +54,9 @@ def _discover_meta(session, onnx_path):
     per_layer_n_heads = [int(inputs[f"past_K_{i}"].shape[1]) for i in range(n_layers)]
     d_head = int(inputs["past_K_0"].shape[2])
     slot_dim = inputs["past_K_0"].shape[0]
-    assert not isinstance(
-        slot_dim, int
-    ), f"past_K_0 first dim must be the symbolic cache_slots, got {slot_dim!r}"
+    assert not isinstance(slot_dim, int), (
+        f"past_K_0 first dim must be the symbolic cache_slots, got {slot_dim!r}"
+    )
     with open(meta_path_for(onnx_path)) as f:
         sidecar = json.load(f)
     cache_stride = discover_cache_stride(inputs, sidecar.get("cache_stride"), onnx_path)
@@ -135,9 +135,9 @@ def test_token_onnx_prefill_matches_compute():
         past_k, past_v = _zero_past(per_layer_n_heads, d_head, S)
         onnx_logits = session.run(["logits"], _feeds(token_ids, past_k, past_v, 0))[0]
 
-        assert np.allclose(
-            ref_logits, onnx_logits, atol=1e-4
-        ), f"logits max diff: {np.abs(ref_logits - onnx_logits).max():.6f}"
+        assert np.allclose(ref_logits, onnx_logits, atol=1e-4), (
+            f"logits max diff: {np.abs(ref_logits - onnx_logits).max():.6f}"
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -217,9 +217,9 @@ def test_token_onnx_autoregressive_1digit():
         test_cases = [("1+1\n", "2"), ("2+3\n", "5"), ("4+5\n", "9")]
         for input_str, expected in test_cases:
             result = "".join(model.generate(input_str))
-            assert (
-                result == expected
-            ), f"{input_str}: expected {expected!r}, got {result!r}"
+            assert result == expected, (
+                f"{input_str}: expected {expected!r}, got {result!r}"
+            )
 
 
 # ---------------------------------------------------------------------------
@@ -253,9 +253,9 @@ def test_token_onnx_autoregressive_3digit():
         ]
         for input_str, expected in test_cases:
             result = "".join(model.generate(input_str))
-            assert (
-                result == expected
-            ), f"{input_str}: expected {expected!r}, got {result!r}"
+            assert result == expected, (
+                f"{input_str}: expected {expected!r}, got {result!r}"
+            )
 
 
 # ---------------------------------------------------------------------------
@@ -485,9 +485,9 @@ def test_token_onnx_chunked_decode_matches_full_prefill(adder_artifact):
         past_v[i][0:2] = results[1 + 2 * i + 1]
 
     chunk = session.run(["logits"], _feeds(token_ids[2:5], past_k, past_v, 2))[0]
-    assert np.allclose(
-        full[2:5], chunk, atol=1e-4
-    ), f"chunked decode diff: {np.abs(full[2:5] - chunk).max():.6f}"
+    assert np.allclose(full[2:5], chunk, atol=1e-4), (
+        f"chunked decode diff: {np.abs(full[2:5] - chunk).max():.6f}"
+    )
 
 
 def test_token_onnx_static_tail_is_inert(adder_artifact):
@@ -651,12 +651,12 @@ def test_token_onnx_trim_heads_shrinks_kv_cache():
         _, per_layer_n_heads, _, _ = _discover_meta(session, onnx_path)
     assert per_layer_n_heads, "no layers discovered"
     assert all(1 <= nh <= max_heads for nh in per_layer_n_heads)
-    assert (
-        min(per_layer_n_heads) < max_heads
-    ), f"no layer trimmed below full width {max_heads}: {per_layer_n_heads}"
-    assert (
-        len(set(per_layer_n_heads)) > 1
-    ), f"head counts are uniform across layers: {per_layer_n_heads}"
+    assert min(per_layer_n_heads) < max_heads, (
+        f"no layer trimmed below full width {max_heads}: {per_layer_n_heads}"
+    )
+    assert len(set(per_layer_n_heads)) > 1, (
+        f"head counts are uniform across layers: {per_layer_n_heads}"
+    )
 
 
 def test_token_onnx_no_trim_preserves_full_width():
@@ -667,9 +667,9 @@ def test_token_onnx_no_trim_preserves_full_width():
         session = onnxruntime.InferenceSession(onnx_path)
         _, per_layer_n_heads, _, _ = _discover_meta(session, onnx_path)
     assert per_layer_n_heads, "no layers discovered"
-    assert all(
-        nh == max_heads for nh in per_layer_n_heads
-    ), f"expected all layers at full width {max_heads}: {per_layer_n_heads}"
+    assert all(nh == max_heads for nh in per_layer_n_heads), (
+        f"expected all layers at full width {max_heads}: {per_layer_n_heads}"
+    )
 
 
 def test_token_onnx_trim_shrinks_mlp_slots():
@@ -681,9 +681,9 @@ def test_token_onnx_trim_shrinks_mlp_slots():
         trim_widths = _l_w1_d_hidden(trim_path)
         notrim_widths = _l_w1_d_hidden(notrim_path)
     assert all(1 <= w <= full_d_hidden for w in trim_widths)
-    assert (
-        min(trim_widths) < full_d_hidden
-    ), f"no layer's MLP trimmed below full d_hidden {full_d_hidden}: {trim_widths}"
+    assert min(trim_widths) < full_d_hidden, (
+        f"no layer's MLP trimmed below full d_hidden {full_d_hidden}: {trim_widths}"
+    )
     assert all(w == full_d_hidden for w in notrim_widths)
 
 
@@ -702,6 +702,6 @@ def test_token_onnx_trim_is_numerical_noop():
         out_trim = sess_trim.run(["logits"], _feeds(token_ids, pk, pv, 0))[0]
         pk, pv = _zero_past(hn, d_head, Sn)
         out_notrim = sess_notrim.run(["logits"], _feeds(token_ids, pk, pv, 0))[0]
-    assert np.allclose(
-        out_trim, out_notrim, atol=1e-4
-    ), f"trim changed the output: max diff {np.abs(out_trim - out_notrim).max():.6e}"
+    assert np.allclose(out_trim, out_notrim, atol=1e-4), (
+        f"trim changed the output: max diff {np.abs(out_trim - out_notrim).max():.6e}"
+    )

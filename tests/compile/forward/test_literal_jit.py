@@ -142,9 +142,9 @@ def test_deep_select_literal_matches_oracle(optimize):
     }
     actual = net.compute(n_pos, inputs)[out].cpu()
     expected = out.compute(n_pos, inputs)
-    assert torch.allclose(
-        actual, expected, atol=1e-3
-    ), f"optimize={optimize} max diff {(actual - expected).abs().max():.5f}"
+    assert torch.allclose(actual, expected, atol=1e-3), (
+        f"optimize={optimize} max diff {(actual - expected).abs().max():.5f}"
+    )
     # The false-branch row must equal the just-in-time-materialized constant.
     assert torch.allclose(actual[1], lit.value, atol=1e-2)
 
@@ -212,9 +212,9 @@ def test_deep_attention_fed_constant_matches_oracle():
     xv = torch.randn(n_pos, 2)
     actual = net.compute(n_pos, {"x": xv})[out].cpu()
     expected = out.compute(n_pos, {"x": xv})
-    assert torch.allclose(
-        actual, expected, atol=1e-2
-    ), f"max diff {(actual - expected).abs().max():.5f}"
+    assert torch.allclose(actual, expected, atol=1e-2), (
+        f"max diff {(actual - expected).abs().max():.5f}"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -339,9 +339,9 @@ def test_cpsat_treats_constant_as_schedulable_not_prefilled():
     )
     ra = net.residual_assignment
     # Schedulable, not a prefilled source.
-    assert lit not in ra.get_nodes(
-        net.layers[0].attn.in_state
-    ), "CP-SAT prefilled the constant into layer-0 in_state (still a source)"
+    assert lit not in ra.get_nodes(net.layers[0].attn.in_state), (
+        "CP-SAT prefilled the constant into layer-0 in_state (still a source)"
+    )
     assert _live_layers(net, lit), "CP-SAT never materialized the constant"
     # Correct.
     xv = torch.randn(3, 2)

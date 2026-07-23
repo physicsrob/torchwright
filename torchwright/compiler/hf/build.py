@@ -207,7 +207,9 @@ def _target(activation: str, bias: bool, rms_norm: bool, architecture=None) -> s
     actual = (
         "phi3"
         if activation == "swish" and not bias and rms_norm
-        else "custom" if activation == "relu" and bias else None
+        else "custom"
+        if activation == "relu" and bias
+        else None
     )
     if actual != expected:
         raise AssertionError(
@@ -472,7 +474,7 @@ def _compile_hf_bundle_into(
                     f"{p}.mlp.down_proj.weight": tpad(wd.T, inter, 1),
                 }
                 kind = "swish"
-            filename = f"model-{index+1:05d}-of-{self.shard_count:05d}.safetensors"
+            filename = f"model-{index + 1:05d}-of-{self.shard_count:05d}.safetensors"
             save_file(sd, os.path.join(output_dir, filename))
             for name, value in sd.items():
                 self.weight_map[name] = filename

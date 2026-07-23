@@ -79,9 +79,9 @@ def test_compiled_picks_most_recent_globally():
 
     for p in range(1, n):
         most_recent = max(mp for mp in matches if mp <= p)
-        assert (
-            abs(out[p].item() - float(most_recent)) < 0.5
-        ), f"pos {p}: expected {most_recent}, got {out[p].item():.2f}"
+        assert abs(out[p].item() - float(most_recent)) < 0.5, (
+            f"pos {p}: expected {most_recent}, got {out[p].item():.2f}"
+        )
 
 
 def test_probe_compiled_parity():
@@ -140,9 +140,9 @@ def test_compiled_picks_most_recent_globally_larger_n():
 
     for p in range(1, n):
         most_recent = max(mp for mp in matches if mp <= p)
-        assert (
-            abs(out[p].item() - float(most_recent)) < 0.5
-        ), f"pos {p}: expected {most_recent}, got {out[p].item():.2f}"
+        assert abs(out[p].item() - float(most_recent)) < 0.5, (
+            f"pos {p}: expected {most_recent}, got {out[p].item():.2f}"
+        )
 
 
 def test_partial_global_recency_placement():
@@ -177,9 +177,9 @@ def test_partial_compiled_picks_most_recent_globally():
 
     for p in range(1, n):
         most_recent = max(mp for mp in matches if mp <= p)
-        assert (
-            abs(out[p].item() - float(most_recent)) < 0.5
-        ), f"pos {p}: expected {most_recent}, got {out[p].item():.2f}"
+        assert abs(out[p].item() - float(most_recent)) < 0.5, (
+            f"pos {p}: expected {most_recent}, got {out[p].item():.2f}"
+        )
 
 
 def test_partial_probe_compiled_parity():
@@ -239,9 +239,9 @@ def test_smoothed_position_compiled_partial_rotary():
     out = m(_pack(m, {"bos": bos}, n).to(m._net.device)).reshape(-1).cpu()
 
     t = torch.arange(n, dtype=out.dtype)
-    assert (
-        float((out - t).abs().max()) < 0.5
-    ), f"max |pos - t| = {float((out - t).abs().max()):.4f}"
+    assert float((out - t).abs().max()) < 0.5, (
+        f"max |pos - t| = {float((out - t).abs().max()):.4f}"
+    )
     steps = out[1:] - out[:-1]
     assert float(steps.min()) > 0.8, f"min step {float(steps.min()):.4f}"
     assert float(steps.max()) < 1.2, f"max step {float(steps.max()):.4f}"

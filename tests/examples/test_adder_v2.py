@@ -62,9 +62,9 @@ class TestThermometerFloorDiv:
                 n_pos=1, input_values={"x": torch.tensor([[float(x)]])}
             )
             expected = x // 10
-            assert (
-                abs(result[0, 0].item() - expected) < 0.1
-            ), f"floor({x}/10): expected {expected}, got {result[0, 0].item()}"
+            assert abs(result[0, 0].item() - expected) < 0.1, (
+                f"floor({x}/10): expected {expected}, got {result[0, 0].item()}"
+            )
 
     def test_div_by_100(self):
         inp = create_input("x", 1)
@@ -74,9 +74,9 @@ class TestThermometerFloorDiv:
                 n_pos=1, input_values={"x": torch.tensor([[float(x)]])}
             )
             expected = x // 100
-            assert (
-                abs(result[0, 0].item() - expected) < 0.1
-            ), f"floor({x}/100): expected {expected}, got {result[0, 0].item()}"
+            assert abs(result[0, 0].item() - expected) < 0.1, (
+                f"floor({x}/100): expected {expected}, got {result[0, 0].item()}"
+            )
 
     def test_div_by_1000(self):
         inp = create_input("x", 1)
@@ -86,9 +86,9 @@ class TestThermometerFloorDiv:
                 n_pos=1, input_values={"x": torch.tensor([[float(x)]])}
             )
             expected = x // 1000
-            assert (
-                abs(result[0, 0].item() - expected) < 0.1
-            ), f"floor({x}/1000): expected {expected}, got {result[0, 0].item()}"
+            assert abs(result[0, 0].item() - expected) < 0.1, (
+                f"floor({x}/1000): expected {expected}, got {result[0, 0].item()}"
+            )
 
 
 class TestNumberToDigitScalars:
@@ -107,9 +107,9 @@ class TestNumberToDigitScalars:
                 result = digit_node.compute(
                     n_pos=1, input_values={"x": torch.tensor([[float(x)]])}
                 )
-                assert (
-                    abs(result[0, 0].item() - expected[i]) < 0.2
-                ), f"x={x}, digit[{i}]: expected {expected[i]}, got {result[0, 0].item()}"
+                assert abs(result[0, 0].item() - expected[i]) < 0.2, (
+                    f"x={x}, digit[{i}]: expected {expected[i]}, got {result[0, 0].item()}"
+                )
 
     def test_two_digit_extraction(self):
         inp = create_input("x", 1)
@@ -120,9 +120,9 @@ class TestNumberToDigitScalars:
                 result = digit_node.compute(
                     n_pos=1, input_values={"x": torch.tensor([[float(x)]])}
                 )
-                assert (
-                    abs(result[0, 0].item() - expected[i]) < 0.2
-                ), f"x={x}, digit[{i}]: expected {expected[i]}, got {result[0, 0].item()}"
+                assert abs(result[0, 0].item() - expected[i]) < 0.2, (
+                    f"x={x}, digit[{i}]: expected {expected[i]}, got {result[0, 0].item()}"
+                )
 
 
 class TestScalarToEmbedding:
@@ -134,6 +134,6 @@ class TestScalarToEmbedding:
                 n_pos=1, input_values={"x": torch.tensor([[float(digit)]])}
             )
             expected = embedding.get_embedding(str(digit))
-            assert torch.allclose(
-                result[0], expected, atol=0.1
-            ), f"digit={digit}: max diff={torch.max(torch.abs(result[0] - expected)).item()}"
+            assert torch.allclose(result[0], expected, atol=0.1), (
+                f"digit={digit}: max diff={torch.max(torch.abs(result[0] - expected)).item()}"
+            )

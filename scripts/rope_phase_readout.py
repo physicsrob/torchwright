@@ -135,7 +135,7 @@ def single_cosine_end_resolution(n: int, margin: float = 0.1) -> None:
         dcos = abs(math.cos(p0) - math.cos(p1))
         print(
             f"    single-cosine sep at {label:>14}: {dcos:.2e} "
-            f"(uniform two-head sep would be ~{theta_half*gap*2:.2e})"
+            f"(uniform two-head sep would be ~{theta_half * gap * 2:.2e})"
         )
 
 

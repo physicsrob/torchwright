@@ -503,9 +503,9 @@ def attend_argmin_above_in_bucket(
         Attn node of width ``len(value)``.
     """
     assert len(score) == 1, "attend_argmin_above_in_bucket expects a width-1 score"
-    assert (
-        len(validity) == 1
-    ), "attend_argmin_above_in_bucket expects a width-1 validity"
+    assert len(validity) == 1, (
+        "attend_argmin_above_in_bucket expects a width-1 validity"
+    )
     assert len(key_bucket_onehot) == len(query_bucket_onehot), (
         "key_bucket_onehot and query_bucket_onehot must have the same width "
         f"(got {len(key_bucket_onehot)} and {len(query_bucket_onehot)})"
@@ -1243,7 +1243,7 @@ def attend_most_recent_globally(
                 f"attend_most_recent_globally: the position tiebreak on the "
                 f"slowest rotated plane {pos_plane} (θ={theta_pos:.3e}) has "
                 f"max_positions={rope.max_positions} × θ = "
-                f"{rope.max_positions * theta_pos:.3f} ≥ π/2 ({math.pi/2:.3f}); a "
+                f"{rope.max_positions * theta_pos:.3f} ≥ π/2 ({math.pi / 2:.3f}); a "
                 f"negative cosine would reverse the tiebreak ordering.  Increase "
                 f"d_rot/base or reduce max_positions."
             )
@@ -1281,7 +1281,7 @@ def attend_most_recent_globally(
                 f"attend_most_recent_globally: content width W={W} places the "
                 f"position tiebreak on plane {d_head // 2 - 1 - W} "
                 f"(θ={theta_pos:.3e}); max_positions={rope.max_positions} × θ = "
-                f"{rope.max_positions * theta_pos:.3f} ≥ π/2 ({math.pi/2:.3f}).  "
+                f"{rope.max_positions * theta_pos:.3f} ≥ π/2 ({math.pi / 2:.3f}).  "
                 f"Narrow the content vector, increase d_head/base, or reduce "
                 f"max_positions."
             )

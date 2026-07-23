@@ -104,9 +104,7 @@ class AttnLayerComponent(Component):
                 V.unsqueeze(0),
                 is_causal=True,
                 scale=1.0,
-            ).squeeze(
-                0
-            )  # (n_heads, n_pos, d_head)
+            ).squeeze(0)  # (n_heads, n_pos, d_head)
 
         output = torch.einsum("hpk,hkd->pd", weighted, self.output_matrix)
         return output
@@ -183,9 +181,7 @@ class AttnLayerComponent(Component):
                     V.unsqueeze(0),
                     is_causal=(n_new == n_total),
                     scale=1.0,
-                ).squeeze(
-                    0
-                )  # (n_heads, n_new, d_head)
+                ).squeeze(0)  # (n_heads, n_new, d_head)
 
         output = torch.einsum("hpk,hkd->pd", weighted, self.output_matrix)
 

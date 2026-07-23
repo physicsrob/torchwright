@@ -45,6 +45,6 @@ def test_binary_increment(binary_increment):
     ]
     for binary_in, expected in test_cases:
         result = run(model, binary_in + "\n", bos_token="<bos>")
-        assert (
-            result == expected
-        ), f"For {binary_in!r}: expected {expected!r} but got {result!r}"
+        assert result == expected, (
+            f"For {binary_in!r}: expected {expected!r} but got {result!r}"
+        )

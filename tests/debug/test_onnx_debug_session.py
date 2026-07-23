@@ -579,7 +579,7 @@ def test_oversized_conversion_external_metadata_and_bytes(token_artifact, monkey
         dense[numpy_helper.to_array(sp.indices)] = numpy_helper.to_array(sp.values)
         dense_by_name[sp.values.name] = (dims, dense)
     assert len(dense_by_name) >= 2, (
-        "fixture regression: need >= 2 sparse initializers to pin cumulative " "offsets"
+        "fixture regression: need >= 2 sparse initializers to pin cumulative offsets"
     )
 
     monkeypatch.setattr(od, "_ORT_EMBEDDED_INITIALIZER_LIMIT", 1)

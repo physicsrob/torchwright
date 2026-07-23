@@ -29,9 +29,9 @@ def test_in_range_headless_values_are_pm1():
     for i in range(N):
         expected = 1.0 if 4 <= i < 8 else -1.0
         actual = result[i].item()
-        assert (
-            abs(actual - expected) < 0.5
-        ), f"slot {i}: expected {expected}, got {actual:.1f}"
+        assert abs(actual - expected) < 0.5, (
+            f"slot {i}: expected {expected}, got {actual:.1f}"
+        )
 
 
 def test_in_range_headless_matches_forward_compile():
@@ -55,5 +55,5 @@ def test_in_range_headless_matches_forward_compile():
         fc_val = fc_out[i].item()
         ch_val = ch_out[i].item()
         assert abs(fc_val - ch_val) < 0.5, (
-            f"slot {i}: forward_compile={fc_val:.1f}, " f"compile_headless={ch_val:.1f}"
+            f"slot {i}: forward_compile={fc_val:.1f}, compile_headless={ch_val:.1f}"
         )

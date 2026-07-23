@@ -284,7 +284,7 @@ def _fold_through_concatenate(
     ``Linear(Concatenate(..., leaf_i, ...))`` reads leaf ``i`` through the
     row block ``M_i`` of ``l.output_matrix`` at the leaf's column offset::
 
-        y = sum_i (leaf_i @ M_i) + b
+        y = sum_i(leaf_i @ M_i) + b
 
     Three leaf rewrites, all exact, mutating only the survivors ``l`` and
     ``c`` (leaves are orphaned, never mutated):

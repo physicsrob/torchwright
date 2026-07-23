@@ -153,9 +153,9 @@ def test_prefill_and_decode_bit_exact(direct_model):
         # Where the row carries real signal, both backends decode the same token.
         if normal.any():
             assert int(o.argmax()) == int(h.argmax()), f"row {i}: argmax diverged"
-    assert (
-        max_logit_diff(o_logits, h_logits) < 1e-30
-    ), "cross-backend logit divergence exceeds the denormal noise floor"
+    assert max_logit_diff(o_logits, h_logits) < 1e-30, (
+        "cross-backend logit divergence exceeds the denormal noise floor"
+    )
 
 
 def test_bare_forward_without_use_cache(direct_model):

@@ -936,8 +936,7 @@ def _build_replay_plan(
         layout = scheduler.held_output_layout
         if planned_rmap.has_held():
             raise AssertionError(
-                f"held output bank was never claimed: "
-                f"{planned_rmap.held_columns()[:8]}"
+                f"held output bank was never claimed: {planned_rmap.held_columns()[:8]}"
             )
         if planned_rmap.is_allocated(layout.source):
             raise AssertionError(
@@ -2326,8 +2325,8 @@ def forward_compile(
                 f"{occupied_before:>6}/{d} ({pct_before:>2}%)  "
                 f"{occupied_after:>6}/{d} ({pct_after:>2}%)  "
                 f"MLP {mlp_slots:>4}/{d_hidden}  "
-                f"{layer_time*1000:>7.1f}ms "
-                f"(attn {attn_time*1000:.0f} mlp {mlp_time*1000:.0f})",
+                f"{layer_time * 1000:>7.1f}ms "
+                f"(attn {attn_time * 1000:.0f} mlp {mlp_time * 1000:.0f})",
                 flush=True,
             )
 

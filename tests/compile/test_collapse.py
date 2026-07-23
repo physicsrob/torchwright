@@ -215,9 +215,9 @@ def test_declines_predicted_accumulation_error():
 
     lowered = _collapse(out, lane_cap=64)
     assert lowered.collapse_report.n_collapsed == 0
-    assert any(
-        "predicted fp32 accumulation" in r for r in _decline_reasons(lowered)
-    ), lowered.collapse_report.format()
+    assert any("predicted fp32 accumulation" in r for r in _decline_reasons(lowered)), (
+        lowered.collapse_report.format()
+    )
 
 
 def test_declines_non_staircase_member():
@@ -292,9 +292,9 @@ def test_declines_composite_budget_overflow():
 
     lowered = _collapse(out)
     assert lowered.collapse_report.n_collapsed == 0
-    assert any(
-        "band deviation" in r for r in _decline_reasons(lowered)
-    ), lowered.collapse_report.format()
+    assert any("band deviation" in r for r in _decline_reasons(lowered)), (
+        lowered.collapse_report.format()
+    )
 
 
 def test_declines_no_depth_gain():

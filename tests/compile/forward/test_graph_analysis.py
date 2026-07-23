@@ -114,9 +114,9 @@ def test_adder_graph():
     for node in order:
         for inp in node.inputs:
             if inp in idx:  # Concatenates may not be in order
-                assert (
-                    idx[inp] < idx[node]
-                ), f"{inp} should come before {node} in topo order"
+                assert idx[inp] < idx[node], (
+                    f"{inp} should come before {node} in topo order"
+                )
 
     # Output node has critical path 0
     assert graph.get_critical_path_length(output_node) == 0

@@ -222,9 +222,7 @@ def subtract_digit_seqs(
         embedding,
         seq1,
         seq2,
-        status_of=lambda a, b: (
-            _GENERATE if a < b else _PROPAGATE if a == b else _KILL
-        ),
+        status_of=lambda a, b: _GENERATE if a < b else _PROPAGATE if a == b else _KILL,
         digit_of=lambda a, b, borrow: (a - b - borrow) % 10,
     )
 

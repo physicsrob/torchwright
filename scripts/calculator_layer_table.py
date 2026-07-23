@@ -141,7 +141,7 @@ def collect_cell(impl_name: str, n: int) -> dict:
         if hasattr(impl, "compiled_layers"):
             row["layers_extrapolated"] = impl.compiled_layers(n, d_hidden=D_HIDDEN)
         print(
-            f"[{impl_name} n={n}] build refused: " f"{row['build_error'][:80]}",
+            f"[{impl_name} n={n}] build refused: {row['build_error'][:80]}",
             flush=True,
         )
         return row

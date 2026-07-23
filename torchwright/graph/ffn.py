@@ -77,19 +77,19 @@ class FFN(Node):
                 f"FFN activation must be 'relu' or 'swish', got {activation!r}"
             )
         n_lanes, d_input = gate_proj.shape
-        assert (
-            len(input_node) == d_input
-        ), f"FFN input width {len(input_node)} != gate_proj d_input {d_input}"
-        assert gate_bias.shape == (
-            n_lanes,
-        ), f"gate_bias shape {tuple(gate_bias.shape)} != ({n_lanes},)"
-        assert (
-            out_proj.shape[0] == n_lanes
-        ), f"out_proj rows {out_proj.shape[0]} != n_lanes {n_lanes}"
+        assert len(input_node) == d_input, (
+            f"FFN input width {len(input_node)} != gate_proj d_input {d_input}"
+        )
+        assert gate_bias.shape == (n_lanes,), (
+            f"gate_bias shape {tuple(gate_bias.shape)} != ({n_lanes},)"
+        )
+        assert out_proj.shape[0] == n_lanes, (
+            f"out_proj rows {out_proj.shape[0]} != n_lanes {n_lanes}"
+        )
         d_output = out_proj.shape[1]
-        assert out_bias.shape == (
-            d_output,
-        ), f"out_bias shape {tuple(out_bias.shape)} != ({d_output},)"
+        assert out_bias.shape == (d_output,), (
+            f"out_bias shape {tuple(out_bias.shape)} != ({d_output},)"
+        )
         if (up_proj is None) != (up_bias is None):
             raise ValueError(
                 "FFN up_proj and up_bias must both be set (gated lane) or "
@@ -100,9 +100,9 @@ class FFN(Node):
                 n_lanes,
                 d_input,
             ), f"up_proj shape {tuple(up_proj.shape)} != ({n_lanes}, {d_input})"
-            assert cast(torch.Tensor, up_bias).shape == (
-                n_lanes,
-            ), f"up_bias shape {tuple(cast(torch.Tensor, up_bias).shape)} != ({n_lanes},)"
+            assert cast(torch.Tensor, up_bias).shape == (n_lanes,), (
+                f"up_bias shape {tuple(cast(torch.Tensor, up_bias).shape)} != ({n_lanes},)"
+            )
 
         self.gate_proj = gate_proj
         self.gate_bias = gate_bias

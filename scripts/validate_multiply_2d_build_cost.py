@@ -56,8 +56,8 @@ def main() -> None:
     print()
     print(
         "old generic path at this n built a (n², n²) = "
-        f"({n_bp ** 2}, {n_bp ** 2}) float64 SVD U matrix "
-        f"≈ {n_bp ** 4 * 8 / 1e9:.1f} GB → OOM"
+        f"({n_bp**2}, {n_bp**2}) float64 SVD U matrix "
+        f"≈ {n_bp**4 * 8 / 1e9:.1f} GB → OOM"
     )
     print()
 

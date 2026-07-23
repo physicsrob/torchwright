@@ -1308,8 +1308,9 @@ def _target_ops() -> List[TargetOp]:
             source_file=_ARITH_FILE,
             input_specs={"x": 1},
             build_graph=lambda nodes: mod_const(nodes["x"], divisor=7, max_value=100),
-            reference_fn=lambda inputs: inputs["x"]
-            - 7.0 * torch.floor(inputs["x"] / 7.0),
+            reference_fn=lambda inputs: (
+                inputs["x"] - 7.0 * torch.floor(inputs["x"] / 7.0)
+            ),
             distribution_names=("mod_integers_0_100_by7",),
             notes=(
                 "Identity `x % d = x - d · thermometer_floor_div(x, d)`. "
@@ -1713,12 +1714,14 @@ def _target_ops() -> List[TargetOp]:
             build_graph=lambda nodes: swiglu_ops.dynamic_extract(
                 nodes["table"], nodes["idx"], n_entries=4, d_fill=2
             ),
-            reference_fn=lambda inputs: inputs["table"]
-            .view(-1, 4, 2)[
-                torch.arange(inputs["table"].shape[0]),
-                inputs["idx"].flatten().long(),
-            ]
-            .view(-1, 2),
+            reference_fn=lambda inputs: (
+                inputs["table"]
+                .view(-1, 4, 2)[
+                    torch.arange(inputs["table"].shape[0]),
+                    inputs["idx"].flatten().long(),
+                ]
+                .view(-1, 2)
+            ),
             distribution_names=("dynamic_extract_int_idx_4x2",),
             notes=(
                 "in_range one-hot → broadcast_select (zero-literal false "
@@ -1893,8 +1896,9 @@ def _target_ops() -> List[TargetOp]:
             build_graph=lambda nodes: swiglu_ops.mod_const(
                 nodes["x"], divisor=7, max_value=100
             ),
-            reference_fn=lambda inputs: inputs["x"]
-            - 7.0 * torch.floor(inputs["x"] / 7.0),
+            reference_fn=lambda inputs: (
+                inputs["x"] - 7.0 * torch.floor(inputs["x"] / 7.0)
+            ),
             distribution_names=("mod_integers_0_100_by7",),
             notes=(
                 "x − d·thermometer_floor_div(x, d) — linear hardware plus "
@@ -2150,8 +2154,7 @@ def render_markdown(data: Dict) -> str:
     lines.append("## Summary")
     lines.append("")
     lines.append(
-        "| Op | Machine | Module | Max abs error | Max rel error "
-        "| Worst distribution |"
+        "| Op | Machine | Module | Max abs error | Max rel error | Worst distribution |"
     )
     lines.append("| --- | --- | --- | --- | --- | --- |")
     for op in data["ops"]:

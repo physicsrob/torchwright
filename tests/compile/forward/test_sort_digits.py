@@ -28,9 +28,9 @@ def _check_case(model, input_str: str, expected: str):
         bos_token="<bos>",
         max_new_tokens=len(input_str),
     )
-    assert (
-        result == expected
-    ), f"input={input_str!r} expected={expected!r} got={result!r}"
+    assert result == expected, (
+        f"input={input_str!r} expected={expected!r} got={result!r}"
+    )
 
 
 # Cases supported by the distinct-digit sorter.

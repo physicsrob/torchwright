@@ -1133,8 +1133,7 @@ def _write_bypass_lane_pair(
     """
     d_output = len(out_idx)
     assert len(mlp_slots) == 2 * d_output, (
-        f"bypass lane-pair needs 2*d_output={2 * d_output} slots, "
-        f"got {len(mlp_slots)}"
+        f"bypass lane-pair needs 2*d_output={2 * d_output} slots, got {len(mlp_slots)}"
     )
     pos_slots = mlp_slots[:d_output]
     neg_slots = mlp_slots[d_output:]
@@ -1469,9 +1468,9 @@ def _write_compute_add_bypass(
     """
     node = op.node
     assert isinstance(node, Add)
-    assert (
-        op.source_cols is not None and op.source_cols_b is not None
-    ), "compute_add_bypass requires source_cols and source_cols_b"
+    assert op.source_cols is not None and op.source_cols_b is not None, (
+        "compute_add_bypass requires source_cols and source_cols_b"
+    )
     width = len(node)
     assert len(op.source_cols) == width and len(op.source_cols_b) == width, (
         f"compute_add_bypass width mismatch for {node!r}: "

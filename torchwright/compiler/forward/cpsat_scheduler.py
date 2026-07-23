@@ -2764,8 +2764,7 @@ def _validate_hint(
         if nid in built.layer_var:
             if not (0 <= L < max_layers):
                 violations.append(
-                    f"layer hint out of range (guard-dropped): "
-                    f"{_desc(nid)} hint={L}"
+                    f"layer hint out of range (guard-dropped): {_desc(nid)} hint={L}"
                 )
             elif built.layer_bounds is not None:
                 lo, hi = built.layer_bounds[nid]
@@ -3406,8 +3405,7 @@ def _solve_built(
                 lit = built.add_reusable.get((A.node_id, i))
                 if lit is not None and bool(solver.Value(lit)) != want:
                     mismatches.append(
-                        f"reusable_{i} solver={bool(solver.Value(lit))} "
-                        f"derived={want}"
+                        f"reusable_{i} solver={bool(solver.Value(lit))} derived={want}"
                     )
             for i in (0, 1):
                 lit = built.add_reuse.get((A.node_id, i))

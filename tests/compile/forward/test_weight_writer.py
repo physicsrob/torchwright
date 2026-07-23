@@ -567,13 +567,13 @@ def test_compute_linear_reuses_dying_input_columns():
     out = layer.attn.forward(res).cpu()
 
     expected_y = y.compute(N_POS, {"x": x_values})
-    assert torch.allclose(
-        out[:, target], expected_y, atol=1e-3
-    ), f"reused columns should hold W·x: got {out[:, target]}, want {expected_y}"
+    assert torch.allclose(out[:, target], expected_y, atol=1e-3), (
+        f"reused columns should hold W·x: got {out[:, target]}, want {expected_y}"
+    )
     freed = [c for c in x_cols if c not in target]
-    assert torch.allclose(
-        out[:, freed], torch.zeros(N_POS, len(freed)), atol=1e-3
-    ), "non-reused input columns should be freed to zero"
+    assert torch.allclose(out[:, freed], torch.zeros(N_POS, len(freed)), atol=1e-3), (
+        "non-reused input columns should be freed to zero"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -1199,9 +1199,9 @@ def test_mlp_cancel_bypass_zeroes_columns():
         x_values = torch.randn(N_POS, 5)
         res = _build_residual_stream(rmap, {x: x_values})
         out = layer.mlp.forward(res)
-        assert torch.allclose(
-            out[:, x_cols].cpu(), torch.zeros(N_POS, 5), atol=atol
-        ), f"{activation}: cancel_bypass left residue {out[:, x_cols].abs().max()}"
+        assert torch.allclose(out[:, x_cols].cpu(), torch.zeros(N_POS, 5), atol=atol), (
+            f"{activation}: cancel_bypass left residue {out[:, x_cols].abs().max()}"
+        )
 
 
 def test_mlp_linear_bypass_with_bias():

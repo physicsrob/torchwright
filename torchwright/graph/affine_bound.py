@@ -48,15 +48,15 @@ class AffineBound:
         assert self.A_hi.shape == (d, n), f"A_hi shape {self.A_hi.shape} != ({d}, {n})"
         assert self.b_lo.shape == (d,), f"b_lo shape {self.b_lo.shape} != ({d},)"
         assert self.b_hi.shape == (d,), f"b_hi shape {self.b_hi.shape} != ({d},)"
-        assert (
-            self.A_lo.dtype == torch.float64
-        ), f"A_lo must be float64, got {self.A_lo.dtype}"
+        assert self.A_lo.dtype == torch.float64, (
+            f"A_lo must be float64, got {self.A_lo.dtype}"
+        )
         total_width = sum(w for _, w in self.columns.values())
         assert total_width == n, f"columns total width {total_width} != n_cols {n}"
         for nid in self.columns:
-            assert (
-                nid in self.input_ranges
-            ), f"node_id {nid} in columns but missing from input_ranges"
+            assert nid in self.input_ranges, (
+                f"node_id {nid} in columns but missing from input_ranges"
+            )
 
     @property
     def n_cols(self) -> int:
@@ -188,9 +188,9 @@ class AffineBound:
         x_hi = torch.full((n,), float("inf"), dtype=torch.float64)
 
         for node_id, (start, width) in self.columns.items():
-            assert (
-                node_id in self.input_ranges
-            ), f"node_id {node_id} in columns but not in input_ranges"
+            assert node_id in self.input_ranges, (
+                f"node_id {node_id} in columns but not in input_ranges"
+            )
             lo_vec, hi_vec = self.input_ranges[node_id]
             x_lo[start : start + width] = lo_vec
             x_hi[start : start + width] = hi_vec

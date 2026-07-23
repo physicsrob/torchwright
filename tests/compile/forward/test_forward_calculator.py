@@ -58,9 +58,9 @@ def calc_3digit(calc_module, tmp_path_factory):
 
 def _check(model, input_str, expected):
     result = run(model, input_str)
-    assert (
-        result == expected
-    ), f"For {input_str!r}: expected {expected!r} but got {result!r}"
+    assert result == expected, (
+        f"For {input_str!r}: expected {expected!r} but got {result!r}"
+    )
 
 
 # ---------------------------------------------------------------------------

@@ -59,9 +59,9 @@ def _verify(
     actual = result[output_node]
 
     expected = output_node.compute(n_pos, input_values)
-    assert torch.allclose(
-        actual.cpu(), expected, atol=1e-4
-    ), f"Max diff: {(actual.cpu() - expected).abs().max().item():.6f}"
+    assert torch.allclose(actual.cpu(), expected, atol=1e-4), (
+        f"Max diff: {(actual.cpu() - expected).abs().max().item():.6f}"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -589,9 +589,9 @@ def test_compile_split_vo_large_ratio():
     result = net.compute(4, {"x": torch.randn(4, 8)})
     expected = out.compute(4, {"x": result[x].cpu()})
     actual = result[out]
-    assert torch.allclose(
-        actual.cpu(), expected, atol=1e-4
-    ), f"Max diff: {(actual.cpu() - expected).abs().max().item():.6f}"
+    assert torch.allclose(actual.cpu(), expected, atol=1e-4), (
+        f"Max diff: {(actual.cpu() - expected).abs().max().item():.6f}"
+    )
 
 
 def test_compile_dqk_equals_dv_unchanged():

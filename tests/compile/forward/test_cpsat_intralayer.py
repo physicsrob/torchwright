@@ -1154,8 +1154,7 @@ def test_entry_dead_assignment_is_cpsat_feasible():
         {w.node_id: ATTN, s.node_id: ATTN},
     )
     assert status in ("OPTIMAL", "FEASIBLE"), (
-        f"the entry-dead assignment must be CP-SAT feasible at depth two, "
-        f"got {status}"
+        f"the entry-dead assignment must be CP-SAT feasible at depth two, got {status}"
     )
 
 

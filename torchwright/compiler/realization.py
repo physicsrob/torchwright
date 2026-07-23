@@ -546,8 +546,7 @@ class RealizationTable:
         entry = self.entries.get(node.node_id)
         if entry is None:
             raise UnresolvedRealizationError(
-                f"node {node.node_id} ({type(node).__name__}) has no "
-                f"realization entry"
+                f"node {node.node_id} ({type(node).__name__}) has no realization entry"
             )
         if entry.resolved is None:
             raise UnresolvedRealizationError(

@@ -151,7 +151,7 @@ def _compare_ops(committed: dict, regenerated: dict) -> List[str]:
                 else:
                     ok = _close_enough(cv, rv)
                 if not ok:
-                    failures.append(f"{op_name}/{dist_name}: {key} " f"{cv} -> {rv}")
+                    failures.append(f"{op_name}/{dist_name}: {key} {cv} -> {rv}")
 
     return failures
 

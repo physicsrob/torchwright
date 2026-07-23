@@ -90,9 +90,9 @@ def test_probe_residual_reads_intermediate_node():
     for layer_i in report.layers:
         v = report.at(layer_i)
         assert v is not None
-        assert torch.allclose(
-            v, expected_y, atol=0.1
-        ), f"layer {layer_i}: expected {expected_y.tolist()} got {v.tolist()}"
+        assert torch.allclose(v, expected_y, atol=0.1), (
+            f"layer {layer_i}: expected {expected_y.tolist()} got {v.tolist()}"
+        )
     # at_layer filter: restrict to the last layer that holds y.
     one = probe_residual(module, inp, y, at_layer=report.layers[-1])
     assert one.layers == [report.layers[-1]]
@@ -130,16 +130,16 @@ def test_probe_attention_captures_softmax_weights():
     assert report.layer_index >= 0
     # Softmax sums to 1 per head (within fp tolerance).
     sums = report.weights.sum(dim=-1)
-    assert torch.allclose(
-        sums, torch.ones_like(sums), atol=1e-4
-    ), f"weights don't sum to 1 per head: {sums.tolist()}"
+    assert torch.allclose(sums, torch.ones_like(sums), atol=1e-4), (
+        f"weights don't sum to 1 per head: {sums.tolist()}"
+    )
     # Causal mask: query row 2 can attend to positions 0, 1, 2 only.
     # Positions 3..n_keys-1 (if any) must have negligible weight.
     if report.weights.shape[1] > 3:
         future_mass = report.weights[:, 3:].sum().item()
-        assert (
-            future_mass < 1e-3
-        ), f"causal mask leak — future positions got {future_mass:.3g}"
+        assert future_mass < 1e-3, (
+            f"causal mask leak — future positions got {future_mass:.3g}"
+        )
     # top() returns a ranked list.
     top = report.top(k=3, head=0)
     assert len(top) == 3

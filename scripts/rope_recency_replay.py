@@ -119,7 +119,7 @@ def build_readouts(max_pos: int, seed: int):
     theta_full = 2.0 * math.pi / MAX_POSITIONS
     c_min = _sigmoid_prime(G_M * math.cos(math.pi / 4)) * G_M * math.sin(math.pi / 4)
     ramp = (c_min * theta_full) * k  # value-space, uniform slope
-    out[f"octant_twohead(slope={c_min*theta_full:.1e}/tok)"] = (
+    out[f"octant_twohead(slope={c_min * theta_full:.1e}/tok)"] = (
         noisy(ramp, n_reads=2),
         1.0,
     )

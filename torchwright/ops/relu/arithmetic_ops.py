@@ -255,9 +255,9 @@ def piecewise_linear(
     assert len(inp) == 1, "Input must be a 1D scalar node"
     n = len(breakpoints)
     assert n >= 2, "Need >= 2 breakpoints"
-    assert all(
-        breakpoints[i] < breakpoints[i + 1] for i in range(n - 1)
-    ), "Breakpoints must be strictly ascending"
+    assert all(breakpoints[i] < breakpoints[i + 1] for i in range(n - 1)), (
+        "Breakpoints must be strictly ascending"
+    )
 
     raw_values = [fn(x) for x in breakpoints]
 

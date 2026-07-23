@@ -72,9 +72,9 @@ def test_hf_self_match_rotary_heads_and_const_column():
     # least one residual column is a literal 1.0 in EVERY vocab row, so the
     # per-token lookup reproduces it at every position.
     emb = hf.model.embed_tokens.weight
-    assert bool(
-        (emb == 1.0).all(dim=0).any()
-    ), "no all-rows constant-1 column in the HF embedding table"
+    assert bool((emb == 1.0).all(dim=0).any()), (
+        "no all-rows constant-1 column in the HF embedding table"
+    )
 
 
 def test_hf_self_match_predicts_previous_token():

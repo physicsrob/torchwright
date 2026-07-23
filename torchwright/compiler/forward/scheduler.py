@@ -432,10 +432,7 @@ class LayerScheduler:
             demand = f"{h} heads"
             over = h > self.n_heads
         if over:
-            return (
-                f"alternative {attn_cls} needs {demand}, over "
-                f"n_heads={self.n_heads}"
-            )
+            return f"alternative {attn_cls} needs {demand}, over n_heads={self.n_heads}"
         return f"alternative {attn_cls} fits: {demand} within n_heads={self.n_heads}"
 
     def _schedule_layer_inner(

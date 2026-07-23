@@ -151,9 +151,9 @@ def test_no_bias_emission_has_no_bias_tensors(artifacts):
     assert not bias_names, f"bias initializers in a bias=False artifact: {bias_names}"
     for node in model.graph.node:
         for inp in node.input:
-            assert not inp.endswith(
-                ("_bgate", "_bup", "_bdown", "_b1", "_b2")
-            ), f"node {node.name} reads a bias tensor {inp}"
+            assert not inp.endswith(("_bgate", "_bup", "_bdown", "_b1", "_b2")), (
+                f"node {node.name} reads a bias tensor {inp}"
+            )
 
 
 def test_no_bias_logits_match_biased_twin(artifacts):

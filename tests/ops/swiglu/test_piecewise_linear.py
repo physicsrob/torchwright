@@ -179,6 +179,6 @@ def test_global_position_from_bos_integer_recovery():
     bos_in[0, 0] = 1.0
     result = pos.compute(n_pos=n, input_values={"bos": bos_in}).reshape(-1)
     errs = (result - torch.arange(n, dtype=torch.float32)).abs()
-    assert (
-        errs.max().item() < 0.15
-    ), f"max position error {errs.max().item():.4f} at pos {errs.argmax().item()}"
+    assert errs.max().item() < 0.15, (
+        f"max position error {errs.max().item():.4f} at pos {errs.argmax().item()}"
+    )

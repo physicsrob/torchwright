@@ -95,9 +95,9 @@ def run(d, eps=0.0, energy_scale=1.0, n_iter=200):
     bound = E * 2**-24  # half-ULP of E; the data energy must stay under this
     ok = "OK" if (err.max() == 0 and rms_spread == 0 and drift == 0) else "BIT-DRIFT"
     print(
-        f"  d={d:<5} b={d.bit_length()-1} cols={n_const} rms=2^{m} gain={gain:.2e} "
+        f"  d={d:<5} b={d.bit_length() - 1} cols={n_const} rms=2^{m} gain={gain:.2e} "
         f"eps={eps:g} scale={energy_scale:<5g} "
-        f"Σdata²={data_energy:.2e}(<{bound:.1e}? {'y' if data_energy<bound else 'N'}) "
+        f"Σdata²={data_energy:.2e}(<{bound:.1e}? {'y' if data_energy < bound else 'N'}) "
         f"rms_spread={rms_spread:.0e} max|Δ|={err.max():.0e} "
         f"drift@{n_iter}={drift:.0e}  [{ok}]"
     )

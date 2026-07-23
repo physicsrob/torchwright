@@ -68,9 +68,9 @@ def test_1digit_adder(adder_1digit):
     ]
     for input_str, expected in test_cases:
         result = run(model, input_str)
-        assert (
-            result == expected
-        ), f"For {input_str!r}: expected {expected!r} but got {result!r}"
+        assert result == expected, (
+            f"For {input_str!r}: expected {expected!r} but got {result!r}"
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -92,9 +92,9 @@ def test_3digit_adder(adder_3digit):
     ]
     for input_str, expected in test_cases:
         result = run(model, input_str)
-        assert (
-            result == expected
-        ), f"For {input_str!r}: expected {expected!r} but got {result!r}"
+        assert result == expected, (
+            f"For {input_str!r}: expected {expected!r} but got {result!r}"
+        )
 
 
 def test_3digit_autoregressive(adder_3digit):
@@ -108,6 +108,6 @@ def test_3digit_autoregressive(adder_3digit):
     ]
     for input_str, expected in test_cases:
         result = run(model, input_str)
-        assert (
-            result == expected
-        ), f"For {input_str!r}: expected {expected!r} but got {result!r}"
+        assert result == expected, (
+            f"For {input_str!r}: expected {expected!r} but got {result!r}"
+        )

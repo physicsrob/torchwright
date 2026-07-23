@@ -96,9 +96,9 @@ def test_layer_bounds_sound_against_solved_schedule():
         gm, SchedulingPolicy(), True, _SOLVE_KW["max_layers"]
     )
     for nid, layer in assignment.node_to_layer.items():
-        assert (
-            es[nid] <= layer <= ls[nid]
-        ), f"node {nid} scheduled at {layer} outside [{es[nid]}, {ls[nid]}]"
+        assert es[nid] <= layer <= ls[nid], (
+            f"node {nid} scheduled at {layer} outside [{es[nid]}, {ls[nid]}]"
+        )
 
 
 def test_solver_params_applied_and_solve_unchanged():

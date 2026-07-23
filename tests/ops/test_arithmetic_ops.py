@@ -109,9 +109,9 @@ def test_square():
     for val in range(10):
         result = sq.compute(n_pos=1, input_values={"x": torch.tensor([[float(val)]])})
         expected = val * val
-        assert (
-            abs(result.item() - expected) < 0.01
-        ), f"{val}² = {expected}, got {result.item()}"
+        assert abs(result.item() - expected) < 0.01, (
+            f"{val}² = {expected}, got {result.item()}"
+        )
 
 
 def test_square_large():
@@ -121,9 +121,9 @@ def test_square_large():
     for val in [0, 1, 9, 10, 17, 18]:
         result = sq.compute(n_pos=1, input_values={"x": torch.tensor([[float(val)]])})
         expected = val * val
-        assert (
-            abs(result.item() - expected) < 0.01
-        ), f"{val}² = {expected}, got {result.item()}"
+        assert abs(result.item() - expected) < 0.01, (
+            f"{val}² = {expected}, got {result.item()}"
+        )
 
 
 def test_multiply_integers_all_digit_pairs():
@@ -141,9 +141,9 @@ def test_multiply_integers_all_digit_pairs():
                 },
             )
             expected = i * j
-            assert (
-                abs(result.item() - expected) < 0.5
-            ), f"{i}*{j} = {expected}, got {result.item()}"
+            assert abs(result.item() - expected) < 0.5, (
+                f"{i}*{j} = {expected}, got {result.item()}"
+            )
 
 
 def test_multiply_integers_zero():
@@ -176,9 +176,9 @@ def test_mod_const():
     for val, divisor, max_val, expected in cases:
         m = mod_const(x, divisor, max_val)
         result = m.compute(n_pos=1, input_values={"x": torch.tensor([[float(val)]])})
-        assert (
-            abs(result.item() - expected) < 0.5
-        ), f"{val} % {divisor} = {expected}, got {result.item()}"
+        assert abs(result.item() - expected) < 0.5, (
+            f"{val} % {divisor} = {expected}, got {result.item()}"
+        )
 
 
 def _eval_pw(node, val):
@@ -216,7 +216,7 @@ def test_piecewise_linear_square():
     f = piecewise_linear(x, bp, lambda x: x * x)
     for i in range(10):
         result = _eval_pw(f, float(i))
-        assert abs(result - i * i) < 0.01, f"f({i}) = {result}, expected {i*i}"
+        assert abs(result - i * i) < 0.01, f"f({i}) = {result}, expected {i * i}"
 
 
 def test_piecewise_linear_constant_segment():
@@ -252,7 +252,7 @@ def test_piecewise_linear_chunking():
     f = piecewise_linear(x, bp, lambda x: x * x, d_max=4)
     for i in range(10):
         result = _eval_pw(f, float(i))
-        assert abs(result - i * i) < 0.01, f"f({i}) = {result}, expected {i*i}"
+        assert abs(result - i * i) < 0.01, f"f({i}) = {result}, expected {i * i}"
 
 
 def test_abs():
@@ -291,9 +291,9 @@ def test_reciprocal():
     for v in range(1, 11):
         result = r.compute(n_pos=1, input_values={"x": torch.tensor([[float(v)]])})
         expected = 1.0 / v
-        assert (
-            abs(result.item() - expected) < 0.01
-        ), f"1/{v} = {expected}, got {result.item()}"
+        assert abs(result.item() - expected) < 0.01, (
+            f"1/{v} = {expected}, got {result.item()}"
+        )
 
 
 def test_reciprocal_interpolation():
@@ -304,9 +304,9 @@ def test_reciprocal_interpolation():
     for v in [1.5, 2.5, 5.5]:
         result = r.compute(n_pos=1, input_values={"x": torch.tensor([[v]])})
         exact = 1.0 / v
-        assert (
-            abs(result.item() - exact) < 0.1
-        ), f"1/{v} = {exact:.4f}, got {result.item():.4f}"
+        assert abs(result.item() - exact) < 0.1, (
+            f"1/{v} = {exact:.4f}, got {result.item():.4f}"
+        )
 
 
 def test_reciprocal_small_min_value():
@@ -353,9 +353,9 @@ def test_floor_int():
     # Between integers
     for v, expected in [(2.3, 2.0), (2.7, 2.0), (4.9, 4.0)]:
         result = f.compute(n_pos=1, input_values={"x": torch.tensor([[v]])})
-        assert (
-            abs(result.item() - expected) < 0.01
-        ), f"floor({v}) = {expected}, got {result.item()}"
+        assert abs(result.item() - expected) < 0.01, (
+            f"floor({v}) = {expected}, got {result.item()}"
+        )
 
 
 def test_floor_int_negative():
@@ -363,9 +363,9 @@ def test_floor_int_negative():
     f = floor_int(x, min_value=-3, max_value=3)
     for v, expected in [(-2.5, -3.0), (-1.0, -1.0), (0.0, 0.0), (1.5, 1.0)]:
         result = f.compute(n_pos=1, input_values={"x": torch.tensor([[v]])})
-        assert (
-            abs(result.item() - expected) < 0.01
-        ), f"floor({v}) = {expected}, got {result.item()}"
+        assert abs(result.item() - expected) < 0.01, (
+            f"floor({v}) = {expected}, got {result.item()}"
+        )
 
 
 def test_ceil_int():
@@ -378,9 +378,9 @@ def test_ceil_int():
     # Between integers
     for v, expected in [(2.3, 3.0), (2.7, 3.0), (0.1, 1.0)]:
         result = c.compute(n_pos=1, input_values={"x": torch.tensor([[v]])})
-        assert (
-            abs(result.item() - expected) < 0.01
-        ), f"ceil({v}) = {expected}, got {result.item()}"
+        assert abs(result.item() - expected) < 0.01, (
+            f"ceil({v}) = {expected}, got {result.item()}"
+        )
 
 
 def test_floor_int_wide_range_large_magnitude():
@@ -399,8 +399,7 @@ def test_floor_int_wide_range_large_magnitude():
         for v in (10.4, 1000.4, 16800.4, 40000.4, 62195.4, 65534.4):
             r = f.compute(n_pos=1, input_values={"x": torch.tensor([[v]])}).item()
             assert abs(r - math.floor(v)) < 0.01, (
-                f"floor_int({v}, [0,65535], s={s}) should be {math.floor(v)}, "
-                f"got {r}"
+                f"floor_int({v}, [0,65535], s={s}) should be {math.floor(v)}, got {r}"
             )
 
 
@@ -426,9 +425,9 @@ def test_ceil_int_wide_range_large_magnitude():
     c = ceil_int(x, min_value=0, max_value=65535)
     for v in (10.4, 1000.4, 40000.4, 62195.98):
         r = c.compute(n_pos=1, input_values={"x": torch.tensor([[v]])}).item()
-        assert (
-            abs(r - math.ceil(v)) < 0.01
-        ), f"ceil_int({v}) should be {math.ceil(v)}, got {r}"
+        assert abs(r - math.ceil(v)) < 0.01, (
+            f"ceil_int({v}) should be {math.ceil(v)}, got {r}"
+        )
 
 
 def test_ceil_int_high_sharpness_screen_y():
@@ -475,9 +474,9 @@ def test_clamp():
         result = out.compute(
             n_pos=1, input_values={"x": torch.tensor([[x_val]])}
         ).item()
-        assert (
-            abs(result - expected) < 0.15
-        ), f"clamp({x_val}, 2, 8): expected {expected}, got {result:.4f}"
+        assert abs(result - expected) < 0.15, (
+            f"clamp({x_val}, 2, 8): expected {expected}, got {result:.4f}"
+        )
 
 
 def test_piecewise_linear_vector():
@@ -514,6 +513,6 @@ def test_piecewise_linear_vector():
             .tolist()
         )
         for j, (r, e) in enumerate(zip(result, expected)):
-            assert (
-                abs(r - e) < 0.01
-            ), f"piecewise_linear({x_val})[{j}]: expected {e}, got {r:.4f}"
+            assert abs(r - e) < 0.01, (
+                f"piecewise_linear({x_val})[{j}]: expected {e}, got {r:.4f}"
+            )

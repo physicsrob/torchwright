@@ -53,9 +53,9 @@ def test_caesar_cipher(caesar):
     ]
     for shift, plaintext, expected in test_cases:
         # Verify reference matches expected
-        assert (
-            _caesar(plaintext, int(shift)) == expected
-        ), f"Reference mismatch for shift={shift}, text={plaintext}"
+        assert _caesar(plaintext, int(shift)) == expected, (
+            f"Reference mismatch for shift={shift}, text={plaintext}"
+        )
         # Prompt: bos, shift token, plaintext chars, newline trigger.
         result = run(model, shift + plaintext + "\n", bos_token="<bos>")
         assert result == expected, (

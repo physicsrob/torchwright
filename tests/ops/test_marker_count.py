@@ -81,9 +81,9 @@ def test_oracle_marker_not_at_zero():
     got = cache[gap].reshape(-1)
     # only positions at/after the marker are meaningful
     for n in range(marker_pos, n_pos):
-        assert (
-            abs(got[n].item() - (n - marker_pos)) < 0.5
-        ), f"pos {n}: expected gap {n - marker_pos}, got {got[n].item():.3f}"
+        assert abs(got[n].item() - (n - marker_pos)) < 0.5, (
+            f"pos {n}: expected gap {n - marker_pos}, got {got[n].item():.3f}"
+        )
 
 
 def test_unsafe_dhead_raises():

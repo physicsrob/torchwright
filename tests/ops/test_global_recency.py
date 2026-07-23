@@ -103,7 +103,7 @@ def test_position_strictly_increases():
     for m in range(1, n - 1):
         assert result[m].item() < result[m + 1].item(), (
             f"position not monotone: result[{m}]={result[m].item():.3f} "
-            f">= result[{m+1}]={result[m+1].item():.3f}"
+            f">= result[{m + 1}]={result[m + 1].item():.3f}"
         )
 
 
@@ -162,9 +162,9 @@ def test_picks_most_recent_within_window():
     for p in range(1, n):
         # m <= p: the query at p can see itself if it's a match (causal, inclusive).
         most_recent = max(m for m in matches if m <= p)
-        assert (
-            abs(out[p].item() - float(most_recent)) < 0.5
-        ), f"pos {p}: expected most-recent match {most_recent}, got {out[p].item():.2f}"
+        assert abs(out[p].item() - float(most_recent)) < 0.5, (
+            f"pos {p}: expected most-recent match {most_recent}, got {out[p].item():.2f}"
+        )
 
 
 def test_fixes_phase6_breakdown():
@@ -319,9 +319,9 @@ def test_wider_content_W16():
 
     for p in range(1, n):
         most_recent = max(m for m in matches if m <= p)
-        assert (
-            abs(result[p].item() - float(most_recent)) < 0.5
-        ), f"pos {p}: expected most-recent {most_recent}, got {result[p].item():.2f}"
+        assert abs(result[p].item() - float(most_recent)) < 0.5, (
+            f"pos {p}: expected most-recent {most_recent}, got {result[p].item():.2f}"
+        )
 
 
 def test_w_of_m_uses_exponential_formula():

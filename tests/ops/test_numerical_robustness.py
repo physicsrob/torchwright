@@ -49,9 +49,9 @@ def test_map_to_table_output_fidelity():
         result = looked_up.compute(n_pos=1, input_values={}).squeeze()
         true_emb = embedding.get_embedding(str(digit))
         dist = (result - true_emb).norm().item()
-        assert (
-            dist < 0.1
-        ), f"digit {digit}: map_to_table output dist={dist:.4f} from true embedding"
+        assert dist < 0.1, (
+            f"digit {digit}: map_to_table output dist={dist:.4f} from true embedding"
+        )
 
 
 def test_chained_map_to_table_output_fidelity():
@@ -84,9 +84,9 @@ def test_equals_vector_after_map_to_table():
         looked_up = map_to_table(inp, table, default=embedding.get_embedding("0"))
         result = equals_vector(looked_up, embedding.get_embedding(str(digit)))
         output = result.compute(n_pos=1, input_values={}).item()
-        assert output == pytest.approx(
-            1.0, abs=0.1
-        ), f"digit {digit}: equals_vector={output:.4f}, expected ~1.0"
+        assert output == pytest.approx(1.0, abs=0.1), (
+            f"digit {digit}: equals_vector={output:.4f}, expected ~1.0"
+        )
 
 
 def test_equals_vector_after_map_to_table_rejects_wrong_digit():
@@ -100,9 +100,9 @@ def test_equals_vector_after_map_to_table_rejects_wrong_digit():
     for wrong_digit in [0, 1, 2, 3, 4, 6, 7, 8, 9]:
         result = equals_vector(looked_up, embedding.get_embedding(str(wrong_digit)))
         output = result.compute(n_pos=1, input_values={}).item()
-        assert output == pytest.approx(
-            -1.0, abs=0.1
-        ), f"wrong digit {wrong_digit}: equals_vector={output:.4f}, expected ~-1.0"
+        assert output == pytest.approx(-1.0, abs=0.1), (
+            f"wrong digit {wrong_digit}: equals_vector={output:.4f}, expected ~-1.0"
+        )
 
 
 def test_equals_vector_after_double_map_to_table():
@@ -116,9 +116,9 @@ def test_equals_vector_after_double_map_to_table():
         second = map_to_table(first, table, default=embedding.get_embedding("0"))
         result = equals_vector(second, embedding.get_embedding(str(digit)))
         output = result.compute(n_pos=1, input_values={}).item()
-        assert output == pytest.approx(
-            1.0, abs=0.1
-        ), f"digit {digit}: equals_vector after double lookup={output:.4f}"
+        assert output == pytest.approx(1.0, abs=0.1), (
+            f"digit {digit}: equals_vector after double lookup={output:.4f}"
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -135,9 +135,9 @@ def test_equals_vector_output_bounds_exact_input():
             inp = create_literal_value(embedding.get_embedding(str(i)))
             result = equals_vector(inp, embedding.get_embedding(str(j)))
             output = result.compute(n_pos=1, input_values={}).item()
-            assert (
-                -1.0 - 1e-3 <= output <= 1.0 + 1e-3
-            ), f"equals_vector({i}, {j}) = {output:.4f}, outside [-1, 1]"
+            assert -1.0 - 1e-3 <= output <= 1.0 + 1e-3, (
+                f"equals_vector({i}, {j}) = {output:.4f}, outside [-1, 1]"
+            )
 
 
 # ---------------------------------------------------------------------------
@@ -165,25 +165,25 @@ def test_equals_vector_after_select():
     selected = select(cond=cond_true, true_node=true_node, false_node=false_node)
     result = equals_vector(selected, e3)
     output = result.compute(n_pos=1, input_values={}).item()
-    assert output == pytest.approx(
-        1.0, abs=0.1
-    ), f"equals_vector(select(true→3), 3) = {output:.4f}, expected ~1.0"
+    assert output == pytest.approx(1.0, abs=0.1), (
+        f"equals_vector(select(true→3), 3) = {output:.4f}, expected ~1.0"
+    )
 
     # Also verify it rejects the wrong digit
     result_wrong = equals_vector(selected, e7)
     output_wrong = result_wrong.compute(n_pos=1, input_values={}).item()
-    assert output_wrong == pytest.approx(
-        -1.0, abs=0.1
-    ), f"equals_vector(select(true→3), 7) = {output_wrong:.4f}, expected ~-1.0"
+    assert output_wrong == pytest.approx(-1.0, abs=0.1), (
+        f"equals_vector(select(true→3), 7) = {output_wrong:.4f}, expected ~-1.0"
+    )
 
     # Condition = false → should select e7
     cond_false = create_literal_value(torch.tensor([-1.0]))
     selected_f = select(cond=cond_false, true_node=true_node, false_node=false_node)
     result_f = equals_vector(selected_f, e7)
     output_f = result_f.compute(n_pos=1, input_values={}).item()
-    assert output_f == pytest.approx(
-        1.0, abs=0.1
-    ), f"equals_vector(select(false→7), 7) = {output_f:.4f}, expected ~1.0"
+    assert output_f == pytest.approx(1.0, abs=0.1), (
+        f"equals_vector(select(false→7), 7) = {output_f:.4f}, expected ~1.0"
+    )
 
 
 def test_equals_vector_after_nested_select():
@@ -210,9 +210,9 @@ def test_equals_vector_after_nested_select():
 
     result = equals_vector(level2, e5)
     output = result.compute(n_pos=1, input_values={}).item()
-    assert output == pytest.approx(
-        1.0, abs=0.1
-    ), f"equals_vector after 2 selects = {output:.4f}, expected ~1.0"
+    assert output == pytest.approx(1.0, abs=0.1), (
+        f"equals_vector after 2 selects = {output:.4f}, expected ~1.0"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -247,7 +247,7 @@ def test_map_to_table_chain_produces_correct_lookup():
 
         assert closest == digit, (
             f"digit {digit}: chained map_to_table decoded as {closest} "
-            f"(dist to correct={( result - true_emb).norm().item():.1f}, "
+            f"(dist to correct={(result - true_emb).norm().item():.1f}, "
             f"dist to decoded={min_dist:.1f})"
         )
 

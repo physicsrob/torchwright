@@ -35,9 +35,9 @@ from torchwright.debug.noise import NOISE_FOOTER_MARKER
 
 
 def _load_json() -> dict:
-    assert (
-        DOCS_JSON.exists()
-    ), f"{DOCS_JSON} is missing. Run `make measure-noise` to generate it."
+    assert DOCS_JSON.exists(), (
+        f"{DOCS_JSON} is missing. Run `make measure-noise` to generate it."
+    )
     return json.loads(DOCS_JSON.read_text())
 
 

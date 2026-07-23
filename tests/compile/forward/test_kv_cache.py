@@ -37,9 +37,9 @@ def test_prefill_matches_forward(compiled_calc):
     expected = net.forward(inp)
     actual, kvs = net.forward_cached(inp)
 
-    assert torch.allclose(
-        expected, actual, atol=1e-5
-    ), f"max diff: {(expected - actual).abs().max().item()}"
+    assert torch.allclose(expected, actual, atol=1e-5), (
+        f"max diff: {(expected - actual).abs().max().item()}"
+    )
     assert len(kvs) == len(net.layers)
 
 
@@ -61,6 +61,6 @@ def test_token_by_token_matches_full(compiled_calc):
         res, kvs = net.forward_cached(new_inp, kvs)
 
     # The last token's output should match
-    assert torch.allclose(
-        expected[-1:], res, atol=1e-4
-    ), f"max diff: {(expected[-1:] - res).abs().max().item()}"
+    assert torch.allclose(expected[-1:], res, atol=1e-4), (
+        f"max diff: {(expected[-1:] - res).abs().max().item()}"
+    )

@@ -139,9 +139,9 @@ class OnnxTokenModule:
         # KV cache topology discovery from the ONNX graph's input spec.
         inputs = {inp.name: inp for inp in self._session.get_inputs()}
         self._n_layers = sum(1 for name in inputs if name.startswith("past_K_"))
-        assert (
-            self._n_layers > 0
-        ), f"{onnx_path}: no past_K_* inputs — is this a cached-protocol model?"
+        assert self._n_layers > 0, (
+            f"{onnx_path}: no past_K_* inputs — is this a cached-protocol model?"
+        )
         self._cache_stride = discover_cache_stride(
             inputs, meta.get("cache_stride"), onnx_path
         )

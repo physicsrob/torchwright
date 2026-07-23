@@ -122,7 +122,7 @@ def global_position_from_bos(
         raise ValueError(
             f"global_position_from_bos requires max_positions × theta_slow < π/2 "
             f"for the BOS weight to be monotone, but got "
-            f"max_positions={max_len} × theta_slow={theta:.3e} = {product:.3f} ≥ {math.pi/2:.3f}.  "
+            f"max_positions={max_len} × theta_slow={theta:.3e} = {product:.3f} ≥ {math.pi / 2:.3f}.  "
             f"Increase d_head or base, or reduce max_positions."
         )
 

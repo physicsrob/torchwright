@@ -144,9 +144,9 @@ def test_default_build_is_pinned(name):
     on = _proto_text(build_cpsat_model(node, _pin_cancels=True, **cfg))
     assert default == on, f"{name}: default proto differs from pinned build"
     assert "parked" not in default, f"{name}: default build has parked vars"
-    assert (
-        "pin_attn" in default or "pin_mlp" in default
-    ), f"{name}: default build posts no pin aux vars (pin is dead)"
+    assert "pin_attn" in default or "pin_mlp" in default, (
+        f"{name}: default build posts no pin aux vars (pin is dead)"
+    )
 
 
 @pytest.mark.parametrize("name", _NAMES)
@@ -162,9 +162,9 @@ def test_knob_off_reproduces_legacy_model(name):
     off = _proto_text(build_cpsat_model(node, _pin_cancels=False, **cfg))
     assert off != default, f"{name}: knob-off proto identical to default"
     assert "parked" in off, f"{name}: legacy build has no parked vars"
-    assert (
-        "pin_attn" not in off and "pin_mlp" not in off
-    ), f"{name}: legacy build still posts pin aux vars"
+    assert "pin_attn" not in off and "pin_mlp" not in off, (
+        f"{name}: legacy build still posts pin aux vars"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -205,8 +205,7 @@ def test_pinned_solution_valid_in_unpinned_model(name, d):
     cfg = _solve_cfg(d, d_head)
     asg, stats = solve_schedule(low, _pin_cancels=True, **cfg)
     assert asg is not None, (
-        f"{name} d={d}: pinned solve found no feasible schedule "
-        f"({stats.status_name})"
+        f"{name} d={d}: pinned solve found no feasible schedule ({stats.status_name})"
     )
 
     built = build_cpsat_model(
@@ -253,12 +252,12 @@ def test_pinned_optimum_no_shallower_than_unpinned(name, d):
 
     off_asg, off_stats = _solve(False)
     on_asg, on_stats = _solve(True)
-    assert (
-        off_asg is not None and off_stats.is_optimal
-    ), f"{name} d={d}: unpinned not optimal in budget ({off_stats.status_name})"
-    assert (
-        on_asg is not None and on_stats.is_optimal
-    ), f"{name} d={d}: pinned not optimal in budget ({on_stats.status_name})"
+    assert off_asg is not None and off_stats.is_optimal, (
+        f"{name} d={d}: unpinned not optimal in budget ({off_stats.status_name})"
+    )
+    assert on_asg is not None and on_stats.is_optimal, (
+        f"{name} d={d}: pinned not optimal in budget ({on_stats.status_name})"
+    )
     assert on_asg.n_layers >= off_asg.n_layers, (
         f"{name} d={d}: pinned optimum {on_asg.n_layers} beats unpinned "
         f"{off_asg.n_layers} — impossible for a pure restriction"
@@ -292,9 +291,9 @@ def test_pin_reaches_snapshot_path():
     )
     live_default = _proto_text(build_cpsat_model(node, **cfg))
     assert snap_default != snap_off, "knob dead on the snapshot path"
-    assert (
-        snap_default == live_default
-    ), "default (pinned) snapshot proto differs from default live"
+    assert snap_default == live_default, (
+        "default (pinned) snapshot proto differs from default live"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -323,9 +322,9 @@ def test_full_hint_with_pin_passes_strict_validation():
         _pin_cancels=True,
         **cfg,
     )
-    assert (
-        asg is not None
-    ), f"pinned solve with full hint found nothing ({stats.status_name})"
+    assert asg is not None, (
+        f"pinned solve with full hint found nothing ({stats.status_name})"
+    )
 
 
 # ---------------------------------------------------------------------------

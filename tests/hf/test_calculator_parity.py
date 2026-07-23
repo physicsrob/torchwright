@@ -145,9 +145,9 @@ def test_prefill_token_identical_within_fp_floor(model, oracle, tok2id, text):
     o, h = _prefill_logits(model, oracle, tok2id, text)
     # Real bar: stock Phi-3 and the ONNX oracle pick the same token at every
     # teacher-forced position (no argmax flip).
-    assert (
-        o.argmax(-1) == h.argmax(-1)
-    ).all(), f"{text!r}: Phi-3/oracle argmax differs at a prefill position (token flip)"
+    assert (o.argmax(-1) == h.argmax(-1)).all(), (
+        f"{text!r}: Phi-3/oracle argmax differs at a prefill position (token flip)"
+    )
     # Residual logit divergence stays within the cross-backend fp floor (Phase-6
     # local-recency reshape) — a structural regression would blow past it.
     assert (o - h).abs().max().item() <= _PARITY_FP_FLOOR

@@ -383,9 +383,9 @@ def test_single_wall_single_query():
     # Query is at row n_pos - 1.
     query_row = n_pos - 1
     assert out.shape == (n_pos, D_OUTPUT)
-    assert (
-        abs(out[query_row, _OUT_WALL_ID].item() - 42.0) < 1e-4
-    ), f"attended wall_id was {out[query_row, _OUT_WALL_ID].item()}, expected 42.0"
+    assert abs(out[query_row, _OUT_WALL_ID].item() - 42.0) < 1e-4, (
+        f"attended wall_id was {out[query_row, _OUT_WALL_ID].item()}, expected 42.0"
+    )
     assert abs(out[query_row, _OUT_WALL_COS].item() - 1.0) < 1e-4
     assert abs(out[query_row, _OUT_WALL_SIN].item() - 0.0) < 1e-4
 
@@ -441,9 +441,9 @@ def test_n_walls_each_midpoint(n_walls):
         # Correct wall dominates the softmax but adjacent walls leak a
         # small amount; use a tolerance wide enough for the blend and
         # assert the wall_id rounds to the right integer.
-        assert np.allclose(
-            got, expected, atol=1e-4
-        ), f"n_walls={n_walls}, query {q_idx}: got {got}, expected {expected}"
+        assert np.allclose(got, expected, atol=1e-4), (
+            f"n_walls={n_walls}, query {q_idx}: got {got}, expected {expected}"
+        )
         # And the actual wall_id rounds to the right integer.
         assert round(got[_OUT_WALL_ID]) == walls[q_idx]["wall_id"], (
             f"n_walls={n_walls}, query {q_idx}: attended wall_id "
@@ -698,6 +698,6 @@ def test_probe_compiled_matches_oracle():
         verbose=False,
         atol=1e-3,
     )
-    assert (
-        report.first_divergent is None
-    ), f"probe reported divergence:\n{report.format_short()}"
+    assert report.first_divergent is None, (
+        f"probe reported divergence:\n{report.format_short()}"
+    )

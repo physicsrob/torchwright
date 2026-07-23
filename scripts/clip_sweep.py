@@ -75,6 +75,6 @@ ag = sorted(all_gaps)
 n = len(ag)
 print(
     f"\nAGGREGATE over all angles: n={n} min={ag[0]} "
-    f"median={statistics.median(ag):.0f} p95={ag[int(0.95*n)]} "
-    f"p99={ag[int(0.99*n)]} max={ag[-1]}"
+    f"median={statistics.median(ag):.0f} p95={ag[int(0.95 * n)]} "
+    f"p99={ag[int(0.99 * n)]} max={ag[-1]}"
 )

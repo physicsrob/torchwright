@@ -130,9 +130,9 @@ class PLFunction:
         assert self.y.shape == (n, d)
         assert self.slope_lo.shape == (d,) and self.slope_hi.shape == (d,)
         if n > 1:
-            assert bool(
-                (self.x[1:] > self.x[:-1]).all()
-            ), "knots must be strictly ascending"
+            assert bool((self.x[1:] > self.x[:-1]).all()), (
+                "knots must be strictly ascending"
+            )
 
     # --- shape ----------------------------------------------------------
 

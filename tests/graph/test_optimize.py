@@ -95,9 +95,9 @@ def test_fuse_chain_ordering_regression():
         assert l3.inputs[0] is inp
 
         out_after = l3.compute(n_pos, {"x": x})
-        assert torch.allclose(
-            out_before, out_after, atol=1e-5
-        ), f"offset={offset}: numeric mismatch after fusion"
+        assert torch.allclose(out_before, out_after, atol=1e-5), (
+            f"offset={offset}: numeric mismatch after fusion"
+        )
 
 
 def test_no_fuse_multiple_consumers():

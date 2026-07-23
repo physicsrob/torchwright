@@ -50,9 +50,9 @@ def test_recompile_after_counter_reset_does_not_collide():
     result = net.compute(3, inputs)
     actual = result[out].cpu()
     expected = out.compute(3, inputs)
-    assert torch.allclose(
-        actual, expected, atol=1e-4
-    ), f"Max diff: {(actual - expected).abs().max().item():.6f}"
+    assert torch.allclose(actual, expected, atol=1e-4), (
+        f"Max diff: {(actual - expected).abs().max().item():.6f}"
+    )
 
 
 def test_reserve_node_id_above_only_advances():

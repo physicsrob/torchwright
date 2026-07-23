@@ -2219,9 +2219,9 @@ class CompiledHeadless:
                 # calls ``attn.attn.forward_cached``.
                 net.forward_cached(res_stream, past_kvs=past_kvs)
         weights, logits = captured["weights"], captured["logits"]
-        assert (
-            weights is not None and logits is not None
-        ), "attention_capture did not fire — hook installed on wrong layer?"
+        assert weights is not None and logits is not None, (
+            "attention_capture did not fire — hook installed on wrong layer?"
+        )
         return weights, logits
 
     def _run_debug_checks(self, res_stream, past_kvs=None, atol: float = 1e-7):

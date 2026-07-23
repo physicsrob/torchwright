@@ -96,13 +96,11 @@ class Embedding(Node):
             ids = raw
             if ids.ndim == 2:
                 assert ids.shape[1] == 1, (
-                    f"integer-ID input must be (n,) or (n, 1); got "
-                    f"{tuple(ids.shape)}"
+                    f"integer-ID input must be (n,) or (n, 1); got {tuple(ids.shape)}"
                 )
                 ids = ids[:, 0]
             assert ids.shape == (n_pos,), (
-                f"expected integer-ID input of shape ({n_pos},); got "
-                f"{tuple(ids.shape)}"
+                f"expected integer-ID input of shape ({n_pos},); got {tuple(ids.shape)}"
             )
             ids = ids.to(dtype=torch.long)
         else:

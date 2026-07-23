@@ -43,9 +43,9 @@ def test_linear_into_in_range():
 
     expected = [-1, -1, -1, 1, 1, 1, -1, -1]
     for i in range(H):
-        assert (
-            abs(graph_out[i].item() - expected[i]) < 0.5
-        ), f"Graph mismatch at slot {i}: got {graph_out[i].item()}, expected {expected[i]}"
+        assert abs(graph_out[i].item() - expected[i]) < 0.5, (
+            f"Graph mismatch at slot {i}: got {graph_out[i].item()}, expected {expected[i]}"
+        )
         assert abs(compiled_out[i].item() - expected[i]) < 0.5, (
             f"Compiled mismatch at slot {i}: got {compiled_out[i].item()}, expected {expected[i]}. "
             f"Full compiled output: {[f'{v:.1f}' for v in compiled_out.tolist()]}"

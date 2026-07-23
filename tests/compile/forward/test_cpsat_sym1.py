@@ -199,7 +199,7 @@ def test_canonical_form_on_solved_model(name, d):
         _pin_cancels=False,
     )
     assert asg is not None and stats.is_optimal, (
-        f"{name} d={d}: expected a proven-optimal solve (got " f"{stats.status_name})"
+        f"{name} d={d}: expected a proven-optimal solve (got {stats.status_name})"
     )
     max_layers = 100
     # node_to_cancel_mech is keyed by exactly the non-keep-forever schedulable
@@ -245,9 +245,9 @@ def test_depth_invariance_on_vs_off(name, d):
 
     off_asg, off_stats = _solve(False)
     on_asg, on_stats = _solve(True)
-    assert (
-        off_asg is not None and off_stats.is_optimal
-    ), f"{name} d={d}: off not optimal"
+    assert off_asg is not None and off_stats.is_optimal, (
+        f"{name} d={d}: off not optimal"
+    )
     assert on_asg is not None and on_stats.is_optimal, f"{name} d={d}: on not optimal"
     assert on_asg.n_layers == off_asg.n_layers, (
         f"{name} d={d}: canonicalization changed the optimal depth "
@@ -285,6 +285,6 @@ def test_knob_on_compile_replays_clean():
     # error); a clean return is the tripwire staying silent.
     off_layers = _compile(False)
     on_layers = _compile(True)
-    assert (
-        on_layers == off_layers
-    ), f"caesar: knob-on compile depth {on_layers} != knob-off {off_layers}"
+    assert on_layers == off_layers, (
+        f"caesar: knob-on compile depth {on_layers} != knob-off {off_layers}"
+    )

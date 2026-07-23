@@ -709,7 +709,7 @@ class OnnxDebugSession:
                 ids = raw.reshape(-1)
             else:
                 assert self._embedding is not None, (
-                    "token-string inputs need an Embedding node in the " "rebuilt graph"
+                    "token-string inputs need an Embedding node in the rebuilt graph"
                 )
                 ids = torch.tensor(
                     [self._embedding.tokenizer.get_token_id(t) for t in raw]

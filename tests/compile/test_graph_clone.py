@@ -308,9 +308,9 @@ def test_clone_remaps_semantic_override_basis():
         ov = clone._semantic_affine_override
         assert ov is not None
         for nid in list(ov.columns) + list(ov.input_ranges):
-            assert (
-                nid not in source_ids
-            ), f"clone override basis still keyed by source node id {nid}"
+            assert nid not in source_ids, (
+                f"clone override basis still keyed by source node id {nid}"
+            )
         sr = src._semantic_affine_override.to_scalar_range()
         cr = ov.to_scalar_range()
         assert (sr.lo, sr.hi) == (cr.lo, cr.hi)
@@ -379,9 +379,9 @@ def test_clone_remaps_sibling_scheduling_predecessor():
 
     r1, r2, r3 = sequential_scope([factory(0), factory(1), factory(2)])
     out = Concatenate([r1, r2, r3])
-    assert any(
-        n.scheduling_predecessors for n in (r1, r2, r3)
-    ), "sequential_scope should have wired sibling predecessors"
+    assert any(n.scheduling_predecessors for n in (r1, r2, r3)), (
+        "sequential_scope should have wired sibling predecessors"
+    )
 
     copy = clone_graph(out, DISPATCH)
     for src_node in (r1, r2, r3):

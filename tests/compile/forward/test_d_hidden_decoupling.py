@@ -84,9 +84,9 @@ def test_compile_with_small_d_hidden():
     x = torch.tensor([[0.5, -1.0, 2.0, 0.25]])
     expected = out_node.compute(n_pos=1, input_values={"x": x})
     actual = module(x)
-    assert torch.allclose(
-        actual, expected, atol=1e-3
-    ), f"max diff: {(actual - expected).abs().max().item():.6f}"
+    assert torch.allclose(actual, expected, atol=1e-3), (
+        f"max diff: {(actual - expected).abs().max().item():.6f}"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -119,9 +119,9 @@ def test_compile_with_d_hidden_larger_than_d():
     # before the decoupling.
     for layer in module._net.layers:
         assert layer.mlp.linear1.output_matrix.shape[0] == 32
-        assert (
-            32 < layer.mlp.linear1.output_matrix.shape[1] <= 64
-        ), "per-layer d_hidden must exceed d=32 to exercise the decoupling"
+        assert 32 < layer.mlp.linear1.output_matrix.shape[1] <= 64, (
+            "per-layer d_hidden must exceed d=32 to exercise the decoupling"
+        )
         assert (
             layer.mlp.linear2.output_matrix.shape[0]
             == layer.mlp.linear1.output_matrix.shape[1]
@@ -131,9 +131,9 @@ def test_compile_with_d_hidden_larger_than_d():
     x = torch.tensor([[0.5, -1.0, 2.0, 0.25]])
     expected = out_node.compute(n_pos=1, input_values={"x": x})
     actual = module(x)
-    assert torch.allclose(
-        actual, expected, atol=1e-3
-    ), f"max diff: {(actual - expected).abs().max().item():.6f}"
+    assert torch.allclose(actual, expected, atol=1e-3), (
+        f"max diff: {(actual - expected).abs().max().item():.6f}"
+    )
 
 
 # ---------------------------------------------------------------------------

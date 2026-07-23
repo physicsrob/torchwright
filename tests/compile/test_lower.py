@@ -152,9 +152,9 @@ def test_lower_copy_has_fresh_bounds_source_keeps_stale():
             f"cached={cached} fresh={fresh}"
         )
     copy_range = lowered.copy_of(l1)._affine_bound.to_scalar_range()
-    assert (
-        copy_range.lo != stale.lo or copy_range.hi != stale.hi
-    ), "mutation should have widened the copy's l1 bound"
+    assert copy_range.lo != stale.lo or copy_range.hi != stale.hi, (
+        "mutation should have widened the copy's l1 bound"
+    )
     # Source untouched: still carrying its (now stale) cached bound.
     src_range = l1._affine_bound.to_scalar_range()
     assert (src_range.lo, src_range.hi) == (stale.lo, stale.hi)

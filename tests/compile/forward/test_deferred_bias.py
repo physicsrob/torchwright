@@ -47,12 +47,12 @@ def test_block_with_two_biased_linear_inputs():
 
     expected = [-1, -1, -1, -1, -1, 1, 1, 1]
     for i in range(H):
-        assert (
-            abs(graph_out[i].item() - expected[i]) < 0.5
-        ), f"Graph mismatch at slot {i}: got {graph_out[i].item():.1f}, expected {expected[i]}"
-        assert (
-            abs(compiled_out[i].item() - expected[i]) < 0.5
-        ), f"Compiled mismatch at slot {i}: got {compiled_out[i].item():.1f}, expected {expected[i]}"
+        assert abs(graph_out[i].item() - expected[i]) < 0.5, (
+            f"Graph mismatch at slot {i}: got {graph_out[i].item():.1f}, expected {expected[i]}"
+        )
+        assert abs(compiled_out[i].item() - expected[i]) < 0.5, (
+            f"Compiled mismatch at slot {i}: got {compiled_out[i].item():.1f}, expected {expected[i]}"
+        )
 
 
 def test_biased_linear_fanout_block_and_add():
@@ -96,9 +96,9 @@ def test_biased_linear_fanout_block_and_add():
     graph_out = output.compute(1, vals)[0]
     compiled_out = net.compute(1, vals)[output][0]
 
-    assert (
-        abs(graph_out[0].item() - 3.0) < 0.5
-    ), f"Graph: expected 3, got {graph_out[0].item():.1f}"
+    assert abs(graph_out[0].item() - 3.0) < 0.5, (
+        f"Graph: expected 3, got {graph_out[0].item():.1f}"
+    )
     assert abs(compiled_out[0].item() - 3.0) < 0.5, (
         f"Compiled: expected 3, got {compiled_out[0].item():.1f}. "
         f"13 → fold missing, -2 → compute_bias missing, -7 → bias doubled"

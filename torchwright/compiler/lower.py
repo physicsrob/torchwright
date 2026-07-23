@@ -356,8 +356,7 @@ def lower(
     """
     if not isinstance(output_node, Node):
         raise TypeError(
-            f"lower() expects the graph's output Node, got "
-            f"{type(output_node).__name__}"
+            f"lower() expects the graph's output Node, got {type(output_node).__name__}"
         )
     if (collapse_univariate or collapse_pl) and collapse_lane_cap is None:
         raise ValueError(
