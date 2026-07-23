@@ -32,7 +32,7 @@ from torchwright.ops.swiglu.logic_ops import bool_all_true, equals_vector
 from torchwright.ops.swiglu.map_select import map_to_table, select
 from torchwright.ops.swiglu.sequence_ops import output_sequence, remove_leading_0s
 
-D_MODEL = 256
+D_MODEL = 512
 # Rotary width the graph is built against; must match the d_head it is
 # compiled at (the token-example harness compiles at this d_head).
 D_HEAD = 16
