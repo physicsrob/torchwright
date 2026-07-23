@@ -230,9 +230,11 @@ def test_cpsat_costs_beta_routes_more_to_mlp():
 
 
 def test_cpsat_compiles_under_zero_init():
-    """The model and heuristic skip BIRTH-layer dirty cancels because the
+    """Produce correct output from the CP-SAT-scheduled module under zero-init.
+
+    The model and heuristic skip BIRTH-layer dirty cancels because the
     runtime always zero-initialises the residual stream (universal since
-    the ``assume_zero_init`` flag was retired).  The CP-SAT-scheduled module
+    the ``assume_zero_init`` flag was retired). The CP-SAT-scheduled module
     must still produce correct output — which ``HeadlessTransformer.compute()``
     verifies by zero-initialising the stream.
     """
@@ -377,9 +379,10 @@ def test_cpsat_compiles_concatenate_input_add():
 
 
 def test_cpsat_falls_back_to_heuristic_when_no_incumbent(monkeypatch):
-    """When CP-SAT finds no feasible solution within budget,
+    """Fall back to the heuristic schedule when CP-SAT finds no feasible solution.
+
     ``forward_compile`` falls back to the heuristic schedule rather
-    than raising.  Simulated by monkey-patching ``solve_schedule`` to
+    than raising. Simulated by monkey-patching ``solve_schedule`` to
     return ``(None, stats)``; the compile must still produce the
     correct token output.
     """
@@ -397,7 +400,7 @@ def test_cpsat_falls_back_to_heuristic_when_no_incumbent(monkeypatch):
         is_optimal=False,
     )
 
-    def fake_solve(*args, **kwargs):
+    def fake_solve(*_args, **_kwargs):
         return None, fake_stats
 
     monkeypatch.setattr(compile_mod, "solve_schedule", fake_solve)
@@ -419,13 +422,12 @@ def test_cpsat_falls_back_to_heuristic_when_no_incumbent(monkeypatch):
 
 
 def test_cpsat_frees_wide_input_for_intermediate():
-    """A wide input consumed early must be freed so its columns carry a
-    wide downstream intermediate.
+    """Free a wide input consumed early so its columns carry a wide downstream value.
 
-    Regression for the input-freeing fix.  The token-`Embedding`-shaped
+    Regression for the input-freeing fix. The token-`Embedding`-shaped
     case in miniature: a 24-wide input ``x`` feeds one narrow ``Linear``
     and is then dead, after which a 40-wide standalone ``Linear`` ``b``
-    must materialise.  At ``d=64``:
+    must materialise. At ``d=64``:
 
       * Pinning ``x`` forever (the pre-fix model) keeps ``x`` (24) and
         its consumer ``a`` (4) live while ``b`` (40) materialises —
@@ -466,9 +468,10 @@ def test_cpsat_frees_wide_input_for_intermediate():
 
 
 def test_require_solver_raises_on_fallback(monkeypatch):
-    """``require_solver=True`` converts a silent CP-SAT fallback into a hard
-    error; the default (``require_solver=False``) warns loudly instead of
-    failing silently.  Regression guard for the silent-fallback footgun.
+    """Convert a silent CP-SAT fallback into a hard error via require_solver=True.
+
+    The default (``require_solver=False``) warns loudly instead of
+    failing silently. Regression guard for the silent-fallback footgun.
     """
     from torchwright.compiler.forward import compile as compile_mod
     from torchwright.compiler.forward.cpsat_scheduler import SolveStats
@@ -484,13 +487,13 @@ def test_require_solver_raises_on_fallback(monkeypatch):
         is_optimal=False,
     )
     monkeypatch.setattr(
-        compile_mod, "solve_schedule", lambda *a, **k: (None, fake_stats)
+        compile_mod, "solve_schedule", lambda *_a, **_k: (None, fake_stats)
     )
 
     out, inputs = _build_branchy()
 
     # require_solver=True -> raise rather than silently fall back.
-    with pytest.raises(RuntimeError, match="no usable assignment|require_solver"):
+    with pytest.raises(RuntimeError, match=r"no usable assignment|require_solver"):
         forward_compile(
             d=D,
             d_head=D_HEAD,

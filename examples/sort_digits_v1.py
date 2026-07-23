@@ -119,11 +119,11 @@ def _build_indicators_above(digit_scalar: Node, is_input_digit: Node) -> Node:
 
 
 def _threshold_onehot(prev_digit: Node) -> Node:
-    """Convert a scalar ``prev_digit ∈ {-1, 0, …, 8}`` to a width-10
-    ``{0, 1}`` one-hot selecting the matching threshold slot.
+    """Convert a scalar ``prev_digit`` to a width-10 one-hot threshold slot.
 
-    Slot ``c = prev_digit + 1``: slot 0 means "prev=-1" (initial),
-    slot 1 means "prev=0", etc.
+    ``prev_digit ∈ {-1, 0, …, 8}`` maps to a width-10 ``{0, 1}`` one-hot
+    selecting the matching threshold slot.  Slot ``c = prev_digit + 1``:
+    slot 0 means "prev=-1" (initial), slot 1 means "prev=0", etc.
     """
     shifted = add_scaled_nodes(
         1.0, prev_digit, 1.0, create_literal_value(torch.tensor([1.0]))

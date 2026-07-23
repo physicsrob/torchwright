@@ -2,7 +2,7 @@
 
 Spec: docs/ops_plain_english.md (compare, equals_vector entries; the bool
 ops inherit compare's).  The pinned facts these tests lean on — contract
-points bit-exact at scale=128, bend overshoot ≤ swish_dip/scale·|T−F|,
+points bit-exact at scale=128, bend overshoot <= swish_dip/scale·|T-F|,
 equals_vector's low-side dip 2·swish_dip·speed/scale — live in
 tests/docs/test_swish_constants.py.
 """
@@ -50,12 +50,14 @@ def test_compare_structure():
 
 
 def test_compare_contract_points_and_false_side_bit_exact():
-    """The robustly bit-exact cases: at thresh and on the whole false
-    side beyond the fillet, every lane contribution is exactly ±0.0
-    (Swish(0) = 0; σ underflows to exactly 0), so the output IS the
-    out_bias; at the true contract point the live lane is exactly scale
-    and `scale·fl((T−F)/scale)` rounds to T−F (fl(0.02)'s relative
-    representation error, 2.2e-8, is under fp32's half-ulp 6e-8).
+    """The robustly bit-exact cases are the false side and the true contract point.
+
+    At thresh and on the whole false side beyond the fillet, every lane
+    contribution is exactly +/-0.0 (Swish(0) = 0; sigma underflows to
+    exactly 0), so the output IS the out_bias; at the true contract point
+    the live lane is exactly scale and `scale·fl((T-F)/scale)` rounds to
+    T-F (fl(0.02)'s relative representation error, 2.2e-8, is under
+    fp32's half-ulp 6e-8).
     """
     x = create_input("x", 1, value_range=(-80.0, 80.0))
     out = compare(x, thresh=0.0)  # ramp width 1/step_sharpness = 0.1
@@ -67,11 +69,11 @@ def test_compare_contract_points_and_false_side_bit_exact():
 
 
 def test_compare_true_side_far_field_ulp_class():
-    """True-side outputs past the fillet carry fp32 product rounding at
-    the lane-contribution magnitude s·(x−thresh)·|T−F| — the same
+    """True-side outputs past the fillet carry fp32 product rounding, not bit-exactness.
+
+    The lane-contribution magnitude is s·(x-thresh)·|T-F| — the same
     far-field class as the ReLU machine (kernel-dependent: FMA vs
-    per-product rounding), NOT bit-exactness. Bounded by a few ulps of
-    the contribution.
+    per-product rounding). Bounded by a few ulps of the contribution.
     """
     x = create_input("x", 1, value_range=(-80.0, 80.0))
     out = compare(x, thresh=0.0)
@@ -79,17 +81,18 @@ def test_compare_true_side_far_field_ulp_class():
     xs = torch.tensor([0.5, 1.0, 7.3, 80.0, (1.0 + 17.0 / scale) / s]).unsqueeze(1)
     val = out.compute(5, {"x": xs})
     # Worst kernel (gate-FMA + per-product out-proj) leaves 4 half-ulp
-    # roundings at the contribution magnitude C = s·|x−thresh|·|T−F|,
-    # i.e. ≤ 2 ulps of C; the ×6 is ~3x safety over that (binade
+    # roundings at the contribution magnitude C = s·|x-thresh|·|T-F|,
+    # i.e. <= 2 ulps of C; the 6x factor is ~3x safety over that (binade
     # position + GPU FP variation), floored at 6 output ulps.
     budget = torch.clamp(6 * 1.2e-7 * s * xs.abs() * 2.0, min=6 * 1.2e-7)
     assert ((val - 1.0).abs() <= budget).all(), (val - 1.0).flatten()
 
 
 def test_compare_bend_overshoot_bounded():
-    """Inputs inside the fillets overshoot the levels by at most
-    swish_dip/scale·|T−F|, and the value-range assert carries exactly
-    that slack.
+    """Inputs inside the fillets overshoot the levels by at most a bounded slack.
+
+    The overshoot bound is swish_dip/scale·|T-F|, and the value-range
+    assert carries exactly that slack.
     """
     x = create_input("x", 1, value_range=(-80.0, 80.0))
     out = compare(x, thresh=0.0)
@@ -98,7 +101,7 @@ def test_compare_bend_overshoot_bounded():
     z = torch.cat([torch.linspace(-0.2, 0.0, 2001), torch.linspace(1.0, 1.2, 2001)])
     xs = (z / s).unsqueeze(1)
     val = out.compute(len(xs), {"x": xs})
-    slack = swish_dip / scale * 2.0  # |T−F| = 2
+    slack = swish_dip / scale * 2.0  # |T-F| = 2
     assert val.min() >= -1.0 - slack - 1e-7
     assert val.max() <= 1.0 + slack + 1e-7
     # The overshoot is real (the bound is tight, not vacuous):
@@ -124,9 +127,10 @@ def test_compare_custom_levels_and_sharpness():
 
 
 def test_compare_semantic_bound_collapse_carries_slack():
-    """An input interval clearing thresh collapses the semantic bound to
-    the level ± the dip slack (the swish constant collapse is an
-    interval, not a constant).
+    """An input interval clearing thresh collapses the semantic bound to a level.
+
+    The collapsed bound is the level +/- the dip slack (the swish
+    constant collapse is an interval, not a constant).
     """
     x = create_input("x", 1, value_range=(1.0, 5.0))
     out = compare(x, thresh=0.0)
@@ -239,15 +243,17 @@ def test_equals_vector_structure():
 
 
 def test_equals_vector_match_and_margin_exact():
-    """A match is bit-exact +1 (hinge argument scale/speed, saturated);
-    a non-match exactly at the 1/speed margin is exact -1 (argument 0,
+    """A match, a margin non-match, and a deep non-match are all bit-exact.
+
+    A match is bit-exact +1 (hinge argument scale/speed, saturated); a
+    non-match exactly at the 1/speed margin is exact -1 (argument 0,
     Swish(0)=0); a deep non-match is bit-exact -1 (sigmoid underflow).
     """
     x = create_input("x", 3, value_range=(-5.0, 5.0))
     out = equals_vector(x, _KEY)
     speed = 1.0  # embedding_step_sharpness
     key_sq = float(_KEY @ _KEY)
-    # Row 1: the key. Row 2: dot = key² − 1/speed (at the margin).
+    # Row 1: the key. Row 2: dot = key² - 1/speed (at the margin).
     # Row 3: dot far below (zeros).
     at_margin = _KEY * ((key_sq - 1.0 / speed) / key_sq)
     xs = torch.stack([_KEY, at_margin, torch.zeros(3)])
@@ -256,9 +262,11 @@ def test_equals_vector_match_and_margin_exact():
 
 
 def test_equals_vector_dip_and_range_slack():
-    """A non-match engineered just past the margin lands in the hinge dip
-    and reads below -1 by up to 2·swish_dip·speed/scale; the value-range
-    assert's low side carries exactly that slack.
+    """A non-match just past the margin reads slightly below -1, within a bounded slack.
+
+    Engineered just past the margin, it lands in the hinge dip and reads
+    below -1 by up to 2·swish_dip·speed/scale; the value-range assert's
+    low side carries exactly that slack.
     """
     x = create_input("x", 3, value_range=(-5.0, 5.0))
     out = equals_vector(x, _KEY)

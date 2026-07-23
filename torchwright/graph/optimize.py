@@ -76,10 +76,11 @@ class FoldLog:
         self.value_changed.add(node)
 
     def record_merge(self, run: list[Node], widths: list[int]) -> None:
-        """Record a sibling merge: ``run[0]`` widened in place to hold every
-        run member's columns side by side, the rest orphaned.
+        """Record a sibling merge.
 
-        ``widths`` are the members' pre-merge output widths (captured before
+        ``run[0]`` is widened in place to hold every run member's columns
+        side by side; the rest are orphaned.  ``widths`` are the members'
+        pre-merge output widths (captured before
         the survivor is mutated).  Composes with earlier merges: a record
         already pointing at a run member follows it to its new offset inside
         the survivor, and a member that already has a record of its own (it
@@ -151,8 +152,10 @@ class FoldLog:
 
 
 def _blocks_absorb(node: Node) -> bool:
-    """True when *node*'s value may not be erased by a fold (the *erased*
-    predicate above — the relaxable checkability policy).
+    """True when *node*'s value may not be erased by a fold.
+
+    This is the *erased* predicate described above — the relaxable
+    checkability policy.
     """
     return bool(node.checks)
 
@@ -231,23 +234,23 @@ def _fold_ffn_into_linear(
 ) -> None:
     """Fold FFN ``b``'s output projection into its sole downstream Linear.
 
-    ``b``'s only consumer is a Linear ``l``.  The fused node is still an FFN
-    (lanes + output projection), so ``b`` survives and ``l`` is orphaned; every
-    consumer of ``l`` is rewired to ``b``.  With ``z = (lane @ out_proj +
-    out_bias) @ M_l + b_l``::
+    ``b``'s only consumer is a Linear ``lin``.  The fused node is still an
+    FFN (lanes + output projection), so ``b`` survives and ``lin`` is
+    orphaned; every consumer of ``lin`` is rewired to ``b``.  With
+    ``z = (lane @ out_proj + out_bias) @ M_l + b_l``::
 
         out_proj' = out_proj @ M_l
         out_bias' = out_bias @ M_l + b_l
     """
-    (l,) = consumers[b]
-    assert isinstance(l, Linear)
-    # b's value becomes what l's was: l's value moves onto b, and b's
+    (lin,) = consumers[b]
+    assert isinstance(lin, Linear)
+    # b's value becomes what lin's was: lin's value moves onto b, and b's
     # own pre-fold value ceases to exist.
-    fold_log.record_move(orphan=l, survivor=b)
-    b.out_bias = b.out_bias @ l.output_matrix + l.output_bias
-    b.out_proj = b.out_proj @ l.output_matrix
-    b.d_output = l.output_matrix.shape[1]
-    # l's checks and range claim describe l's value, which now lives on b —
+    fold_log.record_move(orphan=lin, survivor=b)
+    b.out_bias = b.out_bias @ lin.output_matrix + lin.output_bias
+    b.out_proj = b.out_proj @ lin.output_matrix
+    b.d_output = lin.output_matrix.shape[1]
+    # lin's checks and range claim describe lin's value, which now lives on b —
     # migrate them so the value stays runtime-checkable.  The transfer is
     # UNCONDITIONAL: b's value is replaced, so whatever claim b carried
     # describes a value that no longer exists, and retaining it would
@@ -255,24 +258,24 @@ def _fold_ffn_into_linear(
     # optimization.  (b's checks are guaranteed empty here — a checked b
     # declines the fold — and today every claim arrives via attach_assert,
     # which always appends a check first, so a conditional transfer gated
-    # on ``l.checks`` happened to also clear b's claim whenever one could
+    # on ``lin.checks`` happened to also clear b's claim whenever one could
     # exist.  Nothing enforces that implication; this doesn't rely on it.)
-    b.checks = list(l.checks)
-    b.claimed_type = l.claimed_type
-    b.integer_claim = l.integer_claim
-    # This fold inverts survivorship: b's VALUE becomes what l's was, so a
+    b.checks = list(lin.checks)
+    b.claimed_type = lin.claimed_type
+    b.integer_claim = lin.integer_claim
+    # This fold inverts survivorship: b's VALUE becomes what lin's was, so a
     # semantic affine override installed on b describes the pre-fold value
     # and must not be re-applied by the bounds refresh.  (The other two
     # folds preserve the survivor's value, so their overrides stay valid.)
     b._semantic_affine_override = None
-    if b.name and l.name:
-        b.name = f"fused_{b.name}_{l.name}"
-    for consumer in list(consumers.get(l, [])):
-        consumer.replace_input(l, b)
+    if b.name and lin.name:
+        b.name = f"fused_{b.name}_{lin.name}"
+    for consumer in list(consumers.get(lin, [])):
+        consumer.replace_input(lin, b)
 
 
 def _fold_through_concatenate(
-    l: Linear,
+    lin: Linear,
     c: Concatenate,
     output_nodes: set[Node],
     consumers: dict[Node, list[Node]],
@@ -281,30 +284,30 @@ def _fold_through_concatenate(
     mutated: set[Node],
     fold_log: FoldLog,
 ) -> int:
-    """Fold foldable leaves of single-consumer ``c`` into ``l``'s row blocks.
+    """Fold foldable leaves of single-consumer ``c`` into ``lin``'s row blocks.
 
     ``Linear(Concatenate(..., leaf_i, ...))`` reads leaf ``i`` through the
-    row block ``M_i`` of ``l.output_matrix`` at the leaf's column offset::
+    row block ``M_i`` of ``lin.output_matrix`` at the leaf's column offset::
 
         y = sum_i(leaf_i @ M_i) + b
 
-    Three leaf rewrites, all exact, mutating only the survivors ``l`` and
+    Three leaf rewrites, all exact, mutating only the survivors ``lin`` and
     ``c`` (leaves are orphaned, never mutated):
 
     - a single-consumer ``Concatenate`` leaf is **spliced** inline (its
       inputs replace it in ``c.inputs``) — value-identical, and exposes
       its own leaves to the folds below on a later pass;
     - a ``LiteralValue`` leaf's constant contribution ``v @ M_i`` moves
-      into ``l.output_bias`` and the leaf is dropped with its block rows
+      into ``lin.output_bias`` and the leaf is dropped with its block rows
       — skipped when every leaf is a literal (an input-less Linear is
       not representable);
     - a single-consumer ``Linear`` leaf is **absorbed**: its block
       becomes ``leaf.output_matrix @ M_i``, its bias contribution joins
-      ``l.output_bias``, and ``c`` reads the leaf's input directly.
+      ``lin.output_bias``, and ``c`` reads the leaf's input directly.
       Guarded per leaf so the fold never grows the parameter count.
 
     When exactly one leaf remains, the concat itself is bypassed
-    (``l`` reads that leaf directly) so the plain Linear→Linear /
+    (``lin`` reads that leaf directly) so the plain Linear→Linear /
     FFN→Linear folds can continue in later passes.
 
     Declined outright (except splices, which are value-identical) when
@@ -347,15 +350,15 @@ def _fold_through_concatenate(
     # Literal folds drop leaves; never drop them all.
     has_non_literal = any(not isinstance(x, LiteralValue) for x in leaves)
 
-    d_out = l.d_output
+    d_out = lin.d_output
     blocks: list[torch.Tensor] = []
     new_leaves: list[Node] = []
-    bias = l.output_bias
+    bias = lin.output_bias
     offset = 0
     value_folds = 0  # leaf folds that change c's value (splices don't)
     for leaf in leaves:
         w = len(leaf)
-        m = l.output_matrix[offset : offset + w]
+        m = lin.output_matrix[offset : offset + w]
         offset += w
 
         if (
@@ -418,14 +421,14 @@ def _fold_through_concatenate(
     if applied == 0:
         return 0
 
-    l.output_matrix = torch.cat(blocks, dim=0)
-    l.output_bias = bias
-    l.d_input = l.output_matrix.shape[0]
-    _invalidate_support_cache(l)
+    lin.output_matrix = torch.cat(blocks, dim=0)
+    lin.output_bias = bias
+    lin.d_input = lin.output_matrix.shape[0]
+    _invalidate_support_cache(lin)
     if len(new_leaves) == 1 and not _blocks_orphan(c, hint_targets):
         # Bypass the concat entirely — unless the concat itself carries or is
         # named by a hint, in which case it stays interposed (one leaf wide).
-        l.inputs = [new_leaves[0]]
+        lin.inputs = [new_leaves[0]]
     else:
         c.inputs = new_leaves
         c.d_output = sum(len(x) for x in new_leaves)
@@ -433,8 +436,8 @@ def _fold_through_concatenate(
         if value_folds:
             fold_log.record_value_changed(c)
     touched.add(c)
-    touched.add(l)
-    mutated.add(l)
+    touched.add(lin)
+    mutated.add(lin)
     return applied
 
 
@@ -629,7 +632,8 @@ def _merge_sibling_linear_leaves(
             run_counts[id(leaf_in_run)] = run_counts.get(id(leaf_in_run), 0) + 1
         escapes = any(occurrences[k] != v for k, v in run_counts.items())
 
-        if len(run) < 2 or escapes:
+        min_run_to_merge = 2  # a run of one has nothing to merge with
+        if len(run) < min_run_to_merge or escapes:
             new_inputs.extend(run)
             i = j
             continue
@@ -777,27 +781,27 @@ def _fuse_one_pass(
                 # Fold the FFN's out_proj into this downstream Linear.  The
                 # FFN becomes the survivor, so the Linear must not be a
                 # caller-held output node (its identity would be lost).
-                b, l = inp, node
-                if l in output_nodes:
+                b, lin = inp, node
+                if lin in output_nodes:
                     continue
                 if _blocks_absorb(b):  # b's checked pre-fold value would be erased
-                    continue  # (l's checks migrate — see the fold)
-                # l is the orphan here even though its VALUE survives (it
+                    continue  # (lin's checks migrate — see the fold)
+                # lin is the orphan here even though its VALUE survives (it
                 # moves onto b): hint edges are keyed by node identity, so a
-                # waiter naming l never sees it computed, and l's own
+                # waiter naming lin never sees it computed, and lin's own
                 # predecessors would stop constraining anything.
-                if _blocks_orphan(l, hint_targets):
+                if _blocks_orphan(lin, hint_targets):
                     continue
                 n_lanes = b.n_lanes
                 d_b = b.d_output
-                d_z = l.output_matrix.shape[1]
+                d_z = lin.output_matrix.shape[1]
                 old = (n_lanes * d_b + d_b) + (d_b * d_z + d_z)
                 new = n_lanes * d_z + d_z
                 if not param_delta_ok(new, old):
                     continue
                 _fold_ffn_into_linear(b, consumers, fold_log)
                 touched.add(b)
-                touched.add(l)
+                touched.add(lin)
                 mutated.add(b)
                 applied += 1
 
@@ -934,10 +938,11 @@ def fuse_consecutive_linears(
 
 
 def _recompute_bounds_after_fusion(output_nodes: set[Node], mutated: set[Node]) -> None:
-    """Refresh ``_structural_type`` / ``_affine_bound`` on every node a fold
-    made stale — the mutated survivors and everything downstream of one.
+    """Refresh caches on every node a fold made stale.
 
-    Both are computed eagerly in ``Node.__init__`` from the node's inputs, so
+    ``_structural_type`` / ``_affine_bound`` are refreshed on the mutated
+    survivors and everything downstream of one.  Both are computed
+    eagerly in ``Node.__init__`` from the node's inputs, so
     an in-place fold (new weights, new input) leaves them describing the
     pre-fold graph.  Recomputing only the mutated node is not enough: its own
     recompute reads its inputs' bounds, which are correct, but a node *further*

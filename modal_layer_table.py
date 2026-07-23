@@ -23,6 +23,7 @@ Usage::
 """
 
 import json
+from pathlib import Path
 
 import modal
 
@@ -58,7 +59,7 @@ def main(
         print(render(payload))
     else:
         print(json.dumps(results, indent=2))
-    with open(out, "w") as f:
+    with Path(out).open("w") as f:
         json.dump(payload, f, indent=2)
         f.write("\n")
     print(f"wrote {out}")

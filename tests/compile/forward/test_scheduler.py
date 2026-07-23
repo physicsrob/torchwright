@@ -71,8 +71,9 @@ def _make_biased_linear(inp, d_out, name=""):
 
 
 def _make_ffn(inp, d_hidden, d_out, name=""):
-    """A degenerate-ReLU FFN (the former L1 -> ReLU -> L2 chain, now one
-    node).  Returns the FFN.
+    """A degenerate-ReLU FFN (the former L1 -> ReLU -> L2 chain, now one node).
+
+    Returns the FFN.
     """
     return linear_relu_linear(
         inp,
@@ -203,9 +204,11 @@ def test_schedule_zero_bias_linear_bypass():
 
 
 def test_saturated_head_death_layer_frees_via_mlp_slots():
-    """When the attention head budget is full at a dead node's death layer, the
-    eager heuristic frees it via an MLP ``cancel_bypass`` the same layer instead
-    of deferring the cancel to a later attention batch.
+    """A dead node whose attention-head budget is full frees via MLP ``cancel_bypass``.
+
+    When the attention head budget is full at a dead node's death layer, the
+    eager heuristic frees it via an MLP ``cancel_bypass`` the same layer
+    instead of deferring the cancel to a later attention batch.
 
     Geometry: d_head == d gives one attention head per layer.  A single Attn op
     consumes it, so the dead node ``D`` cannot join an attention cancel batch;
@@ -249,7 +252,10 @@ def test_saturated_head_death_layer_frees_via_mlp_slots():
 
 
 def test_schedule_large_input_linear():
-    """Zero-bias Linear with input dim > d_head: legacy uses attention, default uses bypass."""
+    """Zero-bias Linear with input dim > d_head.
+
+    Legacy uses attention, default uses bypass.
+    """
     pos = _make_reserved_block()
     inputs = [InputNode(f"x{i}", 8, value_range=(-100.0, 100.0)) for i in range(4)]
     cat = Concatenate(inputs)
@@ -513,10 +519,8 @@ def test_mlp_slot_exhaustion():
     """More FFNs than MLP slots: respects slot budget."""
     pos = _make_reserved_block()
     x = InputNode("x", 4, value_range=(-100.0, 100.0))
-    # 4 FFNs × 20 slots each = 80 > D=64
-    ffns = []
-    for i in range(4):
-        ffns.append(_make_ffn(x, 20, 2, f"chain{i}"))
+    # 4 FFNs x 20 slots each = 80 > D=64
+    ffns = [_make_ffn(x, 20, 2, f"chain{i}") for i in range(4)]
     out_cat = Concatenate(ffns)
     out = _make_linear(out_cat, 1, "out")
 
@@ -752,7 +756,7 @@ def test_no_progress_raises_error():
     # Ready nodes (a_consumer, b_consumer) need 2 cols each, 0 available
 
     scheduler = LayerScheduler(graph, small_d, D_HEAD, pos)
-    with pytest.raises(Exception):
+    with pytest.raises(RuntimeError, match="No progress"):
         scheduler.schedule_layer(rmap, computed)
 
 
@@ -831,11 +835,13 @@ def test_output_already_computed():
 
 
 def test_within_layer_freeing_surfaces_freshly_dead_intermediate():
-    """Within-layer (eager) freeing is always on: placing ``b`` makes its input
-    ``a`` freshly dead, and ``_freshly_dead_inputs`` surfaces it so ``a``'s
-    column can be reclaimed in the same layer.  Units 1 and 2 made this density
-    CP-SAT-representable, so the warm start and the production heuristic share
-    it (the ``eager_free=False`` mode that used to gate this off is gone).
+    """Within-layer (eager) freeing is always on.
+
+    Placing ``b`` makes its input ``a`` freshly dead, and
+    ``_freshly_dead_inputs`` surfaces it so ``a``'s column can be reclaimed
+    in the same layer.  Units 1 and 2 made this density CP-SAT-representable,
+    so the warm start and the production heuristic share it (the
+    ``eager_free=False`` mode that used to gate this off is gone).
     """
     pos = _make_reserved_block()
     x = InputNode("x", D, value_range=(-100.0, 100.0))
@@ -863,8 +869,9 @@ def test_within_layer_freeing_surfaces_freshly_dead_intermediate():
 
 
 def test_mlp_add_reuses_dead_addend():
-    """A reusable MLP Add emits add_into_bypass and reassigns the dead
-    addend's columns; no attention Add op is emitted.
+    """A reusable MLP Add emits add_into_bypass and reassigns the dead addend's columns.
+
+    No attention Add op is emitted.
     """
     pos = _make_reserved_block()
     a = InputNode("a", 4, value_range=(-100.0, 100.0))
@@ -898,8 +905,9 @@ def test_mlp_add_reuses_dead_addend():
 
 
 def test_mlp_add_fresh_allocates_columns():
-    """A fresh MLP Add (both addends still live) emits compute_add_bypass
-    into freshly allocated columns.
+    """A fresh MLP Add, with both addends still live, emits compute_add_bypass.
+
+    The write lands in freshly allocated columns.
     """
     pos = _make_reserved_block()
     a = InputNode("a", 4, value_range=(-100.0, 100.0))
@@ -931,8 +939,9 @@ def test_mlp_add_fresh_allocates_columns():
 
 
 def test_mlp_add_both_dead_selects_input0():
-    """When both addends are reusable, occurrence 0 is the target on the
-    MLP route (same deterministic tie-break as attention).
+    """When both addends are reusable, occurrence 0 is the target on the MLP route.
+
+    This is the same deterministic tie-break used on the attention route.
     """
     pos = _make_reserved_block()
     a = InputNode("a", 4, value_range=(-100.0, 100.0))
@@ -957,10 +966,11 @@ def test_mlp_add_both_dead_selects_input0():
 
 
 def test_attention_producer_feeds_mlp_add_same_layer():
-    """An attention result (Attn node) may feed an MLP-routed Add in the
-    same layer: the Add joins the MLP candidates after the attention pass,
-    and the attention-born value is a legal reuse target at the MLP
-    phase-start snapshot.
+    """An attention result (Attn node) may feed an MLP-routed Add in the same layer.
+
+    The Add joins the MLP candidates after the attention pass, and the
+    attention-born value is a legal reuse target at the MLP phase-start
+    snapshot.
     """
     pos = _make_reserved_block()
     v = InputNode("v", 4, value_range=(-100.0, 100.0))
@@ -993,8 +1003,9 @@ def test_attention_producer_feeds_mlp_add_same_layer():
 
 
 def test_mlp_producer_defers_mlp_add_to_next_layer():
-    """An MLP-routed producer (FFN) cannot feed an MLP Add in the same
-    layer — the Add waits (one-layer dependency gap).
+    """An MLP-routed producer (FFN) cannot feed an MLP Add in the same layer.
+
+    The Add waits, a one-layer dependency gap.
     """
     pos = _make_reserved_block()
     x = InputNode("x", 4, value_range=(-100.0, 100.0))
@@ -1023,9 +1034,10 @@ def test_mlp_producer_defers_mlp_add_to_next_layer():
 
 
 def test_same_layer_consumer_reusability_is_sublayer_aware():
-    """A same-layer attention consumer of an addend counts complete for an
-    MLP Add (the attention phase precedes the MLP snapshot); a same-layer
-    MLP consumer does not.
+    """A same-layer attention consumer of an addend counts complete for an MLP Add.
+
+    That's because the attention phase precedes the MLP snapshot; a
+    same-layer MLP consumer does not count complete.
     """
     # Attention peer: a is reusable.
     pos = _make_reserved_block()
@@ -1076,8 +1088,9 @@ def test_same_layer_consumer_reusability_is_sublayer_aware():
 
 
 def test_mlp_add_slot_exhaustion_defers_without_spilling():
-    """When a layer's hidden slots cannot hold a second MLP Add, it defers
-    to the next layer and never spills to attention.
+    """When a layer's hidden slots cannot hold a second MLP Add, it defers.
+
+    The deferred Add moves to the next layer and never spills to attention.
     """
     pos = _make_reserved_block()
     inputs = [InputNode(f"i{k}", 4, value_range=(-100.0, 100.0)) for k in range(4)]
@@ -1108,9 +1121,10 @@ def test_mlp_add_slot_exhaustion_defers_without_spilling():
 
 
 def test_mlp_add_live_source_not_cancelled_same_layer():
-    """The live/source occurrence of an add_into_bypass is excluded from
-    same-layer cancellation (gap #2 conservatism, extended to the MLP
-    route): even when the Add is its final consumer, it stays allocated
+    """The add_into_bypass live/source occurrence is excluded from cancellation.
+
+    This is gap #2 conservatism (same-layer scope), extended to the MLP
+    route: even when the Add is its final consumer, it stays allocated
     through the Add's layer.
     """
     pos = _make_reserved_block()

@@ -11,6 +11,7 @@ refuses biasless artifacts loudly.
 
 import json
 import shutil
+from pathlib import Path
 
 import pytest
 import torch
@@ -104,39 +105,41 @@ def artifacts(tmp_path_factory):
 def test_no_bias_artifact_records_mode(artifacts):
     artifact, onnx_path = artifacts["biasless"]
     assert artifact.bias is False
-    with open(meta_path_for(onnx_path)) as f:
+    with Path(meta_path_for(onnx_path)).open() as f:
         assert json.load(f)["bias"] is False
-    with open(artifact.debug_path) as f:
+    with Path(artifact.debug_path).open() as f:
         assert json.load(f)["bias"] is False
     biased_artifact, biased_path = artifacts["biased"]
     assert biased_artifact.bias is True
-    with open(meta_path_for(biased_path)) as f:
+    with Path(meta_path_for(biased_path)).open() as f:
         assert json.load(f)["bias"] is True
 
 
 def test_artifact_records_collapse_provenance(artifacts):
-    """Meta and debug sidecar both record that the collapse lowerings ran
+    """Meta and debug sidecar both record that the collapse lowerings ran.
+
     (docs/univariate_collapse_plan.md; v1 staircase and the v2 general-PL
     S1 pass) — provenance for depth comparisons across artifacts,
     top-level like "bias" (never inside "extra", which is the caller's
-    verbatim metadata).  Lives here to reuse this module's exported
+    verbatim metadata). Lives here to reuse this module's exported
     artifacts; both passes are unconditional, so this pins the emitted
     keys, not a knob.
     """
     artifact, onnx_path = artifacts["biased"]
-    with open(meta_path_for(onnx_path)) as f:
+    with Path(meta_path_for(onnx_path)).open() as f:
         meta = json.load(f)
     assert meta["collapse_univariate"] is True
     assert meta["collapse_pl"] is True
-    with open(artifact.debug_path) as f:
+    with Path(artifact.debug_path).open() as f:
         sidecar = json.load(f)
     assert sidecar["collapse_univariate"] is True
     assert sidecar["collapse_pl"] is True
 
 
 def test_no_bias_emission_has_no_bias_tensors(artifacts):
-    """No bias initializers exist and no node reads one — each projection
-    is its bare MatMul.
+    """No bias initializers exist and no node reads one.
+
+    Each projection is its bare MatMul.
     """
     import onnx
 
@@ -159,8 +162,9 @@ def test_no_bias_emission_has_no_bias_tensors(artifacts):
 
 
 def test_no_bias_logits_match_biased_twin(artifacts):
-    """The two emissions of the same graph agree at the logits (the folds
-    are the same math, shifted into the matmuls).
+    """The two emissions of the same graph agree at the logits.
+
+    The folds are the same math, shifted into the matmuls.
     """
     _, biased_path = artifacts["biased"]
     _, biasless_path = artifacts["biasless"]
@@ -180,8 +184,9 @@ def test_no_bias_logits_match_biased_twin(artifacts):
 
 
 def test_no_bias_debug_session_roundtrips(artifacts):
-    """probe_compiled over the executing biasless artifact matches the
-    exact oracle; debug=True passes residual self-consistency.
+    """probe_compiled over the executing biasless artifact matches the exact oracle.
+
+    debug=True passes residual self-consistency.
     """
     _, onnx_path = artifacts["biasless"]
     out2, emb2 = _build()
@@ -202,8 +207,10 @@ def test_no_bias_debug_session_roundtrips(artifacts):
 
 
 def test_sidecar_artifact_mode_mismatch_trips(artifacts, tmp_path):
-    """A biasless model paired with a biased compile's sidecars must trip
-    the emission-mode cross-check (the fingerprint cannot see the flag).
+    """A biasless model paired with a biased compile's sidecars must trip the check.
+
+    That's the emission-mode cross-check (the fingerprint cannot see the
+    flag).
     """
     _, biased_path = artifacts["biased"]
     _, biasless_path = artifacts["biasless"]

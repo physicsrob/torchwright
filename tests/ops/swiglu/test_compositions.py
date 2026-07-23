@@ -1,5 +1,4 @@
-"""swiglu compositions: the digit pipeline, embedding arithmetic, and
-sequence predicates.
+"""swiglu compositions: the digit pipeline, embedding arithmetic, sequence predicates.
 
 These are structural ports — every MLP ingredient is a landed swiglu op
 and inherits its entry; the tests pin end-to-end behavior on the same
@@ -72,8 +71,9 @@ def test_number_to_digit_scalars_roundtrip():
 
 
 def test_full_digit_pipeline_compiles(embedding):
-    """digits_to_number → arithmetic → number_to_digit_scalars →
-    scalar_to_embedding, compiled end to end on the swish machine.
+    """digits_to_number -> arithmetic -> scalars -> embedding, compiled end to end.
+
+    On the swish machine.
     """
     from torchwright.ops.linear import add_const
 
@@ -199,9 +199,10 @@ def test_remove_leading_0s_signed_requires_both_kwargs(embedding):
 
 
 def test_remove_leading_0s_depth_constant(embedding):
-    """The trim's critical path must not grow with the removal budget —
-    the property that keeps the calculators' result formatting out of
-    their depth budgets.
+    """The trim's critical path must not grow with the removal budget.
+
+    This is the property that keeps the calculators' result formatting
+    out of their depth budgets.
     """
     from scripts.arithmetic_scaling import critical_path_depth
 

@@ -1,3 +1,5 @@
+import torch
+
 from torchwright.compiler.groups.attn_sublayer import AttnSubLayer
 from torchwright.compiler.groups.mlp_sublayer import GatedMLPSubLayer, MLPSubLayer
 
@@ -28,10 +30,10 @@ class TransformerLayer:
             )
         self.attn = AttnSubLayer(d, d_head, n_heads=n_heads)
 
-    def to(self, device):
+    def to(self, device: str | torch.device) -> "TransformerLayer":
         self.attn.to(device)
         self.mlp.to(device)
         return self
 
-    def num_params(self):
+    def num_params(self) -> int:
         return self.attn.num_params() + self.mlp.num_params()

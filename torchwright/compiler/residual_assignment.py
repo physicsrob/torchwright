@@ -1,7 +1,9 @@
+import itertools
+
 from torchwright.graph import Concatenate, Node
 from torchwright.graph.misc import Placeholder
 
-global_state_id = 0
+_state_id_counter = itertools.count()
 
 
 class ResidualStreamState:
@@ -9,10 +11,8 @@ class ResidualStreamState:
     name: str  # For debugging
 
     def __init__(self, name: str = "") -> None:
-        global global_state_id
-        self.state_id = global_state_id
+        self.state_id = next(_state_id_counter)
         self.name = name
-        global_state_id += 1
 
     def __repr__(self) -> str:
         return f"ResidualStreamState({self.state_id}, name='{self.name}')"

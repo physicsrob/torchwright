@@ -57,7 +57,7 @@ Modal declines it (a ±2-layer read on those cells).  The same flips can
 move ``params``: a cascade that certifies on one environment is replaced
 by a leaner synthesized staircase (advanced n=5 reads 5,136,237 on Modal
 — two 6-member cascades collapse — vs 5,228,969 locally, where their
-emission checks miss the 1e-3 budget by 1.05–1.51e-3).  The committed
+emission checks miss the 1e-3 budget by 1.05-1.51e-3).  The committed
 numbers are the Modal environment's; the instability class is the same
 one ``docs/numerical_noise_findings.md`` records for the staircase noise
 measurements.
@@ -69,12 +69,15 @@ import json
 import os
 import time
 import warnings
+from collections.abc import Callable, Sequence
+from pathlib import Path
 
 from examples._calculator_common import D_HEAD, D_HIDDEN, D_MODEL
 from torchwright.compiler.export import compile_headless
 from torchwright.compiler.forward.cpsat_scheduler import critical_path_layers
 from torchwright.compiler.lower import lower
 from torchwright.compiler.utils import get_ancestor_nodes
+from torchwright.graph import Node
 
 IMPLS = [
     "calculator_simple",
@@ -97,7 +100,7 @@ _WEIGHT_ATTRS = {
 }
 
 
-def graph_params(output_node) -> int:
+def graph_params(output_node: Node) -> int:
     """Total weight count of the graph reachable from ``output_node``."""
     total = 0
     for node in get_ancestor_nodes({output_node}):
@@ -108,7 +111,7 @@ def graph_params(output_node) -> int:
     return total
 
 
-def table_config(ns) -> dict:
+def table_config(ns: Sequence[int]) -> dict:
     """The committed JSON's config block: sweep + the witnessed geometry."""
     return {
         "ns": list(ns),
@@ -199,9 +202,11 @@ def collect_cell(impl_name: str, n: int) -> dict:
     return row
 
 
-def collect(ns) -> dict:
-    """Measure every (impl, n) cell serially (the local, single-cell path;
-    the Modal entrypoint fans cells out instead).
+def collect(ns: Sequence[int]) -> dict:
+    """Measure every (impl, n) cell serially.
+
+    This is the local, single-cell path; the Modal entrypoint fans
+    cells out instead.
     """
     results: dict = {impl: [] for impl in IMPLS}
     for impl_name in IMPLS:
@@ -216,7 +221,7 @@ def render(payload: dict) -> str:
     results = payload["results"]
     short = {impl: impl.split("_")[1] for impl in IMPLS}
 
-    def cell(impl, n, key, fmt=str):
+    def cell(impl: str, n: int, key: str, fmt: Callable[[int], str] = str) -> str:
         row = next((r for r in results[impl] if r["n"] == n), None)
         if row is None:
             return "—"
@@ -236,10 +241,10 @@ def render(payload: dict) -> str:
     ):
         lines.append(f"\n=== {title} ===")
         lines.append(f"{'n':>3} " + "".join(f"{short[i]:>{width}}" for i in IMPLS))
-        for n in ns:
-            lines.append(
-                f"{n:>3} " + "".join(f"{cell(i, n, key, fmt):>{width}}" for i in IMPLS)
-            )
+        lines.extend(
+            f"{n:>3} " + "".join(f"{cell(i, n, key, fmt):>{width}}" for i in IMPLS)
+            for n in ns
+        )
     return "\n".join(lines)
 
 
@@ -255,7 +260,7 @@ def main() -> None:
     payload = collect([int(x) for x in args.ns.split(",")])
     print(render(payload))
     if args.out:
-        with open(args.out, "w") as f:
+        with Path(args.out).open("w") as f:
             json.dump(payload, f, indent=2)
             f.write("\n")
         print(f"wrote {args.out}")

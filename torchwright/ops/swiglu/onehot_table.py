@@ -17,9 +17,9 @@ only one is machine-specific:
   ``-(n_blocks - 0.5)`` bias parks every lane's hinge argument at
   exactly ``+0.5`` (the winner) or ``≤ -0.5`` (everyone else).
   Sharpened, those are ``±scale/2`` — deep in saturation on both sides:
-  the winner's indicator is exactly 0.5 (``σ(64) = 1.0`` and ``64/128``
+  the winner's indicator is exactly 0.5 (``sigma(64) = 1.0`` and ``64/128``
   is exact), a losing lane leaks ``hinge(-0.5) ≈ -8e-29`` — not the
-  exact zero of ``σ(-scale)`` (``e^{-64}`` is representable) but nearly
+  exact zero of ``sigma(-scale)`` (``e^{-64}`` is representable) but nearly
   thirty orders below visibility, vanishing under fp32 addition.
 
 Because exactly one row fires (or none → ``default``), the claimed value
@@ -39,7 +39,7 @@ by up to the largest table magnitude, so the atol is sized by
 claimed range downstream analysis sees stays tight.  Noise pass-through
 is unchanged from the ReLU form: an input one-hot off by ε shifts the
 winner's indicator by exactly ε (the saturated gate is linear down to a
-count deviation of 0.33), so output error is ``2ε·|value_i − default|``.
+count deviation of 0.33), so output error is ``2ε·|value_i - default|``.
 """
 
 import torch
@@ -129,7 +129,8 @@ def onehot_lookup(
         # matrix — linear hardware, identical on both machines.
         weight = default.to(torch.float32).unsqueeze(0).repeat(d_key, 1).clone()
         for key, value in key_to_value.items():
-            row = int((key > 0.5).nonzero(as_tuple=False)[0].item())
+            is_one = (key - 1.0).abs() <= _ONEHOT_ATOL
+            row = int(is_one.nonzero(as_tuple=False)[0].item())
             weight[row] = value.to(torch.float32)
         result: Node = Linear(inp, weight, name="onehot_lookup_select")
     else:

@@ -1,9 +1,12 @@
-from typing import TYPE_CHECKING, Any, Optional
+from typing import TYPE_CHECKING, Any, Optional, cast
 
 import torch
 
 from torchwright.compiler.groups.transformer_layer import TransformerLayer
-from torchwright.compiler.residual_assignment import ResidualAssignment
+from torchwright.compiler.residual_assignment import (
+    ResidualAssignment,
+    ResidualStreamState,
+)
 from torchwright.graph import (
     Concatenate,
     Embedding,
@@ -22,6 +25,11 @@ if TYPE_CHECKING:
     from torchwright.compiler.groups.attn_sublayer import AttnSubLayer
     from torchwright.compiler.groups.mlp_sublayer import GatedMLPSubLayer, MLPSubLayer
     from torchwright.compiler.realization import RealizationTable
+
+# A sublayer's ``forward(..., return_states=True)`` result: the output
+# tensor plus one (ResidualStreamState, tensor) snapshot per named state.
+_SublayerStates = dict[str, tuple[ResidualStreamState, torch.Tensor]]
+_SublayerForwardStatesResult = tuple[torch.Tensor, _SublayerStates]
 
 
 class HeadlessTransformer:
@@ -92,7 +100,7 @@ class HeadlessTransformer:
             return self.layers[0].attn.attn.query_matrix.device
         return torch.device("cpu")
 
-    def to(self, device) -> "HeadlessTransformer":
+    def to(self, device: str | torch.device) -> "HeadlessTransformer":
         for layer in self.layers:
             layer.to(device)
         return self
@@ -116,7 +124,7 @@ class HeadlessTransformer:
         n_pos: int,
         input_values: dict[str, Any],
         past_len: int = 0,
-    ):
+    ) -> torch.Tensor:
         """Build the initial residual stream for ``n_pos`` positions.
 
         ``past_len`` is **vestigial** under RoPE: position now enters only
@@ -150,12 +158,14 @@ class HeadlessTransformer:
                 for i, idx in enumerate(indices):
                     res_stream[:, idx] = embedding_output[:, i]
             else:
-                raise AssertionError("Unsupported node type")
+                raise TypeError("Unsupported node type")
         return res_stream
 
-    def forward(self, inp: torch.Tensor, return_states=False):
+    def forward(
+        self, inp: torch.Tensor, return_states: bool = False
+    ) -> torch.Tensor | _SublayerForwardStatesResult:
         res = inp
-        all_states = {}
+        all_states: _SublayerStates = {}
         for i, layer in enumerate(self.layers):
             sublayer_pairs: list[
                 tuple[AttnSubLayer | MLPSubLayer | GatedMLPSubLayer, str]
@@ -165,19 +175,26 @@ class HeadlessTransformer:
             ]
             for sublayer, sublayer_name in sublayer_pairs:
                 if return_states:
-                    res, states = sublayer.forward(res, return_states=True)
+                    res, states = cast(
+                        "_SublayerForwardStatesResult",
+                        sublayer.forward(res, return_states=True),
+                    )
                     prefixed_states = {
                         f"layer_{i}_{sublayer_name}_{key}": value
                         for key, value in states.items()
                     }
                     all_states.update(prefixed_states)
                 else:
-                    res = sublayer.forward(res)
+                    res = cast("torch.Tensor", sublayer.forward(res))
         if return_states:
             return res, all_states
         return res
 
-    def forward_cached(self, inp: torch.Tensor, past_kvs=None):
+    def forward_cached(
+        self,
+        inp: torch.Tensor,
+        past_kvs: list[tuple[torch.Tensor, torch.Tensor] | None] | None = None,
+    ) -> tuple[torch.Tensor, list[tuple[torch.Tensor, torch.Tensor]]]:
         """Forward pass with KV cache.
 
         Args:
@@ -190,12 +207,12 @@ class HeadlessTransformer:
         if past_kvs is None:
             past_kvs = [None] * len(self.layers)
 
-        new_kvs = []
+        new_kvs: list[tuple[torch.Tensor, torch.Tensor]] = []
         res = inp
         for i, layer in enumerate(self.layers):
             res, kv = layer.attn.forward_cached(res, past_kvs[i])
             new_kvs.append(kv)
-            res = layer.mlp.forward(res)
+            res = cast("torch.Tensor", layer.mlp.forward(res))
 
         return res, new_kvs
 
@@ -209,10 +226,9 @@ class HeadlessTransformer:
         """
         assert self.residual_assignment
 
-        res = self.forward(
-            self.get_input_res_stream(n_pos, input_values).to(self.device)
-        )
-        result = {}
+        in_stream = self.get_input_res_stream(n_pos, input_values).to(self.device)
+        res = cast("torch.Tensor", self.forward(in_stream))
+        result: dict[Node, torch.Tensor] = {}
         out_state = self.layers[-1].mlp.out_state
 
         for node in self.residual_assignment.get_nodes(out_state):

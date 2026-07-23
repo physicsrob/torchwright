@@ -1,5 +1,7 @@
-"""Unit tests for eager affine bound propagation: AffineBound factories,
-alignment, to_interval() concretization, and per-op rules.
+"""Unit tests for eager affine bound propagation.
+
+Covers AffineBound factories, alignment, to_interval() concretization,
+and per-op rules.
 """
 
 import math
@@ -170,9 +172,12 @@ class TestSession:
             assert s2.input_nodes[0] is y
 
     def test_nested_session_raises(self):
-        with fresh_graph_session(), pytest.raises(RuntimeError, match="Nested"):
-            with fresh_graph_session():
-                pass
+        with (
+            fresh_graph_session(),
+            pytest.raises(RuntimeError, match="Nested"),
+            fresh_graph_session(),
+        ):
+            pass
 
 
 # --- Eager bounds (computed in __init__) -----------------------------------
@@ -435,8 +440,9 @@ class TestReluRule:
 
 class TestClaimChannels:
     def test_leaf_claim_preserves_coefficients(self):
-        """A claim on an InputNode tightens its input_ranges entry, not
-        its coefficients (the leaf channel keeps the affine structure).
+        """A claim on an InputNode tightens its input_ranges entry, not its coefs.
+
+        The leaf channel keeps the affine structure.
         """
         with fresh_graph_session():
             x = InputNode(1, name="x", value_range=(-5.0, 5.0))
@@ -476,10 +482,10 @@ class TestClaimChannels:
             assert intervals[0].hi == pytest.approx(1.0)
 
     def test_claim_tightens_the_node_itself(self):
-        """The claim is a fact about the node's value: the node's own
-        bound tightens, and every consumer — including ones reading the
-        node through another handle — sees it (sound: the claim is
-        runtime-checked).
+        """The claim is a fact about the node's value, so the node's own bound tightens.
+
+        Every consumer — including ones reading the node through
+        another handle — sees it (sound: the claim is runtime-checked).
         """
         with fresh_graph_session():
             x = InputNode(1, name="x", value_range=(-10.0, 10.0))
@@ -491,8 +497,9 @@ class TestClaimChannels:
             assert x_intervals[0].hi == pytest.approx(3.0)
 
     def test_parallel_claims_intersect_for_all_consumers(self):
-        """Two claims on the same node intersect; every consumer sees
-        the intersection (claims commute — attach order irrelevant).
+        """Two claims on the same node intersect; every consumer sees the result.
+
+        Claims commute — attach order irrelevant.
         """
         with fresh_graph_session():
             x = InputNode(1, name="x", value_range=(-10.0, 10.0))
@@ -848,7 +855,10 @@ class TestReluChord:
                 assert yv <= intervals[0].hi + 1e-5
 
     def test_chord_lower_bound_negative(self):
-        """Chord lower bound is negative for straddling (looser per-component, tighter correlation)."""
+        """Chord lower bound is negative for straddling.
+
+        Looser per-component, tighter correlation.
+        """
         with fresh_graph_session():
             x = InputNode(1, name="x", value_range=(-2.0, 4.0))
             from torchwright.graph import ReLU
@@ -864,8 +874,9 @@ class TestReluChord:
 
 
 class TestClaimDegenerate:
-    """A finite claim on a non-leaf collapses its bound to the
-    claim-intersected constant box (the general channel).
+    """A finite claim on a non-leaf collapses its bound to a constant box.
+
+    The claim-intersected constant box (the general channel).
     """
 
     def test_degenerate_tight_range(self):
@@ -908,11 +919,13 @@ class TestClaimDegenerate:
 
 
 class TestToIntervalFpCrossing:
-    """``to_interval`` snaps a sub-tolerance lower>upper crossing — fp
-    accumulation noise on a point-valued component — instead of raising; a gross
-    crossing still raises. Regression: a token embedding column at exactly 0.5
-    had its lower bound eval land ~1 ULP above 0.5, tripping the strict ``Range``
-    check during ``value_type`` propagation through a ``select``.
+    """``to_interval`` snaps a sub-tolerance lower>upper crossing instead of raising.
+
+    That crossing is fp accumulation noise on a point-valued
+    component; a gross crossing still raises. Regression: a token
+    embedding column at exactly 0.5 had its lower bound eval land ~1
+    ULP above 0.5, tripping the strict ``Range`` check during
+    ``value_type`` propagation through a ``select``.
     """
 
     @staticmethod
@@ -939,7 +952,7 @@ class TestToIntervalFpCrossing:
 
     def test_gross_crossing_still_raises(self):
         ab = self._point_bound(1.0, 0.5)
-        with pytest.raises(ValueError):
+        with pytest.raises(ValueError, match="lo must be <= hi"):
             ab.to_interval()
 
 
@@ -1064,8 +1077,10 @@ class TestGatedFFNRule:
             assert _pointwise_slack(blk, -3.0, 3.0) >= -1e-9
 
     def test_gated_swish_value_type_finite(self):
-        """The RMSNorm energy certification requirement: a gated swish FFN
-        over bounded inputs must expose a finite value range.
+        """The RMSNorm energy certification requirement.
+
+        A gated swish FFN over bounded inputs must expose a finite
+        value range.
         """
         with fresh_graph_session():
             g = torch.Generator().manual_seed(13)
@@ -1081,9 +1096,10 @@ class TestGatedFFNRule:
             assert math.isfinite(r.hi)
 
     def test_unbounded_input_degenerates_without_crash(self):
-        """An unbounded gated lane must fall back to an unbounded row —
-        constructed and concretized NaN-free (to_interval asserts on NaN),
-        never a crash at graph build.
+        """An unbounded gated lane must fall back to an unbounded row.
+
+        Constructed and concretized NaN-free (to_interval asserts on
+        NaN), never a crash at graph build.
         """
         with fresh_graph_session():
             g = torch.Generator().manual_seed(17)
@@ -1099,9 +1115,10 @@ class TestGatedFFNRule:
 
 
 class TestGatedFFNTightness:
-    """The ops_plain_english.md constructions: the rule must stay within a
-    small factor of the true output range (regression-pinned from the spike:
-    multiply 1.06x, select 1.10x, cond_gate 1.05x).
+    """The ops_plain_english.md constructions stay within a small factor.
+
+    Regression-pinned from the spike: multiply 1.06x, select 1.10x,
+    cond_gate 1.05x.
     """
 
     def test_multiply_construction(self):

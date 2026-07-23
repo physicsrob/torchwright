@@ -23,15 +23,15 @@ class Component(ABC):
         self.out_state = ResidualStreamState(name=f"{self} out_state")
 
     @abstractmethod
-    def forward(self, inp): ...
+    def forward(self, inp: torch.Tensor) -> torch.Tensor: ...
 
     @abstractmethod
     def num_params(self) -> int: ...
 
-    def resize(self, new_d) -> None:
+    def resize(self, new_d: int) -> None:
         self.d = new_d
 
-    def to(self, device):
+    def to(self, device: torch.device | str) -> "Component":
         """Move all tensor attributes to the given device."""
         for attr_name in list(vars(self)):
             val = getattr(self, attr_name)

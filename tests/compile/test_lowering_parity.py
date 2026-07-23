@@ -1,5 +1,7 @@
-"""The lowering copy is bounds-transparent: an in-place run of the
-lowering passes and ``lower()``'s private-copy run agree bit-for-bit.
+"""The lowering copy is bounds-transparent.
+
+An in-place run of the lowering passes and ``lower()``'s private-copy
+run agree bit-for-bit.
 
 Two fresh rebuilds of the same graph: one gets the passes applied
 **in place** (fuse consecutive Linears, refresh every node's derived
@@ -74,11 +76,11 @@ def _assert_bit_identical(inplace, lowered):
     # relative to lower()'s, not a compiler bug — see module docstring.
     assert inplace.keys() == lowered.keys()
     for cid in inplace:
-        i, l = inplace[cid], lowered[cid]
+        i, lw = inplace[cid], lowered[cid]
         assert (i.lo, i.hi) == (
-            l.lo,
-            l.hi,
-        ), f"canonical node {cid}: in-place run {i} vs lowering copy {l}"
+            lw.lo,
+            lw.hi,
+        ), f"canonical node {cid}: in-place run {i} vs lowering copy {lw}"
 
 
 def _adder_1digit():
@@ -102,8 +104,9 @@ def test_bounds_transparent_adder_1digit():
 
 
 def _swish_graph():
-    """A small swish-machine graph with claims on both a leaf and a
-    general (FFN) target — the two claim channels.
+    """A small swish-machine graph with claims on both a leaf and a general target.
+
+    The general (FFN) target is the other of the two claim channels.
     """
 
     def w(*shape, seed):
@@ -149,8 +152,9 @@ def _collapsible_graph():
 
 
 def _inplace_pipeline_bounds_collapsed(output_node):
-    """The in-place twin with the collapse pass in lower()'s round
-    order: fuse, refresh, collapse.
+    """The in-place twin with the collapse pass in lower()'s round order.
+
+    That order is: fuse, refresh, collapse.
     """
     from torchwright.compiler.collapse import collapse_univariate_subgraphs
     from torchwright.graph.optimize import FoldLog

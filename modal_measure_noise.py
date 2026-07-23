@@ -33,7 +33,9 @@ app = modal.App("torchwright-measure-noise", image=IMAGE)
 # p99) match what the drift check under `make test` measures.
 @app.function(gpu="a100-80gb", cpu=8, memory=32768, timeout=1800)
 def measure() -> dict:
-    rc = subprocess.run([sys.executable, "-m", "scripts.measure_op_noise"]).returncode
+    rc = subprocess.run(
+        [sys.executable, "-m", "scripts.measure_op_noise"], check=False
+    ).returncode
     if rc != 0:
         raise RuntimeError(f"scripts.measure_op_noise exited {rc}")
 

@@ -10,9 +10,12 @@ from dataclasses import dataclass
 from typing import Literal, cast
 
 import torch
-import torch.nn.functional as F
+from torch.nn import functional
 
+from torchwright.compiler.components.attn import AttnLayerComponent
+from torchwright.compiler.components.linear import LinearLayerComponent
 from torchwright.compiler.forward.replay_plan import PlannedAttentionOp, PlannedMlpOp
+from torchwright.compiler.groups.mlp_sublayer import GatedMLPSubLayer, MLPSubLayer
 from torchwright.compiler.groups.transformer_layer import TransformerLayer
 from torchwright.compiler.realization import linear_attn_chunks
 from torchwright.compiler.residual_assignment import flatten_concat_nodes
@@ -26,13 +29,13 @@ from torchwright.graph.rope import ROPE_BASE
 # the swish bypass pair below; ops fold it into FFN weights themselves.
 # The bias-lane constants build the no-bias constant lane (see BiasFold).
 from torchwright.ops.const import (
-    bias_lane_gate as _BIAS_LANE_GATE,
+    bias_lane_gate as _bias_lane_gate,
 )
 from torchwright.ops.const import (
-    bias_lane_up as _BIAS_LANE_UP,
+    bias_lane_up as _bias_lane_up,
 )
 from torchwright.ops.const import (
-    scale as _SWISH_SCALE,
+    scale as _swish_scale,
 )
 
 # Self-match attention hardness: scales the constant-1 self-match logit so the
@@ -51,7 +54,7 @@ class PlacementEntry:
     head ``h`` occupies columns ``range(h*d_head, (h+1)*d_head)``).
 
     ``mode`` distinguishes how the write filled the region:
-      * ``"dense"`` — full cross product ``rows × cols`` (a real weight
+      * ``"dense"`` — full cross product ``rows x cols`` (a real weight
         block, written with broadcast/outer indexing).
       * ``"diag"``  — paired write: cell ``k`` is ``(rows[k], cols[k])``
         only (an identity / passthrough, written with aligned 1-D index
@@ -230,17 +233,17 @@ def _coalesce_source_rows(
 
 
 def _scatter_attn_head(
-    attn,
-    head,
-    q_idx,
-    k_idx,
-    v_idx,
-    o_idx,
-    q_mat,
-    k_mat,
-    v_mat,
-    o_mat,
-    d_head,
+    attn: AttnLayerComponent,
+    head: int,
+    q_idx: Sequence[int],
+    k_idx: Sequence[int],
+    v_idx: Sequence[int],
+    o_idx: Sequence[int],
+    q_mat: torch.Tensor,
+    k_mat: torch.Tensor,
+    v_mat: torch.Tensor,
+    o_mat: torch.Tensor,
+    d_head: int,
     *,
     recorder: PlacementRecorder | None = None,
     node: Node | None = None,
@@ -282,7 +285,7 @@ def _scatter_attn_head(
     )
 
 
-def _allocate_head(attn):
+def _allocate_head(attn: AttnLayerComponent) -> int:
     """Allocate the next available attention head."""
     assert attn.used_heads < attn.n_heads, "Ran out of attention heads"
     head = attn.used_heads
@@ -291,7 +294,7 @@ def _allocate_head(attn):
 
 
 def _write_compute_attn(
-    attn,
+    attn: AttnLayerComponent,
     op: PlannedAttentionOp,
     recorder: PlacementRecorder | None = None,
 ) -> None:
@@ -361,10 +364,10 @@ def _write_compute_attn(
         v_end = min(v_start + layer_d_head, node.d_v)
         chunk_size = v_end - v_start
 
-        v_chunk = F.pad(
+        v_chunk = functional.pad(
             node.value_matrix[:, v_start:v_end], (0, layer_d_head - chunk_size)
         )
-        o_chunk = F.pad(
+        o_chunk = functional.pad(
             node.output_matrix[v_start:v_end, :], (0, 0, 0, layer_d_head - chunk_size)
         )
 
@@ -395,13 +398,15 @@ def _write_compute_attn(
         )
 
 
-def _self_match_source(d_head: int, const_one_col: int):
+def _self_match_source(
+    d_head: int, const_one_col: int
+) -> tuple[tuple[int], torch.Tensor, torch.Tensor]:
     """Q/K source columns + matrices for a Δ=0 self-match head.
 
     Reads the single reserved constant-1 column and projects it to
     ``hardness · ones`` (query) / ``ones`` (key) across all ``d_head`` dims.
     The runtime rotates this head by absolute position (rotate_half over the
-    rotary front), and the logit ``∝ Σ_p cos((i − j)·θ_p)`` (plus a constant from
+    rotary front), and the logit ``∝ Σ_p cos((i - j)·θ_p)`` (plus a constant from
     any unrotated NoPE tail) peaks at ``i == j`` — a Δ=0 transport that is
     rotation-invariant, so it holds for full or partial rotary alike.  This is a
     compiler-inserted head; it leaves rope_d_rot unset, so it never constrains the
@@ -417,7 +422,7 @@ def _self_match_source(d_head: int, const_one_col: int):
 
 
 def _write_compute_linear(
-    attn,
+    attn: AttnLayerComponent,
     op: PlannedAttentionOp,
     const_one_col: int,
     recorder: PlacementRecorder | None = None,
@@ -465,7 +470,7 @@ def _write_compute_linear(
 
         # Weight matrix slice for this chunk: rows [start:end]
         weight_slice = node.output_matrix[start:end, :]  # (chunk_size, d_output)
-        o_mat = F.pad(weight_slice, (0, 0, 0, d_head - chunk_size))
+        o_mat = functional.pad(weight_slice, (0, 0, 0, d_head - chunk_size))
 
         head = _allocate_head(attn)
         attn.rope_base = ROPE_BASE
@@ -488,7 +493,7 @@ def _write_compute_linear(
 
 
 def _write_compute_add(
-    attn,
+    attn: AttnLayerComponent,
     op: PlannedAttentionOp,
     const_one_col: int,
     recorder: PlacementRecorder | None = None,
@@ -609,7 +614,7 @@ def _write_compute_add(
 
 
 def _write_cancel(
-    attn,
+    attn: AttnLayerComponent,
     op: PlannedAttentionOp,
     const_one_col: int,
     recorder: PlacementRecorder | None = None,
@@ -657,7 +662,7 @@ def _write_cancel(
 
 
 def _write_add_into(
-    attn,
+    attn: AttnLayerComponent,
     op: PlannedAttentionOp,
     const_one_col: int,
     recorder: PlacementRecorder | None = None,
@@ -730,8 +735,8 @@ class BiasFold:
     its down-projection row carries each constant verbatim.
 
     Lane exactness: ReLU machine ``ReLU(1·1) = 1``; swish machine
-    ``swish(32·1) · ((1/32)·1) = 32 · σ(32) · 2⁻⁵ = 1.0`` bit-exactly — fp32
-    σ saturates to 1.0 from z ≥ 17 (torch/ORT-CUDA; z ≥ 18 CPU-ORT, the A0
+    ``swish(32·1) · ((1/32)·1) = 32 · sigma(32) · 2⁻⁵ = 1.0`` bit-exactly — fp32
+    sigma saturates to 1.0 from z ≥ 17 (torch/ORT-CUDA; z ≥ 18 CPU-ORT, the A0
     probes) and both lane constants are powers of two, so no product rounds.
     Constants live in ``ops/const.py`` (``bias_lane_gate``/``bias_lane_up``).
     """
@@ -740,18 +745,18 @@ class BiasFold:
 
     def __init__(
         self,
-        mlp,
+        mlp: MLPSubLayer | GatedMLPSubLayer,
         const_col: int,
         recorder: PlacementRecorder | None = None,
     ) -> None:
-        self.mlp = mlp
+        self.mlp: MLPSubLayer | GatedMLPSubLayer = mlp
         self.const_col = const_col
         self.recorder = recorder
         self._lane_written = False
 
     def hidden_bias(
         self,
-        lin,
+        lin: LinearLayerComponent,
         matrix_kind: str,
         slots: Sequence[int],
         values: torch.Tensor,
@@ -774,7 +779,7 @@ class BiasFold:
 
     def out_bias(
         self,
-        out_lin,
+        out_lin: LinearLayerComponent,
         cols: Sequence[int],
         values: torch.Tensor,
         *,
@@ -811,9 +816,10 @@ class BiasFold:
             f"bias=False.  Compiler bug."
         )
         if self.mlp.activation == "swish":
-            in_lin.output_matrix[self.const_col, self.LANE_SLOT] = _BIAS_LANE_GATE
-            self.mlp.up_proj.output_matrix[self.const_col, self.LANE_SLOT] = (
-                _BIAS_LANE_UP
+            in_lin.output_matrix[self.const_col, self.LANE_SLOT] = _bias_lane_gate
+            gated_mlp = cast("GatedMLPSubLayer", self.mlp)
+            gated_mlp.up_proj.output_matrix[self.const_col, self.LANE_SLOT] = (
+                _bias_lane_up
             )
         else:
             in_lin.output_matrix[self.const_col, self.LANE_SLOT] = 1.0
@@ -832,7 +838,9 @@ class BiasFold:
                 )
 
 
-def _mlp_in_out(mlp):
+def _mlp_in_out(
+    mlp: MLPSubLayer | GatedMLPSubLayer,
+) -> tuple[LinearLayerComponent, LinearLayerComponent]:
     """The hidden pool's (input-side, output-side) projections, either machine.
 
     ReLU machine: ``(linear1, linear2)``.  Swish machine: ``(gate_proj,
@@ -840,12 +848,14 @@ def _mlp_in_out(mlp):
     the up projection is swish-machine-specific and accessed explicitly.
     """
     if mlp.activation == "swish":
-        return mlp.gate_proj, mlp.down_proj
-    return mlp.linear1, mlp.linear2
+        gated_mlp = cast("GatedMLPSubLayer", mlp)
+        return gated_mlp.gate_proj, gated_mlp.down_proj
+    relu_mlp = cast("MLPSubLayer", mlp)
+    return relu_mlp.linear1, relu_mlp.linear2
 
 
 def _write_compute_ffn(
-    mlp,
+    mlp: MLPSubLayer | GatedMLPSubLayer,
     op: PlannedMlpOp,
     biased_linears: set[Node] | None = None,
     recorder: PlacementRecorder | None = None,
@@ -935,21 +945,23 @@ def _write_compute_ffn(
     # constant 1 (row 0, bias 1 — or, under bias=False, const-column row 1);
     # a gated lane carries its own affine.
     up_matrix = None
+    up_proj_component: LinearLayerComponent | None = None
     if mlp.activation == "swish":
+        up_proj_component = cast("GatedMLPSubLayer", mlp).up_proj
         if ffn.up_proj is None:
             up_bias = torch.ones(len(mlp_slots))
         else:
             up_matrix = ffn.up_proj.t()
             up_bias = cast("torch.Tensor", ffn.up_bias)
             _, up_rows = _coalesce_source_rows(in_idx, up_matrix)
-            mlp.up_proj.output_matrix[
+            up_proj_component.output_matrix[
                 scatter_idx_t.unsqueeze(1), slots_t.unsqueeze(0)
             ] = up_rows.to(target_dtype)
         if bias_fold is None:
-            mlp.up_proj.output_bias[slots_t] = up_bias.to(target_dtype)
+            up_proj_component.output_bias[slots_t] = up_bias.to(target_dtype)
         else:
             bias_fold.hidden_bias(
-                mlp.up_proj,
+                up_proj_component,
                 "mlp.W_up",
                 mlp_slots,
                 up_bias,
@@ -984,14 +996,17 @@ def _write_compute_ffn(
                         accumulate=True,
                     )
                 if up_matrix is not None:
+                    assert up_proj_component is not None
                     up_contrib = (
                         leaf.output_bias @ up_matrix[offset : offset + len(leaf), :]
                     )
                     if bias_fold is None:
-                        mlp.up_proj.output_bias[slots_t] += up_contrib.to(target_dtype)
+                        up_proj_component.output_bias[slots_t] += up_contrib.to(
+                            target_dtype
+                        )
                     else:
                         bias_fold.hidden_bias(
-                            mlp.up_proj,
+                            up_proj_component,
                             "mlp.W_up",
                             mlp_slots,
                             up_contrib,
@@ -1023,7 +1038,9 @@ def _write_compute_ffn(
 
 
 def _write_compute_literal_value(
-    mlp, op: PlannedMlpOp, bias_fold: BiasFold | None = None
+    mlp: MLPSubLayer | GatedMLPSubLayer,
+    op: PlannedMlpOp,
+    bias_fold: BiasFold | None = None,
 ) -> None:
     """Write a constant value via MLP output bias (or the constant lane).
 
@@ -1051,7 +1068,9 @@ def _write_compute_literal_value(
 
 
 def _write_compute_bias(
-    mlp, op: PlannedMlpOp, bias_fold: BiasFold | None = None
+    mlp: MLPSubLayer | GatedMLPSubLayer,
+    op: PlannedMlpOp,
+    bias_fold: BiasFold | None = None,
 ) -> None:
     """Add bias to MLP output bias (for biased Linear split).
 
@@ -1083,7 +1102,9 @@ def _write_compute_bias(
 
 
 def _write_clear_literal_seed(
-    mlp, op: PlannedMlpOp, bias_fold: BiasFold | None = None
+    mlp: MLPSubLayer | GatedMLPSubLayer,
+    op: PlannedMlpOp,
+    bias_fold: BiasFold | None = None,
 ) -> None:
     """Cancel a compiler-internal literal in the final MLP residual update.
 
@@ -1112,7 +1133,7 @@ def _write_clear_literal_seed(
 
 
 def _write_bypass_lane_pair(
-    mlp,
+    mlp: MLPSubLayer | GatedMLPSubLayer,
     in_idx: Sequence[int],
     out_idx: Sequence[int],
     mlp_slots: Sequence[int],
@@ -1123,10 +1144,11 @@ def _write_bypass_lane_pair(
     bias_fold: BiasFold | None = None,
     recorder: PlacementRecorder | None = None,
 ) -> None:
-    """Emit the activation bypass lane-pair computing ``W.T @ x`` from
-    ``in_idx`` into ``out_idx`` over ``mlp_slots`` (== ``2 * len(out_idx)``).
+    """Emit the activation bypass lane-pair computing ``W.T @ x``.
 
-    Shared by :func:`_write_compute_linear_bypass` (``W = node.output_matrix``)
+    Computes from ``in_idx`` into ``out_idx`` over ``mlp_slots``
+    (== ``2 * len(out_idx)``).  Shared by
+    :func:`_write_compute_linear_bypass` (``W = node.output_matrix``)
     and :func:`_write_cancel_bypass` (``W = -I``, so the pair emits ``-x`` and
     the skip connection turns ``x`` into ``x + (-x) = 0``).  Value path only:
     ±in_gain·W on the two slot halves, the degenerate up-lanes (up ≡ 1 on the
@@ -1150,8 +1172,8 @@ def _write_bypass_lane_pair(
 
     in_lin, out_lin = _mlp_in_out(mlp)
     swish = mlp.activation == "swish"
-    in_gain = _SWISH_SCALE if swish else 1.0
-    out_gain = 1.0 / _SWISH_SCALE if swish else 1.0
+    in_gain = _swish_scale if swish else 1.0
+    out_gain = 1.0 / _swish_scale if swish else 1.0
 
     target_dtype = in_lin.output_matrix.dtype
     W = W.to(target_dtype)
@@ -1169,12 +1191,13 @@ def _write_bypass_lane_pair(
 
     # Swish machine: both slot halves are degenerate lanes (up ≡ 1).
     if swish:
+        gated_mlp = cast("GatedMLPSubLayer", mlp)
         if bias_fold is None:
-            mlp.up_proj.output_bias[pos_slots_t] = 1.0
-            mlp.up_proj.output_bias[neg_slots_t] = 1.0
+            gated_mlp.up_proj.output_bias[pos_slots_t] = 1.0
+            gated_mlp.up_proj.output_bias[neg_slots_t] = 1.0
         else:
             bias_fold.hidden_bias(
-                mlp.up_proj,
+                gated_mlp.up_proj,
                 "mlp.W_up",
                 mlp_slots,
                 torch.ones(len(mlp_slots)),
@@ -1195,18 +1218,17 @@ def _write_bypass_lane_pair(
 
 
 def _fold_deferred_source_bias(
-    mlp,
+    mlp: MLPSubLayer | GatedMLPSubLayer,
     leaves: list[Node],
     W: torch.Tensor,
-    mlp_slots,
+    mlp_slots: Sequence[int],
     biased_linears: set[Node],
     bias_fold: BiasFold | None,
     *,
     node: Node | None,
     op_type: str,
 ) -> None:
-    """Fold same-layer deferred attention-Linear biases into a bypass pair's
-    hidden-slot biases.
+    """Fold same-layer deferred attention-Linear biases into hidden-slot biases.
 
     ``leaves`` is the flat source-leaf order the bypass pair reads (its
     entries index ``W``'s rows by offset); a leaf in ``biased_linears`` was
@@ -1220,7 +1242,7 @@ def _fold_deferred_source_bias(
         return
     in_lin, _ = _mlp_in_out(mlp)
     swish = mlp.activation == "swish"
-    in_gain = _SWISH_SCALE if swish else 1.0
+    in_gain = _swish_scale if swish else 1.0
     d_output = len(mlp_slots) // 2
     pos_slots = mlp_slots[:d_output]
     neg_slots = mlp_slots[d_output:]
@@ -1261,8 +1283,9 @@ def _fold_deferred_source_bias(
 
 
 def _flatten_input_leaves(input_node: Node) -> list[Node]:
-    """The flat leaf list a bypass pair's ``resolve_indices`` capture reads,
-    in column order — one entry per occurrence (a Concatenate holding the
+    """The flat leaf list a bypass pair's ``resolve_indices`` capture reads.
+
+    In column order — one entry per occurrence (a Concatenate holding the
     same leaf twice yields it twice).
     """
     if isinstance(input_node, Concatenate):
@@ -1271,17 +1294,19 @@ def _flatten_input_leaves(input_node: Node) -> list[Node]:
 
 
 def _write_cancel_bypass(
-    mlp,
+    mlp: MLPSubLayer | GatedMLPSubLayer,
     op: PlannedMlpOp,
     recorder: PlacementRecorder | None = None,
     bias_fold: BiasFold | None = None,
 ) -> None:
-    """Zero a dying node's columns from the MLP sublayer via the bypass pair
-    with ``W = -I``: the lane-pair emits ``-x`` and the skip connection turns
-    the column's ``x`` into ``x + (-x) = 0`` (up to the swish two-lane fp32
-    residue measured in ``scripts/measure_mlp_cancel_residue.py``; the ReLU
-    pair is bit-exact).  ``source_cols == target_cols`` — it reads what it
-    negates — and there is no graph node (``op.node is None``).
+    """Zero a dying node's columns from the MLP sublayer.
+
+    Via the bypass pair with ``W = -I``: the lane-pair emits ``-x`` and the
+    skip connection turns the column's ``x`` into ``x + (-x) = 0`` (up to the
+    swish two-lane fp32 residue measured in
+    ``scripts/measure_mlp_cancel_residue.py``; the ReLU pair is bit-exact).
+    ``source_cols == target_cols`` — it reads what it negates — and there
+    is no graph node (``op.node is None``).
     """
     assert op.source_cols is not None, "cancel_bypass requires source_cols"
     cols = op.target_cols
@@ -1305,7 +1330,7 @@ def _write_cancel_bypass(
 
 
 def _write_compute_linear_bypass(
-    mlp,
+    mlp: MLPSubLayer | GatedMLPSubLayer,
     op: PlannedMlpOp,
     biased_linears: set[Node] | None = None,
     recorder: PlacementRecorder | None = None,
@@ -1315,7 +1340,7 @@ def _write_compute_linear_bypass(
 
     ReLU machine: ``ReLU(z) - ReLU(-z) = z``.  Swish machine:
     ``Swish(scale·z)/scale - Swish(-scale·z)/scale = z`` — exact at any
-    sharpening (``σ(z) + σ(-z) = 1``), sharpened by the module ``scale``
+    sharpening (``sigma(z) + sigma(-z) = 1``), sharpened by the module ``scale``
     by convention: the value is exact either way, but the affine-bound
     sandwich slack on the pair is ``±0.2785/scale`` sharpened versus
     ``±0.2785`` raw (see the spec's ``min`` entry).  Either way, two MLP
@@ -1399,15 +1424,15 @@ def _write_compute_linear_bypass(
 
 
 def _write_add_into_bypass(
-    mlp,
+    mlp: MLPSubLayer | GatedMLPSubLayer,
     op: PlannedMlpOp,
     biased_linears: set[Node] | None = None,
     recorder: PlacementRecorder | None = None,
     bias_fold: BiasFold | None = None,
 ) -> None:
-    """Add the live addend into a reused dead addend's columns from the MLP
-    sublayer via the bypass pair with ``W = I``.
+    """Add the live addend into a reused dead addend's columns.
 
+    Writes from the MLP sublayer via the bypass pair with ``W = I``.
     The target columns are the dead addend's, reassigned to the Add; they
     still hold the dead addend's value at MLP entry, and the pair's delta
     adds the live addend, so the columns leave the sublayer holding
@@ -1424,7 +1449,11 @@ def _write_add_into_bypass(
     in_idx = op.source_cols
     out_idx = op.target_cols
     width = len(node)
-    assert len(in_idx) == width and len(out_idx) == width, (
+    assert len(in_idx) == width, (
+        f"add_into_bypass width mismatch for {node!r}: "
+        f"source={len(in_idx)}, target={len(out_idx)}, node={width}"
+    )
+    assert len(out_idx) == width, (
         f"add_into_bypass width mismatch for {node!r}: "
         f"source={len(in_idx)}, target={len(out_idx)}, node={width}"
     )
@@ -1458,29 +1487,35 @@ def _write_add_into_bypass(
 
 
 def _write_compute_add_bypass(
-    mlp,
+    mlp: MLPSubLayer | GatedMLPSubLayer,
     op: PlannedMlpOp,
     biased_linears: set[Node] | None = None,
     recorder: PlacementRecorder | None = None,
     bias_fold: BiasFold | None = None,
 ) -> None:
-    """Compute both addends into fresh, zeroed columns from the MLP sublayer
-    via the bypass pair over the concatenated source rows with
-    ``W = [I; I]``.
+    """Compute both addends into fresh, zeroed columns.
 
-    Duplicate source columns coalesce by row-summing inside the lane pair,
-    so ``add(x, x)`` sums both copies instead of dropping one to a
+    Via the MLP sublayer's bypass pair over the concatenated source rows
+    with ``W = [I; I]``.  Duplicate source columns coalesce by row-summing
+    inside the lane pair, so ``add(x, x)`` sums both copies instead of dropping one to a
     last-write-wins scatter.  Both source occurrences fold same-layer
     deferred Linear biases; duplicate sources fold twice, so biased
     ``add(x, x)`` includes ``2 · bias(x)``.
     """
     node = op.node
     assert isinstance(node, Add)
-    assert op.source_cols is not None and op.source_cols_b is not None, (
+    assert op.source_cols is not None, (
+        "compute_add_bypass requires source_cols and source_cols_b"
+    )
+    assert op.source_cols_b is not None, (
         "compute_add_bypass requires source_cols and source_cols_b"
     )
     width = len(node)
-    assert len(op.source_cols) == width and len(op.source_cols_b) == width, (
+    assert len(op.source_cols) == width, (
+        f"compute_add_bypass width mismatch for {node!r}: "
+        f"a={len(op.source_cols)}, b={len(op.source_cols_b)}, node={width}"
+    )
+    assert len(op.source_cols_b) == width, (
         f"compute_add_bypass width mismatch for {node!r}: "
         f"a={len(op.source_cols)}, b={len(op.source_cols_b)}, node={width}"
     )

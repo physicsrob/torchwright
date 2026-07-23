@@ -40,7 +40,8 @@ def _cuda(vals) -> torch.Tensor:
 
 
 def test_sigmoid_saturates_to_one_from_17():
-    """Preamble: fp32 sigmoid is exactly 1.0 for every input >= 17, and
+    """Preamble: fp32 sigmoid is exactly 1.0 for every input >= 17.
+
     16 is not enough — the same threshold the CPU kernel pins.
     """
     z = torch.linspace(17.0, 200.0, 100_001, dtype=torch.float32, device="cuda")
@@ -56,9 +57,10 @@ def test_sigmoid_saturates_to_one_from_17():
 
 
 def test_sigmoid_saturates_to_zero_at_minus_scale():
-    """broadcast_select/select: sigma(-128) computes as exactly 0.0 — the
-    losing branch of a gated select contributes bit-zero, no denormal
-    leak into the output.
+    """broadcast_select/select: sigma(-128) computes as exactly 0.0.
+
+    The losing branch of a gated select contributes bit-zero, no
+    denormal leak into the output.
     """
     assert torch.sigmoid(_cuda(-SCALE)).item() == 0.0
     f = torch.linspace(-4096, 4096, 1001, dtype=torch.float32, device="cuda")
@@ -67,16 +69,18 @@ def test_sigmoid_saturates_to_zero_at_minus_scale():
 
 
 def test_swish_fixed_points():
-    """Swish(0) = 0, and Swish(scale) = scale exactly (saturated gate) —
-    the winning-branch gate of a select is exactly the mask value.
+    """Swish(0) = 0, and Swish(scale) = scale exactly (saturated gate).
+
+    The winning-branch gate of a select is exactly the mask value.
     """
     assert _swish(_cuda(0.0)).item() == 0.0
     assert _swish(_cuda(SCALE)).item() == SCALE
 
 
 def test_compare_contract_points_bit_exact():
-    """compare: the contract-point outputs are bit-exact +1/-1 (both
-    hinges saturated or on-bend) — mirrors the CPU pin.
+    """compare: the contract-point outputs are bit-exact +1/-1.
+
+    Both hinges saturated or on-bend — mirrors the CPU pin.
     """
 
     def compare_out(z: float) -> float:
@@ -90,8 +94,9 @@ def test_compare_contract_points_bit_exact():
 
 
 def test_abs_integer_grid_bit_exact():
-    """abs: hinge(x) + hinge(-x) is bit-exact |x| on the whole integer
-    grid (sigmoid saturation on every point).
+    """abs: hinge(x) + hinge(-x) is bit-exact |x| on the whole integer grid.
+
+    Sigmoid saturation on every point.
     """
     x = torch.arange(-1000.0, 1001.0, dtype=torch.float32, device="cuda")
     f = _swish(SCALE * x) / SCALE + _swish(-SCALE * x) / SCALE
@@ -99,7 +104,8 @@ def test_abs_integer_grid_bit_exact():
 
 
 def test_onehot_winner_indicator_exact():
-    """onehot_lookup: hinge(0.5) is exactly 0.5 (the winner indicator);
+    """onehot_lookup: hinge(0.5) is exactly 0.5 (the winner indicator).
+
     hinge(-0.5) leaks at most ~1e-27 per row (e^-64 is representable,
     unlike sigma(-128); a kernel that flushes it to zero is fine too —
     the budget-relevant direction is the upper bound).
@@ -110,12 +116,13 @@ def test_onehot_winner_indicator_exact():
 
 
 def test_bias_lane_constants_exact_unit_lane():
-    """The no-bias constant lane (docs/no_bias_plan.md) on this kernel:
-    the gate value saturates sigma bit-exactly, and the full lane
-    expression — the GatedMLPSubLayer's ``g * sigmoid(g) * u`` — computes
-    exactly 1.0 in fp32, so a constant routed through the lane's
-    down-projection row lands verbatim in a ``bias=False`` artifact.
-    Mirrors the torch-CPU pin in ``test_swish_constants.py``.
+    """The no-bias constant lane (docs/no_bias_plan.md) on this kernel.
+
+    The gate value saturates sigma bit-exactly, and the full lane
+    expression — the GatedMLPSubLayer's ``g * sigmoid(g) * u`` —
+    computes exactly 1.0 in fp32, so a constant routed through the
+    lane's down-projection row lands verbatim in a ``bias=False``
+    artifact. Mirrors the torch-CPU pin in ``test_swish_constants.py``.
     """
     from torchwright.ops.const import bias_lane_gate, bias_lane_up
 

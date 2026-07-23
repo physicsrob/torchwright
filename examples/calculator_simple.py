@@ -1,6 +1,8 @@
-r"""Calculator compiled into a transformer: ``+``, ``-``, ``*`` on integers up
-to ``max_digits`` digits, parsed from ``"A op B\\n"`` and emitted digit by
-digit.  This is the *legible* variant, built to be read line by line.
+r"""Calculator compiled into a transformer.
+
+``+``, ``-``, ``*`` on integers up to ``max_digits`` digits, parsed from
+``"A op B\\n"`` and emitted digit by digit.  This is the *legible* variant,
+built to be read line by line.
 
 Every operation is the same two ideas — an exhaustive **lookup table** over
 digit combinations (:func:`torchwright.ops.swiglu.onehot_table.onehot_lookup`), and a
@@ -46,6 +48,8 @@ from torchwright.ops.swiglu.arithmetic_ops import piecewise_linear
 from torchwright.ops.swiglu.map_select import in_range
 from torchwright.ops.swiglu.onehot_table import onehot_lookup
 
+_DECIMAL_BASE = 10
+
 __all__ = [
     "CALC_VOCAB",
     "D_HEAD",
@@ -90,8 +94,12 @@ def digitwise_fold(
 
     Args:
         embedding: The one-hot embedding (its ``"0"`` row is the digit default).
-        seq1, seq2: Equal-length MSB-first digit sequences.
-        digit_table, state_table: Lookups keyed on ``concat([a, b, state])``.
+        seq1: Equal-length MSB-first digit sequence (the ``a`` operand).
+        seq2: Equal-length MSB-first digit sequence (the ``b`` operand).
+        digit_table: Lookup keyed on ``concat([a, b, state])`` giving the
+            output digit.
+        state_table: Lookup keyed on ``concat([a, b, state])`` giving the
+            carry/borrow passed to the next position.
         init_state: The state one-hot entering the least-significant position.
 
     Returns:
@@ -140,8 +148,10 @@ def add_digit_seqs(
                     ]
                 )
                 total = a + b + carry
-                digit_table[key] = embedding.get_embedding(str(total % 10))
-                state_table[key] = _state(_YES if total >= 10 else _NO, _CARRY_W)
+                digit_table[key] = embedding.get_embedding(str(total % _DECIMAL_BASE))
+                state_table[key] = _state(
+                    _YES if total >= _DECIMAL_BASE else _NO, _CARRY_W
+                )
     return digitwise_fold(
         embedding,
         seq1,
@@ -272,9 +282,9 @@ def multiply_digit_seqs(
         _state(t, max_total + 1): embedding.get_embedding(str(t % 10))
         for t in range(max_total + 1)
     }
-    # Staircase knot pairs (one step per ten): carry k−1 up to 10k−0.5,
-    # carry k from 10k−0.4 — the standard 1/sharpness ramp width, so
-    # integer totals sit ≥ 0.4 from every knot (bit-exact reads).
+    # Staircase knot pairs (one step per ten): carry k-1 up to 10k-0.5,
+    # carry k from 10k-0.4 — the standard 1/sharpness ramp width, so
+    # integer totals sit >= 0.4 from every knot (bit-exact reads).
     carry_knots: dict[float, float] = {}
     for k in range(1, max_total // 10 + 1):
         carry_knots[10.0 * k - 0.5] = float(k - 1)
@@ -302,7 +312,9 @@ def multiply_digit_seqs(
 def create_network_parts(
     max_digits: int = 3,
 ) -> tuple[Node, Embedding]:
-    """The simple calculator: the legible serial folds wired up by
+    """Build the simple calculator.
+
+    The legible serial folds wired up by
     :func:`examples._calculator_common.build_calculator`.
     """
     return build_calculator(

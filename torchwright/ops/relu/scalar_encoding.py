@@ -3,7 +3,8 @@
 These functions convert digit embeddings into scalar numbers and back again,
 enabling arithmetic in scalar space. The typical pipeline is:
 
-    digits_to_number  →  scalar arithmetic  →  number_to_digit_scalars  →  scalar_to_embedding
+    digits_to_number  →  scalar arithmetic  →  number_to_digit_scalars
+    →  scalar_to_embedding
 
 Use this when numbers arrive as digit tokens and you want to do arithmetic
 as plain addition/subtraction/multiplication on scalars, then convert the

@@ -41,10 +41,11 @@ use — so a fixture reloaded in a fresh container reproduces the same problem.
 from __future__ import annotations
 
 import json
+import shutil
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path
-from typing import cast
+from typing import TYPE_CHECKING, Any, TypeVar, cast
 
 from torchwright.compiler.graph_identity import (
     canonical_ids,
@@ -52,12 +53,22 @@ from torchwright.compiler.graph_identity import (
     nodes_by_canonical_id,
 )
 
+if TYPE_CHECKING:
+    import os
+
+    from torchwright.compiler.forward.cpsat_scheduler import GraphModel
+    from torchwright.compiler.forward.graph_analysis import GraphAnalyzer
+    from torchwright.compiler.forward.scheduling_policy import SchedulingPolicy
+    from torchwright.graph import Node
+
 # Bumped whenever the on-disk schema or the set of facts the builder reads
 # changes.  The loader refuses a snapshot whose ``format_version`` differs from
 # this, so a schema drift is a loud miss, never a silent wrong-graph measure.
 # v2: held-bank contract endpoints (held_source_id / held_target_id) — a v1
 # snapshot of a tied graph would silently re-solve a relaxed model.
 FORMAT_VERSION = 2
+
+_V = TypeVar("_V")
 
 
 # ---------------------------------------------------------------------------
@@ -237,7 +248,7 @@ class FrozenHint:
         )
 
     def remap(self, mapping: dict[int, int]) -> FrozenHint:
-        def rm(t):
+        def rm(t: dict[int, _V]) -> dict[int, _V]:
             return {mapping[k]: v for k, v in t.items() if k in mapping}
 
         return FrozenHint(
@@ -306,7 +317,7 @@ class SchedulingProblem:
 
     # -- id-space transforms ----------------------------------------------
 
-    def canonicalized(self, output_node) -> SchedulingProblem:
+    def canonicalized(self, output_node: Node) -> SchedulingProblem:
         """Return a copy with every id relabeled to canonical (topology) ids.
 
         ``output_node`` is the live graph the problem was captured from; its
@@ -412,10 +423,12 @@ class SchedulingProblem:
     def loads(cls, text: str) -> SchedulingProblem:
         return cls.from_json(json.loads(text))
 
-    def save(self, path) -> Path:
-        """Persist to ``path`` (JSON).  Requires canonical ids + identity so a
-        fixture is self-describing and reproducible; a live-id or
-        identity-less problem is a program error to persist.
+    def save(self, path: str | os.PathLike) -> Path:
+        """Persist to ``path`` (JSON).
+
+        Requires canonical ids + identity so a fixture is self-describing
+        and reproducible; a live-id or identity-less problem is a program
+        error to persist.
         """
         if self.id_space != "canonical":
             raise ValueError(
@@ -437,7 +450,7 @@ class SchedulingProblem:
     @classmethod
     def load(
         cls,
-        path,
+        path: str | os.PathLike,
         *,
         expected_fingerprint: str | None = None,
     ) -> SchedulingProblem:
@@ -464,14 +477,14 @@ class SchedulingProblem:
     def with_identity(
         self,
         *,
-        output_node,
+        output_node: Node,
         d: int,
         d_head: int,
         n_heads: int | None = None,
         d_hidden: int,
         flex_routing: bool,
         cancel_slack: int | None,
-        policy,
+        policy: SchedulingPolicy | None,
         critical_path_layers: int,
         reserve_residual: int = 0,
         reserve_heads: int = 0,
@@ -557,7 +570,7 @@ class SchedulingProblem:
     def with_hint(self, hint: FrozenHint | None) -> SchedulingProblem:
         return self._replace(hint=hint)
 
-    def _replace(self, **changes) -> SchedulingProblem:
+    def _replace(self, **changes: Any) -> SchedulingProblem:
         from dataclasses import replace as _replace
 
         return _replace(self, **changes)
@@ -568,7 +581,7 @@ class SchedulingProblem:
 # ---------------------------------------------------------------------------
 
 
-def _record_for(node, graph) -> NodeRecord:
+def _record_for(node: Node, graph: GraphAnalyzer) -> NodeRecord:
     from torchwright.compiler.realization import live_weight_row_ranges
     from torchwright.graph.linear import Linear as _Linear
 
@@ -591,7 +604,7 @@ def _record_for(node, graph) -> NodeRecord:
 
 
 def snapshot_from_graph_model(
-    gm,
+    gm: GraphModel,
     *,
     held_source_id: int | None = None,
     held_target_id: int | None = None,
@@ -636,11 +649,13 @@ def _git_commit() -> str | None:
     """Best-effort torchwright commit for provenance (None if unavailable)."""
     try:
         here = Path(__file__).resolve()
+        git = shutil.which("git") or "git"
         out = subprocess.run(
-            ["git", "-C", str(here.parent), "rev-parse", "HEAD"],
+            [git, "-C", str(here.parent), "rev-parse", "HEAD"],
             capture_output=True,
             text=True,
             timeout=5,
+            check=False,
         )
         if out.returncode == 0:
             return out.stdout.strip()

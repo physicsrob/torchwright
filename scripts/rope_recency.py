@@ -24,27 +24,29 @@ import numpy as np
 
 try:
     from torchwright.graph.rope import ROPE_BASE as _DEFAULT_BASE
-except Exception:  # pragma: no cover - script may run without the package on path
+except ImportError:  # pragma: no cover - script may run without the package on path
     _DEFAULT_BASE = 500000.0
 
 # Defaults to the live ROPE_BASE (5e5) so figures reconcile with the runtime
 # grid; pass another base as the first CLI arg (e.g. the historical 1e6).
 BASE = float(sys.argv[1]) if len(sys.argv) > 1 else float(_DEFAULT_BASE)
 R = 65536  # full sequence range to test monotonicity / resolution across
+MID_BAND_UPPER_THETA = 0.3  # upper theta bound for the "mid-band" plane subset
+MIN_PLANES_FOR_ANALYSIS = 2  # need at least 2 planes for a taper/analysis pass
 
 
-def freqs(d_head, base=BASE):
+def freqs(d_head: int, base: float = BASE) -> np.ndarray:
     k = np.arange(d_head // 2)
     return base ** (-2.0 * k / d_head)  # theta_k, shape (d_head/2,)
 
 
-def recency_score(deltas, theta, amp):
+def recency_score(deltas: np.ndarray, theta: np.ndarray, amp: np.ndarray) -> np.ndarray:
     # score(Delta) = sum_k amp_k * cos(Delta * theta_k), phase-aligned at 0.
     c = np.cos(np.outer(deltas, theta))  # (len(deltas), n_planes)
     return c @ amp
 
 
-def analyze(label, theta, amp) -> None:
+def analyze(label: str, theta: np.ndarray, amp: np.ndarray) -> None:
     deltas = np.arange(0, R + 1)
     s = recency_score(deltas, theta, amp)
     s0 = s[0]  # == sum(amp), the global max (all cos=1)
@@ -90,16 +92,18 @@ for d_head in [64, 128, 256]:
 
     # (b) only "recency-suitable" planes: drop the slowest (content) planes and
     #     the very fastest (alias < a few positions). Keep a mid band.
-    keep = (theta < 0.3) & (theta > np.pi / R)  # monotone-over-R-ish, not too fast
+    keep = (theta < MID_BAND_UPPER_THETA) & (
+        theta > np.pi / R
+    )  # monotone-over-R-ish, not too fast
     lab = f"d_head={d_head}, mid-band planes [pi/R, 0.3], uniform amp"
     d_head_for[lab] = d_head
-    if keep.sum() >= 2:
+    if keep.sum() >= MIN_PLANES_FOR_ANALYSIS:
         analyze(lab, theta[keep], np.ones(keep.sum()))
 
     # (c) apodized: Hann taper over the kept band (suppress sidelobes/bumps)
     lab = f"d_head={d_head}, mid-band planes, Hann taper"
     d_head_for[lab] = d_head
-    if keep.sum() >= 2:
+    if keep.sum() >= MIN_PLANES_FOR_ANALYSIS:
         n = keep.sum()
         hann = 0.5 - 0.5 * np.cos(2 * np.pi * np.arange(n) / (n - 1))
         analyze(lab, theta[keep], hann + 1e-3)

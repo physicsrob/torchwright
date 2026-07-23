@@ -29,10 +29,10 @@ Scope and limits:
   that broke it rather than only the top output.
 """
 
-from collections.abc import Iterator, Sequence
+from collections.abc import Callable, Iterator, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass, field
-from typing import Any, Protocol
+from typing import Any, Protocol, cast
 
 import torch
 
@@ -61,6 +61,11 @@ from torchwright.graph.misc import (
 _extract_compiled_value = extract_compiled_value
 _first_state_with = first_state_with
 
+# KV cache in either backend's own representation: the in-process backend
+# uses a per-layer list of (K, V) tensor pairs; the ONNX debug backend uses
+# a plain tuple (see torchwright.debug.onnx_debug).
+PastKVs = list[tuple[torch.Tensor, torch.Tensor]] | tuple
+
 
 class DebugRuntime(Protocol):
     """Structural type for a debuggable compiled backend.
@@ -82,6 +87,12 @@ class DebugRuntime(Protocol):
         self,
         prefill: torch.Tensor,
         past_len: int = 0,
+        # Any, not PastKVs: the two concrete backends this Protocol is
+        # matched against structurally (CompiledHeadless, OnnxDebugSession)
+        # declare genuinely different concrete parameter types for
+        # past_kvs (list[tuple[Tensor, Tensor]] | None vs. tuple | None,
+        # in export.py and onnx_debug.py respectively) — a real, load-
+        # bearing type difference across backends, not a laziness gap.
         past_kvs: Any = None,
     ) -> tuple[ResidualAssignment, list[tuple], StateTensors]: ...
 
@@ -146,8 +157,10 @@ def reference_eval(
     all_nodes = get_ancestor_nodes({output_node})
     classes_in_graph = {type(n) for n in all_nodes}
 
-    def _make_cached(orig_compute):
-        def wrapped(self, n_pos_arg, input_values_arg):
+    def _make_cached(
+        orig_compute: Callable[[Node, int, dict], torch.Tensor],
+    ) -> Callable[[Node, int, dict], torch.Tensor]:
+        def wrapped(self: Node, n_pos_arg: int, input_values_arg: dict) -> torch.Tensor:
             hit = cache.get(self)
             if hit is not None:
                 return hit
@@ -163,7 +176,7 @@ def reference_eval(
             if "compute" in cls.__dict__:
                 orig = cls.__dict__["compute"]
                 patched.append((cls, orig))
-                cls.compute = _make_cached(orig)  # type: ignore[method-assign]
+                cls.compute = cast("Any", _make_cached(orig))  # type: ignore[method-assign]
         output_node.compute(n_pos, input_values)
     finally:
         for cls, orig in patched:
@@ -243,8 +256,7 @@ class ProbeReport:
             key=lambda r: -r.max_abs_error,
         )
         lines.append(f"  top-{show_top_k} by error magnitude:")
-        for r in ranked[:show_top_k]:
-            lines.append(f"    {r.summary()}")
+        lines.extend(f"    {r.summary()}" for r in ranked[:show_top_k])
         return "\n".join(lines)
 
 
@@ -282,7 +294,7 @@ def _run_with_states(
     compiled: DebugRuntime,
     prefill: torch.Tensor,
     past_len: int = 0,
-    past_kvs: Any = None,
+    past_kvs: PastKVs | None = None,
 ) -> tuple[
     ResidualAssignment,
     list[tuple],
@@ -408,9 +420,9 @@ def _inputs_from_dict(
     input_values: dict[str, torch.Tensor],
     n_pos: int,
 ) -> torch.Tensor:
-    """Pack an input-name → tensor dict into the flat row-tensor layout
-    the compiled backend expects.  Delegates to the backend's
-    ``build_prefill``.
+    """Pack an input-name → tensor dict into the flat row-tensor layout.
+
+    Delegates to the backend's ``build_prefill``.
     """
     return compiled.build_prefill(input_values, n_pos)
 
@@ -528,7 +540,7 @@ def probe_residual(
     *,
     at_layer: int | None = None,
     past_len: int = 0,
-    past_kvs: Any = None,
+    past_kvs: PastKVs | None = None,
 ) -> ResidualProbe:
     """Extract a node's residual value from each post-MLP layer snapshot.
 
@@ -599,9 +611,10 @@ def attention_capture(
     net: HeadlessTransformer,
     layer_index: int,
 ) -> Iterator[dict[str, torch.Tensor | None]]:
-    """Monkey-patch ``net.layers[layer_index].attn.attn.forward_cached`` to
-    capture the explicit softmax weights and raw logits produced on each
-    call.
+    """Monkey-patch ``net.layers[layer_index].attn.attn.forward_cached``.
+
+    Captures the explicit softmax weights and raw logits produced on
+    each call.
 
     On ``__enter__`` the attention module's ``forward_cached`` is
     replaced with a version that reproduces its numerical contract (Q /
@@ -626,7 +639,10 @@ def attention_capture(
     attn_module = net.layers[layer_index].attn.attn
     orig_fwd_cached = attn_module.forward_cached
 
-    def patched_fwd_cached(inp, past_kv=None):
+    def patched_fwd_cached(
+        inp: torch.Tensor,
+        past_kv: tuple[torch.Tensor, torch.Tensor] | None = None,
+    ) -> tuple[torch.Tensor, tuple[torch.Tensor, torch.Tensor]]:
         Q = torch.einsum("pd,hdk->hpk", inp, attn_module.query_matrix)
         K_new = torch.einsum("pd,hdk->hpk", inp, attn_module.key_matrix)
         V_new = torch.einsum("pd,hdk->hpk", inp, attn_module.value_matrix)
@@ -683,8 +699,9 @@ class AttentionProbe:
         k: int = 8,
         head: int = 0,
     ) -> list[tuple[int, float, str]]:
-        """Return ``(key_pos, weight, label)`` for the ``k`` largest
-        weights in head ``head``.  ``label`` is empty if
+        """Return ``(key_pos, weight, label)`` for the ``k`` largest weights.
+
+        Weights are taken from head ``head``.  ``label`` is empty if
         ``position_labels`` was not supplied.
         """
         w = self.weights[head]
@@ -705,7 +722,7 @@ def probe_attention(
     *,
     query_pos: int,
     past_len: int = 0,
-    past_kvs: Any = None,
+    past_kvs: PastKVs | None = None,
     position_labels: Sequence[str] | None = None,
 ) -> AttentionProbe:
     """Capture softmax weights and logits at a specific query position.
@@ -814,7 +831,7 @@ def probe_layer_diff(
     sentinel: float | None = None,
     sentinel_tol: float = 1e-4,
     past_len: int = 0,
-    past_kvs: Any = None,
+    past_kvs: PastKVs | None = None,
 ) -> LayerDiffReport:
     """Track a node's value + delta-vs-reference across consecutive layers.
 

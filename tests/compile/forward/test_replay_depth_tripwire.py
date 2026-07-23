@@ -58,8 +58,9 @@ def _build_width_graph():
 
 
 def test_tripwire_silent_on_faithful_replay():
-    """A normal optimize=1 compile replays the assignment faithfully, so the
-    tripwire never fires and the compile produces the reference output.
+    """A normal optimize=1 compile replays the assignment faithfully.
+
+    The tripwire never fires and the compile produces the reference output.
     """
     out = _build_width_graph()
     net = forward_compile(
@@ -72,9 +73,10 @@ def test_tripwire_silent_on_faithful_replay():
 
 
 def test_tripwire_fires_on_deeper_replay(monkeypatch):
-    """Gap #5: a schedule the machine replays one layer deeper than the model
-    claimed.  We intercept the solve and push the output node one layer past
-    its assigned layer (keeping ``n_layers``); the faithful replay then emits
+    """Gap #5: a schedule the machine replays one layer deeper than the model claimed.
+
+    We intercept the solve and push the output node one layer past its
+    assigned layer (keeping ``n_layers``); the faithful replay then emits
     ``n_layers + 1`` layers and the tripwire must catch it.
     """
     out = _build_width_graph()
@@ -111,7 +113,7 @@ def test_tripwire_fires_on_deeper_replay(monkeypatch):
     monkeypatch.setattr(
         compile_mod,
         "choose_dominating_assignment",
-        lambda costs, incumbent, candidate: candidate,
+        lambda _costs, _incumbent, candidate: candidate,
     )
 
     with pytest.raises(RuntimeError, match="Replay-depth tripwire"):
@@ -121,10 +123,12 @@ def test_tripwire_fires_on_deeper_replay(monkeypatch):
 
 
 def test_tripwire_helper_placement_divergence():
-    """The placement-divergence branch: a node replayed at a layer other than
-    its assigned one.  Tested against the helper directly — the current
-    executor cannot slip a node (the strict ready filter starves instead), so
-    this guards a future relaxed executor.
+    """The placement-divergence branch: a node replayed at the wrong layer.
+
+    Its assigned layer differs from the one it was replayed at. Tested
+    against the helper directly: the current executor cannot slip a node
+    (the strict ready filter starves instead), so this guards a future
+    relaxed executor.
     """
     assignment = ScheduleAssignment(
         node_to_layer={1: 0, 2: 1, 3: 2},
@@ -139,8 +143,9 @@ def test_tripwire_helper_placement_divergence():
 
 
 def test_tripwire_helper_silent_on_match():
-    """The helper is silent when replay birth layers and emitted depth all
-    agree with the assignment.
+    """The helper is silent when replay birth layers and emitted depth agree.
+
+    All of them must agree with the assignment.
     """
     assignment = ScheduleAssignment(
         node_to_layer={1: 0, 2: 1, 3: 2},

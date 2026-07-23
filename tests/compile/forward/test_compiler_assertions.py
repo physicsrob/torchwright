@@ -38,7 +38,9 @@ D_HEAD = 16
 
 
 def test_D_allocate_rejects_overlap_with_live_node():
-    """If _free somehow contained a column already owned by a live node,
+    """Fire allocate's pre-commit check with the overlap detail.
+
+    If _free somehow contained a column already owned by a live node,
     allocate's pre-commit check fires with the overlap detail.
     """
     rmap = ResidualStreamMap(32)
@@ -57,7 +59,9 @@ def test_D_allocate_rejects_overlap_with_live_node():
 
 
 def test_D_check_invariants_catches_missing_column():
-    """After mutation, if a column is neither in _free nor in any node's
+    """Name the missing column(s) when a column is dropped from every pool.
+
+    After mutation, if a column is neither in _free nor in any node's
     indices, _check_invariants names the missing column(s).
     """
     rmap = ResidualStreamMap(16)
@@ -88,7 +92,9 @@ def test_D_check_invariants_catches_pairwise_overlap():
 
 
 def test_D_check_invariants_catches_held_overlap_with_allocated():
-    """A held column that is also owned by a live node fires the
+    """Fire the held-vs-allocated disjointness branch.
+
+    A held column that is also owned by a live node fires the
     held-vs-allocated disjointness branch.
     """
     rmap = ResidualStreamMap(16)
@@ -103,7 +109,9 @@ def test_D_check_invariants_catches_held_overlap_with_allocated():
 
 
 def test_D_check_invariants_catches_held_overlap_with_free():
-    """A held column that is also in the free pool fires the
+    """Fire the held-vs-free disjointness branch.
+
+    A held column that is also in the free pool fires the
     held-vs-free disjointness branch.
     """
     rmap = ResidualStreamMap(16)
@@ -116,7 +124,9 @@ def test_D_check_invariants_catches_held_overlap_with_free():
 
 
 def test_D_check_invariants_catches_held_overlap_with_reserved():
-    """A held column that is also reserved fires the held-vs-reserved
+    """Fire the held-vs-reserved disjointness branch.
+
+    A held column that is also reserved fires the held-vs-reserved
     disjointness branch.
     """
     rmap = ResidualStreamMap(16)
@@ -130,7 +140,9 @@ def test_D_check_invariants_catches_held_overlap_with_reserved():
 
 
 def test_D_check_invariants_totality_covers_held():
-    """A column dropped from the held bank (without landing anywhere else)
+    """Fire the totality check when a held column drops out of every pool.
+
+    A column dropped from the held bank (without landing anywhere else)
     fires the totality check — held columns are part of the
     free/allocated/held/reserved partition of {0..d-1}.
     """
@@ -152,7 +164,9 @@ def test_D_check_invariants_totality_covers_held():
 
 
 def test_C_literal_write_rejects_truncation():
-    """_write_compute_literal_value refuses when target_cols is shorter
+    """Refuse to write when target_cols is shorter than the literal's value tensor.
+
+    _write_compute_literal_value refuses when target_cols is shorter
     than the literal's value tensor.
     """
     layer = TransformerLayer(D, D_HEAD)
@@ -185,7 +199,9 @@ def test_C_literal_write_rejects_extra_target_cols():
 
 
 def test_B_attn_rejects_v_source_cols_wrong_length():
-    """_write_compute_attn raises when V source_cols length doesn't match
+    """Raise when V source_cols length doesn't match value_in width.
+
+    _write_compute_attn raises when V source_cols length doesn't match
     value_in width.
     """
     # A plain residual node feeding both Q and K (it stands in for whatever
@@ -251,7 +267,7 @@ def test_B_attn_rejects_q_source_cols_wrong_length():
 
 # ---------------------------------------------------------------------------
 # Full-width rotary — d_qk == d_head (an I3-sibling; NOT one of the canonical
-# I1–I4).  Every head is full-width rotary on the global grid; export.py always
+# I1-I4).  Every head is full-width rotary on the global grid; export.py always
 # rotates the full d_head with no width guard of its own, so the in-process
 # assert in _scatter_compute_attn is the only barrier against a partial-width
 # head (silently NoPE on the un-filled planes).  Guard BOTH directions: the
@@ -285,25 +301,27 @@ def test_attn_rejects_d_qk_not_equal_d_head(d_qk):
 
 
 def test_A_end_of_layer_catches_freed_too_early(monkeypatch):
-    """If a node is freed while still having uncomputed consumers, the
+    """Fire the gated end-of-layer check with the consumer names.
+
+    If a node is freed while still having uncomputed consumers, the
     gated end-of-layer check fires with the consumer names.
     """
-    # Two-node linear chain: x -> l (Linear). Compile expects l to read
-    # x's columns, so x must stay allocated while l is uncomputed.
+    # Two-node linear chain: x -> lin (Linear). Compile expects lin to read
+    # x's columns, so x must stay allocated while lin is uncomputed.
     x = InputNode("x", 4, value_range=(-100.0, 100.0))
     weight = torch.eye(4, 4)
     bias = torch.zeros(4)
-    l = Linear(x, weight, bias)
+    lin = Linear(x, weight, bias)
 
-    graph = GraphAnalyzer(l)
+    graph = GraphAnalyzer(lin)
     rmap = ResidualStreamMap(D)
     rmap.allocate(x)
 
-    # x is allocated, l is uncomputed — invariant holds here.
+    # x is allocated, lin is uncomputed — invariant holds here.
     computed = {x}
     _verify_end_of_layer_liveness(graph, rmap, computed, layer_idx=0)
 
-    # Poison: free x while l still needs it. The check must fire.
+    # Poison: free x while lin still needs it. The check must fire.
     rmap.free(x)
     with pytest.raises(AssertionError, match=r"liveness violation"):
         _verify_end_of_layer_liveness(graph, rmap, computed, layer_idx=1)
@@ -315,7 +333,9 @@ def test_A_end_of_layer_catches_freed_too_early(monkeypatch):
 
 
 def test_A_require_live_raises_for_unallocated_input():
-    """LayerScheduler._require_live surfaces unallocated source nodes with
+    """Surface unallocated source nodes with op context before the downstream KeyError.
+
+    LayerScheduler._require_live surfaces unallocated source nodes with
     op context before the downstream KeyError.
     """
     from torchwright.compiler.forward.scheduler import LayerScheduler
@@ -323,15 +343,15 @@ def test_A_require_live_raises_for_unallocated_input():
     x = InputNode("x", 4, value_range=(-100.0, 100.0))
     weight = torch.eye(4, 4)
     bias = torch.zeros(4)
-    l = Linear(x, weight, bias)
+    lin = Linear(x, weight, bias)
 
-    graph = GraphAnalyzer(l)
+    graph = GraphAnalyzer(lin)
     scheduler = LayerScheduler(graph, D, D_HEAD)
     rmap = ResidualStreamMap(D)
     # Deliberately do NOT allocate x — this should be caught by _require_live.
 
     with pytest.raises(AssertionError, match=r"Live-column invariant violated"):
-        scheduler._require_live(x, rmap, f"compute_linear input for {l!r}")
+        scheduler._require_live(x, rmap, f"compute_linear input for {lin!r}")
 
 
 # ---------------------------------------------------------------------------
@@ -340,8 +360,9 @@ def test_A_require_live_raises_for_unallocated_input():
 
 
 def test_reserve_rejects_allocated_col():
-    """reserve() must fail if any requested column is already allocated —
-    the caller would otherwise silently lose that column from the free pool
+    """Fail reserve() if any requested column is already allocated.
+
+    Otherwise the caller would silently lose that column from the free pool
     without any effect (it was already not free).
     """
     rmap = ResidualStreamMap(16)
@@ -353,7 +374,9 @@ def test_reserve_rejects_allocated_col():
 
 
 def test_reserve_blocks_subsequent_allocation():
-    """Reserved columns cannot be handed out by allocate() — the
+    """Never hand out a reserved column via allocate().
+
+    Reserved columns cannot be handed out by allocate() — the
     allocator-level guarantee that a reserved column is never reused.
     """
     rmap = ResidualStreamMap(8)
@@ -379,8 +402,9 @@ def _no_bias_setup():
 
 
 def test_no_bias_slot0_claim_fires():
-    """An PlannedMlpOp claiming hidden slot 0 under bias=False is a scheduler bug:
-    slot 0 is the constant lane, packing must start at slot 1.
+    """Flag a PlannedMlpOp claiming hidden slot 0 under bias=False as a scheduler bug.
+
+    Slot 0 is the constant lane, packing must start at slot 1.
     """
     from torchwright.compiler.forward.weight_writer import write_mlp_sublayer
     from torchwright.graph import FFN
@@ -410,8 +434,9 @@ def test_no_bias_slot0_claim_fires():
 
 
 def test_no_bias_const_column_aliasing_fires():
-    """An FFN whose captured input columns include the pinned constant-1
-    column would collide with the bias-fold row — the writer must refuse.
+    """Refuse an FFN whose captured input columns include the pinned constant-1 column.
+
+    That column would collide with the bias-fold row — the writer must refuse.
     """
     from torchwright.compiler.forward.weight_writer import write_mlp_sublayer
     from torchwright.graph import FFN

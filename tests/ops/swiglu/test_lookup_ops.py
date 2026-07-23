@@ -60,7 +60,7 @@ def test_map_to_table_match_and_default():
     out = map_to_table(x, _table(), _DEFAULT)
     xs = torch.stack([*_KEYS, torch.zeros(3)])
     val = out.compute(4, {"x": xs})
-    # Matches: value_i to ~1 ulp (×scale/÷scale round trip); other
+    # Matches: value_i to ~1 ulp (x-scale/÷-scale round trip); other
     # entries' leakage underflows.
     for i, v in enumerate(_VALUES):
         assert torch.allclose(val[i], v, rtol=1e-6, atol=1e-6), (i, val[i])
@@ -148,8 +148,9 @@ def test_onehot_lookup_tight_range_claim():
 
 
 def test_onehot_lookup_noise_passthrough_linear_in_epsilon():
-    """An input one-hot off by ε shifts the winner's indicator by
-    exactly ε: output error 2ε·|value − default| — today's coefficient.
+    """An input one-hot off by ε shifts the winner's indicator by exactly ε.
+
+    The output error is 2ε·|value - default| — today's coefficient.
     """
     table, key = _two_block_table()
     x = create_input("x", 5, value_range=(0.0, 1.0))
@@ -175,11 +176,13 @@ def test_onehot_lookup_compiles_clean():
 
 
 def test_onehot_lookup_wide_key_accumulated_leak_within_guard():
-    """D6 repro (Phase C, calculator_simple 123*456): a machine-built
-    one-hot carries ~1e-5 per-element round-trip leak, and a wide key
-    (d_key = 61 on the digit pipeline) sums d_key of them, each weighted
-    by up to the largest table magnitude — past the old fixed 1e-3
-    closing-assert slack in exact math.  The guard is now sized by
+    """D6 repro: a wide key's accumulated round-trip leak stays within the guard.
+
+    Phase C, calculator_simple 123*456: a machine-built one-hot carries
+    ~1e-5 per-element round-trip leak, and a wide key (d_key = 61 on the
+    digit pipeline) sums d_key of them, each weighted by up to the
+    largest table magnitude — past the old fixed 1e-3 closing-assert
+    slack in exact math.  The guard is now sized by
     _lookup_numeric_slack(max_abs, 1.0, d_key).
     """
     d_key = 61
@@ -200,9 +203,10 @@ def test_onehot_lookup_wide_key_accumulated_leak_within_guard():
 
 
 def test_onehot_lookup_small_table_guard_stays_tight():
-    """The derived slack stays small for small tables (max_abs=300,
-    d_key=5 → 0.015): a gross input error that pushes the output past
-    the claimed [min, max] still fires the closing assert.
+    """The derived slack stays small for small tables and still catches gross errors.
+
+    For max_abs=300, d_key=5 → 0.015: a gross input error that pushes
+    the output past the claimed [min, max] still fires the closing assert.
     """
     table, key = _two_block_table()
     x = create_input("x", 5, value_range=(0.0, 1.0))

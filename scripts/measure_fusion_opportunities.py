@@ -37,7 +37,8 @@ Usage::
     # is the result itself or the first element of a result tuple
     uv run python -m scripts.measure_fusion_opportunities \
         --spec torchwright_doom.inference.compiled_model:build_graph \
-        --kwargs '{"d_head": 128, "d_rot": 64, "max_positions": 61440, "wad_path": "doom1.wad"}'
+        --kwargs '{"d_head": 128, "d_rot": 64, "max_positions": 61440,
+                   "wad_path": "doom1.wad"}'
 """
 
 from __future__ import annotations
@@ -106,8 +107,10 @@ def _levels(order: list[Node], zero_cost: frozenset = frozenset()) -> dict[Node,
 def _collapsed_levels(
     order: list[Node], src: dict[Node, Node | None]
 ) -> dict[Node, int]:
-    """Levels under family 2: any member of a univariate subgraph lands one
-    sublayer above its source (one FFN computes any function of it).
+    """Levels under family 2.
+
+    Any member of a univariate subgraph lands one sublayer above its
+    source (one FFN computes any function of it).
     """
     lv: dict[Node, int] = {}
     for n in order:
@@ -121,8 +124,9 @@ def _collapsed_levels(
 
 
 def _critical_edges(output: Node, lv: dict[Node, int]) -> tuple[set, Counter]:
-    """Nodes on some longest path, and a bigram histogram of the costly
-    producer->consumer pairs along those paths (concats skipped).
+    """Nodes on some longest path, and a bigram histogram of costly pairs.
+
+    The producer->consumer pairs along those paths (concats skipped).
     """
     critical = {output}
     bigrams: Counter = Counter()
@@ -156,8 +160,7 @@ def _subgraph_details(
     critical: set,
     top: int = 15,
 ) -> None:
-    """Per-source report for the univariate subgraphs touching the
-    critical path.
+    """Per-source report for the univariate subgraphs touching the critical path.
 
     ``chain`` is the subgraph's internal sublayer depth (what collapses
     to 1); ``crit chain`` the same restricted to critical members — the

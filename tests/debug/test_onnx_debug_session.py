@@ -15,8 +15,8 @@ cannot.
 """
 
 import json
-import os
 import shutil
+from pathlib import Path
 
 import pytest
 import torch
@@ -114,8 +114,8 @@ def test_encode_decode_cols_roundtrip():
 
 def test_sidecar_written_with_expected_schema(token_artifact):
     path = debug_meta_path_for(token_artifact)
-    assert os.path.exists(path)
-    with open(path) as f:
+    assert Path(path).exists()
+    with Path(path).open() as f:
         sidecar = json.load(f)
     assert sidecar["format"] == DEBUG_META_FORMAT
     assert sidecar["kind"] == "token"
@@ -153,8 +153,10 @@ def _build_annotated_graph():
 
 
 def test_sidecar_carries_annotations(tmp_path):
-    """The ``annotate()`` label path round-trips through the debug sidecar
-    and onto OnnxDebugSession.annotation() against a fresh rebuild.
+    """The ``annotate()`` label path round-trips through the debug sidecar.
+
+    It also round-trips onto OnnxDebugSession.annotation() against a
+    fresh rebuild.
     """
     out, embedding, _prod, _top = _build_annotated_graph()
     onnx_path = str(tmp_path / "annotated.onnx")
@@ -168,7 +170,7 @@ def test_sidecar_carries_annotations(tmp_path):
         verbose=False,
     )
 
-    with open(debug_meta_path_for(onnx_path)) as f:
+    with Path(debug_meta_path_for(onnx_path)).open() as f:
         sidecar = json.load(f)
     # Annotations now ride in the per-node table; "scene/sum" is deduped,
     # not "scene/scene/sum".
@@ -188,8 +190,9 @@ def test_sidecar_carries_annotations(tmp_path):
 
 
 def test_sidecar_nodes_table_schema(tmp_path):
-    """The per-node table keys by canonical id (same space as placements /
-    states) and carries op/width/weights/inputs/layer/sublayer per node.
+    """The per-node table keys by canonical id (same space as placements / states).
+
+    It carries op/width/weights/inputs/layer/sublayer per node.
     """
     out, embedding, _prod, _top = _build_annotated_graph()
     onnx_path = str(tmp_path / "nodes.onnx")
@@ -204,7 +207,7 @@ def test_sidecar_nodes_table_schema(tmp_path):
         optimize=1,
         extra_metadata={"screen": {"width": 80, "height": 50}, "scale": 4},
     )
-    with open(debug_meta_path_for(onnx_path)) as f:
+    with Path(debug_meta_path_for(onnx_path)).open() as f:
         sidecar = json.load(f)
 
     # Compile knob is first-class; caller metadata rides through "extra"
@@ -387,10 +390,11 @@ def test_assert_coverage_warning_on_weaker_rebuild(tmp_path, capsys):
 
 
 def test_corrupted_initializer_is_detected(token_artifact, tmp_path):
-    """D6 reproducer: an artifact whose weights differ from what the
-    compiler computed must show up as oracle divergence on the ONNX
-    backend.  (The in-process backend never reads the artifact, so it
-    is structurally blind to this class.).
+    """D6 reproducer: an artifact whose weights differ from the compile diverges.
+
+    That divergence must show up as oracle divergence on the ONNX
+    backend. (The in-process backend never reads the artifact, so it is
+    structurally blind to this class.)
     """
     import numpy as np
     import onnx
@@ -525,11 +529,13 @@ def test_artifact_debug_session_matches_direct(tmp_path):
 def test_oversized_sparse_initializer_densifies_and_session_matches(
     token_artifact, monkeypatch
 ):
-    """ORT >= 1.26 refuses any initializer whose dense size exceeds its
-    embedded-data ceiling unless the data is external — and ONNX sparse
-    initializers have no external form, so a production-width sparse
-    ``embed_table`` (3.3 GB declared at d=8192) cannot load at all.  The
-    session densifies such tensors to external data and loads by path.
+    """ORT >= 1.26 refuses any initializer whose dense size exceeds its ceiling.
+
+    That ceiling is the embedded-data ceiling, unless the data is
+    external — and ONNX sparse initializers have no external form, so a
+    production-width sparse ``embed_table`` (3.3 GB declared at d=8192)
+    cannot load at all. The session densifies such tensors to external
+    data and loads by path.
 
     Exercised by shrinking the module ceiling so the small adder artifact's
     own sparse initializers cross it; the converted session must behave
@@ -559,13 +565,15 @@ def test_oversized_sparse_initializer_densifies_and_session_matches(
 
 
 def test_oversized_conversion_external_metadata_and_bytes(token_artifact, monkeypatch):
-    """The external stubs must describe the side file exactly: per-tensor
-    location/offset/length, dims and dtype preserved, and the file's bytes at
-    each offset equal to the densified tensor — including cumulative offsets
-    when several tensors convert.  (The true >2 GiB representation cannot run
-    in a unit test; it is exercised for real by the W6 landing gate, which
-    opens a production e1m1_lowres artifact whose embed_table declares
-    3.3 GB.  This pins the metadata arithmetic that gate relies on.).
+    """The external stubs must describe the side file exactly.
+
+    Per-tensor location/offset/length, dims and dtype preserved, and the
+    file's bytes at each offset equal to the densified tensor — including
+    cumulative offsets when several tensors convert. (The true >2 GiB
+    representation cannot run in a unit test; it is exercised for real by
+    the W6 landing gate, which opens a production e1m1_lowres artifact
+    whose embed_table declares 3.3 GB. This pins the metadata arithmetic
+    that gate relies on.)
     """
     import numpy as np
     import onnx
@@ -590,12 +598,10 @@ def test_oversized_conversion_external_metadata_and_bytes(token_artifact, monkey
     out, _ = _build_adder()
     session = OnnxDebugSession(token_artifact, out)
 
-    tmp_model = os.path.join(session._external_data_dir.name, "debug_model.onnx")
-    converted = onnx.load(tmp_model, load_external_data=False)
+    tmp_model = Path(session._external_data_dir.name) / "debug_model.onnx"
+    converted = onnx.load(str(tmp_model), load_external_data=False)
     assert len(converted.graph.sparse_initializer) == 0
-    with open(
-        os.path.join(session._external_data_dir.name, "debug_dense.bin"), "rb"
-    ) as f:
+    with (Path(session._external_data_dir.name) / "debug_dense.bin").open("rb") as f:
         blob = f.read()
 
     stubs = {
@@ -618,10 +624,11 @@ def test_oversized_conversion_external_metadata_and_bytes(token_artifact, monkey
 
 
 def test_oversized_conversion_chunk_seams(token_artifact, monkeypatch):
-    """Densification writes in fixed flat blocks; the risk is at the seams
-    (an entry landing exactly on a block boundary, blocks with no entries).
-    Shrink the block size so every converted tensor spans many blocks and
-    verify the session still computes identically.
+    """Densification writes in fixed flat blocks; the risk is at the seams.
+
+    An entry landing exactly on a block boundary, blocks with no
+    entries. Shrink the block size so every converted tensor spans many
+    blocks and verify the session still computes identically.
     """
     from torchwright.debug import onnx_debug as od
 
@@ -639,10 +646,12 @@ def test_oversized_conversion_chunk_seams(token_artifact, monkeypatch):
 
 
 def test_suppress_checks_reaches_the_onnx_backend(token_artifact):
-    """suppress_checks() must silence predicate re-checks on THIS backend
-    too — checks are rebuild-side metadata (outside the fingerprint), so a
-    deliberately-violated assert attached to the rebuilt graph discriminates
-    cleanly: raises on a debug step normally, silent inside the context.
+    """suppress_checks() must silence predicate re-checks on THIS backend too.
+
+    Checks are rebuild-side metadata (outside the fingerprint), so a
+    deliberately-violated assert attached to the rebuilt graph
+    discriminates cleanly: raises on a debug step normally, silent
+    inside the context.
     """
     import pytest
 

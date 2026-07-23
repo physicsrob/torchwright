@@ -36,7 +36,7 @@ Run:  make modal-run MODULE=scripts.measure_mlp_cancel_residue
 import torch
 
 from torchwright.graph.rope import ROPE_BASE
-from torchwright.ops.const import scale as SWISH_SCALE
+from torchwright.ops.const import scale as _swish_scale
 
 # Self-match attention hardness (weight_writer._SELF_MATCH_HARDNESS): scales the
 # diagonal self-match logit so the diagonal softmax weight is 1.0 to fp32.
@@ -74,7 +74,7 @@ def measure_swish_cancel(mag: float, device: str) -> dict:
     x = (torch.rand(N_SAMPLES, device=device, dtype=torch.float32) * 2 - 1) * mag
     # residue = x + bypass(-x); computed exactly as the runtime would (cancel
     # feeds -x through the pair, result added to the column holding x).
-    residue = x + swish_bypass(-x, SWISH_SCALE)
+    residue = x + swish_bypass(-x, _swish_scale)
     return _stats(residue)
 
 
@@ -85,8 +85,10 @@ def measure_relu_cancel(mag: float, device: str) -> dict:
 
 
 def _self_match_logits(n_pos: int, d_head: int, device: str) -> torch.Tensor:
-    """Self-match logit(i, j) = hardness · Σ_p cos((i-j)·θ_p), the RoPE Δ=0
-    transport the attention-cancel head uses (peaks on the diagonal).
+    """Self-match logit(i, j) = hardness · Σ_p cos((i-j)·θ_p).
+
+    The RoPE Δ=0 transport the attention-cancel head uses (peaks on the
+    diagonal).
     """
     p = torch.arange(d_head // 2, device=device, dtype=torch.float32)
     theta = ROPE_BASE ** (-2.0 * p / d_head)  # (d_head/2,)
@@ -99,9 +101,9 @@ def _self_match_logits(n_pos: int, d_head: int, device: str) -> torch.Tensor:
 def measure_attention_cancel(
     mag: float, device: str, n_pos: int = 128, d_head: int = 32
 ) -> dict:
-    """Baseline: residue of the attention-cancel head transporting a column of
-    values via the self-match softmax (weight ≈ 1.0 on the diagonal).
+    """Baseline: residue of the attention-cancel head transporting a column.
 
+    Transported via the self-match softmax (weight ≈ 1.0 on the diagonal).
     The cancel adds -(softmax @ v) to the column, so the residue at position i
     is v_i - (softmax @ v)_i.  Off-diagonal leakage (weight not exactly 0 for
     j≠i) is what production already tolerates.
@@ -126,7 +128,7 @@ def main() -> None:
     device = "cuda"
     torch.manual_seed(0)
     print(
-        f"device={torch.cuda.get_device_name()}  SWISH_SCALE={SWISH_SCALE}  "
+        f"device={torch.cuda.get_device_name()}  _swish_scale={_swish_scale}  "
         f"SELF_MATCH_HARDNESS={SELF_MATCH_HARDNESS}  N_LAYERS={N_LAYERS}"
     )
 
@@ -176,10 +178,10 @@ def main() -> None:
         f"(at |x| <= {swish_worst_mag:g})"
     )
     print(
-        f"  worst-chain (linear, {N_LAYERS}× same-sign upper bound): "
+        f"  worst-chain (linear, {N_LAYERS}x same-sign upper bound): "
         f"{worst_chain_linear:.3e}"
     )
-    print(f"  worst-chain (random-walk, sqrt({N_LAYERS})×): {worst_chain_rms:.3e}")
+    print(f"  worst-chain (random-walk, sqrt({N_LAYERS})x): {worst_chain_rms:.3e}")
     print(f"  attention-cancel worst residue (baseline): {attn_worst_max:.3e}")
     print(f"  ReLU-cancel worst residue: {relu_worst_max:.3e}")
 

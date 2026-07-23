@@ -25,7 +25,7 @@ These are the smallest-layer (oracle, ``node.compute``) confidence tests:
 - ``get_prev_value`` **refuses to build when the lobe tiebreak erodes the
   guaranteed gap** (the recency lobe favors near keys by up to
   ``lobe_peak = gate/4``, so the provable true-over-false gap is
-  ``2·gate·cos_floor − lobe_peak``; a healthy-band, quasi-static config
+  ``2·gate·cos_floor - lobe_peak``; a healthy-band, quasi-static config
   with ``cos_floor ≤ 1/8`` leaves it non-positive and the bound proves
   nothing — refused even though no misread was observed at such configs).
 
@@ -64,8 +64,9 @@ def _lobe_curve():
 # The lobe shape (pure rope_lobe_band math)                                    #
 # --------------------------------------------------------------------------- #
 def test_lobe_strictly_decreasing_within_window():
-    """The distance-decay lobe is strictly decreasing over ``[0, W)`` — a nearer
-    key always outscores every farther one inside the window.
+    """The distance-decay lobe strictly decreases over ``[0, W)``.
+
+    A nearer key always outscores every farther one inside the window.
     """
     peak, _, _, lobe = _lobe_curve()
     R = 600
@@ -74,15 +75,17 @@ def test_lobe_strictly_decreasing_within_window():
     rmax = torch.flip(torch.cummax(torch.flip(s, [0]), 0).values, [0])
     wins = s[:-1] > rmax[1:]
     W = int(torch.argmin(wins.int())) if not bool(wins.all()) else R
-    assert W >= 400, f"local-recency window W={W} below the ~415 target (4× ~100)"
+    assert W >= 400, f"local-recency window W={W} below the ~415 target (4x ~100)"
     diffs = s[:W] - s[1 : W + 1]
     assert bool((diffs > 0).all()), f"lobe not strictly decreasing on [0,{W})"
     assert peak > 40.0  # Σ amp_p ≈ 42.6 at the production band
 
 
 def test_lobe_breaks_down_past_window():
-    """Past ``W`` the lobe is non-monotone: a concretely farther key outscores a
-    nearer one.  This is the local limit — tested, not a footnote (Phase 6).
+    """Past ``W`` the lobe is non-monotone.
+
+    A concretely farther key outscores a nearer one. This is the local limit
+    — tested, not a footnote (Phase 6).
     """
     _, _, _, lobe = _lobe_curve()
     R = 1500
@@ -114,8 +117,9 @@ def _rope():
 
 
 def test_get_prev_value_latches_most_recent_true():
-    """get_prev_value reads the value at the most recent position where cond is
-    true; a single far trigger still latches (the content gate dominates the
+    """get_prev_value latches the value at the most recent position where cond is true.
+
+    A single far trigger still latches (the content gate dominates the
     bounded lobe regardless of distance).
     """
     rope = _rope()
@@ -142,9 +146,10 @@ def test_get_prev_value_latches_most_recent_true():
 
 
 def test_get_prev_value_raises_on_degenerate_lobe_band():
-    """A rope config whose lobe band collapses (2 surviving planes both
-    Hann-tapered to the endpoint floor: d_head=32, max_positions=64) must fail
-    loudly at build time.  Before the guard this built a silently-leaky latch
+    """A rope config whose lobe band collapses must fail loudly at build time.
+
+    2 surviving planes both Hann-tapered to the endpoint floor: d_head=32,
+    max_positions=64. Before the guard this built a silently-leaky latch
     whose validity wobble, amplified 1000x by attend_mean_where, skewed
     count_since_marker by 1.2 counts at a gap of 4.
     """
@@ -156,7 +161,9 @@ def test_get_prev_value_raises_on_degenerate_lobe_band():
 
 
 def test_get_prev_value_raises_when_rotation_defeats_the_gate():
-    """Codex finding (2026-07): the leak bound assumed the cond gate
+    """The quasi-static precondition must refuse a config the rotation defeats.
+
+    Codex finding (2026-07): the leak bound assumed the cond gate
     contributes ±gate, but it really contributes ±gate·cos(Δ·θ_slow).  At
     d_head=32, max_positions=20, base=10 the band is healthy (4 planes, gate
     ~3.6e3) and the pre-fix leak bound passed by hundreds of orders of
@@ -168,13 +175,14 @@ def test_get_prev_value_raises_when_rotation_defeats_the_gate():
     rope = RopeConfig(d_head=32, max_positions=20, base=10.0)
     value = InputNode("value", 1, value_range=(-1.0, 1.0))
     cond = InputNode("cond", 1, value_range=(-1.0, 1.0))
-    with pytest.raises(ValueError, match="not.*quasi-static"):
+    with pytest.raises(ValueError, match=r"not.*quasi-static"):
         get_prev_value(rope, value, cond)
 
 
 def test_get_prev_value_raises_when_lobe_tiebreak_erodes_the_gap():
-    """The leak bound must count the recency lobe's tiebreak, not just the
-    cond gate.  At d_head=32, max_positions=20, base=16 the band is healthy
+    """The leak bound must count the recency lobe's tiebreak, not just the cond gate.
+
+    At d_head=32, max_positions=20, base=16 the band is healthy
     (4 planes, gate ≈ 3.6e3) and quasi-static holds (20·θ_slow = 1.487 <
     π/2, cos_floor = 0.084) — the pre-fix bound, which assumed the lobe
     differential ≤ 0, passed by ~260 orders of magnitude.  But the lobe can
@@ -194,9 +202,10 @@ def test_get_prev_value_raises_when_lobe_tiebreak_erodes_the_gap():
 
 
 def test_get_prev_value_builds_on_healthy_bands():
-    """Every config the repo actually uses clears the leak bound with orders of
-    magnitude to spare — including the narrowest (d_head=16, max_positions=512,
-    a 3-plane band whose Hann midpoint survives).
+    """Every config the repo actually uses clears the leak bound with room to spare.
+
+    Orders of magnitude of margin, including the narrowest (d_head=16,
+    max_positions=512, a 3-plane band whose Hann midpoint survives).
     """
     for d_head, max_positions in [(16, 512), (32, 512), (64, 4096), (256, 61440)]:
         rope = create_rope_config(d_head=d_head, max_positions=max_positions)

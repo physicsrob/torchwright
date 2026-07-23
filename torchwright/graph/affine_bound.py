@@ -15,10 +15,17 @@ All coefficient tensors are stored as ``torch.float64``, CPU-only.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import TYPE_CHECKING
 
 import torch
 
 from torchwright.graph.value_type import Range
+
+if TYPE_CHECKING:
+    from torchwright.graph.misc import InputNode
+
+#: ``__repr__`` shows this many intervals inline before truncating with "...".
+_REPR_INLINE_INTERVALS = 4
 
 
 @dataclass
@@ -41,7 +48,7 @@ class AffineBound:
     columns: dict[int, tuple[int, int]]
     input_ranges: dict[int, tuple[torch.Tensor, torch.Tensor]]
 
-    def __post_init__(self):
+    def __post_init__(self) -> None:
         d = self.A_lo.shape[0]
         n = self.n_cols
         assert self.A_lo.shape == (d, n), f"A_lo shape {self.A_lo.shape} != ({d}, {n})"
@@ -67,7 +74,7 @@ class AffineBound:
         return self.A_lo.shape[0]
 
     @classmethod
-    def identity(cls, input_node) -> AffineBound:
+    def identity(cls, input_node: InputNode) -> AffineBound:
         """One-hot rows for *input_node*'s columns, zero offsets."""
         from torchwright.graph.misc import InputNode
 
@@ -158,15 +165,14 @@ class AffineBound:
                 f"NaN in upper bound at component {i}; likely a 0*inf case "
                 f"not caught by the eval guard"
             )
-            if lo > hi:
-                # A sound affine bound has lower <= upper for every component;
-                # a crossing is fp accumulation noise on a near-degenerate
-                # (point-valued) component, e.g. an embedding column at exactly
-                # 0.5 whose lower eval lands 1 ULP above 0.5. Snap when the gap
-                # is within fp tolerance; a gross crossing falls through to the
-                # strict ``Range`` check below as a genuine-bug signal.
-                if lo - hi <= 1e-6 * (1.0 + max(abs(lo), abs(hi))):
-                    lo = hi
+            # A sound affine bound has lower <= upper for every component; a
+            # crossing is fp accumulation noise on a near-degenerate
+            # (point-valued) component, e.g. an embedding column at exactly
+            # 0.5 whose lower eval lands 1 ULP above 0.5. Snap when the gap
+            # is within fp tolerance; a gross crossing falls through to the
+            # strict ``Range`` check below as a genuine-bug signal.
+            if lo > hi and lo - hi <= 1e-6 * (1.0 + max(abs(lo), abs(hi))):
+                lo = hi
             ranges.append(Range(lo, hi))
         return ranges
 
@@ -216,7 +222,7 @@ class AffineBound:
 
     def __repr__(self) -> str:
         intervals = self.to_interval()
-        if len(intervals) <= 4:
+        if len(intervals) <= _REPR_INLINE_INTERVALS:
             ivs = ", ".join(f"[{r.lo:.3g}, {r.hi:.3g}]" for r in intervals)
         else:
             ivs = ", ".join(f"[{r.lo:.3g}, {r.hi:.3g}]" for r in intervals[:3])

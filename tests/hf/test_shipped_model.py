@@ -1,10 +1,11 @@
 """The shipped HF files are import-clean.
 
 ``configuration_torchwright_custom.py`` / ``modeling_torchwright_custom.py`` /
-``tokenization_torchwright_custom.py`` are copied verbatim into an explicitly custom saved model
-directory (by ``transformers``' ``custom_object_save``) and loaded on a
-stranger's machine via ``trust_remote_code`` with only ``torch`` +
-``transformers`` installed — no ``torchwright``. That holds iff each file
+``tokenization_torchwright_custom.py`` are copied verbatim into an explicitly
+custom saved model directory (by ``transformers``' ``custom_object_save``)
+and loaded on a stranger's machine via ``trust_remote_code`` with only
+``torch`` + ``transformers`` installed — no ``torchwright``. That holds iff
+each file
 imports only the standard library, ``transformers`` (and ``torch`` for the
 model), and pulls in no ``torchwright`` / ``onnx`` / sibling module except the
 one allowed relative import the model makes to its config.

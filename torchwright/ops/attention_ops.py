@@ -18,7 +18,7 @@ All primitives here follow this template:
   :func:`~torchwright.graph.rope.rotary_content_head` so the match survives the
   global rotation, with the placement **routed by the config's ``d_rot``**: under
   full rotary the content rides the slowest planes of the ``rope.d_head``
-  ``rotate_half`` grid (quasi-static, ``cos((i−j)·θ_slow) ≈ 1``); under partial
+  ``rotate_half`` grid (quasi-static, ``cos((i-j)·θ_slow) ≈ 1``); under partial
   rotary (``d_rot < d_head``) it rides the unrotated NoPE tail ``[d_rot:d_head]``,
   an *exact* position-free match (``docs/rope_port_plan.md`` §3).  The builders
   therefore take a :class:`~torchwright.graph.RopeConfig` (carrying ``d_head`` /
@@ -77,7 +77,7 @@ from torchwright.ops._math import _theta_slow
 # Default tolerance for hard-selection output assertions.  At
 # ``_QUERY_GAIN = 8`` the runner-up softmax weight is ``exp(-8) ≈ 3.4e-4``,
 # so contamination of the winning value is at most
-# ``3.4e-4 × value_range_width``.  For typical sort-digit value widths
+# ``3.4e-4 x value_range_width``.  For typical sort-digit value widths
 # (≤ 10), the observed deviation is ≤ 3e-3; 5e-3 absorbs that plus
 # position-scalar PL fuzz.  Callers producing larger-magnitude values
 # should pass a larger ``atol``.
@@ -139,7 +139,7 @@ _QUERY_GAIN = 8.0
 # with ``Q = 1.0`` and ``K = ± _VALIDITY_DIRECT``, so the contribution
 # to the logit is literally ``± _VALIDITY_DIRECT`` — not multiplied by
 # ``_QUERY_GAIN``.  Must exceed the one-sided score swing
-# ``_QUERY_GAIN · _MAX_SCORE_ABS = 8 × 120 = 960`` so validity
+# ``_QUERY_GAIN · _MAX_SCORE_ABS = 8 x 120 = 960`` so validity
 # dominates score; ``1000`` buys a small but sufficient margin.
 _VALIDITY_DIRECT = 1000.0
 
@@ -153,7 +153,7 @@ _VALIDITY_DIRECT = 1000.0
 _VALIDITY_KEY_COEFF = 1000.0
 
 # Maximum ``|score|`` supported by these primitives. With gain=8, the
-# worst valid-position logit contribution from score is ``8 × 120 =
+# worst valid-position logit contribution from score is ``8 x 120 =
 # 960``, under the 1000-unit ``_VALIDITY_DIRECT`` bonus (or well under
 # the 8000-unit gained ``_VALIDITY_KEY_COEFF`` contribution in
 # ``attend_argmin_valid_unmasked``).
@@ -171,7 +171,7 @@ _MAX_DOT_LOGIT_ABS = 960.0
 # ``attend_argmin_unmasked`` to masked positions. Must exceed
 # ``_QUERY_GAIN * _MAX_SCORE_UNMASKED_ABS`` so a masked position with
 # the best score still loses to an unmasked position with the worst
-# score. With gain=8 and max_score=100: 8×100 = 800, so 1000 gives
+# score. With gain=8 and max_score=100: 8x100 = 800, so 1000 gives
 # ~25% margin.
 _UNMASKED_PENALTY = 1000.0
 
@@ -240,16 +240,16 @@ _LOCAL_RECENCY_GAIN = 600.0
 # cosine goes negative and the cond ordering can invert outright — a
 # separate build-time raise), and (2) with every cosine then at least
 # ``cos_floor = cos(max_positions·θ_slow) > 0``, a false key's logit
-# ``−gate·cos(Δ·θ_slow) + lobe(Δ)`` sits at least ``2·gate·cos_floor −
+# ``-gate·cos(Δ·θ_slow) + lobe(Δ)`` sits at least ``2·gate·cos_floor -
 # lobe_peak`` below any true key's (positive iff ``cos_floor > 1/8`` at the
 # ``gate = 4·lobe_peak`` sizing), so its weight against the winner is at most
-# ``exp(−gap)`` and the total over at most ``max_positions`` keys is
-# ``max_positions · exp(−gap)``.  (Pre-2026-07 this bound used the bare
+# ``exp(-gap)`` and the total over at most ``max_positions`` keys is
+# ``max_positions · exp(-gap)``.  (Pre-2026-07 this bound used the bare
 # ``2·gate``, silently assuming the rotation factor ≈ 1; a config could pass
 # it while the slow-plane rotation flipped the gate's sign well inside the
 # rollout.  The first fix multiplied in ``cos_floor`` but still assumed the
 # lobe differential ≤ 0 — configs like ``d_head=32, max_positions=20,
-# base=16`` passed by ~260 orders of magnitude while the gap was 608 − 902 <
+# base=16`` passed by ~260 orders of magnitude while the gap was 608 - 902 <
 # 0.  Probing those corner configs showed no actual misread — the lobe rides
 # strictly faster planes than the gate, so its real decay preserves ordering
 # — but past the main lobe a fast band plane can re-cohere toward cos ≈ +1
@@ -264,7 +264,7 @@ _LOCAL_RECENCY_GAIN = 600.0
 # 2.8 at a true gap of 4).  At 1e-6 total leak the tilt is ≤ 2e-3 logits —
 # invisible — while every healthy config passes by hundreds of orders of
 # magnitude (gate ≥ ~2400 with cos_floor ≈ 1 ⇒ the bound underflows to 0)
-# and the observed degenerate config fails by ~14000×.
+# and the observed degenerate config fails by ~14000x.
 _MAX_RECENCY_LEAK = 1e-6
 
 # Per-position logit gain for the position tiebreak in attend_most_recent_globally.
@@ -273,9 +273,10 @@ _MAX_RECENCY_LEAK = 1e-6
 #
 # Constraints the caller must verify:
 #   (1) representability: recency_scale >> ULP(content_score)
-#       For E8 content (score≈320000): ULP≈0.038, so recency_scale=1.0 gives 26× margin.
-#   (2) content dominance: match_gain · min_match_dot_gap > recency_scale · max_positions
-#       For E8 (match_gain=200, dot_gap=1600): 320000 > 1.0 · 61440 ✓ (5.2× margin).
+#       For E8 content (score≈320000): ULP≈0.038, so recency_scale=1.0 gives 26x margin.
+#   (2) content dominance: match_gain · min_match_dot_gap >
+#       recency_scale · max_positions
+#       For E8 (match_gain=200, dot_gap=1600): 320000 > 1.0 · 61440 ✓ (5.2x margin).
 _RECENCY_SCALE = 1.0
 
 
@@ -312,7 +313,7 @@ def attend_argmin_above_integer(
     Combining this with a ``-score_i`` term in column 0 and a large
     above-bonus in columns ``1..N`` gives an attention logit of
 
-        _QUERY_GAIN · (−score_i)
+        _QUERY_GAIN · (-score_i)
             + _ABOVE_BONUS_LOGIT · I(score_i > threshold_j)
 
     whose argmax (argmin of score) is the smallest-score position
@@ -345,6 +346,8 @@ def attend_argmin_above_integer(
         threshold_onehot: Width-``N`` node whose value at each query
             position is a one-hot selecting the active threshold.
         value: Node to read at the selected key position.
+        assert_hardness_gt: If set, also assert the per-query softmax
+            weight on the selected key exceeds this threshold.
 
     Returns:
         Attn node of width ``len(value)``.
@@ -413,12 +416,13 @@ def attend_argmin_above_in_bucket(
     value: Node,
     assert_hardness_gt: float | None = None,
 ) -> Node:
-    """Smallest-``score`` row that is valid, in a requested bucket, and above
-    a requested threshold — read its ``value``.
+    """Read the ``value`` of the smallest-``score`` row that passes filters.
 
-    One vanilla attention head.  For each query position it selects, among
-    all earlier positions ("rows"), the one with the minimum ``score`` that
-    passes three per-row filters, and returns that row's ``value``::
+    The row must be valid, in a requested bucket, and above a requested
+    threshold. One vanilla attention head. For each query position it
+    selects, among all earlier positions ("rows"), the one with the
+    minimum ``score`` that passes three per-row filters, and returns
+    that row's ``value``::
 
         valid:      validity == +1   (torchwright's +1 / -1 convention)
         in bucket:  the row's bucket == the bucket this query asks for
@@ -450,13 +454,13 @@ def attend_argmin_above_in_bucket(
 
     The attention logit at ``(query j, key i)`` is::
 
-        _QUERY_GAIN·(−score_i)
+        _QUERY_GAIN·(-score_i)
             + _VALIDITY_BONUS·validity_i
             + _BUCKET_BONUS·dot(query_bucket_onehot_j, key_bucket_onehot_i)
             + _ABOVE_MATCH_BONUS·dot(threshold_onehot_j, score_above_each_threshold_i)
 
     The three bonuses dominate, so only rows passing all three filters
-    compete; the small ``−score`` term then picks the smallest score.
+    compete; the small ``-score`` term then picks the smallest score.
 
     Layout.  Decoupled identity V/O — ``value`` passes through unchanged and
     may be any width without enlarging the head's logical Q/K width
@@ -607,14 +611,14 @@ def attend_argmin_unmasked(
     at or before ``j``. The attention logit at ``(j, i)`` then has the
     shape
 
-        _QUERY_GAIN · (−score_i)
-        −_UNMASKED_PENALTY · mask_vector_j[position_i]
+        _QUERY_GAIN · (-score_i)
+        -_UNMASKED_PENALTY · mask_vector_j[position_i]
 
     The first term lives in ``d_head`` column 0 as usual. The second term
-    is built by putting ``−_UNMASKED_PENALTY · mask_vector_j[c]`` in
+    is built by putting ``-_UNMASKED_PENALTY · mask_vector_j[c]`` in
     ``Q[j, c+1]`` and ``position_onehot_i[c]`` in ``K[i, c+1]`` for each
     ``c ∈ {0, …, N-1}``. The bilinear sum then equals
-    ``−_UNMASKED_PENALTY · mask_vector_j[position_i]`` — a very negative
+    ``-_UNMASKED_PENALTY · mask_vector_j[position_i]`` — a very negative
     penalty exactly when the query's mask has a bit set at the key's
     position index. An additional slab of ``d_head`` columns at the end
     carries ``value`` through unchanged.
@@ -634,7 +638,7 @@ def attend_argmin_unmasked(
 
     **When every unmasked position is exhausted.** If the mask covers
     every causally-visible position, the best remaining logit is
-    ``−_UNMASKED_PENALTY`` which equals ``-10000`` — still above the
+    ``-_UNMASKED_PENALTY`` which equals ``-10000`` — still above the
     ``CAUSAL_MASK_SENTINEL``, so the attention will return the
     weighted-average of the *least-bad* masked positions rather than
     wandering into "future" positions. Callers that care about this edge
@@ -655,6 +659,8 @@ def attend_argmin_unmasked(
             Must have the same width as ``mask_vector``.
         value: Node to read.  Any width — V/O is identity and the compiler
             splits a wide value across physical heads.
+        assert_hardness_gt: If set, also assert the per-query softmax
+            weight on the selected key exceeds this threshold.
 
     Returns:
         Attn node of width ``len(value)`` equal to ``value`` at the
@@ -719,7 +725,7 @@ def attend_mean_where(
 
     At each query position, the attention returns the uniform average of
     ``value`` over all causally-visible positions where ``validity`` is
-    +1.  Invalid positions (``validity`` = −1) receive a large negative
+    +1.  Invalid positions (``validity`` = -1) receive a large negative
     logit penalty and contribute negligibly to the output.
 
     All valid positions share the same logit (no score term), so softmax
@@ -741,7 +747,7 @@ def attend_mean_where(
 
     Args:
         rope: RoPE config (``d_head`` / ``base``) for the slow-plane placement.
-        validity: 1D boolean node (+1 valid, −1 invalid).
+        validity: 1D boolean node (+1 valid, -1 invalid).
         value: Node to average.  No width constraint — the compiler
             splits wide V/O across multiple physical heads.
 
@@ -757,7 +763,7 @@ def attend_mean_where(
 
     # Content width 1: the only column carries the direct validity bonus,
     # relocated onto the slowest plane by rotary_content_head so the rotation
-    # is quasi-static (cos((i−j)·θ_slow) ≈ 1) over a bounded valid window and
+    # is quasi-static (cos((i-j)·θ_slow) ≈ 1) over a bounded valid window and
     # the mean stays uniform.  Q is an exact 1.0 (a LiteralValue) — unscaled,
     # since validity here is a direct logit contribution, not combined with any
     # gained score.  K reads only validity.  All valid positions get the same
@@ -816,7 +822,7 @@ def attend_causal_mean(
 
     ``output_scale`` folds a scalar multiply into the O projection — e.g.
     the smoothed global position (``global_position_from_bos(...,
-    smoothed=True)``) uses ``output_scale=2.0`` so ``2 × mean(0..t) ≈ t``
+    smoothed=True)``) uses ``output_scale=2.0`` so ``2 x mean(0..t) ≈ t``
     costs no extra sublayer.
 
     Compile cost: one attention head (auto-split across multiple physical
@@ -903,6 +909,7 @@ def attend_argmax_dot(
     ``d_qk = len(query_vector)``, ``d_v = len(value)``.
 
     Args:
+        rope: RoPE config (``d_head`` / ``base``) for the slow-plane placement.
         query_vector: Width-``W`` node at each query position (e.g. a
             column one-hot mapped to 0/1 via ``bool_to_01``).
         key_vector: Width-``W`` node at each key position (e.g. a
@@ -912,6 +919,8 @@ def attend_argmax_dot(
             constraint — the compiler splits wide V/O across
             multiple physical heads.
         match_gain: Coefficient applied to the dot-product term.
+        assert_hardness_gt: If set, also assert the per-query softmax
+            weight on the selected key exceeds this threshold.
 
     Returns:
         Attn node of width ``len(value)`` equal to ``value`` at the
@@ -1030,10 +1039,10 @@ def get_prev_value(
       too weak: false-cond keys leak softmax weight and the latched value
       silently drifts (downstream, ``count_since_marker`` read 2.8 at a true
       gap of 4 before this guard existed).  The guaranteed true-over-false
-      logit gap is ``2·gate·cos_floor − lobe_peak`` — the gate attenuated by
+      logit gap is ``2·gate·cos_floor - lobe_peak`` — the gate attenuated by
       the enforced cosine floor, minus the recency lobe's tiebreak, which can
       favor a nearer false key by up to the lobe peak — and the worst-case
-      leak ``max_positions · exp(−gap)`` (infinite when the gap is not
+      leak ``max_positions · exp(-gap)`` (infinite when the gap is not
       positive) raises ``ValueError`` when it exceeds ``_MAX_RECENCY_LEAK``;
       increase ``max_positions`` or ``d_head`` (widening the lobe band), or
       ``d_head`` alone when the rotation floor is the weak factor.
@@ -1060,7 +1069,7 @@ def get_prev_value(
             f"get_prev_value: the cond gate's slow-plane rotation is not "
             f"quasi-static at d_head={rope.d_head} base={rope.base:g} "
             f"max_positions={rope.max_positions}: the slowest rotated plane "
-            f"(θ={theta_slow:.3e}) turns max_positions × θ = "
+            f"(θ={theta_slow:.3e}) turns max_positions x θ = "
             f"{rope.max_positions * theta_slow:.3f} ≥ π/2 ({math.pi / 2:.3f}), "
             f"so a distant key's gate contribution goes negative and the "
             f"cond ordering can invert — the latch would silently read a "
@@ -1084,7 +1093,7 @@ def get_prev_value(
             f"{float(amps.sum()):.2e} (a <=2-plane band Hann-tapers to its "
             f"endpoint zeros), gate {gate:.3g}, rotation floor "
             f"cos={cos_floor:.3f}, lobe tiebreak up to {lobe_peak:.3g} — the "
-            f"guaranteed true-over-false logit gap 2·gate·cos_floor − "
+            f"guaranteed true-over-false logit gap 2·gate·cos_floor - "
             f"lobe_peak = {gap:.3g} bounds the worst-case false-key softmax "
             f"leak at {leak_bound:.2e} > {_MAX_RECENCY_LEAK:g}, so the "
             f"latched value could silently drift.  Increase max_positions or "
@@ -1149,7 +1158,7 @@ def attend_most_recent_globally(
     **Float32 representability.**  Adjacent positions must differ in logit by more
     than the fp32 ULP at the content score scale.  For E8 content (score ≈ 320,000)
     the ULP is ≈ 0.038; ``recency_scale = 1.0`` gives an adjacent-position gap of
-    1.0 — 26× above the floor.  For content types with smaller scores, reduce
+    1.0 — 26x above the floor.  For content types with smaller scores, reduce
     ``recency_scale`` so that ``recency_scale · max_positions`` stays below the
     content gap.
 
@@ -1164,7 +1173,7 @@ def attend_most_recent_globally(
     content on the slowest ``W``, the tiebreak on the next).  Under partial rotary
     (``rope.d_rot < rope.d_head``) the content rides the unrotated NoPE tail — an
     *exact* position-free match, dissolving the slow-plane ``d_head`` budget — and
-    only the position tiebreak rides a rotated plane (the slowest, ``d_rot/2−1``).
+    only the position tiebreak rides a rotated plane (the slowest, ``d_rot/2-1``).
     The two signals are on disjoint dims either way, so they never interact; the
     partial path is what lets the wide unbounded clip read coexist with the global
     position tiebreak in one feasible-``d_head`` head.
@@ -1179,7 +1188,8 @@ def attend_most_recent_globally(
         value: node to read at the selected key position.
         match_gain: coefficient on the content dot-product term.
         recency_scale: per-unit-position logit gain for the position tiebreak.
-            Must satisfy ``recency_scale · max_positions < match_gain · min_match_dot_gap``
+            Must satisfy
+            ``recency_scale · max_positions < match_gain · min_match_dot_gap``
             (content-dominance invariant; see above).
         exclude_self: if True, shift ``key_vector``, ``global_position``,
             and ``value`` back one position so the current token cannot
@@ -1207,7 +1217,7 @@ def attend_most_recent_globally(
     # recency_scale to the logit.  NOT divided by max_positions — the raw
     # position value ≈ i is used directly so adjacent positions differ by
     # recency_scale in logit.  Float32 at content score ~320000 has ULP ≈ 0.038;
-    # recency_scale=1.0 gives adjacent diff = 1.0 >> 0.038 (26× margin).
+    # recency_scale=1.0 gives adjacent diff = 1.0 >> 0.038 (26x margin).
     alpha = recency_scale
 
     # Shared inputs: content vector + a constant 1.0 (query side) / global_position
@@ -1223,7 +1233,7 @@ def attend_most_recent_globally(
         # Content (W match dims) rides the unrotated NoPE tail [d_rot:d_rot+W]: an
         # EXACT, position-free content dot product at any distance.  The position
         # tiebreak rides the slowest rotated plane d_rot/2-1, where the RoPE
-        # attenuation cos((i−j)·θ_slow) stays positive (the guard below), so among
+        # attenuation cos((i-j)·θ_slow) stays positive (the guard below), so among
         # content-matching keys the largest global_position (most recent) wins.
         # The two signals live on disjoint dims, so they do not interact.  This
         # cannot delegate to rotary_content_head, which would route ALL columns
@@ -1242,7 +1252,7 @@ def attend_most_recent_globally(
             raise ValueError(
                 f"attend_most_recent_globally: the position tiebreak on the "
                 f"slowest rotated plane {pos_plane} (θ={theta_pos:.3e}) has "
-                f"max_positions={rope.max_positions} × θ = "
+                f"max_positions={rope.max_positions} x θ = "
                 f"{rope.max_positions * theta_pos:.3f} ≥ π/2 ({math.pi / 2:.3f}); a "
                 f"negative cosine would reverse the tiebreak ordering.  Increase "
                 f"d_rot/base or reduce max_positions."
@@ -1272,15 +1282,15 @@ def attend_most_recent_globally(
         # --- Full rotary ---
         # Content + position both on slow planes of the d_head grid; the position
         # column occupies the (W+1)-th slowest plane (after the W content planes).
-        # Guard: that plane's frequency θ_pos must satisfy max_positions × θ_pos <
-        # π/2 so cos((i−j)·θ_pos) stays positive for all key offsets; a negative
+        # Guard: that plane's frequency θ_pos must satisfy max_positions x θ_pos <
+        # π/2 so cos((i-j)·θ_pos) stays positive for all key offsets; a negative
         # cosine would reverse the tiebreak ordering.
         theta_pos = float(rope_inv_freq(d_head, rope.base)[d_head // 2 - 1 - W])
         if rope.max_positions * theta_pos >= math.pi / 2:
             raise ValueError(
                 f"attend_most_recent_globally: content width W={W} places the "
                 f"position tiebreak on plane {d_head // 2 - 1 - W} "
-                f"(θ={theta_pos:.3e}); max_positions={rope.max_positions} × θ = "
+                f"(θ={theta_pos:.3e}); max_positions={rope.max_positions} x θ = "
                 f"{rope.max_positions * theta_pos:.3f} ≥ π/2 ({math.pi / 2:.3f}).  "
                 f"Narrow the content vector, increase d_head/base, or reduce "
                 f"max_positions."
@@ -1292,7 +1302,7 @@ def attend_most_recent_globally(
         query_matrix = torch.zeros((W + 1, d_qk))
         for c in range(W):
             query_matrix[c, c] = match_gain
-        query_matrix[W, W] = alpha  # constant 1.0 × recency_scale for position col
+        query_matrix[W, W] = alpha  # constant 1.0 x recency_scale for position col
         key_matrix = torch.zeros((W + 1, d_qk))
         for c in range(W):
             key_matrix[c, c] = 1.0

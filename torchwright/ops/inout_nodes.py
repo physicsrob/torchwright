@@ -7,7 +7,7 @@ _DEFAULT_VALUE_RANGE = (-1e4, 1e4)
 
 
 def create_input(
-    name_or_width,
+    name_or_width: str | int,
     width: int | None = None,
     *,
     value_range: tuple[float, float] | None = None,
@@ -19,13 +19,13 @@ def create_input(
     - create_input(name, width) -> named InputNode (legacy pattern)
 
     Args:
-    - name_or_width: Either the input name (str) or width (int)
-    - width: Width when name is provided (optional)
-    - value_range: (lo, hi) bound on the input tensor values.
-      Defaults to (-1e4, 1e4) if not specified.
+        name_or_width: Either the input name (str) or width (int).
+        width: Width when name is provided (optional).
+        value_range: (lo, hi) bound on the input tensor values.
+            Defaults to (-1e4, 1e4) if not specified.
 
     Returns:
-    - Node: The created input node.
+        Node: The created input node.
     """
     if value_range is None:
         value_range = _DEFAULT_VALUE_RANGE
@@ -42,10 +42,11 @@ def create_literal_value(vector: torch.Tensor, name: str = "") -> Node:
     """Create a node with a literal value.
 
     Args:
-    - vector (torch.Tensor): Tensor representing the literal value.
+        vector: Tensor representing the literal value.
+        name: Node name for debugging.
 
     Returns:
-    - Node: Node with the specified literal value.
+        Node: Node with the specified literal value.
     """
     return LiteralValue(vector, name)
 
@@ -54,10 +55,10 @@ def create_embedding(vocab: list[str]) -> Embedding:
     """Create an embedding input.
 
     Args:
-    - vocab (List[str]): List of vocab words.
+        vocab: List of vocab words.
 
     Returns:
-    - Node: Embedding node.
+        Node: Embedding node.
     """
     return Embedding(vocab)
 
@@ -87,11 +88,11 @@ def create_unembedding(inp: Node, embedding: Embedding) -> Unembedding:
     """Create an unembedding output.
 
     Args:
-    - inp (Node): Node with embedding vector to unembed
-    - embedding (Embedding): Embedding instance to use for unembedding.
+        inp: Node with embedding vector to unembed.
+        embedding: Embedding instance to use for unembedding.
 
     Returns:
-    - Unembedding
+        Unembedding
     """
     return Unembedding(inp, embedding)
 

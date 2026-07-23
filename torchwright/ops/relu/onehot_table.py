@@ -21,12 +21,12 @@ blocks and turns the lookup into exact integer counting, with two shapes:
   ``-(n_blocks - 0.5)`` puts the ReLU at exactly ``0.5`` for the unique winner
   and ``0`` for everyone else — a uniform margin of ``0.5`` on each side, no
   tuning.  The first ``Linear``'s rows are literally the keys; the second
-  ``Linear``'s rows are literally ``2 · (value − default)``.
+  ``Linear``'s rows are literally ``2 · (value - default)``.
 
 Because exactly one row fires (or none → ``default``), the output is always
 one of the table's value vectors, so the claimed value range is the *tight*
 ``[min, max]`` over the values and the default — not ``map_to_table``'s
-pessimistic ``default ± Σ|value − default|`` widening, which is what blew up
+pessimistic ``default ± Σ|value - default|`` widening, which is what blew up
 the interval arithmetic through a long chain of lookups.
 """
 
@@ -38,6 +38,10 @@ from torchwright.graph.value_type import NodeValueType, Range
 from torchwright.ops.relu.linear_relu_linear import linear_relu_linear
 
 _ONEHOT_ATOL = 1e-6
+
+# Midpoint between a one-hot block's off (0) and on (1) values, used to
+# locate the hot index in a key.
+_ONEHOT_THRESHOLD = 0.5
 
 
 def _count_one_hot_blocks(key: torch.Tensor) -> int:
@@ -116,7 +120,7 @@ def onehot_lookup(
         # values.  ``y = inp @ W`` copies the row the one-hot selects.
         weight = default.to(torch.float32).unsqueeze(0).repeat(d_key, 1).clone()
         for key, value in key_to_value.items():
-            row = int((key > 0.5).nonzero(as_tuple=False)[0].item())
+            row = int((key > _ONEHOT_THRESHOLD).nonzero(as_tuple=False)[0].item())
             weight[row] = value.to(torch.float32)
         result: Node = Linear(inp, weight, name="onehot_lookup_select")
     else:

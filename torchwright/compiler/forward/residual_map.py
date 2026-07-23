@@ -1,3 +1,4 @@
+from collections.abc import Iterable
 from dataclasses import dataclass
 
 from torchwright.compiler.residual_assignment import (
@@ -43,7 +44,7 @@ class ResidualStreamMap:
         # Columns permanently withheld from the free pool: never allocated to
         # any node, never freed, for the whole compile.  The sole current user
         # is the pinned-constant RMSNorm (``_reserve_rms_norm_columns``), which
-        # reserves 1–2 columns up front to hold the constant that forces the
+        # reserves 1-2 columns up front to hold the constant that forces the
         # RMS to a power of two — they are seeded once (into ``embed_table``) and
         # read but never written.  (The primitive was first built for an
         # end-of-compile delta-transfer layer, since removed.)
@@ -108,7 +109,7 @@ class ResidualStreamMap:
         self._check_invariants(f"hold({node!r})")
         return list(indices)
 
-    def can_allocate_at(self, node: Node, ordered_cols) -> bool:
+    def can_allocate_at(self, node: Node, ordered_cols: Iterable[int]) -> bool:
         """Whether ``node`` can claim the one complete currently-held bank."""
         cols = list(ordered_cols)
         return (
@@ -119,7 +120,7 @@ class ResidualStreamMap:
             and set(cols) == self._held
         )
 
-    def allocate_at(self, node: Node, ordered_cols) -> list[int]:
+    def allocate_at(self, node: Node, ordered_cols: Iterable[int]) -> list[int]:
         """Assign ``node`` the complete held bank in the supplied order.
 
         This is intentionally *not* a general precoloured allocator: free,
@@ -193,7 +194,7 @@ class ResidualStreamMap:
     def get_allocated_nodes(self) -> set[Node]:
         return set(self._node_to_indices.keys())
 
-    def reserve(self, cols) -> None:
+    def reserve(self, cols: Iterable[int]) -> None:
         """Remove ``cols`` from the free pool without assigning them to any node.
 
         Protects columns that must hold a fixed value for the whole compile from
@@ -228,7 +229,7 @@ class ResidualStreamMap:
         Invariants (all must hold after any successful mutation):
           1. Pairwise disjointness: no two nodes share a column.
           2. free ∩ allocated == ∅.
-          3. free ∪ allocated ∪ held ∪ reserved == {0 .. d-1}.
+          3. free U allocated U held U reserved == {0 .. d-1}.
 
         Called at the end of every mutator (allocate/free/reassign) so a
         corrupted state is surfaced at the *source* rather than the next

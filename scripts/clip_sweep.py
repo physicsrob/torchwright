@@ -12,14 +12,14 @@ from collections import defaultdict
 
 from torchwright_doom.model.constants import COLUMN_COUNT, PIXEL_WIDTH
 from torchwright_doom.model.vocab import CLIP_UPDATE, SCREEN_RANGE, SET_CURSOR_X
-from torchwright_doom.prompt import scenes as S
+from torchwright_doom.prompt import scenes
 from torchwright_doom.pydoom import GameState as PyGameState
 from torchwright_doom.pydoom import Scene as PyScene
 from torchwright_doom.pydoom import expected_ar_tokens
 
 
-def writes_for(angle: int):
-    md, state = S.load(S.E1M1_START_ROOM)
+def writes_for(angle: int) -> tuple[int, list[tuple[int, int]]]:
+    md, state = scenes.load(scenes.E1M1_START_ROOM)
     py_scene = PyScene.model_validate(
         {
             "map_data": md.model_dump(),
@@ -40,12 +40,12 @@ def writes_for(angle: int):
     return len(tokens), writes
 
 
-def gaps(writes):
+def gaps(writes: list[tuple[int, int]]) -> list[int]:
     by = defaultdict(list)
     for pos, col in writes:
         by[col].append(pos)
     g = []
-    for col, ps in by.items():
+    for ps in by.values():
         ps.sort()
         g += [b - a for a, b in itertools.pairwise(ps)]
     return g

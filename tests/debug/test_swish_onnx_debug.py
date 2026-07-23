@@ -11,6 +11,7 @@ topology fingerprint cannot distinguish — trips the explicit machine check.
 """
 
 import json
+from pathlib import Path
 
 import pytest
 import torch
@@ -33,9 +34,10 @@ _ONNX_PROBE_ATOL = 2.5e-3
 
 
 def _build(machine="swish"):
-    """A token graph: embedding -> gated FFN -> degenerate FFN, output
-    d_embed-wide.  ``machine="relu"`` builds the same-shape ReLU twin (both
-    FFNs degenerate) for the machine-mismatch negative test — identical
+    """A token graph: embedding -> gated FFN -> degenerate FFN, output d_embed-wide.
+
+    ``machine="relu"`` builds the same-shape ReLU twin (both FFNs
+    degenerate) for the machine-mismatch negative test — identical
     topology under the wrapper-transparent fingerprint.
     """
     emb = create_embedding(vocab=VOCAB)
@@ -101,15 +103,17 @@ def swish_artifact(tmp_path_factory):
 def test_swish_artifact_records_machine_kind(swish_artifact):
     artifact, onnx_path = swish_artifact
     assert artifact.activation == "swish"
-    with open(meta_path_for(onnx_path)) as f:
+    with Path(meta_path_for(onnx_path)).open() as f:
         assert json.load(f)["activation"] == "swish"
-    with open(artifact.debug_path) as f:
+    with Path(artifact.debug_path).open() as f:
         assert json.load(f)["activation"] == "swish"
 
 
 def test_swish_onnx_emission_is_gated(swish_artifact):
-    """The artifact carries the gated emission: gate/up/down initializers and
-    Sigmoid·Mul swish, no Relu nodes, no W1/W2.
+    """The artifact carries the gated emission, not the ReLU one.
+
+    Gate/up/down initializers and Sigmoid·Mul swish, no Relu nodes,
+    no W1/W2.
     """
     import onnx
 
@@ -128,7 +132,8 @@ def test_swish_onnx_emission_is_gated(swish_artifact):
 
 
 def test_swish_onnx_debug_session_roundtrips(swish_artifact):
-    """probe_compiled over the executing artifact matches the exact oracle;
+    """probe_compiled over the executing artifact matches the exact oracle.
+
     debug=True passes residual self-consistency.
     """
     _, onnx_path = swish_artifact
@@ -150,8 +155,10 @@ def test_swish_onnx_debug_session_roundtrips(swish_artifact):
 
 
 def test_relu_rebuild_trips_machine_check(swish_artifact):
-    """A same-shape ReLU rebuild passes the (frozen, activation-blind)
-    topology fingerprint but must trip the explicit machine cross-check.
+    """A same-shape ReLU rebuild passes the frozen topology fingerprint.
+
+    That fingerprint is activation-blind, but the rebuild must still
+    trip the explicit machine cross-check.
     """
     _, onnx_path = swish_artifact
     relu_out, _ = _build(machine="relu")

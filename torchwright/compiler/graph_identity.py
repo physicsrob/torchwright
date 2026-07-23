@@ -30,6 +30,7 @@ from typing import TYPE_CHECKING, cast
 from torchwright.compiler.utils import resolve_n_heads
 
 if TYPE_CHECKING:
+    from torchwright.compiler.forward.scheduling_policy import SchedulingPolicy
     from torchwright.graph import Node
 
 
@@ -119,7 +120,7 @@ def graph_fingerprint(
     d_hidden: int,
     flex_routing: bool,
     cancel_slack: int | None,
-    policy,
+    policy: SchedulingPolicy | None,
     reserve_residual: int = 0,
     bias: bool = True,
     held_output_source: Node | None = None,
@@ -134,7 +135,7 @@ def graph_fingerprint(
     silently misses.
 
     ``reserve_residual`` (residual columns withheld from the solver, e.g. the
-    pinned-constant RMSNorm's 1–2) changes the modeled residual capacity, hence
+    pinned-constant RMSNorm's 1-2) changes the modeled residual capacity, hence
     the schedule, so it MUST participate in the key.  It is added only when
     non-zero so the common case (no reservation) keeps hashing byte-identically
     to the pre-feature layout and existing cache entries still hit.

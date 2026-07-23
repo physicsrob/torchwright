@@ -215,7 +215,7 @@ def _uniform_2d(
     n_samples: int = 4096,
     seed: int = 0,
 ) -> InputDistribution:
-    """Uniform samples over the 2D box, plus a 64×64 grid."""
+    """Uniform samples over the 2D box, plus a 64x64 grid."""
     gen = torch.Generator().manual_seed(seed)
     n_grid = 64 * 64
     n_rand = n_samples - n_grid
@@ -270,8 +270,9 @@ def _integer_with_plateau_jitter_1d(
     n_samples: int = 4096,
     seed: int = 0,
 ) -> InputDistribution:
-    """Integer samples in [lo, hi] with uniform jitter inside the plateau
-    contract band ±1/(2·step_sharpness) — the in-contract inputs of a
+    """Integer samples in [lo, hi] with uniform jitter inside the plateau band.
+
+    Contract band ±1/(2·step_sharpness) — the in-contract inputs of a
     collapse-synthesized staircase (integer ± tolerated noise), plus the
     exact-integer grid so every plateau center is covered.
     """
@@ -298,7 +299,7 @@ def _integer_with_plateau_jitter_1d(
 # step_sharpness, one plateau per integer, tabulated values.  Plateau
 # values are a deterministic pseudo-random integer table in [-50, 50]
 # whose every adjacent pair differs (37 and 101 are coprime), so the
-# staircase emits the full 2·(n_plateaus − 1) lanes — the pass's
+# staircase emits the full 2·(n_plateaus - 1) lanes — the pass's
 # worst-case lane shape at a given plateau count.
 
 
@@ -307,7 +308,9 @@ def _staircase_table(n_plateaus: int) -> torch.Tensor:
     return ((ks * 37) % 101 - 50).to(torch.float32)
 
 
-def _staircase_build(pl_fn, n_lanes: int):
+def _staircase_build(
+    pl_fn: Callable[..., Node], n_lanes: int
+) -> Callable[[dict[str, Node]], Node]:
     n_plateaus = n_lanes // 2 + 1
     values = _staircase_table(n_plateaus).tolist()
     h = 1.0 / (2.0 * step_sharpness)
@@ -318,7 +321,7 @@ def _staircase_build(pl_fn, n_lanes: int):
     def fn(x: float) -> float:
         return values[min(max(round(x), 0), n_plateaus - 1)]
 
-    def build(nodes):
+    def build(nodes: dict[str, Node]) -> Node:
         return pl_fn(
             nodes["x"],
             breakpoints=breakpoints,
@@ -330,11 +333,13 @@ def _staircase_build(pl_fn, n_lanes: int):
     return build
 
 
-def _staircase_reference(n_lanes: int):
+def _staircase_reference(
+    n_lanes: int,
+) -> Callable[[dict[str, torch.Tensor]], torch.Tensor]:
     n_plateaus = n_lanes // 2 + 1
     table = _staircase_table(n_plateaus)
 
-    def ref(inputs):
+    def ref(inputs: dict[str, torch.Tensor]) -> torch.Tensor:
         idx = inputs["x"].round().long().clamp(0, n_plateaus - 1)
         return table[idx]
 
@@ -396,8 +401,9 @@ def _below_multiples_1d(
     n_samples: int = 4096,
     seed: int = 0,
 ) -> InputDistribution:
-    """Samples at ``m·multiple − offset`` with the offset log-uniform in
-    ``[off_lo, off_hi]`` — stresses the sliver just below staircase
+    """Samples at ``m·multiple - offset`` with the offset log-uniform.
+
+    In ``[off_lo, off_hi]`` — stresses the sliver just below staircase
     boundaries (``radix_floor_int``'s divisor boundaries, ramp zones).
     """
     gen = torch.Generator().manual_seed(seed)
@@ -472,8 +478,9 @@ def _equals_vector_distribution(
 def _map_to_table_distribution(
     name: str, description: str, n_samples: int = 4096, seed: int = 0
 ) -> InputDistribution:
-    """Half exact key matches (cycling three keys), half far-off vectors in
-    [-1, 1]^3 (no-match → default; dot products stay below every key's
+    """Half exact key matches (cycling three keys), half far-off vectors.
+
+    In [-1, 1]^3 (no-match → default; dot products stay below every key's
     self-dot, per the op contract — see _equals_vector_distribution).
     """
     gen = torch.Generator().manual_seed(seed)
@@ -493,8 +500,10 @@ def _map_to_table_distribution(
 def _onehot_lookup_distribution(
     name: str, description: str, n_samples: int = 4096, seed: int = 0
 ) -> InputDistribution:
-    """Two-block one-hot inputs (digit 3 ⊕ carry 2), uniformly over all six
-    combinations — half hit the three-row table, half miss → default.
+    """Two-block one-hot inputs (digit 3 ⊕ carry 2).
+
+    Uniformly over all six combinations — half hit the three-row table,
+    half miss → default.
     """
     gen = torch.Generator().manual_seed(seed)
     d = torch.randint(0, 3, (n_samples,), generator=gen)
@@ -547,8 +556,10 @@ def _select_distribution(
 def _in_range_distribution(
     name: str, description: str, n_slots: int = 8, n_samples: int = 4096, seed: int = 0
 ) -> InputDistribution:
-    """Integer (lower, upper) bound pairs over [0, n_slots], lower ≤ upper
-    (the op contract — inverted bounds are out of contract and read -3).
+    """Integer (lower, upper) bound pairs over [0, n_slots], lower ≤ upper.
+
+    This is the op contract — inverted bounds are out of contract and
+    read -3.
     """
     gen = torch.Generator().manual_seed(seed)
     a = torch.randint(0, n_slots + 1, (n_samples, 1), generator=gen).to(torch.float32)
@@ -605,8 +616,9 @@ def _dynamic_extract_distribution(
 def _table_lookup_2d_distribution(
     name: str, description: str, n_samples: int = 4096, seed: int = 0
 ) -> InputDistribution:
-    """Integer (i, j) index pairs over an 8×6 table, plus 25% out-of-range
-    indices (the clamp path).
+    """Integer (i, j) index pairs over an 8x6 table.
+
+    Plus 25% out-of-range indices (the clamp path).
     """
     gen = torch.Generator().manual_seed(seed)
     i = torch.randint(-2, 10, (n_samples, 1), generator=gen).to(torch.float32)
@@ -788,7 +800,7 @@ def _distributions() -> dict[str, InputDistribution]:
         ),
         "diff_trig_nonuniform": _uniform_2d(
             "diff_trig_nonuniform",
-            "Two-input product over DIFF_BP × TRIG_BP — DIFF in [-40, 40] "
+            "Two-input product over DIFF_BP x TRIG_BP — DIFF in [-40, 40] "
             "(non-uniform), TRIG in [-1, 1] (non-uniform).",
             -40.0,
             40.0,
@@ -797,7 +809,7 @@ def _distributions() -> dict[str, InputDistribution]:
         ),
         "diff_vel_nonuniform": _uniform_2d(
             "diff_vel_nonuniform",
-            "Two-input product over DIFF_BP × VEL_BP — DIFF in [-40, 40] "
+            "Two-input product over DIFF_BP x VEL_BP — DIFF in [-40, 40] "
             "(non-uniform), VEL in [-0.7, 0.7] (non-uniform).",
             -40.0,
             40.0,
@@ -807,7 +819,7 @@ def _distributions() -> dict[str, InputDistribution]:
         "signed_multiply_pm10": _uniform_2d(
             "signed_multiply_pm10",
             "a·b over [-10, 10]² via polarization identity, step=1.0 — "
-            "analytical bound `step × (max_abs1 + max_abs2) / 4 = 5.0` "
+            "analytical bound `step x (max_abs1 + max_abs2) / 4 = 5.0` "
             "absolute, much smaller relative.",
             -10.0,
             10.0,
@@ -816,7 +828,7 @@ def _distributions() -> dict[str, InputDistribution]:
         ),
         "atan_cross_dot_nonuniform": _uniform_2d(
             "atan_cross_dot_nonuniform",
-            "atan2(cross/dot) over [-2, 2] × [0.5, 10] on a non-uniform "
+            "atan2(cross/dot) over [-2, 2] x [0.5, 10] on a non-uniform "
             "grid — rank-3 SVD via `low_rank_2d`.",
             -2.0,
             2.0,
@@ -954,7 +966,7 @@ def _distributions() -> dict[str, InputDistribution]:
         "mod_integers_0_100_by7": _integer_1d(
             "mod_integers_0_100_by7",
             "Integer inputs on [0, 100] with divisor=7. `mod_const` is "
-            "x − divisor × `thermometer_floor_div(x)`, exact on integers.",
+            "x - divisor * `thermometer_floor_div(x)`, exact on integers.",
             0,
             100,
         ),
@@ -1001,7 +1013,7 @@ def _distributions() -> dict[str, InputDistribution]:
         ),
         "dynamic_extract_int_idx_4x2": _dynamic_extract_distribution(
             "dynamic_extract_int_idx_4x2",
-            "Runtime 4×2 tables in [-5, 5] with integer indices — the "
+            "Runtime 4x2 tables in [-5, 5] with integer indices — the "
             "in_range → broadcast_select → sum composition on clean "
             "integer inputs.",
         ),
@@ -1018,7 +1030,7 @@ def _distributions() -> dict[str, InputDistribution]:
         ),
         "table_lookup_2d_int_8x6": _table_lookup_2d_distribution(
             "table_lookup_2d_int_8x6",
-            "Integer (i, j) over an 8×6 table with 25% out-of-range "
+            "Integer (i, j) over an 8x6 table with 25% out-of-range "
             "(clamped) indices — every indicator saturated, the value "
             "path is the delta telescoping's fp32 accumulation.",
         ),
@@ -1460,10 +1472,10 @@ def _target_ops() -> list[TargetOp]:
             distribution_names=("multiply_uniform_pm10", "multiply_uniform_pm1000"),
             notes=(
                 "Exact ± gated-lane pair: `Swish(a)·b + Swish(-a)·(-b) = a·b` "
-                "(σ(a) + σ(-a) = 1). Exact in real math at any magnitude — "
-                "no grid, no range limit; measured error is fp32 rounding, "
-                "relative to the actual product. Replaces the quarter-square "
-                "`multiply_2d` and the `multiply_integers` chain."
+                "(sigmoid(a) + sigmoid(-a) = 1). Exact in real math at any "
+                "magnitude — no grid, no range limit; measured error is fp32 "
+                "rounding, relative to the actual product. Replaces the "
+                "quarter-square `multiply_2d` and the `multiply_integers` chain."
             ),
         ),
         TargetOp(
@@ -1477,7 +1489,7 @@ def _target_ops() -> list[TargetOp]:
             distribution_names=("square_unsigned_0_10", "square_uniform_pm100"),
             notes=(
                 "`multiply` with both operands the same input: "
-                "`Swish(x)·x + Swish(-x)·(-x) = x²`, both terms `x²·σ(±x)` "
+                "`Swish(x)·x + Swish(-x)·(-x) = x²`, both terms `x²·sigmoid(±x)` "
                 "≥ 0. Exact in real math for all x — no [0, max_value] "
                 "contract, no grid, and none of the piecewise version's "
                 "near-zero relative-error blowup."
@@ -1499,13 +1511,13 @@ def _target_ops() -> list[TargetOp]:
             ),
             distribution_names=("compare_uniform_pm80", "compare_near_thresh_0"),
             notes=(
-                "Sharpened-hinge ramp (`hinge(z) − hinge(z−1)`, "
+                "Sharpened-hinge ramp (`hinge(z) - hinge(z-1)`, "
                 "`hinge(z) = Swish(scale·z)/scale`). Same ramp-zone contract "
                 "as the ReLU form (in-ramp inputs interpolate; the "
                 "near-thresh distribution deliberately stresses it). What's "
                 "new vs relu: fillet dips within ~17/(scale·sharpness) of "
                 "the two bends can overshoot either level by up to "
-                "swish_dip/scale·|T−F| (0.0044 total span at scale=128); "
+                "swish_dip/scale·|T-F| (0.0044 total span at scale=128); "
                 "true-side far-field outputs carry fp32 product rounding at "
                 "the lane-contribution magnitude — the same class as relu's "
                 "far-field noise; the false side is exactly out_bias."
@@ -1611,7 +1623,7 @@ def _target_ops() -> list[TargetOp]:
             notes=(
                 "One gated lane per component: `Swish(scale·cond)·inp/scale`. "
                 "At clean ±1 conds the off-path is exactly zero in fp32 "
-                "(σ(−scale) computes as 0.0) and the on-path passes with ~1 "
+                "(sigmoid(-scale) computes as 0.0) and the on-path passes with ~1 "
                 "ulp relative rounding. No offset M, no finite-range "
                 "requirement — cond noise lands as δ·|actual value|."
             ),
@@ -1631,7 +1643,7 @@ def _target_ops() -> list[TargetOp]:
             distribution_names=("select_signed_bool_two_values",),
             notes=(
                 "Complementary gated pair: `Swish(scale·cond)·a/scale + "
-                "Swish(−scale·cond)·b/scale`. The losing branch contributes "
+                "Swish(-scale·cond)·b/scale`. The losing branch contributes "
                 "exactly zero at clean conds; the winner passes with ~1 ulp "
                 "relative rounding. (The relu-machine select was never "
                 "measured.)"
@@ -1666,9 +1678,9 @@ def _target_ops() -> list[TargetOp]:
             reference_fn=lambda inputs: torch.minimum(inputs["a"], inputs["b"]),
             distribution_names=("minmax_uniform_pm50",),
             notes=(
-                "`a − hinge(a−b)` plus a's sharpened bypass pair. One-sided "
+                "`a - hinge(a-b)` plus a's sharpened bypass pair. One-sided "
                 "over-estimate ≤ swish_dip/scale (0.0022), only when "
-                "|a−b| ≲ 0.2; ties exact; far-apart operands carry the "
+                "|a-b| ≲ 0.2; ties exact; far-apart operands carry the "
                 "folded-/scale product-rounding ulp class."
             ),
         ),
@@ -1764,7 +1776,7 @@ def _target_ops() -> list[TargetOp]:
             notes=(
                 "Bank of equals_vector hinges rescaled to 0/1, one "
                 "degenerate lane per entry, ported hinge-for-hinge. "
-                "Matches read their value to ~1 ulp (the ×scale/÷scale "
+                "Matches read their value to ~1 ulp (the x-scale/÷scale "
                 "round trip); no-match indicators underflow, so misses "
                 "return the default bit-exactly. Between-keys inputs can "
                 "partially fire several indicators, as today. (The relu "
@@ -1915,7 +1927,7 @@ def _target_ops() -> list[TargetOp]:
             ),
             distribution_names=("mod_integers_0_100_by7",),
             notes=(
-                "x − d·thermometer_floor_div(x, d) — linear hardware plus "
+                "x - d·thermometer_floor_div(x, d) — linear hardware plus "
                 "the staircase; exact on integer inputs to the folded ulp "
                 "class, as on relu."
             ),
@@ -1976,7 +1988,7 @@ def _target_ops() -> list[TargetOp]:
                 torch.ceil(inputs["x"]), -5.0, 10.0
             ),
             distribution_names=("ceil_integers_neg5_10",),
-            notes="−floor_int(−x); inherits floor_int's entry.",
+            notes="-floor_int(-x); inherits floor_int's entry.",
         ),
         TargetOp(
             name="radix_floor_int",
@@ -2069,14 +2081,17 @@ def _measure_all() -> list[NoiseMeasurement]:
 
 
 def _round_float(x: float, sig: int = 6) -> float | None:
-    """Round ``x`` to ``sig`` sig figs. Returns ``None`` for NaN/inf so the
-    JSON encoder emits ``null`` instead of a non-portable ``NaN`` literal.
+    """Round ``x`` to ``sig`` sig figs.
+
+    Returns ``None`` for NaN/inf so the JSON encoder emits ``null`` instead
+    of a non-portable ``NaN`` literal.
     """
-    if x != x or x in (float("inf"), float("-inf")):
+    import math
+
+    if math.isnan(x) or x in (float("inf"), float("-inf")):
         return None
     if x == 0:
         return 0.0
-    import math
 
     digits = sig - math.floor(math.log10(abs(x))) - 1
     return round(x, digits)

@@ -39,9 +39,10 @@ D_HEAD = 16
 
 
 def _idchain(x, depth, name):
-    """A chain of ``depth`` self-Adds — forces ``depth`` layers of
-    dependency (each layer doubles the value; identity Linears would be
-    absorbed by the lowering boundary's fusion and force nothing).
+    """Build a chain of ``depth`` self-Adds, forcing ``depth`` layers of dependency.
+
+    Each layer doubles the value; identity Linears would be absorbed by
+    the lowering boundary's fusion and force nothing.
     """
     h = x
     for _ in range(depth):
@@ -118,10 +119,12 @@ def test_deep_literal_not_prefilled_and_materialized_in_interior():
 
 @pytest.mark.parametrize("optimize", [0, 1])
 def test_deep_select_literal_matches_oracle(optimize):
-    """``select(cond, <deep>, literal)`` — the constant is the false branch,
-    consumed deep in the network.  Compiled output must match exact math
-    under the heuristic (optimize=0) and CP-SAT (optimize=1) schedulers, and
-    the false-branch positions must equal the constant.
+    """Match exact math for ``select(cond, <deep>, literal)`` under both schedulers.
+
+    The constant is the false branch, consumed deep in the network.
+    Compiled output must match exact math under the heuristic (optimize=0)
+    and CP-SAT (optimize=1) schedulers, and the false-branch positions must
+    equal the constant.
     """
     cond = create_input("cond", 1, value_range=(-1.0, 1.0))
     base = create_input("t", 2, value_range=(-4.0, 4.0))
@@ -195,11 +198,12 @@ def test_shared_literal_two_consumers_correct():
 
 
 def test_deep_attention_fed_constant_matches_oracle():
-    """A constant that feeds an attention *value* path must be materialized
-    just-in-time and produce correct output.  ``Attn`` has no bias, so this
-    constant could never be folded — JIT is the only mechanism that handles
-    it.  The constant is part of the attention value via a Concatenate, needed
-    only when the (deep) attention op runs.
+    """Materialize just-in-time a constant that feeds an attention *value* path.
+
+    ``Attn`` has no bias, so this constant could never be folded — JIT is
+    the only mechanism that handles it. The constant is part of the
+    attention value via a Concatenate, needed only when the (deep)
+    attention op runs.
     """
     rope = create_rope_config(d_head=D_HEAD, max_positions=512)
     x = create_input("x", 2, value_range=(-5.0, 5.0))
@@ -226,12 +230,15 @@ def test_deep_attention_fed_constant_matches_oracle():
 
 
 def test_literal_into_recycled_column_is_clean():
-    """A constant materialized deep in the network, under residual pressure,
-    lands on a column recycled from an earlier dead node.  The birth
-    dirty-cancel must zero that column before the bias write — otherwise the
-    dead node's stale value contaminates the constant.  The investigation
-    flagged this recycled-column path as previously untested, since the old
-    code prefilled every constant into its own layer-0 column.
+    """Zero a recycled column before the bias write for a deep, pressured constant.
+
+    A constant materialized deep in the network, under residual pressure,
+    lands on a column recycled from an earlier dead node. The birth
+    dirty-cancel must zero that column before the bias write — otherwise
+    the dead node's stale value contaminates the constant. The
+    investigation flagged this recycled-column path as previously
+    untested, since the old code prefilled every constant into its own
+    layer-0 column.
 
     A small ``d`` forces recycling; correctness of the output (the constant
     is a saturated value the stale data would visibly corrupt) validates the
@@ -258,10 +265,11 @@ def test_literal_into_recycled_column_is_clean():
 
 
 def _consumer_layer(other_kind):
-    """Compile ``Add(deep_chain(x), other)`` and return the layer the Add is
-    materialized at.  ``other`` is either a constant (JIT-materialized) or a
-    pre-seeded input (available from layer 0).  Structurally identical
-    otherwise, so the Add's layer reveals whether the JIT gate delayed it.
+    """Compile ``Add(deep_chain(x), other)`` and return the layer the Add lands at.
+
+    ``other`` is either a constant (JIT-materialized) or a pre-seeded
+    input (available from layer 0). Structurally identical otherwise, so
+    the Add's layer reveals whether the JIT gate delayed it.
     """
     x = create_input("x", 2, value_range=(-5.0, 5.0))
     deep = _idchain(x, 3, "d")
@@ -275,11 +283,11 @@ def _consumer_layer(other_kind):
 
 
 def test_jit_constant_adds_no_latency_to_consumer():
-    """The consumer of a just-in-time constant is scheduled at the same layer
-    as it would be if that constant were a pre-seeded input (available from
-    layer 0).  Materializing the constant alongside the consumer's last
-    non-constant input — rather than eagerly at layer 0 — costs the consumer
-    nothing.  This is the load-bearing scheduling claim from the design.
+    """Schedule a JIT constant's consumer at the same layer as a pre-seeded input.
+
+    Materializing the constant alongside the consumer's last non-constant
+    input — rather than eagerly at layer 0 — costs the consumer nothing.
+    This is the load-bearing scheduling claim from the design.
     """
     with_literal = _consumer_layer("literal")
     with_input = _consumer_layer("input")
@@ -297,11 +305,12 @@ def test_jit_constant_adds_no_latency_to_consumer():
 
 
 def test_jit_graph_passes_end_of_layer_liveness(monkeypatch):
-    """Compile a deep-constant graph with the gated end-of-layer liveness
-    walk on (``TW_COMPILER_VERIFY=1``).  It raises if any node — here a
-    just-in-time constant — is freed while an effective consumer is still
-    uncomputed.  Exercising it directly validates the new free-after-use
-    behavior for constants.
+    """Compile a deep-constant graph with the gated end-of-layer liveness walk on.
+
+    ``TW_COMPILER_VERIFY=1``. It raises if any node — here a just-in-time
+    constant — is freed while an effective consumer is still uncomputed.
+    Exercising it directly validates the new free-after-use behavior for
+    constants.
     """
     monkeypatch.setenv("TW_COMPILER_VERIFY", "1")
     x = create_input("x", 2, value_range=(-5.0, 5.0))
@@ -322,8 +331,9 @@ def test_jit_graph_passes_end_of_layer_liveness(monkeypatch):
 
 
 def test_cpsat_treats_constant_as_schedulable_not_prefilled():
-    """Phase 2: under CP-SAT (optimize=2) the constant is a *schedulable* node
-    materialized via ``compute_literal_value`` — not a residual column
+    """Treat the constant as a *schedulable* node under CP-SAT (optimize=2), phase 2.
+
+    Materialized via ``compute_literal_value`` — not a residual column
     prefilled at layer 0 — and the output is correct.
 
     Note on placement: CP-SAT defers a constant (just-in-time) only when

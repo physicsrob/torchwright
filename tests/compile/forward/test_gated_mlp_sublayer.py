@@ -54,8 +54,9 @@ def test_forward_matches_hand_swiglu(x):
 
 
 def test_degenerate_lane_reduces_to_bare_swish(x):
-    """A lane written the degenerate way (up-row 0, up-bias 1) computes
-    swish(gate) exactly — the up factor is the constant 1.
+    """Compute swish(gate) exactly for a degenerate-written lane (up-row 0, up-bias 1).
+
+    The up factor is the constant 1.
     """
     mlp = GatedMLPSubLayer(D, D_HIDDEN)
     g = torch.Generator().manual_seed(7)
@@ -105,9 +106,10 @@ def test_headless_transformer_threads_activation():
 
 
 def test_trim_unused_slots_gated(x):
-    """Trailing all-zero slots are removed; a bias-only slot (the written-
-    degenerate-lane signature: up-bias 1, everything else zero) counts as
-    used; the forward value is unchanged by the trim.
+    """Remove trailing all-zero slots but keep a bias-only slot as used.
+
+    The written-degenerate-lane signature (up-bias 1, everything else
+    zero) counts as used; the forward value is unchanged by the trim.
     """
     mlp = GatedMLPSubLayer(D, D_HIDDEN)
     g = torch.Generator().manual_seed(3)

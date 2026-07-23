@@ -85,9 +85,11 @@ def _lanes(x, w: torch.Tensor, tag: str = "lane") -> list:
 
 
 def _consumer(node, n: int):
-    """An ``FFN`` consumer.  (DOOM's real consumer is an ``Attn`` — see
-    ``_build_split_attn``, which isolates the sibling merge without the FFN's
-    confounding ``Linear -> FFN`` gate fold.).
+    """An ``FFN`` consumer.
+
+    (DOOM's real consumer is an ``Attn`` — see ``_build_split_attn``,
+    which isolates the sibling merge without the FFN's confounding
+    ``Linear -> FFN`` gate fold.)
 
     It must not be a ``Linear``: then ``_fold_through_concatenate`` also fires
     and there is nothing to attribute to the sibling merge.  A hand-built
@@ -246,10 +248,12 @@ def test_sibling_linears_fuse_under_an_attn_consumer():
 
 
 def test_merged_leaves_wider_than_the_mlp_still_compile():
-    """The merge is the only fold that grows a node's ``d_output``, so it is the
-    only one that can turn ``n`` individually-placeable Linears into one Linear
-    with no MLP-bypass realization: the bypass costs ``2 * d_output`` hidden
-    slots, and ``2 * 40 = 80`` exceeds this ``d_hidden=64`` layer's whole pool.
+    """The merge is the only fold that grows a node's ``d_output``.
+
+    That's what lets it turn ``n`` individually-placeable Linears into
+    one Linear with no MLP-bypass realization: the bypass costs
+    ``2 * d_output`` hidden slots, and ``2 * 40 = 80`` exceeds this
+    ``d_hidden=64`` layer's whole pool.
 
     Static routing is capacity-aware (``realization.static_flex_class``), so the
     merged Linear goes to attention transport instead of being skipped by the
@@ -463,8 +467,10 @@ def test_leaf_occurring_outside_its_run_declines_merge():
 
 
 def test_multi_consumer_concat_still_merges():
-    """DOOM's ``x_oh`` case: the concat feeds two ``Attn``s.  The leaves are
-    still sole-consumer, so the merge is legal — only the *leaves* are gated.
+    """DOOM's ``x_oh`` case: the concat feeds two ``Attn``s.
+
+    The leaves are still sole-consumer, so the merge is legal — only
+    the *leaves* are gated.
     """
     with fresh_graph_session():
         x = create_input("x", D_EMBED, value_range=(-1.0, 1.0))
@@ -475,8 +481,9 @@ def test_multi_consumer_concat_still_merges():
 
 
 def test_multi_consumer_leaf_declines_merge():
-    """A leaf read from outside the concat cannot be merged away: its reader
-    has no way to address a sub-range of the merged node.
+    """A leaf read from outside the concat cannot be merged away.
+
+    Its reader has no way to address a sub-range of the merged node.
     """
     with fresh_graph_session():
         x = create_input("x", D_EMBED)
@@ -595,9 +602,10 @@ def test_output_concat_of_merged_siblings_compiles_and_matches_compute():
 
 
 def test_merged_leaves_are_probeable_as_survivor_slices():
-    """Each merged source leaf keeps an addressable residual assignment (its
-    slice of the survivor's columns), so probe_compiled checks it against the
-    oracle instead of skipping it.
+    """Each merged source leaf keeps an addressable residual assignment.
+
+    It's the leaf's slice of the survivor's columns, so probe_compiled
+    checks it against the oracle instead of skipping it.
     """
     from torchwright.compiler.export import compile_headless
     from torchwright.debug.probe import probe_compiled
@@ -614,8 +622,10 @@ def test_merged_leaves_are_probeable_as_survivor_slices():
 
 
 def test_fold_log_records_merge_slices():
-    """The fold-log layer: one record per run member, offsets in run order,
-    survivor self-record at offset 0.
+    """The fold-log layer keeps one record per run member.
+
+    Offsets follow run order, and the survivor's self-record sits at
+    offset 0.
     """
     from torchwright.graph.optimize import FoldLog
 
@@ -644,8 +654,10 @@ def _four_nodes():
 
 
 def test_fold_log_merge_composition():
-    """A member that was itself a merge survivor: its members' records follow
-    it into the new survivor in one retarget step.
+    """A member that was itself a merge survivor carries its history forward.
+
+    Its members' records follow it into the new survivor in one
+    retarget step.
     """
     from torchwright.graph.optimize import FoldLog
 
@@ -660,8 +672,10 @@ def test_fold_log_merge_composition():
 
 
 def test_fold_log_duplicate_survivor_occurrence_keeps_offset_zero():
-    """``concat([l, l])``: the survivor's own columns stay at the front; the
-    second occurrence duplicates them and must not retarget the self-record.
+    """``concat([l, l])`` duplicates the survivor without disturbing it.
+
+    The survivor's own columns stay at the front; the second
+    occurrence duplicates them and must not retarget the self-record.
     """
     from torchwright.graph.optimize import FoldLog
 
@@ -673,8 +687,9 @@ def test_fold_log_duplicate_survivor_occurrence_keeps_offset_zero():
 
 
 def test_fold_log_move_retargets_and_invalidates_slices():
-    """record_move: slices of the orphan's value follow it onto the survivor;
-    slices of the survivor's replaced value are dropped.
+    """record_move follows the orphan's slices onto the survivor.
+
+    Slices of the survivor's replaced value are dropped.
     """
     from torchwright.graph.optimize import FoldLog
 

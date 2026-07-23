@@ -37,7 +37,7 @@ D_HEAD = 16
 D_ROT = 8  # partial: the first 8 dims rotate, the last 8 are the NoPE tail
 
 
-def _build_direct(tmpdir):
+def _build_direct(_tmpdir):
     emb = create_onehot_embedding(_VOCAB)
     prev = rotary_offset_head(emb, delta_pos=-1, d_qk=D_HEAD, d_rot=D_ROT)
     return compile_to_hf(prev, emb, d=D, d_head=D_HEAD, max_seq_len=64)
@@ -103,9 +103,11 @@ def test_hf_partial_rope_prefill_equals_cached_decode():
     assert torch.allclose(full, decode, atol=1e-4), (full - decode).abs().max()
 
 
-def _build_content_model(tmpdir):
-    """Predict the highest-vocab-index token seen so far via a content head whose
-    content (a width-1 score) rides the NoPE tail under partial rotary.
+def _build_content_model(_tmpdir):
+    """Predict the highest-vocab-index token seen so far via a content head.
+
+    Its content (a width-1 score) rides the NoPE tail under partial
+    rotary.
     """
     from torchwright.graph.linear import Linear
     from torchwright.ops.attention_ops import attend_argmax_dot
@@ -124,9 +126,10 @@ def _build_content_model(tmpdir):
 
 
 def test_hf_partial_content_head_selects_by_content():
-    """A content head on the NoPE tail survives ONNX export + direct HF compilation and still
-    selects by content: each position predicts the highest-vocab-index token in its
-    causal window.
+    """A content head on the NoPE tail survives ONNX export + direct HF compilation.
+
+    It still selects by content: each position predicts the
+    highest-vocab-index token in its causal window.
     """
     seq = ["<bos>", "a", "c", "b", "e", "d"]  # indices 0,2,4,3,6,5
     ids = torch.tensor([[_VOCAB.index(t) for t in seq]])

@@ -1,6 +1,7 @@
-"""The swiglu_ffn builder: returns a swish FFN, degenerate vs gated by
-``up_proj`` presence, and pure-swish graphs built from it compile clean
-(``compile_headless`` + ``probe_compiled``).
+"""The swiglu_ffn builder returns a swish FFN, degenerate vs gated by ``up_proj``.
+
+Pure-swish graphs built from it compile clean (``compile_headless`` +
+``probe_compiled``).
 """
 
 import pytest
@@ -18,8 +19,9 @@ D_HEAD = 8
 
 
 def _build(gated_second=True):
-    """A two-FFN swish graph (gated feeding degenerate-or-gated) — new
-    node ids each call.
+    """A two-FFN swish graph (gated feeding degenerate-or-gated).
+
+    Returns new node ids each call.
     """
     x = create_input("x", 8, value_range=(-1.0, 1.0))
     g = torch.Generator().manual_seed(31)

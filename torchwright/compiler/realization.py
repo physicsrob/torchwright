@@ -37,7 +37,7 @@ from torchwright.graph.misc import LiteralValue
 
 #: Standalone Linear as rotary Δ=0 self-match attention head(s).
 ATTN_TRANSPORT = "attn_transport"
-#: Standalone Linear in the MLP via the bypass identity act(z) − act(−z) = z
+#: Standalone Linear in the MLP via the bypass identity act(z) - act(-z) = z
 #: (two hidden slots per output column; exact for relu and for swish).
 MLP_BYPASS = "mlp_bypass"
 #: An Attn node on attention heads (the only hardware that attends).
@@ -93,16 +93,16 @@ def is_schedulable(node: Node) -> bool:
 
 
 def has_flex_choice(node: Node) -> bool:
-    """True when the node's class is a *free* choice a resolver must make
-    (a CP-SAT decision variable in the directed path) — the standalone
+    """True when the node's class is a *free* choice a resolver must make.
+
+    A CP-SAT decision variable in the directed path — the standalone
     ``Linear`` and the ``Add``.
     """
     return len(candidate_classes(node)) > 1
 
 
 def flex_route_classes(node: Node) -> tuple[str, str]:
-    """The (attention-family, MLP-family) candidate classes of a node with
-    a free routing choice.
+    """The (attention-family, MLP-family) candidates of a free-routing-choice node.
 
     Raises ``TypeError`` on nodes without exactly one candidate per
     sublayer — the route resolvers and skip diagnostics may only call this
@@ -143,7 +143,7 @@ def fits_mlp(node: Node, usable_slots: int) -> bool:
     """Whether *node* has an MLP realization at all under this geometry.
 
     Both MLP route families spend two hidden slots per output column (the
-    bypass identity ``act(z) − act(−z) = z``), so a node whose
+    bypass identity ``act(z) - act(-z) = z``), so a node whose
     ``2 · d_output`` exceeds a layer's entire usable hidden pool can never
     be placed — not in this layer, not in any layer, no matter how empty
     the MLP is.  That makes this a *structural* property of the node and
@@ -155,9 +155,10 @@ def fits_mlp(node: Node, usable_slots: int) -> bool:
 
 
 def static_flex_class(node: Node, policy: SchedulingPolicy, usable_slots: int) -> str:
-    """The static policy's pick for a free choice — the one rule both the
-    optimize=0 resolver and the CP-SAT model's pinned (``flex_routing=
-    False``) routing apply.
+    """The static policy's pick for a free choice.
+
+    The one rule both the optimize=0 resolver and the CP-SAT model's
+    pinned (``flex_routing=False``) routing apply.
 
     Capacity is checked before policy.  A node too wide for its MLP family
     (:func:`fits_mlp`) has exactly one realization left, so it goes to its
@@ -186,8 +187,7 @@ def static_flex_class(node: Node, policy: SchedulingPolicy, usable_slots: int) -
 
 
 def live_weight_row_ranges(node: Node) -> tuple[tuple[int, int], ...]:
-    """The rows of ``node.output_matrix`` with any nonzero entry, as
-    ``(start, length)`` runs.
+    """The nonzero rows of ``node.output_matrix``, as ``(start, length)`` runs.
 
     THE single support convention for attention-transport head charging —
     nonzero entries of ``output_matrix`` only, matching what
@@ -244,10 +244,10 @@ def _linear_live_attn_chunks(node: Node, d_head: int) -> tuple[int, ...]:
 
 
 def linear_attn_chunks(node: Node, d_head: int) -> tuple[int, ...]:
-    """The ``d_head``-wide input chunks a Linear's attention transport
-    actually needs, in ascending order.
+    """The ``d_head``-wide input chunks a Linear's attention transport actually needs.
 
-    THE single head-charge declaration.  ``_write_compute_linear`` splits a
+    In ascending order.  THE single head-charge declaration.
+    ``_write_compute_linear`` splits a
     Linear's input into ``d_head``-wide chunks and emits one Δ=0 self-match
     head per chunk; a chunk whose weight rows are all zero contributes
     exactly zero to the output (its head's O block would be zero), so it is
@@ -268,8 +268,9 @@ def linear_attn_chunks(node: Node, d_head: int) -> tuple[int, ...]:
 
 
 def linear_attn_heads(node: Node, d_head: int) -> int:
-    """Attention-transport head demand of a standalone Linear: one head per
-    live input chunk (:func:`linear_attn_chunks`), floor 1.
+    """Attention-transport head demand of a standalone Linear.
+
+    One head per live input chunk (:func:`linear_attn_chunks`), floor 1.
     """
     return len(linear_attn_chunks(node, d_head))
 
@@ -285,12 +286,11 @@ def linear_attn_live_heads(node: Node, d_head: int) -> int:
 
 
 def add_attn_heads(node: Node, d_head: int, *, reused: bool) -> int:
-    """Attention-head demand of an ``ATTN_ADD`` at a known residual
-    placement.
+    """Attention-head demand of an ``ATTN_ADD`` at a known residual placement.
 
     Reused placement (``add_into``) copies the live addend into the dead
     addend's columns: one head per ``d_head``-wide chunk.  Fresh placement
-    (``compute_add``) is charged the conservative model-level ``2 ×`` that;
+    (``compute_add``) is charged the conservative model-level ``2 x`` that;
     the walk's emission can share one head when two chunks of the same Add
     fit in a single ``d_head``.
     """
@@ -299,8 +299,9 @@ def add_attn_heads(node: Node, d_head: int, *, reused: bool) -> int:
 
 
 def class_heads(node: Node, cls: str, d_head: int) -> int:
-    """Attention-head demand of realizing *node* as *cls* (0 for MLP
-    classes).  ``ATTN_ADD`` demand depends on reused-versus-fresh residual
+    """Attention-head demand of realizing *node* as *cls* (0 for MLP classes).
+
+    ``ATTN_ADD`` demand depends on reused-versus-fresh residual
     placement, which is scheduler state, not part of the class — callers
     that know the placement use :func:`add_attn_heads`; callers that don't
     report the range (see :func:`summarize_cost`).
@@ -318,8 +319,9 @@ def class_heads(node: Node, cls: str, d_head: int) -> int:
 
 
 def class_hidden_slots(node: Node, cls: str) -> int:
-    """MLP hidden-slot demand of realizing *node* as *cls* (0 for
-    attention classes; a literal's constant write costs no hidden slot).
+    """MLP hidden-slot demand of realizing *node* as *cls*.
+
+    0 for attention classes; a literal's constant write costs no hidden slot.
     """
     if cls in (MLP_BYPASS, MLP_ADD):
         return 2 * node.d_output
@@ -471,8 +473,7 @@ class RealizationTable:
         usable_slots: int,
         forced_classes: dict[int, str] | None = None,
     ) -> "RealizationTable":
-        """The optimize=0 resolver: :func:`static_flex_class` picks every free
-        choice.
+        """The optimize=0 resolver: :func:`static_flex_class` picks every free choice.
 
         :func:`static_flex_class` applies each flexible node's own knob
         (``policy.local_in_attention`` for standalone Linears,
@@ -513,10 +514,12 @@ class RealizationTable:
     def resolve_from_assignment(
         self, node_to_routing: Mapping[int, str]
     ) -> "RealizationTable":
-        """The directed-path resolver: the CP-SAT solve's per-node sublayer
-        decisions (``ScheduleAssignment.node_to_routing``) pick every free
-        choice.  Raises if the assignment contradicts a locked entry's
-        sublayer — the tripwire for the two option sets drifting apart.
+        """The directed-path resolver: per-node sublayer decisions pick every choice.
+
+        Decisions come from the CP-SAT solve
+        (``ScheduleAssignment.node_to_routing``).  Raises if the
+        assignment contradicts a locked entry's sublayer — the tripwire
+        for the two option sets drifting apart.
         """
         resolved: dict[int, Entry] = {}
         for node_id, entry in self.entries.items():
@@ -565,8 +568,9 @@ class RealizationTable:
         return CLASS_SUBLAYER[self.resolved_class(node)] == "attn"
 
     def check_complete(self, nodes: Iterable[Node]) -> None:
-        """Every schedulable node has a resolved entry.  Runs before the
-        layer walk.
+        """Every schedulable node has a resolved entry.
+
+        Runs before the layer walk.
         """
         problems = []
         for node in nodes:

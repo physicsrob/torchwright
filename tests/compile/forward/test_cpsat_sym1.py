@@ -148,8 +148,7 @@ def test_knob_off_is_byte_identical(name):
 
 @pytest.mark.parametrize("name", _NAMES)
 def test_knob_on_changes_proto(name):
-    """With the knob on the legacy proto differs — the implications are really
-    posted.
+    """Change the legacy proto with the canonical-cancel-reps knob on.
 
     Every example graph has at least one non-keep-forever node with a cancel
     window (``cancel_slack`` default 2), so each gets a ``parked`` var and the
@@ -199,7 +198,8 @@ def test_canonical_form_on_solved_model(name, d):
         _canonical_cancel_reps=True,
         _pin_cancels=False,
     )
-    assert asg is not None and stats.is_optimal, (
+    assert asg is not None, f"{name} d={d}: solve found nothing"
+    assert stats.is_optimal, (
         f"{name} d={d}: expected a proven-optimal solve (got {stats.status_name})"
     )
     max_layers = 100
@@ -246,10 +246,10 @@ def test_depth_invariance_on_vs_off(name, d):
 
     off_asg, off_stats = _solve(False)
     on_asg, on_stats = _solve(True)
-    assert off_asg is not None and off_stats.is_optimal, (
-        f"{name} d={d}: off not optimal"
-    )
-    assert on_asg is not None and on_stats.is_optimal, f"{name} d={d}: on not optimal"
+    assert off_asg is not None, f"{name} d={d}: off solve found nothing"
+    assert off_stats.is_optimal, f"{name} d={d}: off not optimal"
+    assert on_asg is not None, f"{name} d={d}: on solve found nothing"
+    assert on_stats.is_optimal, f"{name} d={d}: on not optimal"
     assert on_asg.n_layers == off_asg.n_layers, (
         f"{name} d={d}: canonicalization changed the optimal depth "
         f"(off={off_asg.n_layers}, on={on_asg.n_layers})"

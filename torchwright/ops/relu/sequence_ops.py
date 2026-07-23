@@ -129,7 +129,7 @@ def output_sequence(
     trigger_condition: Node,
     seq: list[Node],
     default_output: torch.Tensor,
-):
+) -> Node:
     r"""Gate a sequence of values for left-to-right autoregressive emission.
 
     Before the trigger fires, outputs default_output. Once the trigger fires
@@ -214,7 +214,7 @@ def remove_leading_0s(
     3. ``in_range(k, k + 1, ...)`` — the shift-amount one-hot, computed
        once and shared by every output slot.
     4. A ``broadcast_select`` per output slot over that slot's shift
-       candidates, plus the free cross-slot collapse.  Steps 3–4 are
+       candidates, plus the free cross-slot collapse.  Steps 3-4 are
        ``dynamic_extract`` with the index one-hot hoisted out of the
        per-slot loop.
 

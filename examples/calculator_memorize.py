@@ -133,8 +133,9 @@ def compiled_layers(max_digits: int, d_hidden: int = 16384) -> int:
 
 
 def _format_answer(embedding: Embedding, value: int, seq_len: int) -> torch.Tensor:
-    """The complete formatted answer as a flat ``seq_len * 17`` vector:
-    sign and decimal digits, then <eos> padding — exactly what the other
+    """The complete formatted answer as a flat ``seq_len * 17`` vector.
+
+    Sign and decimal digits, then <eos> padding - exactly what the other
     calculators spend their comparison / borrow / trim machinery producing.
     """
     text = str(value)

@@ -15,6 +15,9 @@ from torchwright.ops.inout_nodes import create_literal_value
 from torchwright.ops.linear import concat
 from torchwright.ops.swiglu.map_select import map_to_table
 
+# Decimal digits run 0-9; a carry out of the ones place happens at 10.
+_DIGIT_BASE = 10
+
 
 def sum_digits(
     embedding: Embedding, num1: Node, num2: Node, carry_in: Node
@@ -48,7 +51,7 @@ def sum_digits(
                     str((A + B + C) % 10)
                 )
                 carry_out_table[entry_key] = torch.tensor(
-                    [1.0 if (A + B + C) >= 10 else -1.0]
+                    [1.0 if (A + B + C) >= _DIGIT_BASE else -1.0]
                 )
 
     key = concat([num1, num2, carry_in])
@@ -73,7 +76,7 @@ def sum_digit_seqs(
     carry = create_literal_value(torch.tensor([-1.0]))
     out = []
     for digit1, digit2 in reversed(list(zip(seq1, seq2, strict=False))):
-        sum, carry = sum_digits(embedding, digit1, digit2, carry)
-        out.append(sum)
+        digit_sum, carry = sum_digits(embedding, digit1, digit2, carry)
+        out.append(digit_sum)
 
     return list(reversed(out))

@@ -26,8 +26,8 @@ def scalar_to_embedding(inp: Node, embedding: Embedding) -> Node:
     unit steps at half-integer thresholds, vector-valued (the embedding
     deltas fold into out_proj, all lanes degenerate)::
 
-        step_k = hinge(z_k) − hinge(z_k − 1),  z_k = S·(x − (k+0.5))
-        result = embed(0) + Σ_k step_k · (embed(k+1) − embed(k))
+        step_k = hinge(z_k) - hinge(z_k - 1),  z_k = S·(x - (k+0.5))
+        result = embed(0) + Σ_k step_k · (embed(k+1) - embed(k))
 
     The single-FFN form stays safe — no floor_int-style two-stage split:
     there are 9 boundaries and the sharpened arguments top out near

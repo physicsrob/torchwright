@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from typing import Any, cast
+
 from transformers import PretrainedConfig
 
 
@@ -52,7 +54,7 @@ class TorchwrightCustomConfig(PretrainedConfig):
         d_rot: int | None = None,
         rms_norm: bool = False,
         rms_norm_eps: float = 1e-5,
-        **kwargs,
+        **kwargs: object,
     ) -> None:
         self.d = int(d)
         self.d_head = int(d_head)
@@ -93,4 +95,8 @@ class TorchwrightCustomConfig(PretrainedConfig):
                 "— rebuild it with compile_to_hf / compile_hf_bundle."
             )
         kwargs["tie_word_embeddings"] = True
-        super().__init__(**kwargs)
+        # PreTrainedConfig is `@dataclass_transform`-synthesized: its __init__
+        # is a strict union of named field types that no `dict[str, object]`
+        # satisfies structurally, even though every value here is one of the
+        # real, individually-valid config fields.
+        super().__init__(**cast("dict[str, Any]", kwargs))

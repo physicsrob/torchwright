@@ -56,7 +56,7 @@ from torchwright.graph.misc import (
 )
 
 if TYPE_CHECKING:
-    from collections.abc import Callable
+    from collections.abc import Callable, Iterator
 
 
 class GraphCloneError(RuntimeError):
@@ -82,9 +82,7 @@ def topological_order(output_node: Node) -> list[Node]:
             continue
         visited.add(node)
         stack.append((node, True))
-        for inp in node.inputs:
-            if inp not in visited:
-                stack.append((inp, False))
+        stack.extend((inp, False) for inp in node.inputs if inp not in visited)
     return order
 
 
@@ -143,7 +141,7 @@ def _remap_bound_basis(ab: AffineBound, id_map: dict[int, int]) -> AffineBound:
     )
 
 
-def _iter_stray_node_refs(value, depth: int = 0):
+def _iter_stray_node_refs(value: object, depth: int = 0) -> Iterator[Node]:
     """Yield ``Node`` instances found in ``value`` (one container level deep)."""
     if isinstance(value, Node):
         yield value
@@ -273,6 +271,24 @@ class GraphCopy:
     node_map: dict[Node, Node]
 
 
+def _remap_scheduling_predecessors(
+    src: Node, clone: Node, clone_map: dict[Node, Node]
+) -> None:
+    """Remap one clone's scheduling predecessors through ``clone_map``."""
+    try:
+        clone.scheduling_predecessors = {
+            clone_map[pred] for pred in src.scheduling_predecessors
+        }
+    except KeyError as e:
+        raise GraphCloneError(
+            f"scheduling predecessor of {src!r} is outside the "
+            f"output's ancestor cone (no clone exists for "
+            f"{e.args[0]!r}).  A predecessor that is not reachable "
+            f"from the output can never be scheduled — fix the hint "
+            f"wiring."
+        ) from None
+
+
 def clone_graph(output_node: Node, dispatch: dict[type, Callable]) -> GraphCopy:
     """Deep-copy the graph reachable from ``output_node``.
 
@@ -312,18 +328,7 @@ def clone_graph(output_node: Node, dispatch: dict[type, Callable]) -> GraphCopy:
     # may point at siblings the data-topological order visited later, so
     # they can only be remapped once every clone exists.
     for src, clone in clone_map.items():
-        try:
-            clone.scheduling_predecessors = {
-                clone_map[pred] for pred in src.scheduling_predecessors
-            }
-        except KeyError as e:
-            raise GraphCloneError(
-                f"scheduling predecessor of {src!r} is outside the "
-                f"output's ancestor cone (no clone exists for "
-                f"{e.args[0]!r}).  A predecessor that is not reachable "
-                f"from the output can never be scheduled — fix the hint "
-                f"wiring."
-            ) from None
+        _remap_scheduling_predecessors(src, clone, clone_map)
 
     return GraphCopy(
         output_node=clone_map[output_node],

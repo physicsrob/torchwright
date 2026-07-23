@@ -1,8 +1,8 @@
-"""Forward compiler: wires GraphAnalyzer, ResidualStreamMap, LayerScheduler,
-and WeightWriter into a complete compilation pipeline.
+"""Forward compiler: complete compilation pipeline.
 
-Produces a HeadlessTransformer that can compute the output node's value
-given input values.
+Wires GraphAnalyzer, ResidualStreamMap, LayerScheduler, and
+WeightWriter into a complete pipeline.  Produces a HeadlessTransformer
+that can compute the output node's value given input values.
 """
 
 import copy
@@ -18,6 +18,7 @@ import torch
 
 from torchwright.compiler.device import get_device
 from torchwright.compiler.forward.cpsat_scheduler import (
+    DEFAULT_COSTS,
     Costs,
     ScheduleAssignment,
     ScheduleResult,
@@ -51,6 +52,7 @@ from torchwright.compiler.forward.scheduler import (
 from torchwright.compiler.forward.scheduling_policy import SchedulingPolicy
 from torchwright.compiler.forward.sibling_clusters import (
     SiblingClusterAnalyzer,
+    SiblingClusters,
 )
 from torchwright.compiler.forward.weight_writer import (
     PlacementRecorder,
@@ -93,6 +95,25 @@ from torchwright.graph.node import reserve_node_id_above
 # before trusting the norm on a new graph.
 _RMS_NORM_CONST_EXP = 44
 
+# Upper bound (inclusive) on the 1024-multiple widths the compile_to_onnx
+# RMSNorm width contract certifies (rms_norm_width_supported).  Widths above
+# this are only supported when they're a power of two.
+_RMS_NORM_MAX_1024_MULTIPLE = 16384
+
+# fp32 has an 8-bit biased exponent; the largest representable exponent is
+# 127 (2^128 and above overflow to inf).  Used to bound the pinned-RMS
+# energy so it stays fp32-representable.
+_FP32_MAX_EXPONENT = 127
+
+# The minimum d_hidden when bias=False: hidden slot 0 is reserved for the
+# constant lane every folded bias writes through, so at least one real slot
+# (d_hidden >= 2) must remain.
+_MIN_D_HIDDEN_NO_BIAS = 2
+
+# optimize level that gets the folded floor-probe budget on top of its base
+# CP-SAT time budget (see forward_compile's optimize docstring).
+_OPTIMIZE_LEVEL_FOLDED_FLOOR_PROBE = 2
+
 
 @dataclass(frozen=True)
 class RmsNormSpec:
@@ -101,10 +122,10 @@ class RmsNormSpec:
     The norm is the identity.  A few reserved residual columns hold large
     power-of-two constants whose combined energy forces ``rms == 2^m``
     exactly; the uniform gain ``2^m`` cancels it (``x / rms * gain == x``),
-    so ``÷rms`` and ``×gain`` are pure fp32 exponent shifts and the identity
+    so ``÷rms`` and ``x gain`` are pure fp32 exponent shifts and the identity
     is bit-exact for every float at or above ``~2^(m-126)`` (a channel value
     below that underflows to a denormal under ``÷2^m`` and is not recovered
-    by the ``×gain`` — the documented near-zero floor, far below any real
+    by the ``x gain`` — the documented near-zero floor, far below any real
     data).  At a power-of-two width this is one column (two at odd
     ``log2(d)``); the general ``odd·2^k`` layout is derived in
     :func:`_rms_norm_pinned_layout`.  See ``docs/plan_rmsnorm.md`` and
@@ -138,7 +159,7 @@ def rms_norm_width_supported(d: int) -> bool:
     """
     if d <= 0:
         return False
-    if d % 1024 == 0 and d <= 16384:
+    if d % 1024 == 0 and d <= _RMS_NORM_MAX_1024_MULTIPLE:
         return True
     return (d & (d - 1)) == 0
 
@@ -207,7 +228,7 @@ def _reserve_rms_norm_columns(
     import numpy as np
 
     e_exp_top = d.bit_length() - 1 + 2 * m  # exponent of E's top set bit
-    if e_exp_top > 127:
+    if e_exp_top > _FP32_MAX_EXPONENT:
         raise ValueError(
             f"rms_norm_const_exp={q} overflows fp32: the pinned energy "
             f"d·2^(2m) ~ 2^{e_exp_top} exceeds the float32 range at d={d}. "
@@ -264,7 +285,7 @@ def _reserve_rms_norm_columns(
     )
 
 
-def _certify_rms_norm_energy(ra, spec: RmsNormSpec) -> None:
+def _certify_rms_norm_energy(ra: ResidualAssignment, spec: RmsNormSpec) -> None:
     """Prove the pinned-constant RMSNorm is the bit-exact identity for this graph.
 
     The norm is an identity only while the data energy the reduction sees stays
@@ -385,7 +406,7 @@ class _TrackingResidualStreamMap(ResidualStreamMap):
         # heuristic actually chose.
         self.cancel_mech: dict[int, str] = {}
 
-    def allocate(self, node: Node):  # type: ignore[override]
+    def allocate(self, node: Node) -> list[int]:  # type: ignore[override]
         # A node reaching allocate after a recorded free was rolled back
         # (its earlier free was premature); drop the stale cancel so the
         # genuine death — a later free, or omission if it dies by
@@ -399,7 +420,7 @@ class _TrackingResidualStreamMap(ResidualStreamMap):
         self.cancel_mech[node.node_id] = mech
         super().free(node, mech)
 
-    def hold(self, node: Node, mech: str = "attn"):  # type: ignore[override]
+    def hold(self, node: Node, mech: str = "attn") -> list[int]:  # type: ignore[override]
         self.cancel_layer[node.node_id] = self.current_layer
         self.cancel_mech[node.node_id] = mech
         return super().hold(node, mech)
@@ -440,11 +461,11 @@ def _build_heuristic_schedule_trace(
     d: int,
     d_head: int,
     n_heads: int,
-    pos_encoding,
+    pos_encoding: None,
     d_hidden: int,
     residual_map: ResidualStreamMap,
     computed: set[Node],
-    clusters,
+    clusters: SiblingClusters | None,
     *,
     bias: bool = True,
     admission_budget_fraction: float,
@@ -517,9 +538,12 @@ def _build_heuristic_schedule_trace(
             elif op.op_type == "compute_add_bypass":
                 hint_add_placement[op.node.node_id] = (False, None)
         for node in graph.get_all_nodes():
-            if isinstance(node, Concatenate) and node not in hint_computed:
-                if all(leaf in hint_computed for leaf in flatten_concat_nodes([node])):
-                    hint_computed.add(node)
+            if (
+                isinstance(node, Concatenate)
+                and node not in hint_computed
+                and all(leaf in hint_computed for leaf in flatten_concat_nodes([node]))
+            ):
+                hint_computed.add(node)
         for n in hint_computed - prev_hint:
             hint_layers[n.node_id] = hi
         if not attn_ops and not mlp_ops:
@@ -567,14 +591,15 @@ def _effective_consumers(graph: GraphAnalyzer, node: Node) -> set[Node]:
 
 def _verify_end_of_layer_liveness(
     graph: GraphAnalyzer,
-    residual_map,
+    residual_map: ResidualStreamMap,
     computed: set[Node],
     layer_idx: int,
 ) -> None:
-    """Invariant A (cross-layer): every node with uncomputed effective
-    consumers must still be allocated in the residual map.
+    """Invariant A (cross-layer).
 
-    Gated behind ``TW_COMPILER_VERIFY=1`` because the O(|nodes|·fanout)
+    Every node with uncomputed effective consumers must still be
+    allocated in the residual map.  Gated behind
+    ``TW_COMPILER_VERIFY=1`` because the O(|nodes|·fanout)
     walk is noticeable on large compiles.  When enabled, surfaces a
     freed-too-early node at the end of the layer where it was freed
     rather than later at a consumer's KeyError.
@@ -662,15 +687,15 @@ def _verify_end_of_layer_writes(
     prev_computed: set[Node],
     prev_allocated: set[Node],
     computed: set[Node],
-    residual_map,
+    residual_map: ResidualStreamMap,
     layer_idx: int,
 ) -> None:
-    """Invariant B (within-layer): every node freshly added to
-    ``computed_nodes`` this layer that owns residual columns must
-    have been written by some op in this layer's ``attn_ops`` or
-    ``mlp_ops``.
+    """Invariant B (within-layer).
 
-    Catches the failure mode where the scheduler marks a node
+    Every node freshly added to ``computed_nodes`` this layer that
+    owns residual columns must have been written by some op in this
+    layer's ``attn_ops`` or ``mlp_ops``.  Catches the failure mode
+    where the scheduler marks a node
     computed and allocates its columns but emits no op that writes
     a value into them.  Without this check, downstream consumers
     silently read uninitialized data and the compile produces
@@ -828,7 +853,7 @@ def _build_replay_plan(
     d_hidden: int,
     trim_heads: bool,
     max_layers: int,
-    on_node_scheduled=None,
+    on_node_scheduled: Callable[[Node, int], None] | None = None,
 ) -> ReplayPlan:
     """Run the allocator/scheduler once and retain its complete realization."""
     planned_rmap = copy.deepcopy(residual_map)
@@ -863,11 +888,14 @@ def _build_replay_plan(
             planned_rmap, planned_computed
         )
         for node in graph.get_all_nodes():
-            if isinstance(node, Concatenate) and node not in planned_computed:
-                if all(
+            if (
+                isinstance(node, Concatenate)
+                and node not in planned_computed
+                and all(
                     leaf in planned_computed for leaf in flatten_concat_nodes([node])
-                ):
-                    planned_computed.add(node)
+                )
+            ):
+                planned_computed.add(node)
 
         newly_computed = tuple(
             sorted(planned_computed - previous, key=lambda node: node.node_id)
@@ -1063,7 +1091,7 @@ def forward_compile(
     admission_min_peak_width: int = 32,
     policy: SchedulingPolicy | None = None,
     optimize: int = 0,
-    cpsat_costs: Costs = Costs(),
+    cpsat_costs: Costs = DEFAULT_COSTS,
     cpsat_flex_routing: bool = True,
     require_solver: bool = False,
     rms_norm: bool = False,
@@ -1111,6 +1139,34 @@ def forward_compile(
             state objects (``layer.attn.in_state`` / ``layer.mlp.out_state``)
             stay valid regardless and are consumed later when building
             ``residual_assignment``.
+        on_node_scheduled: Optional hook, called with ``(node, layer_idx)``
+            each time a node is scheduled into a layer during replay.
+            Trace-only; does not affect the compiled schedule.
+        trim_heads: When True (default), unused attention heads and
+            trailing unused MLP hidden slots are physically removed
+            from each compiled layer's weights after compilation (or,
+            when streaming via ``on_layer_compiled``, before that
+            layer's tensors are read and nulled).  When False, the
+            full-width (sparsified-but-not-trimmed) weights are kept.
+        admission_control: When True, runs a static sibling-cluster
+            analysis before scheduling and gates the CP-SAT/heuristic
+            admission of newly-computable nodes so co-scheduled
+            siblings finish together rather than trickling in across
+            layers.  Default False reproduces the pre-admission-control
+            scheduler behavior exactly.
+        admission_budget_fraction: Fraction of the residual budget the
+            admission-control gate may hold back for a cluster still
+            filling in.  Ignored when ``admission_control`` is False.
+        admission_min_chains: Minimum number of sibling chains a
+            cluster must have to qualify for admission control.
+            Ignored when ``admission_control`` is False.
+        admission_min_peak_width: Minimum peak residual width a
+            cluster must reach to qualify for admission control.
+            Ignored when ``admission_control`` is False.
+        policy: Static scheduling policy (attention-vs-MLP routing
+            defaults, etc.) consulted when ``cpsat_flex_routing`` is
+            False or ``optimize=0``.  Defaults to ``SchedulingPolicy()``
+            when not given.
         optimize: Optimization level. ``0`` (default) uses the
             heuristic :class:`LayerScheduler` and skips CP-SAT
             entirely — fastest compile, predictable layer count.
@@ -1429,7 +1485,7 @@ def forward_compile(
 
     if d_hidden is None:
         d_hidden = d
-    if not bias and d_hidden < 2:
+    if not bias and d_hidden < _MIN_D_HIDDEN_NO_BIAS:
         raise ValueError(
             f"bias=False reserves hidden slot 0 for the constant lane, so "
             f"d_hidden must be at least 2 (got {d_hidden})."
@@ -1455,7 +1511,7 @@ def forward_compile(
     # owns or writes it, so the column holds 1.0 through every attention read.
     # A compiler-internal final-MLP op then clears it before tied readout.  The
     # runtime rotates it by absolute position
-    # (rotate_half over d_head), making the self-match logit ∝ Σ_p cos((i−j)·θ_p)
+    # (rotate_half over d_head), making the self-match logit ∝ Σ_p cos((i-j)·θ_p)
     # peak at i==j — a bit-identical Δ=0 transport.
     # Before minting any compile-internal node, push the global id counter past
     # every graph node so the mint cannot share an id (and thus compare equal)
@@ -1767,7 +1823,7 @@ def forward_compile(
             # single-solve median 37 over 15 draws (umbrella
             # cpsat_pinned_cancel_plan.md, steps 2-3).
             solve_budget_s = cpsat_time_budget_s
-            if optimize == 2:
+            if optimize == _OPTIMIZE_LEVEL_FOLDED_FLOOR_PROBE:
                 solve_budget_s = cpsat_time_budget_s + min(150.0, cpsat_time_budget_s)
             if _solve_budget_s is not None:
                 # MEASUREMENT-ONLY override; never set in production.
@@ -1806,7 +1862,9 @@ def forward_compile(
             # load-bearing: without them the pinned model completed the hint
             # into ZERO incumbents in 5x600 s on the d=8192 fixture
             # (cpsat_pinned_cancel_plan.md step 2, batch 1).
-            def _solve_once(incumbent, horizon, budget):
+            def _solve_once(
+                incumbent: ScheduleAssignment | None, horizon: int, budget: float
+            ) -> tuple[ScheduleAssignment | None, SolveStats]:
                 return solve_schedule(
                     output_node,
                     pos_encoding,
@@ -1845,7 +1903,7 @@ def forward_compile(
                     ),
                 )
 
-            def _horizon_for(hn):
+            def _horizon_for(hn: int) -> int:
                 # The heuristic / best-so-far layer count + 1 slack layer is
                 # the search horizon when tighter than max_layers — a SOFT
                 # ceiling (the hint at depth hn stays feasible; a hard
@@ -1904,9 +1962,10 @@ def forward_compile(
                     if _disabled_families
                     else "sound"
                 )
+                stats = cast("SolveStats", net.cpsat_solve_stats)
                 print(
                     f"  solve-only measurement ({mode}): {claim}, "
-                    f"bound={cast('SolveStats', net.cpsat_solve_stats).best_objective_bound}"
+                    f"bound={stats.best_objective_bound}"
                 )
             return net
 
@@ -1966,7 +2025,7 @@ def forward_compile(
             )
         ):
 
-            def _plan_candidate(candidate_assignment):
+            def _plan_candidate(candidate_assignment: ScheduleAssignment) -> ReplayPlan:
                 candidate_scheduler = DirectedLayerScheduler(
                     graph,
                     d,
@@ -2469,14 +2528,19 @@ def forward_compile(
                     totals_by_type[op_type] = totals_by_type.get(op_type, 0) + n
             cross_pos = totals_by_type.get("compute_attn", 0)
             self_attn = sum(n for t, n in totals_by_type.items() if t != "compute_attn")
+            other_totals = ", ".join(
+                f"{n} {t}"
+                for t, n in sorted(totals_by_type.items())
+                if t != "compute_attn"
+            )
             print(
                 f"  Heads by purpose: {cross_pos} cross-position (compute_attn), "
-                f"{self_attn} self-attending "
-                f"({', '.join(f'{n} {t}' for t, n in sorted(totals_by_type.items()) if t != 'compute_attn')})"
+                f"{self_attn} self-attending ({other_totals})"
             )
             # Per-layer detail
             print(
-                f"\n  {'Layer':<8} {'Heads':>12}  {'KV depth':>10}  {'cross-pos':>10}  {'self-attn':>10}"
+                f"\n  {'Layer':<8} {'Heads':>12}  {'KV depth':>10}  "
+                f"{'cross-pos':>10}  {'self-attn':>10}"
             )
             for i, layer in enumerate(net.layers):
                 attn = layer.attn.attn

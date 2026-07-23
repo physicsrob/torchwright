@@ -1,14 +1,19 @@
+from typing import TYPE_CHECKING
+
 import torch
 
 from torchwright.graph.node import Node
 from torchwright.graph.rope import ROPE_BASE, apply_rope, rope_cos_sin
+
+if TYPE_CHECKING:
+    from torchwright.graph.value_type import NodeValueType
 
 # Causal mask sentinel: future positions are filled with this value before
 # softmax.  Must be large enough that no valid logit ever falls below it,
 # otherwise the softmax will prefer "hidden" future positions over the
 # real current position.  With _QUERY_GAIN = 8, _VALIDITY_DIRECT = 1000,
 # _UNMASKED_PENALTY = 1000, and |score| up to 120, the worst valid
-# logit is around −3000, still far above −1e6.  Retained at −1e6 so
+# logit is around -3000, still far above -1e6.  Retained at -1e6 so
 # that existing oracle/compiled parity is preserved.
 CAUSAL_MASK_SENTINEL = -1e6
 
@@ -133,7 +138,7 @@ class Attn(Node):
         self.rope_d_rot = rope_d_rot
         super().__init__(output_matrix.shape[1], inputs=[query_in, key_in, value_in])
 
-    def compute_value_type(self):
+    def compute_value_type(self) -> "NodeValueType":
         from torchwright.graph.value_type import NodeValueType
 
         return NodeValueType()
@@ -185,7 +190,7 @@ class Attn(Node):
         return values.matmul(self.output_matrix)
         # values shape is now (query pos, d_output)
 
-    def num_params(self):
+    def num_params(self) -> int:
         return (
             self.query_matrix.numel()
             + self.key_matrix.numel()

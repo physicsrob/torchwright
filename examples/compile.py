@@ -31,7 +31,7 @@ from __future__ import annotations
 import argparse
 import importlib
 import json
-import os
+from pathlib import Path
 
 from torchwright.compiler.hf import compile_hf_bundle
 
@@ -105,10 +105,10 @@ def _norm_gain(out_dir: str) -> str:
 
     from safetensors import safe_open
 
-    with open(os.path.join(out_dir, "model.safetensors.index.json")) as f:
+    with Path(out_dir, "model.safetensors.index.json").open() as f:
         weight_map = json.load(f)["weight_map"]
     key = "model.layers.0.input_layernorm.weight"
-    with safe_open(os.path.join(out_dir, weight_map[key]), framework="pt") as f:
+    with safe_open(str(Path(out_dir, weight_map[key])), framework="pt") as f:
         gain = float(f.get_tensor(key).max())
     exp = round(math.log2(gain))
     approx = f"{gain:.1e}".replace("e+", "e")
@@ -117,14 +117,16 @@ def _norm_gain(out_dir: str) -> str:
     return f"`{approx}`"
 
 
-def model_card(name: str, task: str | None, gain: str, prompts) -> str:
+def model_card(
+    name: str, task: str | None, gain: str, prompts: list[str] | None
+) -> str:
     card = _CARD_HEADER.format(name=name, task=task or "a computation graph", gain=gain)
     if prompts:
         card += _CARD_USAGE.format(prompt=prompts[0])
     return card
 
 
-def demo(out_dir: str, prompts) -> None:
+def demo(out_dir: str, prompts: list[str]) -> None:
     """Clean-room reload + greedy generation, as a user would consume it."""
     import torch
     from transformers import AutoModelForCausalLM, AutoTokenizer
@@ -175,9 +177,10 @@ def main() -> None:
     card = model_card(
         args.name, getattr(module, "CARD_TASK", None), _norm_gain(out_dir), prompts
     )
-    with open(os.path.join(out_dir, "README.md"), "w") as f:
+    with Path(out_dir, "README.md").open("w") as f:
         f.write(card)
-    print(f"Wrote bundle to {out_dir}: {sorted(os.listdir(out_dir))}")
+    bundle_files = sorted(p.name for p in Path(out_dir).iterdir())
+    print(f"Wrote bundle to {out_dir}: {bundle_files}")
 
     if prompts and not args.no_demo:
         demo(out_dir, prompts)

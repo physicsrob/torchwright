@@ -11,8 +11,8 @@ take the stronger bit-exact bar.
 from __future__ import annotations
 
 import importlib
-import os
 import tempfile
+from pathlib import Path
 
 import torch
 
@@ -37,7 +37,7 @@ def compile_example(name: str, d: int | None = None) -> str:
     artifact = compile_to_onnx(
         output_node,
         embedding,
-        os.path.join(out_dir, f"{name}.onnx"),
+        str(Path(out_dir) / f"{name}.onnx"),
         d=d if d is not None else module.D_MODEL,
         d_head=getattr(module, "D_HEAD", 16),
         bias=False,

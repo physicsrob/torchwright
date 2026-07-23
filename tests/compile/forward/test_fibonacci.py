@@ -30,8 +30,8 @@ def test_fibonacci(fibonacci):
 
     # Use "fibonacci" as the prompt — 9 letters provides enough tokens
     # before \n to avoid OOB attention for the output entries.
-    # Expected: 8 Fibonacci terms, each zero-padded to 2 digits.
-    # F = 1, 1, 2, 3, 5, 8, 13, 21
+    # Expected: 8 Fibonacci terms, each zero-padded to 2 digits, sequence
+    # 1, 1, 2, 3, 5, 8, 13, 21.
     expected_fibs = [1, 1, 2, 3, 5, 8, 13, 21]
     expected = "".join(f"{f:02d}" for f in expected_fibs)
 

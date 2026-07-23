@@ -98,13 +98,14 @@ def bool_all_true(inp_list: list[Node]) -> Node:
 
 
 def bool_not(inp: Node) -> Node:
-    """Returns a node that evaluates to 1.0 if the input node is false, and -1.0 if the input node is true.
+    """Returns a node that evaluates to 1.0 if false, -1.0 if true.
 
     Args:
         inp: Input node to be evaluated
 
     Returns:
-        Node: Output node that is 1.0 if the input node is false, and -1.0 if the input node is true.
+        Node: Output node that is 1.0 if the input node is false, and -1.0
+        if the input node is true.
 
     .. noise-footer::
 
@@ -115,14 +116,13 @@ def bool_not(inp: Node) -> Node:
 
 
 def equals_vector(inp: Node, vector: torch.Tensor) -> Node:
-    """Compare a node's value to a fixed key vector: +1 at a match, -1
-    otherwise.
+    """Compare a node's value to a fixed key vector: +1 at a match, -1 otherwise.
 
-    A one-sided compare on a dot product — one sharpened hinge whose bend
+    A one-sided compare on a dot product - one sharpened hinge whose bend
     sits a ``1/speed`` margin below the match::
 
-        m      = vector·inp − vector·vector       # 0 at match, ≤ −1/speed at non-match
-        result = 2·speed · Swish(scale·(m + 1/speed))/scale − 1
+        m      = vector·inp - vector·vector       # 0 at match, <= -1/speed at non-match
+        result = 2·speed · Swish(scale·(m + 1/speed))/scale - 1
 
     ``speed`` is ``embedding_step_sharpness``: the margin, in dot-product
     units, that distinct keys must clear — sized to absorb embedding
@@ -183,8 +183,8 @@ def cond_gate(cond: Node, inp: Node) -> Node:
         cond_gate(cond, inp) = Swish(scale·cond) · inp / scale
 
     ``Swish(scale·cond)/scale ≈ ReLU(cond)``: 1 at ``cond=+1``, 0 at
-    ``cond=−1`` — ``select`` with the false branch pinned to zero.
-    ``cond`` is ±1, enforced by an assert (same ``e^{−scale}``-class gate
+    ``cond=-1`` — ``select`` with the false branch pinned to zero.
+    ``cond`` is ±1, enforced by an assert (same ``e^{-scale}``-class gate
     error as select: at clean conds the off-path is exactly zero in fp32
     and the on-path passes with ~1 ulp relative rounding).  Because the
     multiply is direct, cond noise lands proportionally to the *actual*

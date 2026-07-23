@@ -5,11 +5,11 @@ Each token example used to be compiled in-process (``forward_compile`` →
 tests now export through :func:`compile_to_onnx` and decode with
 :meth:`OnnxTokenModule.generate` (argmax over logits).  The decoded output
 is token-identical: the embedding table is an equal-norm spherical code, so
-``argmax(x · eᵢ)`` selects the same row as ``argmin ‖x − eᵢ‖`` — the
+``argmax(x · eᵢ)`` selects the same row as ``argmin ‖x - eᵢ‖`` — the
 constant ``‖eᵢ‖²`` term drops out of the comparison.
 """
 
-import os
+from pathlib import Path
 
 import pytest
 
@@ -45,7 +45,7 @@ def load_example(build_fn, out_dir, *, d, d_head, name="example", rms_norm=None)
     use an odd width for residual reasons, not to exercise the norm.
     """
     output_node, embedding = build_fn()
-    onnx_path = os.path.join(str(out_dir), f"{name}.onnx")
+    onnx_path = str(Path(out_dir) / f"{name}.onnx")
     artifact = compile_to_onnx(
         output_node,
         embedding,

@@ -39,7 +39,10 @@ from typing import TYPE_CHECKING, Any, cast
 
 from ortools.sat.python import cp_model
 
-from torchwright.compiler.forward.add_placement import derive_add_placement
+from torchwright.compiler.forward.add_placement import (
+    AddPlacement,
+    derive_add_placement,
+)
 from torchwright.compiler.forward.graph_analysis import GraphAnalyzer
 from torchwright.compiler.forward.scheduling_policy import (
     LEGACY_POLICY,
@@ -67,9 +70,10 @@ from torchwright.graph.ffn import FFN
 from torchwright.graph.misc import LiteralValue
 
 if TYPE_CHECKING:
-    from collections.abc import Mapping
+    from collections.abc import Iterable, Mapping
 
     from torchwright.compiler.forward.cpsat_snapshot import (
+        NodeRecord,
         SchedulingProblem,
     )
 
@@ -89,13 +93,13 @@ class Costs:
 
     `beta` (long-sequence regime). Per-token attention compute scales
     as `O(L · d_head)` per head for sequence length `L`; per-layer
-    compute (the full `d × d_hidden` MLP matmul plus the `4 · d²`
+    compute (the full `d x d_hidden` MLP matmul plus the `4 · d²`
     attention QKVO matmuls) is independent of `L`. For long sequences,
     set `beta` above zero to push routing toward MLP. Rule of thumb:
     `beta ≈ L` makes one attention head equivalent to one extra layer.
 
     `gamma` (MLP bypass slot pressure). Less commonly useful — the
-    per-layer MLP matmul costs the full `d × d_hidden` regardless of
+    per-layer MLP matmul costs the full `d x d_hidden` regardless of
     how many slots are used. `gamma=0` is the normal case.
 
     `earliness` (plateau gradient). When above zero, adds a strictly
@@ -129,6 +133,12 @@ class Costs:
     gamma: int = 0
     earliness: int = 0
     waste: int = 0
+
+
+# Shared immutable default so ``cpsat_costs: Costs = DEFAULT_COSTS`` argument
+# defaults are a name lookup rather than a fresh call at def time (Costs is
+# frozen, so sharing this one instance across every default is safe).
+DEFAULT_COSTS = Costs()
 
 
 def lexicographic_objective_scale(max_secondary: int) -> int:
@@ -263,13 +273,15 @@ class ScheduleAssignment:
             missing = sorted(sched_ids - set(layer_map))
             extra = sorted(set(layer_map) - sched_ids)
             raise ValueError(
-                f"heuristic trace layer coverage mismatch: missing={missing}, extra={extra}"
+                f"heuristic trace layer coverage mismatch: "
+                f"missing={missing}, extra={extra}"
             )
         if set(node_to_routing) != sched_ids:
             missing = sorted(sched_ids - set(node_to_routing))
             extra = sorted(set(node_to_routing) - sched_ids)
             raise ValueError(
-                f"heuristic trace routing coverage mismatch: missing={missing}, extra={extra}"
+                f"heuristic trace routing coverage mismatch: "
+                f"missing={missing}, extra={extra}"
             )
 
         # Physical-versus-derived Add placement tripwire + reused-target
@@ -341,7 +353,8 @@ class ScheduleAssignment:
         unknown_cancel = set(observed_cancel_layer) - (sched_ids | input_ids)
         if unknown_cancel:
             raise ValueError(
-                f"heuristic trace has cancellation for unknown nodes: {sorted(unknown_cancel)}"
+                f"heuristic trace has cancellation for unknown nodes: "
+                f"{sorted(unknown_cancel)}"
             )
         cancel.update({int(k): int(v) for k, v in observed_cancel_layer.items()})
         # A reassigned target never went through free(), so its observed
@@ -698,7 +711,7 @@ def _effective_consumers(
     return result
 
 
-def build_graph_model(output_node: Node, pos_encoding=None) -> GraphModel:
+def build_graph_model(output_node: Node, pos_encoding: None = None) -> GraphModel:
     """Run all the static preprocessing the CP-SAT builder needs."""
     graph = GraphAnalyzer(output_node)
     output_node = graph.get_output_node()
@@ -773,7 +786,7 @@ def build_graph_model(output_node: Node, pos_encoding=None) -> GraphModel:
 
 def routing(
     node: Node,
-    gm: GraphModel,
+    _gm: GraphModel,
     policy: SchedulingPolicy,
     usable_slots: int | None,
 ) -> str:
@@ -811,11 +824,10 @@ def routing(
     return CLASS_SUBLAYER[single]
 
 
-def is_flex(node: Node, gm: GraphModel) -> bool:
-    """True iff this node's routing is a CP-SAT decision variable
-    when `flex_routing=True`.
+def is_flex(node: Node, _gm: GraphModel) -> bool:
+    """True iff this node's routing is a CP-SAT decision variable.
 
-    The nodes with a free realization choice
+    Applies when `flex_routing=True`.  The nodes with a free realization choice
     (`realization.has_flex_choice`): a standalone Linear can run in
     attention (`heads = ⌈d_input/d_head⌉`) or in MLP bypass
     (`slots = 2 · d_output`), and an Add can run in attention (reused or
@@ -857,7 +869,7 @@ def heads_for(node: Node, d_head: int) -> int:
     return 0
 
 
-def slots_for(node: Node, gm: GraphModel) -> int:
+def slots_for(node: Node, _gm: GraphModel) -> int:
     """MLP slots consumed if MLP-routed.
 
     An FFN carries one hidden slot per lane (the composite's slot
@@ -877,7 +889,7 @@ def slots_for(node: Node, gm: GraphModel) -> int:
     return 0
 
 
-def uses_residual(node: Node, gm: GraphModel) -> bool:
+def uses_residual(_node: Node, _gm: GraphModel) -> bool:
     """True iff this node gets its own residual-stream column allocation.
 
     Every schedulable node writes its output to the residual stream (a
@@ -974,7 +986,7 @@ def _compute_layer_bounds(
 
 def critical_path_layers(
     output_node: Node,
-    pos_encoding=None,
+    pos_encoding: None = None,
     *,
     policy: SchedulingPolicy | None = None,
     flex_routing: bool = True,
@@ -1005,7 +1017,13 @@ def critical_path_layers(
     return max(es.values()) + 1
 
 
-def _and_presence(model, parked, other, *, name):
+def _and_presence(
+    model: cp_model.CpModel,
+    parked: cp_model.IntVar | None,
+    other: cp_model.LiteralT,
+    *,
+    name: str,
+) -> cp_model.LiteralT:
     """Presence literal for AND(parked.Not(), ``other``).
 
     ``other`` is the desired literal already (e.g. ``cim`` or ``cim.Not()``).
@@ -1016,19 +1034,21 @@ def _and_presence(model, parked, other, *, name):
         return other
     aux = model.new_bool_var(name)
     model.add_bool_and([parked.Not(), other]).OnlyEnforceIf(aux)
-    model.add_bool_or([parked, other.Not()]).OnlyEnforceIf(aux.Not())
+    model.add_bool_or([parked, cast("cp_model.IntVar", other).Not()]).OnlyEnforceIf(
+        aux.Not()
+    )
     return aux
 
 
 def build_cpsat_model(
     output_node: Node,
-    pos_encoding=None,
+    pos_encoding: None = None,
     *,
     d: int,
     d_head: int,
     n_heads: int | None = None,
     d_hidden: int,
-    costs: Costs = Costs(),
+    costs: Costs = DEFAULT_COSTS,
     flex_routing: bool = True,
     max_layers: int = 60,
     cancel_slack: int | None = 2,
@@ -1093,7 +1113,7 @@ def build_cpsat_model_from_gm(
     d_head: int,
     n_heads: int | None = None,
     d_hidden: int,
-    costs: Costs = Costs(),
+    costs: Costs = DEFAULT_COSTS,
     flex_routing: bool = True,
     max_layers: int = 60,
     cancel_slack: int | None = 2,
@@ -1182,7 +1202,7 @@ def build_cpsat_model_from_gm(
     # rotation, no PosEncoding substrate); every input node is freeable
     # (recycled once its last consumer runs).  Additionally, ``reserve_residual``
     # columns are permanently removed from the free pool by ``forward_compile``
-    # *before* scheduling (the pinned-constant RMSNorm reserves 1–2 there — see
+    # *before* scheduling (the pinned-constant RMSNorm reserves 1-2 there — see
     # ``_reserve_rms_norm_columns``).  The solver never sees ``residual_map``, so
     # it must subtract BOTH the self-match column and ``reserve_residual`` here,
     # or the modeled capacity over-counts and the solver can emit a peak-occupancy
@@ -1329,17 +1349,15 @@ def build_cpsat_model_from_gm(
     # ---- Add reusable-placement classification ----
     # (docs/plan_additional_mlp_routing.md, *Route-aware reusable placement*.)
     # Per Add occurrence i, `reusable_i` reifies the sublayer-order deadness
-    # predicate: every OTHER effective consumer C of the occurrence satisfies
-    #     layer[C] < layer[A]
-    #     or (layer[C] == layer[A] and C attention-routed and A MLP-routed)
-    # — a same-layer attention consumer is complete by the MLP phase-start
-    # snapshot; every other same-layer consumer is not.  The occurrence's own
+    # predicate: every OTHER effective consumer C of the occurrence has
+    # `layer[C]` strictly less than `layer[A]`, or `layer[C]` equal to
+    # `layer[A]` with C attention-routed and A MLP-routed — a same-layer
+    # attention consumer is complete by the MLP phase-start snapshot; every
+    # other same-layer consumer is not.  The occurrence's own
     # birth needs no term: the dependency gaps above already order it before
     # A's snapshot.  Target selection is deterministic, never a solver
-    # choice:
-    #     reuse_0 = reusable_0
-    #     reuse_1 = NOT reusable_0 AND reusable_1
-    #     is_free = reusable_0 OR reusable_1
+    # choice: `reuse_0` is `reusable_0`; `reuse_1` is `reusable_1` when
+    # `reusable_0` is false; `is_free` is `reusable_0` or `reusable_1`.
     # Graph inputs are legitimate targets (they own residual columns and the
     # heuristic reassigns them); reuse is rejected only for a physically
     # non-reassignable value (Concatenate, the held source — its columns end
@@ -1507,7 +1525,7 @@ def build_cpsat_model_from_gm(
     # every reader.  The natural upper bound is ``max_layers``, which
     # leaves ~60 candidate values per node on a DOOM-scale graph.
     # When ``cancel_slack`` is set, restrict to a small window above
-    # the lower bound: the heuristic almost always cancels within 1–2
+    # the lower bound: the heuristic almost always cancels within 1-2
     # layers of the last consumer, so K=2 cuts the cancel decision
     # space ~30x with negligible loss of optimality.
     # Under `_pin_cancels` the equality pin (posted after `is_free` exists,
@@ -1584,7 +1602,12 @@ def build_cpsat_model_from_gm(
         tuple[int, cp_model.IntVar, cp_model.IntVar, list[int], list[int]]
     ] = []
 
-    def _canonicalize_cancel_reps(cl, parked, cim, rat=None) -> None:
+    def _canonicalize_cancel_reps(
+        cl: cp_model.IntVar,
+        parked: cp_model.IntVar,
+        cim: cp_model.IntVar | None,
+        rat: cp_model.IntVar | None = None,
+    ) -> None:
         # sym1 (MEASUREMENT-ONLY, gated by `_canonical_cancel_reps`; default OFF
         # posts nothing, keeping the proto byte-identical).  Removes two
         # encoding degeneracies where one physical schedule has multiple model
@@ -1829,12 +1852,12 @@ def build_cpsat_model_from_gm(
     # "add_live_addend_gap" family relaxes both terms to `layer[A]` for a
     # bindingness lower bound; a schedule solved with it disabled must NEVER
     # be compiled/replayed.
-    def _add_consumer_cancel_expr_attn(add_id: int):
+    def _add_consumer_cancel_expr_attn(add_id: int) -> cp_model.LinearExprT:
         if "add_live_addend_gap" in _disabled_families:
             return layer_var[add_id]
         return layer_var[add_id] + add_attn_gap[add_id]
 
-    def _add_consumer_cancel_expr_mlp(add_id: int):
+    def _add_consumer_cancel_expr_mlp(add_id: int) -> cp_model.LinearExprT:
         if "add_live_addend_gap" in _disabled_families:
             return layer_var[add_id]
         return layer_var[add_id] + is_free[add_id]
@@ -2401,40 +2424,44 @@ _KIND_TO_CLASS = {
 
 
 class _StandInGraph:
-    """The narrow slice of ``GraphAnalyzer`` the builder + solver read off
-    ``gm.graph``: ``get_all_nodes`` (validator id→node map) and
+    """The narrow slice of ``GraphAnalyzer`` the builder + solver read off ``gm.graph``.
+
+    Exposes ``get_all_nodes`` (validator id->node map) and
     ``get_critical_path_length`` (solver decision strategy).  Raw-consumer /
     topo-order queries are not reconstructed from a snapshot (the builder uses
     ``gm.consumers_eff``, not ``gm.graph``); they raise loudly if ever read.
     """
 
-    def __init__(self, all_nodes, critical_path: dict[int, int]) -> None:
+    def __init__(
+        self, all_nodes: Iterable[Node], critical_path: dict[int, int]
+    ) -> None:
         self._all_nodes = set(all_nodes)
         self._critical_path = critical_path
 
-    def get_all_nodes(self):
+    def get_all_nodes(self) -> set[Node]:
         return self._all_nodes
 
     def get_critical_path_length(self, node: Node) -> int:
         return self._critical_path.get(node.node_id, 0)
 
-    def get_output_node(self):  # pragma: no cover - parity with GraphAnalyzer
+    def get_output_node(self) -> Node:  # pragma: no cover - parity with GraphAnalyzer
         raise NotImplementedError("stand-in graph exposes no output-node query")
 
-    def get_consumers(self, node):  # pragma: no cover - not snapshotted
+    def get_consumers(self, node: Node) -> tuple[Node, ...]:  # pragma: no cover
         raise NotImplementedError(
             "raw consumers are not reconstructed from a snapshot; the builder "
             "reads gm.consumers_eff instead"
         )
 
-    def get_topological_order(self):  # pragma: no cover - not snapshotted
+    def get_topological_order(self) -> list[Node]:  # pragma: no cover
         raise NotImplementedError("topological order is not reconstructed")
 
 
 class _ShapeCarrier:
-    """Minimal stand-in for a weight tensor: exposes only ``.shape`` so
-    ``FFN.n_lanes`` (``self.gate_proj.shape[0]``) returns the captured lane
-    count without materializing a tensor.
+    """Minimal stand-in for a weight tensor: exposes only ``.shape``.
+
+    So ``FFN.n_lanes`` (``self.gate_proj.shape[0]``) returns the captured
+    lane count without materializing a tensor.
     """
 
     __slots__ = ("shape",)
@@ -2443,7 +2470,7 @@ class _ShapeCarrier:
         self.shape = (n_lanes,)
 
 
-def _stand_in_node(rec) -> Node:
+def _stand_in_node(rec: NodeRecord) -> Node:
     cls = _KIND_TO_CLASS.get(rec.kind)
     if cls is None:
         raise ValueError(
@@ -2521,7 +2548,7 @@ def build_model_from_snapshot(
     d_head: int,
     n_heads: int | None = None,
     d_hidden: int,
-    costs: Costs = Costs(),
+    costs: Costs = DEFAULT_COSTS,
     flex_routing: bool = True,
     max_layers: int = 60,
     cancel_slack: int | None = 2,
@@ -2591,7 +2618,7 @@ def build_model_from_snapshot(
 # ---------------------------------------------------------------------------
 
 
-def dump_model_proto(built: BuiltModel, path) -> os.PathLike:
+def dump_model_proto(built: BuiltModel, path: str | os.PathLike) -> os.PathLike:
     """Serialize a built CP-SAT model to disk for a zero-rebuild re-solve.
 
     Writes the OR-Tools model proto (text format — the installed pybind build
@@ -2618,7 +2645,7 @@ def dump_model_proto(built: BuiltModel, path) -> os.PathLike:
 
 
 def resolve_model_proto(
-    path,
+    path: str | os.PathLike,
     *,
     time_budget_s: float = 60.0,
     workers: int | None = None,
@@ -2684,7 +2711,12 @@ class _IncumbentTrace(cp_model.CpSolverSolutionCallback):
     """
 
     def __init__(
-        self, layer_var, cancel_layer, input_cancel_layer, n_layers_var, out
+        self,
+        layer_var: dict[int, cp_model.IntVar],
+        cancel_layer: dict[int, cp_model.IntVar],
+        input_cancel_layer: dict[int, cp_model.IntVar],
+        n_layers_var: cp_model.IntVar,
+        out: list[dict],
     ) -> None:
         super().__init__()
         self._layer_var = layer_var
@@ -2796,13 +2828,15 @@ def _validate_hint(
                 f"{_desc(nid)} hint={route}"
             )
 
-    def _hinted_add_placement(A: Add):
-        """Derive A's placement from the LAYER/ROUTING hints through the one
-        assignment-level definition (`add_placement.derive_add_placement` —
-        the same rule the model's per-occurrence literals reify; keep them
-        in sync).  Returns None (check leniently) when a needed hint is
-        missing.  The held target short-circuits inside the derivation
-        (is_free pinned 0, never derived).
+    def _hinted_add_placement(A: Add) -> AddPlacement | None:
+        """Derive A's placement from the LAYER/ROUTING hints.
+
+        Goes through the one assignment-level definition
+        (`add_placement.derive_add_placement` — the same rule the model's
+        per-occurrence literals reify; keep them in sync).  Returns None
+        (check leniently) when a needed hint is missing.  The held target
+        short-circuits inside the derivation (is_free pinned 0, never
+        derived).
         """
         if hint_layers is None or A.node_id not in hint_layers:
             return None
@@ -2827,8 +2861,9 @@ def _validate_hint(
             return None
 
     def _hinted_add_placement_complete(A: Add) -> bool:
-        """True when every hint the derivation read actually existed — a
-        missing consumer layer/route makes the derivation conservative
+        """True when every hint the derivation read actually existed.
+
+        A missing consumer layer/route makes the derivation conservative
         (not reusable), which must not be mistaken for a derived fresh.
         """
         if hint_layers is None or A.node_id not in hint_layers:
@@ -2986,8 +3021,13 @@ def _validate_hint(
                     )
 
     if violations:
-        shown = "; ".join(violations[:5])
-        more = f" (+{len(violations) - 5} more)" if len(violations) > 5 else ""
+        max_shown = 5
+        shown = "; ".join(violations[:max_shown])
+        more = (
+            f" (+{len(violations) - max_shown} more)"
+            if len(violations) > max_shown
+            else ""
+        )
         msg = (
             f"warm-start hint validation found {len(violations)} "
             f"violation(s) — CP-SAT will silently drop the affected hints "
@@ -3001,13 +3041,13 @@ def _validate_hint(
 
 def solve_schedule(
     output_node: Node,
-    pos_encoding=None,
+    pos_encoding: None = None,
     *,
     d: int,
     d_head: int,
     n_heads: int | None = None,
     d_hidden: int,
-    costs: Costs = Costs(),
+    costs: Costs = DEFAULT_COSTS,
     flex_routing: bool = True,
     time_budget_s: float = 60.0,
     max_layers: int = 60,
@@ -3043,8 +3083,10 @@ def solve_schedule(
             scheduler operates over.
         pos_encoding: vestigial — always ``None`` under RoPE; retained for
             call-site compatibility.
-        d, d_head, d_hidden: transformer geometry. Residual budget is
+        d: residual stream width.  Residual budget is
             ``d - input_residual_cols``.
+        d_head: attention head dimension.
+        d_hidden: MLP hidden width per layer.
         n_heads: Per-layer attention-head capacity. Defaults to
             ``d // d_head``.
         costs: objective weights. See :class:`Costs`.
@@ -3060,13 +3102,17 @@ def solve_schedule(
             start. Tests and measurement tooling that require a partial or
             intentionally invalid hint use the private ``_diagnostic_hint``
             seam with one :class:`DiagnosticHint` value.
+        held_source_id: node id of the held-bank source (token export's
+            tied-embedding contract), or None outside that contract.
+        held_target_id: node id of the held-bank target, or None outside
+            the held-bank contract.
         cancel_slack: when not None, restrict each non-pinned node's
             cancel layer to ``[earliest_dead, earliest_dead + K]``
             where ``earliest_dead = max(layer[c] + 1)`` over consumers
             and ``K == cancel_slack``.  Cuts the cancel-decision
             search space ~30x at K=2 with negligible loss of
             optimality (the heuristic almost always cancels within
-            1–2 layers of the last consumer).  Set to None to keep
+            1-2 layers of the last consumer).  Set to None to keep
             the wide ``[layer[n]+1, max_layers]`` domain.  Default 2.
         policy: only consulted when ``flex_routing=False``.  Defaults
             to ``LEGACY_POLICY``.
@@ -3079,14 +3125,27 @@ def solve_schedule(
             are saturated by ops outside the model.
         reserve_residual: residual columns permanently removed from the
             free pool before scheduling and therefore unavailable to the
-            solver (the pinned-constant RMSNorm reserves 1–2; see
+            solver (the pinned-constant RMSNorm reserves 1-2; see
             ``forward_compile``).  Subtracted from the residual budget so
             the modeled capacity matches the reservation-reduced replay
             pool.  Defaults to 0.
+        tighten_domains: if True, tighten each node's cancel-layer domain
+            using the warm-start hint (sound only when the hint is known
+            feasible — see the ``tighten_domains=True`` call sites).
+        solver_params: extra ``CpSolver.parameters`` fields (scalar or
+            list-valued) applied to the solve.  MEASUREMENT-ONLY; never
+            set in production.
+        solution_trace: when given, every improving incumbent's full
+            assignment is appended to this list as a snapshot dict
+            (offline trajectory analysis).  MEASUREMENT-ONLY.
         strict_hint: if True, a hint the model would drop or reject
             raises ``ValueError`` (see :func:`_validate_hint`).  Default
             False emits one ``RuntimeWarning`` instead — production
             keeps its fall-back-don't-fail contract; tests use strict.
+        drop_decision_strategy: if True, the scheduler's hand-rolled
+            critical-path-first ``AddDecisionStrategy`` is not emitted,
+            leaving CP-SAT's fixed-search subsolver slot to its default
+            portfolio.  Search-only; never set in production.
 
     Raises ``RuntimeError`` only on structural problems (no residual
     columns left after pre-allocated inputs).  Solver-outcome
@@ -3144,7 +3203,7 @@ def solve_schedule_from_snapshot(
     d_head: int,
     n_heads: int | None = None,
     d_hidden: int,
-    costs: Costs = Costs(),
+    costs: Costs = DEFAULT_COSTS,
     flex_routing: bool = True,
     time_budget_s: float = 60.0,
     max_layers: int = 60,
@@ -3226,9 +3285,11 @@ def _solve_built(
     strict_hint: bool = False,
     drop_decision_strategy: bool = False,
 ) -> tuple[ScheduleAssignment | None, SolveStats]:
-    """Validate + apply the warm-start hint, set the decision strategy, solve,
-    and read the assignment back off a pre-built model.  Shared by
-    :func:`solve_schedule` (live) and :func:`solve_schedule_from_snapshot`.
+    """Validate + apply the warm-start hint, solve, and read back the result.
+
+    Sets the decision strategy, solves, and reads the assignment back off
+    a pre-built model.  Shared by :func:`solve_schedule` (live) and
+    :func:`solve_schedule_from_snapshot`.
 
     ``drop_decision_strategy`` is MEASUREMENT-ONLY (C1 sweep, arm
     ``no_decision_strategy``): when True the hand-rolled critical-path-first
@@ -3237,22 +3298,21 @@ def _solve_built(
     set — only which schedule the search finds first — so it is never set in
     production.
     """
-    if built.pin_cancels:
-        # The pinned model (`_pin_cancels`) equality-pins every cancel layer,
-        # so a captured cancel-layer hint would almost always contradict the
-        # pin and CP-SAT would silently discard the whole incumbent.  Drop it
-        # (once layers, routings, and `cancel_in_mlp` are decided the cancels
-        # are forced by propagation), which also keeps `_validate_hint` off
-        # that family.  The layer, routing, and cancel-MECHANISM hints are
-        # kept: `cancel_in_mlp` stays a free decision under the pin, and on a
-        # head-saturated graph its hint carries exactly the packing choice —
-        # which cancels take the same-layer MLP tier — that makes the warm
-        # start completable.  Measured 2026-07-09 on the d=8192 fixture:
-        # with the mechanism hint also dropped, no seed completed the hint
-        # into ANY incumbent in 600 s (0/5), vs first incumbents at 83-104 s
-        # for the unpinned control.
-        if hint is not None:
-            hint = hint.without_cancel_layers()
+    # The pinned model (`_pin_cancels`) equality-pins every cancel layer,
+    # so a captured cancel-layer hint would almost always contradict the
+    # pin and CP-SAT would silently discard the whole incumbent.  Drop it
+    # (once layers, routings, and `cancel_in_mlp` are decided the cancels
+    # are forced by propagation), which also keeps `_validate_hint` off
+    # that family.  The layer, routing, and cancel-MECHANISM hints are
+    # kept: `cancel_in_mlp` stays a free decision under the pin, and on a
+    # head-saturated graph its hint carries exactly the packing choice —
+    # which cancels take the same-layer MLP tier — that makes the warm
+    # start completable.  Measured 2026-07-09 on the d=8192 fixture:
+    # with the mechanism hint also dropped, no seed completed the hint
+    # into ANY incumbent in 600 s (0/5), vs first incumbents at 83-104 s
+    # for the unpinned control.
+    if built.pin_cancels and hint is not None:
+        hint = hint.without_cancel_layers()
     if log_search_progress and built.cancel_window_delta:
         print(
             f"  cancel windows widened for {len(built.cancel_window_delta)} "

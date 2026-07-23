@@ -25,6 +25,8 @@ from torchwright.ops.relu.map_select import map_to_table
 # Addition
 # ---------------------------------------------------------------------------
 
+_DIGIT_BASE = 10  # decimal digits 0-9
+
 
 def sum_digits(
     embedding: Embedding, num1: Node, num2: Node, carry_in: Node
@@ -44,8 +46,8 @@ def sum_digits(
     sum_out_table = {}
     carry_out_table = {}
 
-    for A in range(10):
-        for B in range(10):
+    for A in range(_DIGIT_BASE):
+        for B in range(_DIGIT_BASE):
             for C in [0, 1]:
                 entry_key = torch.cat(
                     [
@@ -55,10 +57,10 @@ def sum_digits(
                     ]
                 )
                 sum_out_table[entry_key] = embedding.get_embedding(
-                    str((A + B + C) % 10)
+                    str((A + B + C) % _DIGIT_BASE)
                 )
                 carry_out_table[entry_key] = torch.tensor(
-                    [1.0 if (A + B + C) >= 10 else -1.0]
+                    [1.0 if (A + B + C) >= _DIGIT_BASE else -1.0]
                 )
 
     key = concat([num1, num2, carry_in])
@@ -93,7 +95,7 @@ def sum_digit_seqs(
     carry = create_literal_value(torch.tensor([-1.0]))
     out = []
     for digit1, digit2 in reversed(list(zip(seq1, seq2, strict=False))):
-        sum, carry = sum_digits(embedding, digit1, digit2, carry)
-        out.append(sum)
+        digit_sum, carry = sum_digits(embedding, digit1, digit2, carry)
+        out.append(digit_sum)
 
     return list(reversed(out))

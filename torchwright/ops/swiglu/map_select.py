@@ -40,13 +40,13 @@ def select(cond: Node, true_node: Node, false_node: Node) -> Node:
 
     A complementary pair of gated lanes per component::
 
-        select(cond, a, b) = Swish(scale·cond)·a/scale + Swish(−scale·cond)·b/scale
+        select(cond, a, b) = Swish(scale·cond)·a/scale + Swish(-scale·cond)·b/scale
 
     ``Swish(scale·cond)/scale ≈ ReLU(cond)`` — 1 at ``cond=+1``, 0 at
-    ``cond=−1`` — so the two gates are complementary on/off indicators:
+    ``cond=-1`` — so the two gates are complementary on/off indicators:
     one passes ``a``, the other ``b``.  ``cond`` is ±1, enforced by an
     assert.  At clean conds in fp32 the losing branch contributes
-    exactly zero (``σ(−scale)`` computes as 0.0) and the winner passes
+    exactly zero (``sigma(-scale)`` computes as 0.0) and the winner passes
     with at most ~1 ulp relative rounding.  A cond off ±1 by δ
     mis-scales the winner by exactly δ·|actual value| — there is no
     offset ``M``, no finite-range requirement on the branches, and the
@@ -72,7 +72,7 @@ def select(cond: Node, true_node: Node, false_node: Node) -> Node:
     cond = _assert_cond_pm1(cond)
 
     # 2·d gated lanes: d with gate row +scale·cond and up rows picking
-    # true_node's components, d mirrored with −scale·cond picking
+    # true_node's components, d mirrored with -scale·cond picking
     # false_node's; the /scale folds into out_proj.
     gate_proj = torch.zeros(2 * d, 1 + 2 * d)
     gate_proj[:d, 0] = scale
@@ -159,9 +159,9 @@ def in_range(lower: Node, upper: Node, n_slots: int) -> Node:
     if lower <= i + 0.5 < upper, or -1.0 (false) otherwise.  Per slot,
     two compare-shaped sharpened ramps combined in out_proj::
 
-        past_lower_i = hinge(S·(center_i − lower)) − hinge(S·(center_i − lower) − 1)
-        past_upper_i = hinge(S·(center_i − upper)) − hinge(S·(center_i − upper) − 1)
-        out_i        = 2·(past_lower_i − past_upper_i) − 1
+        past_lower_i = hinge(S·(center_i - lower)) - hinge(S·(center_i - lower) - 1)
+        past_upper_i = hinge(S·(center_i - upper)) - hinge(S·(center_i - upper) - 1)
+        out_i        = 2·(past_lower_i - past_upper_i) - 1
 
     Integer-valued bounds are bit-exact across the whole slot vector:
     the +0.5 center offset keeps every hinge argument at least 4 units
@@ -208,7 +208,7 @@ def in_range(lower: Node, upper: Node, n_slots: int) -> Node:
         center = i + 0.5
         base = 4 * i
 
-        # past_lower ramp: hinges at lower = center and lower = center − 1/S
+        # past_lower ramp: hinges at lower = center and lower = center - 1/S
         gate_proj[base, 0] = -scale * S
         gate_bias[base] = scale * S * center
         gate_proj[base + 1, 0] = -scale * S
@@ -220,7 +220,7 @@ def in_range(lower: Node, upper: Node, n_slots: int) -> Node:
         gate_proj[base + 3, 1] = -scale * S
         gate_bias[base + 3] = scale * (S * center - 1.0)
 
-        # out_i = 2·(past_lower − past_upper) − 1, /scale folded in
+        # out_i = 2·(past_lower - past_upper) - 1, /scale folded in
         output_proj[base, i] = 2.0 / scale
         output_proj[base + 1, i] = -2.0 / scale
         output_proj[base + 2, i] = -2.0 / scale
@@ -253,17 +253,17 @@ def broadcast_select(
     slot, the complementary gated pair with ``mask_i`` as the cond::
 
         out[i·d_fill + j] = Swish(scale·mask_i)·t_ij/scale
-                          + Swish(−scale·mask_i)·f_ij/scale
+                          + Swish(-scale·mask_i)·f_ij/scale
 
     One gated form serves every caller — the ReLU-era ``approximate``
-    flag, the ``(M+v)−M`` offset apparatus, and the two-sublayer exact
+    flag, the ``(M+v)-M`` offset apparatus, and the two-sublayer exact
     path all die.  At clean ±1 masks in fp32 the losing branch
     contributes exactly zero and the winner passes with ~1 ulp relative
     rounding.  **Junk masks are safe by construction** — no ±1 assert:
     the flagship builds picks eagerly and discards rows whose masks are
     fractional; once ``|mask| ≥ 0.17`` the gate saturates to the mask
     value itself, so a fractional mask in [-1, 1] blends
-    ``≈ ReLU(m)·t + ReLU(−m)·f``, bounded by the hull of **zero and the
+    ``≈ ReLU(m)·t + ReLU(-m)·f``, bounded by the hull of **zero and the
     two branch ranges** plus the dip term ``swish_dip/scale·|branch|`` —
     at m ≈ 0 both gates vanish and the blend collapses toward zero, so
     the junk-mask bound stays inside the asserted range only when zero
@@ -340,7 +340,7 @@ def broadcast_select(
     for i in range(n_slots):
         for j in range(d_fill):
             out_idx = i * d_fill + j
-            for name, sign, node, is_bcast, dropped in (
+            for name, sign, _node, is_bcast, dropped in (
                 ("true", 1.0, true_value, true_is_broadcast, drop_true),
                 ("false", -1.0, false_value, false_is_broadcast, drop_false),
             ):
@@ -416,7 +416,7 @@ def dynamic_extract(
        drop at build time — the stage is ``n_entries·d_fill`` gated
        lanes, a per-slot cond_gate.
     3. A free ``Linear`` sums across slots.  Every losing slot is
-       *exactly* zero at clean masks (``σ(−scale)`` computes as 0.0), so
+       *exactly* zero at clean masks (``sigma(-scale)`` computes as 0.0), so
        the sum degenerates to a copy of the selected slot.
 
     Contract: ``idx`` integer in ``[0, n_entries - 1]``; off-integer
@@ -474,15 +474,15 @@ def map_to_table(
     table entry, rescaled to 0/1, with each entry's value-delta folded
     into out_proj::
 
-        m_i     = key_i·inp − key_i·key_i
+        m_i     = key_i·inp - key_i·key_i
         match_i = speed · Swish(scale·(m_i + 1/speed))/scale
-        result  = default + Σ_i match_i · (value_i − default)
+        result  = default + Σ_i match_i · (value_i - default)
 
     Today's ReLU construction ported hinge-for-hinge (the deltas are
     constants, so no live multiply anywhere).  A matching entry's
     indicator is bit-exact 1 (hinge argument ``scale/speed``, fully
     saturated), so the result is ``value_i`` to ~1 ulp (the
-    ``×scale/÷scale`` round trip) plus leakage from the other entries —
+    ``xscale/÷scale`` round trip) plus leakage from the other entries —
     and in real vocabularies that leakage is zero: a non-matching key's
     margin sits far below the bend, deep in fp32 underflow, so a
     no-match input returns ``default`` bit-exactly.  Sensitivity to
@@ -558,7 +558,7 @@ def _upper_clamp(index: Node, top: float, gate_mult: float, name: str) -> Node:
     """``min(gate_mult·index, top)`` as one 3-lane degenerate FFN.
 
     The swish :func:`min` with a constant second operand folded into the
-    biases: a hinge lane subtracting ``hinge(g·x − top)`` plus the
+    biases: a hinge lane subtracting ``hinge(g·x - top)`` plus the
     sharpened bypass pair carrying ``g·x`` exactly.  ``gate_mult`` folds
     the caller's index_scale into the gate rows — no separate scaling
     Linear.
@@ -580,8 +580,10 @@ def _upper_clamp(index: Node, top: float, gate_mult: float, name: str) -> Node:
 def _clamp_or_skip(
     index: Node, top: float, gate_mult: float, name: str
 ) -> tuple[Node, float]:
-    """Feed an axis index to the staircase, spending the clamp FFN only
-    when the input range doesn't already prove it in-bounds.
+    """Feed an axis index to the staircase, spending the clamp FFN only when needed.
+
+    Spends the clamp FFN only when the input range doesn't already prove
+    it in-bounds.
 
     ``_upper_clamp`` both scales by ``gate_mult`` and caps at ``top`` in
     one FFN sublayer.  When the input's static value range proves
@@ -611,12 +613,12 @@ def _bounded_step_chunks(
     *,
     gate_mult: float = 1.0,
 ) -> list[tuple]:
-    """floor_int's bounded-step stage per boundary ``k − 0.5``, chunked.
+    """floor_int's bounded-step stage per boundary ``k - 0.5``, chunked.
 
     Returns ``[(ks, step_node), ...]`` where ``step_node`` is the
     width-``len(ks)`` vector of steps
-    ``step_k = hinge(t_k) − hinge(t_k − W)``,
-    ``t_k = s·(gate_mult·x − (k − 0.5)) + 0.5`` — bounded in [0, W], so
+    ``step_k = hinge(t_k) - hinge(t_k - W)``,
+    ``t_k = s·(gate_mult·x - (k - 0.5)) + 0.5`` — bounded in [0, W], so
     downstream accumulation never sees ``s·x``-magnitude terms (the fp32
     2^24 rationale, unchanged from relu).  W keeps today's sizing plus the
     swish saturation floor ``W ≥ 1 + 17/scale`` (dominated by the 2).
@@ -639,7 +641,7 @@ def _bounded_step_chunks(
         for j, k in enumerate(ks):
             t_bias = 0.5 - s * (float(k) - 0.5)
             gate_bias[2 * j] = scale * t_bias  # t_k
-            gate_bias[2 * j + 1] = scale * (t_bias - step_cap)  # t_k − W
+            gate_bias[2 * j + 1] = scale * (t_bias - step_cap)  # t_k - W
             out_proj[2 * j, j] = 1.0 / scale
             out_proj[2 * j + 1, j] = -1.0 / scale
         step = swiglu_ffn(
@@ -667,8 +669,8 @@ def _table_lookup_row_vector(
 
     floor_int's two-stage staircase with vector-valued deltas — the
     third stage is 1 *degenerate* lane per boundary (the deltas are
-    table constants, folded into out_proj): ``row = T[A−1] −
-    Σ_k hinge(1 − step_k)·(T[k] − T[k−1])``.
+    table constants, folded into out_proj): ``row = T[A-1] -
+    Σ_k hinge(1 - step_k)·(T[k] - T[k-1])``.
     """
     rows, cols = table.shape
     if rows == 1:
@@ -715,9 +717,9 @@ def _table_lookup_row_vector(
 def table_lookup_2d(
     i: Node,
     j: Node,
-    table,
+    table: torch.Tensor | list[list[float]],
     *,
-    index_scale=1.0,
+    index_scale: float | tuple[float, float] = 1.0,
     sharpness: float = 100.0,
     name: str = "table_lookup_2d",
 ) -> Node:
@@ -725,19 +727,19 @@ def table_lookup_2d(
 
     Both axes are the same machine — floor_int's two-stage saturating
     staircase, a bounded per-boundary step then a "boundary not yet
-    reached" indicator ``hinge(1 − step_k)`` weighting that boundary's
+    reached" indicator ``hinge(1 - step_k)`` weighting that boundary's
     table delta.  **The two axes differ only in whether the deltas are
     live, and that is the whole redesign**: row-axis deltas are table
     constants (folded into out_proj, degenerate lanes, hinge-for-hinge
     with relu); column-axis deltas are differences of the just-built
     live row vector — a live multiply, one *gated* lane per boundary
-    (gate row ``scale·(1 − step_k(j))``, up row ``row_{k−1} − row_k``)::
+    (gate row ``scale·(1 - step_k(j))``, up row ``row_{k-1} - row_k``)::
 
-        row_c = T[A−1, c] − Σ_k hinge(1 − step_k(i)) · (T[k,c] − T[k−1,c])
-        out   = row_{B−1} + Σ_k hinge(1 − step_k(j)) · (row_{k−1} − row_k)
+        row_c = T[A-1, c] - Σ_k hinge(1 - step_k(i)) · (T[k,c] - T[k-1,c])
+        out   = row_{B-1} + Σ_k hinge(1 - step_k(j)) · (row_{k-1} - row_k)
 
     The ReLU machine's column detour — a second full mask staircase plus
-    the ``0.5·[ReLU(offset·mask + v) − ReLU(offset·mask − v)]`` offset
+    the ``0.5·[ReLU(offset·mask + v) - ReLU(offset·mask - v)]`` offset
     gate — collapses into that one gated lane; the mask staircase, the
     offset, and the ``offset·0.005`` guard term all die.  The gate is a
     hinge (not the exact ± multiply pair) because the indicator must be
@@ -747,14 +749,14 @@ def table_lookup_2d(
 
     Exactness: on the integer grid and outside boundary bands every
     indicator is exactly 0 or 1 (off steps exactly 0; on steps land in
-    the W-slack where ``1 − step ≤ −1`` saturates the hinge), so the
+    the W-slack where ``1 - step ≤ -1`` saturates the hinge), so the
     value path is the delta telescoping's fp32 accumulation — what
     disappears is the offset gate's absolute error at ``ulp(offset)``
     scale.  **In-band behavior upgrades from disclaimer to contract**:
-    the band coefficient is the blend fraction itself (``hinge(α) = α``
-    exactly for ``α ≥ 17/scale``), so a band on one axis gives the clean
-    two-entry linear blend and a corner band genuine bilinear
-    interpolation; below ``α = 0.17`` the coefficient rolls through the
+    the band coefficient is the blend fraction itself (``hinge(alpha) =
+    alpha`` exactly for ``alpha ≥ 17/scale``), so a band on one axis gives
+    the clean two-entry linear blend and a corner band genuine bilinear
+    interpolation; below ``alpha = 0.17`` the coefficient rolls through the
     dip (error ``≤ swish_dip/scale·|Δ|`` per band edge).
 
     What survives: ``sharpness`` and its contract (ramp width ``1/s`` on
@@ -790,9 +792,10 @@ def table_lookup_2d(
     chunk_size = max(1, min_d_hidden // 2)
 
     table_t = torch.as_tensor(table, dtype=torch.float32)
-    if table_t.ndim != 2:
-        raise ValueError(f"table must be 2D, got shape {tuple(table_t.shape)}")
-    rows, cols = table_t.shape
+    try:
+        rows, cols = table_t.shape
+    except ValueError as exc:
+        raise ValueError(f"table must be 2D, got shape {tuple(table_t.shape)}") from exc
     if rows < 1 or cols < 1:
         raise ValueError(f"table must be non-empty, got shape {tuple(table_t.shape)}")
     if not torch.isfinite(table_t).all():
@@ -831,16 +834,16 @@ def table_lookup_2d(
         up_proj = torch.zeros(n_lanes, d_input)
         out_proj = torch.zeros(n_lanes, 1)
         for lj, k in enumerate(ks):
-            # gate: scale·(1 − step_k(j)) — indicator snapped by saturation
+            # gate: scale·(1 - step_k(j)) — indicator snapped by saturation
             gate_proj[lj, lj] = -scale
             gate_bias[lj] = scale
-            # up: row_{k−1} − row_k, read from the live row section
+            # up: row_{k-1} - row_k, read from the live row section
             up_proj[lj, c + k - 1] = 1.0
             up_proj[lj, c + k] = -1.0
             out_proj[lj, 0] = 1.0 / scale
         if first:
             # Always-on lane carrying the live top entry (out_bias cannot —
-            # row_{B−1} is a live value, not a constant).
+            # row_{B-1} is a live value, not a constant).
             gate_bias[c] = scale
             up_proj[c, c + cols - 1] = 1.0
             out_proj[c, 0] = 1.0 / scale

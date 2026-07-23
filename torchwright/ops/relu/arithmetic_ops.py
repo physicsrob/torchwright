@@ -1,4 +1,6 @@
 import builtins
+from collections.abc import Callable
+from typing import cast
 
 import torch
 
@@ -18,6 +20,14 @@ from torchwright.ops.linear import (
 from torchwright.ops.relu.linear_relu_linear import linear_relu_linear
 
 _builtin_abs = builtins.abs  # save before module-level def abs() shadows the builtin
+
+# Below this magnitude, treat a slope change or an axis range as zero
+# (avoids emitting a zero-weight ReLU neuron / degenerate axis).
+_SLOPE_EPS = 1e-12
+
+# A piecewise-linear function needs at least two breakpoints to define one
+# segment.
+_MIN_PIECEWISE_BREAKPOINTS = 2
 
 
 # ---------------------------------------------------------------------------
@@ -95,7 +105,7 @@ def compare(
     false_level: float = -1.0,
     sharpness: float | None = None,
 ) -> Node:
-    """Compare input with threshold and return boolean valued node (1.0 for true, -1.0 for false).
+    """Compare input with threshold, returning a boolean node (1.0 true, -1.0 false).
 
     Args:
         inp: Node to compare. Must be length 1.
@@ -112,7 +122,8 @@ def compare(
             values).
 
     Returns:
-        Node: Node with a value of true_level if inp is greater than thresh, false_level otherwise.
+        Node: Node with a value of true_level if inp is greater than
+        thresh, false_level otherwise.
 
     .. noise-footer::
 
@@ -123,10 +134,11 @@ def compare(
 
     s = step_sharpness if sharpness is None else sharpness
 
-    # We need 2 MLP entries, we'll use the equation:
-    # y= (true_level-false_level) * [
-    #   max(s*x - s*thresh, 0) - max(s*x - s*thresh - 1, 0)
-    # ] + false_level
+    # Two MLP entries implement the step as a difference of two ramps in
+    # (sharpness-scaled input minus threshold), scaled by the true/false
+    # level gap and offset by false_level; the ramps saturate one unit
+    # apart, so the difference rises from 0 to 1 over that unit and pins
+    # the output at true_level beyond it.
 
     input_proj = torch.tensor([[s], [s]])
     input_bias = torch.tensor([-s * thresh, -s * thresh - 1.0])
@@ -193,7 +205,7 @@ def min(inp1: Node, inp2: Node) -> Node:
 def piecewise_linear(
     inp: Node,
     breakpoints: list[float],
-    fn,
+    fn: Callable[[float], float | list[float]],
     clamp: bool = True,
     d_max: int = 1024,
     input_scale: float = 1.0,
@@ -249,7 +261,9 @@ def piecewise_linear(
     """
     assert len(inp) == 1, "Input must be a 1D scalar node"
     n = len(breakpoints)
-    assert n >= 2, "Need >= 2 breakpoints"
+    assert n >= _MIN_PIECEWISE_BREAKPOINTS, (
+        f"Need >= {_MIN_PIECEWISE_BREAKPOINTS} breakpoints"
+    )
     assert all(breakpoints[i] < breakpoints[i + 1] for i in range(n - 1)), (
         "Breakpoints must be strictly ascending"
     )
@@ -258,7 +272,11 @@ def piecewise_linear(
 
     # Normalise to vector form: values[i] is always a list of length d_out.
     scalar = not isinstance(raw_values[0], (list, tuple))
-    values = [[v] for v in raw_values] if scalar else [list(v) for v in raw_values]
+    values = (
+        [[cast("float", v)] for v in raw_values]
+        if scalar
+        else [list(cast("list[float]", v)) for v in raw_values]
+    )
     d_out = len(values[0])
     assert all(len(v) == d_out for v in values)
 
@@ -274,18 +292,18 @@ def piecewise_linear(
 
     for i in range(n - 1):
         deltas = [slopes[i][j] - prev_slopes[j] for j in range(d_out)]
-        if any(_builtin_abs(d) > 1e-12 for d in deltas):
+        if any(_builtin_abs(d) > _SLOPE_EPS for d in deltas):
             relus.append((1.0, breakpoints[i], deltas))
         prev_slopes = list(slopes[i])
 
     # Cancel final slope (clamp)
-    if any(_builtin_abs(s) > 1e-12 for s in prev_slopes):
+    if any(_builtin_abs(s) > _SLOPE_EPS for s in prev_slopes):
         relus.append((1.0, breakpoints[-1], [-s for s in prev_slopes]))
 
     if not clamp:
-        if any(_builtin_abs(s) > 1e-12 for s in slopes[0]):
+        if any(_builtin_abs(s) > _SLOPE_EPS for s in slopes[0]):
             relus.append((-1.0, breakpoints[0], [-s for s in slopes[0]]))
-        if any(_builtin_abs(s) > 1e-12 for s in slopes[-1]):
+        if any(_builtin_abs(s) > _SLOPE_EPS for s in slopes[-1]):
             relus.append((1.0, breakpoints[-1], list(slopes[-1])))
 
     if len(relus) == 0:
@@ -366,13 +384,13 @@ def _product_2d_quarter_square(
         P(u, v) = (lo1 + range1·u)·(lo2 + range2·v)
 
     without the generic least-squares solve.  ``P`` is bilinear, so the
-    only nonlinear term is ``u·v``, and ``u·v = ((u+v)² − (u−v)²)/4``.
+    only nonlinear term is ``u·v``, and ``u·v = ((u+v)² - (u-v)²)/4``.
     The piecewise-linear interpolant of ``t²`` on a uniform grid of
     spacing ``h`` has a *constant* slope change of ``2h`` at every
     interior breakpoint, so each square is a ReLU staircase of
     equal-weight neurons.  The sum axis ``u+v`` ranges over ``[0, 2]``
-    and the difference axis ``u−v`` over ``[−1, 1]``, both uniform with
-    spacing ``h``: ``2·(2n−2)`` neurons total, all assembled into one
+    and the difference axis ``u-v`` over ``[-1, 1]``, both uniform with
+    spacing ``h``: ``2·(2n-2)`` neurons total, all assembled into one
     ``linear_relu_linear``.
 
     The two squares use ``clamp=False`` extrapolation (the leading
@@ -387,10 +405,10 @@ def _product_2d_quarter_square(
     h = 1.0 / (n - 1)
 
     # square(t) on a uniform grid {t_k} (spacing h, clamp=False) expands to
-    #     square(t) = const + m0·t + Σ_{k=1}^{m-2} 2h·ReLU(t − t_k)
+    #     square(t) = const + m0·t + Σ_{k=1}^{m-2} 2h·ReLU(t - t_k)
     # where m0 = t_0 + t_1 is the leading segment slope (carried by the
     # affine part so the ReLUs, inactive left of t_0, never need a left
-    # ramp) and const = t_0² − m0·t_0.
+    # ramp) and const = t_0² - m0·t_0.
     def _square_expansion(t_bps: list[float]) -> tuple[float, float, list]:
         t0 = t_bps[0]
         m0 = t_bps[0] + t_bps[1]
@@ -399,14 +417,14 @@ def _product_2d_quarter_square(
         return const, m0, relus
 
     s_bps = [i * h for i in range(2 * n - 1)]  # u+v ∈ [0, 2]
-    d_bps = [-1.0 + i * h for i in range(2 * n - 1)]  # u−v ∈ [−1, 1]
+    d_bps = [-1.0 + i * h for i in range(2 * n - 1)]  # u-v ∈ [-1, 1]
     cS, mS, rS = _square_expansion(s_bps)
     cD, mD, rD = _square_expansion(d_bps)
 
-    # uv = (S2 − D2)/4, so the product's
-    #   constant term  = lo1·lo2 + range1·range2·(cS − cD)/4
-    #   u coefficient  = lo2·range1 + range1·range2·(mS − mD)/4
-    #   v coefficient  = lo1·range2 + range1·range2·(mS + mD)/4
+    # Since u·v = (S^2 - D^2)/4, the product's constant term, u
+    # coefficient, and v coefficient each combine the corresponding
+    # piece of the sum-square (cS/mS) and difference-square (cD/mD)
+    # expansions, scaled by lo1/lo2/range1/range2 as derived above.
     prod_scale = range1 * range2
     const_term = lo1 * lo2 + prod_scale * (cS - cD) / 4.0
     coef_u = lo2 * range1 + prod_scale * (mS - mD) / 4.0
@@ -414,9 +432,10 @@ def _product_2d_quarter_square(
 
     inp = Concatenate([u_node, v_node])
 
-    # Sum-axis neuron k: ReLU(u + v − thr) contributes +2h·(prod_scale/4).
-    # Diff-axis neuron k: ReLU(u − v − thr) contributes −2h·(prod_scale/4).
-    # (proj_u, proj_v, bias, output_weight)
+    # Sum-axis neuron k: ReLU(u + v - thr) contributes +2h·(prod_scale/4).
+    # Diff-axis neuron k: ReLU(u - v - thr) contributes -2h·(prod_scale/4).
+    # Each entry below holds the neuron's u projection, v projection,
+    # bias, and output weight, in that order.
     relus: list = []
     for thr, w in rS:
         relus.append((1.0, 1.0, -thr, prod_scale * w / 4.0))
@@ -475,8 +494,8 @@ def multiply_2d(
 
     Computes ``inp1 * inp2`` in a **single MLP sublayer** via an analytic
     quarter-square construction: both axes are normalized to a common unit
-    grid and the bilinear product is built from ``((u+v)² − (u−v)²)/4`` as
-    one ReLU bank of ~``2*(2n−2)`` neurons (O(n) in the breakpoint count).
+    grid and the bilinear product is built from ``((u+v)² - (u-v)²)/4`` as
+    one ReLU bank of ~``2*(2n-2)`` neurons (O(n) in the breakpoint count).
 
     **When to prefer over** ``signed_multiply``:
 
@@ -532,7 +551,7 @@ def multiply_2d(
     # --- Normalize both axes to [0, 1] with a common step ---
     #
     # The quarter-square construction places ReLU staircases along the
-    # normalized sum axis u+v and difference axis u−v.  On a square grid
+    # normalized sum axis u+v and difference axis u-v.  On a square grid
     # (equal step on both axes) these are uniform with a single spacing;
     # differing steps would make the sums/differences all distinct → O(n²)
     # neurons.  Affine-mapping both axes to [0, 1] with a common breakpoint
@@ -547,7 +566,7 @@ def multiply_2d(
     range1 = hi1_f - lo1_f
     range2 = hi2_f - lo2_f
 
-    if range1 < 1e-12 or range2 < 1e-12:
+    if range1 < _SLOPE_EPS or range2 < _SLOPE_EPS:
         raise ValueError(
             f"{name}: degenerate zero-width input axis "
             f"(range1={range1}, range2={range2}); multiply_2d requires each "
@@ -581,14 +600,14 @@ def multiply_2d(
     #     P(u, v) = (lo₁ + r₁·u)·(lo₂ + r₂·v)
     #             = lo₁·lo₂ + lo₁·r₂·v + lo₂·r₁·u + r₁·r₂·(u·v)
     #
-    # The only nonlinear term is u·v, and u·v = ((u+v)² − (u−v)²)/4.
+    # The only nonlinear term is u·v, and u·v = ((u+v)² - (u-v)²)/4.
     # The piecewise-linear interpolant of t² on a uniform grid of
     # spacing h has a *constant* slope change of 2h at every interior
     # breakpoint, so each square is a ReLU staircase with equal-weight
-    # neurons.  On the common unit grid (h = 1/(n−1)) the sum axis
-    # u+v ∈ [0, 2] and the difference axis u−v ∈ [−1, 1] are both
+    # neurons.  On the common unit grid (h = 1/(n-1)) the sum axis
+    # u+v ∈ [0, 2] and the difference axis u-v ∈ [-1, 1] are both
     # uniform with spacing h, so the whole product is one ReLU bank of
-    # ~2·(2n−2) neurons (O(n)) — same single MLP sublayer, no solve.
+    # ~2·(2n-2) neurons (O(n)) — same single MLP sublayer, no solve.
     result = _product_2d_quarter_square(
         inp1_norm,
         inp2_norm,
@@ -724,7 +743,7 @@ def thermometer_floor_div(inp: Node, divisor: int, max_value: int) -> Node:
         breakpoints.extend([threshold - eps / 2, threshold + eps / 2])
     breakpoints.append(max_value + eps)
 
-    def _staircase(x):
+    def _staircase(x: float) -> float:
         return float(sum(1 for k in range(1, n + 1) if x > k * divisor - 0.5))
 
     result = piecewise_linear(
@@ -894,23 +913,23 @@ def floor_int(
         return create_literal_value(torch.tensor([float(min_value)]))
 
     # floor(x) = min_value + Σ_{k=min+1..max} step_k, with the unit step
-    #   step_k = clamp(s·(x−k)+1, 0, 2)        (∈ [0, 2], = relu(t)−relu(t−2))
+    #   step_k = clamp(s·(x-k)+1, 0, 2)        (∈ [0, 2], = relu(t)-relu(t-2))
     # fully ON (==2) once x reaches the integer k (with a 1/s-wide ramp just
     # below), OFF (==0) below it. floor counts the steps with step_k < 1:
-    #   floor = min + n − Σ_k relu(1 − step_k).
+    #   floor = min + n - Σ_k relu(1 - step_k).
     # Two properties make this cancellation-free AND compiled-precise:
     #  * Each step_k is a 2-term per-output difference (NOT a sum over all
     #    breakpoints), so its fp32 error is bounded (~ulp of s·x), and the final
-    #    Σ relu(1 − step_k) accumulates only bounded [0,1] terms — partial sums
-    #    never exceed n. The old single-projection Σ ±s·ReLU(x−b_i) summed ~n
+    #    Σ relu(1 - step_k) accumulates only bounded [0,1] terms — partial sums
+    #    never exceed n. The old single-projection Σ ±s·ReLU(x-b_i) summed ~n
     #    terms of magnitude ~s·x; its partial sums overflowed float32's 2^24
     #    exact-integer limit and collapsed to ~0 at large magnitude/sharpness.
     #  * Clamping the step to [0, W] (not [0, 1]) keeps slack below the stage-2
-    #    threshold of 1, so an ON step absorbs to relu(1 − W) = 0 *exactly* even
+    #    threshold of 1, so an ON step absorbs to relu(1 - W) = 0 *exactly* even
     #    with a few ulp of error, and the stage-1 intermediate stays small (≤ W,
     #    not ~s·x) so it does not amplify upstream compiled noise. W must exceed a
-    #    few ulp(s·n): the per-step difference relu(t) − relu(t − W) collapses to
-    #    0 once t and t − W round to the same float32 value (ulp(t) ≥ W), so we
+    #    few ulp(s·n): the per-step difference relu(t) - relu(t - W) collapses to
+    #    0 once t and t - W round to the same float32 value (ulp(t) ≥ W), so we
     #    size W = max(2, 8·ulp(s·n)) — 2 for the common small-range case, larger
     #    only when s·n approaches 2^24.
     # Cost: one extra MLP sublayer (two chained ReLUs) vs the old form.
@@ -924,7 +943,7 @@ def floor_int(
     ulp = 2.0 ** (_math.floor(_math.log2(max_t)) - 23) if max_t >= 1.0 else 2.0**-23
     step_cap = builtins.max(2.0, 8.0 * ulp)  # W
 
-    neg_partials = []  # each chunk contributes −Σ_k relu(1 − step_k)
+    neg_partials = []  # each chunk contributes -Σ_k relu(1 - step_k)
     for c0 in range(0, n, _CHUNK):
         ks = list(
             range(
@@ -933,14 +952,14 @@ def floor_int(
             )
         )
         c = len(ks)
-        # stage 1 (MLP sublayer): step_k = relu(t_k) − relu(t_k − W)   width c
-        # hidden = [relu(t_k), relu(t_k − W)] per step, t_k = s·x − s·k + 1.
+        # stage 1 (MLP sublayer): step_k = relu(t_k) - relu(t_k - W)   width c
+        # hidden = [relu(t_k), relu(t_k - W)] per step, t_k = s·x - s·k + 1.
         in_proj = torch.full((2 * c, 1), s)
         in_bias = torch.empty(2 * c)
         out_proj = torch.zeros((2 * c, c))
         for j, k in enumerate(ks):
             in_bias[2 * j] = 1.0 - s * k  # t_k
-            in_bias[2 * j + 1] = 1.0 - step_cap - s * k  # t_k − W
+            in_bias[2 * j + 1] = 1.0 - step_cap - s * k  # t_k - W
             out_proj[2 * j, j] = 1.0
             out_proj[2 * j + 1, j] = -1.0
         step = linear_relu_linear(
@@ -951,7 +970,7 @@ def floor_int(
             output_bias=torch.zeros(c),
             name="floor_int_step",
         )
-        # stage 2 (MLP sublayer): −Σ_k relu(1 − step_k)               width 1
+        # stage 2 (MLP sublayer): -Σ_k relu(1 - step_k)               width 1
         neg_partials.append(
             linear_relu_linear(
                 input_node=step,
@@ -964,7 +983,7 @@ def floor_int(
         )
 
     summed = neg_partials[0] if len(neg_partials) == 1 else sum_nodes(neg_partials)
-    result = add_const(summed, float(min_value + n))  # min + n − Σ relu(1 − step_k)
+    result = add_const(summed, float(min_value + n))  # min + n - Σ relu(1 - step_k)
     return assert_matches_value_type(
         result,
         NodeValueType(value_range=Range(float(min_value), float(max_value))),

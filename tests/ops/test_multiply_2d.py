@@ -266,7 +266,7 @@ def test_multiply_2d_build_is_linear_in_breakpoints():
 def test_multiply_2d_chunks_across_d_max():
     """The analytic product bank chunks correctly when it exceeds d_max.
 
-    The quarter-square fast path emits ~2·(2n−2) neurons; a small d_max
+    The quarter-square fast path emits ~2·(2n-2) neurons; a small d_max
     forces them across multiple linear_relu_linear sublayers summed
     together.  Grid points must stay exact regardless of chunk boundary.
     """

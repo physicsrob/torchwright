@@ -1,5 +1,4 @@
-"""Purely linear ops — compiled into residual-stream wiring, no MLP
-sublayers.
+"""Purely linear ops — compiled into residual-stream wiring, no MLP sublayers.
 
 No hidden lane means no activation, which is why these ops carry no
 machine choice: both op libraries (``torchwright/ops/relu/``,
@@ -88,7 +87,7 @@ def multiply_const(inp: Node, scalar: float) -> Node:
 def bool_to_01(inp: Node) -> Node:
     """Map a ±1 boolean node to 0/1.
 
-    Converts the torchwright boolean convention (+1 = true, −1 = false)
+    Converts the torchwright boolean convention (+1 = true, -1 = false)
     to a 0/1 scale (1 = true, 0 = false).  This is a free operation
     (no MLP sublayers — two linear transforms).
 
@@ -125,6 +124,9 @@ def add_scaled_nodes(scale1: float, inp1: Node, scale2: float, inp2: Node) -> No
     return Linear(concat, M)
 
 
+_MIN_FANOUT = 2  # a fanout chunk must combine at least 2 operands to be useful
+
+
 def sum_nodes(inp_list: list[Node], *, max_fanout: int | None = None) -> Node:
     """Compute the sum of all input nodes.
 
@@ -149,8 +151,8 @@ def sum_nodes(inp_list: list[Node], *, max_fanout: int | None = None) -> Node:
     assert len(d_values) == 1
     d = d_values.pop()
 
-    if max_fanout is not None and max_fanout < 2:
-        raise ValueError(f"max_fanout must be >= 2, got {max_fanout}")
+    if max_fanout is not None and max_fanout < _MIN_FANOUT:
+        raise ValueError(f"max_fanout must be >= {_MIN_FANOUT}, got {max_fanout}")
 
     def _flat(nodes: list[Node]) -> Node:
         x = Concatenate(nodes)

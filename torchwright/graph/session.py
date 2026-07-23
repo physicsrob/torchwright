@@ -17,6 +17,8 @@ from contextvars import ContextVar
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
+    from collections.abc import Iterator
+
     from torchwright.graph.misc import InputNode
 
 
@@ -47,7 +49,7 @@ def current_session() -> GraphSession:
 
 
 @contextmanager
-def fresh_graph_session():
+def fresh_graph_session() -> Iterator[GraphSession]:
     """Context manager that creates a new, isolated graph session.
 
     All ``InputNode`` instances created inside the block register into

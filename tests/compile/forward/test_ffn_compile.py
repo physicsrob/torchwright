@@ -83,9 +83,10 @@ def test_debug_value_and_assert_on_block_output(xt):
 
 
 def _build_swish(gated_second=True):
-    """A two-FFN swish graph (gated feeding degenerate-or-gated) — new node
-    ids each call.  Directly-authored fixture (plan phase A: no swiglu ops
-    exist yet).
+    """Build a two-FFN swish graph (gated feeding degenerate-or-gated).
+
+    New node ids each call. Directly-authored fixture (plan phase A: no
+    swiglu ops exist yet).
     """
     x = create_input("x", 8, value_range=(-1.0, 1.0))
     g = torch.Generator().manual_seed(21)
@@ -118,8 +119,9 @@ def _build_swish(gated_second=True):
 
 
 def test_swish_graph_compiles_to_gated_machine(xt):
-    """A pure-swish graph selects the gated MLP sublayer and matches the
-    oracle everywhere (probe_compiled), gated and degenerate lanes alike.
+    """Match the oracle everywhere on a pure-swish graph via the gated MLP sublayer.
+
+    probe_compiled, gated and degenerate lanes alike.
     """
     from torchwright.compiler.groups.mlp_sublayer import GatedMLPSubLayer
 
@@ -136,8 +138,9 @@ def test_swish_graph_compiles_to_gated_machine(xt):
 
 
 def test_swish_debug_forward_and_debug_value(xt):
-    """debug=True self-consistency + assert predicates hold on the swish
-    machine; debug_value extracts the FFN's compiled value.
+    """Hold self-consistency + assert predicates under debug=True on the swish machine.
+
+    debug_value extracts the FFN's compiled value.
     """
     _, out = _build_swish()
     wrapped = assert_in_range(out, -1000.0, 1000.0)
@@ -151,8 +154,9 @@ def test_swish_debug_forward_and_debug_value(xt):
 
 
 def test_mixed_activation_graph_rejected(xt):
-    """No mixed networks: a graph with both ReLU and swish FFNs is a compile
-    error (uniformity check, swiglu plan A3).
+    """Reject a graph with both ReLU and swish FFNs as a compile error.
+
+    No mixed networks (uniformity check, swiglu plan A3).
     """
     x = create_input("x", 8, value_range=(-1.0, 1.0))
     g = torch.Generator().manual_seed(5)
@@ -178,8 +182,10 @@ def test_mixed_activation_graph_rejected(xt):
 
 
 def test_relu_gated_ffn_rejected(xt):
-    """A ReLU FFN carrying gated lanes has no physical substrate — rejected
-    at the compile boundary, not deep in the weight writer.
+    """Reject a ReLU FFN carrying gated lanes at the compile boundary.
+
+    It has no physical substrate — rejected at the compile boundary, not
+    deep in the weight writer.
     """
     x = create_input("x", 8, value_range=(-1.0, 1.0))
     g = torch.Generator().manual_seed(6)

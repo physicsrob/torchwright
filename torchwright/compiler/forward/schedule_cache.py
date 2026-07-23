@@ -49,6 +49,10 @@ __all__ = [
 
 _ENV_DIR = "TW_SCHEDULE_CACHE_DIR"
 
+# ``realized_objective_blocks`` is a (primary, secondary) lexicographic
+# objective pair (see ``_replay_plan_objective_blocks`` in compile.py).
+_OBJECTIVE_BLOCKS_LEN = 2
+
 
 def cache_dir() -> Path | None:
     """The active cache directory, or None when the cache is disabled."""
@@ -150,12 +154,13 @@ def store_assignment(
         prior_blocks = (
             tuple(int(value) for value in prior_blocks_raw)
             if isinstance(prior_blocks_raw, (list, tuple))
-            and len(prior_blocks_raw) == 2
+            and len(prior_blocks_raw) == _OBJECTIVE_BLOCKS_LEN
             else None
         )
         new_blocks = (
             tuple(int(value) for value in new_blocks_raw)
-            if isinstance(new_blocks_raw, (list, tuple)) and len(new_blocks_raw) == 2
+            if isinstance(new_blocks_raw, (list, tuple))
+            and len(new_blocks_raw) == _OBJECTIVE_BLOCKS_LEN
             else None
         )
         prior_objective = prior_meta.get("realized_objective")

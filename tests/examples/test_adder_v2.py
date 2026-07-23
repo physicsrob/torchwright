@@ -108,7 +108,8 @@ class TestNumberToDigitScalars:
                     n_pos=1, input_values={"x": torch.tensor([[float(x)]])}
                 )
                 assert abs(result[0, 0].item() - expected[i]) < 0.2, (
-                    f"x={x}, digit[{i}]: expected {expected[i]}, got {result[0, 0].item()}"
+                    f"x={x}, digit[{i}]: expected {expected[i]}, "
+                    f"got {result[0, 0].item()}"
                 )
 
     def test_two_digit_extraction(self):
@@ -121,7 +122,8 @@ class TestNumberToDigitScalars:
                     n_pos=1, input_values={"x": torch.tensor([[float(x)]])}
                 )
                 assert abs(result[0, 0].item() - expected[i]) < 0.2, (
-                    f"x={x}, digit[{i}]: expected {expected[i]}, got {result[0, 0].item()}"
+                    f"x={x}, digit[{i}]: expected {expected[i]}, "
+                    f"got {result[0, 0].item()}"
                 )
 
 
@@ -134,6 +136,7 @@ class TestScalarToEmbedding:
                 n_pos=1, input_values={"x": torch.tensor([[float(digit)]])}
             )
             expected = embedding.get_embedding(str(digit))
+            max_diff = torch.max(torch.abs(result[0] - expected)).item()
             assert torch.allclose(result[0], expected, atol=0.1), (
-                f"digit={digit}: max diff={torch.max(torch.abs(result[0] - expected)).item()}"
+                f"digit={digit}: max diff={max_diff}"
             )

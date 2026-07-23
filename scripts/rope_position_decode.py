@@ -57,7 +57,7 @@ def plane_periods(radix: int, n_levels: int) -> list[int]:
     its phase encodes ``t mod radix**(l+1)``.  The coarsest level
     (``radix**n_levels``) must cover the whole range without wrapping.
     """
-    return [radix ** (l + 1) for l in range(n_levels)]
+    return [radix ** (level + 1) for level in range(n_levels)]
 
 
 # Per-level phase offsets (in POSITION units), chosen to keep every in-range
@@ -89,8 +89,8 @@ def make_phases(t: np.ndarray, periods: list[int], offsets: np.ndarray) -> np.nd
     shape (n_levels, len(t)).
     """
     angles = np.empty((len(periods), t.size), dtype=np.float64)
-    for l, period in enumerate(periods):
-        angles[l] = (TWO_PI * (t + offsets[l]) / period) % TWO_PI
+    for level, period in enumerate(periods):
+        angles[level] = (TWO_PI * (t + offsets[level]) / period) % TWO_PI
     return angles
 
 
@@ -107,11 +107,11 @@ def decode(angles: np.ndarray, periods: list[int], offsets: np.ndarray) -> np.nd
 
     # Coarsest level covers the whole range (period >= N), so t mod period == t.
     t_hat = measured[-1].copy()
-    for l in range(len(periods) - 2, -1, -1):
-        period = periods[l]
+    for level in range(len(periods) - 2, -1, -1):
+        period = periods[level]
         # Snap t_hat onto { k*period + y_l } nearest to the coarse estimate.
-        k = np.round((t_hat - measured[l]) / period)
-        t_hat = k * period + measured[l]
+        k = np.round((t_hat - measured[level]) / period)
+        t_hat = k * period + measured[level]
     return np.round(t_hat).astype(np.int64)
 
 

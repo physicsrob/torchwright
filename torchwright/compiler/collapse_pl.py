@@ -49,6 +49,7 @@ from typing import TYPE_CHECKING, Any
 import torch
 
 from torchwright.compiler.collapse import (
+    _MIN_SYNTH_DEPTH,
     _SYNTH_CLAIM_ATOL,
     CollapseReport,
     SubgraphOutcome,
@@ -83,6 +84,10 @@ _F64 = torch.float64
 # range for any certified knot position.
 _MAX_INPUT_SCALE = 2.0**20
 
+# Below this, a skeleton's slope deltas are float64 noise around a flat
+# function — synthesize a constant instead of a degenerate one-lane PWL.
+_FLAT_SLOPE_ATOL = 1e-12
+
 # Kink pre-screen (2026-07-06, the default-flip cost gate): a member
 # whose candidate-kink population exceeds this multiple of the lane
 # cap declines before its oracle sweep — the sweep is what made the
@@ -105,11 +110,12 @@ def _emit_s1(
     budget: float,
     name: str,
 ) -> Node:
-    """One interpolating ``piecewise_linear`` (or constant) computing
-    the certified skeleton's values from the source.
+    """One interpolating ``piecewise_linear`` (or constant) from the source.
+
+    Computes the certified skeleton's values from the source.
     """
     deltas = skel.slope_deltas().abs()
-    if not bool((deltas > 1e-12).any()):
+    if not bool((deltas > _FLAT_SLOPE_ATOL).any()):
         return LiteralValue(skel.y[0].to(torch.float32).clone().reshape(-1), name=name)
 
     breakpoints = [float(v) for v in skel.x.tolist()]
@@ -151,9 +157,10 @@ def _verify_emission(
     bands: torch.Tensor | None,
     budget: float,
 ) -> tuple[bool, float, float]:
-    """Compare the emitted node's exact compute against the ORIGINAL
-    member's oracle at every skeleton knot and segment midpoint outside
-    the analytic hinge bands.  The original — not the skeleton — is the
+    """Compare the emitted node's exact compute against the ORIGINAL member's oracle.
+
+    Compared at every skeleton knot and segment midpoint outside the
+    analytic hinge bands.  The original — not the skeleton — is the
     claim's reference: comparing against the skeleton would be circular
     (a degenerate skeleton trivially matches its own emission).
     Returns ``(ok, worst, at)``.
@@ -243,7 +250,7 @@ def collapse_pl_subgraphs(
             for m in members
             if m is output_node or any(c not in member_set for c in consumers[m])
         ]
-        synthesized = [m for m in boundary if depth[m] >= 2]
+        synthesized = [m for m in boundary if depth[m] >= _MIN_SYNTH_DEPTH]
         if not synthesized:
             outcomes.append(
                 declined("no depth gain (no boundary member at depth >= 2)")
@@ -322,7 +329,7 @@ def collapse_pl_subgraphs(
             continue
 
         # --- Rewire and orphan (v1's skeleton verbatim). ---------------
-        kept = {m for m in boundary if depth[m] < 2}
+        kept = {m for m in boundary if depth[m] < _MIN_SYNTH_DEPTH}
         freed = sum(
             m.gate_proj.shape[0]
             for m in members

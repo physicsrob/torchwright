@@ -99,9 +99,10 @@ def test_compare(arith):
 
 
 def test_compare_depth_constant(arith):
-    """The comparison's critical path must not grow with the digit count —
-    with the trim also flat, the calculators' end-to-end depth is set by
-    their arithmetic alone.
+    """The comparison's critical path must not grow with the digit count.
+
+    With the trim also flat, the calculators' end-to-end depth is set
+    by their arithmetic alone.
     """
     from scripts.arithmetic_scaling import critical_path_depth
 

@@ -19,16 +19,19 @@ from torchwright.graph.rope import rope_inv_freq
 # ---------------------------------------------------------------------------
 
 
-def _lookup_axis_scale(index_scale, axis: int, n_axes: int = 2) -> float:
+def _lookup_axis_scale(
+    index_scale: float | tuple[float, float], axis: int, n_axes: int = 2
+) -> float:
     if isinstance(index_scale, numbers.Real):
         scale = float(index_scale)
     else:
-        if len(index_scale) != n_axes:
+        pair = cast("tuple[float, float]", index_scale)
+        if len(pair) != n_axes:
             raise ValueError(
                 f"index_scale must be a scalar or length-{n_axes} tuple, "
                 f"got {index_scale!r}"
             )
-        scale = float(index_scale[axis])
+        scale = float(pair[axis])
     if not math.isfinite(scale) or scale <= 0.0:
         raise ValueError(f"index_scale values must be finite and > 0, got {scale}")
     return scale
@@ -76,7 +79,7 @@ def _theta_slow(rope: RopeConfig) -> float:
 
     The runtime rotation runs over the rotary front ``d_rot`` (``apply_rope`` uses
     width ``d_rot``, so per-plane frequencies are ``base^(-2p/d_rot)``), so the
-    slowest rotated plane is index ``d_rot/2 − 1`` with frequency
+    slowest rotated plane is index ``d_rot/2 - 1`` with frequency
     ``rope_inv_freq(d_rot, base)[-1]``.  Under full rotary ``d_rot == d_head`` and
     this is the slowest plane of the ``d_head`` grid — byte-identical to the
     pre-partial form.  This is the plane the BOS-weight feature must ride so its

@@ -1,5 +1,4 @@
-"""Compiled (forward-compile) round-trip tests for
-``attend_argmin_above_in_bucket``.
+"""Compiled (forward-compile) round-trip tests for ``attend_argmin_above_in_bucket``.
 
 The op's exact-math (``node.compute``) behaviour and matrix structure are
 covered in ``tests/ops/test_attention_ops.py``.  These tests confirm the
@@ -59,7 +58,9 @@ def _build(nb, nt, value_width, *, prefix, d_head):
 
 
 def test_baib_adjacent_score_recovered_compiled():
-    """Two matching rows whose scores differ by 1, at the full predicate-bonus
+    """Recover the lower-score row of two adjacent-score matching rows.
+
+    Two matching rows whose scores differ by 1, at the full predicate-bonus
     stack: the compiled fp32 head recovers the lower-score row, matching exact
     math everywhere.
     """
@@ -97,7 +98,9 @@ def test_baib_adjacent_score_recovered_compiled():
 
 
 def test_baib_wide_value_splits_over_heads_compiled():
-    """A value wider than d_head forces the V/O split across physical heads;
+    """Match exact math even when a wide value forces a V/O split across heads.
+
+    A value wider than d_head forces the V/O split across physical heads;
     the compiled output still matches exact math.
     """
     nb, nt, vw = 2, 3, 20  # d_qk = 7 <= 16/2; d_v = 20 > 16 -> 2 V/O heads
@@ -135,8 +138,10 @@ def test_baib_wide_value_splits_over_heads_compiled():
 
 
 def test_baib_all_invalid_compiled_is_finite():
-    """All rows invalid (no match): the compiled head returns a finite,
-    defined blend — never NaN, never raises — and matches the oracle blend.
+    """Return a finite, defined blend when all rows are invalid (no match).
+
+    The compiled head returns a finite, defined blend — never NaN, never
+    raises — and matches the oracle blend.
     """
     nb, nt, vw = 2, 3, 4
     out = _build(nb, nt, vw, prefix="inv", d_head=16)
@@ -166,7 +171,9 @@ def test_baib_all_invalid_compiled_is_finite():
 
 
 def test_baib_self_row_only_compiled_is_finite():
-    """Minimal causal window (n_pos=1, only the self row visible): the compiled
+    """Return a finite value for the minimal causal window (n_pos=1, self row only).
+
+    Minimal causal window (n_pos=1, only the self row visible): the compiled
     head returns a finite value and matches the oracle.
     """
     nb, nt, vw = 2, 3, 4

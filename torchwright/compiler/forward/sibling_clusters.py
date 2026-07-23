@@ -24,7 +24,7 @@ For each candidate join node J (currently: ``Concatenate`` with
     2. The branch-exclusive set = backward-reachable nodes that aren't
        shared with any other branch of J.
     3. Prune nodes whose direct consumers escape the exclusive set
-       (i.e., have any consumer outside ``exclusive ∪ {J}``,
+       (i.e., have any consumer outside ``exclusive U {J}``,
        modulo ``Concatenate`` transparency).
     4. Peak width = the max ``len(n)`` over the surviving branch nodes
        (an FFN's output occupies residual columns like any node).
@@ -45,6 +45,7 @@ Limitations
   than optimal.
 """
 
+from collections.abc import Iterator
 from dataclasses import dataclass, field
 
 from torchwright.compiler.forward.graph_analysis import GraphAnalyzer
@@ -107,8 +108,8 @@ class SiblingClusterAnalyzer:
         A :class:`GraphAnalyzer` over the target graph.
     min_chains
         Minimum number of parallel branches required to register a
-        cluster.  Default 4 — captures unrolled loops without firing on
-        small (2–3 way) joins that don't benefit from batching.
+        cluster.  Default 4 - captures unrolled loops without firing on
+        small (2-3 way) joins that don't benefit from batching.
     min_peak_width
         Minimum per-branch peak intermediate width.  Default 32 —
         excludes scalar-only branches where admission gating would
@@ -151,7 +152,7 @@ class SiblingClusterAnalyzer:
     # Join discovery
     # ------------------------------------------------------------------
 
-    def _find_joins(self):
+    def _find_joins(self) -> Iterator[Concatenate]:
         for node in self.graph.get_all_nodes():
             if isinstance(node, Concatenate) and len(node.inputs) >= self.min_chains:
                 yield node
@@ -250,8 +251,7 @@ class SiblingClusterAnalyzer:
             visited.add(cur)
             if not isinstance(cur, Concatenate):
                 result.add(cur)
-            for inp in cur.inputs:
-                stack.append(inp)
+            stack.extend(cur.inputs)
         return result
 
     def _union_others(self, per_input_reachable: list[set[Node]]) -> list[set[Node]]:
@@ -266,7 +266,7 @@ class SiblingClusterAnalyzer:
         return out
 
     def _prune_external_consumers(self, exclusive: set[Node], join: Node) -> set[Node]:
-        """Iteratively drop nodes with consumers outside ``exclusive ∪ {join}``.
+        """Iteratively drop nodes with consumers outside ``exclusive U {join}``.
 
         Concatenates on the consumer side are walked through: a node n
         whose immediate consumer is a Concatenate C is fine iff all of

@@ -178,8 +178,9 @@ def test_output_add_is_fresh_compute_not_add_into():
 
 
 def _add_output_graph():
-    """The canonical tied Add shape: each addend's only consumer is the
-    output, so the model's E_dead for both addends is the constant 1.
+    """The canonical tied Add shape: each addend's only consumer is the output.
+
+    So the model's E_dead for both addends is the constant 1.
     """
     embedding = _embedding()
     left = _identity(embedding, "left")
@@ -188,9 +189,11 @@ def _add_output_graph():
 
 
 def test_add_target_held_model_is_feasible():
-    """Regression: the held-target pin `is_free == 0` posted ON TOP of the
-    is_free <=> OR(E_dead) biconditional made the model hard-INFEASIBLE for
-    any Add target with a sole-consumer addend — the canonical
+    """Regression: the held-target pin made the model hard-INFEASIBLE.
+
+    The pin `is_free == 0` posted ON TOP of the is_free <=> OR(E_dead)
+    biconditional made the model hard-INFEASIBLE for any Add target with
+    a sole-consumer addend, the canonical
     `logits = transported_embedding + correction` shape.
     """
     embedding, output = _add_output_graph()
@@ -211,8 +214,9 @@ def test_add_target_held_model_is_feasible():
 
 
 def test_output_add_compiles_at_optimize_1_without_fallback():
-    """The production-path companion: an optimize>=1 tied Add compile must
-    come from a real solve, never the silent eager fallback
+    """The production-path companion: an optimize>=1 tied Add compile solves for real.
+
+    It must come from a real solve, never the silent eager fallback
     (require_solver=True turns the fallback into a hard error).
     """
     embedding, output = _add_output_graph()
@@ -234,10 +238,11 @@ def test_output_add_compiles_at_optimize_1_without_fallback():
 
 
 def _held_warm_start_hints(output, embedding, *, d, d_head, d_hidden, max_layers=12):
-    """Run the REAL warm-start seam (`compile._build_heuristic_schedule_trace`)
-    on a held-layout graph, mirroring forward_compile's setup: inputs allocated
-    in node_id order, the bank captured immediately after the source
-    allocates.
+    """Run the REAL warm-start seam (`compile._build_heuristic_schedule_trace`).
+
+    Runs it on a held-layout graph, mirroring forward_compile's setup:
+    inputs allocated in node_id order, the bank captured immediately
+    after the source allocates.
     """
     graph = GraphAnalyzer(output)
     nodes = graph.get_all_nodes()
@@ -274,9 +279,11 @@ def _held_warm_start_hints(output, embedding, *, d, d_head, d_hidden, max_layers
 
 
 def _ffn_chain_graph():
-    """The held-across-layers fixture shape: the source's last (and only)
-    reader is MLP-routed, so an MLP-mechanism hold of the source would fire
-    at the reader's own layer — a timing the model cannot represent.
+    """The held-across-layers fixture shape.
+
+    The source's last (and only) reader is MLP-routed, so an
+    MLP-mechanism hold of the source would fire at the reader's own
+    layer, a timing the model cannot represent.
     """
     embedding = _embedding()
     a = _relu_identity(embedding, "a")
@@ -286,11 +293,12 @@ def _ffn_chain_graph():
 
 
 def test_warm_start_holds_source_via_attention_at_reader_layer_plus_one():
-    """Regression (warm-start/model contract): inputs have no MLP cancel
-    mechanism in the CP-SAT model (no cancel_in_mlp var; MLP readers bound the
-    held source at cl >= layer + 1), so the heuristic must hold the tied bank
-    via an attention cancel at the last MLP reader's layer + 1 — never via an
-    MLP cancel at the reader's own layer.
+    """Regression (warm-start/model contract): inputs have no MLP cancel mechanism.
+
+    There is no cancel_in_mlp var in the CP-SAT model; MLP readers bound
+    the held source at cl >= layer + 1, so the heuristic must hold the
+    tied bank via an attention cancel at the last MLP reader's layer + 1,
+    never via an MLP cancel at the reader's own layer.
     """
     embedding, a, output = _ffn_chain_graph()
     trace, _ = _held_warm_start_hints(output, embedding, d=20, d_head=4, d_hidden=16)
@@ -303,11 +311,12 @@ def test_warm_start_holds_source_via_attention_at_reader_layer_plus_one():
 
 
 def test_warm_start_held_hint_is_model_feasible_knob_off():
-    """The hint the warm start emits must BE a schedule of the knob-off
-    (_pin_cancels=False) held model: hard-fix every hinted variable as an
-    equality and assert the point is feasible.  Before the fix the source's
-    MLP-mechanism gap-0 hold hard-fixed cancel[emb] below the model's
-    lower bound and this point was INFEASIBLE.
+    """The hint the warm start emits must BE a schedule of the knob-off held model.
+
+    The knob-off model is (_pin_cancels=False): hard-fix every hinted
+    variable as an equality and assert the point is feasible. Before the
+    fix the source's MLP-mechanism gap-0 hold hard-fixed cancel[emb]
+    below the model's lower bound and this point was INFEASIBLE.
     """
     from ortools.sat.python import cp_model
 
@@ -352,13 +361,15 @@ def test_warm_start_held_hint_is_model_feasible_knob_off():
 
 
 def test_held_handoff_declines_same_layer_live_addend():
-    """Guard parity: the held handoff must honor the add_into live-addend
-    exclusion like the other same-layer cancel paths (the cancel-candidate
-    and freshly-dead filters).  This state is unreachable through
-    schedule_layer today — a free Add consuming the source is an ancestor of
-    the single-output target, so the two are never in one layer-start ready
-    set — so the attention sublayer is driven directly with the co-resident
-    state to pin the guard against future placement-rule changes.
+    """Guard parity: the held handoff must honor the add_into live-addend exclusion.
+
+    It must exclude like the other same-layer cancel paths (the
+    cancel-candidate and freshly-dead filters). This state is
+    unreachable through schedule_layer today: a free Add consuming the
+    source is an ancestor of the single-output target, so the two are
+    never in one layer-start ready set, so the attention sublayer is
+    driven directly with the co-resident state to pin the guard against
+    future placement-rule changes.
     """
     embedding = _embedding()
     x = _identity(embedding, "x")
@@ -492,10 +503,11 @@ def test_cpsat_charges_direct_compute_and_cancel_in_same_layer():
 
 
 def test_held_live_and_snapshot_models_are_identical():
-    """The snapshot alone carries the held contract: a captured-with-held
-    problem round-trips through JSON and rebuilds the live proto with NO
-    re-supplied kwargs.  A held-less capture builds a different (relaxed)
-    proto — the non-vacuity check.
+    """The snapshot alone carries the held contract.
+
+    A captured-with-held problem round-trips through JSON and rebuilds
+    the live proto with NO re-supplied kwargs. A held-less capture
+    builds a different (relaxed) proto, the non-vacuity check.
     """
     from torchwright.compiler.forward.cpsat_snapshot import SchedulingProblem
 
@@ -534,9 +546,11 @@ def test_held_live_and_snapshot_models_are_identical():
 
 
 def test_snapshot_held_contract_validation():
-    """Loud misses on every malformed held contract: unpaired endpoints,
-    ids that name no captured node, kwargs conflicting with the stored
-    contract, and unknown ids reaching the model builder.
+    """Loud misses on every malformed held contract.
+
+    This covers unpaired endpoints, ids that name no captured node,
+    kwargs conflicting with the stored contract, and unknown ids
+    reaching the model builder.
     """
     from torchwright.compiler.forward.cpsat_snapshot import SchedulingProblem
 
@@ -582,9 +596,9 @@ def test_snapshot_held_contract_validation():
 
 
 def test_canonicalized_snapshot_remaps_and_rebuilds_held_ids():
-    """canonicalized() carries the held endpoints into the canonical id
-    space, and the canonical problem still rebuilds without re-supplied
-    kwargs.
+    """canonicalized() carries the held endpoints into the canonical id space.
+
+    The canonical problem still rebuilds without re-supplied kwargs.
     """
     from torchwright.compiler.graph_identity import canonical_ids
 
@@ -615,9 +629,10 @@ def test_canonicalized_snapshot_remaps_and_rebuilds_held_ids():
 
 
 def test_snapshot_identity_matches_production_cache_key_for_tied_graph(tmp_path):
-    """with_identity derives the held endpoints from the snapshot's own
-    stored ids, so a tied fixture's fingerprint equals the production
-    schedule-cache key — and load() gates on exactly that key.
+    """with_identity derives the held endpoints from the snapshot's own stored ids.
+
+    So a tied fixture's fingerprint equals the production schedule-cache
+    key, and load() gates on exactly that key.
     """
     embedding = _embedding()
     output = _identity(embedding, "output")
@@ -705,7 +720,7 @@ def test_cpsat_no_incumbent_fallback_keeps_held_contract(monkeypatch):
         is_optimal=False,
     )
     monkeypatch.setattr(
-        compile_mod, "solve_schedule", lambda *args, **kwargs: (None, stats)
+        compile_mod, "solve_schedule", lambda *_args, **_kwargs: (None, stats)
     )
 
     embedding = _embedding()
@@ -748,16 +763,18 @@ def test_held_schedule_cache_replay_keeps_bank(monkeypatch, tmp_path):
 
 
 def test_direct_held_handoff_shares_the_atomic_attention_batch():
-    """Scheduler-level pin of the held handoff inside the directed atomic
-    attention batch (atomic-attention-replay plan §5.3): the target's source
-    columns are captured BEFORE ``hold(source)`` (they are exactly the bank
-    plus the ordinary leaf's columns), the held bank is claimed exactly and
-    in order by the target while an ordinary release in the same batch goes
-    to the free pool, and the one coalesced cancel covers both.  The
-    allocator-level facts (held columns are never ordinary-free; ordinary
-    ``allocate`` cannot draw them; only the full ordered bank claim succeeds)
-    are unit-pinned in ``test_residual_map.py``; the end-to-end tied parity
-    tests remain the primary artifact check.
+    """Scheduler-level pin of the held handoff inside the atomic attention batch.
+
+    This is the directed atomic-attention-replay plan §5.3: the target's source
+    columns are captured BEFORE ``hold(source)`` (they are exactly the
+    bank plus the ordinary leaf's columns), the held bank is claimed
+    exactly and in order by the target while an ordinary release in the
+    same batch goes to the free pool, and the one coalesced cancel
+    covers both. The allocator-level facts (held columns are never
+    ordinary-free; ordinary ``allocate`` cannot draw them; only the full
+    ordered bank claim succeeds) are unit-pinned in
+    ``test_residual_map.py``; the end-to-end tied parity tests remain
+    the primary artifact check.
     """
     from torchwright.compiler.forward.cpsat_scheduler import ScheduleAssignment
     from torchwright.compiler.forward.graph_analysis import GraphAnalyzer
@@ -835,10 +852,12 @@ def test_direct_held_handoff_shares_the_atomic_attention_batch():
 
 
 def test_compile_headless_reproduces_the_tied_schedule(tmp_path):
-    """compile_headless(output_layout_source=...) solves the same tied
-    (token.v6) schedule compile_to_onnx always builds, so the documented
-    OnnxDebugSession discrimination recompile (CLAUDE.md, D1) reproduces a
-    v6 artifact's structure instead of silently compiling an untied one.
+    """compile_headless(output_layout_source=...) solves the same tied schedule.
+
+    It solves the same (token.v6) schedule compile_to_onnx always
+    builds, so the documented OnnxDebugSession discrimination recompile
+    (CLAUDE.md, D1) reproduces a v6 artifact's structure instead of
+    silently compiling an untied one.
     """
     from torchwright.compiler.export import compile_headless, compile_to_onnx
 
@@ -860,10 +879,11 @@ def test_compile_headless_reproduces_the_tied_schedule(tmp_path):
 
 
 def test_directed_scheduler_rejects_sibling_clusters():
-    """The CP-SAT model has no admission constraint, so the directed replay
-    must run ungated: an admission deferral after the atomic attention batch
-    committed its releases would strand a batch member whose inputs were
-    already cancelled.  forward_compile rejects optimize>0 with
+    """The CP-SAT model has no admission constraint, so the replay runs ungated.
+
+    An admission deferral after the atomic attention batch committed its
+    releases would strand a batch member whose inputs were already
+    cancelled. forward_compile rejects optimize>0 with
     admission_control=True; direct construction must be rejected too.
     """
     from torchwright.compiler.forward.cpsat_scheduler import ScheduleAssignment
@@ -890,11 +910,13 @@ def test_directed_scheduler_rejects_sibling_clusters():
 
 
 def test_unheld_bank_skip_names_the_held_output_bank():
-    """A held target that cannot allocate because the bank is not yet held
-    is skipped for the "held output bank", not for "residual columns" —
-    the latter would report demand <= free, a self-contradictory line
-    pointing at column exhaustion when the real blocker is that the tied
-    source was never cancelled into the held state.
+    """A held target that cannot allocate is skipped for the "held output bank".
+
+    That happens because the bank is not yet held; it is skipped for
+    "held output bank", not for "residual columns", since the latter
+    would report demand <= free, a self-contradictory line pointing at
+    column exhaustion when the real blocker is that the tied source was
+    never cancelled into the held state.
     """
     emb = _embedding()
     out = _identity(emb, "output")

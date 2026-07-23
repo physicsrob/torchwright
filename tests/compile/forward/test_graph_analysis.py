@@ -14,7 +14,10 @@ def _make_linear(inp, d_out, name=""):
 
 
 def test_simple_chain():
-    """Input -> Linear -> ReLU -> Linear: verify topo order, critical path, consumers."""
+    """Verify topo order, critical path, and consumers on a simple chain.
+
+    Input -> Linear -> ReLU -> Linear.
+    """
     x = InputNode("x", 4, value_range=(-100.0, 100.0))
     l1 = _make_linear(x, 4, "l1")
     r = ReLU(l1, name="relu")
@@ -73,20 +76,20 @@ def test_concatenate_transparency():
     a = InputNode("a", 4, value_range=(-100.0, 100.0))
     b = InputNode("b", 4, value_range=(-100.0, 100.0))
     cat = Concatenate([a, b])
-    l = _make_linear(cat, 2, "l")
+    lin = _make_linear(cat, 2, "l")
 
-    graph = GraphAnalyzer(l)
+    graph = GraphAnalyzer(lin)
 
     # Concat should never appear in ready nodes
     available = {a, b}
     ready = graph.get_ready_nodes(available)
-    assert l in ready
+    assert lin in ready
     assert cat not in ready  # Concat is never "ready" — it's transparent
 
-    # With only a available, l is not ready (needs b through concat)
+    # With only a available, lin is not ready (needs b through concat)
     available = {a}
     ready = graph.get_ready_nodes(available)
-    assert l not in ready
+    assert lin not in ready
 
 
 def test_adder_graph():

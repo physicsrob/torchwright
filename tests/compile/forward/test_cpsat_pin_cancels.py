@@ -19,7 +19,7 @@ the umbrella ``cpsat_pinned_cancel_plan.md``):
   layers, routing, and cancel-MECHANISM hints are kept.
 - **end-to-end replay** — a default (pinned) ``optimize=1`` compile replays
   cleanly through ``DirectedLayerScheduler`` (the always-on replay-depth
-  tripwire and I1–I4 stay silent), and so does a knob-off compile.
+  tripwire and I1-I4 stay silent), and so does a knob-off compile.
 
 CP-SAT solves are CPU-only, so this file runs on the plain suite.
 """
@@ -135,9 +135,10 @@ def _lower(out, d):
 
 @pytest.mark.parametrize("name", _NAMES)
 def test_default_build_is_pinned(name):
-    """The default build IS the pinned model: proto equal to an explicit
-    ``_pin_cancels=True`` build, no ``parked`` vars, the pin equalities
-    really posted.
+    """Confirm the default build IS the pinned model.
+
+    Proto equal to an explicit ``_pin_cancels=True`` build, no ``parked``
+    vars, the pin equalities really posted.
     """
     node, d, d_head = _build(name)
     cfg = {"d": d, "d_head": d_head, "d_hidden": d, "max_layers": _MAX_LAYERS}
@@ -152,11 +153,12 @@ def test_default_build_is_pinned(name):
 
 @pytest.mark.parametrize("name", _NAMES)
 def test_knob_off_reproduces_legacy_model(name):
-    """``_pin_cancels=False`` is the escape hatch: the proto differs from the
-    (pinned) default and rebuilds the window/parked/widening machinery.
+    """Reproduce the legacy model via the ``_pin_cancels=False`` escape hatch.
 
-    Every example graph has at least one non-keep-forever node, so the legacy
-    build gets its ``parked`` var + upper window back and loses the pins.
+    The proto differs from the (pinned) default and rebuilds the
+    window/parked/widening machinery. Every example graph has at least one
+    non-keep-forever node, so the legacy build gets its ``parked`` var +
+    upper window back and loses the pins.
     """
     node, d, d_head = _build(name)
     cfg = {"d": d, "d_head": d_head, "d_hidden": d, "max_layers": _MAX_LAYERS}
@@ -164,9 +166,8 @@ def test_knob_off_reproduces_legacy_model(name):
     off = _proto_text(build_cpsat_model(node, _pin_cancels=False, **cfg))
     assert off != default, f"{name}: knob-off proto identical to default"
     assert "parked" in off, f"{name}: legacy build has no parked vars"
-    assert "pin_attn" not in off and "pin_mlp" not in off, (
-        f"{name}: legacy build still posts pin aux vars"
-    )
+    assert "pin_attn" not in off, f"{name}: legacy build still posts pin_attn"
+    assert "pin_mlp" not in off, f"{name}: legacy build still posts pin_mlp"
 
 
 # ---------------------------------------------------------------------------
@@ -197,10 +198,10 @@ def _solve_cfg(d, d_head):
 
 @pytest.mark.parametrize(("name", "d"), _SOLVE_CELLS)
 def test_pinned_solution_valid_in_unpinned_model(name, d):
-    """Solve the pinned model, then hard-fix its full decision assignment into
-    the UNPINNED legacy model and re-solve: feasibility there proves the pin
-    only added constraints (every pinned schedule is machine-valid by
-    construction).
+    """Hard-fix a pinned solve's assignment into the UNPINNED legacy model and re-solve.
+
+    Feasibility there proves the pin only added constraints (every pinned
+    schedule is machine-valid by construction).
     """
     build, _, d_head = _example_specs()[name]
     torch.manual_seed(0)
@@ -244,8 +245,9 @@ def test_pinned_solution_valid_in_unpinned_model(name, d):
 
 @pytest.mark.parametrize(("name", "d"), _SOLVE_CELLS)
 def test_pinned_optimum_no_shallower_than_unpinned(name, d):
-    """A restriction can never beat the model it restricts: when both solves
-    prove optimality, pinned depth >= unpinned depth.
+    """Never let a restriction beat the model it restricts.
+
+    When both solves prove optimality, pinned depth >= unpinned depth.
     """
     build, _, d_head = _example_specs()[name]
 
@@ -256,10 +258,12 @@ def test_pinned_optimum_no_shallower_than_unpinned(name, d):
 
     off_asg, off_stats = _solve(False)
     on_asg, on_stats = _solve(True)
-    assert off_asg is not None and off_stats.is_optimal, (
+    assert off_asg is not None, f"{name} d={d}: unpinned solve found nothing"
+    assert off_stats.is_optimal, (
         f"{name} d={d}: unpinned not optimal in budget ({off_stats.status_name})"
     )
-    assert on_asg is not None and on_stats.is_optimal, (
+    assert on_asg is not None, f"{name} d={d}: pinned solve found nothing"
+    assert on_stats.is_optimal, (
         f"{name} d={d}: pinned not optimal in budget ({on_stats.status_name})"
     )
     assert on_asg.n_layers >= off_asg.n_layers, (
@@ -274,8 +278,9 @@ def test_pinned_optimum_no_shallower_than_unpinned(name, d):
 
 
 def test_pin_reaches_snapshot_path():
-    """Fixture-based solves go through ``solve_schedule_from_snapshot``; prove
-    the snapshot path agrees with the live path on the new default — the
+    """Prove the snapshot path agrees with the live path on the new default.
+
+    Fixture-based solves go through ``solve_schedule_from_snapshot``. The
     default snapshot build is pinned (equals the pinned live build) and the
     knob-off escape hatch is live there too.
     """
@@ -307,12 +312,12 @@ def test_pin_reaches_snapshot_path():
 
 
 def test_full_hint_with_pin_passes_strict_validation():
-    """A full four-family hint from a LEGACY-model solve does not blow up a
-    strict pinned solve: the cancel-LAYER hints — which may contradict the
-    pin (the legacy model can cancel later than earliest-legal) — are dropped
-    before ``_validate_hint``; layer, routing, and cancel-MECHANISM hints are
-    kept.  ``strict_hint=True`` would raise on any violation the validator
-    can see.
+    """Accept a full four-family legacy hint into a strict pinned solve.
+
+    The cancel-LAYER hints — which may contradict the pin (the legacy model
+    can cancel later than earliest-legal) — are dropped before
+    ``_validate_hint``; layer, routing, and cancel-MECHANISM hints are kept.
+    ``strict_hint=True`` would raise on any violation the validator can see.
     """
     build, _, d_head = _example_specs()["fibonacci"]
     d = 208

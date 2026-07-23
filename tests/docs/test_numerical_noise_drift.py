@@ -87,8 +87,9 @@ def _close_enough(a: float, b: float) -> bool:
 
 
 def _ratio_close(a: float, b: float, factor: float) -> bool:
-    """True when the two magnitudes are within ``factor`` of each other —
-    the machine-dependent-row guard (see _STAIRCASE_RATIO).
+    """True when the two magnitudes are within ``factor`` of each other.
+
+    This is the machine-dependent-row guard (see _STAIRCASE_RATIO).
     """
     if a is None and b is None:
         return True
@@ -164,8 +165,9 @@ def _strip_metadata(text: str) -> dict:
 
 
 def test_committed_measurements_match_current_code() -> None:
-    """Re-measure every op and fail if the numbers no longer match the
-    committed ``docs/op_noise_data.json``.
+    """Re-measure every op and fail if the numbers no longer match.
+
+    "Match" means the committed ``docs/op_noise_data.json``.
 
     To fix a failure of this test:
         1. Run ``make measure-noise`` to regenerate the JSON, markdown,

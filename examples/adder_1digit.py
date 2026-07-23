@@ -39,20 +39,26 @@ def check_is_num(embedding_value: Node, embedding: Embedding) -> Node:
     )
 
 
+_DECIMAL_BASE = 10
+
+
 def sum_numbers(embedding: Embedding, num1: Node, num2: Node) -> tuple[Node, Node]:
-    """Adds num1 with num2.
-    Assumes num1 and num2 are both embedding-valued nodes.
-    return result as embedding-valued node and carry as boolean.
+    """Add num1 with num2.
+
+    Assumes num1 and num2 are both embedding-valued nodes.  Returns the
+    result as an embedding-valued node and the carry as a boolean.
     """
     result_table = {}
     carry_table = {}
-    for A in range(10):
-        for B in range(10):
+    for A in range(_DECIMAL_BASE):
+        for B in range(_DECIMAL_BASE):
             numcat = torch.cat(
                 [embedding.get_embedding(str(A)), embedding.get_embedding(str(B))]
             )
-            result_table[numcat] = embedding.get_embedding(str((A + B) % 10))
-            carry_table[numcat] = torch.tensor([1.0 if (A + B) >= 10 else -1.0])
+            result_table[numcat] = embedding.get_embedding(str((A + B) % _DECIMAL_BASE))
+            carry_table[numcat] = torch.tensor(
+                [1.0 if (A + B) >= _DECIMAL_BASE else -1.0]
+            )
 
     num1_num2 = concat([num1, num2])
     return (

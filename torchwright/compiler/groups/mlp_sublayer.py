@@ -4,6 +4,8 @@ from torchwright.compiler.components.linear import LinearLayerComponent
 from torchwright.compiler.components.relu import ReLULayerComponent
 from torchwright.compiler.residual_assignment import ResidualStreamState
 
+_StatesDict = dict[str, tuple[ResidualStreamState, torch.Tensor]]
+
 
 class MLPSubLayer:
     """MLP sublayer: linear1 -> relu -> linear2 + residual skip.
@@ -29,8 +31,10 @@ class MLPSubLayer:
         self.relu = ReLULayerComponent(d_hidden, name="relu")
         self.linear2 = LinearLayerComponent(d_hidden, d, name="linear2")
 
-    def forward(self, inp: torch.Tensor, return_states=False):
-        states = {}
+    def forward(
+        self, inp: torch.Tensor, return_states: bool = False
+    ) -> torch.Tensor | tuple[torch.Tensor, _StatesDict]:
+        states: _StatesDict = {}
 
         x = self.linear1.forward(inp)
         states["linear1_out_state"] = (self.linear1.out_state, x)
@@ -65,10 +69,10 @@ class MLPSubLayer:
             self.d_hidden = n
             self.relu.d = n
 
-    def num_params(self):
+    def num_params(self) -> int:
         return self.linear1.num_params() + self.linear2.num_params()
 
-    def to(self, device):
+    def to(self, device: str | torch.device) -> "MLPSubLayer":
         self.linear1.to(device)
         self.relu.to(device)
         self.linear2.to(device)
@@ -108,8 +112,10 @@ class GatedMLPSubLayer:
         self.up_proj = LinearLayerComponent(d, d_hidden, name="up_proj")
         self.down_proj = LinearLayerComponent(d_hidden, d, name="down_proj")
 
-    def forward(self, inp: torch.Tensor, return_states=False):
-        states = {}
+    def forward(
+        self, inp: torch.Tensor, return_states: bool = False
+    ) -> torch.Tensor | tuple[torch.Tensor, _StatesDict]:
+        states: _StatesDict = {}
 
         g = self.gate_proj.forward(inp)
         states["gate_proj_out_state"] = (self.gate_proj.out_state, g)
@@ -159,14 +165,14 @@ class GatedMLPSubLayer:
             ].contiguous()
             self.d_hidden = n
 
-    def num_params(self):
+    def num_params(self) -> int:
         return (
             self.gate_proj.num_params()
             + self.up_proj.num_params()
             + self.down_proj.num_params()
         )
 
-    def to(self, device):
+    def to(self, device: str | torch.device) -> "GatedMLPSubLayer":
         self.gate_proj.to(device)
         self.up_proj.to(device)
         self.down_proj.to(device)

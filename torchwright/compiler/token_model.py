@@ -15,7 +15,6 @@ from typing import (
     Literal,
     Protocol,
     TypeAlias,
-    Union,
     cast,
 )
 
@@ -27,6 +26,13 @@ from torchwright.graph.rope import ROPE_BASE
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Mapping
+
+    import torch
+
+    from torchwright.compiler.components.linear import LinearLayerComponent
+    from torchwright.compiler.forward.replay_plan import ReplayPlan
+    from torchwright.compiler.groups.transformer_layer import TransformerLayer
+    from torchwright.compiler.transformer import HeadlessTransformer
 
 JSONScalar: TypeAlias = None | bool | int | float | str
 JSONValue: TypeAlias = JSONScalar | list["JSONValue"] | dict[str, "JSONValue"]
@@ -123,7 +129,7 @@ class SwishLayerWeights:
         return self.wgate.shape[1]
 
 
-CompiledLayerWeights = Union[ReluLayerWeights, SwishLayerWeights]
+CompiledLayerWeights = ReluLayerWeights | SwishLayerWeights
 
 
 @dataclass(frozen=True)
@@ -162,7 +168,7 @@ def make_layer_callback(header: CompileHeader, sink: TokenModelSink) -> Callable
     """Return a ``forward_compile`` callback which transfers layer ownership."""
     begun = False
 
-    def on_replay_plan(plan) -> None:
+    def on_replay_plan(plan: ReplayPlan) -> None:
         nonlocal header, begun
         header = replace(
             header, layer_shapes=tuple(layer.shape for layer in plan.layers)
@@ -170,12 +176,12 @@ def make_layer_callback(header: CompileHeader, sink: TokenModelSink) -> Callable
         sink.begin(header)
         begun = True
 
-    def callback(index, layer) -> None:
+    def callback(index: int, layer: TransformerLayer) -> None:
         nonlocal begun
         if not begun:
             sink.begin(header)
             begun = True
-        attn, mlp = layer.attn.attn, layer.mlp
+        attn, mlp = cast("Any", layer.attn.attn), cast("Any", layer.mlp)
         if header.trim_heads:
             attn.trim_unused_heads()
             mlp.trim_unused_slots()
@@ -188,7 +194,7 @@ def make_layer_callback(header: CompileHeader, sink: TokenModelSink) -> Callable
                 f"announced {expected}, emitted {actual}"
             )
 
-        def array(t):
+        def array(t: torch.Tensor) -> np.ndarray:
             return t.detach().contiguous().cpu().numpy().astype(np.float32, copy=False)
 
         aw = AttentionWeights(
@@ -203,7 +209,10 @@ def make_layer_callback(header: CompileHeader, sink: TokenModelSink) -> Callable
         attn.query_matrix = attn.key_matrix = attn.value_matrix = None
         attn.output_matrix = None
 
-        def linear(lin):
+        def linear(
+            lin_component: LinearLayerComponent,
+        ) -> tuple[np.ndarray, np.ndarray | None]:
+            lin = cast("Any", lin_component)
             matrix = array(lin.output_matrix)
             if header.bias:
                 bias_value = array(lin.output_bias)
@@ -238,7 +247,9 @@ def resolve_rope(layers: list[CompiledLayerWeights], d_head: int) -> tuple[float
     return float(next(iter(bases), ROPE_BASE)), int(next(iter(widths), d_head))
 
 
-def schedule_provenance(compiled, optimize: int) -> ScheduleProvenance:
+def schedule_provenance(
+    compiled: HeadlessTransformer, optimize: int
+) -> ScheduleProvenance:
     result = getattr(compiled, "schedule_result", None)
     if result is None:
         return ScheduleProvenance(optimize=int(optimize))
@@ -258,7 +269,9 @@ def schedule_provenance(compiled, optimize: int) -> ScheduleProvenance:
     )
 
 
-def build_token_weights(compiled, output_node: Node, embedding: Embedding, d: int):
+def build_token_weights(
+    compiled: HeadlessTransformer, output_node: Node, embedding: Embedding, d: int
+) -> TokenModelWeights:
     """Fold token placement, literals and RMS constants into full-width weights."""
     assignment = compiled.residual_assignment
     if assignment is None or not compiled.layers:
@@ -280,7 +293,7 @@ def build_token_weights(compiled, output_node: Node, embedding: Embedding, d: in
         elif isinstance(node, LiteralValue):
             literal_seeds.extend(zip(indices, map(float, node.value), strict=False))
         elif not isinstance(node, (Concatenate, InputNode)):
-            raise AssertionError(f"unexpected input-state node {type(node).__name__}")
+            raise TypeError(f"unexpected input-state node {type(node).__name__}")
     if embedding_indices is None:
         raise ValueError("supplied embedding is absent from the residual assignment")
     compact = embedding.table.detach().cpu().numpy().astype(np.float32, copy=False)

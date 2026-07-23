@@ -62,7 +62,11 @@ def _phase(t: np.ndarray, n: int, margin: float) -> tuple[np.ndarray, float]:
 
 
 def read_two_head(
-    phase: np.ndarray, g: float, sigma_w: float, rng, k_planes: int = 1
+    phase: np.ndarray,
+    g: float,
+    sigma_w: float,
+    rng: np.random.Generator,
+    k_planes: int = 1,
 ) -> np.ndarray:
     """Two-head (cos,sin) readout through a sigmoid attention weight + noise.
 
@@ -70,7 +74,7 @@ def read_two_head(
     angle (redundant readout heads); angle noise falls ~sqrt(K).
     """
 
-    def channel(signal):  # signal in [-1, 1]
+    def channel(signal: np.ndarray) -> np.ndarray:  # signal in [-1, 1]
         w = 1.0 / (1.0 + np.exp(-g * signal))  # 2-key softmax weight
         w = np.clip(w + rng.normal(0.0, sigma_w, w.shape), 1e-9, 1 - 1e-9)
         return np.log(w / (1.0 - w)) / g  # un-sigmoid -> ~signal

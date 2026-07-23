@@ -38,7 +38,7 @@ def run_gpu(module: str, script: str, args: str) -> int:
     cmd = _build_cmd(module, script, args)
     print(f"[remote/gpu] {' '.join(cmd)}")
     t0 = time.time()
-    rc = subprocess.run(cmd).returncode
+    rc = subprocess.run(cmd, check=False).returncode
     print(f"[remote/gpu] exit {rc} in {time.time() - t0:.0f}s")
     return rc
 
@@ -48,7 +48,7 @@ def run_cpu(module: str, script: str, args: str) -> int:
     cmd = _build_cmd(module, script, args)
     print(f"[remote/cpu] {' '.join(cmd)}")
     t0 = time.time()
-    rc = subprocess.run(cmd).returncode
+    rc = subprocess.run(cmd, check=False).returncode
     print(f"[remote/cpu] exit {rc} in {time.time() - t0:.0f}s")
     return rc
 

@@ -1,5 +1,6 @@
-"""Univariate-subgraph collapse — the depth pass of
-``docs/univariate_collapse_plan.md``.
+"""Univariate-subgraph collapse — the depth pass of the collapse plan.
+
+See ``docs/univariate_collapse_plan.md``.
 
 A **univariate subgraph** is a set of per-position nodes (FFN, Linear,
 Add, Concatenate; literals allowed as extra inputs) whose only
@@ -56,6 +57,7 @@ introduces more error than the synthesized claim tolerates — and the
 decline is recorded with its reason in the :class:`CollapseReport`.
 """
 
+from collections.abc import Callable
 from dataclasses import dataclass
 from typing import cast
 
@@ -92,10 +94,17 @@ _OFFSET_FRACTIONS = (0.0, -1.0, 1.0, -2.0 / 3.0, 2.0 / 3.0, -1.0 / 3.0, 1.0 / 3.
 # claim.
 _SYNTH_CLAIM_ATOL = 1e-3
 
+# A boundary member at chain depth 1 above the source is already a single
+# staircase FFN — collapsing it would not shorten anything. Only members at
+# depth >= 2 gain from synthesis.
+_MIN_SYNTH_DEPTH = 2
+
 
 def _ulp32(magnitude: float) -> float:
-    """fp32 ulp at ``magnitude`` — the accumulation-error quantum of a
-    lane sum whose intermediates reach that magnitude.
+    """fp32 ulp at ``magnitude``.
+
+    The accumulation-error quantum of a lane sum whose intermediates reach
+    that magnitude.
     """
     import math
 
@@ -205,8 +214,9 @@ class CollapseReport:
 def _seeded_oracle(
     members: list[Node], source: Node, grid: torch.Tensor
 ) -> dict[Node, torch.Tensor]:
-    """Evaluate every member's exact-math value with ``source`` pinned to
-    ``grid`` — the re-rooted oracle of the plan's synthesis step.
+    """Evaluate every member's exact-math value with ``source`` pinned to ``grid``.
+
+    This is the re-rooted oracle of the plan's synthesis step.
 
     Uses :func:`torchwright.debug.probe.reference_eval` seeded at the
     source: each member's own ``compute`` runs (the same semantic
@@ -215,7 +225,7 @@ def _seeded_oracle(
     upstream of the source is ever evaluated.
 
     Attached checks are suppressed for the walk: the grid's "positions"
-    are synthetic samples (every plateau × offset), so cross-position
+    are synthetic samples (every plateau x offset), so cross-position
     predicates (distinct-across, score gaps) would fire spuriously.
     The same predicates still run on real data through the source
     graph's checks.
@@ -242,10 +252,8 @@ def _member_depths(source: Node, members: list[Node]) -> dict[Node, int]:
     return depth
 
 
-def _machine(all_nodes) -> str | None:
-    """The graph's FFN machine: 'relu', 'swish', None (no FFNs), or
-    'mixed'.
-    """
+def _machine(all_nodes: list[Node]) -> str | None:
+    """The graph's FFN machine: 'relu', 'swish', None (no FFNs), or 'mixed'."""
     activations = {n.activation for n in all_nodes if isinstance(n, FFN)}
     if not activations:
         return None
@@ -254,11 +262,14 @@ def _machine(all_nodes) -> str | None:
     return next(iter(activations))
 
 
-def _piecewise_linear_fn(machine: str | None):
-    """The machine-matching staircase builder.  ``None`` (no FFNs in the
-    graph) can only ever synthesize constants, which take the
-    LiteralValue path before this builder is called — relu is a safe
-    default for that unreachable case.
+def _piecewise_linear_fn(
+    machine: str | None,
+) -> Callable[..., Node]:
+    """The machine-matching staircase builder.
+
+    ``None`` (no FFNs in the graph) can only ever synthesize constants, which
+    take the LiteralValue path before this builder is called — relu is a
+    safe default for that unreachable case.
     """
     if machine == "swish":
         from torchwright.ops.swiglu.arithmetic_ops import piecewise_linear
@@ -275,10 +286,10 @@ def _synthesize_member(
     machine: str | None,
     name: str,
 ) -> Node:
-    """One staircase ``piecewise_linear`` (or constant) computing
-    ``member``'s tabulated values from the source.
+    """One staircase ``piecewise_linear`` (or constant) from the source.
 
-    ``table`` is ``(n_plateaus, d)`` — the oracle at plateau centers.
+    Computes ``member``'s tabulated values.  ``table`` is
+    ``(n_plateaus, d)`` — the oracle at plateau centers.
     Breakpoints are step pairs at half-integers between value-changing
     plateaus, ``1/step_sharpness`` apart (the machine's step
     convention), with ``input_scale=step_sharpness`` so biases stay
@@ -378,7 +389,7 @@ def collapse_univariate_subgraphs(
             for m in members
             if m is output_node or any(c not in member_set for c in consumers[m])
         ]
-        synthesized = [m for m in boundary if depth[m] >= 2]
+        synthesized = [m for m in boundary if depth[m] >= _MIN_SYNTH_DEPTH]
         if not synthesized:
             outcomes.append(
                 declined("no depth gain (no boundary member at depth >= 2)")
@@ -498,7 +509,7 @@ def collapse_univariate_subgraphs(
         # source and literals only, so no FFN survives through them);
         # every other member becomes unreachable once the synthesized
         # nodes take over, freeing its lanes.
-        kept = {m for m in boundary if depth[m] < 2}
+        kept = {m for m in boundary if depth[m] < _MIN_SYNTH_DEPTH}
         freed = sum(
             m.gate_proj.shape[0]
             for m in members

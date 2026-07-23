@@ -1,7 +1,7 @@
-"""Regression: the rotary HF model survives a save_pretrained -> from_pretrained
-round trip.
+"""Regression: the rotary HF model survives a save->load round trip.
 
-The rotary frequency grid and per-head enable mask are derived purely from the
+The full round trip is save_pretrained -> from_pretrained. The rotary
+frequency grid and per-head enable mask are derived purely from the
 serialized config.  An earlier port registered them as ``persistent=False``
 buffers computed in ``__init__``; ``from_pretrained``'s meta-device
 (``low_cpu_mem_usage``) load path does NOT materialize a non-persistent buffer —
@@ -73,8 +73,9 @@ def test_save_load_logits_identical(tmp_path, rope_base):
 
 
 def test_save_load_cached_decode_finite(tmp_path):
-    """The reloaded model also decodes (cached single step after prefill) finite —
-    the path generate() exercises.
+    """The reloaded model also decodes finite: a cached step after prefill.
+
+    This is the path generate() exercises.
     """
     model = _tiny_model(500000.0)
     model.save_pretrained(tmp_path)

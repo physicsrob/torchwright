@@ -13,7 +13,7 @@ from torchwright.compiler.onnx_load import OnnxTokenModule, load_onnx
 def _load_token_model(onnx_path: str) -> OnnxTokenModule:
     model = load_onnx(onnx_path)
     if not isinstance(model, OnnxTokenModule):
-        raise ValueError(
+        raise TypeError(
             f"{onnx_path}: the repl needs a token-I/O export "
             f"(compile_to_onnx); this is a {type(model).__name__} artifact"
         )

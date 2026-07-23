@@ -23,8 +23,14 @@ recovering the single global grid; this same formula covers that case.
 
 import math
 from dataclasses import dataclass
+from typing import TYPE_CHECKING
 
 import torch
+
+from torchwright.graph.node import Node
+
+if TYPE_CHECKING:
+    from torchwright.graph.attn import Attn
 
 # LLaMA3-family base.  See docs/rope_port_plan.md §6 — reconcile downstream
 # analyses (measured at 1e6) if this changes.
@@ -145,9 +151,10 @@ def rotate_half(x: torch.Tensor) -> torch.Tensor:
 
 
 def apply_rope(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.Tensor:
-    """Apply ``rotate_half`` RoPE, vanilla partial-rotary (HF ``partial_rotary_factor``).
+    """Apply ``rotate_half`` RoPE, vanilla partial-rotary variant.
 
-    ``x`` is ``(..., P, d_head)``; ``cos``/``sin`` are ``(P, d_rot)`` and broadcast
+    Matches HF's ``partial_rotary_factor`` behavior.  ``x`` is
+    ``(..., P, d_head)``; ``cos``/``sin`` are ``(P, d_rot)`` and broadcast
     over the leading dims.  The rotary width ``d_rot`` is read from ``cos.shape[-1]``:
     the first ``d_rot`` dims of ``x`` are rotated (``rotate_half`` over ``d_rot``,
     pairing dim ``i`` with ``i + d_rot/2``) and the last ``d_head - d_rot`` dims pass
@@ -169,22 +176,25 @@ def apply_rope(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.T
 
 
 def place_on_slow_planes(mat: torch.Tensor, d_head: int) -> torch.Tensor:
-    """Relocate a content head's ``(rows, W)`` Q/K projection onto the **slowest**
-    ``W`` planes of the full ``d_head`` ``rotate_half`` grid.
+    """Relocate a content head's Q/K projection onto the slowest planes.
+
+    The input is a ``(rows, W)`` matrix; the output places those ``W``
+    columns onto the slowest ``W`` planes of the full ``d_head``
+    ``rotate_half`` grid.
 
     A content-selection head (``attend_argmin``/``argmax``/``_where``/``dot``/
     ``_bucket`` …) matches on content, not position: its logit is
     ``Σ_c q_c · k_c`` with the content in a few small columns ``c = 0 .. W-1``.
     Under the end-state global rotation every head's Q/K is rotated by absolute
-    position, turning that logit into ``Σ_c q_c · k_c · cos((i − j)·θ_{p_c})`` —
+    position, turning that logit into ``Σ_c q_c · k_c · cos((i - j)·θ_{p_c})`` —
     so a content column on a *fast* plane (large ``θ``) is scrambled by the
     relative offset.  Placing each content column on a **slow** plane (tiny
-    ``θ``) keeps ``cos((i − j)·θ) ≈ 1`` over the rollout, so the match is
+    ``θ``) keeps ``cos((i - j)·θ) ≈ 1`` over the rollout, so the match is
     effectively position-free (``docs/rope_port_plan.md`` §3 — standard RoPE on
     the global grid, not NoPE).
 
-    Layout: content column ``c`` goes to the first-half dim ``d_head/2 − 1 − c``
-    (the slowest plane first), with its ``rotate_half`` partner ``d_head − 1 − c``
+    Layout: content column ``c`` goes to the first-half dim ``d_head/2 - 1 - c``
+    (the slowest plane first), with its ``rotate_half`` partner ``d_head - 1 - c``
     left zero, so each plane carries exactly one content scalar and the planes do
     not mix under rotation.  Requires ``W ≤ d_head/2``.
 
@@ -208,8 +218,11 @@ def place_on_slow_planes(mat: torch.Tensor, d_head: int) -> torch.Tensor:
 
 
 def place_on_nope_tail(mat: torch.Tensor, d_head: int, d_rot: int) -> torch.Tensor:
-    """Relocate a content head's ``(rows, W)`` Q/K projection onto the **unrotated
-    NoPE tail** ``[d_rot:d_head]`` of the partial-rotary grid.
+    """Relocate a content head's Q/K projection onto the unrotated NoPE tail.
+
+    The input is a ``(rows, W)`` matrix; the output places those ``W``
+    columns onto the unrotated tail ``[d_rot:d_head]`` of the
+    partial-rotary grid.
 
     The partial-rotary dual of :func:`place_on_slow_planes`.  Under vanilla partial
     rotary (``d_rot < d_head``) :func:`apply_rope` rotates only the first ``d_rot``
@@ -246,19 +259,19 @@ def place_on_nope_tail(mat: torch.Tensor, d_head: int, d_rot: int) -> torch.Tens
 
 
 def rotary_content_head(
-    query_in,
-    key_in,
-    value,
+    query_in: Node,
+    key_in: Node,
+    value: Node,
     query_matrix: torch.Tensor,
     key_matrix: torch.Tensor,
     *,
     d_head: int,
     base: float = ROPE_BASE,
     d_rot: int | None = None,
-):
-    """A content-selection ``Attn`` made rotary, with the content placed so the
-    match survives the global rotation — **routed by ``d_rot``**.
+) -> "Attn":
+    """A content-selection ``Attn`` made rotary, routed by ``d_rot``.
 
+    The content is placed so the match survives the global rotation.
     Takes a content head's compact ``(·, W)`` ``query_matrix`` / ``key_matrix``
     (the same layout the ``attend_*`` builders construct — score in col 0,
     validity / bucket / dot dims in later cols) and rebuilds it as a full-width
@@ -267,7 +280,7 @@ def rotary_content_head(
     - **Full rotary** (``d_rot is None`` or ``== d_head``): content relocated onto
       the slowest ``W`` planes of the ``d_head`` ``rotate_half`` grid via
       :func:`place_on_slow_planes`.  The slow planes are quasi-static under the
-      global rotation (``cos((i−j)·θ_slow) ≈ 1``), so the match is *approximately*
+      global rotation (``cos((i-j)·θ_slow) ≈ 1``), so the match is *approximately*
       position-free (``docs/rope_port_plan.md`` §3).
 
     - **Partial rotary** (``d_rot < d_head``): content relocated onto the unrotated
@@ -357,7 +370,7 @@ def rope_lobe_band(
 
     At ``base 5e5``, ``d_head 256``, ``max_positions 61440``, ``theta_max 0.3``
     the band is planes 12..96 (85 planes), peak ``Σ amp_p ≈ 42.6``, with a
-    measured monotone window ``W ≈ 415`` — ~4× the ~100-token target.  Returns
+    measured monotone window ``W ≈ 415`` — ~4x the ~100-token target.  Returns
     ``(planes, amps)`` where ``amps`` is a ``(len(planes),)`` float32 tensor.
 
     Raises ``ValueError`` if fewer than two planes survive the band (raise
@@ -366,7 +379,8 @@ def rope_lobe_band(
     inv = rope_inv_freq(d_head, base)  # (d_head/2,), θ_p decreasing in p
     floor = math.pi / max_positions
     planes = [p for p in range(d_head // 2) if floor < float(inv[p]) < theta_max]
-    if len(planes) < 2:
+    min_band_planes = 2  # need at least two planes for a monotone decay lobe
+    if len(planes) < min_band_planes:
         raise ValueError(
             f"local-recency lobe band has <2 planes at base={base} "
             f"d_head={d_head} max_positions={max_positions} theta_max={theta_max}; "
@@ -379,9 +393,9 @@ def rope_lobe_band(
 
 
 def rotary_recency_head(
-    query_in,
-    key_in,
-    value,
+    query_in: Node,
+    key_in: Node,
+    value: Node,
     query_matrix: torch.Tensor,
     key_matrix: torch.Tensor,
     *,
@@ -391,7 +405,7 @@ def rotary_recency_head(
     recency_gain: float,
     theta_max: float = LOBE_THETA_MAX,
     d_rot: int | None = None,
-):
+) -> "Attn":
     """A "most recent matching" content head with **intrinsic rotary recency**.
 
     Like :func:`rotary_content_head` — the compact ``(·, W)`` content
@@ -415,14 +429,14 @@ def rotary_recency_head(
     **The lobe amplitude can collapse.**  At a minimal band (2 surviving
     planes — e.g. ``d_head=32, max_positions=64``) the Hann taper evaluates at
     its two endpoint zeros and only the ``1e-3`` floor survives, so the peak
-    ``Σ amp_p`` drops ~1000×.  Callers that size a content gate from the lobe
+    ``Σ amp_p`` drops ~1000x.  Callers that size a content gate from the lobe
     peak must bound the resulting softmax leak —
     :func:`~torchwright.ops.attention_ops.get_prev_value` enforces this with a
     build-time ``ValueError`` (``_MAX_RECENCY_LEAK``).
 
     The recency band is **disjoint** from the content slow planes; this raises if
     the content width would reach into the band (content occupies planes
-    ``d_head/2−W .. d_head/2−1`` — keep ``W`` small, ≲30 at the default config).
+    ``d_head/2-W .. d_head/2-1`` — keep ``W`` small, ≲30 at the default config).
     The head is full-width rotary on the ``d_head`` grid, so it carries **no new
     ONNX/HF emission** — it rides the Phase-0 rotary path exactly like
     :func:`rotary_content_head`.
@@ -476,14 +490,14 @@ def rotary_recency_head(
 
 
 def rotary_offset_head(
-    value,
+    value: Node,
     delta_pos: int = -1,
     *,
     d_qk: int,
     base: float = ROPE_BASE,
     hardness: float = 100.0,
     d_rot: int | None = None,
-):
+) -> Node:
     """A pure-rotary "attend to position ``j + delta_pos``" head.
 
     The rotary analogue of :meth:`PosEncoding.attend_to_offset`, used as the

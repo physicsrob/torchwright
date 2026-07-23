@@ -7,10 +7,10 @@ both in single-pass (prefill) and token-by-token (autoregressive) modes.
 import pytest
 import torch
 
+from examples.calculator_simple import D_HEAD
 from torchwright.compiler.forward.compile import forward_compile
 
 D = 1024
-from examples.calculator_simple import D_HEAD
 
 
 @pytest.fixture(scope="module")

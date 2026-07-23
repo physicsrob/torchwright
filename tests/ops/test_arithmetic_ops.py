@@ -170,7 +170,7 @@ def test_multiply_integers_zero():
 def test_mod_const():
     x = create_input("x", 1)
     cases = [
-        # (value, divisor, max_value, expected)
+        # Each case is (value, divisor, max_value, expected).
         (7, 3, 10, 1),
         (10, 5, 10, 0),
         (13, 4, 15, 1),
@@ -245,7 +245,7 @@ def test_piecewise_linear_extrapolate():
     f = piecewise_linear(x, [0.0, 10.0], lambda x: 10 * x, clamp=False)
     # Interior
     assert abs(_eval_pw(f, 5.0) - 50.0) < 0.01
-    # Extrapolation (slope = 10)
+    # Extrapolation, with slope 10.
     assert abs(_eval_pw(f, -5.0) - (-50.0)) < 0.01
     assert abs(_eval_pw(f, 15.0) - 150.0) < 0.01
 
@@ -389,11 +389,14 @@ def test_ceil_int():
 
 
 def test_floor_int_wide_range_large_magnitude():
-    """Regression: the old slope-change ReLU staircase summed ~n terms of
-    magnitude ~s*x in one projection, overflowing fp32's 2^24 exact-integer
-    limit and collapsing to ~0 above x ~ 2^24/s (e.g. floor_int(40000.4,
-    [0,65535], s=1000) returned 0.0). The saturating-step staircase keeps every
-    partial sum in [0, n] so it stays exact at any magnitude/sharpness.
+    """Regression: the saturating-step staircase stays exact at any magnitude.
+
+    The old slope-change ReLU staircase summed ~n terms of magnitude
+    ~s*x in one projection, overflowing fp32's 2^24 exact-integer limit
+    and collapsing to ~0 above x ~ 2^24/s (e.g. floor_int(40000.4,
+    [0,65535], s=1000) returned 0.0). The saturating-step staircase keeps
+    every partial sum in [0, n] so it stays exact at any
+    magnitude/sharpness.
     """
     import math
 
@@ -410,10 +413,12 @@ def test_floor_int_wide_range_large_magnitude():
 
 
 def test_floor_int_byte_range_exact_high_sharpness():
-    """Exactness guard over the [0,255] byte range at high sharpness — the DOOM
-    digit-quad high byte floor(q/256). The saturating-step form must stay exact
-    across the whole range (the old form's partial sums grew with the step count
-    and position and could lose ~1-2 units near the top).
+    """Exactness guard over the [0,255] byte range at high sharpness.
+
+    This covers the DOOM digit-quad high byte floor(q/256). The
+    saturating-step form must stay exact across the whole range (the
+    old form's partial sums grew with the step count and position and
+    could lose ~1-2 units near the top).
     """
     import math
 
@@ -438,11 +443,13 @@ def test_ceil_int_wide_range_large_magnitude():
 
 
 def test_ceil_int_high_sharpness_screen_y():
-    """ceil_int must forward sharpness to its inner floor_int (the DOOM screen-y
-    CEIL_Y staircase). At sharpness=10000 the ramp is 1e-4 wide, so a raw screen-y
-    carrying ~0.077 of piecewise-linear multiply noise stays in the flat zone and
-    ceils to an exact integer instead of interpolating across a scanline boundary.
-    Covers the narrow [0,49] and wide [0,128] / [-128,49] ranges H actually uses.
+    """ceil_int must forward sharpness to its inner floor_int (DOOM's CEIL_Y staircase).
+
+    At sharpness=10000 the ramp is 1e-4 wide, so a raw screen-y carrying
+    ~0.077 of piecewise-linear multiply noise stays in the flat zone and
+    ceils to an exact integer instead of interpolating across a scanline
+    boundary. Covers the narrow [0,49] and wide [0,128] / [-128,49]
+    ranges H actually uses.
     """
     import math
 
@@ -488,7 +495,7 @@ def test_clamp():
 
 
 def test_piecewise_linear_vector():
-    """piecewise_linear with vector-valued fn looks up vector values from a scalar key."""
+    """A vector-valued fn looks up vector values from a scalar key."""
     import math
 
     x = create_input("x", 1)

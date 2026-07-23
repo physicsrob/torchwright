@@ -23,7 +23,7 @@ class LinearLayerComponent(Component):
     def __repr__(self) -> str:
         return f"LinearLayerComponent(name='{self.name}')"
 
-    def forward(self, inp: torch.Tensor):
+    def forward(self, inp: torch.Tensor) -> torch.Tensor:
         # inp shape (n_pos, d_in) -> (n_pos, d_out)
         x = inp @ self.output_matrix
         return x + self.output_bias

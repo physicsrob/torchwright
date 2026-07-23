@@ -25,8 +25,8 @@ unequal constants (see ``docs/rms_norm_dmodel.md``).
 from __future__ import annotations
 
 import math
-import os
 import tempfile
+from pathlib import Path
 
 import pytest
 
@@ -70,7 +70,7 @@ def _compile(rms_norm: bool) -> str:
     art = compile_to_onnx(
         out_node,
         emb,
-        os.path.join(d_dir, "m.onnx"),
+        str(Path(d_dir) / "m.onnx"),
         d=_EXPORT_D,
         d_head=calculator_simple.D_HEAD,
         rms_norm=rms_norm,
@@ -194,7 +194,7 @@ def _compile_tiny_5120(rms_norm: bool) -> str:
     art = compile_to_onnx(
         out,
         emb,
-        os.path.join(d_dir, "m.onnx"),
+        str(Path(d_dir) / "m.onnx"),
         d=5120,
         d_hidden=64,
         max_seq_len=16,

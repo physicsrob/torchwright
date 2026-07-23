@@ -37,6 +37,8 @@ end-to-end depth now tracks its carry-lookahead / carry-save arithmetic —
 the shared parse, comparison, and leading-zero trim are all constant-depth.)
 """
 
+from collections.abc import Callable
+
 import torch
 
 from torchwright.graph import Embedding, Linear, Node, RopeConfig
@@ -140,13 +142,13 @@ def _slice(node: Node, start: int, width: int, name: str = "slice") -> Node:
 def compare_digit_seqs(
     embedding: Embedding, seq1: list[Node], seq2: list[Node]
 ) -> Node:
-    """Lexicographic comparison at constant depth: weight the digit flags so
-    the first difference outweighs everything after it.
+    """Lexicographic comparison at constant depth.
 
-    This is how a person compares equal-width numbers — walk from the most
-    significant digit, and the first position where the digits differ
-    decides — encoded arithmetically in three FFN stages regardless of
-    digit count:
+    Weight the digit flags so the first difference outweighs everything
+    after it.  This is how a person compares equal-width numbers — walk
+    from the most significant digit, and the first position where the
+    digits differ decides — encoded arithmetically in three FFN stages
+    regardless of digit count:
 
     1. one ``onehot_lookup`` per position maps the concatenated digit pair
        to a three-way flag: ``+1`` (a > b), ``0`` (equal), ``-1`` (a < b)
@@ -325,8 +327,9 @@ def parse_expression(
 
 
 def _pad_result(embedding: Embedding, digits: list[Node], seq_len: int) -> list[Node]:
-    """Align a digit sequence into the shared result frame (free literals):
-    leading ``"0"`` digits out to the widest answer width (``seq_len - 2``,
+    """Align a digit sequence into the shared result frame (free literals).
+
+    Leading ``"0"`` digits out to the widest answer width (``seq_len - 2``,
     multiplication's ``2·max_digits``), then ``<eos>`` padding.  Every branch
     then has the same digit width, so the one post-dispatch trim's
     ``max_removals`` cap keeps exactly one digit of an all-zero answer no
@@ -343,20 +346,24 @@ def emit_result(
     saw_newline: Node,
     result_digits: list[Node],
 ) -> Node:
-    """Emit ``result_digits`` autoregressively once the newline fires, printing
-    a space at every position before then.
+    """Emit ``result_digits`` autoregressively once the newline fires.
+
+    Prints a space at every position before then.
     """
     return output_sequence(
         rope, saw_newline, result_digits, embedding.get_embedding(" ")
     )
 
 
+_DigitSeqOp = Callable[[Embedding, list[Node], list[Node]], list[Node]]
+
+
 def build_calculator(
     max_digits: int,
     *,
-    add_digit_seqs,
-    subtract_digit_seqs,
-    multiply_digit_seqs,
+    add_digit_seqs: _DigitSeqOp,
+    subtract_digit_seqs: _DigitSeqOp,
+    multiply_digit_seqs: _DigitSeqOp,
 ) -> tuple[Node, Embedding]:
     """Assemble the calculator graph from one variant's arithmetic.
 

@@ -1,6 +1,7 @@
-"""Does the constant-column RMSNorm-identity survive GENUINE floats (DOOM-style:
-reciprocals, distances, wide dynamic range), in the COMMITTED reserve-inside
-layout, at the widths that actually ship?
+"""Does the constant-column RMSNorm-identity survive GENUINE floats?
+
+DOOM-style: reciprocals, distances, wide dynamic range, in the COMMITTED
+reserve-inside layout, at the widths that actually ship.
 
 Committed **power-of-two-RMS** gain only (the formula-gain fallback is dropped —
 it is not bit-exact on arbitrary floats; see docs/plan_rmsnorm.md):
@@ -10,9 +11,9 @@ it is not bit-exact on arbitrary floats; see docs/plan_rmsnorm.md):
     when ``b`` is odd (DOOM ships at ``d=8192=2^13``).  The pinned energy
     ``E = n_const * 2^(2q)`` is then ``2^(even)`` (1 col) or ``2^(odd)`` (2 cols),
     chosen so ``rms = sqrt(E/d)`` is an exact power of two ``2^m``.
-  - gain ``= 2^m``  ->  ``÷rms`` and ``×gain`` are pure fp32 exponent shifts  ->
-    **bit-exact identity for ALL floats** (modulo a denormal floor for near-zero
-    data, not exercised by DOOM magnitudes).
+  - gain ``= 2^m``  ->  dividing by rms and multiplying by gain are pure fp32
+    exponent shifts  ->  **bit-exact identity for ALL floats** (modulo a
+    denormal floor for near-zero data, not exercised by DOOM magnitudes).
 
 Per ``(d, energy_scale)`` we check:
   - ``rms_spread == 0``   (rms bit-exactly constant across positions)
@@ -35,10 +36,12 @@ N_POS = 64
 Q = 30  # constant magnitude 2^Q
 
 
-def doom_like_stream(d_data, n, scale=1.0):
-    """A residual stream spanning DOOM-ish magnitudes (distances ~1e3, their
-    reciprocals ~1e-3..1e-4, unit-ish trig, mid-range), scaled by ``scale``
-    (``>1`` simulates the larger residual energy of a deep layer).
+def doom_like_stream(d_data: int, n: int, scale: float = 1.0) -> torch.Tensor:
+    """A residual stream spanning DOOM-ish magnitudes.
+
+    Distances ~1e3, their reciprocals ~1e-3..1e-4, unit-ish trig, mid-range,
+    scaled by ``scale`` (``>1`` simulates the larger residual energy of a
+    deep layer).
     """
     x = torch.zeros(n, d_data)
     w = d_data // 5
@@ -50,7 +53,7 @@ def doom_like_stream(d_data, n, scale=1.0):
     return x * scale
 
 
-def pow2_layout(d):
+def pow2_layout(d: int) -> tuple[int, int]:
     """Reserve-inside power-of-two-RMS layout for width ``d = 2^b``.
 
     Returns ``(n_const, m)``: ``n_const`` columns each ``= 2^Q``, forcing an
@@ -64,13 +67,17 @@ def pow2_layout(d):
     return n_const, (e_exp - b) // 2
 
 
-def rmsnorm(res, gain, eps):
+def rmsnorm(
+    res: torch.Tensor, gain: float, eps: float
+) -> tuple[torch.Tensor, torch.Tensor]:
     ms = (res * res).mean(dim=-1, keepdim=True)
     rms = torch.sqrt(ms + eps)
     return res / rms * gain, rms
 
 
-def run(d, eps=0.0, energy_scale=1.0, n_iter=200):
+def run(
+    d: int, eps: float = 0.0, energy_scale: float = 1.0, n_iter: int = 200
+) -> tuple[float, float, float]:
     n_const, m = pow2_layout(d)
     d_data = d - n_const
     data = doom_like_stream(d_data, N_POS, scale=energy_scale)
@@ -98,7 +105,8 @@ def run(d, eps=0.0, energy_scale=1.0, n_iter=200):
     print(
         f"  d={d:<5} b={d.bit_length() - 1} cols={n_const} rms=2^{m} gain={gain:.2e} "
         f"eps={eps:g} scale={energy_scale:<5g} "
-        f"Σdata²={data_energy:.2e}(<{bound:.1e}? {'y' if data_energy < bound else 'N'}) "
+        f"Σdata²={data_energy:.2e}"
+        f"(<{bound:.1e}? {'y' if data_energy < bound else 'N'}) "
         f"rms_spread={rms_spread:.0e} max|Δ|={err.max():.0e} "
         f"drift@{n_iter}={drift:.0e}  [{ok}]"
     )

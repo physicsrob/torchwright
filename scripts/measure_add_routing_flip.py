@@ -34,7 +34,8 @@ Run on Modal (CP-SAT solves want cores; compiles want the sanctioned box):
 
 Options via ARGS, e.g.:
 
-    make modal-run MODULE=scripts.measure_add_routing_flip ARGS="--graphs calculator caesar"
+    make modal-run MODULE=scripts.measure_add_routing_flip \
+        ARGS="--graphs calculator caesar"
 
 The DOOM flagship is deliberately not swept here — it lives in
 torchwright_doom and its compile is a separate budgeted Modal run; run it
@@ -47,7 +48,7 @@ import argparse
 import os
 import tempfile
 import time
-from typing import Any
+from typing import TYPE_CHECKING, Any, cast
 
 # Cold solves: isolate the schedule cache before torchwright imports read it.
 os.environ["TW_SCHEDULE_CACHE_DIR"] = tempfile.mkdtemp(prefix="tw-add-flip-")
@@ -58,11 +59,17 @@ from torchwright.compiler.forward.scheduling_policy import (
     SchedulingPolicy,
 )
 
+if TYPE_CHECKING:
+    from collections.abc import Callable
+
+    from torchwright.compiler.groups.transformer_layer import TransformerLayer
+    from torchwright.graph import Node
+
 _ADD_ATTN_OPS = ("add_into", "compute_add")
 _ADD_MLP_OPS = ("add_into_bypass", "compute_add_bypass")
 
 
-def _example_specs():
+def _example_specs() -> dict[str, tuple[Callable[[], Node], int, int]]:
     from examples import (
         binary_increment,
         caesar_cipher,
@@ -103,13 +110,26 @@ def _example_specs():
     }
 
 
-def _run_config(out, d, d_head, *, optimize, policy, flex):
-    captured = {}
+def _run_config(
+    out: Node,
+    d: int,
+    d_head: int,
+    *,
+    optimize: int,
+    policy: SchedulingPolicy | None,
+    flex: bool,
+) -> dict[str, Any]:
+    captured: dict[str, Any] = {}
 
-    def on_layer(_i, _layer) -> None:
+    def on_layer(_i: int, _layer: TransformerLayer) -> None:
         pass
 
-    on_layer.on_replay_plan = lambda plan: captured.__setitem__("plan", plan)
+    # ``on_layer_compiled`` supports an optional ``on_replay_plan`` hook read
+    # via getattr; attach it through Any so the callback's own signature
+    # stays precisely typed.
+    cast("Any", on_layer).on_replay_plan = lambda plan: captured.__setitem__(
+        "plan", plan
+    )
     t0 = time.perf_counter()
     try:
         net = forward_compile(

@@ -39,8 +39,10 @@ def _expected_prev(payload: torch.Tensor) -> torch.Tensor:
 
 
 def test_rotary_offset_oracle_selects_prev_position():
-    """The rotary head's oracle selects the previous position, token-identical
-    to the existing trig-shift ``attend_to_offset(-1)``.
+    """The rotary head's oracle selects the previous position.
+
+    Its selection is token-identical to the existing trig-shift
+    ``attend_to_offset(-1)``.
     """
     rope = create_rope_config(d_head=D_HEAD, max_positions=512)
     payload = create_input("payload", 1)
@@ -59,8 +61,9 @@ def test_rotary_offset_oracle_selects_prev_position():
 
 
 def test_rotary_offset_compiled_matches_oracle():
-    """probe_compiled: the compiled rotary head matches its oracle everywhere
-    (no divergent node) — the oracle-first / R15 contract.
+    """probe_compiled: the compiled rotary head matches its oracle everywhere.
+
+    No divergent node: the oracle-first / R15 contract.
     """
     payload = create_input("payload", 1)
     vals = _payload(N_POS)
@@ -75,8 +78,9 @@ def test_rotary_offset_compiled_matches_oracle():
 
 
 def test_rotary_offset_prefill_decode_identical():
-    """Prefill and token-by-token cached decode produce identical offset-head
-    output — the cache-rotation invariant (K stored rotated, Q rotated by
+    """Prefill and token-by-token cached decode produce identical offset-head output.
+
+    This is the cache-rotation invariant (K stored rotated, Q rotated by
     absolute position).
     """
     payload = create_input("payload", 1)

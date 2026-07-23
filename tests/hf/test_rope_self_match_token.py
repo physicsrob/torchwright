@@ -61,8 +61,10 @@ def _build_direct(_tmpdir=None):
 
 
 def test_hf_self_match_rotary_heads_and_const_column():
-    """The self-match heads are rotary in the HF config, and the reserved
-    constant-1 column reached the HF model as a literal 1.0 column.
+    """The self-match heads are rotary in the HF config.
+
+    The reserved constant-1 column reached the HF model as a literal
+    1.0 column.
     """
     hf = _build_direct()
     # Every head (offset + the unconditionally-rotary self-match transport heads)
@@ -79,8 +81,9 @@ def test_hf_self_match_rotary_heads_and_const_column():
 
 
 def test_hf_self_match_predicts_previous_token():
-    """Rotary self-match transports the embedding correctly through export +
-    compilation: the model still predicts the previous token.
+    """Rotary self-match transports the embedding correctly through export + compile.
+
+    The model still predicts the previous token.
     """
     seq = ["<bos>", "a", "b", "c", "d", "e"]
     ids = torch.tensor([[_VOCAB.index(t) for t in seq]])

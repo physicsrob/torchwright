@@ -44,7 +44,7 @@ Emission-shape models (S1/S2) for the analysis report live here too:
 
 - **S1** — one interpolating ``piecewise_linear`` FFN (chain → 1).
   Lanes: one per slope change (the emitter's own rule).  Error model:
-  a saturated lane's accumulated term reaches ``|Δm_i|·(hi − x_i)``,
+  a saturated lane's accumulated term reaches ``|Δm_i|·(hi - x_i)``,
   and the fp32 lane sum quantizes to ulps of the worst term.
 - **S2** — two-sublayer bounded-step emission (chain → 2),
   generalizing ``floor_int``'s ``output_map`` fold: stage 1 emits one
@@ -77,6 +77,14 @@ if TYPE_CHECKING:
     from torchwright.graph import Node
 
 _F64 = torch.float64
+
+# Fewest knots a PLFunction needs to have any segment at all (a segment
+# spans two adjacent knots).
+_MIN_KNOTS_FOR_SEGMENT = 2
+
+# With this many knots or fewer, every knot is an endpoint — there is no
+# strictly interior knot to drop, reduce, or otherwise treat specially.
+_MAX_KNOTS_WITHOUT_INTERIOR = 2
 
 # Per-segment sample offsets (fractions of the segment width) for the
 # linearity certificate.  0.5 is the core midpoint check; the geometric
@@ -117,7 +125,7 @@ class PLFunction:
     slope_lo: torch.Tensor
     slope_hi: torch.Tensor
 
-    def __post_init__(self):
+    def __post_init__(self) -> None:
         object.__setattr__(self, "x", torch.as_tensor(self.x, dtype=_F64).reshape(-1))
         y = torch.as_tensor(self.y, dtype=_F64)
         if y.ndim == 1:
@@ -155,8 +163,9 @@ class PLFunction:
     def line(
         slope: torch.Tensor, intercept: torch.Tensor, lo: float, hi: float
     ) -> PLFunction:
-        """The affine function ``slope·x + intercept`` on ``[lo, hi]``,
-        clamped outside (zero tail slopes).
+        """The affine function ``slope·x + intercept`` on ``[lo, hi]``.
+
+        Clamped outside (zero tail slopes).
         """
         slope = torch.as_tensor(slope, dtype=_F64).reshape(-1)
         intercept = torch.as_tensor(intercept, dtype=_F64).reshape(-1)
@@ -247,8 +256,9 @@ class PLFunction:
         return PLFunction(xs, self.eval(xs), self.slope_lo, self.slope_hi)
 
     def simplified(self, tol: float) -> PLFunction:
-        """Drop interior knots that are chord-consistent — a sequential
-        sleeve scan: knot ``i`` is dropped when it sits within ``tol``
+        """Drop interior knots that are chord-consistent.
+
+        A sequential sleeve scan: knot ``i`` is dropped when it sits within ``tol``
         of the chord from the last *kept* knot to knot ``i+1``.  Keeps
         real bends (to within one dropped neighbor) and mid-step
         anchors; sheds oracle-noise knots and the ±1-ulp candidate
@@ -259,7 +269,7 @@ class PLFunction:
         error a removal introduces shows up in the measurement.
         """
         n = self.n_knots
-        if n <= 2:
+        if n <= _MAX_KNOTS_WITHOUT_INTERIOR:
             return self
         keep = [0]
         for i in range(1, n - 1):
@@ -296,8 +306,9 @@ class PLFunction:
         return after - before
 
     def lanes(self, tol: float | None = None) -> int:
-        """Emitted-lane count of an S1 ``piecewise_linear`` of this
-        function: one lane per knot whose slope changes in any dim.
+        """Emitted-lane count of an S1 ``piecewise_linear`` of this function.
+
+        One lane per knot whose slope changes in any dim.
         """
         deltas = self.slope_deltas().abs()
         if tol is None:
@@ -314,7 +325,7 @@ class PLFunction:
         no entry — the knot is already a knot.  Tail crossings are not
         searched (the walk's functions are domain-clamped).
         """
-        if self.n_knots < 2:
+        if self.n_knots < _MIN_KNOTS_FOR_SEGMENT:
             return torch.zeros(0, dtype=_F64)
         y0, y1 = self.y[:-1], self.y[1:]
         strad = (y0 * y1) < 0
@@ -388,7 +399,7 @@ _RES_FLOOR_K = 8.0
 SIMPLIFY_TOL = _SYNTH_CLAIM_ATOL / 8.0
 
 # A swish hinge is exactly linear only once its pre-activation clears
-# ±_HINGE_EXACT_Z (|z·σ(−z)| at z=25 is 3.5e-10 — even a 1e6-scale
+# ±_HINGE_EXACT_Z (|z·sigmoid(-z)| at z=25 is 3.5e-10 — even a 1e6-scale
 # output weight keeps the tail below any claim budget).  Inside that
 # band the composed value rides the machine's own dip and tail — the
 # documented in-band class, up to ``swish_dip·|Δm|/scale`` at the dip
@@ -458,8 +469,9 @@ class MemberCertificate:
 
 @dataclass
 class SubgraphCertificate:
-    """All member certificates of one univariate subgraph, or the
-    reason the walk stopped.
+    """All member certificates of one univariate subgraph.
+
+    Or the reason the walk stopped.
     """
 
     source: Node
@@ -488,6 +500,7 @@ def _in_intervals(
     iv: torch.Tensor, xs: torch.Tensor, strict: bool = False
 ) -> torch.Tensor:
     """Boolean mask: which ``xs`` lie inside the merged intervals.
+
     ``strict`` excludes the interval endpoints.
     """
     if iv.numel() == 0:
@@ -501,9 +514,10 @@ def _in_intervals(
 
 
 def band_skeleton(fn: PLFunction, bands: torch.Tensor | None) -> PLFunction:
-    """The skeleton of a certified function with each analytic hinge
-    band reduced to one segment: the band-edge positions are refined
-    IN first (values interpolated on the certified function — the
+    """The skeleton of a certified function, hinge bands reduced to one segment each.
+
+    The band-edge positions are refined IN first (values interpolated
+    on the certified function — the
     sleeve simplify legitimately sheds edge knots that sit
     chord-consistent on plateaus, and without re-inserting them a band
     can swallow the only knots carrying a step, collapsing the
@@ -514,7 +528,7 @@ def band_skeleton(fn: PLFunction, bands: torch.Tensor | None) -> PLFunction:
     consume this skeleton; the chord certificate keeps measuring the
     full frame.
     """
-    if bands is None or bands.numel() == 0 or fn.n_knots <= 2:
+    if bands is None or bands.numel() == 0 or fn.n_knots <= _MAX_KNOTS_WITHOUT_INTERIOR:
         return fn
     edges = bands.reshape(-1)
     edges = edges[(edges > fn.x[0]) & (edges < fn.x[-1])]
@@ -586,7 +600,7 @@ def certify_subgraph(
         keep_raw: retain each member's candidate kink set and
             measurement-frame function on its certificate
             (``kinks_raw`` / ``fn_raw``) — forensic use only, memory
-            scales with kinks × d.
+            scales with kinks x d.
         hinge_exact: pre-activation level beyond which the machine's
             gate is exactly linear (see ``_HINGE_EXACT_Z``); each FFN
             crossing contributes band-edge knots and an analytic
@@ -687,7 +701,7 @@ def certify_subgraph(
             )
             cross = _snap_f32(phi.zero_crossings())
             ks.append(cross[(cross > lo) & (cross < hi)])
-            if hinge_exact > 0.0 and phi.n_knots >= 2:
+            if hinge_exact > 0.0 and phi.n_knots >= _MIN_KNOTS_FOR_SEGMENT:
                 # Analytic hinge bands (see _HINGE_EXACT_Z): the
                 # interval where each crossing's pre-activation is
                 # within ±hinge_exact along its local slope.  The
@@ -952,7 +966,7 @@ class S1Model:
 
     lanes: int
     max_abs_dm: float  # largest slope change at any knot
-    worst_term: float  # max_i |Δm_i|·(hi − x_i): the worst accumulated lane term
+    worst_term: float  # max_i |Δm_i|·(hi - x_i): the worst accumulated lane term
     fp_bound: float  # 4·ulp32(worst_term)
     total_bound: float  # fp_bound + measured deviation
 
@@ -995,8 +1009,9 @@ def model_s1(fn: PLFunction, measured_dev: float) -> S1Model:
 
 @dataclass(frozen=True)
 class S2Model:
-    """Two-sublayer bounded-step emission (chain → 2), the
-    ``floor_int`` ``output_map`` shape generalized.
+    """Two-sublayer bounded-step emission (chain → 2).
+
+    The ``floor_int`` ``output_map`` shape generalized.
     """
 
     n_steps: int  # value-changing transitions
@@ -1035,8 +1050,7 @@ def model_s2(
     machine: str | None,
     plateau_tol: float = _SYNTH_CLAIM_ATOL,
 ) -> S2Model:
-    """Segment ``fn`` into plateaus and transitions and model the
-    bounded-step emission.
+    """Segment ``fn`` into plateaus and transitions and model the bounded-step emission.
 
     Segmentation is :func:`transition_runs`'s.  ``plateau_drift``
     reports the worst accumulated value change across a plateau run —

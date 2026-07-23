@@ -1,6 +1,7 @@
-"""Compile is a pure function of the source graph (D6 for L2 of
-``docs/lowering_copy_plan.md`` — the committed form of the parked
-``scripts/repro_double_compile.py`` / ``scripts/cert_diff.py``).
+"""Compile is a pure function of the source graph.
+
+This is D6 for L2 of ``docs/lowering_copy_plan.md``, the committed form
+of the parked ``scripts/repro_double_compile.py`` / ``scripts/cert_diff.py``.
 
 The motivating bug: compiling the same graph object twice silently
 loosened every value bound on the second compile — the first compile's
@@ -13,8 +14,8 @@ and produce a byte-identical debug sidecar.
 """
 
 import json
-import os
 import tempfile
+from pathlib import Path
 
 from torchwright.compiler.export import compile_to_onnx, debug_meta_path_for
 from torchwright.compiler.utils import get_ancestor_nodes
@@ -39,7 +40,7 @@ def _token_parts():
 
 def _compile_sidecar(parts, tmpdir, name):
     output_node, embedding = parts
-    onnx_path = os.path.join(tmpdir, name)
+    onnx_path = str(Path(tmpdir) / name)
     compile_to_onnx(
         output_node,
         embedding,
@@ -49,7 +50,7 @@ def _compile_sidecar(parts, tmpdir, name):
         max_seq_len=32,
         verbose=False,
     )
-    with open(debug_meta_path_for(onnx_path)) as f:
+    with Path(debug_meta_path_for(onnx_path)).open() as f:
         return json.load(f)
 
 
@@ -65,8 +66,10 @@ def _graph_snapshot(output_node):
 
 
 def test_double_compile_same_graph_object_identical_sidecars():
-    """Second compile of the same graph object succeeds and its sidecar is
-    identical to the first's — no bound loosening, no schedule drift.
+    """Second compile of the same graph object succeeds and matches the first.
+
+    The sidecar is identical to the first's: no bound loosening, no
+    schedule drift.
     """
     parts = _token_parts()
     output_node = parts[0]

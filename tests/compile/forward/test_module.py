@@ -7,8 +7,8 @@ wiring, and the token embedding / unembed paths.
 """
 
 import json
-import os
 import tempfile
+from pathlib import Path
 
 import numpy as np
 import pytest
@@ -57,7 +57,7 @@ def _discover_meta(session, onnx_path):
     assert not isinstance(slot_dim, int), (
         f"past_K_0 first dim must be the symbolic cache_slots, got {slot_dim!r}"
     )
-    with open(meta_path_for(onnx_path)) as f:
+    with Path(meta_path_for(onnx_path)).open() as f:
         sidecar = json.load(f)
     cache_stride = discover_cache_stride(inputs, sidecar.get("cache_stride"), onnx_path)
     return n_layers, per_layer_n_heads, d_head, cache_stride
@@ -113,7 +113,7 @@ def test_token_onnx_prefill_matches_compute():
     output_node, embedding = _build_1digit()
 
     with tempfile.TemporaryDirectory() as tmpdir:
-        onnx_path = os.path.join(tmpdir, "adder.onnx")
+        onnx_path = str(Path(tmpdir) / "adder.onnx")
         compile_to_onnx(
             output_node,
             embedding,
@@ -149,7 +149,7 @@ def test_token_onnx_decode_step_matches_full_prefill():
     output_node, embedding = _build_1digit()
 
     with tempfile.TemporaryDirectory() as tmpdir:
-        onnx_path = os.path.join(tmpdir, "adder.onnx")
+        onnx_path = str(Path(tmpdir) / "adder.onnx")
         compile_to_onnx(
             output_node,
             embedding,
@@ -203,7 +203,7 @@ def test_token_onnx_autoregressive_1digit():
     output_node, embedding = _build_1digit()
 
     with tempfile.TemporaryDirectory() as tmpdir:
-        onnx_path = os.path.join(tmpdir, "adder.onnx")
+        onnx_path = str(Path(tmpdir) / "adder.onnx")
         compile_to_onnx(
             output_node,
             embedding,
@@ -233,7 +233,7 @@ def test_token_onnx_autoregressive_3digit():
     output_node, embedding = create_network_parts()
 
     with tempfile.TemporaryDirectory() as tmpdir:
-        onnx_path = os.path.join(tmpdir, "adder3.onnx")
+        onnx_path = str(Path(tmpdir) / "adder3.onnx")
         compile_to_onnx(
             output_node,
             embedding,
@@ -269,7 +269,7 @@ def test_token_onnx_sidecar_schema_and_metadata():
     output_node, embedding = _build_1digit()
 
     with tempfile.TemporaryDirectory() as tmpdir:
-        onnx_path = os.path.join(tmpdir, "adder.onnx")
+        onnx_path = str(Path(tmpdir) / "adder.onnx")
         compile_to_onnx(
             output_node,
             embedding,
@@ -280,7 +280,7 @@ def test_token_onnx_sidecar_schema_and_metadata():
         )
 
         meta_path = meta_path_for(onnx_path)
-        with open(meta_path) as f:
+        with Path(meta_path).open() as f:
             meta = json.load(f)
         assert meta["format"] == TOKEN_META_FORMAT
         assert meta["vocab"] == embedding.tokenizer.vocab
@@ -305,7 +305,7 @@ def test_token_onnx_artifact_fields_load_and_generate():
     output_node, embedding = _build_1digit()
 
     with tempfile.TemporaryDirectory() as tmpdir:
-        onnx_path = os.path.join(tmpdir, "adder.onnx")
+        onnx_path = str(Path(tmpdir) / "adder.onnx")
         artifact = compile_to_onnx(
             output_node,
             embedding,
@@ -343,7 +343,7 @@ def test_token_onnx_extra_metadata_roundtrip():
     extra = {"rows_per_patch": 7, "note": "hello"}
 
     with tempfile.TemporaryDirectory() as tmpdir:
-        onnx_path = os.path.join(tmpdir, "adder.onnx")
+        onnx_path = str(Path(tmpdir) / "adder.onnx")
         compile_to_onnx(
             output_node,
             embedding,
@@ -355,7 +355,7 @@ def test_token_onnx_extra_metadata_roundtrip():
         )
 
         # Nested under "extra"; top-level keys unchanged.
-        with open(meta_path_for(onnx_path)) as f:
+        with Path(meta_path_for(onnx_path)).open() as f:
             meta = json.load(f)
         assert meta["extra"] == extra
         assert meta["format"] == TOKEN_META_FORMAT
@@ -376,7 +376,7 @@ def test_token_onnx_meta_has_no_extra_key_when_omitted():
     output_node, embedding = _build_1digit()
 
     with tempfile.TemporaryDirectory() as tmpdir:
-        onnx_path = os.path.join(tmpdir, "adder.onnx")
+        onnx_path = str(Path(tmpdir) / "adder.onnx")
         compile_to_onnx(
             output_node,
             embedding,
@@ -385,7 +385,7 @@ def test_token_onnx_meta_has_no_extra_key_when_omitted():
             d_head=D_HEAD,
             verbose=False,
         )
-        with open(meta_path_for(onnx_path)) as f:
+        with Path(meta_path_for(onnx_path)).open() as f:
             meta = json.load(f)
         assert "extra" not in meta
         # rope_base and d_rot are present for every rotary model (every model
@@ -447,12 +447,13 @@ def _ids(embedding, tokens):
 
 @pytest.fixture(scope="module")
 def adder_artifact(tmp_path_factory):
-    """A compiled 1-digit adder token artifact (max_seq_len=32) shared by the
-    cached-protocol self-consistency tests below.
+    """Build a compiled 1-digit adder token artifact (max_seq_len=32).
+
+    Shared by the cached-protocol self-consistency tests below.
     """
     output_node, embedding = _build_1digit()
     tmpdir = str(tmp_path_factory.mktemp("token_onnx_proto"))
-    onnx_path = os.path.join(tmpdir, "adder.onnx")
+    onnx_path = str(Path(tmpdir) / "adder.onnx")
     compile_to_onnx(
         output_node,
         embedding,
@@ -466,8 +467,9 @@ def adder_artifact(tmp_path_factory):
 
 
 def test_token_onnx_chunked_decode_matches_full_prefill(adder_artifact):
-    """Prefill 2 rows, then decode a 3-row chunk (n_new>1 at base>0) — the
-    dynamic-mask seam the single-row decode test does not cover.
+    """Decode a 3-row chunk (n_new>1 at base>0) after a 2-row prefill.
+
+    The dynamic-mask seam the single-row decode test does not cover.
     """
     onnx_path, embedding = adder_artifact
     token_ids = _ids(embedding, _PROTO_TOKENS)
@@ -493,9 +495,10 @@ def test_token_onnx_chunked_decode_matches_full_prefill(adder_artifact):
 
 
 def test_token_onnx_static_tail_is_inert(adder_artifact):
-    """Finite garbage in masked tail slots (positions > cache_position) must
-    not change the decode output — the in-graph mask zeroes those weights
-    exactly.  (Slot n itself is overwritten by the ScatterND diagonal.).
+    """Never let finite garbage in masked tail slots change the decode output.
+
+    Positions > cache_position; the in-graph mask zeroes those weights
+    exactly. (Slot n itself is overwritten by the ScatterND diagonal.)
     """
     onnx_path, embedding = adder_artifact
     token_ids = _ids(embedding, _PROTO_TOKENS)
@@ -535,9 +538,10 @@ def test_token_onnx_static_tail_is_inert(adder_artifact):
 
 
 def test_token_onnx_prefix_window_binding(adder_artifact):
-    """Every covering prefix window cache[:S_eff] (base+n_new <= S_eff <= S)
-    must produce bit-identical outputs — the symbolic cache_slots dim derives
-    the mask width from Shape(past_K_0).
+    """Produce bit-identical outputs for every covering prefix window cache[:S_eff].
+
+    base+n_new <= S_eff <= S; the symbolic cache_slots dim derives the
+    mask width from Shape(past_K_0).
     """
     onnx_path, embedding = adder_artifact
     token_ids = _ids(embedding, _PROTO_TOKENS)
@@ -570,8 +574,9 @@ def test_token_onnx_prefix_window_binding(adder_artifact):
 
 
 def test_token_onnx_module_step_matches_full_call(adder_artifact):
-    """OnnxTokenModule.step threads the cache: prefill 4 + decode 1 == one
-    full-sequence call.
+    """Thread the cache through OnnxTokenModule.step.
+
+    Prefill 4 + decode 1 == one full-sequence call.
     """
     from torchwright.compiler.onnx_load import OnnxTokenModule
 
@@ -608,7 +613,7 @@ def test_token_onnx_module_empty_past_shape(adder_artifact):
 
 def _export_token(tmpdir, name="model.onnx", trim_heads=True):
     output_node, embedding = _build_1digit()
-    onnx_path = os.path.join(tmpdir, name)
+    onnx_path = str(Path(tmpdir) / name)
     compile_to_onnx(
         output_node,
         embedding,
@@ -623,8 +628,9 @@ def _export_token(tmpdir, name="model.onnx", trim_heads=True):
 
 
 def _l_w1_d_hidden(onnx_path):
-    """Per-layer MLP hidden widths read off the l{i}_W1 initializers
-    (shape (d, d_hidden_i)); densify-aware (sparse protos carry full dims).
+    """Read per-layer MLP hidden widths off the l{i}_W1 initializers.
+
+    Shape (d, d_hidden_i); densify-aware (sparse protos carry full dims).
     """
     import onnx
 
@@ -648,8 +654,9 @@ def _l_w1_d_hidden(onnx_path):
 
 
 def test_token_onnx_trim_heads_shrinks_kv_cache():
-    """trim_heads=True drops per-layer past_K widths below the full head count
-    and leaves them non-uniform across layers.
+    """Drop per-layer past_K widths below the full head count via trim_heads=True.
+
+    And leaves them non-uniform across layers.
     """
     max_heads = D // D_HEAD
     with tempfile.TemporaryDirectory() as tmpdir:
@@ -680,7 +687,10 @@ def test_token_onnx_no_trim_preserves_full_width():
 
 
 def test_token_onnx_trim_shrinks_mlp_slots():
-    """trim_heads=True shrinks some hidden widths below full d_hidden; False keeps all."""
+    """Shrink some hidden widths below full d_hidden with trim_heads=True.
+
+    trim_heads=False keeps all widths at the full d_hidden.
+    """
     full_d_hidden = D  # d_hidden defaults to d
     with tempfile.TemporaryDirectory() as tmpdir:
         trim_path, _ = _export_token(tmpdir, "trim.onnx", trim_heads=True)
@@ -695,8 +705,9 @@ def test_token_onnx_trim_shrinks_mlp_slots():
 
 
 def test_token_onnx_trim_is_numerical_noop():
-    """Trimmed and full-width ONNX produce the same logits on the same prefill
-    (trimming removes only all-zero heads/slots).
+    """Produce identical logits from trimmed and full-width ONNX on the same prefill.
+
+    Trimming removes only all-zero heads/slots.
     """
     with tempfile.TemporaryDirectory() as tmpdir:
         trim_path, emb = _export_token(tmpdir, "trim.onnx", trim_heads=True)

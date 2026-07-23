@@ -58,8 +58,9 @@ def test_table_rows_match_compiler_layout():
 
 
 def test_power_of_two_column_count_claim():
-    """The doc's prose: powers of two reserve 1 column at an even exponent,
-    2 at an odd one.
+    """The doc's prose: powers of two reserve 1 or 2 columns.
+
+    1 column at an even exponent, 2 at an odd one.
     """
     for k in range(6, 15):
         col_exps, _m = _rms_norm_pinned_layout(2**k, _RMS_NORM_CONST_EXP)
@@ -67,9 +68,10 @@ def test_power_of_two_column_count_claim():
 
 
 def test_first_failing_odd_factor_claim_is_41():
-    """The doc's prose: every odd factor below 41 passes the fp32 mean
-    arithmetic both ways (sum/d and sum·(1/d)); 41 fails.  Mirrors the
-    reservation guard's arithmetic exactly.
+    """The doc's prose: every odd factor below 41 passes the fp32 mean arithmetic.
+
+    Both ways (sum/d and sum·(1/d)); 41 fails. Mirrors the reservation
+    guard's arithmetic exactly.
     """
     import numpy as np
 

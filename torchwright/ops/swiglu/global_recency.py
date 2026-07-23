@@ -67,7 +67,7 @@ def global_position_from_bos(
 
     **``smoothed=True``.**  Feeds the raw recovery through an exact uniform
     causal mean (:func:`~torchwright.ops.attention_ops.attend_causal_mean`)
-    with the ×2 rescale folded into the O projection:
+    with the x2 rescale folded into the O projection:
 
         smoothed(t) = 2 · mean(raw[0..t]) ≈ t
 
@@ -99,9 +99,10 @@ def global_position_from_bos(
     product = max_len * theta
     if product >= math.pi / 2:
         raise ValueError(
-            f"global_position_from_bos requires max_positions × theta_slow < π/2 "
+            f"global_position_from_bos requires max_positions x theta_slow < π/2 "
             f"for the BOS weight to be monotone, but got "
-            f"max_positions={max_len} × theta_slow={theta:.3e} = {product:.3f} ≥ {math.pi / 2:.3f}.  "
+            f"max_positions={max_len} x theta_slow={theta:.3e} = {product:.3f} "
+            f"≥ {math.pi / 2:.3f}.  "
             f"Increase d_head or base, or reduce max_positions."
         )
 
@@ -163,12 +164,12 @@ def global_position_from_bos(
     if not smoothed:
         return raw
 
-    # 2 × exact uniform causal mean of the raw recovery: the fp32 wander is
+    # 2 x exact uniform causal mean of the raw recovery: the fp32 wander is
     # divided by t while the ideal value stays ≈ t (mean(0..t) = t/2).  The
     # generic convexity claim is skipped (raw's compiled values sit up to
     # ~0.1 outside their claimed range at position 0 — its own assert slack);
-    # the closing claim's atol covers the measured envelope: 2×|running-mean
+    # the closing claim's atol covers the measured envelope: 2x|running-mean
     # bias| ≈ ±1.7 at 54k plus the mean head's own fp32 error ≤ 0.03, and
-    # the top end exceeds max_len by 2×bias when the rollout fills the cap.
+    # the top end exceeds max_len by 2xbias when the rollout fills the cap.
     smoothed_pos = attend_causal_mean(rope, raw, output_scale=2.0, claim_range=False)
     return assert_in_range(smoothed_pos, 0.0, float(max_len), atol=8.0)

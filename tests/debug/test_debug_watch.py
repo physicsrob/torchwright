@@ -328,7 +328,7 @@ def test_debug_step_runs_consistency_check():
 
 
 # ---------------------------------------------------------------------------
-# debug_value()
+# debug_value
 # ---------------------------------------------------------------------------
 
 
@@ -404,11 +404,12 @@ def test_debug_value_after_step():
 
 
 def test_suppress_checks_silences_debug_forward_asserts():
-    """suppress_checks() must reach the compiled-value re-check, not just
-    reference eval: a debug=True forward inside the context runs the
-    self-consistency check but skips the attached predicates.  Before the
-    fix, an "asserts silenced" debug pass (torchwright_doom's d3 gate leg
-    1a) still raised from check_debug_predicates.
+    """suppress_checks() must reach the compiled-value re-check, not just ref eval.
+
+    A debug=True forward inside the context runs the self-consistency
+    check but skips the attached predicates. Before the fix, an "asserts
+    silenced" debug pass (torchwright_doom's d3 gate leg 1a) still raised
+    from check_debug_predicates.
     """
     import pytest
 

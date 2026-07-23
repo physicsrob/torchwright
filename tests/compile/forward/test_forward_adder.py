@@ -1,5 +1,4 @@
-"""Adder example: export 1-digit and 3-digit adders to ONNX and verify
-arithmetic via argmax decode.
+"""Export 1-digit and 3-digit adders to ONNX and verify arithmetic via argmax decode.
 
 Converted from the in-process ``forward_compile`` path to ``compile_to_onnx``
 + ``OnnxTokenModule.generate``; see ``_example_onnx`` for why the decoded

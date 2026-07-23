@@ -53,6 +53,9 @@ SCALE = 100.0
 DENSE_END_SPAN = 4000
 
 FP32_EPS = 2.0**-23  # machine epsilon (relative error per fp32 operation)
+HINGE_EPS = 1e-12  # negligible slope-delta threshold for pruning hinges
+ROUNDING_THRESHOLD = 0.5  # half-integer rounding limit for recovered positions
+RELU_PWL_ERR_THRESHOLD = 0.1  # required PWL-only error bound (relu machine)
 
 
 # ---------------------------------------------------------------------------
@@ -96,7 +99,9 @@ def bisect_m(w_target: float, max_len: int, theta: float, n_iter: int = 64) -> f
     return 0.5 * (lo + hi)
 
 
-def build_pwl_table(max_len: int, theta: float, n: int):
+def build_pwl_table(
+    max_len: int, theta: float, n: int
+) -> tuple[list[float], list[float]]:
     """Build log-uniform breakpoints and their inverse-function values.
 
     Returns (w_bps, m_bps): breakpoints in w ∈ [w_min, 1] (ascending) and the
@@ -154,15 +159,15 @@ def build_swish_hinges(w_bps: list, m_bps: list) -> list:
     prev = 0.0
     for i in range(n - 1):
         delta = slopes[i] - prev
-        if abs(delta) > 1e-12:
+        if abs(delta) > HINGE_EPS:
             hinges.append((1.0, w_bps[i], delta))
         prev = slopes[i]
-    if abs(prev) > 1e-12:  # cancel the final slope (the clamp hinge)
+    if abs(prev) > HINGE_EPS:  # cancel the final slope (the clamp hinge)
         hinges.append((1.0, w_bps[-1], -prev))
     # clamp=False: two hinges reinstate linear extrapolation past each end.
-    if abs(slopes[0]) > 1e-12:
+    if abs(slopes[0]) > HINGE_EPS:
         hinges.append((-1.0, w_bps[0], -slopes[0]))
-    if abs(slopes[-1]) > 1e-12:
+    if abs(slopes[-1]) > HINGE_EPS:
         hinges.append((1.0, w_bps[-1], slopes[-1]))
     return hinges
 
@@ -170,7 +175,7 @@ def build_swish_hinges(w_bps: list, m_bps: list) -> list:
 def eval_swish_pwl(w_query: float, hinges: list, y0: float, K: float) -> float:
     """Evaluate the swiglu inversion through the actual sharpened-hinge sum.
 
-        f(w) = y0 + Σ (delta_i / K) · Swish(K · iw_i · (w − thr_i))
+        f(w) = y0 + Σ (delta_i / K) · Swish(K · iw_i · (w - thr_i))
 
     Unlike ``eval_pwl`` (exact linear interpolation, which is what the ReLU op
     computes), this reproduces the radius-``~17/K`` fillet rounding at every
@@ -207,7 +212,7 @@ def main(machine: str = "relu") -> None:
     print("w(m) strictly monotone: ✓")
     print(f"Min adjacent-m gap = {min_gap:.3e}  (at m={min_gap_pos})")
     print(f"fp32 weight floor   = {fp32_floor:.1e}")
-    print(f"Safety margin       = {min_gap / fp32_floor:.1f}×  (need >> 1)")
+    print(f"Safety margin       = {min_gap / fp32_floor:.1f}x  (need >> 1)")
     print()
 
     # 2. PWL inverse accuracy
@@ -268,7 +273,7 @@ def main(machine: str = "relu") -> None:
 
     print(f"Worst-case error: {max_err:.4f} positions (at m={worst_m})")
     print("Rounding threshold: 0.5 positions")
-    print(f"Rounding margin: {0.5 / max_err:.1f}× below threshold  (need >> 1)")
+    print(f"Rounding margin: {0.5 / max_err:.1f}x below threshold  (need >> 1)")
     print()
 
     # 3. fp32 softmax noise contribution
@@ -289,13 +294,14 @@ def main(machine: str = "relu") -> None:
             worst_fp32_m = m_true
 
     print(
-        f"Worst-case fp32 contribution: {max_fp32_err:.4f} positions (at m={worst_fp32_m})"
+        f"Worst-case fp32 contribution: {max_fp32_err:.4f} positions "
+        f"(at m={worst_fp32_m})"
     )
 
     combined = max_err + max_fp32_err
     print(f"Combined (PWL + fp32):        {combined:.4f} positions")
     print("Rounding threshold:           0.5")
-    print(f"Rounding margin:              {0.5 / combined:.1f}×")
+    print(f"Rounding margin:              {0.5 / combined:.1f}x")
     print()
 
     # 4. cosine attenuation magnitude at max_len
@@ -304,7 +310,7 @@ def main(machine: str = "relu") -> None:
     print(f"cos(MAX_LEN · θ_slow) = {cos_at_max:.6f}  (1% would be 0.990)")
     naive_m_hat = MAX_LEN * (1.0 / w_of_m(MAX_LEN, MAX_LEN, theta) - 1)
     print(
-        f"Naive 1/w−1 at MAX_LEN: returns {naive_m_hat:.0f} vs true {MAX_LEN}"
+        f"Naive 1/w-1 at MAX_LEN: returns {naive_m_hat:.0f} vs true {MAX_LEN}"
         f"  (absorbed by the PWL fit)"
     )
     print()
@@ -313,14 +319,18 @@ def main(machine: str = "relu") -> None:
     if machine == "swiglu":
         # Pass criterion: max recovered-position error below the 0.5 rounding
         # threshold (integer position recovery), plus the section-1 gap margin.
-        ok = min_gap > 10 * fp32_floor and max_err < 0.5
+        ok = min_gap > 10 * fp32_floor and max_err < ROUNDING_THRESHOLD
         status = "PASS" if ok else "FAIL"
         print(
             f"[{status}] machine=swiglu, gap={min_gap:.1e}, "
             f"position_err={max_err:.4f} (threshold 0.5), combined={combined:.4f}"
         )
     else:
-        ok = min_gap > 10 * fp32_floor and max_err < 0.1 and combined < 0.5
+        ok = (
+            min_gap > 10 * fp32_floor
+            and max_err < RELU_PWL_ERR_THRESHOLD
+            and combined < ROUNDING_THRESHOLD
+        )
         status = "PASS" if ok else "FAIL"
         print(
             f"[{status}] gap={min_gap:.1e}, PWL_err={max_err:.4f}, "

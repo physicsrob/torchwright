@@ -8,6 +8,9 @@ unk_token = "<unk>"
 bos_token = "<bos>"
 default_special_tokens = [unk_token]
 
+#: Rank of an integer-ID input shaped ``(n_pos, 1)`` rather than ``(n_pos,)``.
+_COLUMN_VECTOR_NDIM = 2
+
 
 class Tokenizer:
     vocab: list[str]
@@ -86,13 +89,13 @@ class Embedding(Node):
     def get_embedding(self, text: str) -> torch.Tensor:
         return self.table[self.tokenizer.get_token_id(text)]
 
-    def compute(self, n_pos: int, input_values: dict):
+    def compute(self, n_pos: int, input_values: dict) -> torch.Tensor:
         assert self.input_name in input_values
         raw = input_values[self.input_name]
 
         if isinstance(raw, torch.Tensor):
             ids = raw
-            if ids.ndim == 2:
+            if ids.ndim == _COLUMN_VECTOR_NDIM:
                 assert ids.shape[1] == 1, (
                     f"integer-ID input must be (n,) or (n, 1); got {tuple(ids.shape)}"
                 )
@@ -124,7 +127,7 @@ class Embedding(Node):
     def compute_value_type(self) -> NodeValueType:
         return NodeValueType()
 
-    def num_params(self):
+    def num_params(self) -> int:
         return self.d_embed * self.max_vocab
 
 

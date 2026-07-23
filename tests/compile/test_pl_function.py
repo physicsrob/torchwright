@@ -126,8 +126,9 @@ def _sawtooth_knots(n_teeth=3, period=4.0, drop=0.2):
 
 
 def test_sawtooth_pullback_multiplies_crossings():
-    """One threshold crossing per monotone run of the sawtooth — the
-    reason per-lane counts are not a valid kink bound.
+    """One threshold crossing per monotone run of the sawtooth.
+
+    That's the reason per-lane counts are not a valid kink bound.
     """
     knots, vals = _sawtooth_knots()
     saw = PLFunction(torch.tensor(knots), torch.tensor(vals).reshape(-1, 1), 0.0, 0.0)
@@ -136,8 +137,10 @@ def test_sawtooth_pullback_multiplies_crossings():
 
 
 def test_sawtooth_graph_kink_pin():
-    """Graph-level: compare-after-sawtooth candidates = the sawtooth's 5
-    interior knots + 2 hinges x 6 monotone runs = 17.
+    """Graph-level: compare-after-sawtooth candidate count is 17.
+
+    The count is the sawtooth's 5 interior knots + 2 hinges x 6 monotone
+    runs = 17.
     """
     ops = _ops("relu")
     knots, vals = _sawtooth_knots()
@@ -160,8 +163,9 @@ def test_sawtooth_graph_kink_pin():
 
 
 def test_saturation_tails_keep_kinks_finite():
-    """A huge interval-arithmetic source range costs nothing: every kink
-    lives inside the clamp contract and the tails are flat.
+    """A huge interval-arithmetic source range costs nothing.
+
+    Every kink lives inside the clamp contract and the tails are flat.
     """
     ops = _ops("relu")
     x = create_input("x", 1, value_range=(-1e9, 1e9))
@@ -229,8 +233,10 @@ def test_kink_pin_clamp(machine):
 
 
 def test_kink_pin_floor_int():
-    """floor_int realizes 2 slope changes per boundary; its two-stage
-    construction contributes at most 3 candidates per boundary.
+    """floor_int realizes 2 slope changes per boundary.
+
+    Its two-stage construction contributes at most 3 candidates per
+    boundary.
     """
     ops = _ops("swish")
     x = create_input("x", 1, value_range=(0.0, 8.0))
@@ -251,8 +257,10 @@ def test_kink_pin_floor_int():
 
 
 def test_kink_pin_table_lookup_2d():
-    """(rows-1) row transitions + (cols-1) column transitions when the
-    two index chains hit their half-integer boundaries at distinct x.
+    """(rows-1) row transitions + (cols-1) column transitions.
+
+    This holds when the two index chains hit their half-integer
+    boundaries at distinct x.
     """
     from torchwright.ops.swiglu.map_select import table_lookup_2d
 
@@ -274,8 +282,9 @@ def test_kink_pin_table_lookup_2d():
 
 @pytest.mark.parametrize("machine", ["relu", "swish"])
 def test_keystone_random_chains_match_reference(machine):
-    """Random small op chains: the certified PL function reproduces the
-    exact oracle on a dense mid-segment grid — exactly on relu,
+    """Random small op chains: the certified PL function reproduces the oracle.
+
+    The reproduction is exact on a dense mid-segment grid on relu, and
     fillet-bounded on swish.
     """
     from torchwright.ops.const import step_sharpness
@@ -317,9 +326,10 @@ def test_keystone_random_chains_match_reference(machine):
 
 
 def test_same_source_multiply_declines_midpoint_linearity():
-    """x·x is piecewise-quadratic: measured, located decline — under
-    BOTH policies (its curvature spans the whole domain, so the banded
-    policy's narrow-run excusal never applies).
+    """x·x is piecewise-quadratic: measured, located decline under BOTH policies.
+
+    Its curvature spans the whole domain, so the banded policy's
+    narrow-run excusal never applies.
     """
     ops = _ops("swish")
     x = create_input("x", 1, value_range=(0.0, 9.0))
@@ -334,10 +344,11 @@ def test_same_source_multiply_declines_midpoint_linearity():
 
 
 def test_resolution_floor_excuses_position_quantization():
-    """A sharp compare at |x| ~ 1400: transition position is only
-    representable to one fp32 spacing (1.2e-4), so mid-ramp chord
-    deviation up to ~slope·eps32(x) is the machine's own quantization
-    — excused, not charged (the doom is_type guard class).
+    """A sharp compare at |x| ~ 1400 has a transition only representable to 1 fp32 step.
+
+    That step is 1.2e-4 wide, so mid-ramp chord deviation up to
+    ~slope·eps32(x) is the machine's own quantization — excused, not
+    charged (the doom is_type guard class).
     """
     ops = _ops("swish")
     x = create_input("x", 1, value_range=(0.0, 3000.0))
@@ -347,11 +358,12 @@ def test_resolution_floor_excuses_position_quantization():
 
 
 def test_banded_policy_excuses_shifted_band_strict_declines():
-    """Simulated upstream position error: the oracle's transition sits
-    0.03 right of the weight-derived candidates.  Inside the narrow
-    candidate-bracketed band the chord reads full-scale deviation —
-    strict charges it, the banded policy (inherited-ramp clause) bins
-    it as in-band.
+    """Simulated upstream position error.
+
+    The oracle's transition sits 0.03 right of the weight-derived
+    candidates. Inside the narrow candidate-bracketed band the chord
+    reads full-scale deviation — strict charges it, the banded policy
+    (inherited-ramp clause) bins it as in-band.
     """
     from torchwright.compiler.collapse import _seeded_oracle
 
@@ -374,8 +386,10 @@ def test_banded_policy_excuses_shifted_band_strict_declines():
 
 
 def test_relu_square_is_pl_and_certifies():
-    """The relu machine's square is a PL *approximation* — the same
-    shape that declines as an exact product certifies as a table.
+    """The relu machine's square is a PL *approximation*.
+
+    The same shape that declines as an exact product certifies as a
+    table.
     """
     ops = _ops("relu")
     x = create_input("x", 1, value_range=(0.0, 9.0))
@@ -385,8 +399,10 @@ def test_relu_square_is_pl_and_certifies():
 
 
 def test_swish_abs_curvature_lands_in_fillet_split():
-    """|x|'s rounding near zero is fillet-class: reported in
-    fillet_deviation, not charged against the chord certificate.
+    """|x|'s rounding near zero is fillet-class.
+
+    It's reported in fillet_deviation, not charged against the chord
+    certificate.
     """
     ops = _ops("swish")
     x = create_input("x", 1, value_range=(-5.0, 5.0))
@@ -398,12 +414,13 @@ def test_swish_abs_curvature_lands_in_fillet_split():
 
 
 def test_hinge_band_zones_classify_dip_as_fillet():
-    """A soft compare picking between ±4096-magnitude branches carries
-    the machine's own dip (~swish_dip·|Δ|/scale ≈ 7 here) in its
-    approach zone.  With analytic hinge bands on (the default), the
-    zone samples classify as fillet — reported, never chargeable — the
-    band-edge knots appear in the candidate set, and the composed
-    select member (whose ancestry inherits the compare's band) stays
+    """A soft compare picking between ±4096-magnitude branches has an approach dip.
+
+    That dip is the machine's own (~swish_dip·|Δ|/scale ≈ 7 here) in its
+    approach zone. With analytic hinge bands on (the default), the zone
+    samples classify as fillet — reported, never chargeable — the
+    band-edge knots appear in the candidate set, and the composed select
+    member (whose ancestry inherits the compare's band) stays
     chord-certifiable.
     """
     from torchwright.ops.swiglu.map_select import select
@@ -422,13 +439,14 @@ def test_hinge_band_zones_classify_dip_as_fillet():
 
 
 def test_hinge_bands_expose_saturated_lane_fp_wander():
-    """A piecewise_linear step with |Δm|·span ≈ 3.4e8 wanders ±16 on
-    its own plateau (fp32 lane-sum accumulation — the S1 fp_bound
-    story).  Without band knots the ±1-segment resolution floor
-    accidentally excused it (the steep candidate bracket was the
-    plateau chord's direct neighbor); the band-edge knot buffers the
-    plateau from the bracket, so the wander is now honestly charged
-    while the dip itself stays in the reported fillet bucket.
+    """A piecewise_linear step with |Δm|·span ≈ 3.4e8 wanders ±16 on its own plateau.
+
+    That's fp32 lane-sum accumulation — the S1 fp_bound story. Without
+    band knots the ±1-segment resolution floor accidentally excused it
+    (the steep candidate bracket was the plateau chord's direct
+    neighbor); the band-edge knot buffers the plateau from the bracket,
+    so the wander is now honestly charged while the dip itself stays in
+    the reported fillet bucket.
     """
     ops = _ops("swish")
     x = create_input("x", 1, value_range=(0.0, 8192.0))
@@ -470,8 +488,10 @@ def test_unbounded_source_declines():
 
 
 def _synthetic_staircase(n_steps=2046, ramp=1e-3):
-    """A doom-floor-shaped staircase: unit steps at integer boundaries
-    across [-1023, 1023], ramps ``ramp`` wide (slope 1/ramp).
+    """A doom-floor-shaped staircase.
+
+    Unit steps at integer boundaries across [-1023, 1023], ramps
+    ``ramp`` wide (slope 1/ramp).
     """
     xs, ys = [-1023.5], [0.0]
     for k in range(n_steps):
@@ -484,8 +504,10 @@ def _synthetic_staircase(n_steps=2046, ramp=1e-3):
 
 
 def test_s1_infeasible_s2_feasible_on_doom_scale_staircase():
-    """The recon insight, pinned: fp32 kills the single-FFN emission of
-    a sharp wide staircase; the bounded-step shape stays in budget.
+    """The recon insight, pinned.
+
+    fp32 kills the single-FFN emission of a sharp wide staircase; the
+    bounded-step shape stays in budget.
     """
     fn = _synthetic_staircase()
     s1 = model_s1(fn, measured_dev=0.0)
@@ -507,8 +529,10 @@ def test_s1_infeasible_s2_feasible_on_doom_scale_staircase():
 
 
 def test_analysis_takes_v1_declined_continuous_chain():
-    """A staircase chain with NO integer claim: v1 declines (gate 1),
-    v2 certifies the composed PL directly and takes it as S1.
+    """A staircase chain with NO integer claim.
+
+    v1 declines (gate 1), v2 certifies the composed PL directly and
+    takes it as S1.
     """
     from torchwright.compiler.collapse_analysis import analyze_collapse_v2
     from torchwright.compiler.lower import lower
@@ -525,8 +549,10 @@ def test_analysis_takes_v1_declined_continuous_chain():
 
 
 def test_analysis_picks_s2_for_sharp_wide_staircase_chain():
-    """A sharp wide floor chain: the single-FFN shape dies on fp32
-    accumulation, the bounded-step shape is taken at chain -> 2.
+    """A sharp wide floor chain.
+
+    The single-FFN shape dies on fp32 accumulation, the bounded-step
+    shape is taken at chain -> 2.
     """
     from torchwright.compiler.collapse_analysis import analyze_collapse_v2
     from torchwright.compiler.lower import lower
@@ -548,9 +574,10 @@ def test_analysis_picks_s2_for_sharp_wide_staircase_chain():
 
 
 def test_s2_swish_fillet_is_reported_not_charged():
-    """Per-step jumps of 100 (a colormap-scale delta) carry an in-band
-    fillet excursion of 2·swish_dip/scale·|δ| — the class the original
-    chain already has.  The model reports it and keeps it out of the
+    """Per-step jumps of 100 (a colormap-scale delta) carry an in-band fillet excursion.
+
+    The excursion is 2·swish_dip/scale·|δ| — the class the original
+    chain already has. The model reports it and keeps it out of the
     charged bound.
     """
     xs = [0.0]

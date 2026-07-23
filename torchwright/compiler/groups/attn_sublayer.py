@@ -3,6 +3,8 @@ import torch
 from torchwright.compiler.components.attn import AttnLayerComponent
 from torchwright.compiler.residual_assignment import ResidualStreamState
 
+_StatesDict = dict[str, tuple[ResidualStreamState, torch.Tensor]]
+
 
 class AttnSubLayer:
     """Attention sublayer: multi-head attention + residual skip connection.
@@ -21,8 +23,10 @@ class AttnSubLayer:
         self.out_state = ResidualStreamState(name="AttnSubLayer Out State")
         self.attn = AttnLayerComponent(d, d_head, name="attn", n_heads=n_heads)
 
-    def forward(self, inp: torch.Tensor, return_states=False):
-        states = {}
+    def forward(
+        self, inp: torch.Tensor, return_states: bool = False
+    ) -> torch.Tensor | tuple[torch.Tensor, _StatesDict]:
+        states: _StatesDict = {}
 
         x = self.attn.forward(inp)
         states["attn_out_state"] = (self.attn.out_state, x)
@@ -32,18 +36,22 @@ class AttnSubLayer:
             return x, states
         return x
 
-    def forward_cached(self, inp, past_kv=None):
+    def forward_cached(
+        self,
+        inp: torch.Tensor,
+        past_kv: tuple[torch.Tensor, torch.Tensor] | None = None,
+    ) -> tuple[torch.Tensor, tuple[torch.Tensor, torch.Tensor]]:
         x, new_kv = self.attn.forward_cached(inp, past_kv)
         x = x + inp
         return x, new_kv
 
-    def num_params(self):
+    def num_params(self) -> int:
         return self.attn.num_params()
 
-    def to(self, device):
+    def to(self, device: str | torch.device) -> "AttnSubLayer":
         self.attn.to(device)
         return self
 
-    def resize(self, new_d) -> None:
+    def resize(self, new_d: int) -> None:
         self.d = new_d
         self.attn.resize(new_d)

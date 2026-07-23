@@ -36,9 +36,10 @@ def test_depth_is_flat_in_max_digits():
 
 
 def _emit(n, total_value, kind):
-    """Reference-eval one streamed carry/borrow column step: a literal column
-    total → the emitted token, through the same ``_emit_from_total`` the sweeps
-    use.
+    """Reference-eval one streamed carry/borrow column step.
+
+    A literal column total to the emitted token, through the same
+    ``_emit_from_total`` the sweeps use.
     """
     embedding = cs.create_onehot_embedding(cs.scratch_vocab(n))
     embed = embedding.get_embedding

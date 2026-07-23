@@ -119,7 +119,7 @@ def test_block_rejects_bad_shapes():
             out_bias=torch.randn(2),
         )
     # bad activation
-    with pytest.raises(ValueError):
+    with pytest.raises(ValueError, match="activation must be"):
         FFN(
             x,
             gate_proj=torch.randn(3, 4),
@@ -129,7 +129,7 @@ def test_block_rejects_bad_shapes():
             activation="gelu",
         )
     # up_proj without up_bias
-    with pytest.raises(ValueError):
+    with pytest.raises(ValueError, match="up_proj and up_bias must both be set"):
         FFN(
             x,
             gate_proj=torch.randn(3, 4),
@@ -141,8 +141,10 @@ def test_block_rejects_bad_shapes():
 
 
 def test_gated_swish_block_compute():
-    """A gated swish FFN computes the SwiGLU lane math (oracle only — the
-    compiler path is degenerate-ReLU this phase; this pins the node's spec).
+    """A gated swish FFN computes the SwiGLU lane math (oracle only).
+
+    The compiler path is degenerate-ReLU this phase; this pins the
+    node's spec.
     """
     d_input, n_lanes, d_output, n_pos = 4, 5, 3, 6
     g = torch.Generator().manual_seed(3)

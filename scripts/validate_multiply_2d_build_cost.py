@@ -8,11 +8,11 @@ matrix is ~35 GB of float64 — a single graph build OOM'd a 30 GB machine.
 
 A product ``x·y`` is exactly bilinear (rank-1), so ``multiply_2d`` now
 builds its piecewise-linear interpolant analytically via the quarter-square
-identity ``x·y = ((x+y)² − (x−y)²)/4`` — O(n) neurons, no global solve.
+identity ``x·y = ((x+y)² - (x-y)²)/4`` — O(n) neurons, no global solve.
 
 This script:
 
-* (i)  builds a 257×257 grid over a realistic operand range and confirms it
+* (i)  builds a 257x257 grid over a realistic operand range and confirms it
        constructs in well under a second using a trivial amount of memory;
 * (ii) checks the max abs error of the product against exact ``x·y`` over a
        dense sample, at magnitudes up to ~1500·1500, stays inside the
@@ -32,6 +32,8 @@ import torch
 
 from torchwright.ops.inout_nodes import create_input
 from torchwright.ops.relu.arithmetic_ops import multiply_2d
+
+MAX_EXPECTED_BUILD_ALLOC_BYTES = 200e6  # expected a few MB; generous headroom
 
 
 def main() -> None:
@@ -62,7 +64,9 @@ def main() -> None:
     print()
 
     assert elapsed < 1.0, f"build took {elapsed:.2f}s — expected well under a second"
-    assert peak < 200e6, f"build allocated {peak / 1e6:.1f} MB — expected a few MB"
+    assert peak < MAX_EXPECTED_BUILD_ALLOC_BYTES, (
+        f"build allocated {peak / 1e6:.1f} MB — expected a few MB"
+    )
 
     # (ii) Accuracy vs exact product over a dense sample.
     torch.manual_seed(0)

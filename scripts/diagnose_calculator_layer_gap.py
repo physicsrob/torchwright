@@ -27,23 +27,25 @@ from collections import Counter
 from typing import TYPE_CHECKING, Any, cast
 
 from torchwright.compiler.forward.cpsat_scheduler import (
+    GraphModel,
     _compute_layer_bounds,
     build_graph_model,
     is_flex,
 )
 from torchwright.compiler.forward.scheduling_policy import LEGACY_POLICY
 from torchwright.compiler.lower import lower
+from torchwright.graph import Node
 
 if TYPE_CHECKING:
     from collections.abc import Callable
 
 
-def _describe(node) -> str:
+def _describe(node: Node) -> str:
     name = getattr(node, "name", None) or "<unnamed>"
     return f"{type(node).__name__:12s} w={len(node):4d}  {name}"
 
 
-def longest_chain(gm, es: dict[int, int]) -> list:
+def longest_chain(gm: GraphModel, es: dict[int, int]) -> list:
     """Backtrack one longest chain through the earliest-start bounds.
 
     Heuristic reconstruction (the bounds are mode-aware; this walk is not):
@@ -69,13 +71,13 @@ def longest_chain(gm, es: dict[int, int]) -> list:
     return [by_id[i] for i in reversed(chain)]
 
 
-def forensic_carry_sweep(output_node, lane_cap: int) -> None:
-    """Re-certify the first declined carry-sweep subgraph with keep_raw and
-    dissect the worst chargeable sample: member, oracle vs chord, and why the
-    sample was not excused as fillet/band.
+def forensic_carry_sweep(output_node: Node, lane_cap: int) -> None:
+    """Re-certify the first declined carry-sweep subgraph with keep_raw.
 
-    Expects a lowered copy with the v1 pass only — the exact graph state
-    collapse_pl saw its subgraphs in.
+    Dissects the worst chargeable sample: member, oracle vs chord, and why
+    the sample was not excused as fillet/band.  Expects a lowered copy with
+    the v1 pass only - the exact graph state collapse_pl saw its subgraphs
+    in.
     """
     import torch
 

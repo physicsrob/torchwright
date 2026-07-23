@@ -19,6 +19,7 @@ runs the same machinery against the flagship calculator with real arithmetic.
 from __future__ import annotations
 
 import json
+from pathlib import Path
 
 import pytest
 
@@ -68,12 +69,14 @@ def _prefill_ids(oracle):
 
 
 def test_custom_config_rejects_explicit_untied():
-    """An explicit tie_word_embeddings=False (a pre-v6 saved config, or a
-    deliberate untied experiment) must raise on the custom config, not be
-    silently overridden — HF's tie_weights() would otherwise clone the
-    embedding over a checkpoint's real lm_head and return wrong logits with
-    no error.  (The stock Phi3 target ties through its ordinary
-    tie_word_embeddings flag instead — no custom guard needed there.).
+    """An explicit ``tie_word_embeddings=False`` must raise, not be silently overridden.
+
+    This covers a pre-v6 saved config, or a deliberate untied
+    experiment. HF's ``tie_weights()`` would otherwise clone the
+    embedding over a checkpoint's real lm_head and return wrong logits
+    with no error. (The stock Phi3 target ties through its ordinary
+    ``tie_word_embeddings`` flag instead — no custom guard needed
+    there.)
     """
     from torchwright.compiler.hf.configuration_torchwright_custom import (
         TorchwrightCustomConfig,
@@ -88,7 +91,7 @@ def test_custom_config_rejects_explicit_untied():
 def test_config_matches_debug_sidecar(artifact_path, direct_model):
     model, _ = direct_model
     cfg = model.config
-    with open(debug_meta_path_for(artifact_path)) as f:
+    with Path(debug_meta_path_for(artifact_path)).open() as f:
         dbg = json.load(f)
     assert cfg.hidden_size == dbg["d"]
     assert cfg.head_dim == dbg["d_head"]
@@ -121,9 +124,10 @@ def test_artifact_uses_one_physically_tied_table(artifact_path):
 
 
 def test_prefill_and_decode_bit_exact(direct_model):
-    """ONNX oracle (onnxruntime) vs stock Phi-3 model (torch): the meaningful
-    logits are bit-identical and decode the same tokens; the cancel-head rows
-    that cancel to denormal magnitude differ only by a denormal ULP.
+    """ONNX oracle (onnxruntime) vs stock Phi-3 (torch): logits are bit-identical.
+
+    They decode the same tokens; the cancel-head rows that cancel to
+    denormal magnitude differ only by a denormal ULP.
 
     Two things make this robust rather than a flaky ``== 0.0``:
 
@@ -229,8 +233,9 @@ def test_standard_attention_mask(direct_model):
 
 
 def test_direct_model_is_storage_tied(direct_model):
-    """The compiled model's lm_head and embed_tokens are one tensor, not two
-    equal copies — the token.v6 tie survives the from_pretrained load path.
+    """The compiled model's lm_head and embed_tokens are one tensor, not two copies.
+
+    The token.v6 tie survives the from_pretrained load path.
     """
     model, _ = direct_model
     assert model.config.tie_word_embeddings

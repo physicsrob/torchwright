@@ -86,7 +86,7 @@ not exist yet, so they are NOT derisked here:
   to a bounded score (cf. ``_MAX_SCORE_ABS`` in the Phase-3 content tests), not
   raw map units.
 * **Angular resolution.**  Real DOOM adjacent-column separation (~0.36° at full
-  width) is ~1000× tighter than this toy's ~11°, forcing a much larger
+  width) is ~1000x tighter than this toy's ~11°, forcing a much larger
   ``logit_scale`` (~3e5); calibrate to the real per-column ``cos`` gap.
 * **Δ-regime.**  Whether walls re-emit per frame (token offset Δ ≈ 300, easy) or
   persist (Δ ≈ 42k, the Phase-3-hard regime) decides the whole difficulty class.
@@ -328,8 +328,9 @@ def _expected_output(
     dist_scale: float,
     wall_bias: float,
 ) -> np.ndarray:
-    """The ``(wall_id, wall_cos_mid, wall_sin_mid)`` vector the query
-    should see given the expected softmax weights.
+    """The vector the query should see, given the expected softmax weights.
+
+    Returns the ``(wall_id, wall_cos_mid, wall_sin_mid)`` values.
     """
     weights = _expected_softmax_weights(
         walls,
@@ -369,7 +370,7 @@ def test_single_wall_single_query():
         {
             "wall_cos_mid": 1.0,
             "wall_sin_mid": 0.0,
-            "wall_dist": 0.0,  # zero distance so the dist term doesn't suppress the logit
+            "wall_dist": 0.0,  # zero distance: the dist term doesn't suppress the logit
             "wall_id": 42.0,
         }
     ]
@@ -396,9 +397,9 @@ def test_single_wall_single_query():
 
 @pytest.mark.parametrize("n_walls", [2, 4, 8, 16])
 def test_n_walls_each_midpoint(n_walls):
-    """``n_walls`` walls evenly spaced on a circle; one query per wall,
-    each pointed exactly at its wall's midpoint.  Every query must
-    retrieve its own wall's V.
+    """``n_walls`` walls evenly spaced on a circle, one query at each midpoint.
+
+    Every query must retrieve its own wall's V.
 
     The softmax weight on the correct wall is whatever logit
     separation falls out of the geometry.  For walls on a unit circle
@@ -476,7 +477,7 @@ def test_n_walls_each_midpoint(n_walls):
     ],
 )
 def test_softmax_weights_match_reference(n_walls, logit_scale, min_correct_weight):
-    """Sweep ``(n_walls, logit_scale)`` and verify two things:
+    """Sweep ``(n_walls, logit_scale)`` and verify two things.
 
     1. The expected softmax weight on the correct wall (the one the
        query ray is pointed at) is at least ``min_correct_weight`` —
@@ -544,6 +545,7 @@ def test_softmax_weights_match_reference(n_walls, logit_scale, min_correct_weigh
 
 def test_distance_tiebreak():
     """Two walls at the same angular midpoint but different distances.
+
     The closer one should win the softmax.
 
     This test was the one that originally caught the "logit ties with
@@ -612,9 +614,10 @@ def test_distance_tiebreak():
 
 
 def test_multi_query_independence():
-    """Four walls + three queries at different angles in one forward
-    pass.  Each query must return its own wall, unaffected by the
-    presence of the other queries or by the order they appear in.
+    """Four walls + three queries at different angles in one forward pass.
+
+    Each query must return its own wall, unaffected by the presence
+    of the other queries or by the order they appear in.
 
     This is where causal masking plus zero-K on query rows matters:
     later queries attend to earlier queries with logit=0 and V=(0,0,0),
@@ -660,11 +663,11 @@ def test_multi_query_independence():
 
 
 def test_probe_compiled_matches_oracle():
-    """Run the full graph through ``probe_graph`` on a canonical
-    4-wall, 2-query config.  The probe compiles the graph into a
-    ``HeadlessTransformer`` and verifies every materialised node's
-    compiled residual-stream value matches the oracle
-    ``Node.compute`` output.
+    """Run the full graph through ``probe_graph`` on a canonical 4-wall, 2-query config.
+
+    The probe compiles the graph into a ``HeadlessTransformer`` and
+    verifies every materialised node's compiled residual-stream value
+    matches the oracle ``Node.compute`` output.
 
     We use this test sparingly — compilation takes seconds — but it
     catches classes of bugs the oracle alone can't see: bad

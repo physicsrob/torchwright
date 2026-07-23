@@ -47,8 +47,8 @@ def test_every_target_op_has_data() -> None:
     missing = declared - json_ops
     extra = json_ops - declared
     assert not missing, (
-        f"ops declared in _target_ops() but missing from {DOCS_JSON.name}: {sorted(missing)}. "
-        f"Run `make measure-noise`."
+        f"ops declared in _target_ops() but missing from {DOCS_JSON.name}: "
+        f"{sorted(missing)}. Run `make measure-noise`."
     )
     assert not extra, (
         f"ops in {DOCS_JSON.name} but not declared in _target_ops(): {sorted(extra)}. "
@@ -57,8 +57,9 @@ def test_every_target_op_has_data() -> None:
 
 
 def test_footer_source_files_cover_both_libraries() -> None:
-    """The sync-back file set (modal_measure_noise.py) covers every
-    target op's module in both library subpackages.  Pins the B0-split
+    """The sync-back file set covers every target op's module in both libraries.
+
+    This is ``modal_measure_noise.py``'s file set. Pins the B0-split
     regression where a non-recursive ``ops/*.py`` glob returned zero
     footer-bearing files once the ops moved into ``ops/relu/`` and
     ``ops/swiglu/``.

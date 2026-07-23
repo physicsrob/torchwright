@@ -263,10 +263,11 @@ def _build_dynamic_extract_graph(n_entries: int, d_fill: int):
     ],
 )
 def test_dynamic_extract_every_index(n_entries, d_fill):
-    """For every ``idx`` in ``[0, n_entries - 1]`` the primitive must
-    return the exact slice from ``table`` — verified both through
-    ``reference_eval`` (graph oracle) and through the compiled
-    transformer via ``probe_graph``.
+    """The primitive returns the exact slice for every valid ``idx``.
+
+    Every ``idx`` in ``[0, n_entries - 1]``, verified both through
+    ``reference_eval`` (graph oracle) and through the compiled transformer
+    via ``probe_graph``.
     """
     out_node = _build_dynamic_extract_graph(n_entries, d_fill)
 
@@ -309,8 +310,9 @@ def test_dynamic_extract_every_index(n_entries, d_fill):
 
 
 def test_dynamic_extract_random_indices():
-    """Random (table, idx) combinations — exercises the primitive
-    under arbitrary per-position inputs, not just "row i picks slot i".
+    """Random (table, idx) combinations exercise the primitive under arbitrary inputs.
+
+    Not just the "row i picks slot i" case.
     """
     n_entries, d_fill = 16, 3
     out_node = _build_dynamic_extract_graph(n_entries, d_fill)
@@ -353,9 +355,10 @@ def test_dynamic_extract_random_indices():
 
 
 def test_table_lookup_2d_out_of_range_index_clamps_to_edge():
-    """Trigger (a): a row index far outside [0, rows-1] clamps to the table
-    edge instead of collapsing (index 1e5 at sharpness 100 -> sharpness*index
-    1e7 > 2^24 used to return ~0).
+    """Trigger (a): a row index far outside [0, rows-1] clamps to the table edge.
+
+    Instead of collapsing: index 1e5 at sharpness 100 -> sharpness*index
+    1e7 > 2^24 used to return ~0.
     """
     rows = 256
     table = torch.arange(rows * 2, dtype=torch.float32).reshape(rows, 2)
@@ -389,10 +392,12 @@ def test_table_lookup_2d_out_of_range_index_clamps_to_edge():
 
 
 def test_table_lookup_2d_tall_table_stays_exact():
-    """Trigger (b): a 20000-row table at sharpness 100 and 1000 keeps in-range
-    indices exact (an in-range index used to collapse to 0).  Oracle-only:
-    compiling a 20000-row table is needlessly expensive and the cancellation is
-    in the exact-math fp32 sum, like the floor_int wide-range regression.
+    """Trigger (b): a 20000-row table keeps in-range indices exact.
+
+    At sharpness 100 and 1000, an in-range index used to collapse to 0.
+    Oracle-only: compiling a 20000-row table is needlessly expensive and
+    the cancellation is in the exact-math fp32 sum, like the floor_int
+    wide-range regression.
     """
     rows = 20000
     table = torch.arange(rows, dtype=torch.float32).reshape(rows, 1)

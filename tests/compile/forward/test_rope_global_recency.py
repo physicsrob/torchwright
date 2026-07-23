@@ -66,7 +66,7 @@ def test_compiled_picks_most_recent_globally():
     """Sparse-match prefill, compiled path: most recent match selected.
 
     Stride-10 matches in a 60-position prefill.  Adjacent match logit gap is
-    recency_scale × 10 = 10, giving >99.99% weight to the most recent key.
+    recency_scale x 10 = 10, giving >99.99% weight to the most recent key.
     """
     sel = _global_recency_graph()
     stride = 10
@@ -96,8 +96,10 @@ def test_probe_compiled_parity():
 
 
 def test_prefill_equals_cached_decode():
-    """Global recency selection is identical between a prefill and an unbounded
-    cached decode — the BOS/K-already-rotated cache invariant (§5).
+    """Global recency selection is identical between a prefill and cached decode.
+
+    This is the BOS/K-already-rotated cache invariant (§5), which holds
+    for an unbounded cached decode.
     """
     sel = _global_recency_graph()
     stride = 8
@@ -146,9 +148,11 @@ def test_compiled_picks_most_recent_globally_larger_n():
 
 
 def test_partial_global_recency_placement():
-    """Under partial rotary the global-recency head splits placement: the 8-wide
-    content rides the NoPE tail [d_rot:d_rot+8] and the position tiebreak rides the
-    slowest rotated plane d_rot/2-1; the head carries rope_d_rot == d_rot.
+    """Under partial rotary the global-recency head splits its placement.
+
+    The 8-wide content rides the NoPE tail [d_rot:d_rot+8] and the
+    position tiebreak rides the slowest rotated plane d_rot/2-1; the
+    head carries rope_d_rot == d_rot.
     """
     from torchwright.compiler.utils import get_ancestor_nodes
     from torchwright.graph.attn import Attn
@@ -166,8 +170,9 @@ def test_partial_global_recency_placement():
 
 
 def test_partial_compiled_picks_most_recent_globally():
-    """Partial-rotary global recency (d_head=128, d_rot=64): most recent match
-    selected over a stride-10 prefill, compiled path.
+    """Partial-rotary global recency (d_head=128, d_rot=64) selects the most recent.
+
+    Selection is over a stride-10 prefill, compiled path.
     """
     sel = _global_recency_graph(d_head=D_HEAD_PARTIAL, d_rot=D_ROT_PARTIAL)
     stride = 10
@@ -196,8 +201,10 @@ def test_partial_probe_compiled_parity():
 
 
 def test_partial_prefill_equals_cached_decode():
-    """Partial-rotary global recency is identical between prefill and unbounded
-    cached decode (the NoPE tail and rotated position column both cache cleanly).
+    """Partial-rotary global recency is identical between prefill and cached decode.
+
+    This holds for an unbounded cached decode: the NoPE tail and rotated
+    position column both cache cleanly.
     """
     sel = _global_recency_graph(d_head=D_HEAD_PARTIAL, d_rot=D_ROT_PARTIAL)
     n = 40
@@ -223,8 +230,8 @@ def test_partial_prefill_equals_cached_decode():
 def test_smoothed_position_compiled_partial_rotary():
     """``global_position_from_bos(smoothed=True)`` on the compiled path.
 
-    The smoothed position is 2 × an exact uniform causal mean of the raw
-    recovery (zero-Q/K head, ×2 folded into O).  It must track t and keep
+    The smoothed position is 2 x an exact uniform causal mean of the raw
+    recovery (zero-Q/K head, x2 folded into O).  It must track t and keep
     its adjacent steps near 1 — the property the recency tiebreak's
     softmax hardness rides on (the raw recovery's compiled fp32 wander
     breaks this at long rollouts; see the op docstring).

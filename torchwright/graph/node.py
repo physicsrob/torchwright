@@ -2,19 +2,21 @@ import functools
 import os
 from contextlib import contextmanager
 from contextvars import ContextVar
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING, Any, Optional, ParamSpec, TypeVar, cast
 
 import torch
 
 from torchwright.graph.value_type import NodeValueType, Range
 
 if TYPE_CHECKING:
+    from collections.abc import Callable, Iterable, Iterator
+
     from torchwright.graph.affine_bound import AffineBound
 
 global_node_id = 0
 
 
-def reserve_node_id_above(nodes) -> None:
+def reserve_node_id_above(nodes: "Iterable[Node]") -> None:
     """Advance ``global_node_id`` past every id in ``nodes``.
 
     ``Node.__eq__``/``__hash__`` key on ``node_id`` (see below), so two distinct
@@ -78,7 +80,7 @@ _checks_suppressed: ContextVar[bool] = ContextVar("checks_suppressed", default=F
 
 
 @contextmanager
-def suppress_checks():
+def suppress_checks() -> "Iterator[None]":
     """Disable attached-check execution (``node.checks``) inside the block.
 
     Claims and bounds are unaffected — only the runtime predicates are
@@ -93,7 +95,7 @@ def suppress_checks():
 
 
 @contextmanager
-def annotate(label: str):
+def annotate(label: str) -> "Iterator[None]":
     """Tag all nodes created inside this block with a hierarchical label.
 
     Nesting builds a ``/``-separated path. A component already active in the
@@ -125,7 +127,11 @@ def annotate(label: str):
         _current_annotation.reset(token)
 
 
-def annotated(label: str):
+_P = ParamSpec("_P")
+_R = TypeVar("_R")
+
+
+def annotated(label: str) -> "Callable[[Callable[_P, _R]], Callable[_P, _R]]":
     """Decorator form of :func:`annotate`.
 
     Tags every node created during the wrapped function's execution with
@@ -139,9 +145,9 @@ def annotated(label: str):
     without re-indenting it.
     """
 
-    def deco(fn):
+    def deco(fn: "Callable[_P, _R]") -> "Callable[_P, _R]":
         @functools.wraps(fn)
-        def wrapper(*args, **kwargs):
+        def wrapper(*args: _P.args, **kwargs: _P.kwargs) -> _R:
             with annotate(label):
                 return fn(*args, **kwargs)
 
@@ -198,13 +204,15 @@ class Node:
     # onto CP-SAT snapshot stand-in nodes); absent until first query.
     _live_weight_row_ranges: tuple[tuple[int, int], ...]
 
-    def __init_subclass__(cls, **kwargs):
+    def __init_subclass__(cls, **kwargs: object) -> None:
         super().__init_subclass__(**kwargs)
         original = cls.__dict__.get("compute")
         if original is None or getattr(original, "_tw_verified", False):
             return
 
-        def wrapped(self, n_pos, input_values, *args, **kw):
+        def wrapped(
+            self: "Node", n_pos: int, input_values: dict, *args: object, **kw: object
+        ) -> torch.Tensor:
             result = original(self, n_pos, input_values, *args, **kw)
             if os.environ.get("TW_VERIFY_VALUE_TYPES") and isinstance(
                 result, torch.Tensor
@@ -226,8 +234,8 @@ class Node:
         wrapped.__name__ = original.__name__
         wrapped.__qualname__ = original.__qualname__
         wrapped.__doc__ = original.__doc__
-        wrapped._tw_verified = True
-        cls.compute = wrapped
+        cast("Any", wrapped)._tw_verified = True
+        type.__setattr__(cls, "compute", wrapped)
 
     def __init__(self, d_output: int, inputs: list["Node"], name: str = "") -> None:
         global global_node_id
@@ -294,7 +302,7 @@ class Node:
         return NodeValueType(value_range=r)
 
     @property
-    def affine_bound(self):
+    def affine_bound(self) -> "AffineBound":
         return self._affine_bound
 
     def compute_value_type(self) -> NodeValueType:
@@ -318,7 +326,7 @@ class Node:
             if self.inputs[i] == old_input:
                 self.inputs[i] = new_input
 
-    def node_type(self):
+    def node_type(self) -> str:
         return type(self).__name__
 
     def __repr__(self) -> str:
@@ -328,26 +336,36 @@ class Node:
         if len(self.inputs) == 1:
             inp = self.inputs[0]
             inp_type_name = inp.node_type()
-            return f"{type_name}(id={self.node_id}, name='{self.name}', inp={inp_type_name}(id={inp.node_id}, name='{inp.name}', d={len(inp)}), d={len(self)})"
+            inp_repr = (
+                f"{inp_type_name}(id={inp.node_id}, name='{inp.name}', d={len(inp)})"
+            )
+            return (
+                f"{type_name}(id={self.node_id}, name='{self.name}', "
+                f"inp={inp_repr}, d={len(self)})"
+            )
         inp_strings = []
         for i, inp in enumerate(self.inputs):
             inp_type_name = inp.node_type()
             inp_strings.append(
-                f"inp{i}={inp_type_name}(id={inp.node_id}, name='{inp.name}', d={len(inp)})"
+                f"inp{i}={inp_type_name}(id={inp.node_id}, name='{inp.name}', "
+                f"d={len(inp)})"
             )
         inp_str = ", ".join(inp_strings)
-        return f"{type_name}(id={self.node_id}, name='{self.name}', {inp_str}, d={len(self)})"
+        return (
+            f"{type_name}(id={self.node_id}, name='{self.name}', "
+            f"{inp_str}, d={len(self)})"
+        )
 
     def num_params(self) -> int:
         return 0
 
-    def __eq__(self, other):
-        return self.node_id == other.node_id
+    def __eq__(self, other: object) -> bool:
+        return self.node_id == cast("Node", other).node_id
 
-    def __hash__(self):
+    def __hash__(self) -> int:
         return self.node_id
 
-    def __deepcopy__(self, memo):
+    def __deepcopy__(self, memo: dict) -> "Node":
         # Nodes are identity-bearing graph singletons (``__hash__``/``__eq__``
         # key on ``node_id``, and the scheduler distinguishes special nodes such
         # as ``pos_encoding`` by ``is`` identity).  Deep-copying a structure that

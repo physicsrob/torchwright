@@ -213,9 +213,10 @@ def test_check_complete_and_unresolved_read():
 
 
 def test_resolve_static_rejects_nodes_missing_the_flex_entry():
-    """The capacity check reads widths off the nodes; a caller that passes a
-    node set not covering the table's unresolved entries gets a named error,
-    not a KeyError.
+    """The capacity check reads widths off the nodes.
+
+    A caller that passes a node set not covering the table's unresolved
+    entries gets a named error, not a KeyError.
     """
     out, _a, _b, _add, _blk, _lit = _test_graph()
     lowered = lower(out)
@@ -251,11 +252,13 @@ def test_compile_records_resolved_table():
 
 
 def test_cost_summary_static_hand_computed():
-    """d_head=8; a,b: Linear 4->3 (bypass 2*3=6 slots each; transport 1 head
-    each — dense randn weights make all of the 4-wide input's single chunk
+    """d_head=8, with per-node costs pinned for each realization class.
+
+    a,b: Linear 4->3 (bypass 2*3=6 slots each; transport 1 head each —
+    dense randn weights make all of the 4-wide input's single chunk
     live, so the support-aware charge equals the old ceil(4/8)); blk: 6
-    lanes; add width 3: MLP_ADD 2*3=6 slots, or ATTN_ADD reuse ceil(3/8)=1 /
-    fresh 2; literal: no slots.
+    lanes; add width 3: MLP_ADD 2*3=6 slots, or ATTN_ADD reuse
+    ceil(3/8)=1 / fresh 2; literal: no slots.
     """
     out, _a, _b, _add, _blk, _lit = _test_graph()
     lowered = lower(out)
@@ -288,9 +291,11 @@ def test_cost_summary_static_hand_computed():
 
 
 def test_cost_summary_bypass_demand_beyond_capacity_routes_to_attention():
-    """The bypass-slot column is not a policy readout: a node whose
-    ``2 * d_output`` exceeds the layer's usable pool has no MLP realization,
-    so the summary must charge it heads even under the MLP policy.
+    """The bypass-slot column is not a policy readout.
+
+    A node whose ``2 * d_output`` exceeds the layer's usable pool has no
+    MLP realization, so the summary must charge it heads even under the
+    MLP policy.
     """
     out, _a, _b, _add, _blk, _lit = _test_graph()
     lowered = lower(out)
@@ -319,8 +324,9 @@ def test_cost_summary_requires_resolved_table():
 
 
 def test_cost_summary_reconciles_with_solver_totals():
-    """Gate B3: the pre-schedule summary's totals agree with the finished
-    solve's accounting (flex pinned so routing is the static table).
+    """Gate B3: the pre-schedule summary's totals agree with the finished solve.
+
+    flex is pinned so routing is the static table.
     """
     from torchwright.compiler.forward.compile import forward_compile
 
@@ -343,9 +349,10 @@ def test_cost_summary_reconciles_with_solver_totals():
 
 
 def test_eager_and_directed_tables_agree_when_flex_pinned():
-    """With cpsat_flex_routing=False the solve uses the shared static
-    routing, so the directed path's table must equal the eager path's —
-    the one-option-set property, exercised end to end.
+    """With cpsat_flex_routing=False the solve uses the shared static routing.
+
+    So the directed path's table must equal the eager path's — the
+    one-option-set property, exercised end to end.
     """
     from torchwright.compiler.forward.compile import forward_compile
 
@@ -403,9 +410,10 @@ def _wide_graph(d_output: int):
 @pytest.mark.parametrize("bias", [True, False])
 @pytest.mark.parametrize("policy", [SchedulingPolicy(), LEGACY_POLICY])
 def test_static_flex_class_capacity_boundary(bias, policy):
-    """d_hidden=64: the widest placeable bypass Linear has 2*d_output equal to
-    the usable pool.  One column wider and only attention transport remains,
-    whatever ``local_in_attention`` says.
+    """d_hidden=64: the widest placeable bypass Linear has 2*d_output equal to the pool.
+
+    One column wider and only attention transport remains, whatever
+    ``local_in_attention`` says.
     """
     usable = usable_hidden_slots(64, bias)
     assert usable == (64 if bias else 63)
@@ -438,8 +446,9 @@ def _add_of_width(w: int) -> Add:
     [SchedulingPolicy(add_in_attention="never"), SchedulingPolicy(), LEGACY_POLICY],
 )
 def test_static_flex_class_add_capacity_boundary(bias, policy):
-    """Same boundary for the Add route family: 2*width against the usable
-    hidden pool.  One column wider and only ATTN_ADD remains, whatever
+    """Same boundary for the Add route family: 2*width against the usable pool.
+
+    One column wider and only ATTN_ADD remains, whatever
     ``add_in_attention`` says.
     """
     usable = usable_hidden_slots(64, bias)
@@ -456,10 +465,12 @@ def test_static_flex_class_add_capacity_boundary(bias, policy):
 
 
 def test_resolve_static_forced_held_target_add():
-    """The tied direct-handoff contract: compile forces a held-target Add to
-    ATTN_ADD through ``forced_classes``, and the resolver honours it even
-    under an MLP-preferring Add policy (the shipping default already keeps
-    Adds on attention, which would make the force vacuous here).
+    """The tied direct-handoff contract.
+
+    Compile forces a held-target Add to ATTN_ADD through
+    ``forced_classes``, and the resolver honours it even under an
+    MLP-preferring Add policy (the shipping default already keeps Adds
+    on attention, which would make the force vacuous here).
     """
     out, a, _b, add, _blk, _lit = _test_graph()
     lowered = lower(out)
@@ -483,8 +494,9 @@ def test_resolve_static_forced_held_target_add():
 
 
 def test_first_hidden_slot_is_the_only_bias_arithmetic():
-    """The scheduler's packing base and the routing rule's pool are two reads
-    of one fact: bias=False reserves slot 0 for the constant lane.
+    """The scheduler's packing base and the routing rule's pool read one fact.
+
+    That fact: bias=False reserves slot 0 for the constant lane.
     """
     assert first_hidden_slot(True) == 0
     assert first_hidden_slot(False) == 1
@@ -497,9 +509,11 @@ def test_first_hidden_slot_is_the_only_bias_arithmetic():
 
 @pytest.mark.parametrize("bias", [True, False])
 def test_resolve_static_routes_unplaceable_bypass_to_attention(bias):
-    """The resolver, not just the rule: an over-wide Linear comes back
-    attention-routed even though the default policy asks for the bypass, while
-    its narrow consumer still takes the bypass.
+    """The resolver, not just the rule, applies the width limit.
+
+    An over-wide Linear comes back attention-routed even though the
+    default policy asks for the bypass, while its narrow consumer still
+    takes the bypass.
     """
     usable = usable_hidden_slots(64, bias)
     out, _wide = _wide_graph(usable // 2 + 1)
@@ -514,9 +528,11 @@ def test_resolve_static_routes_unplaceable_bypass_to_attention(bias):
 
 @pytest.mark.parametrize("bias", [True, False])
 def test_cpsat_routing_agrees_with_resolve_static(bias):
-    """The drift tripwire.  ``routing()`` (CP-SAT's pinned path) and
-    ``resolve_static`` (the eager path) must classify the same node the same
-    way; when they disagree, ``resolve_from_assignment`` raises
+    """The drift tripwire.
+
+    ``routing()`` (CP-SAT's pinned path) and ``resolve_static`` (the
+    eager path) must classify the same node the same way; when they
+    disagree, ``resolve_from_assignment`` raises
     ``UnresolvedRealizationError`` on a graph that used to compile.
     """
     from torchwright.compiler.forward.cpsat_scheduler import (
@@ -539,9 +555,11 @@ def test_cpsat_routing_agrees_with_resolve_static(bias):
 
 
 def test_routing_without_capacity_raises_rather_than_guessing():
-    """``critical_path_layers`` passes no geometry; under flex_routing=True it
-    never routes a Linear.  If a caller reaches this path anyway, it must say
-    so rather than pick a sublayer that may not hold the node.
+    """``critical_path_layers`` passes no geometry.
+
+    Under flex_routing=True it never routes a Linear. If a caller
+    reaches this path anyway, it must say so rather than pick a
+    sublayer that may not hold the node.
     """
     from torchwright.compiler.forward.cpsat_scheduler import (
         build_graph_model,
@@ -563,8 +581,10 @@ def test_routing_without_capacity_raises_rather_than_guessing():
 
 @pytest.mark.parametrize("bias", [True, False])
 def test_wide_bypass_linear_compiles_and_matches_compute(bias):
-    """End to end at optimize=0: the rescued Linear runs as attention
-    transport and computes what ``node.compute`` computes.
+    """End to end at optimize=0.
+
+    The rescued Linear runs as attention transport and computes what
+    ``node.compute`` computes.
     """
     from torchwright.compiler.export import compile_headless
     from torchwright.debug.probe import probe_compiled
@@ -583,10 +603,12 @@ def test_wide_bypass_linear_compiles_and_matches_compute(bias):
 
 @pytest.mark.parametrize("bias", [True, False])
 def test_wide_bypass_linear_solves_under_pinned_cpsat_routing(bias):
-    """``cpsat_flex_routing=False`` pins every Linear via ``routing()``.  With
-    the capacity rule absent it pinned the wide Linear into the MLP and the
-    hidden-slot cumulative made the model INFEASIBLE; ``require_solver=True``
-    turns the silent heuristic fallback into a raise, so this test sees it.
+    """``cpsat_flex_routing=False`` pins every Linear via ``routing()``.
+
+    With the capacity rule absent it pinned the wide Linear into the MLP
+    and the hidden-slot cumulative made the model INFEASIBLE;
+    ``require_solver=True`` turns the silent heuristic fallback into a
+    raise, so this test sees it.
     """
     from torchwright.compiler.forward.compile import forward_compile
 
@@ -608,11 +630,12 @@ def test_wide_bypass_linear_solves_under_pinned_cpsat_routing(bias):
 
 
 def test_eager_scheduler_places_the_wide_linear_in_attention():
-    """The eager walk is what deadlocked, and it is what CP-SAT's warm start
-    runs to produce its hint: while the wide Linear had no reachable
-    realization, the MLP placer skipped it every layer and ``schedule_layer``
-    raised ``No progress`` with an empty hint behind it.  Now it comes out as
-    a ``compute_linear`` attention op.
+    """The eager walk is what deadlocked, and CP-SAT's warm start runs it too.
+
+    While the wide Linear had no reachable realization, the MLP placer
+    skipped it every layer and ``schedule_layer`` raised ``No progress``
+    with an empty hint behind it. Now it comes out as a
+    ``compute_linear`` attention op.
     """
     from torchwright.compiler.forward.graph_analysis import GraphAnalyzer
     from torchwright.compiler.forward.residual_map import ResidualStreamMap

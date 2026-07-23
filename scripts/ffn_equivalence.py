@@ -1,7 +1,7 @@
-"""Equivalence harness for the FFN-IR (formerly block-IR) step-1 refactor
-(``docs/block_ir_step1_plan.md``, "Equivalence harness").
+"""Equivalence harness for the FFN-IR (formerly block-IR) step-1 refactor.
 
-For a given graph builder it compiles **both** code paths — historically the
+See ``docs/block_ir_step1_plan.md``, "Equivalence harness".  For a given
+graph builder it compiles **both** code paths — historically the
 chain-mined path vs the blockified one; since Phase 2b/3 the ops layer builds
 FFNs natively, so both builds are the same graph and the "FFN path" is
 the build certified at the lowering boundary (``compiler.lower``, blockify's
@@ -55,7 +55,7 @@ class ScheduleMetrics:
     peak_hidden: int
     residual_peak: int
 
-    def as_tuple(self):
+    def as_tuple(self) -> tuple[int, int, int, int]:
         return (self.n_layers, self.total_heads, self.peak_hidden, self.residual_peak)
 
 
@@ -109,17 +109,20 @@ class EquivalenceReport:
             lines.append("  COST REGRESSIONS (stop-and-report): " + ", ".join(regs))
         else:
             lines.append("  no cost regression")
-        for n in self.notes:
-            lines.append("  note: " + n)
+        lines.extend("  note: " + n for n in self.notes)
         return "\n".join(lines)
 
 
-def _seed_residual_map(graph: GraphAnalyzer, d: int):
-    """Replicate forward_compile's residual-stream seed for schedule-only runs:
-    the const-1 self-match column and every input node (no RMSNorm reservation
-    — off by default, and irrelevant to the chain-vs-FFN comparison as long as
-    both paths use the same seed).  The runtime always zero-initialises, so the
-    whole free pool starts clean and no cancel bookkeeping is needed.
+def _seed_residual_map(
+    graph: GraphAnalyzer, d: int
+) -> tuple[ResidualStreamMap, set[Node]]:
+    """Replicate forward_compile's residual-stream seed for schedule-only runs.
+
+    The const-1 self-match column and every input node (no RMSNorm
+    reservation — off by default, and irrelevant to the chain-vs-FFN
+    comparison as long as both paths use the same seed).  The runtime
+    always zero-initialises, so the whole free pool starts clean and no
+    cancel bookkeeping is needed.
     """
     input_nodes = [n for n in graph.get_all_nodes() if graph.is_input_node(n)]
     rmap = ResidualStreamMap(d)
@@ -139,8 +142,9 @@ def schedule_metrics(
     d_hidden: int | None = None,
     max_layers: int = 800,
 ) -> ScheduleMetrics:
-    """Run the heuristic scheduler schedule-only (no weight tensors) and capture
-    the compile-metrics tuple.  Memory-safe at flagship scale.
+    """Run the heuristic scheduler schedule-only and capture the compile-metrics tuple.
+
+    No weight tensors.  Memory-safe at flagship scale.
     """
     d_hidden = d if d_hidden is None else d_hidden
     graph = GraphAnalyzer(output_node)
@@ -162,9 +166,12 @@ def schedule_metrics(
         peak_hidden = max(peak_hidden, slots)
         residual_peak = max(residual_peak, d - rmap.get_free_count())
         for node in graph.get_all_nodes():
-            if isinstance(node, Concatenate) and node not in computed:
-                if all(leaf in computed for leaf in flatten_concat_nodes([node])):
-                    computed.add(node)
+            if (
+                isinstance(node, Concatenate)
+                and node not in computed
+                and all(leaf in computed for leaf in flatten_concat_nodes([node]))
+            ):
+                computed.add(node)
         if not attn_ops and not mlp_ops:
             break
         n_layers = i + 1
@@ -220,9 +227,12 @@ def schedule_trace(
                 )
         trace.append({"layer": i, "hidden": hidden, "composites": composites})
         for node in graph.get_all_nodes():
-            if isinstance(node, Concatenate) and node not in computed:
-                if all(leaf in computed for leaf in flatten_concat_nodes([node])):
-                    computed.add(node)
+            if (
+                isinstance(node, Concatenate)
+                and node not in computed
+                and all(leaf in computed for leaf in flatten_concat_nodes([node]))
+            ):
+                computed.add(node)
         if not attn_ops and not mlp_ops:
             break
     return trace
@@ -238,10 +248,10 @@ def equivalence_report(
     input_tensor: torch.Tensor | None = None,
     n_pos: int = 4,
 ) -> EquivalenceReport:
-    """Compile both paths from ``build_fn`` and report metrics (+ optional
-    output divergence).
+    """Compile both paths from ``build_fn`` and report metrics.
 
-    ``build_fn`` must build the graph deterministically and return the output
+    Plus optional output divergence.  ``build_fn`` must build the graph
+    deterministically and return the output
     node; it is called once per path so each path gets a fresh graph.
     """
     # Chain path.
@@ -294,7 +304,7 @@ if __name__ == "__main__":
     from torchwright.ops.inout_nodes import create_input
     from torchwright.ops.relu.linear_relu_linear import linear_relu_linear
 
-    def build():
+    def build() -> Node:
         x = create_input("x", 8, value_range=(-1.0, 1.0))
         g = torch.Generator().manual_seed(11)
         h = linear_relu_linear(

@@ -55,7 +55,7 @@ def test_map_to_table_output_fidelity():
 
 
 def test_chained_map_to_table_output_fidelity():
-    """Chaining two map_to_table lookups should still produce a recognizable embedding."""
+    """Chaining two map_to_table lookups still produces a recognizable embedding."""
     embedding = _make_digit_embedding()
     table = _digit_identity_table(embedding)
 
@@ -187,7 +187,7 @@ def test_equals_vector_after_select():
 
 
 def test_equals_vector_after_nested_select():
-    """equals_vector should work after two levels of select (remove_leading_0s depth=2)."""
+    """equals_vector works after two levels of select (remove_leading_0s depth=2)."""
     embedding = _make_digit_embedding()
 
     e0 = embedding.get_embedding("0")
@@ -221,7 +221,7 @@ def test_equals_vector_after_nested_select():
 
 
 def test_map_to_table_chain_produces_correct_lookup():
-    """A second map_to_table should produce the correct value when fed output of a first.
+    """A second map_to_table produces the correct value when fed output of a first.
 
     This is the core multiplication blocker: multiply_digit_pair (map_to_table)
     feeds into sum_digits (map_to_table) for carry propagation.
@@ -371,7 +371,7 @@ def test_remove_leading_0s_three_levels():
 
 
 def test_remove_leading_0s_no_removal_needed():
-    """remove_leading_0s should leave a sequence alone when there are no leading zeros."""
+    """remove_leading_0s leaves a sequence alone when there are no leading zeros."""
     from torchwright.ops.relu.sequence_ops import remove_leading_0s
 
     embedding = _make_digit_embedding()

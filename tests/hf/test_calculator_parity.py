@@ -48,7 +48,7 @@ _EOS = "<eos>"
 # local-recency graph reshape: amplitude-independent, ~5 logits observed on the
 # gate set (Modal CPU pair ~2.3, other build pairs ~4.7), flips no argmax.  The
 # real correctness bar is per-position argmax-equality; this bounds the residual
-# logit divergence so a structural regression (free-floating 10s–1000s) still
+# logit divergence so a structural regression (free-floating 10s-1000s) still
 # fails.  See docs/numerical_noise_findings.md.
 _PARITY_FP_FLOOR = 8.0
 

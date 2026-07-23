@@ -4,8 +4,8 @@
 (``attend_argmin``/``argmax``/``_where``/``dot``/``_bucket`` …) are
 position-independent today — constant query, content in K.  In the RoPE
 end state every head's Q/K is rotated by absolute position, so a content
-logit ``Σ_c q_c·k_c`` becomes ``Σ_c q_c·k_c·cos((i−j)·θ_{p_c})``.  Putting
-each content column on a **slow** plane (tiny θ) keeps ``cos((i−j)·θ) ≈ 1``
+logit ``Σ_c q_c·k_c`` becomes ``Σ_c q_c·k_c·cos((i-j)·θ_{p_c})``.  Putting
+each content column on a **slow** plane (tiny θ) keeps ``cos((i-j)·θ) ≈ 1``
 over the rollout, so the match stays effectively position-free.  This is the
 capability test for that claim, calibrated (per §9) to the real worst-case
 difficulty: the ~42k production distance and each head's own documented gap.
@@ -13,7 +13,7 @@ difficulty: the ~42k production distance and each head's own documented gap.
 Two layers of validation:
   * **Selection-at-distance (the attenuation gate).**  A query at a large
     absolute position vs keys spanning 0..42k, computed as a single logit row
-    (a full n_pos×n_pos attention matrix at 42k would OOM).  ``_rotary_logits``
+    (a full n_pos x n_pos attention matrix at 42k would OOM).  ``_rotary_logits``
     mirrors ``Attn.compute``'s rotary path exactly and is anchored to it on a
     small case, so the row is a faithful 42k proxy.
   * **Compiled parity.**  A rotary content head built via ``rotary_content_head``
@@ -51,10 +51,12 @@ _VALIDITY_BONUS = 256.0
 
 
 def _rotary_logits(query_matrix, key_matrix, q_in, k_in, q_pos, k_positions):
-    """Logit row of a content head made rotary-on-slow-planes: a query at
-    absolute ``q_pos`` against keys at ``k_positions``.  Mirrors the rotary path
-    of ``Attn.compute`` (place content on slow planes, project, rotate by
-    absolute position, dot) without materialising an n_pos×n_pos matrix.
+    """Logit row of a content head made rotary-on-slow-planes.
+
+    The query is at absolute ``q_pos`` against keys at ``k_positions``.
+    Mirrors the rotary path of ``Attn.compute`` (place content on slow
+    planes, project, rotate by absolute position, dot) without
+    materialising an n_pos x n_pos matrix.
     """
     qm = place_on_slow_planes(query_matrix, D_HEAD)
     km = place_on_slow_planes(key_matrix, D_HEAD)
@@ -68,9 +70,10 @@ def _rotary_logits(query_matrix, key_matrix, q_in, k_in, q_pos, k_positions):
 
 
 def test_rotary_logits_anchored_to_attn_compute():
-    """``_rotary_logits`` equals ``Attn.compute`` on a small case, so using it
-    as the 42k-distance proxy is faithful (it can't be exercised at 42k via the
-    full matrix without OOM).
+    """``_rotary_logits`` equals ``Attn.compute`` on a small case.
+
+    So using it as the 42k-distance proxy is faithful (it can't be
+    exercised at 42k via the full matrix without OOM).
     """
     W = 4
     query_matrix = _QUERY_GAIN * torch.eye(1, W)  # score in col 0
@@ -103,9 +106,11 @@ def test_rotary_logits_anchored_to_attn_compute():
 
 
 def test_dot_match_selects_at_production_distance():
-    """attend_argmax_dot shape (W=8 one-hot, match_gain=200): a matching key at
-    the far end of a 42k rollout beats non-matching keys crowded at the near
-    end — content match survives the rotation with a wide margin.
+    """attend_argmax_dot shape (W=8 one-hot, match_gain=200).
+
+    A matching key at the far end of a 42k rollout beats non-matching
+    keys crowded at the near end: content match survives the rotation
+    with a wide margin.
     """
     W, MG = 8, 200.0
     query_matrix = MG * torch.eye(W)
@@ -128,10 +133,12 @@ def test_dot_match_selects_at_production_distance():
 
 
 def test_fine_score_resolution_at_production_distance():
-    """The binding gate: a unit score delta (gain=8) must still resolve when the
-    winner is at the far end (most attenuated) and the runner-up is adjacent to
-    the query (un-attenuated) — the worst case for the slow-plane cosine.
-    Tested at the max score magnitude (``_MAX_SCORE_ABS``).
+    """The binding gate: a unit score delta (gain=8) must still resolve.
+
+    The worst case for the slow-plane cosine is when the winner is at
+    the far end (most attenuated) and the runner-up is adjacent to the
+    query (un-attenuated). Tested at the max score magnitude
+    (``_MAX_SCORE_ABS``).
     """
     query_matrix = torch.tensor([[_QUERY_GAIN]])  # (1,1)
     key_matrix = torch.tensor([[1.0]])  # argmax: K col0 = +score
@@ -152,10 +159,11 @@ def test_fine_score_resolution_at_production_distance():
 
 
 def test_bucket_rendezvous_selects_at_production_distance():
-    """Bucket-equality rendezvous (one-hot, bonus=256): a key whose bucket
-    matches the query — at the far end — beats non-matching keys at the near end.
-    Matching is what gates validity; the per-key score (separate slow plane)
-    breaks ties among matches.
+    """Bucket-equality rendezvous (one-hot, bonus=256).
+
+    A key whose bucket matches the query, at the far end, beats
+    non-matching keys at the near end. Matching is what gates validity;
+    the per-key score (separate slow plane) breaks ties among matches.
     """
     nb = 12
     query_matrix = _VALIDITY_BONUS * torch.eye(nb)
@@ -177,9 +185,11 @@ def test_bucket_rendezvous_selects_at_production_distance():
 
 
 def test_rotary_content_head_compiled_matches_oracle():
-    """A rotary content head built via ``rotary_content_head`` compiles and
-    matches its exact-math oracle — the rotation is correctly wired through the
-    compiler at full-width d_head (the ONNX/HF full-width rotary contract).
+    """A rotary content head built via ``rotary_content_head`` matches its oracle.
+
+    Compiling it and comparing to its exact-math oracle confirms the
+    rotation is correctly wired through the compiler at full-width
+    d_head (the ONNX/HF full-width rotary contract).
     """
     W = 4
     query_matrix = _QUERY_GAIN * torch.eye(1, W)

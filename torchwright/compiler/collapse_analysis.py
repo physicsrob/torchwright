@@ -35,6 +35,7 @@ from typing import TYPE_CHECKING, cast
 import torch
 
 from torchwright.compiler.collapse import (
+    _MIN_SYNTH_DEPTH,
     _SYNTH_CLAIM_ATOL,
     _machine,
     _member_depths,
@@ -110,7 +111,7 @@ class SubgraphAnalysis:
     stage1_cols_banded: int = 0
     n_oracle_points: int = 0
 
-    def __post_init__(self):
+    def __post_init__(self) -> None:
         if not self.verdict_banded:
             self.verdict_banded = self.verdict
 
@@ -147,20 +148,20 @@ class SubgraphAnalysis:
     def format_detail(self) -> str:
         """The subgraph line plus one line per synthesized member."""
         lines = [self.format_line()]
-        for m in self.members:
-            lines.append(
-                f"    {m.name} (d={m.d_output}, depth {m.depth}): "
-                f"kinks {m.n_kinks}, dev {m.deviation:.2e} "
-                f"(banded {m.banded_deviation:.2e}, "
-                f"in-band {m.fillet_deviation:.2e}); "
-                f"S1 {m.s1.lanes} lanes, bound {m.s1.total_bound:.2e} "
-                f"[{'ok' if m.s1_ok else 'no'}"
-                f"/{'ok' if m.s1_banded_ok else 'no'}]; "
-                f"S2 {m.s2.n_steps} steps, bound {m.s2.total_bound:.2e}, "
-                f"fillet class {m.s2.fillet_bound:.2e} "
-                f"[{'ok' if m.s2_ok else 'no'}"
-                f"/{'ok' if m.s2_banded_ok else 'no'}]"
-            )
+        lines.extend(
+            f"    {m.name} (d={m.d_output}, depth {m.depth}): "
+            f"kinks {m.n_kinks}, dev {m.deviation:.2e} "
+            f"(banded {m.banded_deviation:.2e}, "
+            f"in-band {m.fillet_deviation:.2e}); "
+            f"S1 {m.s1.lanes} lanes, bound {m.s1.total_bound:.2e} "
+            f"[{'ok' if m.s1_ok else 'no'}"
+            f"/{'ok' if m.s1_banded_ok else 'no'}]; "
+            f"S2 {m.s2.n_steps} steps, bound {m.s2.total_bound:.2e}, "
+            f"fillet class {m.s2.fillet_bound:.2e} "
+            f"[{'ok' if m.s2_ok else 'no'}"
+            f"/{'ok' if m.s2_banded_ok else 'no'}]"
+            for m in self.members
+        )
         return "\n".join(lines)
 
 
@@ -223,9 +224,14 @@ class V2Report:
         return "\n".join(lines)
 
 
-def _stage1_col_union(members: list[MemberAnalysis], certs, plateau_tol) -> int:
-    """Bounded-step residual columns for one source's S2 emission:
-    steps shared across members where their transitions coincide.
+def _stage1_col_union(
+    members: list[MemberAnalysis],
+    certs: list[MemberCertificate],
+    plateau_tol: float,
+) -> int:
+    """Bounded-step residual columns for one source's S2 emission.
+
+    Steps shared across members where their transitions coincide.
     """
     mids: list[float] = []
     for cert in certs:
@@ -305,19 +311,36 @@ def analyze_collapse_v2(
             for m in members
             if m is output_node or any(c not in member_set for c in consumers[m])
         ]
-        synthesized = [m for m in boundary if depth[m] >= 2]
+        synthesized = [m for m in boundary if depth[m] >= _MIN_SYNTH_DEPTH]
 
-        def outcome(verdict: str, **kw) -> SubgraphAnalysis:
+        def outcome(
+            verdict: str,
+            *,
+            domain: tuple[float, float] = (float("nan"), float("nan")),
+            verdict_banded: str = "",
+            depth_after: int | None = None,
+            depth_after_banded: int | None = None,
+            members: list[MemberAnalysis] | None = None,
+            stage1_cols: int = 0,
+            stage1_cols_banded: int = 0,
+            n_oracle_points: int = 0,
+        ) -> SubgraphAnalysis:
             return SubgraphAnalysis(
                 source=src_name,
                 annotation=ann,
-                domain=kw.pop("domain", (float("nan"), float("nan"))),
-                n_members=len(members),
+                domain=domain,
+                n_members=len(by_src[source]),
                 chain_depth=chain_depth,
                 n_boundary=len(boundary),
                 n_synthesized=len(synthesized),
                 verdict=verdict,
-                **kw,
+                verdict_banded=verdict_banded,
+                depth_after=depth_after,
+                depth_after_banded=depth_after_banded,
+                members=members if members is not None else [],
+                stage1_cols=stage1_cols,
+                stage1_cols_banded=stage1_cols_banded,
+                n_oracle_points=n_oracle_points,
             )
 
         if not synthesized:
@@ -456,11 +479,9 @@ def analyze_collapse_v2(
         )
         subgraphs.append(sg)
         if sg.taken:
-            for m in synthesized:
-                rewiring.append((source, m, verdict))
+            rewiring.extend((source, m, verdict) for m in synthesized)
         elif sg.taken_banded:
-            for m in synthesized:
-                rewiring_banded.append((source, m, verdict_banded))
+            rewiring_banded.extend((source, m, verdict_banded) for m in synthesized)
         if verbose:
             print(f"  {sg.format_line()}")
 
@@ -482,8 +503,9 @@ def analyze_collapse_v2(
 
 
 def _witness_chain(output_node: Node) -> list[str]:
-    """One deepest dependency chain of the graph (the critical_chain.py
-    pattern): per node, its earliest feasible layer, annotation, name.
+    """One deepest dependency chain of the graph (the critical_chain.py pattern).
+
+    Per node, its earliest feasible layer, annotation, name.
     """
     from torchwright.compiler.forward.cpsat_scheduler import (
         LEGACY_POLICY,
@@ -533,9 +555,10 @@ def _graft_standins(
     consumers: dict[Node, list[Node]],
     by_src: dict[Node, list[Node]],
 ) -> Node:
-    """Replace each taken member's external consumers with 1- (S1) or
-    2-sublayer (S2) stand-in FFNs fed by the source, for the floor
-    model.  Stage-1 stand-ins are shared per source, mirroring the S2
+    """Replace each taken member's external consumers with stand-in FFNs.
+
+    1- (S1) or 2-sublayer (S2) stand-ins fed by the source, for the floor
+    model. Stage-1 stand-ins are shared per source, mirroring the S2
     emission's shared bounded-step stage.
     """
     stage1: dict[Node, Node] = {}

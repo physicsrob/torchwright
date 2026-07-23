@@ -84,9 +84,10 @@ def test_oracle_marker_not_at_zero():
 
 
 def test_unsafe_dhead_raises():
-    """count_since_marker raises ValueError for d_head too small to give <0.5
-    gap error at the given max_gap (the quasi-static approximation breaks down).
-    d_head=16 with max_gap=350 gives analytic error ~1.5 >> 0.45 threshold.
+    """count_since_marker raises ValueError when d_head is too small for the gap error.
+
+    The quasi-static approximation breaks down: d_head=16 with max_gap=350
+    gives analytic error ~1.5, which is far above the 0.45 threshold.
     """
     import pytest
 

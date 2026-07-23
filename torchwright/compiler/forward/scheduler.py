@@ -7,8 +7,9 @@ private to this module and are frozen into ReplayPlan records at the boundary.
 Mutates residual_map (allocate, free, reassign) and computed_nodes (add).
 """
 
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
-from typing import Literal
+from typing import Any, Literal
 
 from torchwright.compiler.forward.add_placement import (
     AddPlacement,
@@ -37,6 +38,8 @@ from torchwright.compiler.utils import resolve_n_heads
 from torchwright.graph import Add, Attn, Concatenate, Linear, Node
 from torchwright.graph.ffn import FFN
 from torchwright.graph.misc import LiteralValue
+
+_ComputeOpType = Literal["compute_attn", "compute_linear", "compute_add"]
 
 
 @dataclass
@@ -170,7 +173,7 @@ class LayerScheduler:
         graph: GraphAnalyzer,
         d: int,
         d_head: int,
-        pos_encoding=None,
+        pos_encoding: Node | None = None,
         d_hidden: int | None = None,
         clusters: SiblingClusters | None = None,
         admission_budget_fraction: float = 0.4,
@@ -292,8 +295,7 @@ class LayerScheduler:
     def _deadlock_message(
         self, remaining: set[Node], residual_map: ResidualStreamMap
     ) -> str:
-        """The ``No progress`` text, itemized by why each ready node was
-        passed over.
+        """The ``No progress`` text, itemized by why each ready node was passed over.
 
         The ``No progress:`` prefix and the ``RuntimeError`` type are a
         contract: ``test_optimize1_compiles_where_eager_heuristic_cannot``
@@ -454,10 +456,10 @@ class LayerScheduler:
         # --- 1. Classify ready nodes ---
         all_ready = self._get_ready_nodes(computed_nodes)
 
-        ready = set()
-        free_adds = []
-        deferred_adds = []
-        mlp_adds = []
+        ready: set[Node] = set()
+        free_adds: list[Add] = []
+        deferred_adds: list[Add] = []
+        mlp_adds: list[Add] = []
         # Iterate node sets in node_id order wherever the iteration
         # order can reach the schedule (list build order feeds stable
         # sorts and append-order scheduling below) — set iteration is
@@ -613,15 +615,21 @@ class LayerScheduler:
 
     def _schedule_attn_sublayer(
         self,
-        ready,
-        dead,
-        free_adds,
-        deferred_adds,
-        residual_map,
-        computed_nodes,
-    ):
-        attn_ops = []
-        biased_linears = []
+        ready: set[Node],
+        dead: list[Node],
+        free_adds: Sequence[Add],
+        deferred_adds: Sequence[Add],
+        residual_map: ResidualStreamMap,
+        computed_nodes: set[Node],
+    ) -> tuple[
+        list["_AttentionOp"],
+        list[Node],
+        list[Node],
+        list[int],
+        set[Node],
+    ]:
+        attn_ops: list[_AttentionOp] = []
+        biased_linears: list[Node] = []
         heads_used = 0
 
         # The dead-node cancels in this layer (zeroing a dying node's columns
@@ -635,7 +643,7 @@ class LayerScheduler:
         cancel_cols_set: set[int] = set()
         cancel_heads = 0
 
-        def try_add_cancel(new_cols):
+        def try_add_cancel(new_cols: list[int]) -> tuple[list[int], int] | None:
             """Try to add ``new_cols`` to the pending cancel batch.
 
             Returns ``(additions, delta_heads)`` if the merged cancel fits
@@ -654,7 +662,7 @@ class LayerScheduler:
                 return None
             return additions, delta
 
-        def commit_cancel(additions, delta) -> None:
+        def commit_cancel(additions: list[int], delta: int) -> None:
             nonlocal heads_used, cancel_heads
             if additions:
                 cancel_cols.extend(additions)
@@ -723,7 +731,7 @@ class LayerScheduler:
         # Build compute candidates: Attn nodes, standalone Linears, deferred Adds.
         # When the routing hook says MLP for a Linear, it's skipped here and
         # scheduled via bypass in _schedule_mlp_sublayer.
-        compute_candidates = []
+        compute_candidates: list[tuple[_ComputeOpType, Node, int]] = []
         bypass_linears: list[Node] = []
         for node in sorted(ready, key=lambda n: n.node_id):
             if isinstance(node, Attn):
@@ -896,9 +904,13 @@ class LayerScheduler:
             cancel_candidates = []
 
         # 2b-2d. Schedule compute ops with cancellation promotion
-        def _try_place(op_type, node, n_heads_needed) -> bool:
-            """Place one compute candidate; return True if placed, False if
-            deferred (over budget, inadmissible, or no columns available).
+        def _try_place(
+            op_type: _ComputeOpType, node: Node, n_heads_needed: int
+        ) -> bool:
+            """Place one compute candidate.
+
+            Returns True if placed, False if deferred (over budget,
+            inadmissible, or no columns available).
             """
             nonlocal heads_used
             if heads_used + n_heads_needed > self.n_heads:
@@ -1040,6 +1052,7 @@ class LayerScheduler:
                 return False
 
             if op_type == "compute_add":
+                assert isinstance(node, Add)
                 self._check_add_placement(node, None)
             op = _AttentionOp(op_type, node, target_cols)
             for attr, cols in sources.items():
@@ -1115,16 +1128,16 @@ class LayerScheduler:
 
     def _schedule_mlp_sublayer(
         self,
-        ready,
-        bypass_linears,
-        biased_linears,
-        residual_map,
-        computed_nodes,
-        mlp_cancel_candidates=None,
-        computed_before_layer=None,
-        mlp_adds=None,
-    ):
-        mlp_ops = []
+        ready: set[Node],
+        bypass_linears: list[Node],
+        biased_linears: list[Node],
+        residual_map: ResidualStreamMap,
+        computed_nodes: set[Node],
+        mlp_cancel_candidates: list[Node] | None = None,
+        computed_before_layer: set[Node] | None = None,
+        mlp_adds: Sequence[Add] | None = None,
+    ) -> list["_MlpOp"]:
+        mlp_ops: list[_MlpOp] = []
         # Slot 0 is the constant lane under bias=False — see LayerScheduler
         # __init__ and weight_writer.BiasFold.
         next_slot = first_hidden_slot(self.bias)
@@ -1164,7 +1177,7 @@ class LayerScheduler:
             computed_before_layer if computed_before_layer is not None else set()
         )
 
-        def _surface_mlp_freshly_dead(placed_node) -> None:
+        def _surface_mlp_freshly_dead(placed_node: Node) -> None:
             # After placing an MLP compute op, its operands may be freshly dead.
             # Offer the MLP-eligible ones to the cancel_bypass batch (their
             # values were captured on the op above, so freeing them is safe).
@@ -1628,10 +1641,11 @@ class LayerScheduler:
         return False
 
     def _ready_except_literals(self, node: Node, computed_nodes: set[Node]) -> bool:
-        """True if every non-``LiteralValue`` effective input of ``node`` (and
-        every scheduling predecessor) is in ``computed_nodes``.
+        """True if every non-``LiteralValue`` effective input of ``node`` is computed.
 
-        Concatenate inputs are walked transparently to their leaves.  A node
+        "Every effective input" includes every scheduling predecessor,
+        and all must be in ``computed_nodes``.  Concatenate inputs are
+        walked transparently to their leaves.  A node
         whose only inputs are constants is trivially ready-except-literals, so
         a pure-constant computation materializes immediately.
         """
@@ -1654,8 +1668,9 @@ class LayerScheduler:
         return self._get_effective_consumers(node).issubset(computed_nodes)
 
     def _is_keep_forever(self, node: Node) -> bool:
-        """The node's residual columns must never be reclaimed within the
-        schedule: the output node (no effective consumers) and every
+        """True if the node's residual columns must never be reclaimed.
+
+        Covers the output node (no effective consumers) and every
         output-cone leaf feeding a terminal ``Concatenate`` (kept, not
         resolved, by ``_get_effective_consumers``).  Such a node reads as
         vacuously "dead" the moment it is computed, but freeing it would drop
@@ -1670,7 +1685,7 @@ class LayerScheduler:
         cons = self._get_effective_consumers(node)
         return (not cons) or any(isinstance(c, Concatenate) for c in cons)
 
-    def _attn_cancel_eligible(self, node: Node) -> bool:
+    def _attn_cancel_eligible(self, _node: Node) -> bool:
         """May this dead node be zeroed by a batched attention cancel head?
 
         The eager heuristic tries the attention batch for every dead node (the
@@ -1709,12 +1724,13 @@ class LayerScheduler:
         )
 
     def _mlp_cancel_defers_live_addends(self) -> bool:
-        """Should a node used as an ``add_into`` live addend THIS layer be left
-        for a later layer's MLP-cancel rather than freed now?
+        """Whether an ``add_into`` live addend used THIS layer should be deferred.
 
-        The eager heuristic defers it (True): the value was just copied into a
-        dead addend's columns, and keeping the live addend resident one more
-        layer is the historical, conservative behaviour a bug reproducer pins
+        "Deferred" means left for a later layer's MLP-cancel rather than
+        freed now.  The eager heuristic defers it (True): the value was
+        just copied into a dead addend's columns, and keeping the live
+        addend resident one more layer is the historical, conservative
+        behaviour a bug reproducer pins
         (the calculator ``switch()`` shared-addend case).  The captured
         cancel-layer hint reflects the deferral, so the model stays consistent.
         ``DirectedLayerScheduler`` overrides this to False: it must honour the
@@ -1728,13 +1744,13 @@ class LayerScheduler:
 
     def _assigned_attention_releases(
         self,
-        batch_nodes: list[Node],
-        residual_map: ResidualStreamMap,
-        computed_nodes: set[Node],
+        _batch_nodes: list[Node],
+        _residual_map: ResidualStreamMap,
+        _computed_nodes: set[Node],
     ) -> list[Node] | None:
-        """The complete release set of this layer's atomic attention batch,
-        or ``None`` to keep the greedy heuristic behavior.
+        """The complete release set of this layer's atomic attention batch.
 
+        Returns ``None`` to keep the greedy heuristic behavior.
         ``batch_nodes`` are the attention compute candidates being placed
         this layer.  A non-``None`` return makes the batch the single
         definition of the attention transition: the shared sublayer walk
@@ -1763,10 +1779,11 @@ class LayerScheduler:
     def _dying_input_to_reuse(
         self, node: Node, residual_map: ResidualStreamMap, computed_nodes: set[Node]
     ) -> Node | None:
-        """An input leaf of ``node`` that placing ``node`` makes dead, whose
-        columns may be cancelled+freed to allocate ``node``'s own output.
+        """An input leaf of ``node`` that placing ``node`` makes dead.
 
-        The eager heuristic does not perform ordinary self-consumer reuse; the
+        Its columns may be cancelled+freed to allocate ``node``'s own
+        output.  The eager heuristic does not perform ordinary self-consumer
+        reuse; the
         one case it supports is the registered tied-input -> output handoff
         (``optimize=0`` replay of the held bank).  The directed replay never
         reaches this: all its assigned same-layer releases — held source
@@ -1825,18 +1842,17 @@ class LayerScheduler:
                 continue
             if not residual_map.is_allocated(cur):
                 continue
-            if self.graph.is_input_node(cur):
-                # Graph source nodes (InputNode, Embedding, LiteralValue,
-                # RopeConfig) must stay in the residual stream so
-                # callers can read their values via the compiled model's
-                # snapshot-based lookup.  Existing dead-node cancellation
-                # also leaves them alone until a later layer, so eager-
-                # freeing must respect the same invariant.
-                if (
-                    self.held_output_layout is None
-                    or cur is not self.held_output_layout.source
-                ):
-                    continue
+            # Graph source nodes (InputNode, Embedding, LiteralValue,
+            # RopeConfig) must stay in the residual stream so
+            # callers can read their values via the compiled model's
+            # snapshot-based lookup.  Existing dead-node cancellation
+            # also leaves them alone until a later layer, so eager-
+            # freeing must respect the same invariant.
+            if self.graph.is_input_node(cur) and (
+                self.held_output_layout is None
+                or cur is not self.held_output_layout.source
+            ):
+                continue
             if self._get_effective_consumers(cur).issubset(computed_nodes):
                 result.append(cur)
         return result
@@ -1922,9 +1938,11 @@ class LayerScheduler:
         )
 
     def _check_add_placement(self, add_node: Add, reuse_index: int | None) -> None:
-        """Hook: verify the walk's fresh/reused decision for one Add just
-        before its operation is emitted.  ``reuse_index`` is the selected
-        target occurrence (0 or 1) for a reuse, ``None`` for fresh.
+        """Hook: verify the walk's fresh/reused decision for one Add.
+
+        Runs just before its operation is emitted.  ``reuse_index`` is
+        the selected target occurrence (0 or 1) for a reuse, ``None``
+        for fresh.
 
         Base heuristic: no-op — the physical walk IS the decision, and
         assignment completion (``ScheduleAssignment.from_heuristic_trace``)
@@ -1969,7 +1987,7 @@ class LayerScheduler:
             return None
         return source
 
-    def _critical_path_key(self, node: Node):
+    def _critical_path_key(self, node: Node) -> tuple[int, int]:
         # node_id tie-break: critical-path ties are common, and a stable
         # sort without a total key inherits whatever order the candidate
         # list was built in — for node sets that is hash-table order
@@ -2054,7 +2072,7 @@ class LayerScheduler:
                 in_flight.discard(t_chain_id)
 
     def _filter_admissible(
-        self, candidates: list, node_getter=lambda t: t[1]
+        self, candidates: list, node_getter: Callable[[Any], Node] = lambda t: t[1]
     ) -> tuple[list, list]:
         """Partition candidates into (admissible, deferred).
 
@@ -2077,10 +2095,10 @@ class LayerScheduler:
     def _capture_attn_sources(
         self, op_type: str, node: Node, residual_map: ResidualStreamMap
     ) -> dict[str, list[int]]:
-        """Capture an attention compute op's source columns while every input
-        is still allocated.
+        """Capture an attention compute op's source columns.
 
-        Runs the I4 schedule-time liveness check (``_require_live``) at the
+        Captured while every input is still allocated.  Runs the I4
+        schedule-time liveness check (``_require_live``) at the
         capture site and returns exactly the attributes later copied onto the
         emitted ``_AttentionOp`` (the weight-writer reads sources from the op,
         never from the residual map at write time).  The heuristic calls this
@@ -2122,10 +2140,10 @@ class LayerScheduler:
         residual_map: ResidualStreamMap,
         op_label: str,
     ) -> None:
-        """Invariant A (schedule-time): ``node`` must be retrievable from
-        ``residual_map`` when its value is read as a source.
+        """Invariant A (schedule-time).
 
-        Walks through Concatenate to check every leaf.  Raises
+        ``node`` must be retrievable from ``residual_map`` when its value
+        is read as a source.  Walks through Concatenate to check every leaf.  Raises
         :class:`AssertionError` with op context if any required leaf is
         not currently allocated — surfaces a liveness bug *before* the
         KeyError from get_indices, so the message names the node, the
@@ -2184,7 +2202,7 @@ class DirectedLayerScheduler(LayerScheduler):
     What it preserves (by inheriting the parent's per-layer code path):
     cancel coalescing into a single batched ``_AttentionOp("cancel")``,
     source-column capture via ``_require_live``, and the four allocator
-    invariants I1–I4 (which run inside ``ResidualStreamMap`` and the
+    invariants I1-I4 (which run inside ``ResidualStreamMap`` and the
     weight-writer that this subclass doesn't touch).
 
     The caller must invoke :meth:`set_current_layer` with the layer
@@ -2197,7 +2215,7 @@ class DirectedLayerScheduler(LayerScheduler):
         graph: GraphAnalyzer,
         d: int,
         d_head: int,
-        pos_encoding,
+        pos_encoding: Node | None,
         assignment: ScheduleAssignment,
         d_hidden: int | None = None,
         clusters: SiblingClusters | None = None,
@@ -2360,8 +2378,10 @@ class DirectedLayerScheduler(LayerScheduler):
         return True
 
     def _expected_add_placement(self, add_node: Add) -> AddPlacement:
-        """The assignment-level derivation of this Add's placement — the
-        expectation the physical residual-map state must reproduce.
+        """The assignment-level derivation of this Add's placement.
+
+        This is the expectation the physical residual-map state must
+        reproduce.
         """
         layout = self.held_output_layout
         return derive_add_placement(
@@ -2407,7 +2427,7 @@ class DirectedLayerScheduler(LayerScheduler):
             f"{a1!r}: {_describe(a1)}."
         )
 
-    def _literal_needed_now(self, node: Node, computed_nodes: set[Node]) -> bool:
+    def _literal_needed_now(self, _node: Node, _computed_nodes: set[Node]) -> bool:
         # Assignment-driven: the CP-SAT layer assignment already places each
         # constant just-in-time, and ``_get_ready_nodes`` only releases it at
         # its assigned layer.  No consumer-readiness gate here.

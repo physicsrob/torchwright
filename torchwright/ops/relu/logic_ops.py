@@ -14,7 +14,7 @@ _GATE_OFFSET_SAFETY_FACTOR = 2.0
 """Headroom over the declared ``max|value|`` so that activation noise
 from the compiled transformer's ReLU approximations doesn't leak
 through the gate's off-path. The old global ``big_offset = 1000`` gave
-~100× headroom over typical values; a 2× factor keeps the precision
+~100x headroom over typical values; a 2x factor keeps the precision
 win (M ≈ 2·max_abs rather than 1000) while tolerating modest drift."""
 
 
@@ -34,24 +34,26 @@ def _max_abs_or_raise(vt: NodeValueType, caller: str) -> float:
         raise TypeError(
             f"{caller} requires a bounded value_range on its gated input; "
             f"got {vt}. Wrap the upstream node with "
-            f"`assert_matches_value_type(node, NodeValueType(value_range=Range(lo, hi)))`."
+            "`assert_matches_value_type(node, "
+            "NodeValueType(value_range=Range(lo, hi)))`."
         )
     M = _GATE_OFFSET_SAFETY_FACTOR * m
     assert M <= _MAX_REASONABLE_OFFSET, (
-        f"{caller}: M offset {M:.2e} exceeds sanity bound {_MAX_REASONABLE_OFFSET:.0e}. "
+        f"{caller}: M offset {M:.2e} exceeds sanity bound "
+        f"{_MAX_REASONABLE_OFFSET:.0e}. "
         f"Input value_range={r} is likely a stale or un-clamped range — "
         f"check that upstream value_type propagation returns bounded ranges."
     )
     return M
 
 
-def per_column_offsets(intervals, scalar_M: float) -> "torch.Tensor":
+def per_column_offsets(intervals: list[Range], scalar_M: float) -> "torch.Tensor":
     """Per-output-column gate offsets ``M_j = safety * max|range_j|``.
 
     The additive-cancellation gate ``(M + v) - M`` rounds ``v`` to
     ``ULP(M)``; a single scalar ``M`` is forced to the *widest* column, so
     a narrow column bundled with a wide sibling (e.g. the lifted-id key
-    ``[child, -child^2, 1]``, where ``child`` needs ~``2q``× finer precision
+    ``[child, -child^2, 1]``, where ``child`` needs ~``2q``x finer precision
     than ``-child^2``) is rounded far more coarsely than it needs to be.
     Sizing ``M`` per column from the per-column affine interval keeps each
     column's rounding at its own scale -- the Plan-K Step-1 edge-key fix.
@@ -72,14 +74,15 @@ def per_column_offsets(intervals, scalar_M: float) -> "torch.Tensor":
     return out
 
 
-def _intersect_intervals(node: "Node"):
-    """Per-component intervals of ``node`` intersected with its scalar
-    value_type, or ``None`` if a per-column affine bound is unavailable /
+def _intersect_intervals(node: "Node") -> list[Range] | None:
+    """Per-component intervals of ``node`` intersected with its scalar value_type.
+
+    Returns ``None`` if a per-column affine bound is unavailable /
     width-mismatched (caller falls back to the scalar offset).
     """
     try:
         intervals = node.affine_bound.to_interval()
-    except Exception:
+    except (AssertionError, ValueError):
         return None
     if intervals is None or len(intervals) != len(node):
         return None
@@ -142,13 +145,14 @@ def bool_all_true(inp_list: list[Node]) -> Node:
 
 
 def bool_not(inp: Node) -> Node:
-    """Returns a node that evaluates to 1.0 if the input node is false, and -1.0 if the input node is true.
+    """Returns a node that evaluates to 1.0 if false and -1.0 if true.
 
     Args:
         inp: Input node to be evaluated
 
     Returns:
-        Node: Output node that is 1.0 if the input node is false, and -1.0 if the input node is true.
+        Node: Output node that is 1.0 if the input node is false, and
+        -1.0 if the input node is true.
 
     .. noise-footer::
 
@@ -173,11 +177,11 @@ def equals_vector(inp: Node, vector: torch.Tensor) -> Node:
        Max error: 0 abs, 0 rel over 4096 samples;
        measured at commit a39e4c6. See docs/numerical_noise.md.
     """
-    # If value1 == c, result is 1
-    # else result is -1
-    # We'll use an MLP:
-    # y = 2.0*speed * max(1.0/speed + c @ value - c @ c, 0) - 1.0
-    # d_hidden = 1
+    # Result is 1 if the input equals the target vector, else -1. A single
+    # hidden neuron computes this: the ReLU term peaks at 1/speed exactly
+    # when the dot product ``value @ vector`` equals ``vector @ vector``
+    # (i.e. equality), and the output scaling maps that peak to +1 and
+    # everything else to -1.
     speed = embedding_step_sharpness
     input_proj = vector.unsqueeze(0)  # We're dotting vector into value
     input_bias = 1.0 / speed - vector @ vector
@@ -204,11 +208,13 @@ def _cond_gate_output_type(cond: Node, inp: Node) -> NodeValueType:
 
 
 def cond_gate(cond: Node, inp: Node) -> Node:
-    """Gates the value of a node based on a condition. If the condition is true,
-    outputs the value. If false, outputs a zero tensor of the same shape as value.
+    """Gates the value of a node based on a condition.
+
+    If the condition is true, outputs the value. If false, outputs a zero
+    tensor of the same shape as value.
 
     Uses a single L→ReLU→L sublayer with an additive cancellation trick: the
-    on-path computes ``(M + v) − M`` where ``M`` is derived from
+    on-path computes ``(M + v) - M`` where ``M`` is derived from
     ``inp.value_type``. This loses precision for ``|v| ≪ ULP(M)`` and amplifies
     approximate-cond error as ``M·ε``. An Assert checks ``||cond| - 1|`` stays
     within ``_COND_GATE_C_TOL`` and the output's semantic bound is widened by

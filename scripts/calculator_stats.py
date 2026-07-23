@@ -17,8 +17,8 @@ Run locally (CPU is fine, no GPU needed)::
 """
 
 import json
-import os
 import tempfile
+from pathlib import Path
 from typing import cast
 
 import torch
@@ -32,7 +32,7 @@ from examples.calculator_simple import (
     subtract_digit_seqs,
 )
 from torchwright.compiler.export import compile_headless, compile_to_onnx
-from torchwright.graph import Concatenate
+from torchwright.graph import Concatenate, Node
 from torchwright.ops.inout_nodes import create_input, create_onehot_embedding
 from torchwright.ops.relu.onehot_table import onehot_lookup
 
@@ -51,10 +51,10 @@ def _peak_residual_occupancy(sidecar: dict) -> int:
 
 
 def whole_calculator_stats() -> None:
-    print("== whole calculator (max_digits=%d) ==" % MAX_DIGITS)
+    print(f"== whole calculator (max_digits={MAX_DIGITS}) ==")
     output_node, embedding = calc.create_network_parts(max_digits=MAX_DIGITS)
     with tempfile.TemporaryDirectory() as tmp:
-        path = os.path.join(tmp, "calculator.onnx")
+        path = str(Path(tmp) / "calculator.onnx")
         artifact = compile_to_onnx(
             output_node,
             embedding,
@@ -63,7 +63,8 @@ def whole_calculator_stats() -> None:
             d_head=D_HEAD,
             verbose=False,
         )
-        sidecar = json.load(open(cast("str", artifact.debug_path)))
+        with Path(cast("str", artifact.debug_path)).open() as f:
+            sidecar = json.load(f)
 
     peak = _peak_residual_occupancy(sidecar)
     print(f"  layers              : {artifact.n_layers}")
@@ -83,7 +84,7 @@ def per_operation_layers() -> None:
     embedding = create_onehot_embedding(calc.CALC_VOCAB)
     d_embed = embedding.d_embed
 
-    def operand(prefix: str, n: int):
+    def operand(prefix: str, n: int) -> list[Node]:
         return [
             create_input(f"{prefix}{i}", d_embed, value_range=(0.0, 1.0))
             for i in range(n)
@@ -127,18 +128,17 @@ def addition_table_figure() -> None:
 
     # Evaluate all 100 (x, y) pairs at carry-in 0 in one batched forward.
     no_carry = _state(_NO, _CARRY_W)
-    rows = []
-    for x in range(10):
-        for y in range(10):
-            rows.append(
-                torch.cat(
-                    [
-                        embedding.get_embedding(str(x)),
-                        embedding.get_embedding(str(y)),
-                        no_carry,
-                    ]
-                )
-            )
+    rows = [
+        torch.cat(
+            [
+                embedding.get_embedding(str(x)),
+                embedding.get_embedding(str(y)),
+                no_carry,
+            ]
+        )
+        for x in range(10)
+        for y in range(10)
+    ]
     out = lookup.compute(n_pos=100, input_values={"key": torch.stack(rows)})
     decoded = [embedding.tokenizer.vocab[int(v.argmax())] for v in out]
 
@@ -150,8 +150,9 @@ def addition_table_figure() -> None:
 
 
 def times_table_figure() -> None:
-    """The compiled digit-products lookup, reconstructed as the 10x10 times
-    table — multiply now sums these products per column and carries once.
+    """The compiled digit-products lookup, reconstructed as the 10x10 times table.
+
+    Multiply now sums these products per column and carries once.
     """
     print("\n== compiled times-table lookup (digit x digit) ==")
     embedding = create_onehot_embedding(calc.CALC_VOCAB)
@@ -178,10 +179,11 @@ def times_table_figure() -> None:
 
     print("      " + "  ".join(str(y) for y in range(10)))
     for x in range(10):
-        cells = "  ".join(
-            f"{round(out[x * 10 + y, 0].item()) * 10 + round(out[x * 10 + y, 1].item()):2d}"
+        cell_values = (
+            round(out[x * 10 + y, 0].item()) * 10 + round(out[x * 10 + y, 1].item())
             for y in range(10)
         )
+        cells = "  ".join(f"{v:2d}" for v in cell_values)
         print(f"  {x}: {cells}")
     print("  (each cell = 10*tens + ones, the compiled (tens, ones) product pair)")
 

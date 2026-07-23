@@ -66,7 +66,9 @@ def _op_types(plan):
 
 
 def test_flex_solve_replays_and_matches_oracle():
-    """optimize=1 with default flex routing: whatever routes the solver
+    """Replay any solver-chosen route through the directed scheduler and match oracle.
+
+    optimize=1 with default flex routing: whatever routes the solver
     picks, the assignment replays through the directed scheduler and the
     compiled values match the recursive oracle.
     """
@@ -83,8 +85,10 @@ def test_flex_solve_replays_and_matches_oracle():
 
 
 def test_legacy_policy_with_flex_off_pins_cpsat_adds_to_attention():
-    """The documented legacy configuration: policy=LEGACY_POLICY plus
-    cpsat_flex_routing=False keeps every Add on the attention writers.
+    """Keep every Add on the attention writers under the documented legacy config.
+
+    policy=LEGACY_POLICY plus cpsat_flex_routing=False keeps every Add on
+    the attention writers.
     """
     out, *_ = _mixed_add_graph()
     _net, plan = _capture_plan(
@@ -130,7 +134,9 @@ def _head_starved_graph():
 
 
 def test_low_head_geometry_feasible_via_mlp_adds():
-    """The headline win: attention-only Add routing cannot fit n_heads=1,
+    """Make the CP-SAT compile feasible via MLP Add routing where attention-only fails.
+
+    The headline win: attention-only Add routing cannot fit n_heads=1,
     and MLP Add routing makes the CP-SAT compile feasible (require_solver
     turns the silent heuristic fallback into a raise) and exact.
     """
@@ -157,11 +163,13 @@ def test_low_head_geometry_feasible_via_mlp_adds():
 
 
 def test_low_head_geometry_feasible_via_mlp_adds_heuristic_path():
-    """Same geometry at optimize=0: an MLP-preferring Add policy routes the
-    Add to MLP and the heuristic + directed replay compile it.  (The
+    """Route the Add to MLP and compile it via the heuristic + directed replay.
+
+    Same geometry at optimize=0: an MLP-preferring Add policy routes the
+    Add to MLP and the heuristic + directed replay compile it. (The
     shipping default keeps Adds on attention statically — at optimize=0
     this geometry needs the explicit knob; at optimize>0 the solver's flex
-    routing rescues it regardless, per the test above.).
+    routing rescues it regardless, per the test above.)
     """
     out = _head_starved_graph()
     compiled = compile_headless(
@@ -179,7 +187,9 @@ def test_low_head_geometry_feasible_via_mlp_adds_heuristic_path():
 
 
 def test_reused_input_target_gets_virtual_handoff_in_assignment():
-    """A CP-SAT solve that reuses a graph-input target records the canonical
+    """Record the canonical virtual cancel `layer[A] + 1` for a reused input target.
+
+    A CP-SAT solve that reuses a graph-input target records the canonical
     virtual cancel `layer[A] + 1` for it, with no mechanism entry.
     """
     out, _x, _add_reuse, _add_fresh = _mixed_add_graph()
@@ -203,7 +213,9 @@ def test_reused_input_target_gets_virtual_handoff_in_assignment():
 
 
 def test_extraction_tripwire_fires_on_corrupted_literal():
-    """A deliberately inconsistent model — the extraction reads a literal
+    """Trip the named invariant before a ScheduleAssignment is returned.
+
+    A deliberately inconsistent model — the extraction reads a literal
     that no constraint ties to the layer assignment — must trip the named
     invariant before a ScheduleAssignment is returned.
     """
@@ -226,7 +238,9 @@ def test_extraction_tripwire_fires_on_corrupted_literal():
 
 
 def test_a2_trips_on_mlp_add_source_with_same_layer_attention_cancel():
-    """A corrupted assignment that gives an MLP-routed Add's source a
+    """Raise contract check A2 at replay rather than mis-execute a corrupted assignment.
+
+    A corrupted assignment that gives an MLP-routed Add's source a
     same-layer attention cancel must raise contract check A2 at replay
     rather than mis-execute (the batch would release a value whose
     uncomputed consumer is outside the attention batch).

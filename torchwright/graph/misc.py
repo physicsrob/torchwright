@@ -66,8 +66,8 @@ class Check:
 class InputNode(Node):
     def __init__(
         self,
-        d_output_or_name,
-        d_output_or_nothing=None,
+        d_output_or_name: int | str,
+        d_output_or_nothing: int | str | None = None,
         name: str = "",
         *,
         value_range: tuple[float, float],
@@ -80,6 +80,11 @@ class InputNode(Node):
             # Legacy pattern: InputNode(name, d_output)
             if d_output_or_nothing is None:
                 raise ValueError("d_output is required when name is the first argument")
+            if not isinstance(d_output_or_nothing, int):
+                raise TypeError(
+                    "d_output must be an int in the legacy InputNode(name, "
+                    f"d_output) pattern; got {type(d_output_or_nothing).__name__}"
+                )
             d_output = d_output_or_nothing
             name = d_output_or_name
         else:
@@ -152,7 +157,7 @@ class Add(Node):
     def compute_value_type(self) -> NodeValueType:
         return NodeValueType()
 
-    def other_input(self, node: Node):
+    def other_input(self, node: Node) -> Node:
         if self.inputs[0] == node:
             return self.inputs[1]
         if self.inputs[1] == node:
@@ -181,7 +186,7 @@ class LiteralValue(Node):
         hi = float(v.max().item())
         return NodeValueType(value_range=Range(lo, hi))
 
-    def is_zero(self):
+    def is_zero(self) -> torch.Tensor:
         return self.value.eq(0).all()
 
     def node_type(self) -> str:

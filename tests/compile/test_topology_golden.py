@@ -80,7 +80,7 @@ def _build_asserted_graph():
     m1 = Linear(b, torch.tensor([[3.0]]), name="m1")
     m2 = Linear(m1, torch.tensor([[1.0]]), name="m2")
 
-    watched = debug_watch(l2, lambda x: (True, ""), "golden watch")
+    watched = debug_watch(l2, lambda _x: (True, ""), "golden watch")
     return Concatenate([watched, ordered_b, m2, Add(l2, m2)])
 
 

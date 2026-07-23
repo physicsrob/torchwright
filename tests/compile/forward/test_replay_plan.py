@@ -62,9 +62,10 @@ def test_planned_operations_reject_tensor_indices():
 
 
 def test_reuse_records_require_the_occurrence_index():
-    """Every reuse record (add_into, add_into_bypass) carries exactly one
-    valid target-occurrence index; every fresh or unrelated record rejects
-    one (docs/plan_additional_mlp_routing.md).
+    """Every reuse record carries exactly one valid target-occurrence index.
+
+    This applies to add_into and add_into_bypass; every fresh or unrelated
+    record rejects one (docs/plan_additional_mlp_routing.md).
     """
     from torchwright.graph import Add
 
@@ -139,8 +140,9 @@ def test_reuse_records_require_the_occurrence_index():
 
 
 def test_compute_add_bypass_source_field_rules():
-    """compute_add_bypass requires both source lists; every other MLP record
-    rejects source_cols_b.
+    """compute_add_bypass requires both source lists.
+
+    Every other MLP record rejects source_cols_b.
     """
     from torchwright.graph import Add
 

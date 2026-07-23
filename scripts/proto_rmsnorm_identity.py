@@ -1,11 +1,12 @@
-"""Prototype: insert a real RMSNorm into a *compiled* torchwright transformer,
-pinning the residual RMS with the committed power-of-two-RMS constant column(s)
-RESERVED INSIDE the existing power-of-two width, and confirm the output is
+"""Insert a real RMSNorm into a compiled torchwright transformer.
+
+Pins the residual RMS with the committed power-of-two-RMS constant column(s)
+RESERVED INSIDE the existing power-of-two width, and confirms the output is
 bit-identical to the no-norm baseline — i.e. the norm is the identity even
 through the scheduler's cancel heads (the DOOM-critical interaction).
 
 This is the compiler-integration counterpart to proto_rmsnorm_float_roundtrip.py
-(which validates the bit-exact math on genuine floats).  Here the point is the
+(which validates the bit-exact math on genuine floats). Here the point is the
 *structure*: a real compiled graph, real cancel heads, the reserve-inside layout
 at both an even width (d=1024 -> ONE constant column) and DOOM's odd width
 (d=8192 -> TWO equal columns).
@@ -14,10 +15,13 @@ Run from repo root with the workspace venv (CPU is fine; compile_headless
 defaults to device="cpu").
 """
 
+from typing import cast
+
 import torch
 
 from examples.calculator_simple import create_network_parts
 from torchwright.compiler.export import compile_headless
+from torchwright.compiler.transformer import HeadlessTransformer
 
 torch.manual_seed(0)
 torch.set_default_dtype(torch.float32)
@@ -28,9 +32,11 @@ EPS = 1e-6
 NZ = 1e-12  # "nonzero" threshold for free-column detection
 
 
-def pow2_layout(d):
-    """Reserve-inside power-of-two-RMS layout: (n_const, m) for width d=2^b.
-    One constant column (= 2^Q) for even b, two equal for odd b; rms = 2^m.
+def pow2_layout(d: int) -> tuple[int, int]:
+    """Compute the reserve-inside power-of-two-RMS layout for width d=2^b.
+
+    Returns (n_const, m): one constant column (= 2^Q) for even b, two equal
+    for odd b; rms = 2^m.
     """
     b = d.bit_length() - 1
     assert 1 << b == d, f"d={d} is not a power of two"
@@ -40,31 +46,45 @@ def pow2_layout(d):
     return n_const, (e_exp - b) // 2
 
 
-def rmsnorm(res, gain, eps):
+def rmsnorm(
+    res: torch.Tensor, gain: float, eps: float
+) -> tuple[torch.Tensor, torch.Tensor]:
     ms = (res * res).mean(dim=-1, keepdim=True)
     rms = torch.sqrt(ms + eps)
     return res / rms * gain, rms
 
 
-def baseline_and_free_cols(net, res0):
-    """Run the no-norm baseline sublayer-by-sublayer and return
-    (final_res, free_col_indices) — columns never written by any sublayer
-    (and zero in the seed), so they can hold a reserved constant untouched.
+def baseline_and_free_cols(
+    net: HeadlessTransformer, res0: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Run the no-norm baseline sublayer-by-sublayer.
+
+    Returns (final_res, free_col_indices) — columns never written by any
+    sublayer (and zero in the seed), so they can hold a reserved constant
+    untouched.
     """
     cur = res0.clone()
     ever_nz = (res0.abs() > NZ).any(dim=0)  # (d,) bool
     for layer in net.layers:
         for sublayer in (layer.attn, layer.mlp):
-            cur = sublayer.forward(cur)
+            cur = cast("torch.Tensor", sublayer.forward(cur))
             ever_nz |= (cur.abs() > NZ).any(dim=0)
     free = (~ever_nz).nonzero(as_tuple=True)[0]
     return cur, free
 
 
-def normed_forward(net, res0, free_cols, n_const, gain, eps):
-    """Pre-norm forward with the pinned constant in the last n_const free
-    columns. With a bit-exact (pow2) norm, norm(res) == res, so this must
-    track the baseline exactly. Returns (final_res, rms_spread).
+def normed_forward(
+    net: HeadlessTransformer,
+    res0: torch.Tensor,
+    free_cols: torch.Tensor,
+    n_const: int,
+    gain: float,
+    eps: float,
+) -> tuple[torch.Tensor, float]:
+    """Run the pre-norm forward with the pinned constant in the last n_const columns.
+
+    With a bit-exact (pow2) norm, norm(res) == res, so this must track the
+    baseline exactly. Returns (final_res, rms_spread).
     """
     const_cols = free_cols[-n_const:]
     res = res0.clone()
@@ -76,12 +96,13 @@ def normed_forward(net, res0, free_cols, n_const, gain, eps):
         for sublayer in (layer.attn, layer.mlp):
             normed, rms = rmsnorm(cur, gain, eps)
             rms_seen.append(rms.flatten())
-            cur = cur + (sublayer.forward(normed) - normed)  # skip un-normed res
+            sub_out = cast("torch.Tensor", sublayer.forward(normed))
+            cur = cur + (sub_out - normed)  # skip un-normed res
     rms_all = torch.stack(rms_seen)
     return cur, (rms_all.max() - rms_all.min()).item()
 
 
-def run_case(d, max_digits, prompt) -> None:
+def run_case(d: int, max_digits: int, prompt: list[str]) -> None:
     n_const, m = pow2_layout(d)
     gain = 2.0**m
     output_node, embedding = create_network_parts(max_digits=max_digits)

@@ -11,8 +11,8 @@ this fails.
 """
 
 import json
-import os
 import tempfile
+from pathlib import Path
 
 import torch
 
@@ -136,7 +136,8 @@ def test_matrices_table_shapes_and_axes():
             rec = matrices[mid]
             assert rec["layer"] == i
             assert rec["shape"] == shape, mid
-            assert rec["axis0"] == a0 and rec["axis1"] == a1, mid
+            assert rec["axis0"] == a0, mid
+            assert rec["axis1"] == a1, mid
 
 
 def test_matrices_table_uses_explicit_attention_width():
@@ -184,7 +185,7 @@ def test_onnx_sidecar_uses_explicit_attention_width(tmp_path):
         verbose=False,
     )
 
-    with open(debug_meta_path_for(str(path))) as f:
+    with Path(debug_meta_path_for(str(path))).open() as f:
         data = json.load(f)
     assert data["d"] == 32
     assert data["d_head"] == 8
@@ -242,7 +243,8 @@ def test_placements_cover_all_nonzero_weights():
         covered = _expand(rects_by_matrix.get(mid, []))
         # All claimed cells are inside the matrix.
         for r, c in covered:
-            assert 0 <= r < rows_n and 0 <= c < cols_n, f"{mid} cell ({r},{c}) OOB"
+            assert 0 <= r < rows_n, f"{mid} cell ({r},{c}) OOB"
+            assert 0 <= c < cols_n, f"{mid} cell ({r},{c}) OOB"
 
         nz = torch.nonzero(weight, as_tuple=False)
         for r, c in nz.tolist():
@@ -301,7 +303,7 @@ def _compile_sidecar(parts, tmpdir, name="model.onnx"):
     to unembed against.
     """
     output_node, embedding = parts
-    onnx_path = os.path.join(tmpdir, name)
+    onnx_path = str(Path(tmpdir) / name)
     compile_to_onnx(
         output_node,
         embedding,
@@ -311,7 +313,7 @@ def _compile_sidecar(parts, tmpdir, name="model.onnx"):
         max_seq_len=32,
         verbose=False,
     )
-    with open(debug_meta_path_for(onnx_path)) as f:
+    with Path(debug_meta_path_for(onnx_path)).open() as f:
         return json.load(f)
 
 
@@ -348,9 +350,9 @@ def test_occupancy_stable_across_cache_hit(monkeypatch):
     with tempfile.TemporaryDirectory() as cache_dir:
         monkeypatch.setenv("TW_SCHEDULE_CACHE_DIR", cache_dir)
         with tempfile.TemporaryDirectory() as tmpdir:
-            # cold: solves + caches
+            # First compile solves and caches the schedule.
             first = _compile_sidecar(_token_parts(), tmpdir, "a.onnx")
-            # warm: cache hit, fresh graph
+            # Second compile is a warm cache hit on a fresh graph.
             second = _compile_sidecar(_token_parts(), tmpdir, "b.onnx")
 
     for key in ("n_heads", "d_hidden", "matrices", "placements"):

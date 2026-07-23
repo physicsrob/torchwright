@@ -22,11 +22,11 @@ and the score to every other key is 0, giving softmax weight
 
 ``w`` is strictly monotone in m (validated in
 ``scripts/rope_global_recency_validate.py``), with minimum adjacent-m gap
-~4.9e-6 (~81× the fp32 weight floor).  A 1024-breakpoint log-uniform PWL
+~4.9e-6 (~81x the fp32 weight floor).  A 1024-breakpoint log-uniform PWL
 inverts w → m with max error ~0.009; combined with the fp32 softmax noise
 (~0.006) the total positional error is ~0.15 (fp32 ReLU accumulation in the PWL sum
 dominates at small positions — see ``tests/ops/test_global_recency.py``) —
-still 3.3× below the 0.5 rounding threshold for integer recovery.
+still 3.3x below the 0.5 rounding threshold for integer recovery.
 
 The cosine attenuation at large m (cos(MAX_LEN·θ_slow) ≈ 0.991 — a ~1%
 variation) is **baked into the PWL fit**: the table is built against the true
@@ -87,9 +87,9 @@ def global_position_from_bos(
     rollouts the fp32 evaluation of the PWL sum develops a deterministic
     wander that grows with position — measured on the swiglu twin at
     ±0.5 / ±9.2 / ±10.4 positions by 3.7k / 21k / 54k (see that module's
-    docstring) — so the "3.3× below the 0.5 rounding threshold" budget
+    docstring) — so the "3.3x below the 0.5 rounding threshold" budget
     holds only near the origin.  Pass ``smoothed=True`` (an exact uniform
-    causal mean of the recovery, ×2) when the position feeds ordering or
+    causal mean of the recovery, x2) when the position feeds ordering or
     position-difference arithmetic at scale; it divides the wander by t at
     the cost of one extra attention sublayer.
 
@@ -120,9 +120,10 @@ def global_position_from_bos(
     product = max_len * theta
     if product >= math.pi / 2:
         raise ValueError(
-            f"global_position_from_bos requires max_positions × theta_slow < π/2 "
+            f"global_position_from_bos requires max_positions x theta_slow < π/2 "
             f"for the BOS weight to be monotone, but got "
-            f"max_positions={max_len} × theta_slow={theta:.3e} = {product:.3f} ≥ {math.pi / 2:.3f}.  "
+            f"max_positions={max_len} x theta_slow={theta:.3e} "
+            f"= {product:.3f} ≥ {math.pi / 2:.3f}.  "
             f"Increase d_head or base, or reduce max_positions."
         )
 
@@ -182,7 +183,7 @@ def global_position_from_bos(
     if not smoothed:
         return raw
 
-    # 2 × exact uniform causal mean of the raw recovery — see the swiglu twin
+    # 2 x exact uniform causal mean of the raw recovery — see the swiglu twin
     # for the full rationale (the compiled PWL machine's fp32 wander grows
     # with position; the mean divides it by t).  The generic convexity claim
     # is skipped (raw's compiled values sit up to ~0.1 outside their claimed

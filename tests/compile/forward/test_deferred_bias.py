@@ -48,10 +48,12 @@ def test_block_with_two_biased_linear_inputs():
     expected = [-1, -1, -1, -1, -1, 1, 1, 1]
     for i in range(H):
         assert abs(graph_out[i].item() - expected[i]) < 0.5, (
-            f"Graph mismatch at slot {i}: got {graph_out[i].item():.1f}, expected {expected[i]}"
+            f"Graph mismatch at slot {i}: got {graph_out[i].item():.1f}, "
+            f"expected {expected[i]}"
         )
         assert abs(compiled_out[i].item() - expected[i]) < 0.5, (
-            f"Compiled mismatch at slot {i}: got {compiled_out[i].item():.1f}, expected {expected[i]}"
+            f"Compiled mismatch at slot {i}: got {compiled_out[i].item():.1f}, "
+            f"expected {expected[i]}"
         )
 
 
@@ -90,7 +92,7 @@ def test_biased_linear_fanout_block_and_add():
     )
 
     # x=0 → y=5
-    # in_range(5, 10, 12) → positions 5-9 in range: 5×(+1) + 7×(-1) = -2
+    # in_range(5, 10, 12) → positions 5-9 in range: 5x(+1) + 7x(-1) = -2
     # output = mask_sum + y = -2 + 5 = 3
     vals = {"x": torch.tensor([[0.0]])}
     graph_out = output.compute(1, vals)[0]

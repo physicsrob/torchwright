@@ -47,6 +47,19 @@ from torchwright.graph.misc import Check, Concatenate, Predicate
 from torchwright.graph.node import Node, _current_annotation
 from torchwright.graph.value_type import NodeValueType, Range, tightened_with
 
+# The midpoint between {0, 1} and ±1 validity encodings: both conventions'
+# "valid" value (1.0 or +1.0) sits above this line and their "invalid"
+# value (0.0 or -1.0) sits below it, so a single threshold reads either.
+_BOOL_VALID_THRESHOLD = 0.5
+
+# A pairwise-distinctness or gap check is vacuous with fewer than two rows
+# to compare — there's no pair to violate the invariant.
+_MIN_ROWS_FOR_A_PAIR = 2
+
+# Row/column-shaped tensors this module checks against are always 2D:
+# (n_pos, d).
+_ROW_TENSOR_NDIM = 2
+
 
 def attach_assert(
     node: Node,
@@ -132,8 +145,7 @@ def _walk(output_node: Node) -> list[Node]:
             continue
         seen.add(node.node_id)
         ordered.append(node)
-        for inp in node.inputs:
-            stack.append(inp)
+        stack.extend(node.inputs)
     return ordered
 
 
@@ -286,7 +298,7 @@ def assert_onehot(node: Node, *, atol: float = 1e-3) -> Node:
     """
 
     def predicate(x: torch.Tensor) -> tuple:
-        if x.ndim != 2:
+        if x.ndim != _ROW_TENSOR_NDIM:
             return False, f"expected 2D (n_pos, d); got shape {tuple(x.shape)}"
         near_zero = x.abs() <= atol
         near_one = (x - 1.0).abs() <= atol
@@ -298,8 +310,11 @@ def assert_onehot(node: Node, *, atol: float = 1e-3) -> Node:
         if rows_ok.all():
             return True, ""
         bad_rows = (~rows_ok).nonzero(as_tuple=False).flatten().tolist()
-        head = bad_rows[:3]
-        more = "" if len(bad_rows) <= 3 else f" (+{len(bad_rows) - 3} more)"
+        max_show = 3
+        head = bad_rows[:max_show]
+        more = (
+            "" if len(bad_rows) <= max_show else f" (+{len(bad_rows) - max_show} more)"
+        )
         summary = ", ".join(f"row {i} sum={row_sums[i].item():.3f}" for i in head)
         return False, f"not one-hot (atol={atol}); {summary}{more}"
 
@@ -353,7 +368,7 @@ def assert_strictly_less(
     *,
     margin: float = 0.0,
 ) -> Node:
-    """Assert every element of ``a`` is strictly less than the matching element of ``b``.
+    """Assert every element of ``a`` is strictly less than ``b``'s matching element.
 
     Both nodes must have the same width.  Returns a checked projection
     of ``b`` (the upper bound) — the natural thing to thread into
@@ -424,10 +439,10 @@ def assert_unique_values(
     """
 
     def predicate(x: torch.Tensor) -> tuple:
-        if x.ndim != 2:
+        if x.ndim != _ROW_TENSOR_NDIM:
             return False, f"expected 2D (n_pos, d); got shape {tuple(x.shape)}"
         _n_pos, d = x.shape
-        if d < 2:
+        if d < _MIN_ROWS_FOR_A_PAIR:
             return True, ""
         # Pairwise absolute differences within each row.
         # x.unsqueeze(-1) - x.unsqueeze(-2) has shape (n_pos, d, d).
@@ -453,7 +468,7 @@ def assert_distinct_across(
     *,
     margin: float = 0.5,
 ) -> Node:
-    """Assert per-position ``value`` is pairwise-distinct across rows where ``where ≈ 1``.
+    """Assert per-position ``value`` is pairwise-distinct across ``where ≈ 1`` rows.
 
     Use this for cross-position uniqueness invariants like "``bsp_rank``
     values at WALL positions are all different" — the precondition that
@@ -487,12 +502,12 @@ def assert_distinct_across(
         val = x[:, :d_value]
         valid = x[:, d_value : d_value + d_where]
         if d_where == 1:
-            mask = valid.squeeze(-1) > 0.5
+            mask = valid.squeeze(-1) > _BOOL_VALID_THRESHOLD
         else:
             # Multi-wide validity collapses to "any slot ≥ 0.5".
-            mask = (valid > 0.5).any(dim=-1)
+            mask = (valid > _BOOL_VALID_THRESHOLD).any(dim=-1)
         rows = val[mask]
-        if rows.shape[0] < 2:
+        if rows.shape[0] < _MIN_ROWS_FOR_A_PAIR:
             return True, ""
         diffs = (rows.unsqueeze(1) - rows.unsqueeze(0)).abs().max(dim=-1).values
         eye = torch.eye(rows.shape[0], dtype=torch.bool, device=rows.device)
@@ -555,9 +570,13 @@ def assert_score_gap_at_least(
     def predicate(x: torch.Tensor) -> tuple:
         val = x[:, :d_value]
         valid = x[:, d_value : d_value + d_where]
-        mask = valid.squeeze(-1) > 0.5 if d_where == 1 else (valid > 0.5).any(dim=-1)
+        mask = (
+            valid.squeeze(-1) > _BOOL_VALID_THRESHOLD
+            if d_where == 1
+            else (valid > _BOOL_VALID_THRESHOLD).any(dim=-1)
+        )
         rows = val[mask]
-        if rows.shape[0] < 2:
+        if rows.shape[0] < _MIN_ROWS_FOR_A_PAIR:
             return True, ""
         flat = rows.squeeze(-1) if d_value == 1 else rows.min(dim=-1).values
         sorted_scores, order = torch.sort(flat)
@@ -635,7 +654,11 @@ def assert_picked_from(
         res = x[:, :d_r]
         vals = x[:, d_r : d_r + d_v]
         keys_t = x[:, d_r + d_v : d_r + d_v + d_k]
-        mask = keys_t.squeeze(-1) > 0.5 if d_k == 1 else (keys_t > 0.5).any(dim=-1)
+        mask = (
+            keys_t.squeeze(-1) > _BOOL_VALID_THRESHOLD
+            if d_k == 1
+            else (keys_t > _BOOL_VALID_THRESHOLD).any(dim=-1)
+        )
         n_pos = res.shape[0]
         valid_idxs = mask.nonzero(as_tuple=False).squeeze(-1)
         if valid_idxs.numel() == 0:
@@ -699,12 +722,13 @@ def assert_softmax_hardness(
     attn_node: Node,
     threshold: float,
 ) -> Node:
-    """Assert the attention's softmax concentrates at least ``threshold``
-    mass on the winning key at every query position.
+    """Assert the attention's softmax concentrates on the winning key.
 
-    Attaches a check whose predicate re-derives the softmax weights
-    from the Attn node's Q/K matrices and input values, then checks
-    ``max(weights, dim=keys) >= threshold`` per query.
+    At least ``threshold`` mass must land on the winning key at every
+    query position.  Attaches a check whose predicate re-derives the
+    softmax weights from the Attn node's Q/K matrices and input
+    values, then checks ``max(weights, dim=keys) >= threshold`` per
+    query.
 
     ``threshold=0.99`` means 99% of the attention mass must land on a
     single key.  This directly catches the blending failure mode where
@@ -772,12 +796,13 @@ def assert_softmax_hardness(
         #       argmin-above-integer attention at a query that precedes
         #       any WALL token).  Without a non-trivial K, Q · K is
         #       dominated by noise and the softmax is forced uniform.
-        query_active = qi.norm(dim=1) > 1e-3
+        residual_noise_floor = 1e-3
+        query_active = qi.norm(dim=1) > residual_noise_floor
         if query_active.any():
             k_norms = K.norm(dim=1)  # shape (n_pos,)
             # Cumulative max over causally-visible keys [0..q] inclusive.
             cumulative_max_k = torch.cummax(k_norms, dim=0).values
-            keys_meaningful = cumulative_max_k > 1e-3
+            keys_meaningful = cumulative_max_k > residual_noise_floor
             query_active = query_active & keys_meaningful
 
         min_hw = max_weights.min().item()

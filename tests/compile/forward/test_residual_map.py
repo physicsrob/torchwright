@@ -54,7 +54,7 @@ def test_full_stream():
     rmap.allocate(b)
     assert rmap.get_free_count() == 0
 
-    with pytest.raises(ValueError):
+    with pytest.raises(ValueError, match="Cannot allocate"):
         rmap.allocate(c)
 
 
@@ -176,8 +176,10 @@ def test_resolve_indices_concatenate():
 
 
 def test_tracking_map_clears_rollback_cancel_on_reallocate():
-    """A node freed by a *rolled-back* speculative allocation, then re-allocated
-    (reborn) at a later layer, must not keep the rollback layer as its cancel.
+    """A node freed by a rolled-back speculative allocation must drop the stale cancel.
+
+    When that node is re-allocated (reborn) at a later layer, it must not
+    keep the rollback layer as its cancel.
 
     Regression for the CP-SAT warm-start hint producing ``cancel < birth``:
     ``LayerScheduler`` speculatively allocates a node, fails its dirty-cancel/
@@ -211,9 +213,10 @@ def test_tracking_map_clears_rollback_cancel_on_reallocate():
 
 
 def test_node_deepcopy_preserves_identity():
-    """`copy.deepcopy` of a container that *references* nodes must keep node
-    identity (nodes are graph singletons keyed on node_id), while still
-    deep-copying the surrounding container.
+    """`copy.deepcopy` of a container that references nodes must keep node identity.
+
+    Nodes are graph singletons keyed on node_id, so identity must survive
+    while the surrounding container is still deep-copied.
 
     Regression for the warm-start: `_run_heuristic_warm_start` does
     `copy.deepcopy(residual_map)` to isolate its scheduler mutations.  Without
@@ -235,8 +238,9 @@ def test_node_deepcopy_preserves_identity():
 
 
 def test_tracking_map_clears_stale_cancel_on_reassign():
-    """A node reborn via ``reassign`` (the free-add path) must not keep a stale
-    cancel from an earlier rolled-back allocation.
+    """A node reborn via ``reassign`` (the free-add path) must not keep a stale cancel.
+
+    That stale cancel would be from an earlier rolled-back allocation.
     """
     from torchwright.compiler.forward.compile import _TrackingResidualStreamMap
 

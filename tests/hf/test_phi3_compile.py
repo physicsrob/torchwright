@@ -70,7 +70,7 @@ def test_stock_streaming_bundle_loads_without_custom_code(tmp_path, monkeypatch)
     monkeypatch.setattr(
         hf_build.tempfile,
         "TemporaryDirectory",
-        lambda *args, **kwargs: pytest.fail("bundle build created a spool"),
+        lambda *_args, **_kwargs: pytest.fail("bundle build created a spool"),
     )
     out, emb, d, d_head = _graph()
     report = compile_hf_bundle(out, emb, tmp_path, d=d, d_head=d_head, max_seq_len=64)
@@ -102,6 +102,7 @@ def test_failed_bundle_compile_preserves_existing_destination(tmp_path):
     sentinel = destination / "existing.txt"
     sentinel.write_text("keep me")
     out, emb, d, d_head = _graph()
+    missing_bos = "<missing-bos>"
 
     with pytest.raises(ValueError, match="bos_token"):
         compile_hf_bundle(
@@ -110,7 +111,7 @@ def test_failed_bundle_compile_preserves_existing_destination(tmp_path):
             destination,
             d=d,
             d_head=d_head,
-            bos_token="<missing-bos>",
+            bos_token=missing_bos,
             write_tokenizer=False,
         )
 
@@ -137,9 +138,11 @@ def test_publish_swap_failure_rolls_back_existing_destination(tmp_path, monkeypa
         return real_replace(source, target)
 
     monkeypatch.setattr(hf_build.os, "replace", fail_staging_publish)
-    with pytest.raises(OSError, match="simulated publish failure"):
-        with hf_build._staged_bundle_directory(destination) as staging:
-            (Path(staging) / "new.txt").write_text("new")
+    with (
+        pytest.raises(OSError, match="simulated publish failure"),
+        hf_build._staged_bundle_directory(destination) as staging,
+    ):
+        (Path(staging) / "new.txt").write_text("new")
 
     assert {path.name for path in destination.iterdir()} == {"existing.txt"}
     assert (destination / "existing.txt").read_text() == "old"
@@ -196,7 +199,7 @@ def test_bundle_rejects_multiple_reachable_embeddings_before_writing(tmp_path):
     first = Embedding(["a"], d_embed=2, table=torch.eye(2), special_tokens=["<unk>"])
     second = Embedding(["a"], d_embed=2, table=torch.eye(2), special_tokens=["<unk>"])
 
-    with pytest.raises(ValueError, match="exactly one Embedding.*found 2"):
+    with pytest.raises(ValueError, match=r"exactly one Embedding.*found 2"):
         compile_hf_bundle(
             Concatenate([first, second]),
             first,
@@ -271,7 +274,8 @@ def test_trivial_graph_accepts_explicit_decoupled_head_count(tmp_path):
 def test_fast_tokenizer_character_round_trip(direct):
     _, emb = direct
     vocab = list(emb.tokenizer.vocab)
-    tok = build_fast_tokenizer(vocab, bos_token="<bos>", eos_token="<eos>")
+    bos, eos = "<bos>", "<eos>"
+    tok = build_fast_tokenizer(vocab, bos_token=bos, eos_token=eos)
     encoded = tok("1+2\n")["input_ids"]
     assert encoded[0] == vocab.index("<bos>")
     assert tok.decode(encoded, skip_special_tokens=True) == "1+2\n"

@@ -49,10 +49,11 @@ def test_exact_on_integers_and_flat_zones():
 
 
 def test_divisor_boundary_sliver_reconstructs_exactly():
-    """Inputs in the HI ramp (just below a multiple of D=64) but out of
-    the LO ramp: the flat form is exact here, and the radix form must be
-    too — a fractional hi would be amplified x64 by the recombine, so
-    this pins the snap + extended-lo compensation.
+    """Inputs in the HI ramp but out of the LO ramp reconstruct exactly.
+
+    Just below a multiple of D=64: the flat form is exact here, and the
+    radix form must be too — a fractional hi would be amplified x64 by
+    the recombine, so this pins the snap + extended-lo compensation.
     """
     _x, f = _native()
     for m in (-512, -64, 64, 512, 896):
@@ -66,9 +67,11 @@ def test_divisor_boundary_sliver_reconstructs_exactly():
 
 
 def test_lo_ramp_stays_within_one_step():
-    """Inside the LO ramp (within 1/s below an integer) the output is
-    fractional — the same tolerated window as flat floor_int.  The pin:
-    it stays inside (true, true+1), never D-amplified.
+    """Inside the LO ramp, the output stays within one step, never D-amplified.
+
+    Within 1/s below an integer the output is fractional — the same
+    tolerated window as flat floor_int.  The pin: it stays inside
+    (true, true+1), never D-amplified.
     """
     _x, f = _native()
     for k in (-512, -100, 0, 64, 1000):
@@ -89,8 +92,9 @@ def test_negative_range_and_default_divisor():
 
 
 def test_falls_back_to_flat_when_range_within_divisor():
-    """N <= divisor takes the flat-floor_int early return (nothing to
-    split); the op must still floor correctly on that branch.
+    """N <= divisor takes the flat-floor_int early return and still floors correctly.
+
+    Nothing to split; the op must still floor correctly on that branch.
     """
     x = create_input("x", 1, value_range=(-2.0, 2.0))
     # n=4 <= d=8 -> fallback branch.
@@ -100,8 +104,10 @@ def test_falls_back_to_flat_when_range_within_divisor():
 
 
 def test_lane_cost_is_sqrtn_class():
-    """The point of the op: ~8.5*sqrt(N) hidden lanes vs 3N flat, and no
-    residual intermediate wider than 2*max(ceil(N/D), D+1).
+    """The point of the op: lane cost is in the sqrt(N) class, not linear in N.
+
+    ~8.5*sqrt(N) hidden lanes vs 3N flat, and no residual intermediate
+    wider than 2*max(ceil(N/D), D+1).
     """
     from torchwright.compiler.utils import get_ancestor_nodes
     from torchwright.graph import FFN
@@ -117,8 +123,9 @@ def test_lane_cost_is_sqrtn_class():
 
 
 def test_compiles_clean():
-    """Compiled swish graph matches the exact-math oracle on a sweep of
-    legal inputs across the native range.
+    """Compiled swish graph matches the exact-math oracle on a sweep of legal inputs.
+
+    The sweep spans the native range.
     """
     x = create_input("x", 1, value_range=(-127.0, 127.0))
     f = radix_floor_int(x, -127, 127, sharpness=1000.0)

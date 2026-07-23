@@ -7,6 +7,7 @@ Otherwise `residual_map.get_indices(leaf)` raises KeyError because
 the columns were freed while deeper subgraphs were still compiling.
 """
 
+import pytest
 import torch
 
 from torchwright.compiler.export import compile_headless
@@ -45,7 +46,3 @@ def test_concatenate_output_mixed_depth():
     assert result.shape == (1, 2)
     assert result[0, 0].item() == pytest.approx(1.0, abs=0.2)  # shallow = a = 1.0
     assert result[0, 1].item() == pytest.approx(1.0, abs=0.2)  # deep = 1/1.0 = 1.0
-
-
-# Allow running with pytest
-import pytest

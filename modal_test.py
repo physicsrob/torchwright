@@ -44,7 +44,7 @@ _MEDIUM_FILE_GROUPS: list[list[str]] = [
         "tests/compile/forward/test_sort_digits.py",
         "tests/ops/test_resampling_primitives.py",
     ],
-    # Calculator family (d=1024–3072, ~90 layers each).
+    # Calculator family (d=1024-3072, ~90 layers each).
     [
         "tests/compile/forward/test_forward_calculator.py",
     ],
@@ -142,8 +142,9 @@ def main(file: str = "tests", args: str = "") -> None:
 
     shards = SHARDS
     print(f"Running {len(shards)} shards in parallel:")
+    label_max_len = 90
     for i, s in enumerate(shards):
-        label = s[:90] + "…" if len(s) > 90 else s
+        label = s[:label_max_len] + "…" if len(s) > label_max_len else s
         print(f"  shard {i}: {label}")
 
     t0 = time.time()

@@ -48,5 +48,5 @@ class Linear(Node):
     def compute_value_type(self) -> NodeValueType:
         return NodeValueType()
 
-    def num_params(self):
+    def num_params(self) -> int:
         return self.d_input * self.d_output + self.d_output

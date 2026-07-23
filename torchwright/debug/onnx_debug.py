@@ -37,15 +37,15 @@ Constraints (stated upfront):
   outputs defeat onnxruntime's memory-reuse planning.  Never put it on
   a hot path.
 * Fetching every residual snapshot costs
-  ``n_pos × d × 2·n_layers`` floats on host per run — fine for
+  ``n_pos x d x 2·n_layers`` floats on host per run — fine for
   debug-sized runs; probe very long prefills in slices.
 """
 
 from __future__ import annotations
 
 import json
-import os
-from typing import TYPE_CHECKING, Any
+from pathlib import Path
+from typing import TYPE_CHECKING, Any, cast
 
 import numpy as np
 import torch
@@ -68,6 +68,11 @@ from torchwright.compiler.residual_assignment import (
 from torchwright.graph.embedding import Embedding
 
 if TYPE_CHECKING:
+    import tempfile
+
+    import onnx
+    import onnxruntime as ort
+
     from torchwright.graph import Node
 
 #: Appended to the self-consistency failure preamble on this backend —
@@ -89,12 +94,12 @@ _ONNX_CONSISTENCY_CAUSES = (
 
 def _sidecar_or_raise(onnx_path: str) -> dict:
     path = debug_meta_path_for(onnx_path)
-    if not os.path.exists(path):
+    if not Path(path).exists():
         raise FileNotFoundError(
             f"Missing debug sidecar {path}. Re-export with "
             f"compile_to_onnx (debug_sidecar=True, the default) to produce it."
         )
-    with open(path) as f:
+    with Path(path).open() as f:
         sidecar = json.load(f)
     fmt = sidecar.get("format")
     if fmt != DEBUG_META_FORMAT:
@@ -122,7 +127,9 @@ _ORT_EMBEDDED_INITIALIZER_LIMIT = 2**31
 _DENSIFY_BLOCK_ELEMS = 64 * 1024 * 1024
 
 
-def _make_session(model, providers, owner):
+def _make_session(
+    model: onnx.ModelProto, providers: list[str] | None, owner: OnnxDebugSession
+) -> ort.InferenceSession:
     """Build the onnxruntime session for the (output-promoted) debug model.
 
     Small models load from in-memory bytes, as before.  When any sparse
@@ -141,7 +148,7 @@ def _make_session(model, providers, owner):
 
     providers = providers or ["CPUExecutionProvider"]
 
-    def _declared_bytes(sp) -> int:
+    def _declared_bytes(sp: onnx.SparseTensorProto) -> int:
         n = 1
         for d in sp.dims:
             n *= int(d)
@@ -164,7 +171,7 @@ def _make_session(model, providers, owner):
     # init; keeping it for the session's lifetime is the safe contract).
     owner._external_data_dir = tempfile.TemporaryDirectory(prefix="tw_onnx_debug_")
     data_name = "debug_dense.bin"
-    data_path = os.path.join(owner._external_data_dir.name, data_name)
+    data_path = Path(owner._external_data_dir.name) / data_name
 
     # The dense bytes go straight into a side file, never into a
     # TensorProto: a protobuf message caps at 2 GiB, so a >2 GiB dense
@@ -177,7 +184,7 @@ def _make_session(model, providers, owner):
     # never a second `tobytes()` copy of it (2x 3.3 GB at production
     # width).
     offset = 0
-    with open(data_path, "wb") as f:
+    with data_path.open("wb") as f:
         for sp in oversized:
             dims = tuple(int(d) for d in sp.dims)
             numel = int(np.prod(dims))
@@ -224,7 +231,7 @@ def _make_session(model, providers, owner):
     # Everything still embedded fits comfortably (the artifact held it all
     # in one file), so a plain save alongside the side file suffices; ORT
     # resolves external_data locations relative to the model's directory.
-    tmp_model = os.path.join(owner._external_data_dir.name, "debug_model.onnx")
+    tmp_model = str(Path(owner._external_data_dir.name) / "debug_model.onnx")
     onnx.save(model, tmp_model)
     return ort.InferenceSession(tmp_model, providers=providers)
 
@@ -250,7 +257,7 @@ class OnnxDebugSession:
         self,
         onnx_path: str,
         output_node: Node,
-        providers=None,
+        providers: list[str] | None = None,
     ) -> None:
         import onnx
 
@@ -397,8 +404,8 @@ class OnnxDebugSession:
         # --- Production meta sidecar (vocab etc.) — optional but normal.
         self.metadata: dict = {}
         meta_path = meta_path_for(onnx_path)
-        if os.path.exists(meta_path):
-            with open(meta_path) as f:
+        if Path(meta_path).exists():
+            with Path(meta_path).open() as f:
                 self.metadata = json.load(f)
 
         # --- Build the debug ORT session: promote the per-layer residual
@@ -435,14 +442,15 @@ class OnnxDebugSession:
                 f"re-export the pair together."
             )
 
-        def _dim(vi, k):
+        def _dim(vi: onnx.ValueInfoProto, k: int) -> int | None:
             d = vi.type.tensor_type.shape.dim[k]
             return d.dim_value if d.HasField("dim_value") else None
 
         self._per_layer_n_heads = [
-            int(_dim(graph_inputs[f"past_K_{i}"], 1)) for i in range(self._n_layers)
+            int(cast("int", _dim(graph_inputs[f"past_K_{i}"], 1)))
+            for i in range(self._n_layers)
         ]
-        self._d_head = int(_dim(graph_inputs["past_K_0"], 2))
+        self._d_head = int(cast("int", _dim(graph_inputs["past_K_0"], 2)))
         # Symbolic slot dim => prefix bindings allowed (stride
         # bucketing); a static dim (old export) forces full-width feeds.
         self._static_slot_dim: int | None = _dim(graph_inputs["past_K_0"], 0)
@@ -472,7 +480,7 @@ class OnnxDebugSession:
 
         # Session-lifetime home of externalized initializer data; set by
         # _make_session only when an oversized sparse tensor was converted.
-        self._external_data_dir = None
+        self._external_data_dir: tempfile.TemporaryDirectory[str] | None = None
         self._session = _make_session(model, providers, self)
         self._primary_output = "logits" if self._kind == "token" else "outputs"
         self._debug_state: _DebugState | None = None
@@ -480,8 +488,9 @@ class OnnxDebugSession:
     # ---- feed/run plumbing ----------------------------------------------
 
     def empty_past(self) -> tuple:
-        """Zero-length sequence-major KV tuples, mirroring
-        ``CompiledHeadless.empty_past``'s grow-per-step representation
+        """Zero-length sequence-major KV tuples.
+
+        Mirrors ``CompiledHeadless.empty_past``'s grow-per-step representation
         (each entry ``(n_committed, n_heads_i, d_head)``).
         """
         k = tuple(torch.zeros(0, nh, self._d_head) for nh in self._per_layer_n_heads)
@@ -489,10 +498,10 @@ class OnnxDebugSession:
         return (k, v)
 
     def _feeds(self, prefill: torch.Tensor, base: int, past: tuple | None) -> dict:
-        """Build ORT feeds for ``n_new`` rows at absolute positions
-        ``base..base+n_new``.
+        """Build ORT feeds for ``n_new`` rows at absolute positions.
 
-        The KV binding is the smallest covering prefix ``base + n_new``
+        Positions run ``base..base+n_new``.  The KV binding is the
+        smallest covering prefix ``base + n_new``
         (valid under stride bucketing) so debug runs never materialize
         the full stride buffer; old static-dim exports get full-width
         zero-padded feeds instead.

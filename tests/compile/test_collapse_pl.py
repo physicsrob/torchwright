@@ -31,8 +31,9 @@ def _eval(node, xs):
 
 
 def _chain(machine, sharpness=50.0):
-    """add_const -> compare -> add_const: depth-3 univariate chain a
-    continuous source can never hand to v1 (no integer claim).
+    """add_const -> compare -> add_const: a depth-3 univariate chain.
+
+    A continuous source can never hand this chain to v1 (no integer claim).
     """
     ops = _ops(machine)
     x = create_input("x", 1, value_range=(0.0, 10.0))
@@ -45,7 +46,8 @@ def test_s1_take_matches_source_both_machines():
         _x, out = _chain(machine)
         lowered = lower(out, collapse_pl=True, collapse_lane_cap=64)
         rep = lowered.collapse_pl_report
-        assert rep is not None and rep.n_collapsed == 1, (machine, rep.format())
+        assert rep is not None
+        assert rep.n_collapsed == 1, (machine, rep.format())
         xs = torch.linspace(0.0, 10.0, 4001, dtype=torch.float64)
         err = (_eval(lowered.output_node, xs) - _eval(out, xs)).abs().amax(dim=1)
         # Outside the compare's transition window (step at x=4, designed
@@ -59,8 +61,9 @@ def test_s1_take_matches_source_both_machines():
 
 
 def test_pl_takes_what_v1_leaves():
-    """v1 (staircase, integer-gated) declines the continuous chain;
-    the pl pass takes it in the same lower() run.
+    """v1 (staircase, integer-gated) declines the continuous chain.
+
+    The pl pass takes it in the same lower() run.
     """
     _x, out = _chain("swish")
     lowered = lower(
@@ -99,11 +102,12 @@ def test_lane_cap_declines_s1():
 
 
 def test_kink_prescreen_declines_before_the_sweep():
-    """A member whose candidate-kink population exceeds 4 x lane_cap
-    declines at the pre-screen (the kink-explosion seam, before the
-    member's oracle sweep) — the suite-cost mitigation for the
-    default flip.  ~98 candidates (quadratic values: one gate lane
-    per knot) against cap 8 (screen 32).
+    """A member whose candidate-kink population exceeds 4 x lane_cap declines early.
+
+    It declines at the pre-screen (the kink-explosion seam, before the
+    member's oracle sweep) — the suite-cost mitigation for the default
+    flip. ~98 candidates (quadratic values: one gate lane per knot)
+    against cap 8 (screen 32).
     """
     ops = _ops("relu")
     x = create_input("x", 1, value_range=(0.0, 100.0))
@@ -129,7 +133,7 @@ def test_orphaned_checks_are_counted():
     _x, out = _chain("relu")
     # A watch on the interior compare member: the rewiring orphans it.
     interior = out.inputs[0]
-    debug_watch(interior, lambda v: (True, ""), "interior watch")
+    debug_watch(interior, lambda _v: (True, ""), "interior watch")
     lowered = lower(out, collapse_pl=True, collapse_lane_cap=64)
     (o,) = [o for o in lowered.collapse_pl_report.outcomes if o.collapsed]
     assert o.n_checks_orphaned >= 1
@@ -165,14 +169,15 @@ def test_flag_off_is_inert():
 
 
 def test_emitted_step_survives_shallow_crossing_bands():
-    """The regression the emitter's first sweep caught: a swish
-    compare carries a shallow-slope gate crossing whose analytic band,
-    unclamped, spans the whole domain — every sample classified as
+    """The regression the emitter's first sweep caught.
+
+    A swish compare carries a shallow-slope gate crossing whose analytic
+    band, unclamped, spans the whole domain — every sample classified as
     fillet, the member 'certified' trivially, and the emitted skeleton
-    was a straight chord through the step.  The locality bound on
-    bands (pl_function) plus emitted-vs-ORIGINAL verification
-    (collapse_pl) each independently prevent it; the value sweep pins
-    the end-to-end behavior.
+    was a straight chord through the step. The locality bound on bands
+    (pl_function) plus emitted-vs-ORIGINAL verification (collapse_pl)
+    each independently prevent it; the value sweep pins the end-to-end
+    behavior.
     """
     _x, out = _chain("swish", sharpness=50.0)
     lowered = lower(out, collapse_pl=True, collapse_lane_cap=64)
@@ -186,13 +191,14 @@ def test_emitted_step_survives_shallow_crossing_bands():
 
 
 def test_output_concat_with_literal_field_compiles():
-    """The doom emit-row shape (flag-on sweep regression, 2026-07-06):
-    the OUTPUT node is a Concatenate whose whole row is univariate in
-    one source — constant fields are literal leaves — so the pass
-    synthesizes the Concatenate as a unit and the leaves orphan with
-    the interior.  The source-facing output gather must then use the
-    synthesized member's direct residual entry; flattening the source
-    Concatenate into its (now orphaned) leaves was a KeyError.
+    """The doom emit-row shape (flag-on sweep regression, 2026-07-06).
+
+    The OUTPUT node is a Concatenate whose whole row is univariate in one
+    source — constant fields are literal leaves — so the pass synthesizes
+    the Concatenate as a unit and the leaves orphan with the interior.
+    The source-facing output gather must then use the synthesized
+    member's direct residual entry; flattening the source Concatenate
+    into its (now orphaned) leaves was a KeyError.
     """
     x = create_input("x", 1, value_range=(0.0, 10.0))
     ops = _ops("relu")

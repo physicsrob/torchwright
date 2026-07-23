@@ -1,5 +1,7 @@
-"""Depth-optimized calculator: the same calculator as ``calculator_simple`` but
-with the logarithmic-depth arithmetic a hardware multiplier uses.
+"""Depth-optimized calculator.
+
+The same calculator as ``calculator_simple`` but with the logarithmic-depth
+arithmetic a hardware multiplier uses.
 
 This is one of two standalone calculator implementations.  It computes the same
 functions as ``calculator_simple`` but trades the legible serial folds for
@@ -38,6 +40,8 @@ sequences are MSB-first (``seq[0]`` most significant), and each function
 documents the input width the caller must supply so the fixed-width result is
 exact with no dropped nonzero carry.
 """
+
+from collections.abc import Callable
 
 import torch
 
@@ -84,6 +88,7 @@ __all__ = [
 
 _KILL, _PROPAGATE, _GENERATE = 0, 1, 2
 _SEG_W = 3
+_DECIMAL_BASE = 10
 
 
 def _combine_table() -> dict[torch.Tensor, torch.Tensor]:
@@ -139,8 +144,10 @@ def carry_lookahead(segments: list[Node]) -> list[Node]:
         _state(_GENERATE, _SEG_W): _state(_YES, _CARRY_W),
     }
     carries: list[Node] = [create_literal_value(_state(_NO, _CARRY_W))]
-    for j in range(1, n):
-        carries.append(onehot_lookup(prefix[j - 1], generated, _state(_NO, _CARRY_W)))
+    carries.extend(
+        onehot_lookup(prefix[j - 1], generated, _state(_NO, _CARRY_W))
+        for j in range(1, n)
+    )
     return carries
 
 
@@ -149,8 +156,8 @@ def _carry_lookahead_op(
     seq1: list[Node],
     seq2: list[Node],
     *,
-    status_of,
-    digit_of,
+    status_of: Callable[[int, int], int],
+    digit_of: Callable[[int, int, int], int],
 ) -> list[Node]:
     """Add or subtract two MSB-first digit sequences via carry-lookahead.
 
@@ -199,9 +206,13 @@ def add_digit_seqs(
         seq1,
         seq2,
         status_of=lambda a, b: (
-            _GENERATE if a + b >= 10 else _PROPAGATE if a + b == 9 else _KILL
+            _GENERATE
+            if a + b >= _DECIMAL_BASE
+            else _PROPAGATE
+            if a + b == _DECIMAL_BASE - 1
+            else _KILL
         ),
-        digit_of=lambda a, b, carry: (a + b + carry) % 10,
+        digit_of=lambda a, b, carry: (a + b + carry) % _DECIMAL_BASE,
     )
 
 
@@ -264,7 +275,7 @@ def _digit_value_proj(embedding: Embedding) -> torch.Tensor:
     return proj
 
 
-def _make_compressor(embedding: Embedding):
+def _make_compressor(embedding: Embedding) -> Callable[[list[Node]], tuple[Node, Node]]:
     """Return an 11:2 compressor ``(<=11 one-hot digits) -> (sum, carry)``.
 
     Rather than a ``10**11``-row lookup (one neuron per input combination — fat
@@ -288,7 +299,7 @@ def _make_compressor(embedding: Embedding):
         for t in range(n_buckets)
     }
 
-    def compress(digits: list[Node]):
+    def compress(digits: list[Node]) -> tuple[Node, Node]:
         values: list[Node] = [Linear(d, value_proj, name="digit_value") for d in digits]
         total = sum_nodes(values)  # plain-number add of up to 11 digits, 0..99
         bucket = bool_to_01(in_range(total, add_const(total, 1.0), n_buckets))
@@ -359,14 +370,16 @@ def multiply_digit_seqs(
     # Step 2: carry-save reduction — up to _RADIX rows -> 2 rows per level, all
     # columns in parallel, until two rows survive.
     compress = _make_compressor(embedding)
+    _FINAL_ROW_COUNT = 2
+    _MIN_COMPRESSIBLE_CHUNK = 3
 
-    while len(rows) > 2:
+    while len(rows) > _FINAL_ROW_COUNT:
         nxt: list[list[Node]] = []
         k = 0
         while k < len(rows):
             chunk = rows[k : k + _RADIX]
             k += len(chunk)
-            if len(chunk) < 3:  # 1 or 2 leftover rows: nothing to compress
+            if len(chunk) < _MIN_COMPRESSIBLE_CHUNK:  # 1-2 leftover rows: nothing
                 nxt.extend(chunk)
                 continue
             sum_row = [zero] * width
@@ -380,7 +393,7 @@ def multiply_digit_seqs(
             nxt.append(carry_row)
         rows = nxt
 
-    while len(rows) < 2:  # pad to exactly two rows for the final add
+    while len(rows) < _FINAL_ROW_COUNT:  # pad to exactly two rows for the final add
         rows.append([zero] * width)
 
     # Step 3: add the two surviving rows (MSB-first) with carry-lookahead.
@@ -392,7 +405,9 @@ def multiply_digit_seqs(
 def create_network_parts(
     max_digits: int = 3,
 ) -> tuple[Node, Embedding]:
-    """The advanced calculator: the depth-optimized arithmetic wired up by
+    """Build the advanced calculator.
+
+    The depth-optimized arithmetic wired up by
     :func:`examples._calculator_common.build_calculator`.
     """
     return build_calculator(

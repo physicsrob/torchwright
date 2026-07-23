@@ -1,5 +1,7 @@
-"""PyTorch Torchwright model — a pre-norm causal decoder with rotary position
-embeddings, per-layer head and MLP widths, and a tied LM head.
+"""PyTorch Torchwright model.
+
+A pre-norm causal decoder with rotary position embeddings, per-layer head
+and MLP widths, and a tied LM head.
 
 The forward path:
 
@@ -28,8 +30,8 @@ from __future__ import annotations
 from typing import cast
 
 import torch
-import torch.nn.functional as F
 from torch import nn
+from torch.nn import functional
 from torch.nn.attention import SDPBackend, sdpa_kernel
 from transformers import GenerationMixin, PreTrainedModel
 from transformers.cache_utils import Cache, DynamicCache
@@ -44,6 +46,9 @@ from .configuration_torchwright_custom import TorchwrightCustomConfig
 # and runs; this model's outputs must be bit-reproducible, so attention is
 # pinned to the deterministic math backend (plain softmax + matmul).
 _SDPA_BACKEND = [SDPBackend.MATH]
+
+# A supported key-padding mask is 2D: (batch, total_keys).
+_KEY_PADDING_MASK_NDIM = 2
 
 
 class TorchwrightCustomAttention(nn.Module):
@@ -129,7 +134,7 @@ class TorchwrightCustomAttention(nn.Module):
         # attn_mask is (1, 1, T, T_total) boolean, True == visible; it
         # broadcasts over the batch and head axes.
         with sdpa_kernel(_SDPA_BACKEND):
-            attn = F.scaled_dot_product_attention(
+            attn = functional.scaled_dot_product_attention(
                 q, k, v, attn_mask=attn_mask, scale=1.0
             )
 
@@ -147,12 +152,14 @@ class TorchwrightCustomMLP(nn.Module):
         self.fc2 = nn.Linear(d_hidden, config.d, bias=True)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.fc2(F.relu(self.fc1(x)))
+        return self.fc2(functional.relu(self.fc1(x)))
 
 
 class TorchwrightCustomRMSNorm(nn.Module):
-    """Root-mean-square norm, ``x / sqrt(mean(x^2, -1) + eps) * weight`` —
-    the same form as Llama's.
+    """Root-mean-square norm.
+
+    Computes ``x / sqrt(mean(x^2, -1) + eps) * weight`` — the same form as
+    Llama's.
     """
 
     def __init__(self, d: int, eps: float) -> None:
@@ -166,8 +173,10 @@ class TorchwrightCustomRMSNorm(nn.Module):
 
 
 class TorchwrightCustomDecoderLayer(nn.Module):
-    """Pre-norm decoder block: ``x = x + attn(norm(x)); x = x + mlp(norm(x))``.
-    The norms are ``nn.Identity`` when ``config.rms_norm`` is off.
+    """Pre-norm decoder block.
+
+    ``x = x + attn(norm(x)); x = x + mlp(norm(x))``. The norms are
+    ``nn.Identity`` when ``config.rms_norm`` is off.
     """
 
     def __init__(self, config: TorchwrightCustomConfig, layer_idx: int) -> None:
@@ -207,10 +216,17 @@ class TorchwrightCustomPreTrainedModel(PreTrainedModel):
     config_class = TorchwrightCustomConfig
     base_model_prefix = "model"
     supports_gradient_checkpointing = False
-    _no_split_modules = ["TorchwrightCustomDecoderLayer"]
     _supports_sdpa = True
 
-    def _init_weights(self, module) -> None:
+    def __init__(
+        self, config: TorchwrightCustomConfig, *inputs: object, **kwargs: object
+    ) -> None:
+        super().__init__(config, *inputs, **kwargs)
+        # Instance attribute (not a class-level mutable default): shared list
+        # literals as class attributes are a footgun across instances.
+        self._no_split_modules = ["TorchwrightCustomDecoderLayer"]
+
+    def _init_weights(self, module: nn.Module) -> None:
         # Real weights come from the checkpoint; a fresh construction only has
         # to be finite and shape-correct. Use ``nn.init.*`` on the parameter
         # (not ``.data.normal_()``): under ``from_pretrained``, transformers
@@ -230,7 +246,7 @@ class TorchwrightCustomModel(TorchwrightCustomPreTrainedModel):
 
     def __init__(self, config: TorchwrightCustomConfig) -> None:
         super().__init__(config)
-        self.embed_tokens = nn.Embedding(config.vocab_size, config.d)
+        self.embed_tokens: nn.Module = nn.Embedding(config.vocab_size, config.d)
         self.layers = nn.ModuleList(
             [TorchwrightCustomDecoderLayer(config, i) for i in range(config.n_layers)]
         )
@@ -242,10 +258,10 @@ class TorchwrightCustomModel(TorchwrightCustomPreTrainedModel):
         )
         self.post_init()
 
-    def get_input_embeddings(self):
+    def get_input_embeddings(self) -> nn.Module:
         return self.embed_tokens
 
-    def set_input_embeddings(self, value) -> None:
+    def set_input_embeddings(self, value: nn.Module) -> None:
         self.embed_tokens = value
 
     def forward(
@@ -257,7 +273,7 @@ class TorchwrightCustomModel(TorchwrightCustomPreTrainedModel):
         inputs_embeds: torch.FloatTensor | None = None,
         use_cache: bool | None = None,
         cache_position: torch.LongTensor | None = None,
-        **kwargs,
+        **_kwargs: object,
     ) -> BaseModelOutputWithPast:
         if inputs_embeds is not None:
             raise NotImplementedError("inputs_embeds is not supported; pass input_ids.")
@@ -322,7 +338,10 @@ class TorchwrightCustomModel(TorchwrightCustomPreTrainedModel):
         # passes for a single unpadded sequence. Anything else is refused
         # loudly rather than silently reduced to causal-only.
         if attention_mask is not None:
-            if attention_mask.dim() == 2 and attention_mask.shape[-1] == total:
+            if (
+                attention_mask.dim() == _KEY_PADDING_MASK_NDIM
+                and attention_mask.shape[-1] == total
+            ):
                 pad = attention_mask[:, None, None, :].to(torch.bool)
                 mask = mask & pad  # -> (B, 1, T, total)
             else:
@@ -349,27 +368,28 @@ class TorchwrightCustomForCausalLM(TorchwrightCustomPreTrainedModel, GenerationM
     The head is storage-tied to ``model.embed_tokens`` and has no bias.
     """
 
-    _tied_weights_keys = {"lm_head.weight": "model.embed_tokens.weight"}
-
     def __init__(self, config: TorchwrightCustomConfig) -> None:
         super().__init__(config)
         self.model = TorchwrightCustomModel(config)
-        self.lm_head = nn.Linear(config.d, config.vocab_size, bias=False)
+        self.lm_head: nn.Module = nn.Linear(config.d, config.vocab_size, bias=False)
+        # Instance attribute (not a class-level mutable default): a dict
+        # literal as a class attribute is shared across every instance.
+        self._tied_weights_keys = {"lm_head.weight": "model.embed_tokens.weight"}
         self.post_init()
 
-    def get_input_embeddings(self):
+    def get_input_embeddings(self) -> nn.Module:
         return self.model.embed_tokens
 
-    def set_input_embeddings(self, value) -> None:
+    def set_input_embeddings(self, value: nn.Module) -> None:
         self.model.embed_tokens = value
 
-    def get_output_embeddings(self):
+    def get_output_embeddings(self) -> nn.Module:
         return self.lm_head
 
-    def set_output_embeddings(self, value) -> None:
+    def set_output_embeddings(self, value: nn.Module) -> None:
         self.lm_head = value
 
-    def get_decoder(self):
+    def get_decoder(self) -> TorchwrightCustomModel:
         return self.model
 
     def forward(
@@ -386,7 +406,7 @@ class TorchwrightCustomForCausalLM(TorchwrightCustomPreTrainedModel, GenerationM
         return_dict: bool | None = None,
         cache_position: torch.LongTensor | None = None,
         logits_to_keep: int = 0,
-        **kwargs,
+        **kwargs: object,
     ) -> CausalLMOutputWithPast:
         outputs = self.model(
             input_ids=input_ids,
@@ -413,7 +433,7 @@ class TorchwrightCustomForCausalLM(TorchwrightCustomPreTrainedModel, GenerationM
         if labels is not None:
             shift_logits = logits[:, :-1, :].contiguous().float()
             shift_labels = labels[:, 1:].contiguous()
-            loss = F.cross_entropy(
+            loss = functional.cross_entropy(
                 shift_logits.view(-1, shift_logits.size(-1)),
                 shift_labels.view(-1),
             )

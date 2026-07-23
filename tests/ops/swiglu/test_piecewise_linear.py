@@ -1,9 +1,10 @@
-"""swiglu piecewise_linear and its compositions (clamp, reciprocal,
-thermometer_floor_div, mod_const, global_position_from_bos).
+"""swiglu piecewise_linear and its compositions.
 
-Spec: docs/ops_plain_english.md (piecewise_linear entry; the compositions
-inherit it).  Fillet radius/dip magnitudes are pinned in
-tests/docs/test_swish_constants.py (test_hinge_fillet_width).
+The compositions are clamp, reciprocal, thermometer_floor_div, mod_const,
+and global_position_from_bos.  Spec: docs/ops_plain_english.md
+(piecewise_linear entry; the compositions inherit it).  Fillet radius/dip
+magnitudes are pinned in tests/docs/test_swish_constants.py
+(test_hinge_fillet_width).
 """
 
 import torch
@@ -38,8 +39,10 @@ def _unwrap(node):
 
 
 def test_pl_knots_and_segment_interiors():
-    """Away from the fillets (|x - x_i| > 17/K) the op computes the exact
-    interpolation to the folded ulp class; knots included.
+    """Away from the fillets, the op computes the exact interpolation to the ulp class.
+
+    This holds where |x - x_i| > 17/K, to the folded ulp class; knots
+    included.
     """
     x = create_input("x", 1, value_range=(-2.0, 6.0))
     out = piecewise_linear(x, [0.0, 1.0, 3.0, 4.0], lambda v: v * v)
@@ -67,8 +70,9 @@ def test_pl_no_clamp_extrapolates():
 
 
 def test_pl_fillet_dip_bounded_by_slope_change():
-    """Inside a fillet the gap to the exact PL is ≤ swish_dip·|Δm|/K,
-    and the fillet is really there.
+    """Inside a fillet, the gap to the exact PL is bounded, and the fillet is real.
+
+    The gap is ≤ swish_dip·|Δm|/K.
     """
     x = create_input("x", 1, value_range=(-2.0, 4.0))
     # single corner at 1.0 with slope change 3.0 (0 -> 3)
@@ -100,8 +104,9 @@ def test_pl_vector_fn_and_range_slack():
 
 
 def test_pl_chunking_matches_single_ffn():
-    """d_max chunking splits lanes across FFNs joined by sum_nodes; the
-    math is identical.
+    """d_max chunking splits lanes across FFNs joined by sum_nodes.
+
+    The math is identical to the unchunked whole.
     """
     bps = [float(k) for k in range(9)]
 
@@ -145,9 +150,11 @@ def test_clamp_identity_and_edges():
 
 
 def test_reciprocal_accuracy_vs_true_function():
-    """Smooth-target grid: fillets bend toward 1/x, so the dense low-end
-    grid keeps the error in the relu class (measured entry is the
-    authority; this is the sanity ceiling).
+    """A smooth-target grid keeps the error in the relu class.
+
+    The fillets bend toward 1/x, so the dense low-end grid keeps the
+    error in the relu class (measured entry is the authority; this is
+    the sanity ceiling).
     """
     x = create_input("x", 1, value_range=(0.3, 200.0))
     out = reciprocal(x, min_value=0.3, max_value=200.0, step=1.0)
@@ -173,9 +180,11 @@ def test_thermometer_floor_div_and_mod_const_exact_on_integers():
 
 
 def test_global_position_from_bos_integer_recovery():
-    """Position recovery within the relu op's empirical ceiling (0.15;
-    hard requirement is 0.5 for integer rounding).  The inversion table
-    is the library's densest grid — this is its stacked-fillet audit.
+    """Position recovery stays within the relu op's empirical ceiling.
+
+    The ceiling is 0.15; hard requirement is 0.5 for integer rounding.
+    The inversion table is the library's densest grid — this is its
+    stacked-fillet audit.
     """
     rope = create_rope_config(d_head=256, max_positions=61440)
     n = 80

@@ -22,10 +22,11 @@ def test_public_hf_defaults_are_phi3():
 
 def test_examples_do_not_import_relu_dialect():
     examples = Path(__file__).resolve().parents[2] / "examples"
-    offenders = []
-    for path in examples.glob("*.py"):
-        if "torchwright.ops.relu" in path.read_text():
-            offenders.append(path.name)
+    offenders = [
+        path.name
+        for path in examples.glob("*.py")
+        if "torchwright.ops.relu" in path.read_text()
+    ]
     assert not offenders, (
         "examples must compile under the default Phi-3 profile; ReLU imports "
         f"require a non-example custom fixture instead: {offenders}"

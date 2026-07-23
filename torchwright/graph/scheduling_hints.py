@@ -19,21 +19,22 @@ from torchwright.graph.node import Node
 
 
 def add_scheduling_dependency(node: Node, depends_on: Node) -> None:
-    """Declare that ``node`` must not be scheduled until ``depends_on``
-    is in ``computed_nodes``.
+    """Declare that ``node`` must wait on ``depends_on`` to be scheduled.
 
-    This does NOT add a data input — the compiled op won't read from
-    ``depends_on``.  It only affects scheduler ordering via
-    :meth:`GraphAnalyzer.is_ready`.
+    ``node`` must not be scheduled until ``depends_on`` is in
+    ``computed_nodes``.  This does NOT add a data input — the compiled
+    op won't read from ``depends_on``.  It only affects scheduler
+    ordering via :meth:`GraphAnalyzer.is_ready`.
     """
     node.scheduling_predecessors.add(depends_on)
 
 
 def assert_hints_intact(output_node: Node, context: str) -> None:
-    """Every scheduling predecessor of every reachable node is itself
-    reachable from ``output_node``.
+    """Assert every reachable node's scheduling predecessors are also reachable.
 
-    The same invariant ``clone_graph`` asserts during its remap — but the
+    Every scheduling predecessor of every reachable node must itself be
+    reachable from ``output_node``.  The same invariant ``clone_graph``
+    asserts during its remap — but the
     clone runs *before* fusion, so its check cannot see a hint orphaned by
     a later pass.  A dangling hint's downstream symptom is far from its
     cause: ``Compilation did not converge in N layers`` at ``optimize=0``,
@@ -76,9 +77,10 @@ def _current_node_id() -> int:
 
 
 def _find_entry_nodes(terminal: Node, lo: int, hi: int) -> list[Node]:
-    """Non-Concatenate nodes in id-range [lo, hi) reachable backward
-    from ``terminal`` whose flattened-input ids are all < lo.
+    """Find this iteration's entry nodes.
 
+    These are the non-Concatenate nodes in id-range [lo, hi) reachable
+    backward from ``terminal`` whose flattened-input ids are all < lo.
     An "entry node" is the earliest point in this iteration where
     gating scheduling is effective: downstream nodes in the iteration
     will naturally wait on their data inputs, so blocking at the entry
@@ -100,8 +102,7 @@ def _find_entry_nodes(terminal: Node, lo: int, hi: int) -> list[Node]:
             continue
         if isinstance(cur, Concatenate):
             # Walk through; Concatenates aren't scheduled themselves.
-            for inp in cur.inputs:
-                stack.append(inp)
+            stack.extend(cur.inputs)
             continue
         # Non-Concatenate in-range node.  Check if it's an entry:
         # all of its flattened inputs must be strictly pre-iteration.
@@ -119,8 +120,7 @@ def _find_entry_nodes(terminal: Node, lo: int, hi: int) -> list[Node]:
         if is_entry:
             entries.append(cur)
         # Keep walking backward through all inputs to find deeper entries.
-        for inp in cur.inputs:
-            stack.append(inp)
+        stack.extend(cur.inputs)
     return entries
 
 
@@ -128,10 +128,11 @@ def sequential_scope(
     factories: list[Callable[[], Node]],
     batch_size: int = 1,
 ) -> list[Node]:
-    """Call ``factories`` in order, wiring scheduling deps so that at
-    most ``batch_size`` iterations are in flight concurrently.
+    """Call ``factories`` in order, limiting in-flight iterations.
 
-    Each factory builds one iteration's subgraph and returns its
+    Wires scheduling deps so that at most ``batch_size`` iterations are
+    in flight concurrently.  Each factory builds one iteration's subgraph
+    and returns its
     terminal node — the one that downstream code consumes.  After
     iteration ``i`` runs, its entry nodes (those whose flattened
     inputs are all pre-iteration) are given a scheduling predecessor:

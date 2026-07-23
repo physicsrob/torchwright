@@ -62,13 +62,27 @@ Run locally (CPU is fine, no GPU needed)::
 
 import argparse
 import json
+from collections.abc import Callable, Iterator, Sequence
+from pathlib import Path
+from types import ModuleType
+from typing import TYPE_CHECKING, cast
 
 from examples import calculator_advanced, calculator_scratchpad, calculator_simple
+from torchwright.graph import Embedding, Node, RopeConfig
 from torchwright.ops.inout_nodes import (
     create_literal_value,
     create_onehot_embedding,
     create_rope_config,
 )
+
+if TYPE_CHECKING:
+    from torchwright.graph.ffn import FFN
+
+ScratchpadOp = Callable[
+    [RopeConfig, Embedding, list[Node], list[Node], int, Node],
+    tuple[list[Node], list[Node]],
+]
+Records = list[dict[str, int]]
 
 # Registered implementations, in figure order: the legible serial folds vs the
 # depth-optimized carry-lookahead / carry-save versions.  Each calculator module
@@ -117,24 +131,28 @@ def log(message: str) -> None:
     print(f"[scaling] {message}")
 
 
-def _is_neuron(node) -> bool:
-    """A node that lowers to hidden compute: an FFN (the packable lane unit
-    the swiglu ops build), a legacy ReLU layer, or an attention sublayer.
+def _is_neuron(node: Node) -> bool:
+    """A node that lowers to hidden compute.
+
+    Includes an FFN (the packable lane unit the swiglu ops build), a
+    legacy ReLU layer, or an attention sublayer.
     """
     t = type(node).__name__
     return t == "FFN" or "ReLU" in t or "Attn" in t
 
 
-def _neuron_width(node) -> int:
-    """The hidden width a neuron node contributes: an FFN's lane count
-    (``gate_proj`` rows), otherwise the node's output width.
+def _neuron_width(node: Node) -> int:
+    """The hidden width a neuron node contributes.
+
+    An FFN's lane count (``gate_proj`` rows), otherwise the node's
+    output width.
     """
     if type(node).__name__ == "FFN":
-        return node.gate_proj.shape[0]
+        return cast("FFN", node).gate_proj.shape[0]
     return len(node)
 
 
-def _walk(outputs):
+def _walk(outputs: Sequence[Node]) -> Iterator[Node]:
     """Yield every unique node reachable from ``outputs`` (post-order ids)."""
     seen = set()
     stack = list(outputs)
@@ -147,7 +165,7 @@ def _walk(outputs):
         stack.extend(getattr(node, "inputs", None) or [])
 
 
-def critical_path_depth(outputs) -> int:
+def critical_path_depth(outputs: Sequence[Node]) -> int:
     """Longest chain of neuron-producing nodes from any input to ``outputs``.
 
     This is the transformer-layer depth the algorithm needs with enough width
@@ -168,22 +186,26 @@ def critical_path_depth(outputs) -> int:
             if id(node) in memo:
                 continue
             stack.append((node, True))
-            for i in getattr(node, "inputs", None) or []:
-                if id(i) not in memo:
-                    stack.append((i, False))
+            stack.extend(
+                (i, False)
+                for i in getattr(node, "inputs", None) or []
+                if id(i) not in memo
+            )
     return max(memo[id(o)] for o in outputs)
 
 
-def total_neurons(outputs) -> int:
+def total_neurons(outputs: Sequence[Node]) -> int:
     """Sum of every neuron-producing node's width (total compute, ~params/2d)."""
     return sum(_neuron_width(node) for node in _walk(outputs) if _is_neuron(node))
 
 
-def _operand(embedding, n):
+def _operand(embedding: Embedding, n: int) -> list[Node]:
     return [create_literal_value(embedding.get_embedding("1")) for _ in range(n)]
 
 
-def measure_op(arith, fn_name, n, embedding):
+def measure_op(
+    arith: ModuleType, fn_name: str, n: int, embedding: Embedding
+) -> tuple[int, int]:
     """Build ``op(a, b)`` over two n-digit operands; return (depth, neurons)."""
     fn = getattr(arith, fn_name)
     outputs = fn(embedding, _operand(embedding, n), _operand(embedding, n))
@@ -219,7 +241,7 @@ SCRATCHPAD_OP_CAP = 12
 SCRATCHPAD_MULTIPLY_PLANE_CAP = calculator_scratchpad.D_HEAD // 4
 
 
-def measure_scratchpad_op(op_fn, n):
+def measure_scratchpad_op(op_fn: ScratchpadOp, n: int) -> tuple[int, int]:
     """Build the streamed scratchpad ``op(a, b)`` kernel; return (depth, neurons).
 
     Depth is flat in ``n`` (the streaming moves the serial recurrence onto the
@@ -240,7 +262,7 @@ def measure_scratchpad_op(op_fn, n):
     return critical_path_depth(outputs), total_neurons(outputs)
 
 
-def _sweep_for(op_name, digit_sweep, multiply_cap):
+def _sweep_for(op_name: str, digit_sweep: list[int], multiply_cap: int) -> list[int]:
     if op_name == "multiply":
         capped = [n for n in digit_sweep if n <= multiply_cap]
         if capped != digit_sweep:
@@ -252,14 +274,16 @@ def _sweep_for(op_name, digit_sweep, multiply_cap):
     return digit_sweep
 
 
-def run(digit_sweep, multiply_cap=DEFAULT_MULTIPLY_CAP):
+def run(
+    digit_sweep: list[int], multiply_cap: int = DEFAULT_MULTIPLY_CAP
+) -> dict[str, dict[str, Records]]:
     """Build every (impl, op, n) graph and collect depth/size records."""
     embedding = create_onehot_embedding(VOCAB)
-    results = {}
+    results: dict[str, dict[str, Records]] = {}
     for impl_name, arith in IMPLEMENTATIONS.items():
         results[impl_name] = {}
         for op_name, fn_name in OPS.items():
-            records = []
+            records: Records = []
             for n in _sweep_for(op_name, digit_sweep, multiply_cap):
                 depth, neurons = measure_op(arith, fn_name, n, embedding)
                 records.append({"n": n, "depth": depth, "neurons": neurons})
@@ -289,23 +313,26 @@ def run(digit_sweep, multiply_cap=DEFAULT_MULTIPLY_CAP):
     return results
 
 
-def measure_model(impl, n):
-    """Build the whole model ``create_network_parts(n)``; return its end-to-end
-    (depth, neurons) — parse + arithmetic + dispatch + emit, not one op.
+def measure_model(impl: ModuleType, n: int) -> tuple[int, int]:
+    """Build the whole model ``create_network_parts(n)``.
+
+    Returns its end-to-end (depth, neurons): parse + arithmetic +
+    dispatch + emit, not one op.
     """
     output_node, _ = impl.create_network_parts(max_digits=n)
     return critical_path_depth([output_node]), total_neurons([output_node])
 
 
-def run_models(digit_sweep):
-    """End-to-end model depth/size for every implementation, plus the scratchpad
-    worst-case decode-step count (its O(n) cost, the axis that grows instead of
-    depth — the multiply transcript's length; add/sub stop at their own <eos>
-    earlier).
+def run_models(digit_sweep: list[int]) -> dict[str, Records]:
+    """End-to-end model depth/size for every implementation.
+
+    Also includes the scratchpad worst-case decode-step count (its O(n)
+    cost, the axis that grows instead of depth — the multiply
+    transcript's length; add/sub stop at their own <eos> earlier).
     """
-    results = {}
+    results: dict[str, Records] = {}
     for name, impl in MODEL_IMPLEMENTATIONS.items():
-        records = []
+        records: Records = []
         for n in digit_sweep:
             depth, neurons = measure_model(impl, n)
             record = {"n": n, "depth": depth, "neurons": neurons}
@@ -320,7 +347,7 @@ def run_models(digit_sweep):
     return results
 
 
-def print_models_table(model_results) -> None:
+def print_models_table(model_results: dict[str, Records]) -> None:
     print("\n== end-to-end model scaling (whole-model critical-path depth) ==")
     for name, records in model_results.items():
         print(f"\n  model = {name}")
@@ -336,7 +363,7 @@ def print_models_table(model_results) -> None:
             print(row)
 
 
-def print_table(results) -> None:
+def print_table(results: dict[str, dict[str, Records]]) -> None:
     print("\n== one-hot arithmetic scaling (critical-path depth / total neurons) ==")
     for impl_name, ops in results.items():
         print(f"\nimpl = {impl_name}")
@@ -347,7 +374,13 @@ def print_table(results) -> None:
                 print(f"    {r['n']:>4}  {r['depth']:>6}  {r['neurons']:>12,}")
 
 
-def build_payload(results, model_results, digit_sweep, model_digit_sweep, multiply_cap):
+def build_payload(
+    results: dict[str, dict[str, Records]],
+    model_results: dict[str, Records],
+    digit_sweep: list[int],
+    model_digit_sweep: list[int],
+    multiply_cap: int,
+) -> dict[str, object]:
     return {
         "config": {
             "digit_sweep": digit_sweep,
@@ -355,8 +388,13 @@ def build_payload(results, model_results, digit_sweep, model_digit_sweep, multip
             "multiply_cap": multiply_cap,
             "scratchpad_multiply_plane_cap": SCRATCHPAD_MULTIPLY_PLANE_CAP,
             "depth_metric": "critical-path length over neuron-producing nodes",
-            "size_metric": "total neuron count (FFN lanes + ReLU widths; ~ params / 2d, gated lanes ~ params / 3d)",
-            "model_depth_metric": "whole-model critical-path depth (parse + ops + dispatch + emit)",
+            "size_metric": (
+                "total neuron count (FFN lanes + ReLU widths; "
+                "~ params / 2d, gated lanes ~ params / 3d)"
+            ),
+            "model_depth_metric": (
+                "whole-model critical-path depth (parse + ops + dispatch + emit)"
+            ),
             "decode_steps_metric": (
                 "worst-case decode steps per query (scratchpad: the multiply "
                 "transcript, 8n+3; add/sub transcripts hit their own <eos> "
@@ -368,13 +406,17 @@ def build_payload(results, model_results, digit_sweep, model_digit_sweep, multip
     }
 
 
-def write_json(payload, path) -> None:
-    with open(path, "w") as f:
+def write_json(payload: dict[str, object], path: str) -> None:
+    with Path(path).open("w") as f:
         json.dump(payload, f, indent=2)
     log(f"wrote scaling data -> {path}")
 
 
-def write_plot(results, model_results, path) -> None:
+def write_plot(
+    results: dict[str, dict[str, Records]],
+    model_results: dict[str, Records],
+    path: str,
+) -> None:
     try:
         import matplotlib as mpl
 
@@ -396,7 +438,7 @@ def write_plot(results, model_results, path) -> None:
     # Left: the multiply kernel's depth — the headline op, one line per
     # implementation (simple linear, advanced log, scratchpad flat), so the
     # legend matches the right panel exactly.
-    for impl_name in impl_color:
+    for impl_name, color in impl_color.items():
         ops = results.get(impl_name)
         if not ops or "multiply" not in ops:
             continue
@@ -406,7 +448,7 @@ def write_plot(results, model_results, path) -> None:
             ns,
             [r["depth"] for r in records],
             marker="o",
-            color=impl_color[impl_name],
+            color=color,
             label=impl_name,
         )
     ax_depth.set_title("arithmetic-kernel depth (multiply)")
@@ -454,12 +496,15 @@ def main() -> None:
         "--multiply-cap",
         type=int,
         default=DEFAULT_MULTIPLY_CAP,
-        help="cap the multiply sweep at this n (default: %d)" % DEFAULT_MULTIPLY_CAP,
+        help=f"cap the multiply sweep at this n (default: {DEFAULT_MULTIPLY_CAP})",
     )
     parser.add_argument(
         "--model-digits",
         default=None,
-        help=f"comma-separated end-to-end model sweep (default: {DEFAULT_MODEL_DIGIT_SWEEP})",
+        help=(
+            "comma-separated end-to-end model sweep "
+            f"(default: {DEFAULT_MODEL_DIGIT_SWEEP})"
+        ),
     )
     args = parser.parse_args()
 

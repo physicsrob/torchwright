@@ -30,7 +30,7 @@ class Range:
     lo: float = -_INF
     hi: float = _INF
 
-    def __post_init__(self):
+    def __post_init__(self) -> None:
         if not (self.lo <= self.hi):
             raise ValueError(f"Range lo must be <= hi, got lo={self.lo}, hi={self.hi}")
 

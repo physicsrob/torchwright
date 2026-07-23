@@ -13,7 +13,7 @@ __all__ = [
 ]
 
 
-def __getattr__(name):
+def __getattr__(name: str) -> object:
     if name in __all__:
         if name in {"CompileProfile", "ScheduleProvenance"}:
             from . import token_model

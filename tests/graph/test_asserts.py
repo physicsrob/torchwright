@@ -96,7 +96,7 @@ def test_assert_bool(values, should_raise):
 
 
 # ---------------------------------------------------------------------------
-# assert_01 ({0,1})
+# assert_01 -- values in 0 or 1
 # ---------------------------------------------------------------------------
 
 
@@ -544,8 +544,10 @@ def test_picked_from_rejects_blend():
 
 
 def test_picked_from_skips_no_valid_keys():
-    """Zero valid key positions → skip (caller's type-boolean convention
-    means every query is itself inactive, so there's nothing to check).
+    """Zero valid key positions → skip.
+
+    The caller's type-boolean convention means every query is itself
+    inactive, so there's nothing to check.
 
     Previously this case raised AssertionError; commit ``ee3047c``
     changed it to a silent skip with a stdout note, because the skip
@@ -710,9 +712,10 @@ def test_range_violation_raises():
 
 
 def test_contradictory_claim_rejected_at_attach():
-    """A claim disjoint from the node's structural type is a bug in one
-    of the two; it fails loudly at attach time (the old wrapper design
-    only caught it at the compile-time strip).
+    """A claim disjoint from the node's structural type is a bug in one of the two.
+
+    It fails loudly at attach time (the old wrapper design only
+    caught it at the compile-time strip).
     """
     from torchwright.graph import LiteralValue
 
@@ -722,11 +725,12 @@ def test_contradictory_claim_rejected_at_attach():
 
 
 def test_format_bad_multidim_reports_true_positions():
-    """_format_bad on a multi-dim tensor: indices are into the flattened
-    tensor and pair with the actual offending values. (Regression: a
-    multi-dim nonzero returns coordinate rows; flattening those produced
-    coordinates misread as flat indices, pairing wrong values with wrong
-    positions.).
+    """_format_bad on a multi-dim tensor: indices are into the flattened tensor.
+
+    They pair with the actual offending values. (Regression: a
+    multi-dim nonzero returns coordinate rows; flattening those
+    produced coordinates misread as flat indices, pairing wrong values
+    with wrong positions.)
     """
     from torchwright.graph.asserts import _format_bad
 

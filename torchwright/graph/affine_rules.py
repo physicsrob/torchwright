@@ -16,7 +16,13 @@ import torch
 from torchwright.graph.affine_bound import AffineBound
 
 if TYPE_CHECKING:
+    from torchwright.graph.attn import Attn
+    from torchwright.graph.embedding import Embedding
+    from torchwright.graph.ffn import FFN
+    from torchwright.graph.linear import Linear
+    from torchwright.graph.misc import Add, Concatenate
     from torchwright.graph.node import Node
+    from torchwright.graph.relu import ReLU
 
 
 def _safe_matvec(W: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
@@ -42,49 +48,39 @@ def compute_affine_bound(node: Node) -> AffineBound:
     from torchwright.graph.relu import ReLU
 
     if isinstance(node, InputNode):
-        ab = AffineBound.identity(node)
-        assert ab.n_cols > 0, "InputNode must produce non-degenerate affine bound"
-        return ab
-
-    if isinstance(node, LiteralValue):
+        result = AffineBound.identity(node)
+        assert result.n_cols > 0, "InputNode must produce non-degenerate affine bound"
+    elif isinstance(node, LiteralValue):
         import torch
 
-        return AffineBound.constant(node.value.to(dtype=torch.float64))
+        result = AffineBound.constant(node.value.to(dtype=torch.float64))
+    elif isinstance(node, ValueLogger):
+        result = node.inputs[0]._affine_bound
+    elif isinstance(node, Linear):
+        result = _linear_rule(node)
+    elif isinstance(node, Add):
+        result = _add_rule(node)
+    elif isinstance(node, Concatenate):
+        result = _concat_rule(node)
+    elif isinstance(node, ReLU):
+        result = _relu_rule(node)
+    elif isinstance(node, FFN):
+        result = _ffn_rule(node)
+    elif isinstance(node, Attn):
+        result = _attn_rule(node)
+    elif isinstance(node, Embedding):
+        result = _embedding_rule(node)
+        assert result.n_cols > 0, "Embedding must produce non-degenerate affine bound"
+    else:
+        from torchwright.graph.misc import Placeholder
 
-    if isinstance(node, ValueLogger):
-        return node.inputs[0]._affine_bound
-
-    if isinstance(node, Linear):
-        return _linear_rule(node)
-
-    if isinstance(node, Add):
-        return _add_rule(node)
-
-    if isinstance(node, Concatenate):
-        return _concat_rule(node)
-
-    if isinstance(node, ReLU):
-        return _relu_rule(node)
-
-    if isinstance(node, FFN):
-        return _ffn_rule(node)
-
-    if isinstance(node, Attn):
-        return _attn_rule(node)
-
-    if isinstance(node, Embedding):
-        ab = _embedding_rule(node)
-        assert ab.n_cols > 0, "Embedding must produce non-degenerate affine bound"
-        return ab
-
-    from torchwright.graph.misc import Placeholder
-
-    if not isinstance(node, Placeholder):
-        raise NotImplementedError(
-            f"No affine rule for {type(node).__name__}. Add one to "
-            f"affine_rules.py or register it as an explicit pass-through."
-        )
-    return AffineBound.degenerate(node.d_output)
+        if not isinstance(node, Placeholder):
+            raise NotImplementedError(
+                f"No affine rule for {type(node).__name__}. Add one to "
+                f"affine_rules.py or register it as an explicit pass-through."
+            )
+        result = AffineBound.degenerate(node.d_output)
+    return result
 
 
 def _linear_affine(
@@ -119,7 +115,7 @@ def _linear_affine(
     )
 
 
-def _linear_rule(node) -> AffineBound:
+def _linear_rule(node: Linear) -> AffineBound:
     """Y = x @ W + c: sign-split GEMM."""
     inp_ab = node.inputs[0]._affine_bound
     W = node.output_matrix.to(torch.float64)
@@ -127,7 +123,7 @@ def _linear_rule(node) -> AffineBound:
     return _linear_affine(inp_ab, W, c)
 
 
-def _add_rule(node) -> AffineBound:
+def _add_rule(node: Add) -> AffineBound:
     u = node.inputs[0]._affine_bound
     v = node.inputs[1]._affine_bound
     if u.d_output != v.d_output:
@@ -146,7 +142,7 @@ def _add_rule(node) -> AffineBound:
     )
 
 
-def _concat_rule(node) -> AffineBound:
+def _concat_rule(node: Concatenate) -> AffineBound:
     import torch
 
     from torchwright.graph.affine_bound import _merge_layouts, _scatter
@@ -194,15 +190,15 @@ def _relu_affine(inp_ab: AffineBound, warn_node: Node | None = None) -> AffineBo
     b_hi = torch.zeros(d, dtype=torch.float64)
 
     for i in range(d):
-        l, h = intervals[i].lo, intervals[i].hi
-        if l >= 0:
+        lo_i, h = intervals[i].lo, intervals[i].hi
+        if lo_i >= 0:
             A_lo[i] = inp_ab.A_lo[i]
             A_hi[i] = inp_ab.A_hi[i]
             b_lo[i] = inp_ab.b_lo[i]
             b_hi[i] = inp_ab.b_hi[i]
         elif h <= 0:
             pass
-        elif math.isinf(l) or math.isinf(h):
+        elif math.isinf(lo_i) or math.isinf(h):
             if warn_node is not None:
                 vt_range = warn_node.value_type.value_range
                 if math.isfinite(vt_range.lo) and math.isfinite(vt_range.hi):
@@ -210,17 +206,17 @@ def _relu_affine(inp_ab: AffineBound, warn_node: Node | None = None) -> AffineBo
 
                     warnings.warn(
                         f"Node {warn_node.node_id}: ReLU input affine interval is "
-                        f"infinite ({l}, {h}) but value_type is finite "
+                        f"infinite ({lo_i}, {h}) but value_type is finite "
                         f"{vt_range}. Upstream affine rule may be missing or "
                         f"degenerate.",
                         stacklevel=2,
                     )
             b_hi[i] = float(h)
         else:
-            slope = h / (h - l)
+            slope = h / (h - lo_i)
             A_hi[i] = slope * inp_ab.A_hi[i]
-            b_hi[i] = slope * (inp_ab.b_hi[i] - l)
-            alpha = h / (h - l)
+            b_hi[i] = slope * (inp_ab.b_hi[i] - lo_i)
+            alpha = h / (h - lo_i)
             A_lo[i] = alpha * inp_ab.A_lo[i]
             b_lo[i] = alpha * inp_ab.b_lo[i]
 
@@ -234,7 +230,7 @@ def _relu_affine(inp_ab: AffineBound, warn_node: Node | None = None) -> AffineBo
     )
 
 
-def _relu_rule(node) -> AffineBound:
+def _relu_rule(node: ReLU) -> AffineBound:
     """ReLU per-component case analysis using linear envelope."""
     return _relu_affine(node.inputs[0]._affine_bound, warn_node=node.inputs[0])
 
@@ -279,11 +275,13 @@ def _swish_scalar(v: float) -> float:
 
 
 def _swish_interval(lo: float, hi: float) -> tuple:
-    """Exact range of swish over [lo, hi]: endpoints plus the interior
-    minimum when the interval contains swish's argmin.  (Swish decreases
-    until the argmin and increases after it, so the maximum is always at an
-    endpoint.)  Uses -C for the interior minimum — rounded below the true
-    minimum, keeping the range sound.
+    """Exact range of swish over [lo, hi].
+
+    Endpoints plus the interior minimum when the interval contains
+    swish's argmin.  (Swish decreases until the argmin and increases
+    after it, so the maximum is always at an endpoint.)  Uses -C for
+    the interior minimum — rounded below the true minimum, keeping
+    the range sound.
     """
     f_lo, f_hi = _swish_scalar(lo), _swish_scalar(hi)
     out_lo, out_hi = min(f_lo, f_hi), max(f_lo, f_hi)
@@ -299,14 +297,16 @@ def _bilinear_comb(
     s_ab: AffineBound,
     u_ab: AffineBound,
     lower: bool,
-):
-    """Per-lane affine under-estimator (``lower=True``) or over-estimator of
-    ``a_s*s + a_u*u + g``: route each coefficient to the factor's lower or
-    upper affine expression by sign — the same clamp-and-route logic as the
-    sign-split GEMM in :func:`_linear_affine`, per lane.
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Per-lane affine under- or over-estimator of ``a_s*s + a_u*u + g``.
+
+    ``lower=True`` selects the under-estimator, ``lower=False`` the
+    over-estimator: route each coefficient to the factor's lower or
+    upper affine expression by sign — the same clamp-and-route logic
+    as the sign-split GEMM in :func:`_linear_affine`, per lane.
     """
 
-    def pick(coef, ab):
+    def pick(coef: torch.Tensor, ab: AffineBound) -> tuple[torch.Tensor, torch.Tensor]:
         take_lo = (coef >= 0) if lower else (coef < 0)
         A = torch.where(take_lo.unsqueeze(1), ab.A_lo, ab.A_hi)
         b = torch.where(take_lo, ab.b_lo, ab.b_hi)
@@ -323,10 +323,10 @@ def _bilinear_comb(
 def _gated_lane_affine(
     s_ab: AffineBound, u_ab: AffineBound, s_iv: list, u_iv: list
 ) -> AffineBound:
-    """Affine bound on the per-lane product ``w = s * u`` (activated gate
-    times up projection).
+    """Affine bound on the per-lane product ``w = s * u``.
 
-    A product of two affine-bounded quantities is not affine, but given
+    ``s`` is the activated gate and ``u`` is the up projection.  A
+    product of two affine-bounded quantities is not affine, but given
     interval endpoints ``s in [sl, sh]``, ``u in [ul, uh]`` that hold
     pointwise, the four standard linear product relaxations (the McCormick
     inequalities) are::
@@ -372,7 +372,12 @@ def _gated_lane_affine(
         A[bad] = 0.0
         b[bad] = fill
 
-    def bound(A_lo, b_lo, A_hi, b_hi):
+    def bound(
+        A_lo: torch.Tensor,
+        b_lo: torch.Tensor,
+        A_hi: torch.Tensor,
+        b_hi: torch.Tensor,
+    ) -> AffineBound:
         return AffineBound(
             A_lo=A_lo,
             A_hi=A_hi,
@@ -401,9 +406,8 @@ def _gated_lane_affine(
     )
 
 
-def _ffn_rule(node) -> AffineBound:
-    """FFN: gate projection -> activation envelope -> (x up projection) ->
-    output projection.
+def _ffn_rule(node: FFN) -> AffineBound:
+    """FFN: gate projection, activation envelope, up projection, then output.
 
     The degenerate-ReLU form composes exactly the rules the mined
     ``Linear -> ReLU -> Linear`` chain applied across three nodes.  The
@@ -427,6 +431,9 @@ def _ffn_rule(node) -> AffineBound:
     if node.up_proj is None:
         lane_ab = act_ab
     else:
+        # FFN.__init__ enforces up_proj/up_bias both-or-neither, so up_bias
+        # is not None here (mypy can't see that cross-attribute invariant).
+        assert node.up_bias is not None
         up_W = node.up_proj.to(torch.float64).T
         up_c = node.up_bias.to(torch.float64)
         u_ab = _linear_affine(inp_ab, up_W, up_c)
@@ -509,7 +516,7 @@ def _apply_claim_to_bound(node: Node) -> None:
         )
 
 
-def _attn_rule(node) -> AffineBound:
+def _attn_rule(node: Attn) -> AffineBound:
     """Attn: propagate value bounds through V then O.
 
     Softmax produces convex-combination weights, so per-component
@@ -518,7 +525,7 @@ def _attn_rule(node) -> AffineBound:
     """
     value_ab = node.inputs[2]._affine_bound
     V = node.value_matrix.to(torch.float64)
-    O = node.output_matrix.to(torch.float64)
+    O_mat = node.output_matrix.to(torch.float64)
 
     V_plus = torch.clamp(V, min=0)
     V_minus = torch.clamp(V, max=0)
@@ -531,8 +538,8 @@ def _attn_rule(node) -> AffineBound:
         V_minus.T, value_ab.b_lo
     )
 
-    O_plus = torch.clamp(O, min=0)
-    O_minus = torch.clamp(O, max=0)
+    O_plus = torch.clamp(O_mat, min=0)
+    O_minus = torch.clamp(O_mat, max=0)
     A_lo = O_plus.T @ proj_A_lo + O_minus.T @ proj_A_hi
     b_lo = _safe_matvec(O_plus.T, proj_b_lo) + _safe_matvec(O_minus.T, proj_b_hi)
     A_hi = O_plus.T @ proj_A_hi + O_minus.T @ proj_A_lo
@@ -548,7 +555,7 @@ def _attn_rule(node) -> AffineBound:
     )
 
 
-def _embedding_rule(node) -> AffineBound:
+def _embedding_rule(node: Embedding) -> AffineBound:
     """Identity A-matrix with per-column min/max ranges from the embedding table."""
     import torch
 
@@ -593,10 +600,12 @@ def _apply_semantic_override(node: Node, semantic_ab: AffineBound | None) -> Non
         return
     propagated = node._affine_bound.to_scalar_range()
     semantic = semantic_ab.to_scalar_range()
-    assert semantic.lo <= propagated.hi and semantic.hi >= propagated.lo, (
+    disjoint_msg = (
         f"Semantic override on node {node.node_id} is disjoint from "
         f"propagated bound: semantic={semantic}, propagated={propagated}"
     )
+    assert semantic.lo <= propagated.hi, disjoint_msg
+    assert semantic.hi >= propagated.lo, disjoint_msg
     node._semantic_affine_override = semantic_ab
     node._affine_bound = semantic_ab
 
@@ -664,14 +673,14 @@ def _cond_gate_semantic_bound(
     b_hi = torch.zeros(d, dtype=torch.float64)
 
     for i in range(d):
-        l, h = intervals[i].lo, intervals[i].hi
-        if l >= 0:
+        lo, h = intervals[i].lo, intervals[i].hi
+        if lo >= 0:
             A_hi[i] = inp_ab.A_hi[i]
             b_hi[i] = inp_ab.b_hi[i]
         elif h <= 0:
             A_lo[i] = inp_ab.A_lo[i]
             b_lo[i] = inp_ab.b_lo[i]
-        elif math.isinf(l) or math.isinf(h):
+        elif math.isinf(lo) or math.isinf(h):
             if inp_node is not None:
                 vt_range = inp_node.value_type.value_range
                 if math.isfinite(vt_range.lo) and math.isfinite(vt_range.hi):
@@ -679,20 +688,20 @@ def _cond_gate_semantic_bound(
 
                     warnings.warn(
                         f"Node {inp_node.node_id}: cond_gate input affine "
-                        f"interval is infinite ({l}, {h}) but value_type is "
+                        f"interval is infinite ({lo}, {h}) but value_type is "
                         f"finite {vt_range}. Upstream affine rule may be "
                         f"missing or degenerate.",
                         stacklevel=2,
                     )
-            b_lo[i] = float(min(0, l))
+            b_lo[i] = float(min(0, lo))
             b_hi[i] = float(max(0, h))
         else:
-            s_hi = h / (h - l)
+            s_hi = h / (h - lo)
             A_hi[i] = s_hi * inp_ab.A_hi[i]
-            b_hi[i] = s_hi * (inp_ab.b_hi[i] - l)
-            s_lo = -l / (h - l)
+            b_hi[i] = s_hi * (inp_ab.b_hi[i] - lo)
+            s_lo = -lo / (h - lo)
             A_lo[i] = s_lo * inp_ab.A_lo[i]
-            b_lo[i] = s_lo * inp_ab.b_lo[i] + l * h / (h - l)
+            b_lo[i] = s_lo * inp_ab.b_lo[i] + lo * h / (h - lo)
 
     widen = c_tol * M
     b_lo -= widen
@@ -727,7 +736,7 @@ def _select_semantic_bound(
     ``rel_tolerance`` widens each hull side by ``rel_tolerance·|side|``
     (swish gate: the saturated gate is linear in the cond, so a cond off
     by δ mis-scales the winning branch by exactly δ·|actual value| —
-    the extreme scaled values are ``lo − δ·|lo|`` and ``hi + δ·|hi|``).
+    the extreme scaled values are ``lo - δ·|lo|`` and ``hi + δ·|hi|``).
     """
     import torch
 
@@ -850,16 +859,16 @@ def _compare_semantic_bound(
 
     intervals = inp_ab.to_interval()
     assert len(intervals) == 1
-    l, h = intervals[0].lo, intervals[0].hi
+    iv_lo, iv_hi = intervals[0].lo, intervals[0].hi
 
     lo = min(true_level, false_level)
     hi = max(true_level, false_level)
 
-    if l > thresh:
+    if iv_lo > thresh:
         if slack == 0.0:
             return AffineBound.constant(torch.tensor([true_level], dtype=torch.float64))
         return AffineBound.degenerate(1, lo=true_level - slack, hi=true_level + slack)
-    if h <= thresh:
+    if iv_hi <= thresh:
         if slack == 0.0:
             return AffineBound.constant(
                 torch.tensor([false_level], dtype=torch.float64)

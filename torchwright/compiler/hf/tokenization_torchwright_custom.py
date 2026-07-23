@@ -1,5 +1,6 @@
-"""``TorchwrightCustomTokenizer`` — a character-level tokenizer over a fixed
-vocabulary.
+"""``TorchwrightCustomTokenizer``: a character-level tokenizer.
+
+Operates over a fixed vocabulary.
 
 The vocabulary is a JSON list of tokens in id order (``vocab.json``), one
 entry per row of the model's embedding table. Every printable token is a
@@ -12,12 +13,17 @@ character pass, exactly as ``transformers`` does for any added token.
 from __future__ import annotations
 
 import json
-import os
 from pathlib import Path
 
 from transformers import PreTrainedTokenizer
 
 VOCAB_FILES_NAMES = {"vocab_file": "vocab.json"}
+
+# Default special-token spellings (not secrets — named to dodge bandit's
+# hardcoded-password heuristic on *_token-named parameters).
+_DEFAULT_UNK_SPELLING = "<unk>"
+_DEFAULT_BOS_SPELLING = "<bos>"
+_DEFAULT_EOS_SPELLING = "<eos>"
 
 
 class TorchwrightCustomTokenizer(PreTrainedTokenizer):
@@ -29,17 +35,16 @@ class TorchwrightCustomTokenizer(PreTrainedTokenizer):
     """
 
     vocab_files_names = VOCAB_FILES_NAMES
-    model_input_names = ["input_ids", "attention_mask"]
 
     def __init__(
         self,
         vocab_file: str | None = None,
         *,
-        unk_token: str = "<unk>",
-        bos_token: str | None = "<bos>",
-        eos_token: str | None = "<eos>",
+        unk_token: str = _DEFAULT_UNK_SPELLING,
+        bos_token: str | None = _DEFAULT_BOS_SPELLING,
+        eos_token: str | None = _DEFAULT_EOS_SPELLING,
         add_bos_token: bool = True,
-        **kwargs,
+        **kwargs: object,
     ) -> None:
         if vocab_file is None:
             raise ValueError(
@@ -57,7 +62,7 @@ class TorchwrightCustomTokenizer(PreTrainedTokenizer):
         # save_pretrained keeps; on reload it arrives here as a kwarg.
         prepend_bos = kwargs.pop("prepend_bos", None)
         if prepend_bos is not None:
-            add_bos_token = prepend_bos
+            add_bos_token = bool(prepend_bos)
         # Never prepend a bos that doesn't exist: a model with no bos passes
         # bos_token=None, and prepending its (None) id would inject None into
         # input_ids. Tie add_bos_token to bos actually being present.
@@ -83,7 +88,7 @@ class TorchwrightCustomTokenizer(PreTrainedTokenizer):
     def get_vocab(self) -> dict[str, int]:
         return {**self._token_to_id, **self.added_tokens_encoder}
 
-    def _tokenize(self, text: str, **kwargs) -> list[str]:
+    def _tokenize(self, text: str, **_kwargs: object) -> list[str]:
         # Character-level: each character is its own token. Special / added
         # tokens are split out by the base tokenize() before this is called.
         return list(text)
@@ -133,10 +138,8 @@ class TorchwrightCustomTokenizer(PreTrainedTokenizer):
     def save_vocabulary(
         self, save_directory: str, filename_prefix: str | None = None
     ) -> tuple[str]:
-        os.makedirs(save_directory, exist_ok=True)
+        Path(save_directory).mkdir(parents=True, exist_ok=True)
         prefix = (filename_prefix + "-") if filename_prefix else ""
-        vocab_path = os.path.join(
-            save_directory, prefix + VOCAB_FILES_NAMES["vocab_file"]
-        )
-        Path(vocab_path).write_text(json.dumps(self._tokens))
-        return (vocab_path,)
+        vocab_path = Path(save_directory) / (prefix + VOCAB_FILES_NAMES["vocab_file"])
+        vocab_path.write_text(json.dumps(self._tokens))
+        return (str(vocab_path),)

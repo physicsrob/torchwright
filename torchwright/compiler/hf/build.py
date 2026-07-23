@@ -10,7 +10,7 @@ import tempfile
 from contextlib import contextmanager
 from dataclasses import dataclass, replace
 from pathlib import Path
-from typing import Any, Literal, Union, cast
+from typing import TYPE_CHECKING, Any, Literal, cast
 
 import numpy as np
 
@@ -19,12 +19,14 @@ from torchwright.compiler.forward.compile import (
     rms_norm_width_supported,
 )
 from torchwright.compiler.token_model import (
+    CompiledLayerWeights,
     CompileHeader,
     CompileProfile,
     ReluLayerWeights,
     ScheduleProvenance,
     SwishLayerWeights,
     TokenModelSpec,
+    TokenModelWeights,
     build_token_weights,
     make_layer_callback,
     resolve_rope,
@@ -33,7 +35,19 @@ from torchwright.compiler.token_model import (
 from torchwright.compiler.utils import get_ancestor_nodes, resolve_n_heads
 from torchwright.graph import Embedding, Node
 
-HFArchitecture = Union[CompileProfile, str]
+if TYPE_CHECKING:
+    from collections.abc import Iterator, Sequence
+
+    import torch
+    from transformers import PreTrainedModel, PreTrainedTokenizerFast
+
+HFArchitecture = CompileProfile | str
+
+# Default special-token spellings (not secrets — named to dodge bandit's
+# hardcoded-password heuristic on *_token-named parameters).
+_DEFAULT_BOS_SPELLING = "<bos>"
+_DEFAULT_EOS_SPELLING = "<eos>"
+_DEFAULT_UNK_SPELLING = "<unk>"
 
 
 @dataclass(frozen=True)
@@ -71,49 +85,52 @@ def _validate_embedding_contract(output_node: Node, embedding: Embedding) -> Non
 def _remove_path(path: str) -> None:
     if not os.path.lexists(path):
         return
-    if os.path.isdir(path) and not os.path.islink(path):
-        shutil.rmtree(path)
+    p = Path(path)
+    if p.is_dir() and not p.is_symlink():
+        shutil.rmtree(p)
     else:
-        os.unlink(path)
+        p.unlink()
 
 
 @contextmanager
-def _staged_bundle_directory(output_dir):
+def _staged_bundle_directory(output_dir: str | os.PathLike) -> Iterator[str]:
     """Build beside ``output_dir`` and publish with rollback on failure."""
     destination = os.path.abspath(os.fspath(output_dir))
-    parent = os.path.dirname(destination)
-    os.makedirs(parent, exist_ok=True)
-    staging = tempfile.mkdtemp(
-        prefix=f".{os.path.basename(destination)}.staging-", dir=parent
-    )
+    parent = Path(destination).parent
+    parent.mkdir(parents=True, exist_ok=True)
+    staging = tempfile.mkdtemp(prefix=f".{Path(destination).name}.staging-", dir=parent)
     backup = staging + ".previous"
     try:
         yield staging
         if os.path.lexists(destination):
-            os.replace(destination, backup)
+            Path(destination).replace(backup)
         try:
-            os.replace(staging, destination)
+            Path(staging).replace(destination)
         except BaseException:
             if os.path.lexists(backup):
-                os.replace(backup, destination)
+                Path(backup).replace(destination)
             raise
         try:
             _remove_path(backup)
         except BaseException:
-            os.replace(destination, staging)
-            os.replace(backup, destination)
+            Path(destination).replace(staging)
+            Path(backup).replace(destination)
             _remove_path(staging)
             raise
     except BaseException:
         _remove_path(staging)
         if os.path.lexists(backup) and not os.path.lexists(destination):
-            os.replace(backup, destination)
+            Path(backup).replace(destination)
         raise
 
 
-def _write_generation_config(output_dir, bos_id, eos_id) -> None:
-    """Compiled vocabs carry no pad token: alias pad to eos so
-    ``generate()`` and ``pipeline()`` run without an explicit pad_token_id.
+def _write_generation_config(
+    output_dir: str | os.PathLike, bos_id: int | None, eos_id: int | None
+) -> None:
+    """Compiled vocabs carry no pad token.
+
+    Alias pad to eos so ``generate()`` and ``pipeline()`` run without an
+    explicit pad_token_id.
     """
     from transformers import GenerationConfig
 
@@ -122,7 +139,9 @@ def _write_generation_config(output_dir, bos_id, eos_id) -> None:
     ).save_pretrained(output_dir)
 
 
-def _validate_staged_bundle(directory, *, expect_tokenizer: bool) -> None:
+def _validate_staged_bundle(
+    directory: str | os.PathLike, *, expect_tokenizer: bool
+) -> None:
     """Validate bundle structure and tensor manifests without loading weights."""
     from safetensors import safe_open
     from transformers import AutoConfig, AutoTokenizer
@@ -175,7 +194,7 @@ def _validate_staged_bundle(directory, *, expect_tokenizer: bool) -> None:
             AutoTokenizer.from_pretrained(directory)
 
 
-def _token_id(vocab, token, kind):
+def _token_id(vocab: tuple[str, ...], token: str | None, kind: str) -> int | None:
     if token is None:
         return None
     if token not in vocab:
@@ -183,7 +202,9 @@ def _token_id(vocab, token, kind):
     return vocab.index(token)
 
 
-def _resolve_architecture(architecture, bias, rms_norm):
+def _resolve_architecture(
+    architecture: HFArchitecture, bias: bool | None, rms_norm: bool | None
+) -> CompileProfile:
     try:
         profile = CompileProfile(architecture)
     except ValueError:
@@ -201,7 +222,12 @@ def _resolve_architecture(architecture, bias, rms_norm):
     return profile
 
 
-def _target(activation: str, bias: bool, rms_norm: bool, architecture=None) -> str:
+def _target(
+    activation: str,
+    bias: bool,
+    rms_norm: bool,
+    architecture: HFArchitecture | None = None,
+) -> str:
     profile = CompileProfile(architecture)
     expected = profile.value
     actual = (
@@ -219,22 +245,26 @@ def _target(activation: str, bias: bool, rms_norm: bool, architecture=None) -> s
     return actual
 
 
-def _torch(arr):
+def _torch(arr: np.ndarray) -> torch.Tensor:
     import torch
 
     return torch.from_numpy(np.ascontiguousarray(arr, dtype=np.float32).copy())
 
 
 def build_fast_tokenizer(
-    vocab, *, bos_token="<bos>", eos_token="<eos>", add_bos_token=True
-):
+    vocab: Sequence[str],
+    *,
+    bos_token: str | None = _DEFAULT_BOS_SPELLING,
+    eos_token: str | None = _DEFAULT_EOS_SPELLING,
+    add_bos_token: bool = True,
+) -> PreTrainedTokenizerFast:
     from tokenizers import Regex, Tokenizer, decoders, pre_tokenizers, processors
     from tokenizers.models import WordLevel
     from transformers import PreTrainedTokenizerFast
 
     vocab_dict = {token: i for i, token in enumerate(vocab)}
-    unk = "<unk>" if "<unk>" in vocab_dict else None
-    tok = Tokenizer(WordLevel(vocab=vocab_dict, unk_token="<unk>"))
+    unk = _DEFAULT_UNK_SPELLING if _DEFAULT_UNK_SPELLING in vocab_dict else None
+    tok = Tokenizer(WordLevel(vocab=vocab_dict, unk_token=_DEFAULT_UNK_SPELLING))
     tok.pre_tokenizer = pre_tokenizers.Split(Regex(r"[\s\S]"), behavior="isolated")
     tok.decoder = decoders.Fuse()
     tok.add_special_tokens([t for t in (unk, bos_token, eos_token) if t is not None])
@@ -250,8 +280,13 @@ def build_fast_tokenizer(
 
 
 def save_hf_bundle(
-    model, vocab, output_dir, *, add_bos_token=True, write_tokenizer=True
-):
+    model: PreTrainedModel,
+    vocab: Sequence[str],
+    output_dir: str | os.PathLike,
+    *,
+    add_bos_token: bool = True,
+    write_tokenizer: bool = True,
+) -> PreTrainedModel:
     """Save a directly compiled model and its vocabulary as an HF bundle."""
     with _staged_bundle_directory(output_dir) as staging:
         _save_hf_bundle_into(
@@ -266,9 +301,14 @@ def save_hf_bundle(
 
 
 def _save_hf_bundle_into(
-    model, vocab, output_dir, *, add_bos_token=True, write_tokenizer=True
+    model: PreTrainedModel,
+    vocab: Sequence[str],
+    output_dir: str | os.PathLike,
+    *,
+    add_bos_token: bool = True,
+    write_tokenizer: bool = True,
 ) -> None:
-    os.makedirs(output_dir, exist_ok=True)
+    Path(output_dir).mkdir(parents=True, exist_ok=True)
     model.save_pretrained(output_dir)
     _write_generation_config(
         output_dir, model.config.bos_token_id, model.config.eos_token_id
@@ -289,11 +329,11 @@ def _save_hf_bundle_into(
 
         TorchwrightCustomConfig.register_for_auto_class()
         TorchwrightCustomForCausalLM.register_for_auto_class("AutoModelForCausalLM")
-        vocab_path = os.path.join(output_dir, "vocab.json")
-        with open(vocab_path, "w") as f:
+        vocab_path = Path(output_dir) / "vocab.json"
+        with vocab_path.open("w") as f:
             json.dump(list(vocab), f)
         tok = TorchwrightCustomTokenizer(
-            vocab_file=vocab_path,
+            vocab_file=str(vocab_path),
             bos_token=bos,
             eos_token=eos,
             add_bos_token=add_bos_token,
@@ -306,28 +346,28 @@ def _save_hf_bundle_into(
 def compile_hf_bundle(
     output_node: Node,
     embedding: Embedding,
-    output_dir,
+    output_dir: str | os.PathLike,
     *,
-    d=1024,
-    d_head=16,
-    n_heads=None,
-    max_seq_len=512,
-    max_layers=400,
-    optimize=0,
-    d_hidden=None,
-    trim_heads=True,
-    rms_norm=None,
-    rms_norm_eps=1e-5,
-    rms_norm_const_exp=None,
+    d: int = 1024,
+    d_head: int = 16,
+    n_heads: int | None = None,
+    max_seq_len: int = 512,
+    max_layers: int = 400,
+    optimize: int = 0,
+    d_hidden: int | None = None,
+    trim_heads: bool = True,
+    rms_norm: bool | None = None,
+    rms_norm_eps: float = 1e-5,
+    rms_norm_const_exp: int | None = None,
     architecture: HFArchitecture = "phi3",
     bias: bool | None = None,
-    bos_token="<bos>",
-    eos_token="<eos>",
-    verbose=False,
-    add_bos_token=True,
-    write_tokenizer=True,
-    _solver_seed=None,
-    _force_resolve=False,
+    bos_token: str | None = _DEFAULT_BOS_SPELLING,
+    eos_token: str | None = _DEFAULT_EOS_SPELLING,
+    verbose: bool = False,
+    add_bos_token: bool = True,
+    write_tokenizer: bool = True,
+    _solver_seed: int | None = None,
+    _force_resolve: bool = False,
 ) -> HFBundleReport:
     """Compile and transactionally publish a sharded safetensors HF bundle.
 
@@ -371,29 +411,29 @@ def compile_hf_bundle(
 def _compile_hf_bundle_into(
     output_node: Node,
     embedding: Embedding,
-    output_dir,
+    output_dir: str | os.PathLike,
     *,
-    d=1024,
-    d_head=16,
-    n_heads=None,
-    max_seq_len=512,
-    max_layers=400,
-    optimize=0,
-    d_hidden=None,
-    trim_heads=True,
-    rms_norm=None,
-    rms_norm_eps=1e-5,
-    rms_norm_const_exp=None,
+    d: int = 1024,
+    d_head: int = 16,
+    n_heads: int | None = None,
+    max_seq_len: int = 512,
+    max_layers: int = 400,
+    optimize: int = 0,
+    d_hidden: int | None = None,
+    trim_heads: bool = True,
+    rms_norm: bool | None = None,
+    rms_norm_eps: float = 1e-5,
+    rms_norm_const_exp: int | None = None,
     architecture: HFArchitecture = "phi3",
     bias: bool | None = None,
-    bos_token="<bos>",
-    eos_token="<eos>",
-    verbose=False,
-    add_bos_token=True,
-    write_tokenizer=True,
-    _solver_seed=None,
-    _force_resolve=False,
-):
+    bos_token: str | None = _DEFAULT_BOS_SPELLING,
+    eos_token: str | None = _DEFAULT_EOS_SPELLING,
+    verbose: bool = False,
+    add_bos_token: bool = True,
+    write_tokenizer: bool = True,
+    _solver_seed: int | None = None,
+    _force_resolve: bool = False,
+) -> HFBundleReport:
     """Compile directly to a sharded safetensors HF bundle.
 
     Each compiled layer is transformed directly into its final HF shard.
@@ -419,11 +459,11 @@ def _compile_hf_bundle_into(
 
     class DirectShardSink:
         def __init__(self) -> None:
-            self.meta: list[tuple[str, int, int, float, int]] = []
+            self.meta: list[tuple[str, int, int, float | None, int | None]] = []
             self.weight_map: dict[str, str] = {}
             self.total_size = 0
 
-        def begin(self, header) -> None:
+        def begin(self, header: CompileHeader) -> None:
             self.header = header
             if not header.layer_shapes:
                 raise RuntimeError("HF streaming requires announced layer shapes")
@@ -431,7 +471,7 @@ def _compile_hf_bundle_into(
             self.max_heads = max(shape.n_heads for shape in header.layer_shapes)
             self.max_hidden = max(shape.d_hidden for shape in header.layer_shapes)
 
-        def write_layer(self, index, layer) -> None:
+        def write_layer(self, index: int, layer: CompiledLayerWeights) -> None:
             a = layer.attention
             p = f"model.layers.{index}"
             if profile is CompileProfile.CUSTOM:
@@ -442,9 +482,9 @@ def _compile_hf_bundle_into(
                     f"{p}.self_attn.v_proj.weight": _torch(a.wv).T.contiguous(),
                     f"{p}.self_attn.o_proj.weight": _torch(a.wo).T.contiguous(),
                     f"{p}.mlp.fc1.weight": _torch(layer.w1).T.contiguous(),
-                    f"{p}.mlp.fc1.bias": _torch(layer.b1),
+                    f"{p}.mlp.fc1.bias": _torch(cast("np.ndarray", layer.b1)),
                     f"{p}.mlp.fc2.weight": _torch(layer.w2).T.contiguous(),
-                    f"{p}.mlp.fc2.bias": _torch(layer.b2),
+                    f"{p}.mlp.fc2.bias": _torch(cast("np.ndarray", layer.b2)),
                 }
                 kind = "relu"
             else:
@@ -452,7 +492,9 @@ def _compile_hf_bundle_into(
                 rows, inter = self.max_heads * d_head, self.max_hidden
                 q = (_torch(a.wq).T.double() * math.sqrt(float(d_head))).float()
 
-                def tpad(value, target_size, axis):
+                def tpad(
+                    value: torch.Tensor, target_size: int, axis: int
+                ) -> torch.Tensor:
                     shape = list(value.shape)
                     shape[axis] = target_size
                     out = torch.zeros(shape, dtype=torch.float32)
@@ -475,17 +517,17 @@ def _compile_hf_bundle_into(
                 }
                 kind = "swish"
             filename = f"model-{index + 1:05d}-of-{self.shard_count:05d}.safetensors"
-            save_file(sd, os.path.join(output_dir, filename))
+            save_file(sd, str(Path(output_dir) / filename))
             for name, value in sd.items():
                 self.weight_map[name] = filename
                 self.total_size += value.numel() * value.element_size()
             self.meta.append((kind, a.n_heads, layer.d_hidden, a.rope_base, a.d_rot))
 
-        def finalize(self, spec, weights) -> None:
+        def finalize(self, spec: TokenModelSpec, weights: TokenModelWeights) -> None:
             self.spec = spec
             self.token_weights = weights
 
-    os.makedirs(output_dir, exist_ok=True)
+    Path(output_dir).mkdir(parents=True, exist_ok=True)
     sink = DirectShardSink()
     with torch.no_grad():
         compiled = forward_compile(
@@ -513,10 +555,11 @@ def _compile_hf_bundle_into(
             machine=machine,
             _solver_seed=_solver_seed,
             _force_resolve=_force_resolve,
-            **(
+            **cast(
+                "dict[str, Any]",
                 {}
                 if rms_norm_const_exp is None
-                else {"rms_norm_const_exp": rms_norm_const_exp}
+                else {"rms_norm_const_exp": rms_norm_const_exp},
             ),
         )
         token = build_token_weights(compiled, output_node, embedding, d)
@@ -586,8 +629,12 @@ def _compile_hf_bundle_into(
             )
             config.architectures = ["TorchwrightCustomForCausalLM"]
             config.auto_map = {
-                "AutoConfig": "configuration_torchwright_custom.TorchwrightCustomConfig",
-                "AutoModelForCausalLM": "modeling_torchwright_custom.TorchwrightCustomForCausalLM",
+                "AutoConfig": (
+                    "configuration_torchwright_custom.TorchwrightCustomConfig"
+                ),
+                "AutoModelForCausalLM": (
+                    "modeling_torchwright_custom.TorchwrightCustomForCausalLM"
+                ),
             }
         else:
             from transformers import Phi3Config
@@ -650,23 +697,24 @@ def _compile_hf_bundle_into(
                 final_sd[f"{p}.input_layernorm.weight"] = _torch(gain)
                 final_sd[f"{p}.post_attention_layernorm.weight"] = _torch(gain)
         filename = f"model-{shard_count:05d}-of-{shard_count:05d}.safetensors"
-        save_file(final_sd, os.path.join(output_dir, filename))
+        save_file(final_sd, str(Path(output_dir) / filename))
         for name, value in final_sd.items():
             weight_map[name] = filename
             total_size += value.numel() * value.element_size()
-        with open(os.path.join(output_dir, "model.safetensors.index.json"), "w") as f:
+        index_path = Path(output_dir) / "model.safetensors.index.json"
+        with index_path.open("w") as f:
             json.dump(
                 {"metadata": {"total_size": total_size}, "weight_map": weight_map}, f
             )
 
     if target == "custom":
-        here = os.path.dirname(__file__)
+        here = Path(__file__).parent
         for name in (
             "configuration_torchwright_custom.py",
             "modeling_torchwright_custom.py",
             "tokenization_torchwright_custom.py",
         ):
-            shutil.copy2(os.path.join(here, name), os.path.join(output_dir, name))
+            shutil.copy2(here / name, Path(output_dir) / name)
     if write_tokenizer:
         if target == "phi3":
             build_fast_tokenizer(
@@ -678,12 +726,12 @@ def _compile_hf_bundle_into(
         else:
             from .tokenization_torchwright_custom import TorchwrightCustomTokenizer
 
-            vocab_path = os.path.join(output_dir, "vocab.json")
-            with open(vocab_path, "w") as f:
+            vocab_path = Path(output_dir) / "vocab.json"
+            with vocab_path.open("w") as f:
                 json.dump(list(vocab), f)
             TorchwrightCustomTokenizer.register_for_auto_class()
             TorchwrightCustomTokenizer(
-                vocab_file=vocab_path,
+                vocab_file=str(vocab_path),
                 bos_token=bos_token,
                 eos_token=eos_token,
                 add_bos_token=add_bos_token,
@@ -705,25 +753,25 @@ def compile_to_hf(
     output_node: Node,
     embedding: Embedding,
     *,
-    d=1024,
-    d_head=16,
-    n_heads=None,
-    max_seq_len=512,
-    max_layers=400,
-    optimize=0,
-    d_hidden=None,
-    trim_heads=True,
-    rms_norm=None,
-    rms_norm_eps=1e-5,
-    rms_norm_const_exp=None,
+    d: int = 1024,
+    d_head: int = 16,
+    n_heads: int | None = None,
+    max_seq_len: int = 512,
+    max_layers: int = 400,
+    optimize: int = 0,
+    d_hidden: int | None = None,
+    trim_heads: bool = True,
+    rms_norm: bool | None = None,
+    rms_norm_eps: float = 1e-5,
+    rms_norm_const_exp: int | None = None,
     architecture: HFArchitecture = "phi3",
     bias: bool | None = None,
-    bos_token="<bos>",
-    eos_token="<eos>",
-    verbose=False,
-    _solver_seed=None,
-    _force_resolve=False,
-):
+    bos_token: str | None = _DEFAULT_BOS_SPELLING,
+    eos_token: str | None = _DEFAULT_EOS_SPELLING,
+    verbose: bool = False,
+    _solver_seed: int | None = None,
+    _force_resolve: bool = False,
+) -> PreTrainedModel:
     """Compile directly into an fp32 eval-mode Hugging Face model.
 
     The default is stock ``Phi3ForCausalLM``. The custom implementation is
@@ -756,7 +804,7 @@ def compile_to_hf(
             _force_resolve=_force_resolve,
             write_tokenizer=False,
         )
-        with open(os.path.join(directory, "config.json")) as f:
+        with (Path(directory) / "config.json").open() as f:
             model_type = json.load(f)["model_type"]
         model: Any
         if model_type == "phi3":

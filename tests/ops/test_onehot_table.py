@@ -158,7 +158,7 @@ def test_tight_value_range_single():
     )
     r = out.value_type.value_range
     # Tight [min, max] over {values, default}; not map_to_table's wider
-    # default ± Σ|value − default| = -1 ± 32.
+    # default ± Σ|value - default| = -1 ± 32.
     assert r.lo == -1.0
     assert r.hi == 20.0
 

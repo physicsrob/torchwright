@@ -32,6 +32,7 @@ from __future__ import annotations
 import math
 import struct
 import sys
+from pathlib import Path
 
 import numpy as np
 
@@ -39,10 +40,13 @@ import numpy as np
 # whole rollout. max_positions in e1m1 is 61440.
 MAX_POSITIONS = 61440
 
+# One replay row: (query_pos, selected, decisive, cand_pos[], cand_clogit[]).
+Row = tuple[int, int, int, np.ndarray, np.ndarray]
 
-def load(path: str):
+
+def load(path: str) -> list[Row]:
     """Yield (query_pos, selected, decisive, cand_pos[], cand_clogit[])."""
-    with open(path, "rb") as fh:
+    with Path(path).open("rb") as fh:
         buf = fh.read()
     off = 0
     rows = []
@@ -67,12 +71,12 @@ SIGMA_W = 6e-8
 G_M = 2.0  # gain*amplitude; mid-sigmoid operating point
 
 
-def _sigmoid_prime(x):
+def _sigmoid_prime(x: float) -> float:
     s = 1.0 / (1.0 + np.exp(-x))
     return s * (1.0 - s)
 
 
-def build_readouts(max_pos: int, seed: int):
+def build_readouts(max_pos: int, seed: int) -> dict[str, tuple[np.ndarray, float]]:
     """Per-position stored recency signal R[k] under a SLOPE-AWARE noise model.
 
     Each scheme reads softmax weight(s) with fp32 noise SIGMA_W. The error in
@@ -97,7 +101,7 @@ def build_readouts(max_pos: int, seed: int):
     # read. A flip happens where the value-space gap between adjacent positions
     # is smaller than the noise -- i.e. where the readout's slope (in value
     # units) collapses. Gain 1.0: only the ordering matters for the tie-break.
-    def noisy(v, n_reads=1):
+    def noisy(v: np.ndarray, n_reads: int = 1) -> np.ndarray:
         e = sum(rng.normal(0.0, SIGMA_W, v.shape) for _ in range(n_reads))
         return v + e
 
@@ -127,7 +131,7 @@ def build_readouts(max_pos: int, seed: int):
     return out
 
 
-def replay(rows, R, G):
+def replay(rows: list[Row], R: np.ndarray, G: float) -> tuple[int, int, np.ndarray]:
     flips = 0
     dec_flips = 0
     flip_positions = []
@@ -142,7 +146,7 @@ def replay(rows, R, G):
     return flips, dec_flips, np.array(flip_positions)
 
 
-def margin_diagnostic(rows, R):
+def margin_diagnostic(rows: list[Row], R: np.ndarray) -> tuple[float, int | None, int]:
     """Deterministic, noiseless budget the readout R must preserve.
 
     For each selection the renderer chose `selected` (the most-recent key in

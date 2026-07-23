@@ -39,7 +39,7 @@ parse is ``O(1)`` depth at any operand width.
 
 The *answer* is trimmed (no leading zeros, MSB-first), even though the column
 arithmetic is fixed-width.  Each fixed-width answer digit is derived **once**
-into a **scratch-digit** region (plain ``0``–``9``, MSB-first); a streamed
+into a **scratch-digit** region (plain ``0``-``9``, MSB-first); a streamed
 **normalization sweep** then counts the leading zeros (one count glyph per
 answer column, reading each scratch digit's ``is_zero`` back at a static
 offset), and each answer slot reads the count ``L`` and **points** at the
@@ -61,7 +61,7 @@ Token protocol (rendered)::
 
 ``THINKING_START`` (``<THINKING>``) opens the scratch region; the work region
 holds the thinking glyphs — carry / borrow / verdict (superscripts, one per
-column), then the scratch answer digits (plain ``0``–``9``), then the
+column), then the scratch answer digits (plain ``0``-``9``), then the
 leading-zero count (subscripts, one per answer column); ``RESULT``
 (``</THINKING>``) separates scratch from answer; the answer region holds only
 digit tokens (and ``-`` for a negative difference); then ``<eos>``.  The two
@@ -159,10 +159,10 @@ __all__ = [
 
 
 def decode_steps(max_digits: int) -> int:
-    """**Worst-case** decode steps (emitted tokens, incl. ``THINKING_START`` /
-    ``RESULT`` / ``<eos>``) for ``max_digits``-wide operands.
+    """**Worst-case** decode steps for ``max_digits``-wide operands.
 
-    This is a max over the three per-op transcript lengths, and the multiply
+    Emitted tokens, incl. ``THINKING_START`` / ``RESULT`` / ``<eos>``.  This
+    is a max over the three per-op transcript lengths, and the multiply
     transcript is the longest (``8·max_digits + 3``: open, ``2n`` carry glyphs,
     ``2n`` scratch digits, ``2n`` normalization glyphs, close, up to ``2n``
     answer digits, ``<eos>``) — an add or subtract query emits its own
@@ -205,15 +205,17 @@ RESULT = "</THINKING>"
 
 
 def _thinking_text(k: int) -> str:
-    """Display string for the carry/borrow/verdict glyph carrying value ``k``
-    (e.g. ``"¹² "``).
+    """Display string for the carry/borrow/verdict glyph carrying value ``k``.
+
+    E.g. ``"¹² "``.
     """
     return str(k).translate(_SUP) + " "
 
 
 def _count_text(k: int) -> str:
-    """Display string for the normalization glyph carrying leading-zero count
-    ``k`` (e.g. ``"₁₂ "``).
+    """Display string for the normalization glyph carrying leading-zero count.
+
+    Carries count ``k`` (e.g. ``"₁₂ "``).
     """
     return str(k).translate(_SUB) + " "
 
@@ -277,12 +279,11 @@ def _digit_scalar(embedding: Embedding, digit_onehot: Node) -> Node:
 
 
 def _thinking_value(embedding: Embedding, token: Node, n_state: int) -> Node:
-    """Carry/borrow/verdict glyph embedding → the integer it carries (default
-    ``0``).
+    """Carry/borrow/verdict glyph embedding → the integer it carries.
 
-    Non-superscript tokens (digits, normalization glyphs, ``THINKING_START``,
-    ``RESULT``, …) map to ``0``, so a column whose preceding token is not a carry
-    glyph reads carry-in ``0``.
+    Default ``0``.  Non-superscript tokens (digits, normalization glyphs,
+    ``THINKING_START``, ``RESULT``, …) map to ``0``, so a column whose
+    preceding token is not a carry glyph reads carry-in ``0``.
     """
     return onehot_lookup(
         token,
@@ -295,12 +296,11 @@ def _thinking_value(embedding: Embedding, token: Node, n_state: int) -> Node:
 
 
 def _count_value(embedding: Embedding, token: Node, n_state: int) -> Node:
-    """Normalization glyph embedding → the leading-zero count it carries
-    (default ``0``).
+    """Normalization glyph embedding → the leading-zero count it carries.
 
-    The subscript twin of :func:`_thinking_value`: non-subscript tokens map to
-    ``0``, so a stray read of a carry glyph (or ``RESULT``) reads count ``0``
-    rather than a plausible-but-wrong integer.
+    Default ``0``.  The subscript twin of :func:`_thinking_value`:
+    non-subscript tokens map to ``0``, so a stray read of a carry glyph (or
+    ``RESULT``) reads count ``0`` rather than a plausible-but-wrong integer.
     """
     return onehot_lookup(
         token,
@@ -324,7 +324,7 @@ class _SeqLayout:
 
     The full list is ``[THINKING_START] + carry + scratch + norm + [RESULT] +
     answer + [<eos>]`` (see :func:`_assemble`).  The scratch region holds the
-    ``N`` fixed-width answer digits (MSB-first, plain ``0``–``9``), derived once;
+    ``N`` fixed-width answer digits (MSB-first, plain ``0``-``9``), derived once;
     the normalization sweep and the answer both read *it* (no re-derivation).
     Every cross-token read offset is the target list-index minus the emitting
     list-index plus one (the autoregressive shift — see :func:`_read_offset`),
@@ -350,14 +350,14 @@ class _SeqLayout:
 
 
 def _read_offset(target_idx: int, here_idx: int) -> int:
-    """``delta_pos`` for ``attend_to_offset(embedding, ...)`` so the token
-    emitted at list-index ``here_idx`` reads the token emitted at list-index
-    ``target_idx``.
+    """``delta_pos`` for ``attend_to_offset(embedding, ...)``.
 
-    The ``+1`` is the autoregressive shift: the raw input ``embedding`` at a
-    decode position holds the *previously* emitted token, so reading list-index
-    ``t`` from position ``h`` (which emits list element ``h``) means attending
-    ``t - (h - 1) = t - h + 1`` positions back.
+    So the token emitted at list-index ``here_idx`` reads the token emitted
+    at list-index ``target_idx``.  The ``+1`` is the autoregressive shift:
+    the raw input ``embedding`` at a decode position holds the *previously*
+    emitted token, so reading list-index ``t`` from position ``h`` (which
+    emits list element ``h``) means attending ``t - (h - 1) = t - h + 1``
+    positions back.
     """
     return target_idx - here_idx + 1
 
@@ -368,10 +368,10 @@ def _steps_since_newline(
     *,
     max_gap: int,
 ) -> Node:
-    """``pos - newline_pos`` (the decode-step index), via the bucket-1
-    near-marker count.
+    """``pos - newline_pos`` (the decode-step index).
 
-    The RoPE-native replacement for the old
+    Computed via the bucket-1 near-marker count.  The RoPE-native
+    replacement for the old
     ``pos.get_position_scalar() - pos.get_prev_value(pos_scalar, saw_newline)``:
     there is no absolute position counter under RoPE, but ``count_since_marker``
     recovers the bounded gap to a recent marker token directly.  The newline is
@@ -408,30 +408,31 @@ DigitFn = Callable[[int, int], Node]
 
 
 def _emit_from_total(
-    embedding: Embedding,
+    _embedding: Embedding,
     total: Node,
     table: dict[torch.Tensor, torch.Tensor],
     default: torch.Tensor,
     W: int,
 ) -> Node:
-    """Turn a column total (an integer ``0..W-1``) into a one-hot index, then
-    read off the emitted token via ``table`` — the carry-sweep idiom shared with
-    ``calculator_simple``'s multiply: ``in_range`` makes the one-hot,
-    ``onehot_lookup`` reads the table.
+    """Turn a column total into a one-hot index, then read off the emitted token.
+
+    ``total`` is an integer ``0..W-1``; the token is read via ``table`` — the
+    carry-sweep idiom shared with ``calculator_simple``'s multiply: ``in_range``
+    makes the one-hot, ``onehot_lookup`` reads the table.
     """
     onehot = bool_to_01(in_range(total, add_const(total, 1.0), W))
     return onehot_lookup(onehot, table, default)
 
 
 def _carry_sweep(embedding: Embedding, T: list[Node], W: int, n: int) -> list[Node]:
-    """Carry sweep over LSB-first column totals ``T`` → one thinking glyph per
-    column (each carrying that column's carry-out).
+    """Carry sweep over LSB-first column totals ``T``.
 
-    Column ``k`` forms ``total = T[k] + carry_in`` and emits its carry-out
-    (``total // 10``); the carry-in is read from the immediately-preceding
-    emitted token (the raw embedding at decode time); column 0 starts from a
-    literal 0.  ``W`` is one past the largest possible column total (carry-in
-    included).
+    Emits one thinking glyph per column (each carrying that column's
+    carry-out).  Column ``k`` forms ``total = T[k] + carry_in`` and emits
+    its carry-out (``total // 10``); the carry-in is read from the
+    immediately-preceding emitted token (the raw embedding at decode time);
+    column 0 starts from a literal 0.  ``W`` is one past the largest
+    possible column total (carry-in included).
     """
     embed = embedding.get_embedding
     n_state = _n_thinking(n)
@@ -458,11 +459,13 @@ def _carry_digit_fn(
     W: int,
     n: int,
 ) -> DigitFn:
-    """Closure deriving the addition/multiplication answer digit at MSB position
-    ``m`` (place-value column ``kc = len(T)-1-m``): ``total = T[kc] + carry_in``,
-    where the carry-in is the carry-out of column ``kc-1`` read from the carry
-    sweep at a statically-known offset.  Only ``total % 10`` (the digit) is
-    returned; the carry half lives in :func:`_carry_sweep`.
+    """Closure deriving the addition/multiplication answer digit at MSB position.
+
+    At MSB position ``m`` (place-value column ``kc = len(T)-1-m``):
+    ``total = T[kc] + carry_in``, where the carry-in is the carry-out of
+    column ``kc-1`` read from the carry sweep at a statically-known offset.
+    Only ``total % 10`` (the digit) is returned; the carry half lives in
+    :func:`_carry_sweep`.
     """
     embed = embedding.get_embedding
     n_state = _n_thinking(n)
@@ -493,14 +496,15 @@ def _stream_normalize(
     layout: _SeqLayout,
     N: int,
 ) -> list[Node]:
-    """Normalization sweep: MSB-first, one count glyph per answer column,
-    threading a single running leading-zero count.
+    """Normalization sweep.
 
-    The trick that lets one integer carry the whole state (no separate "still in
-    the run" flag): the count can equal the number of columns processed *only if
-    every one was zero*, so "still scanning leading zeros at column ``m``" is
-    exactly ``prev_count == m`` — a compare against a static threshold (the count
-    can never exceed ``m``).  Per column ``m`` (MSB index): read the previous
+    MSB-first, one count glyph per answer column, threading a single
+    running leading-zero count.  The trick that lets one integer carry the
+    whole state (no separate "still in the run" flag): the count can equal
+    the number of columns processed *only if every one was zero*, so "still
+    scanning leading zeros at column ``m``" is exactly ``prev_count == m``
+    — a compare against a static threshold (the count can never exceed
+    ``m``).  Per column ``m`` (MSB index): read the previous
     count from the immediately-preceding emitted glyph (``m == 0`` starts at 0),
     read this column's answer digit back from the **scratch region** at a static
     offset (only its ``is_zero`` is used), and increment the count iff still in
@@ -535,9 +539,9 @@ def _stream_normalize(
 def _read_count(
     rope: RopeConfig, embedding: Embedding, layout: _SeqLayout, here: int
 ) -> Node:
-    """The total leading-zero count ``L`` carried by the last normalization
-    glyph (``layout.norm_last``), read from the token emitted at list-index
-    ``here``.
+    """The total leading-zero count ``L`` carried by the last normalization glyph.
+
+    ``layout.norm_last``, read from the token emitted at list-index ``here``.
     """
     token = attend_to_offset(
         rope, embedding, delta_pos=_read_offset(layout.norm_last, here)
@@ -563,10 +567,10 @@ def _col_onehot(steps_since: Node, layout: _SeqLayout, N: int) -> Node:
     ``e_i``; everywhere else the column scalar lands outside ``[0, N)`` so the
     one-hot is all-zero (a key that matches no answer-slot query).  The column
     index is the decode-step index measured from the scratch region's start:
-    ``steps_since`` is ``pos − newline_pos`` (the bucket-1 near-marker count),
+    ``steps_since`` is ``pos - newline_pos`` (the bucket-1 near-marker count),
     and scratch digit ``i`` is the input at ``newline_pos + scratch_start + i +
     1`` (list element ``k`` is emitted at ``newline_pos + k`` and re-read one
-    position later), so ``col = steps_since − (scratch_start + 1)``.
+    position later), so ``col = steps_since - (scratch_start + 1)``.
 
     Deliberately **no** ``assert_integer`` on ``steps_since``/``col_scalar``:
     ``count_since_marker`` is a reciprocal approximation, accurate only to
@@ -643,9 +647,11 @@ def _build_carry_op(
     n: int,
     steps_since: Node,
 ) -> tuple[list[Node], list[Node]]:
-    """Carry-based op (addition / multiplication): carry sweep, scratch digits,
-    normalization sweep, pointer-gathered answer.  Returns ``(thinking, answer)``
-    where ``thinking`` is ``carry ++ scratch ++ norm``.
+    """Carry-based op (addition / multiplication).
+
+    Carry sweep, scratch digits, normalization sweep, pointer-gathered
+    answer.  Returns ``(thinking, answer)`` where ``thinking`` is
+    ``carry ++ scratch ++ norm``.
     """
     N = len(T)
     # Column totals are sums of digit-table lookups — genuinely integer.
@@ -675,8 +681,10 @@ def _add_op(
     n: int,
     steps_since: Node,
 ) -> tuple[list[Node], list[Node]]:
-    """Streamed addition.  ``num_cols = n + 1`` columns give the top carry a home;
-    the column total is just ``a_k + b_k``.
+    """Streamed addition.
+
+    ``num_cols = n + 1`` columns give the top carry a home; the column
+    total is just ``a_k + b_k``.
     """
     a_scalar = [_digit_scalar(embedding, d) for d in A]  # MSB-first
     b_scalar = [_digit_scalar(embedding, d) for d in B]
@@ -702,10 +710,12 @@ def _mul_op(
     n: int,
     steps_since: Node,
 ) -> tuple[list[Node], list[Node]]:
-    """Streamed multiplication.  The ``n²`` digit products and the per-column
-    number sums are ``calculator_simple``'s multiply steps 1–2 verbatim (all
-    ``O(1)`` depth); only the serial carry loop is replaced by the streamed
-    sweep.  ``num_cols = 2n``; a column total plus carry never exceeds ``20n``.
+    """Streamed multiplication.
+
+    The ``n²`` digit products and the per-column number sums are
+    ``calculator_simple``'s multiply steps 1-2 verbatim (all ``O(1)``
+    depth); only the serial carry loop is replaced by the streamed sweep.
+    ``num_cols = 2n``; a column total plus carry never exceeds ``20n``.
     """
     embed = embedding.get_embedding
 
@@ -719,7 +729,7 @@ def _mul_op(
     }
     default_product = torch.tensor([0.0, 0.0])
 
-    # Steps 1–2: drop each product's digits into their place-value columns and
+    # Steps 1-2: drop each product's digits into their place-value columns and
     # collect the (free) per-column number contributions.
     columns: list[list[Node]] = [[] for _ in range(2 * n)]
     for i in range(n):
@@ -749,12 +759,14 @@ def _sub_op(
     n: int,
     steps_since: Node,
 ) -> tuple[list[Node], list[Node]]:
-    """Streamed subtraction.  Three streamed thinking phases precede the answer:
+    """Streamed subtraction.
+
+    Three streamed thinking phases precede the answer:
 
     1. **comparison** (MSB-first) — a 3-state less/equal/greater verdict folded
        one column at a time, each column reading the prior verdict from the
        previous emitted token; the last (LSB) verdict is the overall ``A ≥ B``.
-    2. **borrow sweep** (LSB-first) — ``|A − B|`` by a borrow fold over
+    2. **borrow sweep** (LSB-first) — ``|A - B|`` by a borrow fold over
        ``bigger_k = (a_k if A≥B else b_k)`` / ``smaller_k``.
     3. **normalization** (MSB-first) — the leading-zero count of the magnitude.
 
@@ -816,7 +828,7 @@ def _sub_op(
     borrow_start = layout.carry_start + n  # borrow[k] at borrow_start + k
 
     # Read the final verdict (at ``verdict_last``) from list-index ``here``,
-    # sharpened to a clean ±1 A≥B boolean (less → −1, equal/greater → +1).
+    # sharpened to a clean ±1 A≥B boolean (less → -1, equal/greater → +1).
     def a_ge_b_at(here: int) -> Node:
         token = attend_to_offset(
             rope, embedding, delta_pos=_read_offset(verdict_last, here)
@@ -833,12 +845,14 @@ def _sub_op(
         return compare(score, thresh=0.0, true_level=1.0, false_level=-1.0)
 
     # --- borrow phase: LSB-first borrow fold on bigger/smaller.  A shifted
-    # column total (bigger − smaller − borrow_in + 10) ∈ 0..19 makes both the
+    # column total (bigger - smaller - borrow_in + 10) ∈ 0..19 makes both the
     # borrow-out (1 if total < 10) and the digit (total % 10) one table lookup. ---
+    _decimal_base = 10
     borrow_table = {
-        _state(t, W): embed(_thinking_text(1 if t < 10 else 0)) for t in range(W)
+        _state(t, W): embed(_thinking_text(1 if t < _decimal_base else 0))
+        for t in range(W)
     }
-    digit_table = {_state(t, W): embed(str(t % 10)) for t in range(W)}
+    digit_table = {_state(t, W): embed(str(t % _decimal_base)) for t in range(W)}
     prev_borrow = _thinking_value(embedding, embedding, n_state)  # offset 0
 
     def shifted_total(bigger: Node, smaller: Node, borrow_in: Node) -> Node:
@@ -898,10 +912,10 @@ def _sub_op(
 def _assemble(
     embedding: Embedding, thinking: list[Node], answer: list[Node]
 ) -> list[Node]:
-    """Wrap a (thinking, answer) pair into the full emitted token list:
-    ``[THINKING_START] + thinking + [RESULT] + answer + [<eos>]``.
+    """Wrap a (thinking, answer) pair into the full emitted token list.
 
-    The seq-index layout this produces (``THINKING_START`` at 0, ``thinking[k]``
+    ``[THINKING_START] + thinking + [RESULT] + answer + [<eos>]``.  The
+    seq-index layout this produces (``THINKING_START`` at 0, ``thinking[k]``
     at ``1+k``, ``RESULT`` at ``1+len(thinking)``, ``answer[m]`` at
     ``2+len(thinking)+m``) is exactly what each op's :class:`_SeqLayout`
     encodes, so every read offset lines up by construction.
@@ -925,8 +939,9 @@ def _emit_by_slot_index(
 ) -> Node:
     """Autoregressive emission gated by the exact integer step counter.
 
-    A drop-in replacement for :func:`~torchwright.ops.swiglu.sequence_ops.output_sequence`
-    that avoids ``attend_to_offset`` for the slot-index gating — the same helper
+    A drop-in replacement for
+    :func:`~torchwright.ops.swiglu.sequence_ops.output_sequence` that avoids
+    ``attend_to_offset`` for the slot-index gating — the same helper
     ``sort_digits_v1`` carries, lifted here for the same
     reason.  ``output_sequence`` gates slot ``k`` with
     ``attend_to_offset(is_trigger, delta_pos=-k)``; at an early emit position the

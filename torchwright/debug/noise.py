@@ -14,6 +14,7 @@ See ``docs/numerical_noise.md`` for the methodology this module implements.
 from __future__ import annotations
 
 import ast
+import math
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
@@ -306,4 +307,4 @@ def _fmt(x: float) -> str:
 
 
 def _is_nan(x: float) -> bool:
-    return x != x
+    return math.isnan(x)

@@ -209,9 +209,10 @@ def test_compile_sum_nodes():
 
 
 def test_compile_cond_gate():
-    """cond_gate — a gating op built on FFNs (linear_relu_linear).
+    """Test cond_gate — a gating op built on FFNs (linear_relu_linear).
 
-    cond_gate(cond, inp) = cond_add_vector(cond, ffn(cond_add_vector(cond, inp, ...)), ...)
+    cond_gate(cond, inp) =
+        cond_add_vector(cond, ffn(cond_add_vector(cond, inp, ...)), ...)
     """
     cond = create_input("cond", 1, value_range=(-1.0, 1.0))
     inp = create_input("inp", 4, value_range=(-4.0, 4.0))
@@ -229,9 +230,10 @@ def test_compile_cond_gate():
 
 
 def test_compile_get_prev_value():
-    """get_prev_value() — most recent value where cond was true, ranked by the
-    intrinsic rotary recency lobe (compiled == oracle; both apply the same
-    rotation).
+    """Test get_prev_value(): most recent value where cond was true.
+
+    Ranked by the intrinsic rotary recency lobe (compiled == oracle; both
+    apply the same rotation).
     """
     rope = _rope()
     v = create_input("v", 4)
@@ -400,9 +402,7 @@ def test_compile_multi_switch_shared_constants():
     real_values = [create_literal_value(torch.randn(4)) for _ in range(3)]
 
     # Multiple switches sharing the same zero placeholder — like the calculator
-    results = []
-    for i in range(3):
-        results.append(switch([c1, c2, c3], [real_values[i], zero, zero]))
+    results = [switch([c1, c2, c3], [real_values[i], zero, zero]) for i in range(3)]
 
     out = sum_nodes(results)
 
@@ -565,9 +565,11 @@ def test_compile_rejects_d_qk_too_large():
     ids=["exact_divisible", "with_remainder"],
 )
 def test_compile_split_vo(d_v):
-    """V/O split across heads.  Q/K are full-width d_qk == d_head (16): every
-    head is rotary on the global grid, so the V/O split is the only thing that
-    varies here (d_v=32 -> 2 heads exact; d_v=48 -> 3 heads, last chunk padded).
+    """Test the V/O split across heads with full-width Q/K (d_qk == d_head == 16).
+
+    Every head is rotary on the global grid, so the V/O split is the only
+    thing that varies here (d_v=32 -> 2 heads exact; d_v=48 -> 3 heads, last
+    chunk padded).
     """
     x = create_input("x", 8)
     out = _build_attn(x, x, x, d_qk=D_HEAD, d_v=d_v, d_out=8)
@@ -680,9 +682,10 @@ def test_compile_attend_argmax_dot():
 
 
 def _width_starved_out():
-    """8 chains x -> Li(12 cols) -> {Ma_i, Mb_i}; at d=48 the Li's cannot
-    coexist.  Same fixture as tests/compile/forward/test_cpsat_intralayer.py;
-    the Ma's are grouped before the Mb's so no two adjacent concat leaves share
+    """Build 8 chains x -> Li(12 cols) -> {Ma_i, Mb_i}; at d=48 the Li's cannot coexist.
+
+    Same fixture as tests/compile/forward/test_cpsat_intralayer.py; the
+    Ma's are grouped before the Mb's so no two adjacent concat leaves share
     an input (which the sibling fold would merge, unravelling the starvation).
     """
     torch.manual_seed(0)
@@ -698,9 +701,9 @@ def _width_starved_out():
 
 
 def test_no_progress_names_the_out_of_budget_nodes():
-    """Residual-column exhaustion: the only deadlock a correct compiler can
-    reach.  The message must name a starved node, its column demand, and how
-    many columns were actually free.
+    """Name the starved node, its column demand, and free count on residual exhaustion.
+
+    The only deadlock a correct compiler can reach.
     """
     with pytest.raises(RuntimeError, match="No progress") as exc:
         forward_compile(
@@ -721,9 +724,11 @@ def test_no_progress_names_the_out_of_budget_nodes():
 
 
 def test_no_progress_names_an_ffn_too_wide_for_the_mlp():
-    """An FFN's only realization class is the MLP composite, so `n_lanes`
+    """Report an over-wide FFN as a geometry problem, not a compiler bug.
+
+    An FFN's only realization class is the MLP composite, so `n_lanes`
     beyond a layer's usable hidden pool is unschedulable at any layer and no
-    routing rule can rescue it.  That is a geometry problem, not a bug.
+    routing rule can rescue it.
     """
     torch.manual_seed(0)
     x = create_input("x", 4, value_range=(-1.0, 1.0))
@@ -753,17 +758,17 @@ def test_no_progress_names_an_ffn_too_wide_for_the_mlp():
 
 
 def test_no_progress_calls_a_misrouted_linear_a_compiler_bug(monkeypatch):
-    """A standalone Linear has two realization classes.  If it lands in the MLP
-    bypass without room for its `2 * d_output` slots, the routing rule failed —
-    that is a compiler bug (D1), and the message has to say so rather than
-    read like the geometry is too small.
+    """Report a misrouted Linear that overflows the MLP bypass as a compiler bug (D1).
 
-    Reached by defeating `fits_mlp`, the capacity check that makes this
-    unreachable on the real code path.
+    If it lands in the MLP bypass without room for its `2 * d_output`
+    slots, the routing rule failed, and the message has to say so rather
+    than read like the geometry is too small. Reached by defeating
+    `fits_mlp`, the capacity check that makes this unreachable on the real
+    code path.
     """
     from torchwright.compiler import realization
 
-    monkeypatch.setattr(realization, "fits_mlp", lambda node, usable: True)
+    monkeypatch.setattr(realization, "fits_mlp", lambda _node, _usable: True)
 
     torch.manual_seed(0)
     x = create_input("x", 4, value_range=(-1.0, 1.0))
@@ -787,8 +792,9 @@ def test_no_progress_calls_a_misrouted_linear_a_compiler_bug(monkeypatch):
 
 
 def test_no_progress_truncation_says_how_many_it_dropped():
-    """A DOOM-scale deadlock would list hundreds of starved nodes.  The
-    transient section caps the list — and says what it left out.
+    """Cap the starved-node list and say what it left out on a DOOM-scale deadlock.
+
+    A DOOM-scale deadlock would list hundreds of starved nodes.
     """
     with pytest.raises(RuntimeError, match="No progress") as exc:
         forward_compile(

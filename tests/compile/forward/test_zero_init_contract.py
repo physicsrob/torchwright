@@ -15,8 +15,8 @@ column with no dirty cancel to catch it — this test is the guard.
 Reads the ONNX file directly (no onnxruntime), so it runs locally.
 """
 
-import os
 import tempfile
+from pathlib import Path
 
 import onnx
 from onnx import numpy_helper
@@ -60,8 +60,10 @@ def _embed_table_nonzero_columns(onnx_path: str, d: int) -> set:
 
 
 def _layer0_seeded_columns(output_node) -> set:
-    """The residual columns allocated at layer-0 entry (input nodes + the
-    const-1 self-match column) — the only columns the embed-table may seed.
+    """The residual columns allocated at layer-0 entry.
+
+    Input nodes plus the const-1 self-match column — the only columns the
+    embed-table may seed.
 
     Taken from the same deterministic ``forward_compile`` the ONNX exporter
     runs; the layer-0 allocation happens before any scheduling, so it is
@@ -85,16 +87,18 @@ def _layer0_seeded_columns(output_node) -> set:
 
 
 def test_token_onnx_embed_table_zeroes_free_pool_columns():
-    """Every free-pool column (the ones the scheduler allocates for
-    intermediate / output nodes assuming zero-init) is zero in the ONNX
-    embed-table.  ``rms_norm=False`` so there are no reserved constant columns
-    to complicate the seedable set (embedding + const-1 only).
+    """Every free-pool column is zero in the ONNX embed-table.
+
+    A free-pool column is one the scheduler allocates for intermediate /
+    output nodes assuming zero-init. ``rms_norm=False`` so there are no
+    reserved constant columns to complicate the seedable set (embedding +
+    const-1 only).
     """
     output_node, embedding = _adder_token_parts()
     seeded = _layer0_seeded_columns(output_node)
 
     with tempfile.TemporaryDirectory() as tmpdir:
-        onnx_path = os.path.join(tmpdir, "model.onnx")
+        onnx_path = str(Path(tmpdir) / "model.onnx")
         compile_to_onnx(
             output_node,
             embedding,
@@ -120,12 +124,14 @@ def test_token_onnx_embed_table_zeroes_free_pool_columns():
 
 
 def test_token_onnx_embed_table_is_not_trivially_empty():
-    """Guard the guard: the embedding + const-1 columns really are seeded, so
-    the zero-check above is meaningful and not passing on an all-zero table.
+    """Guard the guard.
+
+    The embedding + const-1 columns really are seeded, so the zero-check
+    above is meaningful and not passing on an all-zero table.
     """
     output_node, embedding = _adder_token_parts()
     with tempfile.TemporaryDirectory() as tmpdir:
-        onnx_path = os.path.join(tmpdir, "model.onnx")
+        onnx_path = str(Path(tmpdir) / "model.onnx")
         compile_to_onnx(
             output_node,
             embedding,

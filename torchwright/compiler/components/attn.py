@@ -1,11 +1,11 @@
 import torch
-import torch.nn.functional as F
+import torch.nn.functional as nnf
 from torch.nn.attention import SDPBackend, sdpa_kernel
 
 from torchwright.compiler.components.component import Component
 from torchwright.graph.rope import ROPE_BASE, apply_rope, rope_cos_sin
 
-# F.scaled_dot_product_attention's default backend on A100 with fp32
+# nnf.scaled_dot_product_attention's default backend on A100 with fp32
 # inputs is EFFICIENT_ATTENTION, which on some inputs perturbs V by
 # 1 fp32 mantissa-LSB in the away-from-zero direction.  Trigger
 # condition is mantissa-pattern-dependent (not a clean magnitude or
@@ -63,12 +63,14 @@ class AttnLayerComponent(Component):
     def _apply_rope(
         self, Q: torch.Tensor, K: torch.Tensor, positions: torch.Tensor
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Rotate Q/K of every head by ``positions`` (rotate_half over the rotary
-        front ``rope_d_rot``; the last ``d_head - rope_d_rot`` dims pass through
-        unrotated — the NoPE tail).  Q/K are ``(n_heads, P, d_head)``;
-        ``positions`` is ``(P,)`` of absolute positions.  ``apply_rope`` reads the
-        rotary width from ``cos`` and slices; unused (all-zero) heads rotate
-        harmlessly (zeros stay zero).
+        """Rotate Q/K of every head by ``positions`` (rotate_half over the rotary span).
+
+        The rotary front is ``rope_d_rot`` wide; the last
+        ``d_head - rope_d_rot`` dims pass through unrotated — the NoPE
+        tail.  Q/K are ``(n_heads, P, d_head)``; ``positions`` is ``(P,)``
+        of absolute positions.  ``apply_rope`` reads the rotary width from
+        ``cos`` and slices; unused (all-zero) heads rotate harmlessly
+        (zeros stay zero).
         """
         d_rot = self.d_head if self.rope_d_rot is None else self.rope_d_rot
         cos, sin = rope_cos_sin(positions, d_rot, self.rope_base)  # (P, d_rot)
@@ -76,7 +78,7 @@ class AttnLayerComponent(Component):
         sin = sin.to(Q.dtype)
         return apply_rope(Q, cos, sin), apply_rope(K, cos, sin)
 
-    def forward(self, inp: torch.Tensor):
+    def forward(self, inp: torch.Tensor) -> torch.Tensor:
         # inp shape (n_pos, d)
         assert inp.shape[1] == self.d
 
@@ -96,7 +98,7 @@ class AttnLayerComponent(Component):
         # upper-triangular mask for causal prefill.
         # Shape: (n_heads, n_pos, d_head) → unsqueeze batch → squeeze back.
         with sdpa_kernel(_SDPA_BACKEND):
-            weighted = F.scaled_dot_product_attention(
+            weighted = nnf.scaled_dot_product_attention(
                 Q.unsqueeze(0),
                 K.unsqueeze(0),
                 V.unsqueeze(0),
@@ -163,7 +165,7 @@ class AttnLayerComponent(Component):
             ).tril()
             attn_mask = torch.cat([past_visible, new_block], dim=1)
             with sdpa_kernel(_SDPA_BACKEND):
-                weighted = F.scaled_dot_product_attention(
+                weighted = nnf.scaled_dot_product_attention(
                     Q.unsqueeze(0),
                     K.unsqueeze(0),
                     V.unsqueeze(0),
@@ -172,7 +174,7 @@ class AttnLayerComponent(Component):
                 ).squeeze(0)
         else:
             with sdpa_kernel(_SDPA_BACKEND):
-                weighted = F.scaled_dot_product_attention(
+                weighted = nnf.scaled_dot_product_attention(
                     Q.unsqueeze(0),
                     K.unsqueeze(0),
                     V.unsqueeze(0),

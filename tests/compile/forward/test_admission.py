@@ -24,7 +24,7 @@ def _linear(inp, d_out, name=""):
 def _build_sibling_chain_graph(n_branches=8, branch_width=64):
     """Graph with many parallel wide chains feeding one Concatenate.
 
-    shared_in → N × [Linear(→branch_width) → Linear(→3)] → Concatenate
+    shared_in → N x [Linear(→branch_width) → Linear(→3)] → Concatenate
     """
     shared_in = create_input("shared", 1)
     terminals = []

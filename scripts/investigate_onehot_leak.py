@@ -32,17 +32,23 @@ Run locally:         ../.venv/bin/python -m scripts.investigate_onehot_leak
 Cross-host (Modal):  make modal-run MODULE=scripts.investigate_onehot_leak CPU_ONLY=1
 """
 
+from __future__ import annotations
+
+from typing import TYPE_CHECKING, Self
+
 import torch
 
 import torchwright.ops.swiglu.map_select as _map_select
 import torchwright.ops.swiglu.onehot_table as _onehot_table
-from torchwright.graph import Node
 from torchwright.graph.node import suppress_checks
 from torchwright.ops._math import _lookup_numeric_slack
 from torchwright.ops.inout_nodes import create_input
 from torchwright.ops.linear import add_const, bool_to_01, concat
 from torchwright.ops.swiglu.map_select import in_range
 from torchwright.ops.swiglu.onehot_table import onehot_lookup
+
+if TYPE_CHECKING:
+    from torchwright.graph import Node
 
 N_SLOTS = 61  # max_total + 1 for the 3-digit multiply (20*n, n=3)
 
@@ -61,18 +67,25 @@ def _f32(x: float) -> torch.Tensor:
 # ---------------------------------------------------------------------------
 
 
-def _patched_scale(value: float | None):
-    class _Ctx:
-        def __enter__(self):
-            self.saved = (_map_select.scale, _onehot_table.scale)
-            if value is not None:
-                _map_select.scale = value
-                _onehot_table.scale = value
+class _ScaleCtx:
+    def __init__(self, value: float | None) -> None:
+        self._value = value
+        self.saved: tuple[float, float] | None = None
 
-        def __exit__(self, *exc):
-            _map_select.scale, _onehot_table.scale = self.saved
+    def __enter__(self) -> Self:
+        self.saved = (_map_select.scale, _onehot_table.scale)
+        if self._value is not None:
+            _map_select.scale = self._value
+            _onehot_table.scale = self._value
+        return self
 
-    return _Ctx()
+    def __exit__(self, *exc: object) -> None:
+        assert self.saved is not None
+        _map_select.scale, _onehot_table.scale = self.saved
+
+
+def _patched_scale(value: float | None) -> _ScaleCtx:
+    return _ScaleCtx(value)
 
 
 def build_carry_chain(scale_override: float | None) -> dict[str, Node]:
@@ -181,11 +194,9 @@ def sweep_carry(
 def sweep_times_table(
     nodes: dict[str, Node], deltas: list[float], device: torch.device
 ) -> dict[str, torch.Tensor]:
-    rows: list[tuple[int, int, float]] = []
-    for da in range(10):
-        for db in range(10):
-            for d in deltas:
-                rows.append((da, db, d))
+    rows: list[tuple[int, int, float]] = [
+        (da, db, d) for da in range(10) for db in range(10) for d in deltas
+    ]
     a = torch.tensor([r[0] + r[2] for r in rows], dtype=torch.float32).unsqueeze(1)
     b = torch.tensor([float(r[1]) for r in rows], dtype=torch.float32).unsqueeze(1)
     n = len(rows)

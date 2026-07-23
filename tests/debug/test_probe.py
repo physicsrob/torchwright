@@ -21,12 +21,13 @@ from torchwright.ops.linear import add_const, multiply_const
 
 
 def test_reference_eval_matches_direct_compute_tiny():
-    """Build a tiny graph (small enough that unmemoised direct compute
-    is fast) and check that ``reference_eval`` returns exactly the same
-    top-level value as ``output_node.compute``.  Also checks that the
-    class-level ``compute`` monkey-patches are restored cleanly: a
-    second unmemoised compute after reference_eval must still produce
-    the identical tensor.
+    """Check that ``reference_eval`` returns the same value as ``output_node.compute``.
+
+    Build a tiny graph (small enough that unmemoised direct compute is
+    fast) for the comparison. Also checks that the class-level
+    ``compute`` monkey-patches are restored cleanly: a second
+    unmemoised compute after reference_eval must still produce the
+    identical tensor.
     """
     from torchwright.graph.misc import InputNode
     from torchwright.ops.linear import add, add_const, multiply_const
@@ -61,8 +62,10 @@ def test_reference_eval_matches_direct_compute_tiny():
 
 
 def test_probe_residual_reads_intermediate_node():
-    """Compile a tiny chain and confirm ``probe_residual`` reports the
-    intermediate node's value at the layer that materialises it.
+    """Compile a tiny chain and confirm ``probe_residual`` reports the right value.
+
+    That value is the intermediate node's value at the layer that
+    materialises it.
 
     Graph: y = 3*x, z = y + 1.  Compile with output [z, y], probe y.
     (y is also an output leaf so it has two consumers — otherwise the
@@ -99,11 +102,12 @@ def test_probe_residual_reads_intermediate_node():
 
 
 def test_probe_attention_captures_softmax_weights():
-    """Build a tiny single-Attn graph, compile, and confirm
-    ``probe_attention`` returns per-head softmax weights that sum to
-    one, with at least one non-trivial top contributor at the queried
-    row.  This exercises the monkey-patch + forward path end-to-end on
-    a graph small enough that layer-hosting lookup is unambiguous.
+    """Confirm ``probe_attention`` returns per-head softmax weights that sum to one.
+
+    Build a tiny single-Attn graph and compile it for the check, with at
+    least one non-trivial top contributor at the queried row. This
+    exercises the monkey-patch + forward path end-to-end on a graph
+    small enough that layer-hosting lookup is unambiguous.
     """
     x = create_input("x", 4)
     torch.manual_seed(0)
@@ -148,8 +152,9 @@ def test_probe_attention_captures_softmax_weights():
 
 
 def test_probe_layer_diff_drift_and_sentinel():
-    """Compile y = 3*x, sample at multiple positions, and verify
-    ``probe_layer_diff``:
+    """Compile y = 3*x, sample at multiple positions, and verify ``probe_layer_diff``.
+
+    It:
 
     * reports ``first_drift_layer is None`` when given the correct
       reference (no drift beyond tolerance),

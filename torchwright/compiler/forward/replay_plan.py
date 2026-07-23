@@ -1,9 +1,9 @@
 """Immutable physical plans produced by directed schedule realization."""
 
-from collections.abc import Mapping
+from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 from numbers import Integral
-from typing import TYPE_CHECKING, Literal, Union, cast
+from typing import TYPE_CHECKING, Literal, SupportsInt, cast
 
 from torchwright.compiler.forward.cpsat_scheduler import ScheduleAssignment
 from torchwright.compiler.realization import linear_attn_live_heads
@@ -12,23 +12,26 @@ from torchwright.compiler.utils import resolve_n_heads
 from torchwright.graph import Node
 
 if TYPE_CHECKING:
+    from torchwright.compiler.forward.scheduler import _AttentionOp, _MlpOp
     from torchwright.graph import Attn
 
 
-def _freeze_ints(value, field_name: str) -> tuple[int, ...]:
+def _freeze_ints(value: Iterable[object], field_name: str) -> tuple[int, ...]:
     try:
         frozen = tuple(value)
     except TypeError as exc:
         raise TypeError(f"{field_name} must be an iterable of integers") from exc
     if any(not isinstance(item, Integral) or isinstance(item, bool) for item in frozen):
         raise TypeError(f"{field_name} must contain only integers")
-    result = tuple(int(item) for item in frozen)
+    result = tuple(int(cast("SupportsInt", item)) for item in frozen)
     if any(item < 0 for item in result):
         raise ValueError(f"{field_name} cannot contain negative indices")
     return result
 
 
-def _freeze_node_indices(value, field_name: str, *, sort: bool) -> "NodeIndices":
+def _freeze_node_indices(
+    value: Iterable[object], field_name: str, *, sort: bool
+) -> "NodeIndices":
     try:
         items = tuple(value)
     except TypeError as exc:
@@ -37,8 +40,9 @@ def _freeze_node_indices(value, field_name: str, *, sort: bool) -> "NodeIndices"
         ) from exc
     frozen: list[tuple[int, tuple[int, ...]]] = []
     seen: set[int] = set()
+    pair_len = 2
     for item in items:
-        if not isinstance(item, (tuple, list)) or len(item) != 2:
+        if not isinstance(item, (tuple, list)) or len(item) != pair_len:
             raise TypeError(f"{field_name} entries must be (node_id, indices) pairs")
         node_id, indices = item
         if not isinstance(node_id, Integral) or isinstance(node_id, bool):
@@ -54,13 +58,15 @@ def _freeze_node_indices(value, field_name: str, *, sort: bool) -> "NodeIndices"
 
 
 def _check_reuse_input_index(
-    op_type: str, index, reuse_op_types: tuple[str, ...]
+    op_type: str, index: int | None, reuse_op_types: tuple[str, ...]
 ) -> None:
-    """A reuse operation carries exactly one valid target-occurrence index
-    (0 or 1); every fresh or unrelated operation carries None.  The index is
-    occurrence-level, not node-level — for ``add(x, x)`` both addends name
-    one node and only the index says which occurrence owns the reused
-    columns (docs/plan_additional_mlp_routing.md).
+    """A reuse operation carries exactly one valid target-occurrence index.
+
+    That index is 0 or 1; every fresh or unrelated operation carries
+    None.  The index is occurrence-level, not node-level — for
+    ``add(x, x)`` both addends name one node and only the index says
+    which occurrence owns the reused columns
+    (docs/plan_additional_mlp_routing.md).
     """
     if op_type in reuse_op_types:
         if index not in (0, 1):
@@ -118,8 +124,8 @@ class PlannedAttentionOp:
         _check_reuse_input_index(self.op_type, self.reuse_input_index, ("add_into",))
 
     @classmethod
-    def from_scheduler_op(cls, op) -> "PlannedAttentionOp":
-        def freeze(value):
+    def from_scheduler_op(cls, op: "_AttentionOp") -> "PlannedAttentionOp":
+        def freeze(value: list[int] | None) -> tuple[int, ...] | None:
             return None if value is None else tuple(value)
 
         return cls(
@@ -224,7 +230,7 @@ class PlannedMlpOp:
             raise ValueError("add_into_bypass requires source_cols")
 
     @classmethod
-    def from_scheduler_op(cls, op) -> "PlannedMlpOp":
+    def from_scheduler_op(cls, op: "_MlpOp") -> "PlannedMlpOp":
         return cls(
             op.op_type,
             op.node,
@@ -251,7 +257,7 @@ class PlannedMlpOp:
 
 ResidualSnapshot = tuple[tuple[int, tuple[int, ...]], ...]
 NodeIndices = tuple[tuple[int, tuple[int, ...]], ...]
-PlannedOp = Union[PlannedAttentionOp, PlannedMlpOp]
+PlannedOp = PlannedAttentionOp | PlannedMlpOp
 
 
 @dataclass(frozen=True)
@@ -335,8 +341,9 @@ class ReplayPlan:
         resolver_items = tuple(self.nodes_by_id)
         resolver: list[tuple[int, Node]] = []
         resolver_ids: set[int] = set()
+        pair_len = 2
         for item in resolver_items:
-            if not isinstance(item, (tuple, list)) or len(item) != 2:
+            if not isinstance(item, (tuple, list)) or len(item) != pair_len:
                 raise TypeError("nodes_by_id entries must be (node_id, Node) pairs")
             node_id, node = item
             if not isinstance(node_id, Integral) or isinstance(node_id, bool):

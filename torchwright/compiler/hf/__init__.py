@@ -1,6 +1,7 @@
-"""Native HuggingFace ``transformers`` surface for compiled torchwright token
-models — the torch-native counterpart to ``compiler/onnx_load.py``'s ONNX
-runtime loaders.
+"""Native HuggingFace ``transformers`` surface for compiled torchwright models.
+
+The torch-native counterpart to ``compiler/onnx_load.py``'s ONNX runtime
+loaders.
 
 A compiled torchwright token graph targets stock ``Phi3ForCausalLM`` by
 default: SwiGLU, biasless projections, RMSNorm, and ordinary

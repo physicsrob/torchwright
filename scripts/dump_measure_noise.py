@@ -18,11 +18,11 @@ def main() -> None:
 
     try:
         sha = subprocess.check_output(["git", "rev-parse", "HEAD"]).decode().strip()
-    except Exception:
+    except (OSError, subprocess.CalledProcessError):
         sha = "unknown"
     import datetime
 
-    now = datetime.datetime.utcnow().isoformat() + "Z"
+    now = datetime.datetime.now(datetime.UTC).replace(tzinfo=None).isoformat() + "Z"
     json_text = render_json(measurements, commit=sha, measured_at=now)
     # Print a separator so we can grep out the real JSON block
     sys.stderr.write("=== NOISE JSON BEGIN ===\n")

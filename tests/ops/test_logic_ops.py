@@ -45,8 +45,10 @@ def test_cond_gate():
 
 
 def test_cond_gate_adaptive_M_uses_value_range():
-    """cond_gate picks M from inp.value_type.value_range, so small inputs survive
-    that would be lost under the old global big_offset=1000.
+    """cond_gate picks M from inp.value_type.value_range.
+
+    Small inputs survive that would be lost under the old global
+    big_offset=1000.
     """
     x = create_input("x", 1)
     x_bounded = assert_matches_value_type(

@@ -62,8 +62,9 @@ def test_interior_dead_head_is_compacted():
 
 
 def test_all_dead_heads_keeps_one():
-    """Degenerate case: every allocated head is dead — keep one zero head
-    rather than emitting empty-tensor shapes.
+    """Keep one zero head when every allocated head is dead.
+
+    Rather than emitting empty-tensor shapes.
     """
     attn = AttnLayerComponent(D, D_HEAD)
     attn.used_heads = 2  # allocated, but O left zero
@@ -73,9 +74,7 @@ def test_all_dead_heads_keeps_one():
 
 
 def test_trailing_trim_behavior_unchanged():
-    """The old contract: no dead interior heads -> compaction equals the
-    trailing slice.
-    """
+    """No dead interior heads: compaction equals the trailing slice (old contract)."""
     attn = _component_with_interior_dead_head()
     attn.output_matrix[1] = torch.randn(D_HEAD, D) * 0.1  # make head 1 live too
     attn.trim_unused_heads()
@@ -83,10 +82,11 @@ def test_trailing_trim_behavior_unchanged():
 
 
 def test_compiled_zero_support_floor_head_is_compacted():
-    """Compile-level: a zero-support Linear keeps one floor head whose O
-    block is zero — the interior dead head the support-aware emitter still
-    produces (a merely *sparse* Linear no longer emits dead heads at all:
-    ``linear_attn_chunks`` skips its zero chunks).  Compaction reclaims it
+    """Compile a zero-support Linear that keeps one floor head whose O block is zero.
+
+    The interior dead head the support-aware emitter still produces (a
+    merely *sparse* Linear no longer emits dead heads at all:
+    ``linear_attn_chunks`` skips its zero chunks). Compaction reclaims it
     and the compiled values still match node.compute.
     """
     torch.manual_seed(0)

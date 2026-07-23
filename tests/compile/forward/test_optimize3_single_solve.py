@@ -39,9 +39,11 @@ def _width_graph():
 
 
 def _ffn_chain_graph():
-    """X -> FFN -> L_mid -> FFN -> L_out: nonlinearities keep the
-    intermediates alive through lowering, so the heuristic warm start has
-    real nodes to free — non-empty cancel + cancel-mechanism hints.
+    """X -> FFN -> L_mid -> FFN -> L_out.
+
+    The nonlinearities keep the intermediates alive through lowering, so
+    the heuristic warm start has real nodes to free: non-empty cancel and
+    cancel-mechanism hints.
     """
     torch.manual_seed(0)
     x = create_input("x", 8)
@@ -66,8 +68,9 @@ def _ffn_chain_graph():
 
 
 def test_optimize3_compiles_replays_and_is_no_worse_than_optimize1():
-    """A real optimize=3 compile produces a valid, replayable schedule no
-    deeper than optimize=1 (the bigger budget never regresses).
+    """A real optimize=3 compile produces a valid, replayable schedule.
+
+    It is no deeper than optimize=1: the bigger budget never regresses.
     """
     graph = _width_graph()
     net3 = forward_compile(
@@ -90,8 +93,10 @@ def test_optimize3_compiles_replays_and_is_no_worse_than_optimize1():
 
 
 def test_solve_budget_override_is_accepted():
-    """The measurement-only ``_solve_budget_s`` overrides the solve budget
-    (production default 600s stays put) and still yields a valid solve.
+    """The measurement-only ``_solve_budget_s`` overrides the solve budget.
+
+    The production default of 600s stays put, and the override still
+    yields a valid solve.
     """
     graph = _width_graph()
     net = forward_compile(
@@ -125,19 +130,21 @@ def _fake_stats(n_layers, optimal):
 def test_optimize3_is_one_solve_with_the_full_budget_and_the_mech_hint(
     monkeypatch,
 ):
-    """optimize=3 performs exactly ONE ``solve_schedule`` call at the full
-    600 s budget — no rung loop, no re-solve — warm-started with all four
-    hint families from the heuristic.  The cancel-MECHANISM hint reaching the
-    solver is load-bearing under the pinned-cancel default: without those
-    bits the pinned model completed the hint into ZERO incumbents in
-    5x600 s on the d=8192 production fixture (cpsat_pinned_cancel_plan.md
-    step 2, batch 1) — the solver, not the compile, is where the
-    cancel-LAYER values get dropped.  (``_solve_only`` returns before the
-    replay, so the fake schedule is never executed.).
+    """optimize=3 performs exactly ONE ``solve_schedule`` call at the full budget.
+
+    The full 600 s budget is used, with no rung loop and no re-solve,
+    warm-started with all four hint families from the heuristic.  The
+    cancel-MECHANISM hint reaching the solver is load-bearing under the
+    pinned-cancel default: without those bits the pinned model completed
+    the hint into ZERO incumbents in 5x600 s on the d=8192 production
+    fixture (cpsat_pinned_cancel_plan.md step 2, batch 1); the solver,
+    not the compile, is where the cancel-LAYER values get dropped.
+    (``_solve_only`` returns before the replay, so the fake schedule is
+    never executed.)
     """
     calls = []
 
-    def fake_solve(output_node, pos_encoding=None, **kw):
+    def fake_solve(_output_node, _pos_encoding=None, **kw):
         calls.append(kw)
         asg = ScheduleAssignment(
             node_to_layer={1: 5},

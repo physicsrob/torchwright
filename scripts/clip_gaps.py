@@ -16,14 +16,14 @@ from collections import defaultdict
 
 from torchwright_doom.model.constants import COLUMN_COUNT, PIXEL_WIDTH, VIEW_HEIGHT
 from torchwright_doom.model.vocab import CLIP_UPDATE, SCREEN_RANGE, SET_CURSOR_X
-from torchwright_doom.prompt import scenes as S
+from torchwright_doom.prompt import scenes
 from torchwright_doom.pydoom import GameState as PyGameState
 from torchwright_doom.pydoom import Scene as PyScene
 from torchwright_doom.pydoom import expected_ar_tokens
 
 
-def build_scene():
-    md, state = S.load(S.E1M1_START_ROOM)
+def build_scene() -> tuple[PyScene, PyGameState]:
+    md, state = scenes.load(scenes.E1M1_START_ROOM)
     py_scene = PyScene.model_validate(
         {
             "map_data": md.model_dump(),
@@ -38,7 +38,8 @@ def main() -> None:
     py_scene, py_state = build_scene()
     tokens = expected_ar_tokens(py_scene, py_state)
     print(
-        f"PIXEL_WIDTH={PIXEL_WIDTH} COLUMN_COUNT={COLUMN_COUNT} VIEW_HEIGHT={VIEW_HEIGHT}"
+        f"PIXEL_WIDTH={PIXEL_WIDTH} COLUMN_COUNT={COLUMN_COUNT} "
+        f"VIEW_HEIGHT={VIEW_HEIGHT}"
     )
     print(f"total tokens in frame: {len(tokens)}")
 
@@ -76,7 +77,7 @@ def main() -> None:
 
     same_col_gaps: list[int] = []
     writes_per_col: list[int] = []
-    for col, positions in by_col.items():
+    for positions in by_col.values():
         positions.sort()
         writes_per_col.append(len(positions))
         for a, b in itertools.pairwise(positions):
@@ -94,14 +95,14 @@ def main() -> None:
     # than this. The MIN (not the median) is what matters.
     winner_runnerup_gaps = same_col_gaps
 
-    def summ(name, xs) -> None:
+    def summ(name: str, xs: list[int]) -> None:
         if not xs:
             print(f"  {name}: (none)")
             return
         xs = sorted(xs)
         n = len(xs)
 
-        def p(q):
+        def p(q: float) -> int:
             return xs[min(n - 1, int(q * n))]
 
         print(

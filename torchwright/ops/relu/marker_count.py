@@ -37,6 +37,10 @@ from torchwright.ops.attention_ops import attend_mean_where
 from torchwright.ops.linear import add_const
 from torchwright.ops.relu.arithmetic_ops import reciprocal
 
+# Above this estimated total gap error, the quasi-static approximation's
+# non-uniformity pushes past the +/-0.5 rounding threshold.
+_MAX_GAP_ERR_BUDGET = 0.45
+
 
 def count_since_marker(
     rope: RopeConfig,
@@ -79,14 +83,15 @@ def count_since_marker(
 
     # Guard: the quasi-static approximation holds only when the slowest-plane
     # frequency is small enough.  The analytic bound on window non-uniformity
-    # is ~333 × θ_slow² × max_gap³; exceeding 0.45 pushes the total gap error
+    # is ~333 x θ_slow² x max_gap³; exceeding 0.45 pushes the total gap error
     # past the ±0.5 rounding threshold.  At base=5e5 this requires d_head ≥ 64
     # for max_gap=350.
     theta_slow = float(rope_inv_freq(rope.d_head, rope.base)[-1])
     approx_err = 333.0 * theta_slow**2 * max_gap**3
-    if approx_err > 0.45:
+    if approx_err > _MAX_GAP_ERR_BUDGET:
         raise ValueError(
-            f"count_since_marker: estimated gap error {approx_err:.2f} > 0.45 "
+            f"count_since_marker: estimated gap error {approx_err:.2f} > "
+            f"{_MAX_GAP_ERR_BUDGET} "
             f"(theta_slow={theta_slow:.2e}, max_gap={max_gap}, "
             f"d_head={rope.d_head}).  "
             f"Increase d_head/base or reduce max_gap — at base=5e5, d_head≥64 "

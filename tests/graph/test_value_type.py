@@ -17,7 +17,7 @@ def test_range_default_is_unbounded():
 
 
 def test_range_rejects_inverted_bounds():
-    with pytest.raises(ValueError):
+    with pytest.raises(ValueError, match="lo must be <= hi"):
         Range(1.0, 0.0)
 
 

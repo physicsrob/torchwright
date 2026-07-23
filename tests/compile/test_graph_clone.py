@@ -100,7 +100,7 @@ def _variant_graph():
     emb = Embedding(vocab=["a", "b", "c"], d_embed=8)
     emb_lin = Linear(emb, _rand(8, 4, seed=21) * 0.2, name="emb_lin")
 
-    watched = debug_watch(ffn_gated, lambda t: (True, ""), "never fires")
+    watched = debug_watch(ffn_gated, lambda _t: (True, ""), "never fires")
     logged = ValueLogger(attn_partial, name="vlog")
 
     out = Concatenate([ffn_relu, watched, attn_full, logged, emb_lin])
@@ -120,38 +120,41 @@ def _variant_graph():
 def _node_field_matches(key, sval, cval, node_map):
     """Field-level source-vs-clone comparison; node references go through the map."""
     if key == "node_id":
-        return cval != sval
-    if key == "inputs":
-        return all(c is node_map[s] for s, c in zip(sval, cval, strict=False)) and len(
-            sval
-        ) == len(cval)
-    if key == "scheduling_predecessors":
-        return cval == {node_map[s] for s in sval} and all(
+        result = cval != sval
+    elif key == "inputs":
+        result = all(
+            c is node_map[s] for s, c in zip(sval, cval, strict=False)
+        ) and len(sval) == len(cval)
+    elif key == "scheduling_predecessors":
+        result = cval == {node_map[s] for s in sval} and all(
             c is not s for s in sval for c in cval
         )
-    if key == "checks":
+    elif key == "checks":
         # Fresh list object per clone; Check entries shared by reference.
-        return (
+        result = (
             (cval is not sval or not sval)
             and all(c is s for c, s in zip(cval, sval, strict=False))
             and len(cval) == len(sval)
         )
-    if key == "_structural_type":
-        return cval.value_range == sval.value_range
-    if key == "_affine_bound":
+    elif key == "_structural_type":
+        result = cval.value_range == sval.value_range
+    elif key == "_affine_bound":
         sr, cr = sval.to_scalar_range(), cval.to_scalar_range()
-        return (sr.lo, sr.hi) == (cr.lo, cr.hi)
-    if key == "_semantic_affine_override":
+        result = (sr.lo, sr.hi) == (cr.lo, cr.hi)
+    elif key == "_semantic_affine_override":
         if sval is None or cval is None:
-            return sval is None and cval is None
-        sr, cr = sval.to_scalar_range(), cval.to_scalar_range()
-        return (sr.lo, sr.hi) == (cr.lo, cr.hi)
-    if isinstance(sval, torch.Tensor):
-        return cval is sval  # weights shared by reference, never copied
-    try:
-        return cval is sval or cval == sval
-    except Exception:
-        return cval is sval
+            result = sval is None and cval is None
+        else:
+            sr, cr = sval.to_scalar_range(), cval.to_scalar_range()
+            result = (sr.lo, sr.hi) == (cr.lo, cr.hi)
+    elif isinstance(sval, torch.Tensor):
+        result = cval is sval  # weights shared by reference, never copied
+    else:
+        try:
+            result = cval is sval or cval == sval
+        except Exception:
+            result = cval is sval
+    return result
 
 
 def test_clone_completeness_every_vocabulary_variant():
@@ -367,9 +370,11 @@ def test_clone_raises_on_out_of_cone_scheduling_predecessor():
 
 
 def test_clone_remaps_sibling_scheduling_predecessor():
-    """A scheduling predecessor may be a *sibling* (scheduling-only edge,
-    not an ancestor via inputs), which the data-topological clone order
-    can visit after its dependent — the remap runs as a second pass.
+    """A scheduling predecessor may be a *sibling*, not an ancestor via inputs.
+
+    A scheduling-only edge like this means the data-topological clone
+    order can visit it after its dependent — the remap runs as a second
+    pass.
     """
     from torchwright.graph.scheduling_hints import sequential_scope
 

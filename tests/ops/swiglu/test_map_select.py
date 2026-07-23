@@ -1,9 +1,8 @@
-"""swiglu select, cond_gate, switch: the complementary gated pair and its
-compositions.
+"""swiglu select/cond_gate/switch: the complementary gated pair and its compositions.
 
 Spec: docs/ops_plain_english.md (select, cond_gate entries; switch is a
 composition).  Pinned facts these lean on — losing branch exactly zero at
-clean conds (σ(−scale) = 0 in fp32), winner ~1 ulp relative, saturated
+clean conds (sigma(-scale) = 0 in fp32), winner ~1 ulp relative, saturated
 gate linear in the mask — live in tests/docs/test_swish_constants.py
 (the gated_select tests).
 """
@@ -61,14 +60,16 @@ def test_select_picks_branch_winner_ulp_class():
     ct = _cond(1.0, -1.0, 1.0, -1.0)
     val = out.compute(4, {"c": ct, "a": at, "b": bt})
     ref = torch.where(ct > 0, at, bt)
-    # Winner passes with ~1 ulp relative rounding (the ×scale/÷scale
+    # Winner passes with ~1 ulp relative rounding (the x-scale/÷-scale
     # round trip) — often bit-exact, not always; don't pin equality.
     assert torch.allclose(val, ref, rtol=1e-6, atol=1e-7)
 
 
 def test_cond_gate_losing_branch_exactly_zero():
-    """At cond=-1, σ(-scale) computes as exactly 0.0 in fp32, so the
-    gated value is exactly zero — the pinned losing-branch claim.
+    """At cond=-1, the losing branch computes to exactly zero.
+
+    sigma(-scale) computes as exactly 0.0 in fp32, so the gated value is
+    exactly zero — the pinned losing-branch claim.
     """
     c = create_input("c", 1, value_range=(-1.0, 1.0))
     v = create_input("v", 2, value_range=(-1000.0, 1000.0))
@@ -91,9 +92,10 @@ def test_cond_gate_structure_and_pass_through():
 
 
 def test_no_finite_range_requirement():
-    """The ReLU-era offset apparatus is gone: unbounded branch ranges
-    build fine (relu select/cond_gate raise TypeError via the M
-    derivation).
+    """Unbounded branch ranges build fine; the ReLU-era offset apparatus is gone.
+
+    The relu select/cond_gate ops raise TypeError via the M derivation
+    instead.
     """
     c = create_input("c", 1, value_range=(-1.0, 1.0))
     a = create_input("a", 1)  # no value_range — unbounded
@@ -116,8 +118,9 @@ def test_cond_assert_fires_on_junk_cond():
 
 
 def test_cond_deviation_scales_with_actual_value():
-    """A cond off ±1 by δ mis-scales the winner by exactly δ·|value| —
-    the saturated gate is linear in the cond (no M anywhere).
+    """A cond off +/-1 by δ mis-scales the winner by exactly δ·|value|.
+
+    The saturated gate is linear in the cond (no M anywhere).
     """
     c = create_input("c", 1, value_range=(-1.0, 1.0))
     v = create_input("v", 1, value_range=(-1000.0, 1000.0))
@@ -130,8 +133,9 @@ def test_cond_deviation_scales_with_actual_value():
 
 
 def test_select_semantic_bound_relative_widening():
-    """The semantic hull widens by c_tol·|side| per side — actual-value
-    terms, replacing the ReLU-era c_tol·M.
+    """The semantic hull widens by c_tol·|side| per side, in actual-value terms.
+
+    This replaces the ReLU-era c_tol·M.
     """
     c = create_input("c", 1, value_range=(-1.0, 1.0))
     a = create_input("a", 1, value_range=(2.0, 5.0))
@@ -144,8 +148,9 @@ def test_select_semantic_bound_relative_widening():
 
 
 def test_cond_gate_semantic_bound_sign_determined_scaling():
-    """Sign-determined inputs keep the pass-through affine bound, scaled
-    by (1 + c_tol) for cond noise.
+    """Sign-determined inputs keep the pass-through affine bound, scaled for cond noise.
+
+    The scaling factor is (1 + c_tol).
     """
     c = create_input("c", 1, value_range=(-1.0, 1.0))
     v = create_input("v", 1, value_range=(1.0, 6.0))
@@ -230,8 +235,10 @@ def test_in_range_structure_and_integer_bounds():
 
 
 def test_in_range_dip_slack_and_claimed_range():
-    """Continuous bounds near a ramp edge dip past ±1 by up to
-    4·swish_dip/scale; the claimed value range carries that slack.
+    """Continuous bounds near a ramp edge dip past +/-1, within a claimed slack.
+
+    The dip is bounded by up to 4·swish_dip/scale; the claimed value
+    range carries that slack.
     """
     from torchwright.ops.const import swish_dip
     from torchwright.ops.swiglu import in_range
@@ -276,8 +283,9 @@ def test_broadcast_select_per_slot_and_broadcast():
 
 
 def test_broadcast_select_junk_mask_safe_no_assert():
-    """Fractional masks blend smoothly — no ±1 assert fires, and the
-    blend stays inside the hull plus the dip term.
+    """Fractional masks blend smoothly, with no +/-1 assert firing.
+
+    The blend stays inside the hull plus the dip term.
     """
     from torchwright.ops.swiglu import broadcast_select
 
@@ -315,13 +323,15 @@ def test_broadcast_select_zero_literal_branch_drops_lanes():
 
 
 def test_broadcast_select_both_branches_zero_collapses_to_literal():
-    """BOTH branches all-zero literals: the op is identically zero at any
-    mask value, so it must collapse to a zero LiteralValue rather than build
-    a zero-lane FFN — the zero-lane bound reaches _gated_lane_affine with
-    empty per-lane comparison lists, whose torch.tensor([]) defaults to
-    float32 and crashes torch.where.  The flagship hits this construction
-    through pick_by_one_hot over an all-zero table (a missing-texture
-    bank's palette rows).
+    """Both branches as all-zero literals must collapse to a zero LiteralValue.
+
+    The op is identically zero at any mask value, so it must collapse to
+    a zero LiteralValue rather than build a zero-lane FFN — the zero-lane
+    bound reaches _gated_lane_affine with empty per-lane comparison
+    lists, whose torch.tensor([]) defaults to float32 and crashes
+    torch.where.  The flagship hits this construction through
+    pick_by_one_hot over an all-zero table (a missing-texture bank's
+    palette rows).
     """
     from torchwright.graph.misc import LiteralValue
     from torchwright.ops.swiglu import broadcast_select

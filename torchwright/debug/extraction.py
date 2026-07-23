@@ -35,6 +35,18 @@ from torchwright.graph import Concatenate, Node
 #: is ambiguous (every layer's MLP out state shares the same name).
 StateTensors = dict[ResidualStreamState, tuple[torch.Tensor, str]]
 
+#: Below this many dims a diff tensor is already per-column (no leading
+#: position axis to max-reduce away) in the violation report below.
+_DIFF_MATRIX_NDIM = 2
+
+#: Inline a value slice up to this many elements; above it, summarize as
+#: min/max/count so the error stays readable for long prefills.
+_INLINE_VALUE_LIMIT = 8
+
+#: Inline a column-index list up to this many entries; above it, truncate
+#: with an ellipsis in the violation report.
+_INLINE_COLS_LIMIT = 16
+
 
 def extract_compiled_value(
     node: Node,
@@ -169,7 +181,7 @@ def run_consistency_check(
         max_diff,
     ) in enumerate(violations, 1):
         diff = (first_val - val).abs()
-        per_col_max = diff.max(dim=0).values if diff.ndim >= 2 else diff
+        per_col_max = diff.max(dim=0).values if diff.ndim >= _DIFF_MATRIX_NDIM else diff
         worst_col_idx = int(per_col_max.argmax().item())
         worst_col = cols[worst_col_idx] if worst_col_idx < len(cols) else None
         node_name = node.annotation or node.name or f"node_{node.node_id}"
@@ -177,9 +189,14 @@ def run_consistency_check(
         # positions: show min/max across positions rather than dumping
         # the whole list so the error stays readable when the prefill
         # is long.
+        cols_fmt = (
+            cols
+            if len(cols) <= _INLINE_COLS_LIMIT
+            else str(cols[:_INLINE_COLS_LIMIT]) + "..."
+        )
         a_slice = first_val[..., worst_col_idx]
         b_slice = val[..., worst_col_idx]
-        if a_slice.ndim == 0 or a_slice.numel() <= 8:
+        if a_slice.ndim == 0 or a_slice.numel() <= _INLINE_VALUE_LIMIT:
             a_fmt = a_slice.tolist()
             b_fmt = b_slice.tolist()
         else:
@@ -196,7 +213,7 @@ def run_consistency_check(
             f"type={type(node).__name__}, width={len(cols)})\n"
             f"      first:     {first_label}\n"
             f"      later:     {later_label}\n"
-            f"      cols:      {cols if len(cols) <= 16 else str(cols[:16]) + '...'}\n"
+            f"      cols:      {cols_fmt}\n"
             f"      worst col: residual[{worst_col}] (node index {worst_col_idx})\n"
             f"      first val: {a_fmt}\n"
             f"      later val: {b_fmt}\n"

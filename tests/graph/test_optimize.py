@@ -232,8 +232,8 @@ def test_fold_block_out_into_downstream_linear():
     """An FFN whose sole consumer is a Linear folds its out_proj into it."""
     inp = InputNode("x", 6, value_range=(-2.0, 2.0))
     b = _block(inp, 6, 8, 4, seed=2)
-    l = Linear(b, torch.randn(4, 3) * 0.2, torch.randn(3) * 0.1, name="l")
-    sink = Concatenate([l])  # keep l off the output boundary
+    lin = Linear(b, torch.randn(4, 3) * 0.2, torch.randn(3) * 0.1, name="l")
+    sink = Concatenate([lin])  # keep lin off the output boundary
 
     n_pos = 5
     x = torch.randn(n_pos, 6)
@@ -250,16 +250,17 @@ def test_fold_block_out_into_downstream_linear():
 
 
 def test_block_out_fold_declined_at_output_boundary():
-    """The FFN-into-Linear fold is declined when the Linear is a caller-held
-    output node, preserving the caller's output identity.
+    """The FFN-into-Linear fold is declined when the Linear is a caller-held output.
+
+    This preserves the caller's output identity.
     """
     inp = InputNode("x", 6, value_range=(-2.0, 2.0))
     b = _block(inp, 6, 8, 4, seed=3)
-    l = Linear(b, torch.randn(4, 3) * 0.2, torch.randn(3) * 0.1, name="l")
+    lin = Linear(b, torch.randn(4, 3) * 0.2, torch.randn(3) * 0.1, name="l")
 
-    fused = fuse_consecutive_linears({l})
+    fused = fuse_consecutive_linears({lin})
     assert fused == 0
-    assert l.inputs[0] is b  # unchanged
+    assert lin.inputs[0] is b  # unchanged
 
 
 def test_fold_linear_block_linear_both_sides():
@@ -267,8 +268,8 @@ def test_fold_linear_block_linear_both_sides():
     inp = InputNode("x", 10, value_range=(-2.0, 2.0))
     u = Linear(inp, torch.randn(10, 6) * 0.2, torch.randn(6) * 0.1, name="u")
     b = _block(u, 6, 8, 4, seed=4)
-    l = Linear(b, torch.randn(4, 3) * 0.2, torch.randn(3) * 0.1, name="l")
-    sink = Concatenate([l])
+    lin = Linear(b, torch.randn(4, 3) * 0.2, torch.randn(3) * 0.1, name="l")
+    sink = Concatenate([lin])
 
     n_pos = 5
     x = torch.randn(n_pos, 10)
@@ -298,13 +299,13 @@ def test_block_folds_preserve_compiled_output():
             name="u",
         )
         b = _block(u, 8, 10, 6, seed=7)
-        l = Linear(
+        lin = Linear(
             b,
             torch.randn(6, 5, generator=g) * 0.2,
             torch.randn(5, generator=g) * 0.1,
             name="l",
         )
-        return inp, Concatenate([l])
+        return inp, Concatenate([lin])
 
     n_pos = 4
     g = torch.Generator().manual_seed(21)
@@ -326,8 +327,9 @@ def test_block_folds_preserve_compiled_output():
 
 
 def test_fold_linear_leaves_through_concat():
-    """Single-consumer Linear leaves fold into the downstream Linear's row
-    blocks; the concat survives, rewired to the leaves' inputs.
+    """Single-consumer Linear leaves fold into the downstream Linear's row blocks.
+
+    The concat survives, rewired to the leaves' inputs.
     """
     in1 = InputNode("a", 4, value_range=(-2.0, 2.0))
     in2 = InputNode("b", 5, value_range=(-2.0, 2.0))
@@ -399,8 +401,9 @@ def test_concat_fold_declined_output_leaf():
 
 
 def test_literal_leaf_folds_into_bias():
-    """A LiteralValue leaf's contribution moves into the bias; the leaf and
-    its block rows are dropped.
+    """A LiteralValue leaf's contribution moves into the bias.
+
+    The leaf and its block rows are dropped.
     """
     from torchwright.graph import LiteralValue
 
@@ -423,8 +426,9 @@ def test_literal_leaf_folds_into_bias():
 
 
 def test_all_literal_concat_declined():
-    """Literal folds never empty the concat (a 0-input Linear is not
-    representable).
+    """Literal folds never empty the concat.
+
+    A 0-input Linear is not representable.
     """
     from torchwright.graph import LiteralValue
 
@@ -453,8 +457,9 @@ def test_concat_fold_param_guard():
 
 
 def test_accumulator_chain_collapses():
-    """The ``sum_nodes`` fanout-limited accumulator shape —
-    ``Linear(Concat(acc_Linear, ...))`` chains — collapses to one flat
+    """The ``sum_nodes`` fanout-limited accumulator shape collapses to one flat Linear.
+
+    ``Linear(Concat(acc_Linear, ...))`` chains collapse to one flat
     Linear over the leaves' inputs across passes (fold, splice, fold).
     """
     ins = [InputNode(f"x{i}", 4, value_range=(-2.0, 2.0)) for i in range(3)]
@@ -492,9 +497,10 @@ def test_accumulator_chain_collapses():
 
 
 def test_concat_fold_refreshes_stale_bounds():
-    """Concat folds mutate the survivor Linear and the concat in place; the
-    cached bounds of both — and everything downstream — must equal a fresh
-    recompute afterwards.
+    """Concat folds mutate the survivor Linear and the concat in place.
+
+    The cached bounds of both — and everything downstream — must
+    equal a fresh recompute afterwards.
     """
     from torchwright.compiler.utils import get_ancestor_nodes
     from torchwright.graph.affine_rules import compute_affine_bound
@@ -513,21 +519,27 @@ def test_concat_fold_refreshes_stale_bounds():
     for node in get_ancestor_nodes({sink}):
         cached = node._affine_bound.to_scalar_range()
         fresh = compute_affine_bound(node).to_scalar_range()
-        assert cached.lo == fresh.lo and cached.hi == fresh.hi, (
+        assert cached.lo == fresh.lo, (
+            f"stale bound on {type(node).__name__} id={node.node_id}: "
+            f"cached={cached} fresh={fresh}"
+        )
+        assert cached.hi == fresh.hi, (
             f"stale bound on {type(node).__name__} id={node.node_id}: "
             f"cached={cached} fresh={fresh}"
         )
 
 
 def test_fusion_refreshes_stale_bounds():
-    """Regression (RMSNorm-cert soundness crash): a fold rewrites a surviving
-    node's weights/inputs in place, so its eagerly-cached ``_affine_bound`` /
-    ``_structural_type`` — and every downstream node's — go stale.  A stale
-    bound stays hidden until a claim tightens a structural type, at which
-    point the affine and structural ranges
-    disagree and the RMSNorm energy certification's soundness check fires.
-    ``fuse_consecutive_linears`` must refresh every mutated/downstream bound, so
-    the cached bound equals a fresh recompute for every node.
+    """Regression (RMSNorm-cert soundness crash).
+
+    A fold rewrites a surviving node's weights/inputs in place, so its
+    eagerly-cached ``_affine_bound`` / ``_structural_type`` — and
+    every downstream node's — go stale. A stale bound stays hidden
+    until a claim tightens a structural type, at which point the
+    affine and structural ranges disagree and the RMSNorm energy
+    certification's soundness check fires. ``fuse_consecutive_linears``
+    must refresh every mutated/downstream bound, so the cached bound
+    equals a fresh recompute for every node.
     """
     from torchwright.compiler.utils import get_ancestor_nodes
     from torchwright.graph.affine_rules import compute_affine_bound
@@ -538,8 +550,8 @@ def test_fusion_refreshes_stale_bounds():
     inp = InputNode("x", 6, value_range=(-1.0, 1.0))
     u = Linear(inp, torch.randn(6, 8) * 0.2, torch.randn(8) * 0.1, name="u")
     b = _block(u, 8, 10, 5, seed=3)
-    l = Linear(b, torch.randn(5, 4) * 0.2, torch.randn(4) * 0.1, name="l")
-    sink = Concatenate([l])
+    lin = Linear(b, torch.randn(5, 4) * 0.2, torch.randn(4) * 0.1, name="l")
+    sink = Concatenate([lin])
 
     n = fuse_consecutive_linears({sink})
     assert n == 2, f"expected both folds to fire, got {n}"
@@ -548,17 +560,23 @@ def test_fusion_refreshes_stale_bounds():
     for node in get_ancestor_nodes({sink}):
         cached = node._affine_bound.to_scalar_range()
         fresh = compute_affine_bound(node).to_scalar_range()
-        assert cached.lo == fresh.lo and cached.hi == fresh.hi, (
+        assert cached.lo == fresh.lo, (
+            f"stale bound on {type(node).__name__} id={node.node_id}: "
+            f"cached={cached} fresh={fresh}"
+        )
+        assert cached.hi == fresh.hi, (
             f"stale bound on {type(node).__name__} id={node.node_id}: "
             f"cached={cached} fresh={fresh}"
         )
 
 
 def test_concat_fold_merges_duplicate_leaves():
-    """Two absorbed selector Linears over the SAME input leave the same node
-    in two concat slots; the fold must merge their blocks (x reads through
-    B1 + B2) instead of leaving duplicates — duplicated source columns broke
-    the weight-writer scatter (the doom instance-index regression).
+    """Two absorbed selector Linears over the SAME input must merge, not duplicate.
+
+    They leave the same node in two concat slots; the fold must merge
+    their blocks (x reads through B1 + B2) instead of leaving
+    duplicates — duplicated source columns broke the weight-writer
+    scatter (the doom instance-index regression).
 
     Since the sibling fold landed, ``p`` and ``vp`` are contiguous same-input
     leaves and merge into one wide Linear *before* the absorb, so the duplicate
@@ -588,11 +606,12 @@ def test_concat_fold_merges_duplicate_leaves():
 
 
 def test_concat_fold_merges_hand_built_duplicate_leaves():
-    """A hand-built Concat([x, x]) under a Linear merges to a single leaf
-    with summed blocks even though no leaf fold fires.
+    """A hand-built Concat([x, x]) under a Linear merges to a single leaf.
+
+    Summed blocks even though no leaf fold fires.
     """
     x = InputNode("x", 2, value_range=(-5.0, 5.0))
-    l = Linear(
+    lin = Linear(
         Concatenate([x, x]),
         torch.tensor([[1.0], [2.0], [10.0], [20.0]]),
         name="l",
@@ -600,21 +619,23 @@ def test_concat_fold_merges_hand_built_duplicate_leaves():
 
     n_pos = 3
     vals = {"x": torch.randn(n_pos, 2)}
-    before = l.compute(n_pos, vals)
+    before = lin.compute(n_pos, vals)
 
-    fused = fuse_consecutive_linears({l})
+    fused = fuse_consecutive_linears({lin})
     assert fused == 1  # the merge alone
-    assert l.inputs[0] is x
-    assert torch.equal(l.output_matrix, torch.tensor([[11.0], [22.0]]))
+    assert lin.inputs[0] is x
+    assert torch.equal(lin.output_matrix, torch.tensor([[11.0], [22.0]]))
 
-    after = l.compute(n_pos, vals)
+    after = lin.compute(n_pos, vals)
     assert torch.allclose(before, after, atol=1e-5)
 
 
 def test_duplicate_selector_shape_compiles_correct():
-    """End-to-end pin of the doom instance-index regression: two selectors
-    over one input, concatenated into a combining Linear, must compile to
-    the oracle value (it compiled to the second block only).
+    """End-to-end pin of the doom instance-index regression.
+
+    Two selectors over one input, concatenated into a combining
+    Linear, must compile to the oracle value (it compiled to the
+    second block only).
     """
     from torchwright.ops.inout_nodes import create_input
 
@@ -667,39 +688,41 @@ def test_ffn_fold_declined_on_checked_ffn():
     inp = InputNode("x", 6, value_range=(-1.0, 1.0))
     b = _block(inp, 6, 8, 4, seed=22)
     assert_in_range(b, -100.0, 100.0)  # b's pre-fold value is checked
-    l = Linear(b, torch.randn(4, 3) * 0.2, torch.randn(3) * 0.1, name="l")
-    sink = Concatenate([l])
+    lin = Linear(b, torch.randn(4, 3) * 0.2, torch.randn(3) * 0.1, name="l")
+    sink = Concatenate([lin])
 
     assert fuse_consecutive_linears({sink}) == 0
-    assert l.inputs[0] is b
+    assert lin.inputs[0] is b
 
 
 def test_ffn_fold_migrates_checks_from_orphaned_linear():
-    """The one fold where the orphan's VALUE survives (on the FFN): its
-    checks and claim migrate to the survivor instead of blocking.
+    """The one fold where the orphan's VALUE survives (on the FFN).
+
+    Its checks and claim migrate to the survivor instead of blocking.
     """
     from torchwright.graph.asserts import assert_in_range
 
     inp = InputNode("x", 6, value_range=(-1.0, 1.0))
     b = _block(inp, 6, 8, 4, seed=23)
-    l = Linear(b, torch.randn(4, 3) * 0.2, torch.randn(3) * 0.1, name="l")
-    assert_in_range(l, -1000.0, 1000.0)
-    sink = Concatenate([l])
+    lin = Linear(b, torch.randn(4, 3) * 0.2, torch.randn(3) * 0.1, name="l")
+    assert_in_range(lin, -1000.0, 1000.0)
+    sink = Concatenate([lin])
 
     n_pos = 5
     x = torch.randn(n_pos, 6)
-    l_before = l.compute(n_pos, {"x": x})
+    lin_before = lin.compute(n_pos, {"x": x})
 
     assert fuse_consecutive_linears({sink}) == 1
     assert len(b.checks) == 1  # migrated with the value
     assert b.claimed_type is not None
-    assert torch.allclose(b.compute(n_pos, {"x": x}), l_before, atol=1e-5)
+    assert torch.allclose(b.compute(n_pos, {"x": x}), lin_before, atol=1e-5)
 
 
 def test_concat_fold_declined_on_checked_concat():
-    """The composite two-input asserts attach to a Concatenate; every
-    concat fold changes its value or width, so a checked concat stays
-    whole (splices included).
+    """The composite two-input asserts attach to a Concatenate.
+
+    Every concat fold changes its value or width, so a checked concat
+    stays whole (splices included).
     """
     from torchwright.graph.asserts import assert_unique_values
 
@@ -761,6 +784,7 @@ def _hinted(node):
 
 def _waited_on(node, out_width=1):
     """Make node a hint target: some sibling in the graph waits on it.
+
     Returns the waiter (must stay reachable from the test's output).
     """
     from torchwright.graph.scheduling_hints import add_scheduling_dependency
@@ -817,16 +841,18 @@ def test_gate_fold_declines_hinted_upstream_linear():
 
 
 def test_ffn_fold_declines_hinted_downstream_linear():
-    """The FFN->Linear fold orphans l even though l's VALUE moves onto the
-    FFN: hint edges are keyed by node identity, so a waiter naming l would
-    never see it computed.
+    """The FFN->Linear fold orphans the downstream Linear.
+
+    That happens even though its VALUE moves onto the FFN: hint edges
+    are keyed by node identity, so a waiter naming it would never see
+    it computed.
     """
     inp = InputNode("x", 6, value_range=(-2.0, 2.0))
     b = _block(inp, 6, 8, 4, seed=2)
-    l = _hinted(Linear(b, torch.randn(4, 3) * 0.2, name="l"))
-    sink = Concatenate([l])
+    lin = _hinted(Linear(b, torch.randn(4, 3) * 0.2, name="l"))
+    sink = Concatenate([lin])
     assert fuse_consecutive_linears({sink}) == 0
-    assert sink.inputs[0] is l
+    assert sink.inputs[0] is lin
 
     inp2 = InputNode("x2", 6, value_range=(-2.0, 2.0))
     b2 = _block(inp2, 6, 8, 4, seed=2)
@@ -840,8 +866,8 @@ def test_concat_fold_declines_hinted_linear_leaf():
     leaf = _hinted(Linear(inp, torch.randn(4, 3), name="leaf"))
     other = InputNode("y", 2, value_range=(-2.0, 2.0))
     c = Concatenate([leaf, other])
-    l = Linear(c, torch.randn(5, 2), name="l")
-    assert fuse_consecutive_linears({l}) == 0
+    lin = Linear(c, torch.randn(5, 2), name="l")
+    assert fuse_consecutive_linears({lin}) == 0
     assert leaf in c.inputs
 
 
@@ -852,9 +878,9 @@ def test_concat_fold_declines_hinted_literal_leaf():
     lit = LiteralValue(torch.ones(2), name="lit")
     waiter = _waited_on_literal(lit, inp)
     c = Concatenate([Linear(inp, torch.randn(4, 3), name="leaf"), lit])
-    l = Linear(c, torch.randn(5, 2), name="l")
+    lin = Linear(c, torch.randn(5, 2), name="l")
     # The Linear leaf still absorbs (1 fold); the literal must survive.
-    fuse_consecutive_linears({Concatenate([l, waiter])})
+    fuse_consecutive_linears({Concatenate([lin, waiter])})
     assert lit in c.inputs
 
 
@@ -867,9 +893,10 @@ def _waited_on_literal(lit, src):
 
 
 def test_concat_fold_declines_hinted_nested_concat_splice():
-    """A splice is value-identical but still orphans the nested concat; a
-    waiter can name a Concatenate (the scheduler marks one computed once its
-    leaves are), so the gate applies.
+    """A splice is value-identical but still orphans the nested concat.
+
+    A waiter can name a Concatenate (the scheduler marks one computed
+    once its leaves are), so the gate applies.
     """
     from torchwright.graph.scheduling_hints import add_scheduling_dependency
 
@@ -877,11 +904,11 @@ def test_concat_fold_declines_hinted_nested_concat_splice():
     a = Linear(inp, torch.randn(4, 2), name="a")
     inner = Concatenate([a, InputNode("y", 1, value_range=(-1.0, 1.0))])
     c = Concatenate([inner, InputNode("z", 1, value_range=(-1.0, 1.0))])
-    l = Linear(c, torch.randn(4, 2), name="l")
+    lin = Linear(c, torch.randn(4, 2), name="l")
     waiter = Linear(inp, torch.zeros(4, 1), name="waiter")
     add_scheduling_dependency(waiter, inner)
 
-    fuse_consecutive_linears({Concatenate([l, waiter])})
+    fuse_consecutive_linears({Concatenate([lin, waiter])})
     assert inner in c.inputs  # splice declined; the waiter's target survives
 
 
@@ -951,8 +978,10 @@ def test_sequential_scope_serializes_under_forward_compile():
 
 
 def test_assert_hints_intact_names_the_pass():
-    """The lower()-level tripwire: a pass that orphans a hint target (the
-    collapse passes have no orphan gates) fails loudly, attributed.
+    """The lower()-level tripwire: an orphaned hint target fails loudly.
+
+    A pass that orphans a hint target (the collapse passes have no
+    orphan gates) fails loudly, attributed.
     """
     from torchwright.graph.scheduling_hints import (
         add_scheduling_dependency,
@@ -973,11 +1002,13 @@ def test_assert_hints_intact_names_the_pass():
 
 
 def test_ffn_fold_clears_survivor_stale_claim_without_checks():
-    """Soundness (the *replaced* predicate): the FFN survivor's value is
-    replaced by the fold, so a claim it carried — installed WITHOUT a check,
-    which nothing forbids — must not survive onto the new value, where it
-    would wrongly tighten bounds.  The gate that made this safe by accident
-    is ``bool(b.checks)``; this constructs the case that gate misses.
+    """Soundness (the *replaced* predicate).
+
+    The FFN survivor's value is replaced by the fold, so a claim it
+    carried — installed WITHOUT a check, which nothing forbids — must
+    not survive onto the new value, where it would wrongly tighten
+    bounds. The gate that made this safe by accident is
+    ``bool(b.checks)``; this constructs the case that gate misses.
     """
     from torchwright.graph.value_type import NodeValueType, Range
 
@@ -989,19 +1020,21 @@ def test_ffn_fold_clears_survivor_stale_claim_without_checks():
     b.integer_claim = True
     assert not b.checks  # the _blocks_absorb(b) gate does not fire
 
-    l = Linear(b, torch.randn(4, 3) * 0.2, torch.randn(3) * 0.1, name="l")
-    sink = Concatenate([l])
+    lin = Linear(b, torch.randn(4, 3) * 0.2, torch.randn(3) * 0.1, name="l")
+    sink = Concatenate([lin])
 
     assert fuse_consecutive_linears({sink}) == 1  # fold proceeds (b unchecked)
-    # b now computes l's value; the stale claim on the OLD value is gone.
+    # b now computes lin's value; the stale claim on the OLD value is gone.
     assert b.claimed_type is None
     assert b.integer_claim is False
     assert b.checks == []
 
 
 def test_ffn_fold_unconditional_transfer_still_migrates():
-    """The unconditional transfer changes nothing for the covered case: l's
-    checks and claim still land on b (regression guard alongside
+    """The unconditional transfer changes nothing for the covered case.
+
+    The orphaned Linear's checks and claim still land on b
+    (regression guard alongside
     test_ffn_fold_migrates_checks_from_orphaned_linear).
     """
     from torchwright.graph.asserts import assert_in_range
@@ -1010,11 +1043,11 @@ def test_ffn_fold_unconditional_transfer_still_migrates():
     inp = InputNode("x", 6, value_range=(-1.0, 1.0))
     b = _block(inp, 6, 8, 4, seed=31)
     b.claimed_type = NodeValueType(value_range=Range(-0.5, 0.5))  # stale, no check
-    l = Linear(b, torch.randn(4, 3) * 0.2, torch.randn(3) * 0.1, name="l")
-    assert_in_range(l, -1000.0, 1000.0)
-    sink = Concatenate([l])
+    lin = Linear(b, torch.randn(4, 3) * 0.2, torch.randn(3) * 0.1, name="l")
+    assert_in_range(lin, -1000.0, 1000.0)
+    sink = Concatenate([lin])
 
     assert fuse_consecutive_linears({sink}) == 1
     assert len(b.checks) == 1
     assert b.claimed_type is not None
-    assert b.claimed_type.value_range.lo == -1000.0  # l's claim, not b's stale one
+    assert b.claimed_type.value_range.lo == -1000.0  # lin's claim, not b's stale one

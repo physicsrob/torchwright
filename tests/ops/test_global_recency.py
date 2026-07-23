@@ -41,10 +41,9 @@ def _rope():
 
 
 def test_bos_weight_gives_correct_position():
-    """Output of global_position_from_bos rounds to the correct absolute
-    position at oracle precision.
+    """global_position_from_bos output rounds to the correct absolute position.
 
-    Tests n=80 positions to keep oracle compute fast.
+    Tested at oracle precision (n=80 positions, to keep oracle compute fast).
 
     The validation script (scripts/rope_global_recency_validate.py) confirms
     PWL-only error < 0.009 when sampled every 10 positions.  However, the
@@ -52,7 +51,7 @@ def test_bos_weight_gives_correct_position():
     in float32; fp32 accumulation in this sum adds up to ~0.09 at small
     positions (the initial slope is O(250000), and each of the ~1022 active
     terms carries rounding error).  Tolerance 0.15 is the empirical ceiling
-    seen here — still 3.3× below the 0.5 rounding threshold that matters for
+    seen here — still 3.3x below the 0.5 rounding threshold that matters for
     downstream use.
     """
     rope = _rope()
@@ -83,11 +82,10 @@ def test_bos_weight_gives_correct_position():
 
 
 def test_position_strictly_increases():
-    """The recovered position increases monotonically with absolute position
-    (oracle precision, n=60).
+    """The recovered position increases monotonically with absolute position.
 
-    This confirms the PWL inverse faithfully reflects w(m) being strictly
-    monotone decreasing.
+    Oracle precision, n=60. This confirms the PWL inverse faithfully reflects
+    w(m) being strictly monotone decreasing.
     """
     rope = _rope()
     n = 60
@@ -151,7 +149,7 @@ def test_picks_most_recent_within_window():
     """Sparse matches within the local window: most recent is selected.
 
     Matches every 10 positions (0, 10, 20, …, 120).  Adjacent match logit gap
-    is recency_scale × 10 = 10, giving softmax weight exp(10)/(exp(10)+1) >
+    is recency_scale x 10 = 10, giving softmax weight exp(10)/(exp(10)+1) >
     99.99% — essentially one-hot on the most recent match.
     """
     n = 130
@@ -163,14 +161,16 @@ def test_picks_most_recent_within_window():
         # m <= p: the query at p can see itself if it's a match (causal, inclusive).
         most_recent = max(m for m in matches if m <= p)
         assert abs(out[p].item() - float(most_recent)) < 0.5, (
-            f"pos {p}: expected most-recent match {most_recent}, got {out[p].item():.2f}"
+            f"pos {p}: expected most-recent match {most_recent}, "
+            f"got {out[p].item():.2f}"
         )
 
 
 def test_fixes_phase6_breakdown():
-    """The exact scenario where Phase-6 local recency FAILS: two matches, the
-    only recent one is at position 500 and the older at position 10 — gap=490
-    exceeds the local window W ≈ 415.
+    """The exact scenario where Phase-6 local recency FAILS.
+
+    Two matches: the only recent one is at position 500 and the older at
+    position 10 — gap=490 exceeds the local window W ≈ 415.
 
     Phase 6 `attend_most_recent_matching` would invert here and pick pos 10
     (the farther match) because the lobe is non-monotone past W.
@@ -192,11 +192,12 @@ def test_fixes_phase6_breakdown():
 
 
 def test_content_dominates_recency():
-    """A non-matching key at a very recent position loses to a matching key at
-    a much older position — content score dominates the position tiebreak.
+    """Content score dominates the position tiebreak.
 
-    Scenario: one match at position 5, non-matches everywhere else (including
-    position n-2, very recent).  Query from position n-1 should pick position 5.
+    A non-matching key at a very recent position loses to a matching key at
+    a much older position.  Scenario: one match at position 5, non-matches
+    everywhere else (including position n-2, very recent).  Query from
+    position n-1 should pick position 5.
     """
     n = 80
     match_pos = 5
@@ -234,7 +235,7 @@ def test_exclude_self_does_not_pick_self():
     (past the causal boundary).  The most recent VISIBLE match for query j (a
     multiple of 10) is at shifted position j-9, carrying value j-10.
 
-    Adjacent shifted-match logit gap is recency_scale × 10 = 10, so exp(10) ≈
+    Adjacent shifted-match logit gap is recency_scale x 10 = 10, so exp(10) ≈
     22026 → effectively one-hot on the previous match.
     """
     n = 50
@@ -303,7 +304,7 @@ def test_wider_content_W16():
     matches = set(range(0, n, stride))
 
     match_vec = torch.zeros(W)
-    match_vec[0] = 10.0  # match_gain(200) × dot(100) = 20000 >> max_position tiebreak
+    match_vec[0] = 10.0  # match_gain(200) x dot(100) = 20000 >> max_position tiebreak
     other_vec = torch.zeros(W)
 
     bos_in = torch.zeros(n, 1)

@@ -106,8 +106,9 @@ class NumericSequence:
         self.digit_values = [attend_to_offset(rope, digit) for digit in current_digits]
 
     def get_digits_at_event(self, termination_event: Node) -> list[Node]:
-        """Capture the digit window at the position where termination_event
-        fires; the captured values persist forward via attention.
+        """Capture the digit window at the position where termination_event fires.
+
+        The captured values persist forward via attention.
 
         Returns:
             List of embedding-valued digit nodes, MSB-first.
@@ -141,11 +142,11 @@ _SENTINEL_FLOOR = 0.5
 # is stated in bare dot products, but each content lane's Q·K contribution is
 # really multiplied by cos(Δ·θ_lane), where Δ is the distance from the query
 # to the key and θ_lane is the frequency of the slow plane that lane rides
-# (place_on_slow_planes: lane c → plane d_head/2 − 1 − c, so the *last* lane —
+# (place_on_slow_planes: lane c → plane d_head/2 - 1 - c, so the *last* lane —
 # the sentinel's dedicated no-member lane — rides the fastest selected plane).
 # Requiring cos(max_read_distance · θ) ≥ 0.75 on every lane keeps the ordering
 # intact with margin: member-beats-sentinel needs worst-member cos 0.75 >
-# _SENTINEL_FLOOR · best-sentinel cos 1 (a 1.5× margin — and in fact the
+# _SENTINEL_FLOOR · best-sentinel cos 1 (a 1.5x margin — and in fact the
 # sentinel sits at the marker, farther than every member, so its cosine on the
 # shared lane never exceeds the member's); sentinel-beats-zero needs cos > 0.
 # Measured against reference eval (d_head=32, base=5e5, prompt-length reads):
@@ -198,7 +199,7 @@ class IndexedRegion:
       enforces ``cos(max_read_distance · θ) ≥ 0.75`` on the fastest selected
       plane — a loud ``ValueError``, not silent drift.  Wide regions select
       fast planes (``max_len + 1`` lanes reach down to plane
-      ``d_head/2 − max_len − 1``), so the practical remedy is raising
+      ``d_head/2 - max_len - 1``), so the practical remedy is raising
       ``rope.d_head``; shrinking ``max_len`` or consuming reads closer to
       the marker (e.g. latching them at a delimiter with
       :func:`~torchwright.ops.attention_ops.get_prev_value`, the calculator
@@ -226,7 +227,7 @@ class IndexedRegion:
             rotary planes (they must fit ``rope.d_head // 2``), and how *fast*
             the fastest of those planes is bounds the usable read distance —
             see ``max_read_distance``.
-        max_read_distance: upper bound on ``query position − marker
+        max_read_distance: upper bound on ``query position - marker
             position`` over every position where a :meth:`token_at` read is
             consumed (unconsumed reads stay bounded garbage as documented on
             :meth:`token_at`).  Raises ``ValueError`` when the rotation over
@@ -255,8 +256,8 @@ class IndexedRegion:
         require_full_rotary(cast("int", rope.d_rot), rope.d_head, "IndexedRegion")
 
         # Build-time dominance bound (see _CONTENT_COS_FLOOR): the gather's
-        # max_len + 1 content lanes land on planes d_head/2 − 1 (slowest)
-        # down to d_head/2 − max_len − 1 (fastest); cos is monotone on the
+        # max_len + 1 content lanes land on planes d_head/2 - 1 (slowest)
+        # down to d_head/2 - max_len - 1 (fastest); cos is monotone on the
         # guarded range, so checking the fastest plane at the farthest
         # consumed distance covers every lane and every nearer key.
         half = rope.d_head // 2
@@ -330,9 +331,10 @@ class IndexedRegion:
         return add_const(get_prev_value(self.rope, self._count, event), -1.0)
 
     def token_at(self, index: Node) -> Node:
-        """The region's token at runtime ``index`` (0 = first member), or the
-        region's ``default`` where ``index`` falls outside ``[0, region
-        length)``.
+        """The region's token at runtime ``index``, or ``default`` if out of range.
+
+        ``index`` of 0 is the first member; the region's ``default`` is
+        returned where ``index`` falls outside ``[0, region length)``.
 
         One content-match attention.  The index becomes a one-hot query with
         a computed "out of ``[0, max_len)``" last lane; at most one member
@@ -361,7 +363,7 @@ def output_sequence(
     trigger_condition: Node,
     seq: list[Node],
     default_output: torch.Tensor,
-):
+) -> Node:
     """Gate a sequence of values for left-to-right autoregressive emission.
 
     Before the trigger fires, outputs default_output. Once the trigger
@@ -429,7 +431,7 @@ def remove_leading_0s(
     3. ``in_range(k, k + 1, ...)`` — the shift-amount one-hot, computed
        once and shared by every output slot.
     4. A ``broadcast_select`` per output slot over that slot's shift
-       candidates, plus the free cross-slot collapse.  Steps 3–4 are
+       candidates, plus the free cross-slot collapse.  Steps 3-4 are
        ``dynamic_extract`` with the index one-hot hoisted out of the
        per-slot loop; the single-call form would also recompute the
        one-hot per slot and the monolithic single-table form would put

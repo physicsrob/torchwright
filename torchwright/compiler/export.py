@@ -39,10 +39,10 @@ big graphs (e.g. the DOOM renderer) fit in realistic RAM.
 """
 
 import json
-import os
 import time
 from collections.abc import Callable
 from dataclasses import dataclass
+from pathlib import Path
 from typing import (
     TYPE_CHECKING,
     Any,
@@ -51,7 +51,9 @@ from typing import (
 )
 
 if TYPE_CHECKING:
+    from torchwright.compiler.onnx_load import OnnxTokenModule
     from torchwright.compiler.residual_assignment import ResidualAssignment
+    from torchwright.debug.onnx_debug import OnnxDebugSession
 
 import numpy as np
 import onnx
@@ -64,15 +66,18 @@ from torchwright.compiler.forward.compile import (
 )
 from torchwright.compiler.forward.scheduling_policy import SchedulingPolicy
 from torchwright.compiler.token_model import (
+    CompiledLayerWeights,
     CompileHeader,
     CompileProfile,
     ReluLayerWeights,
     SwishLayerWeights,
     TokenModelSpec,
+    TokenModelWeights,
     build_token_weights,
     make_layer_callback,
     schedule_provenance,
 )
+from torchwright.compiler.transformer import HeadlessTransformer
 from torchwright.compiler.utils import resolve_n_heads
 from torchwright.graph import Concatenate, Embedding, LiteralValue, Node
 from torchwright.graph.attn import CAUSAL_MASK_SENTINEL
@@ -96,25 +101,23 @@ DEBUG_META_FORMAT = "torchwright.debug.v1"
 
 
 def meta_path_for(onnx_path: str) -> str:
-    base, _ = os.path.splitext(onnx_path)
-    return base + ".meta.json"
+    return str(Path(onnx_path).with_suffix(".meta.json"))
 
 
 def _write_meta(onnx_path: str, meta: dict) -> str:
     meta_path = meta_path_for(onnx_path)
-    with open(meta_path, "w") as f:
+    with Path(meta_path).open("w") as f:
         json.dump(meta, f)
     return meta_path
 
 
-def _schedule_provenance(compiled, optimize: int) -> dict:
+def _schedule_provenance(compiled: "HeadlessTransformer", optimize: int) -> dict:
     """Selected-schedule provenance plus the independent solver attempt."""
     return schedule_provenance(compiled, optimize).to_dict()
 
 
 def debug_meta_path_for(onnx_path: str) -> str:
-    base, _ = os.path.splitext(onnx_path)
-    return base + ".debug.json"
+    return str(Path(onnx_path).with_suffix(".debug.json"))
 
 
 @dataclass(frozen=True)
@@ -150,7 +153,7 @@ class OnnxArtifact:
     # (biases folded against the pinned constant-1 column; no_bias_plan.md).
     bias: bool = True
 
-    def load(self, providers=None):
+    def load(self, providers: list[str] | None = None) -> "OnnxTokenModule":
         """Load the artifact via :func:`torchwright.compiler.onnx_load.load_onnx`.
 
         Returns an ``OnnxTokenModule``.
@@ -161,7 +164,9 @@ class OnnxArtifact:
 
         return load_onnx(self.path, providers=providers)
 
-    def debug_session(self, output_node, providers=None):
+    def debug_session(
+        self, output_node: Node, providers: list[str] | None = None
+    ) -> "OnnxDebugSession":
         """Open a :class:`torchwright.debug.onnx_debug.OnnxDebugSession`.
 
         ``output_node`` must come from the same deterministic
@@ -196,11 +201,11 @@ _MATRIX_AXES = {
 }
 
 
-def _dense_rects(matrix_id, rows, cols):
-    """A dense write fills the full cross product ``rows × cols``.
+def _dense_rects(matrix_id: str, rows: list[int], cols: list[int]) -> list[dict]:
+    """A dense write fills the full cross product ``rows x cols``.
 
     Run-length-encode each axis independently (order is irrelevant for a
-    set of cells) and emit one rectangle per row-run × col-run pair.
+    set of cells) and emit one rectangle per row-run x col-run pair.
     """
     from torchwright.compiler.graph_identity import encode_cols
 
@@ -213,7 +218,7 @@ def _dense_rects(matrix_id, rows, cols):
     return rects
 
 
-def _diag_rects(matrix_id, rows, cols):
+def _diag_rects(matrix_id: str, rows: list[int], cols: list[int]) -> list[dict]:
     """A diagonal (paired) write fills only cells ``(rows[k], cols[k])``.
 
     Pairing order is meaningful, so we do NOT sort.  Coalesce into maximal
@@ -242,8 +247,12 @@ def _diag_rects(matrix_id, rows, cols):
 
 
 def _build_matrix_occupancy(
-    compiled, canon, d: int, d_head: int, n_heads: int | None = None
-):
+    compiled: "HeadlessTransformer",
+    canon: dict[int, int],
+    d: int,
+    d_head: int,
+    n_heads: int | None = None,
+) -> tuple[dict[str, dict], dict[str, list], int, list[int]]:
     """Build the ``matrices`` table and ``placements`` map for the sidecar.
 
     Returns ``(matrices, placements, n_heads, d_hidden_per_layer)``.  All
@@ -304,7 +313,7 @@ def _build_matrix_occupancy(
 def _write_debug_sidecar(
     onnx_path: str,
     *,
-    compiled,
+    compiled: "HeadlessTransformer",
     output_node: Node,
     d: int,
     d_head: int,
@@ -521,10 +530,10 @@ def _write_debug_sidecar(
         "states": state_entries,
     }
     path = debug_meta_path_for(onnx_path)
-    with open(path, "w") as f:
+    with Path(path).open("w") as f:
         json.dump(payload, f)
     if verbose:
-        print(f"Wrote {path} ({os.path.getsize(path):,} bytes)")
+        print(f"Wrote {path} ({Path(path).stat().st_size:,} bytes)")
     return path
 
 
@@ -538,7 +547,9 @@ _SPARSITY_THRESHOLD = 0.75
 _MIN_SPARSE_ELEMENTS = 1024
 
 
-def _tensor_to_proto(name: str, arr: np.ndarray):
+def _tensor_to_proto(
+    name: str, arr: np.ndarray
+) -> tuple[TensorProto | None, onnx.SparseTensorProto | None]:
     """Convert a float32 numpy array to (dense_tp, sparse_tp).
 
     Exactly one of the returned values is non-None.  Float tensors with
@@ -598,8 +609,8 @@ def _tensor_to_proto(name: str, arr: np.ndarray):
 
 
 def _append_proto(
-    dense_tp,
-    sparse_tp,
+    dense_tp: TensorProto | None,
+    sparse_tp: onnx.SparseTensorProto | None,
     dense_inits: list,
     sparse_inits: list,
 ) -> None:
@@ -630,11 +641,12 @@ def _add_int64_init(name: str, arr: np.ndarray, dense_inits: list) -> None:
 
 
 def _add_scalar_inits(dense_inits: list) -> None:
-    """Register the scalar / tiny 1-D helper initializers used by the
-    cached preamble and layers (Where sentinel, Unsqueeze axes).
+    """Register the scalar / tiny 1-D helper initializers.
 
-    Initializer-fed axes inputs do NOT create Memcpy nodes (initializers
-    are materialized on every EP), so these are CUDA-graph-safe.
+    Used by the cached preamble and layers (Where sentinel, Unsqueeze
+    axes).  Initializer-fed axes inputs do NOT create Memcpy nodes
+    (initializers are materialized on every EP), so these are
+    CUDA-graph-safe.
     """
     dense_inits.append(
         helper.make_tensor(
@@ -671,9 +683,11 @@ def _rope_freq_row(d_rot: int, base: float) -> np.ndarray:
 def _add_rope_inits(
     per_layer_rotary: list, d_head: int, dense_inits: list
 ) -> tuple[float, int]:
-    """Add the global RoPE initializers (``rope_freq``, ``rope_split``, and — for
-    partial rotary — ``rope_partial_split``).  Returns ``(base, d_rot)`` for the
-    sidecar meta.  All layers must share one ``base`` AND one ``d_rot``.
+    """Add the global RoPE initializers.
+
+    Adds ``rope_freq``, ``rope_split``, and — for partial rotary —
+    ``rope_partial_split``.  Returns ``(base, d_rot)`` for the sidecar
+    meta.  All layers must share one ``base`` AND one ``d_rot``.
     """
     bases = {r["base"] for r in per_layer_rotary if r.get("base") is not None}
     if len(bases) > 1:
@@ -763,14 +777,14 @@ def _make_stream_layer_weights_cb(
     """
 
     class OnnxLayerSink:
-        def begin(self, header) -> None:
+        def begin(self, header: CompileHeader) -> None:
             assert header.d == d
             assert header.d_head == d_head
             assert header.n_heads == n_heads
             assert header.trim_heads == trim_heads
             assert header.bias == bias
 
-        def write_layer(self, i, weights) -> None:
+        def write_layer(self, i: int, weights: CompiledLayerWeights) -> None:
             attn = weights.attention
             nh, hd = attn.n_heads, attn.n_heads * d_head
             per_layer_n_heads.append(nh)
@@ -796,7 +810,7 @@ def _make_stream_layer_weights_cb(
                 dense_inits,
             )
 
-            def emit_bias(name, value) -> None:
+            def emit_bias(name: str, value: np.ndarray | None) -> None:
                 if value is not None:
                     emit(name, value)
 
@@ -814,7 +828,7 @@ def _make_stream_layer_weights_cb(
                 emit(f"l{i}_W2", weights.w2)
                 emit_bias(f"l{i}_b2", weights.b2)
 
-        def finalize(self, spec, weights) -> None:
+        def finalize(self, spec: TokenModelSpec, weights: TokenModelWeights) -> None:
             # Graph assembly below consumes the finalized semantic values.
             self.spec = spec
             self.token_weights = weights
@@ -886,7 +900,7 @@ def _emit_cached_preamble(nodes: list) -> None:
         comparison and by every layer's ``ScatterND`` indices.
     """
 
-    def add(op, ins, outs, **attrs) -> None:
+    def add(op: str, ins: list[str], outs: list[str], **attrs: Any) -> None:
         nodes.append(helper.make_node(op, ins, outs, **attrs))
 
     # S_eff = bound first dim of the cache; slots = arange_S[:S_eff].
@@ -925,7 +939,9 @@ def _emit_cached_preamble(nodes: list) -> None:
     add("Unsqueeze", ["_rope_sin", "_axes1_1d"], ["_rope_sin_k"])
 
 
-def _emit_rmsnorm(node, x: str, gain: str, eps: str, out: str, scratch: str) -> None:
+def _emit_rmsnorm(
+    node: Callable[..., None], x: str, gain: str, eps: str, out: str, scratch: str
+) -> None:
     """Emit opset-14 RMSNorm ops: ``out = x / sqrt(mean(x^2, -1) + eps) * gain``.
 
     ``node`` is the layer's ``make_node`` closure; ``scratch`` namespaces the
@@ -990,7 +1006,7 @@ def _emit_cached_layer_nodes(
     """
     p = f"l{layer_idx}"
 
-    def node(op, ins, outs, **attrs) -> None:
+    def node(op: str, ins: list[str], outs: list[str], **attrs: Any) -> None:
         nodes.append(helper.make_node(op, ins, outs, **attrs))
 
     # Pre-norm: the attention sublayer reads norm(current_res); the residual
@@ -1012,10 +1028,12 @@ def _emit_cached_layer_nodes(
         )
 
     def rope_rotate(src: str, dst: str, cos: str, sin: str) -> None:
-        """rotate_half RoPE over the rotary front ``d_rot``: rotate the first
-        ``d_rot`` dims (``front*cos + rotate_half(front)*sin``) and pass the last
-        ``d_head - d_rot`` dims (the NoPE tail) through unchanged.  Matches
-        graph/rope.py (vanilla partial rotary, half-split over d_rot);
+        """rotate_half RoPE over the rotary front ``d_rot``.
+
+        Rotates the first ``d_rot`` dims (``front*cos +
+        rotate_half(front)*sin``) and passes the last ``d_head - d_rot``
+        dims (the NoPE tail) through unchanged.  Matches graph/rope.py
+        (vanilla partial rotary, half-split over d_rot);
         modeling_torchwright_custom.py mirrors this op sequence.
 
         ``d_rot == d_head`` (full rotary) emits the exact pre-partial 6-node
@@ -1539,7 +1557,7 @@ def compile_to_onnx(
             # Only Embedding / LiteralValue / Concatenate / InputNode are
             # expected in the token seed; anything else would be silently
             # dropped by the vanilla-embedding seed below — fail loud instead.
-            raise AssertionError(
+            raise TypeError(
                 f"unexpected input-state node {type(node).__name__} in the "
                 f"token seed; only Embedding / LiteralValue / Concatenate / "
                 f"InputNode are expected"
@@ -1654,7 +1672,7 @@ def compile_to_onnx(
     # full-width tied unembed.
     nodes: list = []
 
-    def add(op, ins, outs, **attrs) -> None:
+    def add(op: str, ins: list[str], outs: list[str], **attrs: Any) -> None:
         nodes.append(helper.make_node(op, ins, outs, **attrs))
 
     # RoPE: bake the global rope inits when any layer is rotary; the preamble
@@ -1827,7 +1845,7 @@ def compile_to_onnx(
             f"{n_layers} layers, {vocab_size} vocab, "
             f"{len(sparse_inits)} sparse inits, {len(dense_inits)} dense inits"
         )
-        model_size = os.path.getsize(output_path)
+        model_size = Path(output_path).stat().st_size
         print(f"Wrote {output_path} ({model_size:,} bytes)")
         print(f"Wrote {meta_path}")
 
@@ -1867,7 +1885,9 @@ class _DebugState:
     ra: "ResidualAssignment"
 
 
-def _ordered_mlp_state_triples(net, ra) -> list[tuple]:
+def _ordered_mlp_state_triples(
+    net: HeadlessTransformer, ra: "ResidualAssignment"
+) -> list[tuple]:
     """Post-MLP sublayer states in execution order.
 
     Returns ``(layer_index, state_name, state)`` triples, one per
@@ -1890,10 +1910,9 @@ def _ordered_mlp_state_triples(net, ra) -> list[tuple]:
 
 
 class CompiledHeadless:
-    """Callable wrapper around :class:`HeadlessTransformer` — the
-    in-process debug/test backend.
+    """Callable wrapper around :class:`HeadlessTransformer`.
 
-    Exposes a three-method surface:
+    The in-process debug/test backend.  Exposes a three-method surface:
 
     - ``module(inputs)``: stateless per-query inference — runs the
       non-cached ``forward()`` path and returns outputs.
@@ -1906,7 +1925,7 @@ class CompiledHeadless:
 
     def __init__(
         self,
-        net,
+        net: HeadlessTransformer,
         input_specs: list[tuple],
         output_indices: torch.Tensor,
         metadata: dict | None = None,
@@ -1932,8 +1951,10 @@ class CompiledHeadless:
 
     @property
     def n_layers(self) -> int:
-        """Compiled layer count — the number the depth-oriented passes
-        (and their before/after reports) are measured by.
+        """Compiled layer count.
+
+        The number the depth-oriented passes (and their before/after
+        reports) are measured by.
         """
         return self._n_layers
 
@@ -2061,7 +2082,9 @@ class CompiledHeadless:
             past_len = int(past_K[0].shape[1])
 
         res_stream = self._build_res_stream(inputs, past_len=past_len)
-        past_kvs = [(past_K[i], past_V[i]) for i in range(self._n_layers)]
+        past_kvs: list[tuple[torch.Tensor, torch.Tensor] | None] = [
+            (past_K[i], past_V[i]) for i in range(self._n_layers)
+        ]
         if debug and self._checked_nodes:
             res, new_kvs = self._run_debug_checks(
                 res_stream, past_kvs=past_kvs, atol=debug_atol
@@ -2121,7 +2144,11 @@ class CompiledHeadless:
     # Shared with torchwright.debug.onnx_debug.OnnxDebugSession so the
     # probes in torchwright/debug/probe.py work on either backend.
 
-    def _capture_states(self, res_stream: torch.Tensor, past_kvs=None):
+    def _capture_states(
+        self,
+        res_stream: torch.Tensor,
+        past_kvs: list[tuple[torch.Tensor, torch.Tensor] | None] | None = None,
+    ) -> tuple:
         """Forward once with per-sublayer residual snapshots.
 
         Prefill (``past_kvs=None``): ``net.forward(return_states=True)``.
@@ -2149,7 +2176,7 @@ class CompiledHeadless:
                         res,
                         f"layer_{i}_attn_skip_out_state",
                     )
-                    res = layer.mlp.forward(res)
+                    res = cast("torch.Tensor", layer.mlp.forward(res))
                     state_tensor[layer.mlp.out_state] = (
                         res,
                         f"layer_{i}_mlp_out_state",
@@ -2171,7 +2198,7 @@ class CompiledHeadless:
         self,
         prefill: torch.Tensor,
         past_len: int = 0,
-        past_kvs=None,
+        past_kvs: list[tuple[torch.Tensor, torch.Tensor] | None] | None = None,
     ) -> tuple:
         """Forward once with state capture; returns ``(ra, ordered, state_tensor)``.
 
@@ -2203,10 +2230,11 @@ class CompiledHeadless:
         layer_index: int,
         prefill: torch.Tensor,
         past_len: int = 0,
-        past_kvs=None,
+        past_kvs: list[tuple[torch.Tensor, torch.Tensor] | None] | None = None,
     ) -> tuple:
-        """Softmax ``(weights, logits)`` at one attention layer, each
-        ``(n_heads, n_queries, n_keys)``.
+        """Softmax ``(weights, logits)`` at one attention layer.
+
+        Each is shaped ``(n_heads, n_queries, n_keys)``.
         """
         from torchwright.debug.probe import attention_capture
 
@@ -2219,12 +2247,20 @@ class CompiledHeadless:
                 # calls ``attn.attn.forward_cached``.
                 net.forward_cached(res_stream, past_kvs=past_kvs)
         weights, logits = captured["weights"], captured["logits"]
-        assert weights is not None and logits is not None, (
+        assert weights is not None, (
+            "attention_capture did not fire — hook installed on wrong layer?"
+        )
+        assert logits is not None, (
             "attention_capture did not fire — hook installed on wrong layer?"
         )
         return weights, logits
 
-    def _run_debug_checks(self, res_stream, past_kvs=None, atol: float = 1e-7):
+    def _run_debug_checks(
+        self,
+        res_stream: torch.Tensor,
+        past_kvs: list[tuple[torch.Tensor, torch.Tensor] | None] | None = None,
+        atol: float = 1e-7,
+    ) -> tuple:
         """Run forward with state capture, then check consistency, asserts, and watches.
 
         For prefill (past_kvs=None): uses net.forward(return_states=True).

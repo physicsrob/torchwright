@@ -6,7 +6,10 @@ from torchwright.graph import Concatenate, Linear, Node
 from torchwright.graph.asserts import assert_matches_value_type
 from torchwright.graph.misc import LiteralValue
 from torchwright.graph.value_type import NodeValueType, Range
+from torchwright.ops._math import _lookup_axis_scale, _lookup_numeric_slack
 from torchwright.ops.const import embedding_step_sharpness, step_sharpness
+from torchwright.ops.linear import sum_nodes
+from torchwright.ops.relu.linear_relu_linear import linear_relu_linear
 from torchwright.ops.relu.logic_ops import (
     _intersect_intervals,
     _max_abs_or_raise,
@@ -22,12 +25,18 @@ far-field compare noise."""
 _LOOKUP_D_MAX = 1024
 """Neurons-per-MLP-sublayer cap for the table-lookup column-gate chunking."""
 
+_TABLE_2D_NDIM = 2  # table_lookup_2d requires a rank-2 (rows, cols) table
 
-def _select_per_column_offsets(true_node, false_node, scalar_M):
-    """Per-output-column gate offsets for a two-way select. The output column
-    ``j`` equals ``true_j`` or ``false_j``, so size ``M_j`` from the union of
-    the two operands' per-column affine intervals (falls back to the scalar
-    ``M`` if a per-column bound is unavailable). See ``per_column_offsets``.
+
+def _select_per_column_offsets(
+    true_node: Node, false_node: Node, scalar_M: float
+) -> torch.Tensor:
+    """Per-output-column gate offsets for a two-way select.
+
+    The output column ``j`` equals ``true_j`` or ``false_j``, so size
+    ``M_j`` from the union of the two operands' per-column affine intervals
+    (falls back to the scalar ``M`` if a per-column bound is unavailable).
+    See ``per_column_offsets``.
     """
     ti = _intersect_intervals(true_node)
     fi = _intersect_intervals(false_node)
@@ -40,11 +49,18 @@ def _select_per_column_offsets(true_node, false_node, scalar_M):
 
 
 def _broadcast_select_per_column_offsets(
-    true_value, false_value, n_slots, d_fill, true_bc, false_bc, scalar_M
-):
-    """Per-output-column gate offsets for broadcast_select. Output column
-    ``i*d_fill+j`` equals ``true``/``false`` at its (possibly broadcast)
-    source column, so union those two per-column intervals.
+    true_value: Node,
+    false_value: Node,
+    n_slots: int,
+    d_fill: int,
+    true_bc: bool,
+    false_bc: bool,
+    scalar_M: float,
+) -> torch.Tensor:
+    """Per-output-column gate offsets for broadcast_select.
+
+    Output column ``i*d_fill+j`` equals ``true``/``false`` at its (possibly
+    broadcast) source column, so union those two per-column intervals.
     """
     ti = _intersect_intervals(true_value)
     fi = _intersect_intervals(false_value)
@@ -59,11 +75,6 @@ def _broadcast_select_per_column_offsets(
     return per_column_offsets(union, scalar_M)
 
 
-from torchwright.ops._math import _lookup_axis_scale, _lookup_numeric_slack
-from torchwright.ops.linear import sum_nodes
-from torchwright.ops.relu.linear_relu_linear import linear_relu_linear
-
-
 def map_to_table(
     inp: Node, key_to_value: dict[torch.Tensor, torch.Tensor], default: torch.Tensor
 ) -> Node:
@@ -71,8 +82,10 @@ def map_to_table(
 
     Args:
         inp (Node): Node whose values will be looked up.
-        key_to_value (Dict[torch.Tensor, torch.Tensor]): Lookup table mapping from keys to values.
-        default (torch.Tensor): Default tensor to return if the input value doesn't exist in the table.
+        key_to_value (Dict[torch.Tensor, torch.Tensor]): Lookup table
+            mapping from keys to values.
+        default (torch.Tensor): Default tensor to return if the input
+            value doesn't exist in the table.
 
     Returns:
         Node: Output node with mapped values.
@@ -88,12 +101,12 @@ def map_to_table(
 
     d_hidden = len(key_to_value)
     speed = embedding_step_sharpness
-    # We'll use 1 MLP entry per item in the table, and an overall output bias of the default value
-    # So roughly speaking:
-    # input_proj will be (d_hidden x d_key), where input_proj[i, :] = table.keys()[i]
-    # input_bias will be (d_hidden), where input_bias[i] = 1.0/speed - (table.keys()[i] @ table.keys()[i])
-    # output_proj will be (d_hidden, d_value), where output_proj[i, :] = speed * (table.values()[i] - default)
-    # output_bias will be (d_value), equal to default
+    # One MLP entry per table item, plus an overall output bias of the
+    # default value. Roughly speaking: each hidden row of input_proj holds
+    # one table key, with a matching input_bias term that peaks (at
+    # 1.0/speed) exactly when the input equals that key; each row of
+    # output_proj then routes that peak to speed times the gap between the
+    # table's value and the default, and output_bias holds the default.
 
     input_proj = torch.zeros(d_hidden, d_key)
     input_bias = torch.zeros(d_hidden)
@@ -321,9 +334,9 @@ def _table_lookup_column_mask(
 def table_lookup_2d(
     i: Node,
     j: Node,
-    table,
+    table: torch.Tensor,
     *,
-    index_scale=1.0,
+    index_scale: float | tuple[float, float] = 1.0,
     sharpness: float = 100.0,
     name: str = "table_lookup_2d",
 ) -> Node:
@@ -349,7 +362,7 @@ def table_lookup_2d(
     d_max = _LOOKUP_D_MAX
 
     table_t = torch.as_tensor(table, dtype=torch.float32)
-    if table_t.ndim != 2:
+    if table_t.ndim != _TABLE_2D_NDIM:
         raise ValueError(f"table must be 2D, got shape {tuple(table_t.shape)}")
     rows, cols = table_t.shape
     if rows < 1 or cols < 1:
@@ -469,7 +482,7 @@ def select(cond: Node, true_node: Node, false_node: Node) -> Node:
     """Outputs one of two nodes based on a boolean condition.
 
     Uses a single L→ReLU→L sublayer with an additive cancellation trick: both
-    branches compute ``(M + v) − M`` where ``M`` is derived from the union of
+    branches compute ``(M + v) - M`` where ``M`` is derived from the union of
     ``true_node`` / ``false_node`` ranges; this loses precision for
     ``|v| ≪ ULP(M)``. An Assert checks ``||cond| - 1|`` stays within
     ``_GATE_C_TOL`` and the output's semantic bound is widened by
@@ -609,10 +622,11 @@ def in_range(lower: Node, upper: Node, n_slots: int) -> Node:
         input_proj[base + 3, 1] = -S
         input_bias[base + 3] = S * center - 1.0
 
-        # output_i = 2*(step_past_lower - step_past_upper) - 1
-        # step_past_lower = unit0 - unit1, step_past_upper = unit2 - unit3
-        # output_i = 2*((u0 - u1) - (u2 - u3)) - 1
-        #          = 2*u0 - 2*u1 - 2*u2 + 2*u3 - 1
+        # output_i combines the two steps: twice the difference between
+        # step_past_lower (units 0 minus 1) and step_past_upper (units 2
+        # minus 3), minus one. Expanded over the four units, that gives
+        # the +/-2.0 weights assigned below (the final -1 output bias is
+        # applied elsewhere).
         output_proj[base, i] = 2.0
         output_proj[base + 1, i] = -2.0
         output_proj[base + 2, i] = -2.0
@@ -763,7 +777,8 @@ def broadcast_select(
         approximate: When ``True`` (default), uses a single L→ReLU→L
             sublayer with four units per ``(slot, channel)`` that cancel
             the mask-offset carry per-unit (no output bias). Offset is
-            ``M = max|true ∪ false|`` derived from value ranges. When
+            ``M = max|true or false|`` derived from the union of value
+            ranges. When
             ``False``, uses two sublayers: sublayer 1 produces
             ``c_off[i] = ReLU(-mask_i)`` and ``c_on[i] = ReLU(mask_i)``;
             sublayer 2 gates each branch by ReLU clipping against
@@ -821,27 +836,31 @@ def broadcast_select(
                 unit_neg_t = 4 * out_idx + 2
                 unit_neg_b = 4 * out_idx + 3
 
-                # unit_pos_t = ReLU(M * mask_i + true_ij)
+                # unit_pos_t rectifies (M times mask_i) plus true_ij.
                 input_proj[unit_pos_t, mask_offset + i] = M_o
                 if true_is_broadcast:
                     input_proj[unit_pos_t, true_offset + j] = 1.0
                 else:
                     input_proj[unit_pos_t, true_offset + i * d_fill + j] = 1.0
 
-                # unit_pos_b = ReLU(M * mask_i)
+                # unit_pos_b rectifies (M times mask_i) alone, as the
+                # carrier that cancels the M offset on the true side.
                 input_proj[unit_pos_b, mask_offset + i] = M_o
 
-                # unit_neg_t = ReLU(-M * mask_i + false_ij)
+                # unit_neg_t rectifies (-M times mask_i) plus false_ij.
                 input_proj[unit_neg_t, mask_offset + i] = -M_o
                 if false_is_broadcast:
                     input_proj[unit_neg_t, false_offset + j] = 1.0
                 else:
                     input_proj[unit_neg_t, false_offset + i * d_fill + j] = 1.0
 
-                # unit_neg_b = ReLU(-M * mask_i)
+                # unit_neg_b rectifies (-M times mask_i) alone, as the
+                # carrier that cancels the M offset on the false side.
                 input_proj[unit_neg_b, mask_offset + i] = -M_o
 
-                # output = (unit_pos_t - unit_pos_b) + (unit_neg_t - unit_neg_b)
+                # The output sums the true-side pair (pos_t minus its
+                # carrier pos_b) with the false-side pair (neg_t minus its
+                # carrier neg_b).
                 output_proj[unit_pos_t, out_idx] = 1.0
                 output_proj[unit_pos_b, out_idx] = -1.0
                 output_proj[unit_neg_t, out_idx] = 1.0

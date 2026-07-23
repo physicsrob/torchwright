@@ -8,6 +8,7 @@ Each op assembles gated-FFN lanes per its entry in
 import builtins
 import math
 from collections.abc import Callable
+from typing import cast
 
 import torch
 
@@ -24,6 +25,17 @@ from torchwright.ops.linear import (
 )
 from torchwright.ops.swiglu.swiglu_ffn import swiglu_ffn
 
+# Below this magnitude, treat a slope change as zero (avoids emitting a
+# zero-weight gate lane / degenerate hinge).
+_SLOPE_EPS = 1e-12
+
+# A piecewise-linear function needs at least two breakpoints to define one
+# segment.
+_MIN_PIECEWISE_BREAKPOINTS = 2
+
+# radix_floor_int's radix divisor D must be at least 2 (base-2 split).
+_MIN_RADIX_DIVISOR = 2
+
 
 def compare(
     inp: Node,
@@ -32,14 +44,14 @@ def compare(
     false_level: float = -1.0,
     sharpness: float | None = None,
 ) -> Node:
-    """Compare input with threshold: ``true_level`` (+1 by default) if
-    ``inp`` is above ``thresh``, ``false_level`` (-1) if below.
+    """Compare input with threshold, returning true_level above and false_level below.
 
-    A saturating ramp built from two sharpened hinges
+    ``true_level`` is +1 by default, ``false_level`` is -1. A saturating
+    ramp built from two sharpened hinges
     (``hinge(z) = Swish(scale·z)/scale ≈ ReLU(z)``)::
 
-        z       = sharpness · (inp − thresh)
-        compare = false_level + (true_level − false_level)·(hinge(z) − hinge(z−1))
+        z       = sharpness · (inp - thresh)
+        compare = false_level + (true_level - false_level)·(hinge(z) - hinge(z-1))
 
     The caller contract is unchanged from the ReLU form: the ramp is
     ``1/sharpness`` wide in input units — inputs at least ``1/sharpness``
@@ -49,7 +61,7 @@ def compare(
     exactly confined to ``[false_level, true_level]`` — inputs landing in
     a fillet (within ``~1.3/(scale·sharpness)`` of one of the two bends)
     can overshoot either level by up to
-    ``swish_dip/scale · |true_level − false_level|`` (0.0022 at
+    ``swish_dip/scale · |true_level - false_level|`` (0.0022 at
     scale=128).  The value-range assert and the semantic bound both carry
     that slack, and every downstream ``c_tol`` budget must too.
 
@@ -120,8 +132,8 @@ def multiply(inp1: Node, inp2: Node) -> Node:
         multiply(a, b) = Swish(a)·b + Swish(-a)·(-b)  =  a·b
 
     Exact for all ``a``, ``b`` — no range limit, no grid: the ± pair
-    makes the Swish sigmoid factors cancel (``Swish(z) = z·σ(z)`` and
-    ``σ(a) + σ(-a) = 1``, so the two lanes sum to ``a·b``).  Both terms
+    makes the Swish sigmoid factors cancel (``Swish(z) = z·sigma(z)`` and
+    ``sigma(a) + sigma(-a) = 1``, so the two lanes sum to ``a·b``).  Both terms
     share the sign of ``a·b``, so they add constructively — no
     catastrophic cancellation.  This replaces the ReLU-era workarounds
     for multiplication (the quarter-square construction in
@@ -264,7 +276,7 @@ def square(inp: Node) -> Node:
 
     :func:`multiply` with both operands the same node — exact for all
     ``inp`` (see there for the ± cancellation).  Both terms are
-    ``x²·σ(±x)`` — non-negative, so they add cleanly.  Drops the
+    ``x²·sigma(±x)`` — non-negative, so they add cleanly.  Drops the
     ReLU-era ``[0, max_value]`` restriction, the ``step`` grid, and the
     huge near-zero relative error of the piecewise-linear version.
 
@@ -296,7 +308,7 @@ def square(inp: Node) -> Node:
 def piecewise_linear(
     inp: Node,
     breakpoints: list[float],
-    fn,
+    fn: Callable[[float], float | list[float]],
     clamp: bool = True,
     d_max: int = min_d_hidden,
     input_scale: float = 1.0,
@@ -360,7 +372,7 @@ def piecewise_linear(
     """
     assert len(inp) == 1, "Input must be a 1D scalar node"
     n = len(breakpoints)
-    assert n >= 2, "Need >= 2 breakpoints"
+    assert n >= _MIN_PIECEWISE_BREAKPOINTS, "Need >= 2 breakpoints"
     assert all(breakpoints[i] < breakpoints[i + 1] for i in range(n - 1)), (
         "Breakpoints must be strictly ascending"
     )
@@ -368,7 +380,11 @@ def piecewise_linear(
     raw_values = [fn(x) for x in breakpoints]
 
     scalar = not isinstance(raw_values[0], (list, tuple))
-    values = [[v] for v in raw_values] if scalar else [list(v) for v in raw_values]
+    values = (
+        [[cast("float", v)] for v in raw_values]
+        if scalar
+        else [list(cast("list[float]", v)) for v in raw_values]
+    )
     d_out = len(values[0])
     assert all(len(v) == d_out for v in values)
 
@@ -383,18 +399,18 @@ def piecewise_linear(
 
     for i in range(n - 1):
         deltas = [slopes[i][j] - prev_slopes[j] for j in range(d_out)]
-        if any(builtins.abs(d) > 1e-12 for d in deltas):
+        if any(builtins.abs(d) > _SLOPE_EPS for d in deltas):
             relus.append((1.0, breakpoints[i], deltas))
         prev_slopes = list(slopes[i])
 
     # Cancel final slope (clamp)
-    if any(builtins.abs(s) > 1e-12 for s in prev_slopes):
+    if any(builtins.abs(s) > _SLOPE_EPS for s in prev_slopes):
         relus.append((1.0, breakpoints[-1], [-s for s in prev_slopes]))
 
     if not clamp:
-        if any(builtins.abs(s) > 1e-12 for s in slopes[0]):
+        if any(builtins.abs(s) > _SLOPE_EPS for s in slopes[0]):
             relus.append((-1.0, breakpoints[0], [-s for s in slopes[0]]))
-        if any(builtins.abs(s) > 1e-12 for s in slopes[-1]):
+        if any(builtins.abs(s) > _SLOPE_EPS for s in slopes[-1]):
             relus.append((1.0, breakpoints[-1], list(slopes[-1])))
 
     if len(relus) == 0:
@@ -601,7 +617,7 @@ def thermometer_floor_div(inp: Node, divisor: int, max_value: int) -> Node:
         breakpoints.extend([threshold - eps / 2, threshold + eps / 2])
     breakpoints.append(max_value + eps)
 
-    def _staircase(x):
+    def _staircase(x: float) -> float:
         return float(sum(1 for k in range(1, n + 1) if x > k * divisor - 0.5))
 
     result = piecewise_linear(
@@ -659,11 +675,11 @@ def floor_int(
     bounded — that constraint is about fp32 accumulation, not the
     activation; do not "simplify" this back to one layer::
 
-        t_k    = sharpness·(x − k) + 1                # per boundary k
-        step_k = hinge(t_k) − hinge(t_k − W)          # FFN 1: bounded step ∈ [0, W]
-        floor  = min + n − Σ_k hinge(1 − step_k)      # FFN 2: count not-yet-ON steps
+        t_k    = sharpness·(x - k) + 1                # per boundary k
+        step_k = hinge(t_k) - hinge(t_k - W)          # FFN 1: bounded step ∈ [0, W]
+        floor  = min + n - Σ_k hinge(1 - step_k)      # FFN 2: count not-yet-ON steps
 
-    ``hinge(1 − step_k)`` is the exact indicator ``[x < k]`` (1 while
+    ``hinge(1 - step_k)`` is the exact indicator ``[x < k]`` (1 while
     boundary ``k`` is un-crossed, 0 once crossed): stage 2 subtracts it
     from ``min + n`` so the result counts crossed boundaries, i.e.
     ``floor(x)``.
@@ -674,11 +690,11 @@ def floor_int(
     integers* floor_int already switches on — so instead of computing
     the floor and feeding it to a separate op, pass ``g`` as
     ``output_map`` and the downstream op disappears.  Writing
-    ``δ_k = g(k) − g(k−1)`` and telescoping
-    ``g(floor(x)) = g(min) + Σ_k δ_k·[x ≥ k] = g(max) − Σ_k δ_k·[x < k]``,
+    ``δ_k = g(k) - g(k-1)`` and telescoping
+    ``g(floor(x)) = g(min) + Σ_k δ_k·[x ≥ k] = g(max) - Σ_k δ_k·[x < k]``,
     stage 2 becomes::
 
-        out = g(max) − Σ_k δ_k · hinge(1 − step_k)    # FFN 2, per-boundary δ_k
+        out = g(max) - Σ_k δ_k · hinge(1 - step_k)    # FFN 2, per-boundary δ_k
 
     i.e. exactly today's stage 2 with the all-ones output weights
     replaced by the ``δ_k`` and the closing constant ``min + n`` replaced
@@ -688,7 +704,7 @@ def floor_int(
 
     Contract unchanged from the ReLU form: inputs stay out of the
     ``1/sharpness``-wide ramp zone just below each boundary; the flat
-    zone ``[k, k+1−1/sharpness]`` is the home of legal inputs.
+    zone ``[k, k+1-1/sharpness]`` is the home of legal inputs.
     Flat-zone interiors and exact integer inputs are exact to the folded
     ulp class (at ``x = k`` the critical hinges sit exactly on a bend,
     where ``Swish(0) = 0``, or fully saturated).  The port adds fillet
@@ -696,7 +712,7 @@ def floor_int(
     contributing ``≤ swish_dip/scale`` apiece — at most a couple live at
     once, so the closing range claim carries ``2·swish_dip/scale`` of
     slack.  **The W-slack absorbs fillets too**: an ON step parks stage
-    2's hinge argument at ``1 − W = −1`` — ``scale`` past saturation —
+    2's hinge argument at ``1 - W = -1`` — ``scale`` past saturation —
     so stage-1 fillet noise on an ON step still reads exactly 0 in stage
     2, the same mechanism that absorbs fp ulps today; the existing
     sizing ``W = max(2, 8·ulp(sharpness·n))`` already dominates the
@@ -753,7 +769,7 @@ def floor_int(
     assert len(inp) == 1, "Input must be a 1D scalar node"
     assert max_value >= min_value
 
-    # δ_k = g(k) − g(k−1) per boundary; the identity g leaves every δ_k = 1
+    # δ_k = g(k) - g(k-1) per boundary; the identity g leaves every δ_k = 1
     # and g(max) = min + n, reproducing the plain-floor weights exactly.
     g = (float) if output_map is None else output_map
 
@@ -775,7 +791,7 @@ def floor_int(
     ulp = 2.0 ** (math.floor(math.log2(max_t)) - 23) if max_t >= 1.0 else 2.0**-23
     step_cap = builtins.max(2.0, 8.0 * ulp)  # W
 
-    neg_partials = []  # each chunk contributes −Σ_k δ_k·hinge(1 − step_k)
+    neg_partials = []  # each chunk contributes -Σ_k δ_k·hinge(1 - step_k)
     for c0 in range(0, n, _CHUNK):
         ks = list(
             range(
@@ -784,14 +800,14 @@ def floor_int(
             )
         )
         c = len(ks)
-        # stage 1: step_k = hinge(t_k) − hinge(t_k − W), t_k = s·x − s·k + 1;
+        # stage 1: step_k = hinge(t_k) - hinge(t_k - W), t_k = s·x - s·k + 1;
         # scale folds into the gate rows, /scale into out_proj.
         gate_proj = torch.full((2 * c, 1), scale * s)
         gate_bias = torch.empty(2 * c)
         out_proj = torch.zeros((2 * c, c))
         for j, k in enumerate(ks):
             gate_bias[2 * j] = scale * (1.0 - s * k)  # t_k
-            gate_bias[2 * j + 1] = scale * (1.0 - step_cap - s * k)  # t_k − W
+            gate_bias[2 * j + 1] = scale * (1.0 - step_cap - s * k)  # t_k - W
             out_proj[2 * j, j] = 1.0 / scale
             out_proj[2 * j + 1, j] = -1.0 / scale
         step = swiglu_ffn(
@@ -803,8 +819,8 @@ def floor_int(
             name="floor_int_step",
         )
         # Pin the stage's true range: hinge(z) <= relu(z) and hinge(z) >=
-        # relu(z) − swish_dip/scale pointwise, so step_k = hinge(t_k) −
-        # hinge(t_k − W) lies in [−dip, W + dip] for ANY input — garbage
+        # relu(z) - swish_dip/scale pointwise, so step_k = hinge(t_k) -
+        # hinge(t_k - W) lies in [-dip, W + dip] for ANY input — garbage
         # rows included, no ramp-zone assumption.  The computed fp32 value
         # additionally carries folded-gate rounding of the ulp(s·n) class —
         # the same class the W = max(2, 8·ulp) sizing absorbs — so the
@@ -823,8 +839,8 @@ def floor_int(
             ),
             atol=1e-5,
         )
-        # stage 2: −Σ_k δ_k·hinge(1 − step_k), single output column.  Default
-        # δ_k = 1 makes out_proj byte-identical to the old −ones/scale.
+        # stage 2: -Σ_k δ_k·hinge(1 - step_k), single output column.  Default
+        # δ_k = 1 makes out_proj byte-identical to the old -ones/scale.
         dlist = [_delta(k) for k in ks]
         deltas = torch.tensor(dlist)
         neg_partial = swiglu_ffn(
@@ -835,12 +851,12 @@ def floor_int(
             torch.zeros(1),
             name="floor_int_saturate",
         )
-        # Same universal bound one level up: 1 − step_k ∈ [1−W−dip, 1+dip],
-        # so hinge(1 − step_k) ∈ [−dip, 1+dip]; weighting lane k by δ_k, its
-        # term −δ_k·hinge lies in [min(δ_k·dip, −δ_k(1+dip)), max(...)].  Sum
+        # Same universal bound one level up: 1 - step_k ∈ [1-W-dip, 1+dip],
+        # so hinge(1 - step_k) ∈ [-dip, 1+dip]; weighting lane k by δ_k, its
+        # term -δ_k·hinge lies in [min(δ_k·dip, -δ_k(1+dip)), max(...)].  Sum
         # the per-lane extremes, then pad by max|δ_k| for the summed fp32
         # rounding — that pad dominates the true ~c·max|δ_k|·ulp by orders of
-        # magnitude.  Default δ_k = 1 recovers [−c(1+dip)−1, c·dip+1].
+        # magnitude.  Default δ_k = 1 recovers [-c(1+dip)-1, c·dip+1].
         lo_sum = sum(builtins.min(d * dip, -d * (1.0 + dip)) for d in dlist)
         hi_sum = sum(builtins.max(d * dip, -d * (1.0 + dip)) for d in dlist)
         pad = builtins.max(1.0, *(builtins.abs(d) for d in dlist))
@@ -853,10 +869,10 @@ def floor_int(
         )
 
     summed = neg_partials[0] if len(neg_partials) == 1 else sum_nodes(neg_partials)
-    result = add_const(summed, float(g(max_value)))  # g(max) − Σ δ_k·hinge(1 − step_k)
+    result = add_const(summed, float(g(max_value)))  # g(max) - Σ δ_k·hinge(1 - step_k)
     # Output spans g over the integer floors; the couple-of-fillets closing
     # slack is δ-amplified, so it scales with max|δ_k| (default max|δ_k| = 1
-    # recovers the plain [min − 2·dip, max + 2·dip]).
+    # recovers the plain [min - 2·dip, max + 2·dip]).
     g_vals = [float(g(j)) for j in range(min_value, max_value + 1)]
     max_abs_delta = builtins.max(
         builtins.abs(_delta(k)) for k in range(min_value + 1, max_value + 1)
@@ -912,16 +928,16 @@ def radix_floor_int(
 ) -> Node:
     r"""Compute floor(x) as a radix split of three small :func:`floor_int`\\ s.
 
-    A flat ``floor_int`` over ``N = max_value − min_value`` boundaries
+    A flat ``floor_int`` over ``N = max_value - min_value`` boundaries
     costs ``3N`` hidden lanes in 2 sublayers and holds an up-to-512-wide
     step vector live on the residual between its stages.  This form
     splits with divisor ``D`` (default: the power of two nearest
     ``√(2N)``)::
 
-        hi_raw = floor_int((x − min) / D)            # ⌈N/D⌉ boundaries
-        hi     = floor_int(hi_raw + 0.5)             # integer snap, ⌈N/D⌉+1
-        lo     = floor_int(x − min − D·hi)           # over [−1, D]: D+1
-        floor  = min + D·hi + lo
+        hi_raw = floor_int((x - min) / D)  # ⌈N/D⌉ boundaries
+        hi = floor_int(hi_raw + 0.5)  # integer snap, ⌈N/D⌉+1
+        lo = floor_int(x - min - D·hi)  # over [-1, D]: D+1
+        floor = min + D·hi + lo
 
     Cost: ``≈ 3·(2·⌈N/D⌉ + D + 2)`` lanes (≈ ``8.5·√N`` at the default
     divisor, vs ``3N`` flat), 6 FFN sublayers plus 3 one-wide Linears
@@ -937,10 +953,10 @@ def radix_floor_int(
     two-digit emit split).  Rounding ``hi_raw`` to the nearest integer
     (add 0.5, floor) collapses it to one of the two neighboring
     integers — and *either* neighbor reconstructs ``floor(x)`` exactly,
-    because ``lo`` is floored over the extended range ``[−1, D]`` and its
-    input ``x − min − D·hi`` is computed from ``x`` directly, so it
+    because ``lo`` is floored over the extended range ``[-1, D]`` and its
+    input ``x - min - D·hi`` is computed from ``x`` directly, so it
     carries x's own fractional part: with ``hi`` one too high, ``lo``
-    lands in ``[−1, 0)`` and compensates; one too low, in ``[D−1, D)``.
+    lands in ``[-1, 0)`` and compensates; one too low, in ``[D-1, D)``.
     Unlike the emit digit-quad — whose low byte is recovered affinely
     and therefore inherits a ±1-step truncation in the sliver — the
     composed floors reconstruct *exactly* throughout the hi ramp.
@@ -951,14 +967,14 @@ def radix_floor_int(
       each **integer** — the LO floor's ramp, the same zone flat
       ``floor_int`` excludes.  There, the result is exact to the folded
       ulp class: hi is a snapped exact integer, ``D·hi`` is exact
-      (D a small power of two), the one-Linear ``x − min − D·hi``
+      (D a small power of two), the one-Linear ``x - min - D·hi``
       rounds at ~ulp(D), well inside lo's flat zone.
     - An input *inside* that ramp yields a fractional value within the
       same ±1-step window as flat ``floor_int`` — no D-amplification.
     - Residual hazard, by the digit-quad's product-of-slivers argument:
       the snap's own half-integer ramp is hit only when the hi ramp
       already produced a fraction within ``1/step_sharpness`` of 0.5 —
-      two independent slivers (~``D/(hi_sharpness·N) ×
+      two independent slivers (~``D/(hi_sharpness·N) x
       1/step_sharpness`` of the range), where the D-amplified error
       survives.  Callers who care push ``hi_sharpness`` up, exactly as
       the emit digit-quad does (``_DQ_HI_SHARPNESS``).
@@ -990,9 +1006,13 @@ def radix_floor_int(
     if divisor is None:
         # Power of two nearest sqrt(2n) in log space: minimizes
         # 2*ceil(n/D) + D over powers of two.
-        divisor = 2 ** builtins.max(1, round(0.5 * math.log2(2 * n))) if n >= 2 else 2
+        divisor = (
+            2 ** builtins.max(1, round(0.5 * math.log2(2 * n)))
+            if n >= _MIN_RADIX_DIVISOR
+            else 2
+        )
     d = int(divisor)
-    assert d >= 2, "divisor must be >= 2"
+    assert d >= _MIN_RADIX_DIVISOR, "divisor must be >= 2"
     if n <= d:
         # Nothing to split: the flat form is already at or below the
         # composed form's lo-floor cost.
@@ -1001,7 +1021,7 @@ def radix_floor_int(
     hi_s = hi_sharpness if hi_sharpness is not None else sharpness
     n_hi = -(-n // d)  # ceil(n/d): hi ∈ [0, n_hi]
 
-    # (x − min)/D — one 1-wide Linear; exact when D is a power of two.
+    # (x - min)/D — one 1-wide Linear; exact when D is a power of two.
     hi_in = Linear(
         inp,
         torch.tensor([[1.0 / d]], dtype=torch.float32),
@@ -1017,7 +1037,7 @@ def radix_floor_int(
         name="radix_floor_hi_snap_half",
     )
     hi = floor_int(hi_half, 0, n_hi + 1, sharpness=hi_s)
-    # lo input x − min − D·hi as ONE Linear over (x, hi) — the chained
+    # lo input x - min - D·hi as ONE Linear over (x, hi) — the chained
     # subtract/multiply_const form leaves extra unfusable Linears.
     lo_in = Linear(
         Concatenate([inp, hi]),
@@ -1025,7 +1045,7 @@ def radix_floor_int(
         torch.tensor([-float(min_value)], dtype=torch.float32),
         name="radix_floor_lo_in",
     )
-    # [−1, D]: the extended range that absorbs both snap outcomes.
+    # [-1, D]: the extended range that absorbs both snap outcomes.
     lo = floor_int(lo_in, -1, d, sharpness=sharpness)
     result = Linear(
         Concatenate([hi, lo]),
@@ -1034,7 +1054,7 @@ def radix_floor_int(
         name="radix_floor_recombine",
     )
     # Same closing claim as floor_int, widened one step down: an
-    # in-ramp input can land just below its integer (lo = −1 against
+    # in-ramp input can land just below its integer (lo = -1 against
     # the true floor's min), exactly the flat form's ±1-step window.
     slack = 2.0 * swish_dip / scale
     return assert_matches_value_type(

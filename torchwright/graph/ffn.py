@@ -29,8 +29,9 @@ from torchwright.graph.value_type import NodeValueType
 
 
 class FFN(Node):
-    """One feed-forward unit: lanes computed from a gate (and optional up)
-    projection, combined by an output projection.
+    """One feed-forward unit: lanes from a gate (and optional up) projection.
+
+    Lanes are combined by an output projection.
 
     For an input row ``x`` (width ``d_input``)::
 
@@ -100,8 +101,9 @@ class FFN(Node):
                 n_lanes,
                 d_input,
             ), f"up_proj shape {tuple(up_proj.shape)} != ({n_lanes}, {d_input})"
-            assert cast("torch.Tensor", up_bias).shape == (n_lanes,), (
-                f"up_bias shape {tuple(cast('torch.Tensor', up_bias).shape)} != ({n_lanes},)"
+            up_bias_shape = tuple(cast("torch.Tensor", up_bias).shape)
+            assert up_bias_shape == (n_lanes,), (
+                f"up_bias shape {up_bias_shape} != ({n_lanes},)"
             )
 
         self.gate_proj = gate_proj
@@ -146,7 +148,7 @@ class FFN(Node):
         # (_ffn_rule).  Semantic overrides stay op-level, as for Linear/ReLU.
         return NodeValueType()
 
-    def num_params(self):
+    def num_params(self) -> int:
         n_lanes = self.n_lanes
         gate = n_lanes * self.d_input + n_lanes
         up = 0 if self.up_proj is None else n_lanes * self.d_input + n_lanes

@@ -41,16 +41,23 @@ def test_dedup_compound_label():
 
 def test_dedup_interleaved_components():
     # the A/B/A/B shape produced by sibling functions calling each other
-    with annotate("stor/R_StoreWallRange"), annotate("pix/R_DrawColumn"):
-        with annotate("pix/R_DrawColumn"):
-            with annotate("tex"):
-                assert _cur() == "stor/R_StoreWallRange/pix/R_DrawColumn/tex"
+    with (
+        annotate("stor/R_StoreWallRange"),
+        annotate("pix/R_DrawColumn"),
+        annotate("pix/R_DrawColumn"),
+        annotate("tex"),
+    ):
+        assert _cur() == "stor/R_StoreWallRange/pix/R_DrawColumn/tex"
+
+
+def _boom():
+    raise ValueError("boom")
 
 
 def test_reset_on_exit_even_on_error():
     try:
         with annotate("x"):
-            raise ValueError("boom")
+            _boom()
     except ValueError:
         pass
     assert _cur() is None

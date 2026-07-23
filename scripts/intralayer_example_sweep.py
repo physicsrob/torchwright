@@ -23,7 +23,8 @@ Run on Modal GPU (compiles need it):
 
 Options via ARGS, e.g.:
 
-    make modal-run MODULE=scripts.intralayer_example_sweep ARGS="--graphs calculator caesar --budget 20"
+    make modal-run MODULE=scripts.intralayer_example_sweep \
+        ARGS="--graphs calculator caesar --budget 20"
 
 Gap #2 (the free-add phantom cancel charge) is NOT relaxed here: whether a node
 dies by ``reassign`` is a per-node solver outcome (``is_free`` of the consuming
@@ -35,6 +36,7 @@ from __future__ import annotations
 
 import argparse
 import time
+from pathlib import Path
 from typing import TYPE_CHECKING
 
 import torch
@@ -49,6 +51,8 @@ from torchwright.compiler.lower import lower
 
 if TYPE_CHECKING:
     from collections.abc import Callable
+
+    from torchwright.graph import Node
 
 _RELAX = frozenset({"mlp_cancel_occupancy"})
 
@@ -71,7 +75,7 @@ _FAMILY_SWEEP = [
 ]
 
 
-def _build_bucketed_argmin():
+def _build_bucketed_argmin() -> Node:
     from torchwright.graph import InputNode
     from torchwright.ops.attention_ops import attend_argmin_above_in_bucket
     from torchwright.ops.inout_nodes import create_rope_config
@@ -97,8 +101,9 @@ def _build_bucketed_argmin():
 
 
 def _example_specs() -> dict[str, tuple[Callable, int, int]]:
-    """Name -> (build_output_node, d_natural, d_head).  Built lazily so a
-    ``--graphs`` subset never imports the others.
+    """Name -> (build_output_node, d_natural, d_head).
+
+    Built lazily so a ``--graphs`` subset never imports the others.
     """
     from examples import (
         binary_increment,
@@ -141,11 +146,15 @@ def _example_specs() -> dict[str, tuple[Callable, int, int]]:
     }
 
 
-def _compile_layers(out, d, d_head, optimize) -> tuple[int | None, str]:
-    """Compile ``out`` and return (n_layers, status).  ``status`` is
-    'heuristic'/'solver'/'fallback' for a successful compile, or 'FAIL:<reason>'
-    when the compile raised (the width is below this optimize level's floor).
-    The optimize=1 solve uses forward_compile's own 60s budget.
+def _compile_layers(
+    out: Node, d: int, d_head: int, optimize: int
+) -> tuple[int | None, str]:
+    """Compile ``out`` and return (n_layers, status).
+
+    ``status`` is 'heuristic'/'solver'/'fallback' for a successful compile,
+    or 'FAIL:<reason>' when the compile raised (the width is below this
+    optimize level's floor).  The optimize=1 solve uses forward_compile's
+    own 60s budget.
     """
     try:
         net = forward_compile(
@@ -171,7 +180,7 @@ def _compile_layers(out, d, d_head, optimize) -> tuple[int | None, str]:
 
 
 def _solve_layers(
-    low_out, d, d_head, budget, disabled
+    low_out: Node, d: int, d_head: int, budget: float, disabled: frozenset[str]
 ) -> tuple[int | None, bool, float | None]:
     """Solve-only (never compiled): (n_layers, is_optimal, proven_bound).
 
@@ -204,7 +213,7 @@ def _solve_layers(
     return asg.n_layers, stats.is_optimal, stats.best_objective_bound
 
 
-def _lower(out, d):
+def _lower(out: Node, d: int) -> Node:
     """Lower ``out`` the way forward_compile does before scheduling."""
     return lower(
         out,
@@ -217,6 +226,7 @@ def _lower(out, d):
 
 def _width_grid(d_natural: int, d_head: int, n_points: int) -> list[int]:
     """Widths from d_natural down toward a pressured floor, on the d_head grid.
+
     Floor target is a quarter of the natural width (>= two heads); compiles
     below the true scheduling floor are recorded as FAIL, which locates it.
     """
@@ -231,7 +241,7 @@ def _width_grid(d_natural: int, d_head: int, n_points: int) -> list[int]:
     return sorted((d for d in grid if d >= d_head), reverse=True)
 
 
-def sweep(graphs: list[str], budget: float, n_points: int):
+def sweep(graphs: list[str], budget: float, n_points: int) -> dict[str, list[dict]]:
     specs = _example_specs()
     results: dict[str, list[dict]] = {}
     for name in graphs:
@@ -316,7 +326,7 @@ def sweep(graphs: list[str], budget: float, n_points: int):
     return results
 
 
-def _fmt(v) -> str:
+def _fmt(v: int | None) -> str:
     return "  -" if v is None else f"{v:>3}"
 
 
@@ -387,7 +397,7 @@ def main() -> None:
     if args.json:
         import json
 
-        with open(args.json, "w", encoding="utf-8") as fh:
+        with Path(args.json).open("w", encoding="utf-8") as fh:
             json.dump(results, fh, indent=2)
         print(f"\nwrote {args.json}")
 

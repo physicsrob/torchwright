@@ -91,7 +91,7 @@ def test_lower_raises_on_lone_relu():
     # scheduler has no write path for it.
     x = create_input("x", 4, value_range=(-2.0, 2.0))
     relu = ReLU(x)
-    with pytest.raises(LoweringError, match="lone ReLU|no chain shape"):
+    with pytest.raises(LoweringError, match=r"lone ReLU|no chain shape"):
         lower(relu)
 
 
@@ -123,12 +123,14 @@ def test_lower_rejects_non_node():
 
 
 def test_lower_copy_has_fresh_bounds_source_keeps_stale():
-    """Boundary twin of test_fusion_refreshes_stale_bounds: an in-place
-    weight mutation (here a hand edit) leaves the eagerly-cached bounds
-    describing the pre-mutation graph.  The *copy* lower() builds must
-    have cached == fresh for every reachable node (its caches are
-    recomputed at clone time), while the source — compilation is a pure
-    function — keeps whatever caches it had, stale or not.
+    """Boundary twin of test_fusion_refreshes_stale_bounds.
+
+    An in-place weight mutation (here a hand edit) leaves the
+    eagerly-cached bounds describing the pre-mutation graph. The *copy*
+    lower() builds must have cached == fresh for every reachable node
+    (its caches are recomputed at clone time), while the source —
+    compilation is a pure function — keeps whatever caches it had, stale
+    or not.
     """
     x = create_input("x", 4, value_range=(-1.0, 1.0))
     l1 = Linear(x, torch.randn(4, 6) * 0.2, torch.randn(6) * 0.1)
@@ -148,10 +150,12 @@ def test_lower_copy_has_fresh_bounds_source_keeps_stale():
     for node in get_ancestor_nodes({lowered.output_node}):
         cached = node._affine_bound.to_scalar_range()
         fresh = compute_affine_bound(node).to_scalar_range()
-        assert cached.lo == fresh.lo and cached.hi == fresh.hi, (
+        msg = (
             f"stale bound on copy {type(node).__name__} id={node.node_id}: "
             f"cached={cached} fresh={fresh}"
         )
+        assert cached.lo == fresh.lo, msg
+        assert cached.hi == fresh.hi, msg
     copy_range = lowered.copy_of(l1)._affine_bound.to_scalar_range()
     assert copy_range.lo != stale.lo or copy_range.hi != stale.hi, (
         "mutation should have widened the copy's l1 bound"
@@ -162,10 +166,11 @@ def test_lower_copy_has_fresh_bounds_source_keeps_stale():
 
 
 def test_lower_preserves_semantic_overrides_on_copy():
-    """Ops install semantic affine overrides (tighter than pure propagation)
-    via _apply_semantic_override; the copy's clone-time recompute must
-    re-apply them, not wipe them — a wipe would silently loosen every
-    downstream bound.
+    """Ops install semantic affine overrides via _apply_semantic_override.
+
+    These are tighter than pure propagation; the copy's clone-time
+    recompute must re-apply them, not wipe them — a wipe would silently
+    loosen every downstream bound.
 
     ``compare()`` installs its override on the node it returns (which
     also carries compare's range claim); the copy must re-apply both,
@@ -200,9 +205,10 @@ def test_lower_preserves_semantic_overrides_on_copy():
 
 
 def test_lower_twice_is_bit_identical_and_source_untouched():
-    """D6 for L1: lowering the same source twice yields per-node
-    value_types that are bit-identical across the two copies, and the
-    source — node set, checks, bounds — is untouched by both.
+    """D6 for L1: lowering the same source twice is bit-identical and pure.
+
+    The per-node value_types are bit-identical across the two copies,
+    and the source — node set, checks, bounds — is untouched by both.
     """
     from torchwright.compiler.utils import get_ancestor_nodes
     from torchwright.graph.asserts import assert_in_range, collect_asserts
@@ -256,8 +262,10 @@ def test_forward_compile_rejects_uncertified_graph():
 
 
 def test_lower_fuses_copy_and_leaves_source_unfused():
-    """lower() fuses the compiler-private copy; the source keeps its
-    Linear -> Linear chain, and the fused copy computes the same value.
+    """lower() fuses the compiler-private copy and leaves the source unfused.
+
+    The source keeps its Linear -> Linear chain, and the fused copy
+    computes the same value.
     """
     x = create_input("x", 4, value_range=(-2.0, 2.0))
     l1 = Linear(x, torch.randn(4, 3) * 0.3, torch.randn(3) * 0.1, name="l1")
@@ -285,8 +293,9 @@ def test_lower_fuses_copy_and_leaves_source_unfused():
 
 
 def test_lower_node_map_drops_fused_away_nodes():
-    """A source node whose value was absorbed into a survivor's weights has
-    no counterpart; copy_of names fusion in the error.
+    """A node whose value was absorbed into a survivor's weights has no counterpart.
+
+    copy_of names fusion in the error.
     """
     x = create_input("x", 4, value_range=(-2.0, 2.0))
     l1 = Linear(x, torch.randn(4, 3), torch.randn(3), name="l1")
@@ -299,31 +308,33 @@ def test_lower_node_map_drops_fused_away_nodes():
 
 
 def test_lower_node_map_follows_value_move():
-    """The FFN->Linear fold moves the Linear's value onto the FFN: the source
-    Linear maps to the surviving copy FFN, and the source FFN (whose own
-    value no longer exists) has no counterpart.
+    """The FFN->Linear fold moves the Linear's value onto the FFN.
+
+    The source Linear maps to the surviving copy FFN, and the source FFN
+    (whose own value no longer exists) has no counterpart.
     """
     x = create_input("x", 6, value_range=(-2.0, 2.0))
     blk = _block(x, 6, 8, 4, seed=11)
-    l = Linear(blk, torch.randn(4, 3) * 0.2, torch.randn(3) * 0.1, name="l")
-    sink = Concatenate([l])  # keep l off the output boundary
+    lin = Linear(blk, torch.randn(4, 3) * 0.2, torch.randn(3) * 0.1, name="l")
+    sink = Concatenate([lin])  # keep lin off the output boundary
 
     lowered = lower(sink)
-    moved = lowered.copy_of(l)
+    moved = lowered.copy_of(lin)
     assert isinstance(moved, FFN)
 
     n_pos = 5
     xt = torch.randn(n_pos, 6)
     assert torch.allclose(
-        moved.compute(n_pos, {"x": xt}), l.compute(n_pos, {"x": xt}), atol=1e-5
+        moved.compute(n_pos, {"x": xt}), lin.compute(n_pos, {"x": xt}), atol=1e-5
     )
     with pytest.raises(KeyError):
         lowered.copy_of(blk)
 
 
 def test_lower_node_map_concat_fold():
-    """Concat-fold survivors keep their mapping; absorbed leaves and the
-    value-changed concat lose theirs.
+    """Concat-fold survivors keep their mapping.
+
+    Absorbed leaves and the value-changed concat lose theirs.
     """
     a = create_input("a", 4, value_range=(-2.0, 2.0))
     b = create_input("b", 5, value_range=(-2.0, 2.0))
@@ -351,29 +362,32 @@ def test_lower_node_map_concat_fold():
 
 
 def test_lower_checks_on_moved_value_migrate_to_survivor():
-    """The FFN->Linear fold moves the orphaned Linear's value onto the
-    FFN — and its checks and claim move with it, so the value stays
+    """The FFN->Linear fold moves the orphaned Linear's value onto the FFN.
+
+    Its checks and claim move with it, so the value stays
     runtime-checkable on the copy (the old wrapper used to be rewired
     onto the survivor; metadata migrates instead).
     """
     x = create_input("x", 6, value_range=(-1.0, 1.0))
     blk = _block(x, 6, 8, 4, seed=12)
-    l = Linear(blk, torch.randn(4, 3) * 0.1, torch.randn(3) * 0.05, name="l")
-    assert_in_range(l, -1000.0, 1000.0)
-    sink = Concatenate([l])
+    lin = Linear(blk, torch.randn(4, 3) * 0.1, torch.randn(3) * 0.05, name="l")
+    assert_in_range(lin, -1000.0, 1000.0)
+    sink = Concatenate([lin])
 
     lowered = lower(sink)
-    moved = lowered.copy_of(l)
+    moved = lowered.copy_of(lin)
     assert isinstance(moved, FFN)
     assert len(moved.checks) == 1  # migrated with the value
     assert moved.claimed_type is not None
     # The source Linear keeps its own metadata untouched.
-    assert len(l.checks) == 1
+    assert len(lin.checks) == 1
 
 
 def test_compiled_debug_value_speaks_source_after_fusion():
-    """debug_value keys by source node: the fused-away Linear returns None,
-    the survivor returns the oracle value.
+    """debug_value keys by source node.
+
+    The fused-away Linear returns None, the survivor returns the oracle
+    value.
     """
     from torchwright.compiler.export import compile_headless
 

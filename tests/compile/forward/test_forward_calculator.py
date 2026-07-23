@@ -1,5 +1,6 @@
-"""V1 one-hot calculator: export to ONNX and verify +, -, * via argmax decode
-(converted from ``forward_compile``; see ``_example_onnx``).
+"""Export the V1 one-hot calculator to ONNX and verify +, -, * via argmax decode.
+
+Converted from ``forward_compile``; see ``_example_onnx``.
 """
 
 import importlib
