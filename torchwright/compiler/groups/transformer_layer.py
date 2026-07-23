@@ -1,20 +1,18 @@
-from typing import Optional, Union
-
 from torchwright.compiler.groups.attn_sublayer import AttnSubLayer
 from torchwright.compiler.groups.mlp_sublayer import GatedMLPSubLayer, MLPSubLayer
 
 
 class TransformerLayer:
     attn: AttnSubLayer
-    mlp: Union[MLPSubLayer, GatedMLPSubLayer]
+    mlp: MLPSubLayer | GatedMLPSubLayer
 
     def __init__(
         self,
         d: int,
         d_head: int,
-        d_hidden: Optional[int] = None,
+        d_hidden: int | None = None,
         activation: str = "relu",
-        n_heads: Optional[int] = None,
+        n_heads: int | None = None,
     ):
         # The machine kind is uniform per network (all-ReLU or all-swish);
         # the compiler selects it from the graph's FFN nodes and threads it

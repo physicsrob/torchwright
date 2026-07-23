@@ -1,9 +1,9 @@
 import pytest
 import torch
 
-from torchwright.compiler.residual_assignment import ResidualStreamState
 from torchwright.compiler.forward.residual_map import ResidualStreamMap
-from torchwright.graph import Node, Concatenate
+from torchwright.compiler.residual_assignment import ResidualStreamState
+from torchwright.graph import Concatenate
 from torchwright.graph.misc import InputNode, LiteralValue
 
 
@@ -236,7 +236,8 @@ def test_node_deepcopy_preserves_identity():
 
 def test_tracking_map_clears_stale_cancel_on_reassign():
     """A node reborn via ``reassign`` (the free-add path) must not keep a stale
-    cancel from an earlier rolled-back allocation."""
+    cancel from an earlier rolled-back allocation.
+    """
     from torchwright.compiler.forward.compile import _TrackingResidualStreamMap
 
     base = ResidualStreamMap(64)

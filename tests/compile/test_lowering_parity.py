@@ -34,10 +34,10 @@ from torchwright.compiler.graph_identity import canonical_ids
 from torchwright.compiler.lower import lower
 from torchwright.compiler.utils import get_ancestor_nodes
 from torchwright.graph.affine_rules import refresh_node_caches
-from torchwright.graph.optimize import fuse_consecutive_linears
 from torchwright.graph.asserts import assert_in_range
 from torchwright.graph.ffn import FFN
 from torchwright.graph.linear import Linear
+from torchwright.graph.optimize import fuse_consecutive_linears
 from torchwright.ops.inout_nodes import create_input
 
 
@@ -103,7 +103,8 @@ def test_bounds_transparent_adder_1digit():
 
 def _swish_graph():
     """A small swish-machine graph with claims on both a leaf and a
-    general (FFN) target — the two claim channels."""
+    general (FFN) target — the two claim channels.
+    """
 
     def w(*shape, seed):
         g = torch.Generator().manual_seed(seed)
@@ -139,7 +140,8 @@ _COLLAPSE_LANE_CAP = 64
 def _collapsible_graph():
     """An integer-asserted scalar chain the collapse pass rewrites."""
     from torchwright.graph.asserts import assert_integer
-    from torchwright.ops.relu.arithmetic_ops import compare, min as ops_min
+    from torchwright.ops.relu.arithmetic_ops import compare
+    from torchwright.ops.relu.arithmetic_ops import min as ops_min
 
     x = create_input("x", 1, value_range=(0.0, 9.0))
     xi = assert_integer(x)
@@ -148,7 +150,8 @@ def _collapsible_graph():
 
 def _inplace_pipeline_bounds_collapsed(output_node):
     """The in-place twin with the collapse pass in lower()'s round
-    order: fuse, refresh, collapse."""
+    order: fuse, refresh, collapse.
+    """
     from torchwright.compiler.collapse import collapse_univariate_subgraphs
     from torchwright.graph.optimize import FoldLog
 

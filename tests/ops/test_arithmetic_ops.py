@@ -1,18 +1,6 @@
 import torch
-from torchwright.ops.relu.arithmetic_ops import (
-    abs as abs_node,
-    clamp,
-    relu_add,
-    compare,
-    min as min_node,
-    mod_const,
-    piecewise_linear,
-    square,
-    multiply_integers,
-    reciprocal,
-    floor_int,
-    ceil_int,
-)
+
+from torchwright.ops.inout_nodes import create_input
 from torchwright.ops.linear import (
     add_const,
     bool_to_01,
@@ -20,7 +8,24 @@ from torchwright.ops.linear import (
     negate,
     subtract,
 )
-from torchwright.ops.inout_nodes import create_input
+from torchwright.ops.relu.arithmetic_ops import (
+    abs as abs_node,
+)
+from torchwright.ops.relu.arithmetic_ops import (
+    ceil_int,
+    clamp,
+    compare,
+    floor_int,
+    mod_const,
+    multiply_integers,
+    piecewise_linear,
+    reciprocal,
+    relu_add,
+    square,
+)
+from torchwright.ops.relu.arithmetic_ops import (
+    min as min_node,
+)
 
 
 def test_bool_to_01():
@@ -256,7 +261,7 @@ def test_piecewise_linear_chunking():
 
 
 def test_abs():
-    """abs on a 3-wide node with positive, negative, and zero."""
+    """Abs on a 3-wide node with positive, negative, and zero."""
     x = create_input("x", 3)
     out = abs_node(x)
     vals = torch.tensor([[5.0, -3.0, 0.0]])
@@ -265,7 +270,7 @@ def test_abs():
 
 
 def test_abs_scalar():
-    """abs on scalar inputs."""
+    """Abs on scalar inputs."""
     x = create_input("x", 1)
     out = abs_node(x)
     for v in [-7.0, 0.0, 4.5]:
@@ -310,7 +315,7 @@ def test_reciprocal_interpolation():
 
 
 def test_reciprocal_small_min_value():
-    """reciprocal must be accurate even when min_value << 1.
+    """Reciprocal must be accurate even when min_value << 1.
 
     The game graph calls reciprocal(x, min_value=0.01, max_value=20)
     and reciprocal(x, min_value=0.1, max_value=20).  With uniform
@@ -388,7 +393,8 @@ def test_floor_int_wide_range_large_magnitude():
     magnitude ~s*x in one projection, overflowing fp32's 2^24 exact-integer
     limit and collapsing to ~0 above x ~ 2^24/s (e.g. floor_int(40000.4,
     [0,65535], s=1000) returned 0.0). The saturating-step staircase keeps every
-    partial sum in [0, n] so it stays exact at any magnitude/sharpness."""
+    partial sum in [0, n] so it stays exact at any magnitude/sharpness.
+    """
     import math
 
     # Mid-bin values (0.4 above an integer, clear of any ramp for s >= 10) so the
@@ -407,7 +413,8 @@ def test_floor_int_byte_range_exact_high_sharpness():
     """Exactness guard over the [0,255] byte range at high sharpness — the DOOM
     digit-quad high byte floor(q/256). The saturating-step form must stay exact
     across the whole range (the old form's partial sums grew with the step count
-    and position and could lose ~1-2 units near the top)."""
+    and position and could lose ~1-2 units near the top).
+    """
     import math
 
     x = create_input("x", 1)
@@ -435,7 +442,8 @@ def test_ceil_int_high_sharpness_screen_y():
     CEIL_Y staircase). At sharpness=10000 the ramp is 1e-4 wide, so a raw screen-y
     carrying ~0.077 of piecewise-linear multiply noise stays in the flat zone and
     ceils to an exact integer instead of interpolating across a scanline boundary.
-    Covers the narrow [0,49] and wide [0,128] / [-128,49] ranges H actually uses."""
+    Covers the narrow [0,49] and wide [0,128] / [-128,49] ranges H actually uses.
+    """
     import math
 
     x = create_input("x", 1)

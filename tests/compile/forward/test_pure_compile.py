@@ -66,7 +66,8 @@ def _graph_snapshot(output_node):
 
 def test_double_compile_same_graph_object_identical_sidecars():
     """Second compile of the same graph object succeeds and its sidecar is
-    identical to the first's — no bound loosening, no schedule drift."""
+    identical to the first's — no bound loosening, no schedule drift.
+    """
     parts = _token_parts()
     output_node = parts[0]
 

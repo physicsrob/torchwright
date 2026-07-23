@@ -62,7 +62,8 @@ def _eval(embedding, out, tokens):
 def test_output_sequence_short_prompt_no_slot_leak(machine):
     """Trigger at position 2 with 6 slots: slots 3..5 target positions before
     BOS and must contribute nothing — the trigger position emits exactly
-    seq[0], not a superposition."""
+    seq[0], not a superposition.
+    """
     embedding, out, default = _build(machine)
     values = _eval(embedding, out, ["0", "1", "="])
     torch.testing.assert_close(
@@ -76,7 +77,8 @@ def test_output_sequence_short_prompt_no_slot_leak(machine):
 @pytest.mark.parametrize("machine", ["relu", "swiglu"])
 def test_output_sequence_in_range_walk(machine):
     """The default path is unchanged: from the trigger onward, position
-    trigger+i emits seq[i]."""
+    trigger+i emits seq[i].
+    """
     embedding, out, _ = _build(machine)
     # Positions 2..5 emit seq[0..3] (the post-trigger input tokens are the
     # autoregressive echo of the emission; the gating ignores them).

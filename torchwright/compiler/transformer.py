@@ -1,17 +1,17 @@
-from typing import TYPE_CHECKING, Any, List, Dict, Optional, Tuple, Union
+from typing import TYPE_CHECKING, Any, Optional
 
 import torch
 
-from torchwright.compiler.residual_assignment import ResidualAssignment
 from torchwright.compiler.groups.attn_sublayer import AttnSubLayer
 from torchwright.compiler.groups.mlp_sublayer import GatedMLPSubLayer, MLPSubLayer
 from torchwright.compiler.groups.transformer_layer import TransformerLayer
+from torchwright.compiler.residual_assignment import ResidualAssignment
 from torchwright.graph import (
-    Node,
-    LiteralValue,
-    InputNode,
     Concatenate,
     Embedding,
+    InputNode,
+    LiteralValue,
+    Node,
 )
 
 if TYPE_CHECKING:
@@ -31,15 +31,15 @@ class HeadlessTransformer:
     transformer on graph-level inputs and retrieve output node values.
     """
 
-    layers: List[TransformerLayer]
+    layers: list[TransformerLayer]
     d: int
     d_hidden: int
     d_head: int
     n_heads: int
-    residual_assignment: Optional[ResidualAssignment]
+    residual_assignment: ResidualAssignment | None
     # 2-D weight-matrix occupancy recorded during weight writing (see
     # forward.weight_writer.PlacementRecorder).  ``None`` until compile sets it.
-    placements: Optional[Any]
+    placements: Any | None
     # --- Attributes attached by ``forward_compile`` (forward/compile.py) ---
     # Emission mode: False means no physical bias parameters.
     bias: bool
@@ -50,21 +50,21 @@ class HeadlessTransformer:
     # Solve-only measurement output (None when no feasible incumbent).
     cpsat_assignment: Optional["ScheduleAssignment"]
     # Diagnostics from the dominating-replay-plan choice.
-    replay_candidate_diagnostics: Dict[str, object]
+    replay_candidate_diagnostics: dict[str, object]
     # Pinned-constant RMSNorm layout; None when the norm is off.
     rms_norm_spec: Optional["RmsNormSpec"]
     # Resolved realization table the compile scheduled against.
     realization_table: "RealizationTable"
     # Per-layer attention-head usage by op type (observability only).
-    per_layer_head_counts: List[Dict[str, int]]
+    per_layer_head_counts: list[dict[str, int]]
 
     def __init__(
         self,
         d: int,
         d_head: int,
-        d_hidden: Optional[int] = None,
+        d_hidden: int | None = None,
         activation: str = "relu",
-        n_heads: Optional[int] = None,
+        n_heads: int | None = None,
     ):
         if activation not in ("relu", "swish"):
             raise ValueError(
@@ -114,7 +114,7 @@ class HeadlessTransformer:
     def get_input_res_stream(
         self,
         n_pos: int,
-        input_values: Dict[str, Any],
+        input_values: dict[str, Any],
         past_len: int = 0,
     ):
         """Build the initial residual stream for ``n_pos`` positions.
@@ -157,8 +157,8 @@ class HeadlessTransformer:
         res = inp
         all_states = {}
         for i, layer in enumerate(self.layers):
-            sublayer_pairs: List[
-                tuple[Union[AttnSubLayer, MLPSubLayer, GatedMLPSubLayer], str]
+            sublayer_pairs: list[
+                tuple[AttnSubLayer | MLPSubLayer | GatedMLPSubLayer, str]
             ] = [
                 (layer.attn, "attn"),
                 (layer.mlp, "mlp"),
@@ -175,8 +175,7 @@ class HeadlessTransformer:
                     res = sublayer.forward(res)
         if return_states:
             return res, all_states
-        else:
-            return res
+        return res
 
     def forward_cached(self, inp: torch.Tensor, past_kvs=None):
         """Forward pass with KV cache.
@@ -201,8 +200,8 @@ class HeadlessTransformer:
         return res, new_kvs
 
     def compute(
-        self, n_pos: int, input_values: Dict[str, Any]
-    ) -> Dict[Node, torch.Tensor]:
+        self, n_pos: int, input_values: dict[str, Any]
+    ) -> dict[Node, torch.Tensor]:
         """Run the transformer on graph-level inputs.
 
         Returns a dict mapping each output Node to its value tensor

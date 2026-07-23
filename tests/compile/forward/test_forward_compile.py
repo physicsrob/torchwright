@@ -8,22 +8,21 @@ import pytest
 import torch
 
 from torchwright.compiler.forward.compile import forward_compile
-from torchwright.graph import Linear, Add, Concatenate
-from torchwright.graph.misc import InputNode, LiteralValue
+from torchwright.graph import Concatenate, Linear
+from torchwright.ops.attention_ops import (
+    attend_to_offset,
+    get_prev_value,
+)
 from torchwright.ops.inout_nodes import (
     create_input,
     create_literal_value,
     create_rope_config,
 )
-from torchwright.ops.relu.linear_relu_linear import linear_relu_linear
-from torchwright.ops.relu.arithmetic_ops import relu_add
 from torchwright.ops.linear import add, add_const, add_scaled_nodes, concat, sum_nodes
+from torchwright.ops.relu.arithmetic_ops import relu_add
+from torchwright.ops.relu.linear_relu_linear import linear_relu_linear
 from torchwright.ops.relu.logic_ops import cond_gate
-from torchwright.ops.relu.map_select import select, map_to_table
-from torchwright.ops.attention_ops import (
-    attend_to_offset,
-    get_prev_value,
-)
+from torchwright.ops.relu.map_select import map_to_table, select
 
 D = 256
 D_HEAD = 16
@@ -232,7 +231,8 @@ def test_compile_cond_gate():
 def test_compile_get_prev_value():
     """get_prev_value() — most recent value where cond was true, ranked by the
     intrinsic rotary recency lobe (compiled == oracle; both apply the same
-    rotation)."""
+    rotation).
+    """
     rope = _rope()
     v = create_input("v", 4)
     cond = create_input("cond", 1)
@@ -287,7 +287,8 @@ def test_compile_select_into_add():
     Preserves the compiler pattern the cut ``cond_add_vector`` exercised:
     a select's L->ReLU->L multiplexer output added onto another live node
     (here ``add(x, select(cond, true_vec, false_vec))``).  cond=+1 -> x+true_vec,
-    cond=-1 -> x+false_vec."""
+    cond=-1 -> x+false_vec.
+    """
     cond = create_input("cond", 1, value_range=(-1.0, 1.0))
     x = create_literal_value(torch.tensor([15.0, 25.0]))
     true_vec = create_literal_value(torch.tensor([100.0, 0.0]))
@@ -385,7 +386,6 @@ def test_compile_multi_switch_shared_constants():
     add_into live addends can be incorrectly freed.
     """
     from torchwright.ops.relu.map_select import switch
-    from torchwright.ops.relu.logic_ops import cond_gate
 
     rope = _rope()
     flag = create_input("flag", 1)
@@ -417,7 +417,7 @@ def test_compile_multi_switch_shared_constants():
 
 
 def test_compile_switch_with_attention_conditions():
-    """switch where conditions come from attention (get_prev_value).
+    """Switch where conditions come from attention (get_prev_value).
 
     This mirrors the calculator's operator dispatch: the conditions are
     latched via get_prev_value and feed into cond_gate chains. The deeper
@@ -425,7 +425,6 @@ def test_compile_switch_with_attention_conditions():
     can be incorrectly cancelled.
     """
     from torchwright.ops.relu.map_select import switch
-    from torchwright.ops.relu.logic_ops import equals_vector
 
     rope = _rope()
     embedding_dim = 8
@@ -568,7 +567,8 @@ def test_compile_rejects_d_qk_too_large():
 def test_compile_split_vo(d_v):
     """V/O split across heads.  Q/K are full-width d_qk == d_head (16): every
     head is rotary on the global grid, so the V/O split is the only thing that
-    varies here (d_v=32 -> 2 heads exact; d_v=48 -> 3 heads, last chunk padded)."""
+    varies here (d_v=32 -> 2 heads exact; d_v=48 -> 3 heads, last chunk padded).
+    """
     x = create_input("x", 8)
     out = _build_attn(x, x, x, d_qk=D_HEAD, d_v=d_v, d_out=8)
     _verify(out, n_pos=4, input_values={"x": torch.randn(4, 8)}, max_layers=10)
@@ -645,7 +645,6 @@ def test_compile_attend_mean_where():
 def test_compile_attend_argmax_dot():
     """attend_argmax_dot — vector dot-product matching in attention."""
     from torchwright.ops.attention_ops import attend_argmax_dot
-    from torchwright.ops.relu.logic_ops import cond_gate
 
     rope = _rope()
     qv = create_input("qv", 4)
@@ -701,7 +700,8 @@ def _width_starved_out():
 def test_no_progress_names_the_out_of_budget_nodes():
     """Residual-column exhaustion: the only deadlock a correct compiler can
     reach.  The message must name a starved node, its column demand, and how
-    many columns were actually free."""
+    many columns were actually free.
+    """
     with pytest.raises(RuntimeError, match="No progress") as exc:
         forward_compile(
             d=48,
@@ -723,7 +723,8 @@ def test_no_progress_names_the_out_of_budget_nodes():
 def test_no_progress_names_an_ffn_too_wide_for_the_mlp():
     """An FFN's only realization class is the MLP composite, so `n_lanes`
     beyond a layer's usable hidden pool is unschedulable at any layer and no
-    routing rule can rescue it.  That is a geometry problem, not a bug."""
+    routing rule can rescue it.  That is a geometry problem, not a bug.
+    """
     torch.manual_seed(0)
     x = create_input("x", 4, value_range=(-1.0, 1.0))
     ffn = linear_relu_linear(
@@ -787,7 +788,8 @@ def test_no_progress_calls_a_misrouted_linear_a_compiler_bug(monkeypatch):
 
 def test_no_progress_truncation_says_how_many_it_dropped():
     """A DOOM-scale deadlock would list hundreds of starved nodes.  The
-    transient section caps the list — and says what it left out."""
+    transient section caps the list — and says what it left out.
+    """
     with pytest.raises(RuntimeError, match="No progress") as exc:
         forward_compile(
             d=48,

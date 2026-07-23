@@ -1,5 +1,3 @@
-from typing import Optional
-
 import torch
 
 from torchwright.compiler.components.linear import LinearLayerComponent
@@ -20,7 +18,7 @@ class MLPSubLayer:
     #: Machine kind (uniform per compiled network; see GatedMLPSubLayer).
     activation = "relu"
 
-    def __init__(self, d: int, d_hidden: Optional[int] = None):
+    def __init__(self, d: int, d_hidden: int | None = None):
         if d_hidden is None:
             d_hidden = d
         self.d = d
@@ -44,8 +42,7 @@ class MLPSubLayer:
         states["skip"] = (self.out_state, x)
         if return_states:
             return x, states
-        else:
-            return x
+        return x
 
     def trim_unused_slots(self):
         """Remove trailing unused (all-zero) hidden slots after compilation.
@@ -103,7 +100,7 @@ class GatedMLPSubLayer:
     #: Machine kind (uniform per compiled network; see MLPSubLayer).
     activation = "swish"
 
-    def __init__(self, d: int, d_hidden: Optional[int] = None):
+    def __init__(self, d: int, d_hidden: int | None = None):
         if d_hidden is None:
             d_hidden = d
         self.d = d
@@ -128,8 +125,7 @@ class GatedMLPSubLayer:
         states["skip"] = (self.out_state, x)
         if return_states:
             return x, states
-        else:
-            return x
+        return x
 
     def trim_unused_slots(self):
         """Remove trailing unused (all-zero) hidden slots after compilation.

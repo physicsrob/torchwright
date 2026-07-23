@@ -16,12 +16,10 @@ compile path* (plan decision #2) rather than a standalone replica:
   (C1 arm ``no_decision_strategy``).
 """
 
-import pytest
 import torch
 
 import torchwright.compiler.forward.compile as compile_mod
 from torchwright.compiler.forward.compile import forward_compile
-from torchwright.compiler.forward.schedule_cache import graph_fingerprint
 from torchwright.graph import Concatenate, Linear
 from torchwright.ops.inout_nodes import create_input
 
@@ -52,7 +50,8 @@ def _compile(out, **kw):
 def test_disabled_families_is_solve_only():
     """A relaxed solve returns the assignment + stats without replaying: zero
     compiled layers, and the relaxed depth is a lower bound on the sound one
-    (``dependency`` relaxed lands strictly below, the §0 sanity family)."""
+    (``dependency`` relaxed lands strictly below, the §0 sanity family).
+    """
     sound = _compile(_width_graph())
     assert len(sound.layers) > 0  # sound path compiles + replays
     sound_n = sound.cpsat_solve_stats.objective_value
@@ -70,7 +69,8 @@ def test_add_live_addend_gap_family_is_accepted():
     the family name resolves (unknown names raise), the relaxed solve stays
     solve-only, and its depth is a valid lower bound on the sound optimum.
     The graph carries a free Add so the relaxed `layer[A]` form of the
-    Add-consumer cancel term is actually constructed."""
+    Add-consumer cancel term is actually constructed.
+    """
     torch.manual_seed(0)
     x = create_input("x", 4)
     u = Linear(x, torch.randn(4, 4), torch.zeros(4), name="u")
@@ -92,7 +92,8 @@ def test_add_live_addend_gap_family_is_accepted():
 def test_relaxed_solve_never_touches_the_cache(tmp_path, monkeypatch):
     """A relaxed solve must neither read a cached sound schedule nor write its
     own (unsound) schedule into the fingerprint-keyed cache the production
-    compile replays from."""
+    compile replays from.
+    """
     monkeypatch.setenv("TW_SCHEDULE_CACHE_DIR", str(tmp_path))
 
     # A sound compile populates the cache.
@@ -109,7 +110,8 @@ def test_relaxed_solve_never_touches_the_cache(tmp_path, monkeypatch):
 
 def test_force_resolve_bypasses_a_cached_schedule(tmp_path, monkeypatch):
     """``_force_resolve`` re-solves even when a cache entry exists (a cached
-    hit would otherwise silently stand in for the measurement)."""
+    hit would otherwise silently stand in for the measurement).
+    """
     monkeypatch.setenv("TW_SCHEDULE_CACHE_DIR", str(tmp_path))
 
     cached = _compile(_width_graph())
@@ -126,7 +128,8 @@ def test_force_resolve_bypasses_a_cached_schedule(tmp_path, monkeypatch):
 def test_solve_only_returns_sound_depth_without_replaying():
     """``_solve_only`` returns the SOUND solve's assignment/stats before the
     replay — the G0 attribution reads the sound n_layers through the same
-    real path as the relaxed cells, and it matches the full compile's depth."""
+    real path as the relaxed cells, and it matches the full compile's depth.
+    """
     full = _compile(_width_graph())
     solve_only = _compile(_width_graph(), _solve_only=True, _force_resolve=True)
     assert len(solve_only.layers) == 0  # replay skipped
@@ -136,7 +139,8 @@ def test_solve_only_returns_sound_depth_without_replaying():
 
 def test_solver_seed_is_accepted_and_replays():
     """A seeded solve still produces a sound, replayable schedule (the seed
-    only perturbs the search, never soundness)."""
+    only perturbs the search, never soundness).
+    """
     graph = _width_graph()
     net = _compile(graph, _solver_seed=12345)
     assert len(net.layers) > 0
@@ -150,7 +154,8 @@ def test_solver_params_merge_reaches_the_solve(monkeypatch):
     """``_solver_params`` reaches ``solve_schedule`` merged with the
     ``_solver_seed`` random_seed, and ``_drop_decision_strategy`` is forwarded
     — captured at the solve boundary so the plumbing is proven independent of
-    solver behavior."""
+    solver behavior.
+    """
     captured = {}
     real = compile_mod.solve_schedule
 
@@ -172,7 +177,8 @@ def test_solver_params_merge_reaches_the_solve(monkeypatch):
 
 def test_solver_params_none_when_unset(monkeypatch):
     """No seed, no params → ``solver_params`` stays None and the decision
-    strategy is kept (default production behavior is byte-unchanged)."""
+    strategy is kept (default production behavior is byte-unchanged).
+    """
     captured = {}
     real = compile_mod.solve_schedule
 
@@ -189,7 +195,8 @@ def test_solver_params_none_when_unset(monkeypatch):
 
 def test_solver_params_applied_and_schedule_replays():
     """A general parameter override still yields a sound, replayable schedule
-    (a valid ``CpSolver`` field can only change search, never feasibility)."""
+    (a valid ``CpSolver`` field can only change search, never feasibility).
+    """
     graph = _width_graph()
     net = _compile(graph, _solver_params={"linearization_level": 2})
     assert len(net.layers) > 0
@@ -201,7 +208,8 @@ def test_solver_params_applied_and_schedule_replays():
 
 def test_drop_decision_strategy_replays():
     """Dropping the decision strategy is search-only: the compile still
-    produces a sound, replayable schedule."""
+    produces a sound, replayable schedule.
+    """
     graph = _width_graph()
     net = _compile(graph, _drop_decision_strategy=True)
     assert len(net.layers) > 0

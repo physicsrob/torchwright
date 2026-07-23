@@ -18,13 +18,13 @@ explanation.
 """
 
 from torchwright.graph.embedding import Unembedding
-from torchwright.ops.linear import add
 from torchwright.ops.inout_nodes import (
-    create_literal_value,
     create_embedding,
+    create_literal_value,
     create_rope_config,
     create_unembedding,
 )
+from torchwright.ops.linear import add
 from torchwright.ops.swiglu.logic_ops import equals_vector
 from torchwright.ops.swiglu.scalar_encoding import (
     digits_to_number,

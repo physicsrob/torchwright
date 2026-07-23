@@ -143,7 +143,8 @@ def test_kept_depth1_boundary_member():
 
 def test_interior_member_value_ceases_to_exist():
     """Interior members are orphaned; their node_map entries drop, the
-    same contract fusion orphans already have."""
+    same contract fusion orphans already have.
+    """
     ops = _ops("relu")
     x = create_input("x", 1, value_range=(0.0, 9.0))
     xi = assert_integer(x)
@@ -191,7 +192,8 @@ def test_declines_over_budget_plateau_count():
 
 def test_declines_emitted_lane_overflow_past_prescreen():
     """10 plateaus pass a 12-lane pre-screen, but 9 changing steps emit
-    18 lanes — the post-tabulation lane gate must decline."""
+    18 lanes — the post-tabulation lane gate must decline.
+    """
     ops = _ops("relu")
     x = create_input("x", 1, value_range=(0.0, 9.0))
     xi = assert_integer(x)
@@ -209,7 +211,8 @@ def test_declines_predicted_accumulation_error():
     the synthesized claim's 1e-3 tolerance — declined, per the measured
     staircase entries in docs/op_noise_data.json.  The +-1 chain is
     bit-constant on plateaus and the x100 Linear is exact in fp32, so
-    this reaches the error-model gate rather than the staircase check."""
+    this reaches the error-model gate rather than the staircase check.
+    """
     _, chain = _staircase_chain("relu")  # bit-exact +-1 staircase of x
     out = Linear(chain, torch.tensor([[100.0]]))
 
@@ -223,7 +226,8 @@ def test_declines_predicted_accumulation_error():
 def test_declines_non_staircase_member():
     """|x - 4.5| varies inside every plateau by the full band offset
     (0.05, far past the 1e-3 budget) — not a function of round(x); the
-    measured-deviation check must decline it."""
+    measured-deviation check must decline it.
+    """
     ops = _ops("relu")
     x = create_input("x", 1, value_range=(0.0, 9.0))
     xi = assert_integer(x)
@@ -241,7 +245,8 @@ def test_collapses_saturating_min_over_interior_variation():
     plateau up to fp32 associativity residue (ulp-scale), which the
     composite budget measures and admits.  Under the pre-composite
     bit-identical contract this was declined — the pin for the 2026-07-06
-    contract change."""
+    contract change.
+    """
     ops = _ops("relu")
     x = create_input("x", 1, value_range=(0.0, 9.0))
     xi = assert_integer(x)
@@ -264,7 +269,8 @@ def test_collapses_sub_budget_band_deviation():
     <= the synthesized claim's 1e-3), and admitted.  This is the swish
     fillet-tail shape (ulp-scale band residue) in a machine-independent
     construction; the collapse replaces the leak with its
-    plateau-center value."""
+    plateau-center value.
+    """
     xi, chain = _staircase_chain("relu")
     out = add(chain, Linear(xi, torch.tensor([[1e-5]])))
 
@@ -283,7 +289,8 @@ def test_declines_composite_budget_overflow():
     at 4·ulp32(10·9·30) = 2^-10 ≈ 9.8e-4 (< 1e-3), and a 1e-3·x leak
     adds a measured band deviation of 1e-3·slack = 5e-5 (< 1e-3);
     together they exceed the synthesized claim's tolerance and the
-    composite gate declines."""
+    composite gate declines.
+    """
     xi, chain = _staircase_chain("relu")
     out = add(
         Linear(chain, torch.tensor([[15.0]])),
@@ -299,7 +306,8 @@ def test_declines_composite_budget_overflow():
 
 def test_declines_no_depth_gain():
     """A subgraph whose only boundary member sits at depth 1 has nothing
-    to collapse."""
+    to collapse.
+    """
     ops = _ops("relu")
     x = create_input("x", 1, value_range=(0.0, 9.0))
     xi = assert_integer(x)
@@ -319,7 +327,8 @@ def test_compile_headless_collapse_saves_layers_and_matches():
     was retired 2026-07-06; ``lower()`` keeps the kwarg as the off-path
     seam these tests use directly).  The multi-sublayer staircase chain
     must compile to a single layer — fewer than its off-path lowered
-    chain depth — and match the exact oracle."""
+    chain depth — and match the exact oracle.
+    """
     from torchwright.compiler.export import compile_headless
 
     inputs = torch.arange(0.0, 10.0).unsqueeze(1)  # the single "x" column
@@ -332,8 +341,8 @@ def test_compile_headless_collapse_saves_layers_and_matches():
     # measured on the lower() seam — the compile above must land below it.
     off = lower(out_a)
     order = topological_order(off.output_node)
-    from torchwright.graph.misc import Add
     from torchwright.graph.linear import Linear as _Linear
+    from torchwright.graph.misc import Add
 
     costly = (FFN, _Linear, Add)
     depth: dict = {}
@@ -358,7 +367,8 @@ def test_compile_headless_collapse_saves_layers_and_matches():
 
 def test_scalar_sources_reseeds_at_two_source_meet():
     """Checks are node metadata, so the finder walks the ops-layer
-    graph directly — a claim never interrupts a subgraph."""
+    graph directly — a claim never interrupts a subgraph.
+    """
     ops = _ops("relu")
     x = create_input("x", 1, value_range=(0.0, 9.0))
     y = create_input("y", 1, value_range=(0.0, 9.0))

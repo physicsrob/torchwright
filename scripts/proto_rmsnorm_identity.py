@@ -30,7 +30,8 @@ NZ = 1e-12  # "nonzero" threshold for free-column detection
 
 def pow2_layout(d):
     """Reserve-inside power-of-two-RMS layout: (n_const, m) for width d=2^b.
-    One constant column (= 2^Q) for even b, two equal for odd b; rms = 2^m."""
+    One constant column (= 2^Q) for even b, two equal for odd b; rms = 2^m.
+    """
     b = d.bit_length() - 1
     assert 1 << b == d, f"d={d} is not a power of two"
     n_const = 1 if b % 2 == 0 else 2
@@ -48,7 +49,8 @@ def rmsnorm(res, gain, eps):
 def baseline_and_free_cols(net, res0):
     """Run the no-norm baseline sublayer-by-sublayer and return
     (final_res, free_col_indices) — columns never written by any sublayer
-    (and zero in the seed), so they can hold a reserved constant untouched."""
+    (and zero in the seed), so they can hold a reserved constant untouched.
+    """
     cur = res0.clone()
     ever_nz = (res0.abs() > NZ).any(dim=0)  # (d,) bool
     for layer in net.layers:
@@ -62,7 +64,8 @@ def baseline_and_free_cols(net, res0):
 def normed_forward(net, res0, free_cols, n_const, gain, eps):
     """Pre-norm forward with the pinned constant in the last n_const free
     columns. With a bit-exact (pow2) norm, norm(res) == res, so this must
-    track the baseline exactly. Returns (final_res, rms_spread)."""
+    track the baseline exactly. Returns (final_res, rms_spread).
+    """
     const_cols = free_cols[-n_const:]
     res = res0.clone()
     res[:, const_cols] = float(2**Q)

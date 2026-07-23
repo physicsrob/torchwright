@@ -9,10 +9,11 @@ from __future__ import annotations
 import statistics
 from collections import defaultdict
 
+from torchwright_doom.model.constants import COLUMN_COUNT, PIXEL_WIDTH
+from torchwright_doom.model.vocab import CLIP_UPDATE, SCREEN_RANGE, SET_CURSOR_X
 from torchwright_doom.prompt import scenes as S
-from torchwright_doom.model.constants import PIXEL_WIDTH, COLUMN_COUNT
-from torchwright_doom.model.vocab import SET_CURSOR_X, CLIP_UPDATE, SCREEN_RANGE
-from torchwright_doom.pydoom import Scene as PyScene, GameState as PyGameState
+from torchwright_doom.pydoom import GameState as PyGameState
+from torchwright_doom.pydoom import Scene as PyScene
 from torchwright_doom.pydoom import expected_ar_tokens
 
 

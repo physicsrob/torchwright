@@ -58,7 +58,8 @@ def test_recompile_after_counter_reset_does_not_collide():
 def test_reserve_node_id_above_only_advances():
     """The counter helper never moves the counter backward and is a no-op when
     the counter already leads — the property that makes it inert in production
-    and in every single-compile test."""
+    and in every single-compile test.
+    """
     a = create_input("a", 1)  # some node with a concrete id
     _node_module.global_node_id = a.node_id + 100
     before = _node_module.global_node_id

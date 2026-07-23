@@ -201,7 +201,8 @@ def collect_cell(impl_name: str, n: int) -> dict:
 
 def collect(ns) -> dict:
     """Measure every (impl, n) cell serially (the local, single-cell path;
-    the Modal entrypoint fans cells out instead)."""
+    the Modal entrypoint fans cells out instead).
+    """
     results: dict = {impl: [] for impl in IMPLS}
     for impl_name in IMPLS:
         for n in ns:

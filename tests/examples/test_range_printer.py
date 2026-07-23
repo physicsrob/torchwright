@@ -13,9 +13,6 @@ import numpy as np
 import pytest
 import torch
 
-from torchwright.compiler.export import compile_headless
-from torchwright.debug.probe import probe_graph, reference_eval
-
 from examples.range_printer import (
     D_HEAD,
     D_TOKEN_TYPE,
@@ -26,6 +23,8 @@ from examples.range_printer import (
     out_done_flag,
     out_feedback_slice,
 )
+from torchwright.compiler.export import compile_headless
+from torchwright.debug.probe import probe_graph, reference_eval
 
 # ---------------------------------------------------------------------------
 # Helpers

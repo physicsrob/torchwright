@@ -59,7 +59,8 @@ def _pack(module, named, n):
 
 def test_apply_rope_tail_is_position_invariant():
     """The NoPE tail ``x[..., d_rot:]`` is byte-identical across positions; only
-    the rotary front changes."""
+    the rotary front changes.
+    """
     x = torch.randn(1, D_HEAD)
     cos0, sin0 = rope_cos_sin(torch.tensor([0]), D_ROT, BASE)
     cos7, sin7 = rope_cos_sin(torch.tensor([7]), D_ROT, BASE)
@@ -75,7 +76,8 @@ def test_apply_rope_tail_is_position_invariant():
 
 def test_apply_rope_full_width_reduces_to_exact_expression():
     """At ``d_rot == d_head`` (cos as wide as x) the partial path takes the exact
-    pre-partial expression, byte-for-byte."""
+    pre-partial expression, byte-for-byte.
+    """
     x = torch.randn(3, D_HEAD)
     cos, sin = rope_cos_sin(torch.tensor([0, 5, 11]), D_HEAD, BASE)
     exact = x * cos + rotate_half(x) * sin
@@ -96,7 +98,8 @@ def test_rope_config_default_d_rot_is_full():
 def _content_dot_graph():
     """A content (dot-match) head under partial rotary. ``attend_argmax_dot``
     picks the causal key with the largest ``query·key`` — a pure content head,
-    so under ``d_rot < d_head`` its content must ride the NoPE tail."""
+    so under ``d_rot < d_head`` its content must ride the NoPE tail.
+    """
     rope = create_rope_config(d_head=D_HEAD, max_positions=512, d_rot=D_ROT)
     query = create_input("query", 1)
     key = create_input("key", 1)
@@ -108,7 +111,8 @@ def test_content_head_builds_on_nope_tail_partial_rotary():
     """A content head *builds* under partial rotary (no longer rejected): the
     content rides the NoPE tail, so the Attn carries ``rope_d_rot == D_ROT`` and the
     rotary front of its Q/K projection is all zero (the logit is pure content
-    dot)."""
+    dot).
+    """
     from torchwright.compiler.utils import get_ancestor_nodes
     from torchwright.graph.attn import Attn
 
@@ -128,7 +132,8 @@ def test_partial_content_compiled_matches_oracle_and_selects():
     """Compiled partial-rotary content-dot head == oracle, and selects the
     highest-dot valid key EXACTLY across distance (tail content has no slow-plane
     attenuation): a unique max planted at position 1 is selected by every later
-    query, near and far alike."""
+    query, near and far alike.
+    """
     sel = _content_dot_graph()
     n = 24
     q = torch.ones(n, 1)  # constant query
@@ -149,7 +154,8 @@ def test_partial_content_compiled_matches_oracle_and_selects():
 
 def test_compile_rejects_mixed_d_rot():
     """d_rot is global: a graph mixing two rotary widths fails fast at
-    forward_compile (one shared cos/sin grid can't honor both)."""
+    forward_compile (one shared cos/sin grid can't honor both).
+    """
     from torchwright.graph import Concatenate
 
     payload = create_input("payload", 1)

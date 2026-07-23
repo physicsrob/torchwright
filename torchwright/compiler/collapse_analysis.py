@@ -30,7 +30,7 @@ Phase A instrument; synthesis is Phase B, gated on Rob's GO.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Tuple, cast
+from typing import cast
 
 import torch
 
@@ -42,8 +42,8 @@ from torchwright.compiler.collapse import (
 )
 from torchwright.compiler.graph_clone import topological_order
 from torchwright.compiler.pl_function import (
-    SIMPLIFY_TOL,
     _HINGE_EXACT_Z,
+    SIMPLIFY_TOL,
     MemberCertificate,
     S1Model,
     S2Model,
@@ -94,16 +94,16 @@ class SubgraphAnalysis:
 
     source: str
     annotation: str
-    domain: Tuple[float, float]
+    domain: tuple[float, float]
     n_members: int
     chain_depth: int
     n_boundary: int
     n_synthesized: int
     verdict: str  # 'S1' | 'S2' | 'no depth gain' | 'declined: <reason>'
     verdict_banded: str = ""
-    depth_after: Optional[int] = None  # modeled chain depth if taken (strict)
-    depth_after_banded: Optional[int] = None
-    members: List[MemberAnalysis] = field(default_factory=list)
+    depth_after: int | None = None  # modeled chain depth if taken (strict)
+    depth_after_banded: int | None = None
+    members: list[MemberAnalysis] = field(default_factory=list)
     stage1_cols: int = 0  # union bounded-step residual columns (strict S2)
     stage1_cols_banded: int = 0
     n_oracle_points: int = 0
@@ -166,14 +166,14 @@ class SubgraphAnalysis:
 class V2Report:
     """All subgraph verdicts + the modeled floors and liveness totals."""
 
-    subgraphs: List[SubgraphAnalysis]
-    floor_off: Optional[int] = None
-    floor_strict: Optional[int] = None
-    floor_banded: Optional[int] = None
-    machine: Optional[str] = None
+    subgraphs: list[SubgraphAnalysis]
+    floor_off: int | None = None
+    floor_strict: int | None = None
+    floor_banded: int | None = None
+    machine: str | None = None
     # One deepest dependency chain of the banded-grafted graph — what
     # still holds the floor after v2 takes everything it can.
-    witness_banded: List[str] = field(default_factory=list)
+    witness_banded: list[str] = field(default_factory=list)
 
     @property
     def total_stage1_cols(self) -> int:
@@ -205,9 +205,9 @@ class V2Report:
             lines.append(
                 f"modeled layer floor: {self.floor_off} off, "
                 f"{self.floor_strict} strict "
-                f"(delta {cast(int, self.floor_strict) - self.floor_off:+d}), "
+                f"(delta {cast('int', self.floor_strict) - self.floor_off:+d}), "
                 f"{self.floor_banded} banded "
-                f"(delta {cast(int, self.floor_banded) - self.floor_off:+d})"
+                f"(delta {cast('int', self.floor_banded) - self.floor_off:+d})"
             )
         lines.append(
             f"S2 stage-1 residual columns, simultaneous: "
@@ -221,10 +221,11 @@ class V2Report:
         return "\n".join(lines)
 
 
-def _stage1_col_union(members: List[MemberAnalysis], certs, plateau_tol) -> int:
+def _stage1_col_union(members: list[MemberAnalysis], certs, plateau_tol) -> int:
     """Bounded-step residual columns for one source's S2 emission:
-    steps shared across members where their transitions coincide."""
-    mids: List[float] = []
+    steps shared across members where their transitions coincide.
+    """
+    mids: list[float] = []
     for cert in certs:
         fn = band_skeleton(cert.fn, cert.bands)
         _, runs = transition_runs(fn, plateau_tol)
@@ -267,27 +268,27 @@ def analyze_collapse_v2(
     src = scalar_sources(order)
     machine = _machine(order)
 
-    by_src: Dict[Node, List[Node]] = {}
+    by_src: dict[Node, list[Node]] = {}
     for n in order:
         s = src[n]
         if s is not None and s is not n:
             by_src.setdefault(s, []).append(n)
 
-    consumers: Dict[Node, List[Node]] = {n: [] for n in order}
+    consumers: dict[Node, list[Node]] = {n: [] for n in order}
     for n in order:
         for u in n.inputs:
             if u in consumers:
                 consumers[u].append(n)
 
     topo_index = {n: i for i, n in enumerate(order)}
-    subgraphs: List[SubgraphAnalysis] = []
+    subgraphs: list[SubgraphAnalysis] = []
     # (source, synthesized member, shape) for the floor model's
     # rewiring passes — subgraphs taken under strict, and the extra
     # ones only the banded policy admits (strict takes are a subset of
     # banded takes, so the banded floor grafts on top of the strict
     # one).
-    rewiring: List[Tuple[Node, Node, str]] = []
-    rewiring_banded: List[Tuple[Node, Node, str]] = []
+    rewiring: list[tuple[Node, Node, str]] = []
+    rewiring_banded: list[tuple[Node, Node, str]] = []
 
     for source in sorted(by_src, key=topo_index.__getitem__):
         members = by_src[source]
@@ -336,7 +337,7 @@ def analyze_collapse_v2(
             subgraphs.append(outcome(f"declined: {cert.declined}", domain=cert.domain))
             continue
 
-        analyses: List[MemberAnalysis] = []
+        analyses: list[MemberAnalysis] = []
         for m in synthesized:
             c: MemberCertificate = cert.members[m]
             # Strict-policy models (the sleeve tolerance of the
@@ -381,7 +382,7 @@ def analyze_collapse_v2(
                 )
             )
 
-        def policy_verdict(banded: bool) -> Tuple[str, Optional[int]]:
+        def policy_verdict(banded: bool) -> tuple[str, int | None]:
             lin = [a.linear_banded if banded else a.linear_ok for a in analyses]
             s1s = [a.s1_banded_ok if banded else a.s1_ok for a in analyses]
             s2s = [
@@ -478,9 +479,10 @@ def analyze_collapse_v2(
     return report
 
 
-def _witness_chain(output_node: Node) -> List[str]:
+def _witness_chain(output_node: Node) -> list[str]:
     """One deepest dependency chain of the graph (the critical_chain.py
-    pattern): per node, its earliest feasible layer, annotation, name."""
+    pattern): per node, its earliest feasible layer, annotation, name.
+    """
     from torchwright.compiler.forward.cpsat_scheduler import (
         LEGACY_POLICY,
         _compute_layer_bounds,
@@ -489,7 +491,7 @@ def _witness_chain(output_node: Node) -> List[str]:
 
     gm = build_graph_model(output_node, None)
     es, _ = _compute_layer_bounds(gm, LEGACY_POLICY, True, max_layers=1 << 20)
-    preds: Dict[int, List[int]] = {}
+    preds: dict[int, list[int]] = {}
     for u, v in gm.edges:
         preds.setdefault(v.node_id, []).append(u.node_id)
     id2node = {n.node_id: n for n in gm.schedulable}
@@ -502,7 +504,7 @@ def _witness_chain(output_node: Node) -> List[str]:
         cur = max(ps, key=lambda p: es[p])
         chain.append(cur)
     chain.reverse()
-    out: List[str] = []
+    out: list[str] = []
     for i in chain:
         n = id2node.get(i)
         if n is None:
@@ -525,15 +527,16 @@ def _standin_ffn(inp: Node, d_out: int, name: str) -> FFN:
 
 def _graft_standins(
     output_node: Node,
-    rewiring: List[Tuple[Node, Node, str]],
-    consumers: Dict[Node, List[Node]],
-    by_src: Dict[Node, List[Node]],
+    rewiring: list[tuple[Node, Node, str]],
+    consumers: dict[Node, list[Node]],
+    by_src: dict[Node, list[Node]],
 ) -> Node:
     """Replace each taken member's external consumers with 1- (S1) or
     2-sublayer (S2) stand-in FFNs fed by the source, for the floor
     model.  Stage-1 stand-ins are shared per source, mirroring the S2
-    emission's shared bounded-step stage."""
-    stage1: Dict[Node, Node] = {}
+    emission's shared bounded-step stage.
+    """
+    stage1: dict[Node, Node] = {}
     for source, m, verdict in rewiring:
         member_set = set(by_src[source])
         if verdict == "S1":

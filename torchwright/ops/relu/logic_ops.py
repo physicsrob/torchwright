@@ -1,16 +1,14 @@
 import math
-from typing import List
-
-from torchwright.graph import Node, Concatenate
-from torchwright.graph.asserts import assert_matches_value_type
-from torchwright.graph.value_type import NodeValueType, Range
-from torchwright.ops.relu.linear_relu_linear import linear_relu_linear
 
 import torch
 
-from torchwright.ops.relu.arithmetic_ops import compare
-from torchwright.ops.linear import sum_nodes
+from torchwright.graph import Concatenate, Node
+from torchwright.graph.asserts import assert_matches_value_type
+from torchwright.graph.value_type import NodeValueType, Range
 from torchwright.ops.const import embedding_step_sharpness
+from torchwright.ops.linear import sum_nodes
+from torchwright.ops.relu.arithmetic_ops import compare
+from torchwright.ops.relu.linear_relu_linear import linear_relu_linear
 
 _GATE_OFFSET_SAFETY_FACTOR = 2.0
 """Headroom over the declared ``max|value|`` so that activation noise
@@ -77,7 +75,8 @@ def per_column_offsets(intervals, scalar_M: float) -> "torch.Tensor":
 def _intersect_intervals(node: "Node"):
     """Per-component intervals of ``node`` intersected with its scalar
     value_type, or ``None`` if a per-column affine bound is unavailable /
-    width-mismatched (caller falls back to the scalar offset)."""
+    width-mismatched (caller falls back to the scalar offset).
+    """
     try:
         intervals = node.affine_bound.to_interval()
     except Exception:
@@ -93,9 +92,8 @@ def _intersect_intervals(node: "Node"):
     ]
 
 
-def bool_any_true(inp_list: List[Node]) -> Node:
-    """
-    Returns a node that evaluates to True if any of the input nodes are true.
+def bool_any_true(inp_list: list[Node]) -> Node:
+    """Returns a node that evaluates to True if any of the input nodes are true.
 
     Args:
         inp_list (List[Node]): List of nodes to be evaluated.
@@ -117,9 +115,8 @@ def bool_any_true(inp_list: List[Node]) -> Node:
     return compare(sum_node, thresh=0.5, true_level=1.0, false_level=-1.0)
 
 
-def bool_all_true(inp_list: List[Node]) -> Node:
-    """
-    Returns a node that evaluates to True if all of the input nodes are true.
+def bool_all_true(inp_list: list[Node]) -> Node:
+    """Returns a node that evaluates to True if all of the input nodes are true.
 
     Inputs must be clean ±1.0 booleans (as produced by compare/bool_* ops).
     Sum of N such inputs is +N only when all are +1; otherwise ≤ N-2.
@@ -145,8 +142,7 @@ def bool_all_true(inp_list: List[Node]) -> Node:
 
 
 def bool_not(inp: Node) -> Node:
-    """
-    Returns a node that evaluates to 1.0 if the input node is false, and -1.0 if the input node is true.
+    """Returns a node that evaluates to 1.0 if the input node is false, and -1.0 if the input node is true.
 
     Args:
         inp: Input node to be evaluated
@@ -163,8 +159,7 @@ def bool_not(inp: Node) -> Node:
 
 
 def equals_vector(inp: Node, vector: torch.Tensor) -> Node:
-    """
-    Compares a node's value to a vector tensor.
+    """Compares a node's value to a vector tensor.
 
     Args:
         inp (Node): The node to be compared.
@@ -209,8 +204,7 @@ def _cond_gate_output_type(cond: Node, inp: Node) -> NodeValueType:
 
 
 def cond_gate(cond: Node, inp: Node) -> Node:
-    """
-    Gates the value of a node based on a condition. If the condition is true,
+    """Gates the value of a node based on a condition. If the condition is true,
     outputs the value. If false, outputs a zero tensor of the same shape as value.
 
     Uses a single L→ReLU→L sublayer with an additive cancellation trick: the

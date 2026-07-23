@@ -1,22 +1,20 @@
-import pytest
+import torch
 
 from torchwright.graph.asserts import assert_matches_value_type
 from torchwright.graph.value_type import NodeValueType, Range
-from torchwright.ops.linear import add_const
 from torchwright.ops.inout_nodes import (
+    create_embedding,
     create_input,
     create_literal_value,
-    create_embedding,
 )
+from torchwright.ops.linear import add_const
 from torchwright.ops.relu.map_select import (
-    select,
-    map_to_table,
-    switch,
-    in_range,
     broadcast_select,
+    in_range,
+    map_to_table,
+    select,
+    switch,
 )
-
-import torch
 
 
 def test_select():
@@ -33,7 +31,7 @@ def test_select():
 
 
 def test_select_builds_eagerly():
-    """select with bounded inputs builds eagerly (no placeholder)."""
+    """Select with bounded inputs builds eagerly (no placeholder)."""
     cond_input = create_input("cond", 1)
     t = create_input("t", 1)
     f = create_literal_value(torch.tensor([1.0]))

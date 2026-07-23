@@ -26,20 +26,20 @@ import torch
 
 from torchwright.graph import InputNode
 from torchwright.graph.asserts import assert_01, assert_integer, assert_onehot
+from torchwright.graph.attn import Attn
 from torchwright.ops.attention_ops import (
+    _ABOVE_BONUS,
+    _ABOVE_MATCH_BONUS,
+    _BUCKET_BONUS,
+    _QUERY_GAIN,
+    _VALIDITY_BONUS,
     attend_argmax_dot,
-    attend_argmin_above_integer,
     attend_argmin_above_in_bucket,
+    attend_argmin_above_integer,
     attend_argmin_unmasked,
     attend_causal_mean,
     attend_mean_where,
-    _QUERY_GAIN,
-    _VALIDITY_BONUS,
-    _BUCKET_BONUS,
-    _ABOVE_MATCH_BONUS,
-    _ABOVE_BONUS,
 )
-from torchwright.graph.attn import Attn
 from torchwright.ops.inout_nodes import create_rope_config
 
 # Uniform rotary substrate for these oracle (``node.compute``) tests.  Under
@@ -153,7 +153,8 @@ def _build_indicators(scores, thresholds):
 
 def test_attend_argmin_above_integer_picks_smallest_above_threshold():
     """At each query position, pick the smallest score strictly above the
-    threshold indicated by the one-hot query."""
+    threshold indicated by the one-hot query.
+    """
     rope = _rope()
     score = assert_integer(InputNode("score", 1, value_range=(-100.0, 100.0)))
     indicators = InputNode("indicators", 10, value_range=(-100.0, 100.0))
@@ -198,7 +199,8 @@ def test_attend_argmin_above_integer_picks_smallest_above_threshold():
 
 def test_attend_argmin_above_integer_threshold_varies_per_query():
     """The one-hot threshold can differ per query position, giving
-    different selections at each."""
+    different selections at each.
+    """
     rope = _rope()
     score = assert_integer(InputNode("score", 1, value_range=(-100.0, 100.0)))
     indicators = InputNode("indicators", 10, value_range=(-100.0, 100.0))
@@ -392,7 +394,8 @@ def test_attend_causal_mean_is_exact_cumulative_mean():
 def test_attend_causal_mean_exact_under_full_rotary():
     """The exactness is layout-proof: rotating zero Q/K vectors is a no-op,
     so full rotary gives the same exact uniform mean as partial (the
-    distinction that makes attend_mean_where only quasi-uniform there)."""
+    distinction that makes attend_mean_where only quasi-uniform there).
+    """
     rope_full = create_rope_config(d_head=64, max_positions=4096)  # d_rot = d_head
     value = InputNode("value", 1, value_range=(-100.0, 100.0))
     out = attend_causal_mean(rope_full, value)
@@ -482,7 +485,8 @@ def test_attend_argmax_dot_selects_best_match():
 
 def test_attend_argmax_dot_zero_key_isolation():
     """Zero key_vector (from cond_gate) produces dot product 0, losing to
-    any matching position."""
+    any matching position.
+    """
     rope = _rope()
     query_vector = InputNode("qv", 3, value_range=(-100.0, 100.0))
     key_vector = InputNode("kv", 3, value_range=(-100.0, 100.0))
@@ -691,7 +695,8 @@ def _run_baib(
 
 def test_baib_picks_lowest_valid_in_bucket_above():
     """Among rows that are valid, in the queried bucket, and above the queried
-    threshold, the smallest score wins."""
+    threshold, the smallest score wins.
+    """
     nb, nt = 3, 5
     out = _baib_nodes(nb, nt)
     n_pos = 5
@@ -723,7 +728,8 @@ def test_baib_picks_lowest_valid_in_bucket_above():
 
 def test_baib_ignores_wrong_bucket():
     """A valid, above-threshold row in the WRONG bucket loses to a worse-score
-    row in the right bucket."""
+    row in the right bucket.
+    """
     nb, nt = 3, 4
     out = _baib_nodes(nb, nt)
     n_pos = 2
@@ -841,7 +847,8 @@ def test_baib_query_threshold_varies_per_position():
 
 def test_baib_bucket_boundary():
     """Query bucket k; candidates in k-1, k, k+1 — only the bucket-k row wins,
-    even when neighbors have lower scores."""
+    even when neighbors have lower scores.
+    """
     nb, nt = 3, 4
     out = _baib_nodes(nb, nt)
     n_pos = 3
@@ -863,7 +870,7 @@ def test_baib_bucket_boundary():
 
 
 def test_baib_threshold_boundary_equal_is_not_above():
-    """score == threshold is NOT strictly above."""
+    """Score == threshold is NOT strictly above."""
     nb, nt = 1, 5
     out = _baib_nodes(nb, nt)
     n_pos = 2
@@ -921,7 +928,8 @@ def test_baib_arbitrary_value_width_does_not_grow_dqk():
 
 def test_baib_duplicate_matching_rows_with_identical_payload_blend_harmlessly():
     """Two matching rows that tie on score and carry the same payload produce
-    that payload (the blend is a no-op)."""
+    that payload (the blend is a no-op).
+    """
     nb, nt = 2, 4
     out = _baib_nodes(nb, nt)
     n_pos = 2
@@ -945,7 +953,8 @@ def test_baib_duplicate_matching_rows_with_identical_payload_blend_harmlessly():
 
 def test_baib_near_one_hot_inputs_do_not_change_selection():
     """Bucket / threshold tables softened to ~0.97 (as compiled values are)
-    still select the same row — the predicate-bonus margin absorbs it."""
+    still select the same row — the predicate-bonus margin absorbs it.
+    """
     nb, nt = 3, 5
     out = _baib_nodes(nb, nt)
     n_pos = 5
@@ -973,7 +982,8 @@ def test_baib_near_one_hot_inputs_do_not_change_selection():
 
 def test_baib_threshold_above_max_has_no_match_but_does_not_crash():
     """No row above the queried threshold: output is a finite blend (undefined
-    by contract), never NaN, never raises."""
+    by contract), never NaN, never raises.
+    """
     nb, nt = 1, 6
     out = _baib_nodes(nb, nt)
     n_pos = 3
@@ -1017,7 +1027,8 @@ def test_baib_all_invalid_does_not_crash():
 
 def test_baib_scalar_bucket_recompute_is_unsafe_under_blend():
     """Negative result: recomputing presence from an AVERAGED scalar bucket id
-    is unsafe — two wrong-bucket rows can blend to the query bucket id."""
+    is unsafe — two wrong-bucket rows can blend to the query bucket id.
+    """
     nb, nt = 3, 4
     out = _baib_nodes(nb, nt, value_width=1)
     n_pos = 2
@@ -1045,7 +1056,8 @@ def test_baib_scalar_bucket_recompute_is_unsafe_under_blend():
 def test_baib_onehot_recompute_stays_false_under_blend():
     """Positive result: the robust recomputation — carry the selected
     `key_bucket_onehot` and dot it against the query one-hot — stays low in the
-    same no-match blend."""
+    same no-match blend.
+    """
     nb, nt = 3, 4
     out = _baib_nodes(nb, nt, value_width=nb)
     n_pos = 2
@@ -1070,7 +1082,8 @@ def test_baib_onehot_recompute_stays_false_under_blend():
 
 def test_baib_assert_hardness_passes_on_clean_matches():
     """With `assert_hardness_gt`, a clean scene with a unique winner per query
-    passes the reference-eval hardness predicate (does not raise)."""
+    passes the reference-eval hardness predicate (does not raise).
+    """
     nb, nt = 1, 5
     out = _baib_nodes(nb, nt, assert_hardness_gt=0.99)
     n_pos = 4
@@ -1093,7 +1106,8 @@ def test_baib_assert_hardness_passes_on_clean_matches():
 
 def test_baib_d_qk_is_two_plus_buckets_plus_thresholds():
     """Width regression: the logical content width (slow planes used) is exactly
-    2 + n_buckets + n_thresholds."""
+    2 + n_buckets + n_thresholds.
+    """
     for nb, nt in [(1, 1), (3, 5), (8, 6)]:
         attn = _unwrap_attn(_baib_nodes(nb, nt, value_width=7))
         assert _content_width(attn) == 2 + nb + nt, (nb, nt, _content_width(attn))
@@ -1101,7 +1115,8 @@ def test_baib_d_qk_is_two_plus_buckets_plus_thresholds():
 
 def test_baib_identity_vo_is_decoupled_from_dqk():
     """V/O regression: value passes through identity matrices of width
-    len(value), decoupled from the content width."""
+    len(value), decoupled from the content width.
+    """
     nb, nt, vw = 2, 3, 11
     attn = _unwrap_attn(_baib_nodes(nb, nt, value_width=vw))
     assert attn.d_v == vw
@@ -1115,7 +1130,8 @@ def test_baib_bonus_magnitudes_are_op_local_not_inherited_1000():
     """The validity / bucket / above coefficients baked into the matrices are
     op-local AND large enough to dominate the score swing.  The compiled probe
     cannot tell 256 from a too-small (or 1000) bonus in fp32, so these
-    structural checks are what pin the constants."""
+    structural checks are what pin the constants.
+    """
     nb, nt = 3, 4
     attn = _unwrap_attn(_baib_nodes(nb, nt))
     q, k = attn.query_matrix, attn.key_matrix
@@ -1154,7 +1170,8 @@ def test_baib_bonus_dominates_worst_case_score_gap():
     has the best score (0) and the matching row the worst (30, a near-maximal
     in-range gap under the ~32 diameter), the matching row must still win.  An
     undersized bonus mis-selects here even though the small-gap fixtures stay
-    green."""
+    green.
+    """
     nb, nt = 3, 12
     out = _baib_nodes(nb, nt)
     n_pos = 4
@@ -1179,7 +1196,8 @@ def test_baib_bonus_dominates_worst_case_score_gap():
 def test_baib_single_column_bucket_and_threshold_select():
     """n_buckets == 1 and n_thresholds == 1 (the asserted lower bound) still
     select: a 1-wide bucket is a constant no-op filter, a 1-wide threshold
-    gates on the single above-column, and argmin-of-score still wins."""
+    gates on the single above-column, and argmin-of-score still wins.
+    """
     nb, nt = 1, 1
     out = _baib_nodes(nb, nt)
     n_pos = 3
@@ -1201,7 +1219,8 @@ def test_baib_single_column_bucket_and_threshold_select():
 
 def test_baib_all_zero_selectors_stay_finite():
     """All-zero query selectors (no bucket / threshold column chosen — e.g. an
-    out-of-range query index) drop that filter rather than crash: finite out."""
+    out-of-range query index) drop that filter rather than crash: finite out.
+    """
     nb, nt = 3, 4
     out = _baib_nodes(nb, nt)
     n_pos = 3

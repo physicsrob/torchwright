@@ -36,13 +36,13 @@ import torch
 from torchwright.compiler.graph_identity import topology_entries
 from torchwright.compiler.lower import lower
 from torchwright.graph import Concatenate, Linear
-from torchwright.graph.misc import Add
 from torchwright.graph.asserts import (
     assert_in_range,
     assert_integer,
     assert_strictly_less,
     debug_watch,
 )
+from torchwright.graph.misc import Add
 from torchwright.ops.inout_nodes import create_input
 
 # Computed 2026-07-05 on the pre-migration (wrapper-node) representation.

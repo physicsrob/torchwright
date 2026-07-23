@@ -86,7 +86,8 @@ def measure_relu_cancel(mag: float, device: str) -> dict:
 
 def _self_match_logits(n_pos: int, d_head: int, device: str) -> torch.Tensor:
     """Self-match logit(i, j) = hardness · Σ_p cos((i-j)·θ_p), the RoPE Δ=0
-    transport the attention-cancel head uses (peaks on the diagonal)."""
+    transport the attention-cancel head uses (peaks on the diagonal).
+    """
     p = torch.arange(d_head // 2, device=device, dtype=torch.float32)
     theta = ROPE_BASE ** (-2.0 * p / d_head)  # (d_head/2,)
     idx = torch.arange(n_pos, device=device, dtype=torch.float32)

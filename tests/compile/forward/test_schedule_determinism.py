@@ -33,7 +33,8 @@ def _w(*shape, seed):
 def _build_graph():
     """Parallel same-depth branches → critical-path ties the sweep must break
     identically across rebuilds.  Weights are seeded per-site so both builds
-    carry identical parameters (schedule inputs must match exactly)."""
+    carry identical parameters (schedule inputs must match exactly).
+    """
     a = create_input("a", 2, value_range=(-1.0, 1.0))
     b = create_input("b", 2, value_range=(-1.0, 1.0))
     c = create_input("c", 2, value_range=(-1.0, 1.0))

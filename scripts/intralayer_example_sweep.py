@@ -35,8 +35,7 @@ from __future__ import annotations
 
 import argparse
 import time
-import traceback
-from typing import Callable, Dict, List, Optional, Tuple
+from collections.abc import Callable
 
 import torch
 
@@ -94,9 +93,10 @@ def _build_bucketed_argmin():
     )
 
 
-def _example_specs() -> Dict[str, Tuple[Callable, int, int]]:
-    """name -> (build_output_node, d_natural, d_head).  Built lazily so a
-    ``--graphs`` subset never imports the others."""
+def _example_specs() -> dict[str, tuple[Callable, int, int]]:
+    """Name -> (build_output_node, d_natural, d_head).  Built lazily so a
+    ``--graphs`` subset never imports the others.
+    """
     from examples import (
         binary_increment,
         caesar_cipher,
@@ -138,11 +138,12 @@ def _example_specs() -> Dict[str, Tuple[Callable, int, int]]:
     }
 
 
-def _compile_layers(out, d, d_head, optimize) -> Tuple[Optional[int], str]:
+def _compile_layers(out, d, d_head, optimize) -> tuple[int | None, str]:
     """Compile ``out`` and return (n_layers, status).  ``status`` is
     'heuristic'/'solver'/'fallback' for a successful compile, or 'FAIL:<reason>'
     when the compile raised (the width is below this optimize level's floor).
-    The optimize=1 solve uses forward_compile's own 60s budget."""
+    The optimize=1 solve uses forward_compile's own 60s budget.
+    """
     try:
         net = forward_compile(
             d=d,
@@ -168,7 +169,7 @@ def _compile_layers(out, d, d_head, optimize) -> Tuple[Optional[int], str]:
 
 def _solve_layers(
     low_out, d, d_head, budget, disabled
-) -> Tuple[Optional[int], bool, Optional[float]]:
+) -> tuple[int | None, bool, float | None]:
     """Solve-only (never compiled): (n_layers, is_optimal, proven_bound).
 
     Returns ``(None, False, None)`` on no-solution / raise.  The proven bound
@@ -179,7 +180,8 @@ def _solve_layers(
     lowered graph (collapse passes), so a raw-graph solve would over-count.
     Uses ``SchedulingPolicy()`` and ``tighten_domains`` to match the compile;
     the only intended difference between calls is ``disabled`` (the relaxed
-    constraint family)."""
+    constraint family).
+    """
     try:
         asg, stats = solve_schedule(
             low_out,
@@ -210,10 +212,11 @@ def _lower(out, d):
     ).output_node
 
 
-def _width_grid(d_natural: int, d_head: int, n_points: int) -> List[int]:
+def _width_grid(d_natural: int, d_head: int, n_points: int) -> list[int]:
     """Widths from d_natural down toward a pressured floor, on the d_head grid.
     Floor target is a quarter of the natural width (>= two heads); compiles
-    below the true scheduling floor are recorded as FAIL, which locates it."""
+    below the true scheduling floor are recorded as FAIL, which locates it.
+    """
     lo = max(2 * d_head, (d_natural // 4 // d_head) * d_head)
     lo = min(lo, d_natural)
     if n_points <= 1 or d_natural <= lo:
@@ -225,9 +228,9 @@ def _width_grid(d_natural: int, d_head: int, n_points: int) -> List[int]:
     return sorted((d for d in grid if d >= d_head), reverse=True)
 
 
-def sweep(graphs: List[str], budget: float, n_points: int):
+def sweep(graphs: list[str], budget: float, n_points: int):
     specs = _example_specs()
-    results: Dict[str, List[dict]] = {}
+    results: dict[str, list[dict]] = {}
     for name in graphs:
         build, d_nat, d_head = specs[name]
         cp_lb = critical_path_layers(build())
@@ -237,7 +240,7 @@ def sweep(graphs: List[str], budget: float, n_points: int):
             f"critical-path floor={cp_lb} layers; widths={grid} ===",
             flush=True,
         )
-        rows: List[dict] = []
+        rows: list[dict] = []
         for d in grid:
             t0 = time.perf_counter()
             # Layer counts depend only on topology, so one build serves all
@@ -256,7 +259,7 @@ def sweep(graphs: List[str], budget: float, n_points: int):
                     low_out, d, d_head, budget, frozenset()
                 )
                 # Full per-family sweep: each family disabled alone (§0).
-                fam: Dict[str, dict] = {}
+                fam: dict[str, dict] = {}
                 for family in _FAMILY_SWEEP:
                     fn, fopt, fbound = _solve_layers(
                         low_out, d, d_head, budget, frozenset({family})
@@ -312,7 +315,7 @@ def _fmt(v) -> str:
     return "  -" if v is None else f"{v:>3}"
 
 
-def _verdict(results: Dict[str, List[dict]]):
+def _verdict(results: dict[str, list[dict]]):
     print("\n" + "=" * 72)
     print("PHASE-GATE VERDICT")
     print("=" * 72)

@@ -6,16 +6,13 @@ are compositions of swiglu ingredients (map_to_table banks and the
 thermometer staircase); the pipeline structure is unchanged from relu.
 """
 
-from typing import List
-
 import torch
 
 from torchwright.graph import Node
-from torchwright.graph.embedding import Embedding
 from torchwright.graph.asserts import assert_matches_value_type
+from torchwright.graph.embedding import Embedding
 from torchwright.graph.value_type import NodeValueType, Range
 from torchwright.ops.const import scale, step_sharpness
-
 from torchwright.ops.linear import add_scaled_nodes, sum_nodes
 from torchwright.ops.swiglu.arithmetic_ops import thermometer_floor_div
 from torchwright.ops.swiglu.map_select import map_to_table
@@ -107,7 +104,7 @@ def digit_to_scaled_scalar(
     return map_to_table(inp=digit_node, key_to_value=table, default=torch.tensor([0.0]))
 
 
-def digits_to_number(embedding: Embedding, digit_nodes: List[Node]) -> Node:
+def digits_to_number(embedding: Embedding, digit_nodes: list[Node]) -> Node:
     """Convert digit embeddings (MSB first) to a single scalar.
 
     Example: [embed("1"), embed("2"), embed("3")]
@@ -121,7 +118,7 @@ def digits_to_number(embedding: Embedding, digit_nodes: List[Node]) -> Node:
     return sum_nodes(scaled)
 
 
-def number_to_digit_scalars(inp: Node, num_digits: int, max_value: int) -> List[Node]:
+def number_to_digit_scalars(inp: Node, num_digits: int, max_value: int) -> list[Node]:
     """Extract individual digit scalars (0.0-9.0) from a scalar number, MSB first.
 
     Greedy extraction via :func:`thermometer_floor_div`: peel off the most

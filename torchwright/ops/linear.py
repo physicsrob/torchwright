@@ -8,16 +8,13 @@ preserve that property — an op that needs an MLP sublayer belongs in a
 machine library, not in this module.
 """
 
-from typing import List, Optional
-
 import torch
 
-from torchwright.graph import Node, Add, Concatenate, Linear
+from torchwright.graph import Add, Concatenate, Linear, Node
 
 
 def add(inp1: Node, inp2: Node) -> Node:
-    """
-    Performs element-wise addition of two input nodes.
+    """Performs element-wise addition of two input nodes.
 
     Args:
         inp1 (Node): First node for addition.
@@ -30,8 +27,7 @@ def add(inp1: Node, inp2: Node) -> Node:
 
 
 def subtract(inp1: Node, inp2: Node) -> Node:
-    """
-    Subtracts inp2 from inp1 element-wise.
+    """Subtracts inp2 from inp1 element-wise.
 
     Args:
         inp1 (Node): Node to subtract from.
@@ -44,8 +40,7 @@ def subtract(inp1: Node, inp2: Node) -> Node:
 
 
 def negate(inp: Node) -> Node:
-    """
-    Negates the input node (multiplies by -1).
+    """Negates the input node (multiplies by -1).
 
     Args:
         inp (Node): Node to negate.
@@ -58,8 +53,7 @@ def negate(inp: Node) -> Node:
 
 
 def add_const(inp: Node, scalar: float) -> Node:
-    """
-    Adds a scalar value to each entry of the input node.
+    """Adds a scalar value to each entry of the input node.
 
     Args:
         inp (Node): Node whose values will have the scalar added.
@@ -78,8 +72,7 @@ def add_const(inp: Node, scalar: float) -> Node:
 
 
 def multiply_const(inp: Node, scalar: float) -> Node:
-    """
-    Multiplies each entry of the input node by a scalar.
+    """Multiplies each entry of the input node by a scalar.
 
     Args:
         inp (Node): Node to scale.
@@ -109,8 +102,7 @@ def bool_to_01(inp: Node) -> Node:
 
 
 def add_scaled_nodes(scale1: float, inp1: Node, scale2: float, inp2: Node) -> Node:
-    """
-    Computes the linear combination of two nodes using specified coefficients.
+    """Computes the linear combination of two nodes using specified coefficients.
 
     Args:
         scale1 (float): Coefficient for the first node.
@@ -133,7 +125,7 @@ def add_scaled_nodes(scale1: float, inp1: Node, scale2: float, inp2: Node) -> No
     return Linear(concat, M)
 
 
-def sum_nodes(inp_list: List[Node], *, max_fanout: Optional[int] = None) -> Node:
+def sum_nodes(inp_list: list[Node], *, max_fanout: int | None = None) -> Node:
     """Compute the sum of all input nodes.
 
     Args:
@@ -160,7 +152,7 @@ def sum_nodes(inp_list: List[Node], *, max_fanout: Optional[int] = None) -> Node
     if max_fanout is not None and max_fanout < 2:
         raise ValueError(f"max_fanout must be >= 2, got {max_fanout}")
 
-    def _flat(nodes: List[Node]) -> Node:
+    def _flat(nodes: list[Node]) -> Node:
         x = Concatenate(nodes)
         output_matrix = torch.zeros(len(x), d)
         for i in range(len(x)):
@@ -182,9 +174,8 @@ def sum_nodes(inp_list: List[Node], *, max_fanout: Optional[int] = None) -> Node
     return running
 
 
-def concat(inp_list: List[Node]) -> Node:
-    """
-    Concatenates all the Nodes in inp_list.
+def concat(inp_list: list[Node]) -> Node:
+    """Concatenates all the Nodes in inp_list.
 
     Args:
         inp_list (List[Node]): List of nodes to concatenate

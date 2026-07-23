@@ -18,13 +18,12 @@ from torchwright.compiler.export import compile_headless
 from torchwright.debug.probe import reference_eval
 from torchwright.graph.asserts import (
     assert_in_range,
-    collect_asserts,
-    collect_watches,
     collect_debug_nodes,
+    collect_watches,
     debug_watch,
 )
-from torchwright.ops.relu.arithmetic_ops import clamp
 from torchwright.ops.inout_nodes import create_input
+from torchwright.ops.relu.arithmetic_ops import clamp
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -410,7 +409,8 @@ def test_suppress_checks_silences_debug_forward_asserts():
     reference eval: a debug=True forward inside the context runs the
     self-consistency check but skips the attached predicates.  Before the
     fix, an "asserts silenced" debug pass (torchwright_doom's d3 gate leg
-    1a) still raised from check_debug_predicates."""
+    1a) still raised from check_debug_predicates.
+    """
     import pytest
 
     from torchwright.graph.node import suppress_checks

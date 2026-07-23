@@ -7,7 +7,7 @@ Each op assembles gated-FFN lanes per its entry in
 
 import builtins
 import math
-from typing import Callable, List, Optional
+from collections.abc import Callable
 
 import torch
 
@@ -15,7 +15,6 @@ from torchwright.graph import Concatenate, Linear, Node
 from torchwright.graph.asserts import assert_matches_value_type
 from torchwright.graph.value_type import NodeValueType, Range
 from torchwright.ops.const import min_d_hidden, scale, step_sharpness, swish_dip
-
 from torchwright.ops.linear import (
     add_const,
     multiply_const,
@@ -296,7 +295,7 @@ def square(inp: Node) -> Node:
 
 def piecewise_linear(
     inp: Node,
-    breakpoints: List[float],
+    breakpoints: list[float],
     fn,
     clamp: bool = True,
     d_max: int = min_d_hidden,
@@ -653,8 +652,8 @@ def floor_int(
     inp: Node,
     min_value: int,
     max_value: int,
-    sharpness: Optional[float] = None,
-    output_map: Optional[Callable[[int], float]] = None,
+    sharpness: float | None = None,
+    output_map: Callable[[int], float] | None = None,
 ) -> Node:
     """Compute floor(x) — or f(floor(x)) — for a continuous scalar input.
 
@@ -883,7 +882,7 @@ def ceil_int(
     inp: Node,
     min_value: int,
     max_value: int,
-    sharpness: Optional[float] = None,
+    sharpness: float | None = None,
 ) -> Node:
     """Compute ceil(x) using the identity ``ceil(x) = -floor(-x)``.
 
@@ -913,9 +912,9 @@ def radix_floor_int(
     inp: Node,
     min_value: int,
     max_value: int,
-    divisor: Optional[int] = None,
-    sharpness: Optional[float] = None,
-    hi_sharpness: Optional[float] = None,
+    divisor: int | None = None,
+    sharpness: float | None = None,
+    hi_sharpness: float | None = None,
 ) -> Node:
     """Compute floor(x) as a radix split of three small :func:`floor_int`\\ s.
 

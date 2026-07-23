@@ -33,7 +33,8 @@ def _pack(module, named, n):
 
 def test_get_prev_value_latch_compiled():
     """get_prev_value latches the most-recent true position on the compiled path;
-    a single far trigger still latches (content gate dominates the lobe)."""
+    a single far trigger still latches (content gate dominates the lobe).
+    """
     rope = create_rope_config(d_head=D_HEAD, max_positions=CAP)
     value = create_input("value", 1)
     cond = create_input("cond", 1)

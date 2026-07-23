@@ -62,7 +62,8 @@ def _build(nb, nt, value_width, *, prefix, d_head):
 def test_baib_adjacent_score_recovered_compiled():
     """Two matching rows whose scores differ by 1, at the full predicate-bonus
     stack: the compiled fp32 head recovers the lower-score row, matching exact
-    math everywhere."""
+    math everywhere.
+    """
     # d_qk = 2 + 3 + 5 = 10; under RoPE the content rides the slowest d_head/2
     # planes, so d_head >= 2*10 = 20, AND d_head must divide d (512) for an
     # integer head count — so the smallest valid even d_head is 32 (was d_head=16
@@ -98,7 +99,8 @@ def test_baib_adjacent_score_recovered_compiled():
 
 def test_baib_wide_value_splits_over_heads_compiled():
     """A value wider than d_head forces the V/O split across physical heads;
-    the compiled output still matches exact math."""
+    the compiled output still matches exact math.
+    """
     nb, nt, vw = 2, 3, 20  # d_qk = 7 <= 16/2; d_v = 20 > 16 -> 2 V/O heads
     out = _build(nb, nt, vw, prefix="wide", d_head=16)
     n_pos = 2
@@ -135,7 +137,8 @@ def test_baib_wide_value_splits_over_heads_compiled():
 
 def test_baib_all_invalid_compiled_is_finite():
     """All rows invalid (no match): the compiled head returns a finite,
-    defined blend — never NaN, never raises — and matches the oracle blend."""
+    defined blend — never NaN, never raises — and matches the oracle blend.
+    """
     nb, nt, vw = 2, 3, 4
     out = _build(nb, nt, vw, prefix="inv", d_head=16)
     n_pos = 3
@@ -165,7 +168,8 @@ def test_baib_all_invalid_compiled_is_finite():
 
 def test_baib_self_row_only_compiled_is_finite():
     """Minimal causal window (n_pos=1, only the self row visible): the compiled
-    head returns a finite value and matches the oracle."""
+    head returns a finite value and matches the oracle.
+    """
     nb, nt, vw = 2, 3, 4
     out = _build(nb, nt, vw, prefix="self", d_head=16)
     n_pos = 1

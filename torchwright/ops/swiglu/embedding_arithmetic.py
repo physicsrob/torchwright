@@ -8,20 +8,17 @@ banks' activation changed (they inherit map_to_table's entry).
 All sequences are MSB-first: seq[0] is the most significant digit.
 """
 
-from typing import List, Tuple
-
 import torch
 
 from torchwright.graph import Embedding, Node
-
-from torchwright.ops.linear import concat
 from torchwright.ops.inout_nodes import create_literal_value
+from torchwright.ops.linear import concat
 from torchwright.ops.swiglu.map_select import map_to_table
 
 
 def sum_digits(
     embedding: Embedding, num1: Node, num2: Node, carry_in: Node
-) -> Tuple[Node, Node]:
+) -> tuple[Node, Node]:
     """Add two single-digit embeddings plus a carry bit.
 
     Args:
@@ -67,8 +64,8 @@ def sum_digits(
 
 
 def sum_digit_seqs(
-    embedding: Embedding, seq1: List[Node], seq2: List[Node]
-) -> List[Node]:
+    embedding: Embedding, seq1: list[Node], seq2: list[Node]
+) -> list[Node]:
     """Add two digit sequences with carry propagation, right-to-left.
 
     Sequences are MSB-first; overflow digit not included.

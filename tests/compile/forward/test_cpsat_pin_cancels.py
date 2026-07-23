@@ -31,8 +31,8 @@ from ortools.sat.python import cp_model
 from torchwright.compiler.forward.compile import forward_compile
 from torchwright.compiler.forward.cpsat_scheduler import (
     ATTN,
-    DiagnosticHint,
     MLP,
+    DiagnosticHint,
     build_cpsat_model,
     solve_schedule,
 )
@@ -137,7 +137,8 @@ def _lower(out, d):
 def test_default_build_is_pinned(name):
     """The default build IS the pinned model: proto equal to an explicit
     ``_pin_cancels=True`` build, no ``parked`` vars, the pin equalities
-    really posted."""
+    really posted.
+    """
     node, d, d_head = _build(name)
     cfg = dict(d=d, d_head=d_head, d_hidden=d, max_layers=_MAX_LAYERS)
     default = _proto_text(build_cpsat_model(node, **cfg))
@@ -155,7 +156,8 @@ def test_knob_off_reproduces_legacy_model(name):
     (pinned) default and rebuilds the window/parked/widening machinery.
 
     Every example graph has at least one non-keep-forever node, so the legacy
-    build gets its ``parked`` var + upper window back and loses the pins."""
+    build gets its ``parked`` var + upper window back and loses the pins.
+    """
     node, d, d_head = _build(name)
     cfg = dict(d=d, d_head=d_head, d_hidden=d, max_layers=_MAX_LAYERS)
     default = _proto_text(build_cpsat_model(node, **cfg))
@@ -198,7 +200,8 @@ def test_pinned_solution_valid_in_unpinned_model(name, d):
     """Solve the pinned model, then hard-fix its full decision assignment into
     the UNPINNED legacy model and re-solve: feasibility there proves the pin
     only added constraints (every pinned schedule is machine-valid by
-    construction)."""
+    construction).
+    """
     build, _, d_head = _example_specs()[name]
     torch.manual_seed(0)
     low = _lower(build(), d)
@@ -242,7 +245,8 @@ def test_pinned_solution_valid_in_unpinned_model(name, d):
 @pytest.mark.parametrize("name,d", _SOLVE_CELLS)
 def test_pinned_optimum_no_shallower_than_unpinned(name, d):
     """A restriction can never beat the model it restricts: when both solves
-    prove optimality, pinned depth >= unpinned depth."""
+    prove optimality, pinned depth >= unpinned depth.
+    """
     build, _, d_head = _example_specs()[name]
 
     def _solve(pin):
@@ -273,7 +277,8 @@ def test_pin_reaches_snapshot_path():
     """Fixture-based solves go through ``solve_schedule_from_snapshot``; prove
     the snapshot path agrees with the live path on the new default — the
     default snapshot build is pinned (equals the pinned live build) and the
-    knob-off escape hatch is live there too."""
+    knob-off escape hatch is live there too.
+    """
     from torchwright.compiler.forward.cpsat_scheduler import (
         build_graph_model,
         build_model_from_snapshot,
@@ -307,7 +312,8 @@ def test_full_hint_with_pin_passes_strict_validation():
     pin (the legacy model can cancel later than earliest-legal) — are dropped
     before ``_validate_hint``; layer, routing, and cancel-MECHANISM hints are
     kept.  ``strict_hint=True`` would raise on any violation the validator
-    can see."""
+    can see.
+    """
     build, _, d_head = _example_specs()["fibonacci"]
     d = 208
     torch.manual_seed(0)

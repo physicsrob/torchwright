@@ -46,8 +46,9 @@ SCALE = 128.0
 
 
 def _run_sigmoid_swish(z: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
-    """sig = Sigmoid(z), swish = Mul(z, sig) under CPU onnxruntime,
-    default session options.  Opset 14, matching the exporter."""
+    """Sig = Sigmoid(z), swish = Mul(z, sig) under CPU onnxruntime,
+    default session options.  Opset 14, matching the exporter.
+    """
     n = len(z)
     graph = helper.make_graph(
         [
@@ -74,7 +75,8 @@ def _run_sigmoid_swish(z: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
 def test_positive_saturation_threshold_is_18_not_17():
     """The divergence from torch: sigmoid(17) sits one ulp below 1.0;
     exact 1.0 holds from 18 up, with at most ~1.8e-7 shortfall on
-    [17, 18)."""
+    [17, 18).
+    """
     z = np.linspace(17.0, 200.0, 100_001, dtype=np.float32)
     sig, _ = _run_sigmoid_swish(z)
 
@@ -96,7 +98,8 @@ def test_positive_saturation_threshold_is_18_not_17():
 def test_negative_saturation_exact_zero_from_minus_18():
     """ORT-CPU sigmoid is exactly 0.0 for every z <= -18 (torch keeps
     denormals down to ~-103).  Strictly safer for the spec's leak
-    claims: sigma(-128) = 0 (dead select branch) is included."""
+    claims: sigma(-128) = 0 (dead select branch) is included.
+    """
     z = np.linspace(-200.0, -18.0, 100_001, dtype=np.float32)
     sig, swish = _run_sigmoid_swish(z)
     bad = z[sig != 0.0]
@@ -115,7 +118,8 @@ def test_swish_fixed_points_and_onehot_indicator():
     """The claims the spec leans on hold on this kernel: Swish(0) = 0,
     Swish(128) = 128 (saturated winning gate), Swish(64) = 64 (onehot
     winner indicator = exactly 0.5 after /scale), and the onehot leak
-    at -0.5 is exactly zero (sigma(-64) = 0 here, unlike torch)."""
+    at -0.5 is exactly zero (sigma(-64) = 0 here, unlike torch).
+    """
     probe = np.array([0.0, SCALE, SCALE / 2, -SCALE / 2], dtype=np.float32)
     _, swish = _run_sigmoid_swish(probe)
     assert swish[0] == 0.0
@@ -131,7 +135,8 @@ def test_bias_lane_constants_exact_unit_lane():
     expression — the GatedMLPSubLayer's ``g * sigmoid(g) * u`` — computes
     exactly 1.0 in fp32, so a constant routed through the lane's
     down-projection row lands verbatim in a ``bias=False`` artifact.
-    Mirrors the torch-CPU pin in ``test_swish_constants.py``."""
+    Mirrors the torch-CPU pin in ``test_swish_constants.py``.
+    """
     from torchwright.ops.const import bias_lane_gate, bias_lane_up
 
     z = np.array([bias_lane_gate], dtype=np.float32)

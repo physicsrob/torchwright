@@ -369,7 +369,8 @@ def test_clone_raises_on_out_of_cone_scheduling_predecessor():
 def test_clone_remaps_sibling_scheduling_predecessor():
     """A scheduling predecessor may be a *sibling* (scheduling-only edge,
     not an ancestor via inputs), which the data-topological clone order
-    can visit after its dependent — the remap runs as a second pass."""
+    can visit after its dependent — the remap runs as a second pass.
+    """
     from torchwright.graph.scheduling_hints import sequential_scope
 
     x = create_input("x", 4, value_range=(-1.0, 1.0))

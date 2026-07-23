@@ -7,12 +7,8 @@ venv is broken or we need A100-specific measurements.  Usage:
 """
 
 import sys
-from pathlib import Path
 
 from scripts.measure_op_noise import _measure_all, render_json
-from torchwright.compiler.forward.compile import (
-    forward_compile,
-)  # noqa: F401 pre-import
 
 
 def main():

@@ -36,7 +36,8 @@ def _build(machine="swish"):
     """A token graph: embedding -> gated FFN -> degenerate FFN, output
     d_embed-wide.  ``machine="relu"`` builds the same-shape ReLU twin (both
     FFNs degenerate) for the machine-mismatch negative test — identical
-    topology under the wrapper-transparent fingerprint."""
+    topology under the wrapper-transparent fingerprint.
+    """
     emb = create_embedding(vocab=VOCAB)
     d = len(emb)
     g = torch.Generator().manual_seed(17)
@@ -108,7 +109,8 @@ def test_swish_artifact_records_machine_kind(swish_artifact):
 
 def test_swish_onnx_emission_is_gated(swish_artifact):
     """The artifact carries the gated emission: gate/up/down initializers and
-    Sigmoid·Mul swish, no Relu nodes, no W1/W2."""
+    Sigmoid·Mul swish, no Relu nodes, no W1/W2.
+    """
     import onnx
 
     _, onnx_path = swish_artifact
@@ -127,7 +129,8 @@ def test_swish_onnx_emission_is_gated(swish_artifact):
 
 def test_swish_onnx_debug_session_roundtrips(swish_artifact):
     """probe_compiled over the executing artifact matches the exact oracle;
-    debug=True passes residual self-consistency."""
+    debug=True passes residual self-consistency.
+    """
     _, onnx_path = swish_artifact
     out2, emb2 = _build()
     session = OnnxDebugSession(onnx_path, out2)
@@ -148,7 +151,8 @@ def test_swish_onnx_debug_session_roundtrips(swish_artifact):
 
 def test_relu_rebuild_trips_machine_check(swish_artifact):
     """A same-shape ReLU rebuild passes the (frozen, activation-blind)
-    topology fingerprint but must trip the explicit machine cross-check."""
+    topology fingerprint but must trip the explicit machine cross-check.
+    """
     _, onnx_path = swish_artifact
     relu_out, _ = _build(machine="relu")
     with pytest.raises(ValueError, match="machine mismatch"):

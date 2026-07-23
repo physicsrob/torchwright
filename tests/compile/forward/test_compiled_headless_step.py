@@ -11,8 +11,8 @@ the float graph is incidental — ``CompiledHeadless`` runs any graph.)
 import torch
 
 from torchwright.compiler.export import compile_headless
-from torchwright.ops.relu.arithmetic_ops import multiply_2d
 from torchwright.ops.inout_nodes import create_input
+from torchwright.ops.relu.arithmetic_ops import multiply_2d
 
 D = 256
 D_HEAD = 16

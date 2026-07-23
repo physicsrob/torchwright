@@ -20,8 +20,6 @@ MSB-first answer, negative differences, a tall multiply column) lives in
 ``tests/compile/forward/test_forward_calculator_scratchpad.py``.
 """
 
-import torch
-
 from examples import calculator_scratchpad as cs
 from scripts.arithmetic_scaling import critical_path_depth
 
@@ -40,7 +38,8 @@ def test_depth_is_flat_in_max_digits():
 def _emit(n, total_value, kind):
     """Reference-eval one streamed carry/borrow column step: a literal column
     total → the emitted token, through the same ``_emit_from_total`` the sweeps
-    use."""
+    use.
+    """
     embedding = cs.create_onehot_embedding(cs.scratch_vocab(n))
     embed = embedding.get_embedding
     W = 20 * n + 1

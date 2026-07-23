@@ -37,7 +37,8 @@ MIN_D_HIDDEN = 1024
 def test_scale_is_the_module_constant():
     """The value every claim below is derived at IS the shipped module
     constant (ops/const.py) — the one the compiler's swish bypass pair and
-    the swiglu ops fold into weights."""
+    the swiglu ops fold into weights.
+    """
     from torchwright.ops.const import scale
 
     assert scale == SCALE
@@ -46,7 +47,8 @@ def test_scale_is_the_module_constant():
 def test_swish_dip_is_the_module_constant():
     """The dip magnitude the swiglu ops size their assert slacks and
     semantic-bound widenings with (ops/const.py) IS the doc's 0.2785 —
-    and both match the actual minimum of z·sigmoid(z)."""
+    and both match the actual minimum of z·sigmoid(z).
+    """
     from torchwright.ops.const import swish_dip
 
     assert swish_dip == SWISH_PEAK
@@ -58,7 +60,8 @@ def test_swish_dip_is_the_module_constant():
 def test_min_d_hidden_is_the_module_constant():
     """The declared minimum MLP hidden width IS the shipped module
     constant (ops/const.py).  The flagship compiles at d_hidden = 16384
-    (torchwright_doom configs/e1m1*.yaml) — 16x headroom."""
+    (torchwright_doom configs/e1m1*.yaml) — 16x headroom.
+    """
     from torchwright.ops.const import min_d_hidden
 
     assert min_d_hidden == MIN_D_HIDDEN
@@ -70,7 +73,8 @@ def test_swiglu_chunk_caps_derive_from_min_d_hidden():
     is the constant itself; floor_int and table_lookup_2d chunk at
     min_d_hidden // 2 (two hinge lanes per boundary).  A hardcoded 1024
     or 512 would pass a value check but silently decouple from the
-    constant, so these pin the derivation in source."""
+    constant, so these pin the derivation in source.
+    """
     import inspect
 
     from torchwright.ops.const import min_d_hidden
@@ -98,7 +102,8 @@ def _hinge(z: torch.Tensor, scale: float = SCALE) -> torch.Tensor:
 
 def test_sharpened_hinge_uniform_bound():
     """Preamble/compare: |hinge(z) - relu(z)| <= 0.2785/scale everywhere,
-    peaking at z = -1.278/scale (Swish's argmin)."""
+    peaking at z = -1.278/scale (Swish's argmin).
+    """
     z = torch.linspace(-8, 8, 400_001, dtype=torch.float64)
     dev = (_hinge(z, 1.0) - torch.relu(z)).abs()  # scale=1: peak is the raw constant
     peak = dev.max().item()
@@ -112,14 +117,15 @@ def test_sharpened_hinge_uniform_bound():
     # soundness (docs/affine_bounds.md).
     from torchwright.graph.affine_rules import _SWISH_SANDWICH_C
 
-    assert _SWISH_SANDWICH_C >= peak
+    assert peak <= _SWISH_SANDWICH_C
     assert _SWISH_SANDWICH_C - peak < 1e-5
 
 
 def test_naive_transliteration_fails():
     """compare: the unsharpened ramp Swish(z) - Swish(z-1) misses its
     levels by 0.27 at the contract points and ~0.10 two ramp-widths past
-    saturation — sharpening is mandatory, not tuning."""
+    saturation — sharpening is mandatory, not tuning.
+    """
 
     def ramp(z: float) -> float:
         t = torch.tensor([z, z - 1.0], dtype=torch.float64)
@@ -132,14 +138,16 @@ def test_naive_transliteration_fails():
 
 def test_fp32_sigmoid_saturation_threshold():
     """Preamble: fp32 sigmoid computes exactly 1.0 once its input exceeds
-    ~17 (e^-17 is below fp32's resolution next to 1); 16 is not enough."""
+    ~17 (e^-17 is below fp32's resolution next to 1); 16 is not enough.
+    """
     assert torch.sigmoid(torch.tensor(17.0, dtype=torch.float32)).item() == 1.0
     assert torch.sigmoid(torch.tensor(16.0, dtype=torch.float32)).item() < 1.0
 
 
 def test_compare_contract_points_bit_exact_fp32():
     """compare: at scale=128 in fp32, the contract-point outputs are
-    bit-exact (+1/-1), because both hinges are saturated or on-bend."""
+    bit-exact (+1/-1), because both hinges are saturated or on-bend.
+    """
 
     def compare_out(z: float) -> float:
         # y = F + (T-F) * (hinge(z) - hinge(z-1)), T=+1, F=-1, fp32 throughout
@@ -153,7 +161,8 @@ def test_compare_contract_points_bit_exact_fp32():
 
 def test_multiply_identity_exact():
     """multiply: Swish(a)*b + Swish(-a)*(-b) = a*b exactly, all a, b —
-    the sigma(a) + sigma(-a) = 1 cancellation."""
+    the sigma(a) + sigma(-a) = 1 cancellation.
+    """
     g = torch.linspace(-50, 50, 501, dtype=torch.float64)
     a, b = torch.meshgrid(g, g, indexing="ij")
     lhs = _swish(a) * b + _swish(-a) * (-b)
@@ -161,8 +170,9 @@ def test_multiply_identity_exact():
 
 
 def test_bypass_identity_exact_at_any_sharpening():
-    """min (and mlp_bypass): Swish(s*a)/s - Swish(-s*a)/s = a exactly,
-    sharpened or not."""
+    """Min (and mlp_bypass): Swish(s*a)/s - Swish(-s*a)/s = a exactly,
+    sharpened or not.
+    """
     a = torch.linspace(-1000, 1000, 20_001, dtype=torch.float64)
     for s in (1.0, SCALE):
         lhs = _swish(s * a) / s - _swish(-s * a) / s
@@ -172,7 +182,8 @@ def test_bypass_identity_exact_at_any_sharpening():
 def test_abs_error_peak_and_one_sidedness():
     """abs: hinge(x) + hinge(-x) = x*tanh(scale*x/2) lies in [0, |x|],
     worst underestimate 0.557/scale (= 2 * hinge peak) at
-    |x| = 1.278/scale."""
+    |x| = 1.278/scale.
+    """
     u = torch.linspace(0, 8, 400_001, dtype=torch.float64)  # scale=1 units
     f = u * torch.tanh(u / 2)
     err = u - f
@@ -186,7 +197,8 @@ def test_abs_error_peak_and_one_sidedness():
 
 def test_abs_integer_grid_bit_exact_fp32():
     """abs: at scale=128 in fp32, bit-exact on the whole integer grid
-    (tanh/sigmoid saturation)."""
+    (tanh/sigmoid saturation).
+    """
     x = torch.arange(-1000.0, 1001.0, dtype=torch.float32)
     f = _swish(SCALE * x) / SCALE + _swish(-SCALE * x) / SCALE
     assert torch.equal(f, x.abs())
@@ -195,7 +207,8 @@ def test_abs_integer_grid_bit_exact_fp32():
 def test_min_hinge_form():
     """min: a - hinge(a-b) over-estimates min by at most 0.2785/scale,
     ties are exact, and the error is symmetric in the arguments despite
-    the asymmetric construction."""
+    the asymmetric construction.
+    """
     g = torch.linspace(-5, 5, 401, dtype=torch.float64)
     a, b = torch.meshgrid(g, g, indexing="ij")
     m = a - _hinge(a - b)
@@ -214,7 +227,8 @@ def test_gated_select_off_branch_exact_zero_fp32():
     branch contributes exactly zero — sigmoid(-128) computes as 0.0 on the
     CPU kernel, and e^-128 ~ 2.6e-56 sits below fp32's subnormal floor
     (~1.4e-45), so even a kernel that materialized the exponential would
-    underflow to exactly 0."""
+    underflow to exactly 0.
+    """
     assert torch.sigmoid(torch.tensor(-SCALE, dtype=torch.float32)).item() == 0.0
     f = torch.linspace(-4096, 4096, 1001, dtype=torch.float32)
     leak = _swish(torch.tensor(-SCALE, dtype=torch.float32)) * f / SCALE
@@ -227,7 +241,8 @@ def test_gated_select_winning_branch_bit_exact():
     factors are powers of two, so neither product rounds.  (At scale=100
     this carried up to 1 fp32 ulp relative rounding, the recorded
     regression versus the approximate=False path; the power-of-two scale
-    erases it.)"""
+    erases it.)
+    """
     t = torch.linspace(-5000, 5000, 100_001, dtype=torch.float32)
     gate = _swish(torch.tensor(SCALE, dtype=torch.float32))  # Swish(128) = 128.0
     assert gate.item() == SCALE
@@ -240,7 +255,8 @@ def test_gated_select_mask_deviation_passthrough():
     scale*m >= 17, i.e. m >= 0.14 at scale=128), so a mask off +1 by delta
     mis-scales the winner by exactly delta * value — actual value, not the
     range maximum M.  With the power-of-two scale the saturated gate equals
-    the mask bit for bit."""
+    the mask bit for bit.
+    """
     m = torch.linspace(0.17, 2.0, 4001, dtype=torch.float32)
     gate = _swish(SCALE * m) / SCALE
     assert torch.equal(gate, m)  # gate == mask, exactly
@@ -255,7 +271,8 @@ def test_relu_cancellation_absolute_error_at_M():
     """broadcast_select what-dies note: today's approximate=True recovers
     the winner via (M + t) - M in fp32, absolute error up to half an ulp
     of M — 3e-5 at M=1000 — error at the offset's magnitude even for tiny
-    values, versus the gated form's relative-to-the-value ulp."""
+    values, versus the gated form's relative-to-the-value ulp.
+    """
     M = torch.tensor(1000.0, dtype=torch.float32)
     t = torch.linspace(-1, 1, 100_001, dtype=torch.float32)
     err = ((M + t) - M) - t
@@ -270,7 +287,8 @@ def test_table_lookup_2d_telescoping():
     column axis consuming its steps through gated lanes (gate =
     hinge(1 - step), up = adjacent-column difference) — recovers integer-
     grid entries and edge clamps exactly, and yields genuine bilinear
-    interpolation inside boundary bands (today's op disclaims bilinear)."""
+    interpolation inside boundary bands (today's op disclaims bilinear).
+    """
     s, W = 100.0, 2.0
     dt = torch.float64
 
@@ -319,7 +337,8 @@ def test_onehot_lookup_counting_margin():
     at argument +0.5 (winner) or <= -0.5 (rest).  Sharpened: hinge(0.5) is
     exactly 0.5 in fp32; hinge(-0.5) leaks ~1e-28 per row (e^-64 is
     representable, unlike sigma(-128) = 0); a slightly-off one-hot shifts
-    the indicator by exactly its count deviation (saturated gate)."""
+    the indicator by exactly its count deviation (saturated gate).
+    """
     half = torch.tensor(SCALE * 0.5, dtype=torch.float32)
     assert (_swish(half) / SCALE).item() == 0.5  # winner indicator exact
     leak = (_swish(-half) / SCALE).abs().item()
@@ -361,7 +380,8 @@ def test_scalar_to_embedding_staircase():
     special case) ports hinge-for-hinge.  Integer digits put every hinge
     argument on an exact saturated integer, so component error is out_proj
     rounding only (~few ulps at norm-40 embeddings); mid-ramp blends the
-    adjacent embeddings; the pair-spacing audit reduces to scale > 34."""
+    adjacent embeddings; the pair-spacing audit reduces to scale > 34.
+    """
     S = 10.0  # step_sharpness
     g = torch.Generator().manual_seed(2)
     E = torch.randn(10, 32, generator=g, dtype=torch.float32) * (40.0 / 32**0.5)
@@ -394,7 +414,8 @@ def test_scalar_to_embedding_staircase():
 
 def test_hinge_fillet_width():
     """Entries' fillet radius: beyond |z| ~ 17/scale the hinge deviation
-    from ReLU is below 1e-8 — the '17/(scale*sharpness)' error zones."""
+    from ReLU is below 1e-8 — the '17/(scale*sharpness)' error zones.
+    """
     for z in (0.17, 0.5, 1.0):
         zt = torch.tensor(z, dtype=torch.float64)
         assert abs(_hinge(zt).item() - z) < 1e-8  # positive side -> identity
@@ -407,7 +428,8 @@ def test_bias_lane_constants_exact_unit_lane():
     sigma bit-exactly (>= 17 on this kernel; the CPU-ORT floor of 18 also
     clears), and the full lane expression — the GatedMLPSubLayer's
     ``g * sigmoid(g) * u`` — computes exactly 1.0 in fp32, so a constant
-    routed through the lane's down-projection row lands verbatim."""
+    routed through the lane's down-projection row lands verbatim.
+    """
     from torchwright.ops.const import bias_lane_gate, bias_lane_up
 
     assert bias_lane_gate == 32.0

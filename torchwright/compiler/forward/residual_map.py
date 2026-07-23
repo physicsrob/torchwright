@@ -1,12 +1,11 @@
 from dataclasses import dataclass
-from typing import Dict, List, Set, Tuple
 
 from torchwright.compiler.residual_assignment import (
     ResidualAssignment,
     ResidualStreamState,
     flatten_concat_nodes,
 )
-from torchwright.graph import Node, Concatenate
+from torchwright.graph import Concatenate, Node
 
 
 @dataclass(frozen=True)
@@ -21,7 +20,7 @@ class HeldOutputLayout:
 
     source: Node
     target: Node
-    bank: Tuple[int, ...]
+    bank: tuple[int, ...]
 
 
 class ResidualStreamMap:
@@ -34,13 +33,13 @@ class ResidualStreamMap:
 
     def __init__(self, d: int):
         self.d = d
-        self._free: Set[int] = set(range(d))
-        self._node_to_indices: Dict[Node, List[int]] = {}
+        self._free: set[int] = set(range(d))
+        self._node_to_indices: dict[Node, list[int]] = {}
         # Columns that have been physically zeroed by a scheduled cancel but
         # are deliberately unavailable to ordinary allocation until a named
         # output claims the complete ordered bank via ``allocate_at``.  Unlike
         # ``_reserved``, held columns are transient and contain runtime zero.
-        self._held: Set[int] = set()
+        self._held: set[int] = set()
         # Columns permanently withheld from the free pool: never allocated to
         # any node, never freed, for the whole compile.  The sole current user
         # is the pinned-constant RMSNorm (``_reserve_rms_norm_columns``), which
@@ -48,9 +47,9 @@ class ResidualStreamMap:
         # RMS to a power of two — they are seeded once (into ``embed_table``) and
         # read but never written.  (The primitive was first built for an
         # end-of-compile delta-transfer layer, since removed.)
-        self._reserved: Set[int] = set()
+        self._reserved: set[int] = set()
 
-    def allocate(self, node: Node) -> List[int]:
+    def allocate(self, node: Node) -> list[int]:
         n = len(node)
         if n > len(self._free):
             raise ValueError(
@@ -89,7 +88,7 @@ class ResidualStreamMap:
         del self._node_to_indices[node]
         self._check_invariants(f"free({node!r})")
 
-    def hold(self, node: Node, mech: str = "attn") -> List[int]:
+    def hold(self, node: Node, mech: str = "attn") -> list[int]:
         """Move a cancelled node's columns into the transient held set.
 
         The caller is responsible for emitting/charging the physical cancel
@@ -120,7 +119,7 @@ class ResidualStreamMap:
             and set(cols) == self._held
         )
 
-    def allocate_at(self, node: Node, ordered_cols) -> List[int]:
+    def allocate_at(self, node: Node, ordered_cols) -> list[int]:
         """Assign ``node`` the complete held bank in the supplied order.
 
         This is intentionally *not* a general precoloured allocator: free,
@@ -160,10 +159,10 @@ class ResidualStreamMap:
         self._node_to_indices[new_node] = indices
         self._check_invariants(f"reassign({old_node!r} -> {new_node!r})")
 
-    def get_indices(self, node: Node) -> List[int]:
+    def get_indices(self, node: Node) -> list[int]:
         return self._node_to_indices[node]
 
-    def resolve_indices(self, node: Node) -> List[int]:
+    def resolve_indices(self, node: Node) -> list[int]:
         """Get column indices for a node, resolving through Concatenate.
 
         Unlike get_indices(), this handles Concatenate nodes by gathering
@@ -187,11 +186,11 @@ class ResidualStreamMap:
         """Whether the one transient held bank currently exists."""
         return bool(self._held)
 
-    def held_columns(self) -> List[int]:
+    def held_columns(self) -> list[int]:
         """Sorted columns of the transient held bank (empty when none)."""
         return sorted(self._held)
 
-    def get_allocated_nodes(self) -> Set[Node]:
+    def get_allocated_nodes(self) -> set[Node]:
         return set(self._node_to_indices.keys())
 
     def reserve(self, cols) -> None:
@@ -235,7 +234,7 @@ class ResidualStreamMap:
         corrupted state is surfaced at the *source* rather than the next
         unrelated get_indices lookup.
         """
-        seen: Dict[int, Node] = {}
+        seen: dict[int, Node] = {}
         for node, cols in self._node_to_indices.items():
             for c in cols:
                 if c in seen:
@@ -308,7 +307,7 @@ class ResidualStreamMap:
         self,
         in_state: ResidualStreamState,
         out_state: ResidualStreamState,
-        input_nodes: List[Node],
+        input_nodes: list[Node],
         output_node: Node,
     ) -> ResidualAssignment:
         """Build a ResidualAssignment bridge for HeadlessTransformer.compute().

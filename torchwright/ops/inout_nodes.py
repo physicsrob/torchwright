@@ -1,8 +1,6 @@
-from typing import List, Optional, Tuple
-
-from torchwright.graph import Node, InputNode, LiteralValue, Embedding, RopeConfig
 import torch
 
+from torchwright.graph import Embedding, InputNode, LiteralValue, Node, RopeConfig
 from torchwright.graph.embedding import Unembedding
 
 _DEFAULT_VALUE_RANGE = (-1e4, 1e4)
@@ -12,10 +10,9 @@ def create_input(
     name_or_width,
     width: int | None = None,
     *,
-    value_range: Optional[Tuple[float, float]] = None,
+    value_range: tuple[float, float] | None = None,
 ) -> Node:
-    """
-    Create an input node with optional name and specified dimension.
+    """Create an input node with optional name and specified dimension.
 
     Supports two call patterns:
     - create_input(width) -> anonymous InputNode with given width
@@ -35,16 +32,14 @@ def create_input(
     if isinstance(name_or_width, int):
         # New pattern: create_input(width)
         return InputNode(name_or_width, value_range=value_range)
-    else:
-        # Legacy pattern: create_input(name, width)
-        if width is None:
-            raise ValueError("width is required when name is provided")
-        return InputNode(width, name=name_or_width, value_range=value_range)
+    # Legacy pattern: create_input(name, width)
+    if width is None:
+        raise ValueError("width is required when name is provided")
+    return InputNode(width, name=name_or_width, value_range=value_range)
 
 
 def create_literal_value(vector: torch.Tensor, name: str = "") -> Node:
-    """
-    Create a node with a literal value.
+    """Create a node with a literal value.
 
     Args:
     - vector (torch.Tensor): Tensor representing the literal value.
@@ -55,9 +50,8 @@ def create_literal_value(vector: torch.Tensor, name: str = "") -> Node:
     return LiteralValue(vector, name)
 
 
-def create_embedding(vocab: List[str]) -> Embedding:
-    """
-    Create an embedding input.
+def create_embedding(vocab: list[str]) -> Embedding:
+    """Create an embedding input.
 
     Args:
     - vocab (List[str]): List of vocab words.
@@ -68,7 +62,7 @@ def create_embedding(vocab: List[str]) -> Embedding:
     return Embedding(vocab)
 
 
-def create_onehot_embedding(vocab: List[str]) -> Embedding:
+def create_onehot_embedding(vocab: list[str]) -> Embedding:
     """Create a one-hot embedding: token ``i`` maps to the ``i``-th unit vector.
 
     The table is the identity ``eye(len(vocab))`` and there are no special
@@ -90,8 +84,7 @@ def create_onehot_embedding(vocab: List[str]) -> Embedding:
 
 
 def create_unembedding(inp: Node, embedding: Embedding) -> Unembedding:
-    """
-    Create an unembedding output.
+    """Create an unembedding output.
 
     Args:
     - inp (Node): Node with embedding vector to unembed

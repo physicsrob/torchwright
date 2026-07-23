@@ -21,11 +21,10 @@ import torch
 from torchwright.compiler.export import compile_headless
 from torchwright.compiler.graph_identity import graph_fingerprint
 from torchwright.debug.probe import probe_compiled
-from torchwright.graph import FFN
 from torchwright.graph.misc import LiteralValue
 from torchwright.ops.inout_nodes import create_input
-from torchwright.ops.relu.linear_relu_linear import linear_relu_linear
 from torchwright.ops.linear import add, add_const
+from torchwright.ops.relu.linear_relu_linear import linear_relu_linear
 from torchwright.ops.swiglu.swiglu_ffn import swiglu_ffn
 
 N_POS = 4
@@ -51,7 +50,8 @@ def _assert_no_physical_bias(compiled):
 
 def _relu_graph(seed=11):
     """add_const (deferred-bias route) -> relu FFN, plus a literal Add —
-    all four bias-writing op types in one graph."""
+    all four bias-writing op types in one graph.
+    """
     x = create_input("x", 4, value_range=(-1.0, 1.0))
     g = torch.Generator().manual_seed(seed)
     shifted = add_const(x, 3.25)
@@ -70,7 +70,8 @@ def _relu_graph(seed=11):
 
 def _swish_graph(seed=13):
     """Same shape on the swish machine: add_const -> gated swiglu FFN +
-    literal (add_const/add are the machine-neutral linear seams)."""
+    literal (add_const/add are the machine-neutral linear seams).
+    """
     x = create_input("x", 4, value_range=(-1.0, 1.0))
     g = torch.Generator().manual_seed(seed)
     shifted = add_const(x, 3.25)
@@ -98,7 +99,8 @@ def xt():
 @pytest.mark.parametrize("build", [_relu_graph, _swish_graph], ids=["relu", "swish"])
 def test_no_bias_probe_clean(build, xt):
     """probe_compiled agrees with the oracle everywhere under bias=False,
-    on both machines, and no physical bias vector is written."""
+    on both machines, and no physical bias vector is written.
+    """
     _, lit, out = build()
     compiled = compile_headless(out, d=D, d_head=D_HEAD, bias=False)
     _assert_no_physical_bias(compiled)
@@ -109,7 +111,8 @@ def test_no_bias_probe_clean(build, xt):
 @pytest.mark.parametrize("build", [_relu_graph, _swish_graph], ids=["relu", "swish"])
 def test_no_bias_literal_bit_exact_end_to_end(build, xt):
     """A literal compiled under bias=False lands bitwise-equal (the
-    constant lane computes exactly 1.0; only the lane writes its columns)."""
+    constant lane computes exactly 1.0; only the lane writes its columns).
+    """
     from torchwright.graph.asserts import assert_in_range
 
     _, lit, out = build()
@@ -127,7 +130,8 @@ def test_no_bias_literal_bit_exact_end_to_end(build, xt):
 @pytest.mark.parametrize("build", [_relu_graph, _swish_graph], ids=["relu", "swish"])
 def test_no_bias_matches_biased_compile(build, xt):
     """The same graph compiled with bias=True and bias=False agrees to
-    fp32 accumulation noise (the folds move bias adds into the matmul)."""
+    fp32 accumulation noise (the folds move bias adds into the matmul).
+    """
     _, _, out_a = build()
     ca = compile_headless(out_a, d=D, d_head=D_HEAD, bias=True)
     _, _, out_b = build()
@@ -156,7 +160,8 @@ def _two_ffn_graph(n_lanes=4, seed=7):
 def test_no_bias_capacity_edge_heuristic(xt):
     """d_hidden exactly equal to the layer's lane demand: bias=True packs
     both FFNs into one MLP sublayer; bias=False reserves slot 0, so the
-    same demand must spill — and the compiled values stay oracle-clean."""
+    same demand must spill — and the compiled values stay oracle-clean.
+    """
     _, out_a = _two_ffn_graph()
     ca = compile_headless(out_a, d=D, d_head=D_HEAD, d_hidden=8, bias=True)
     _, out_b = _two_ffn_graph()
@@ -171,7 +176,8 @@ def test_no_bias_capacity_edge_heuristic(xt):
 
 def test_no_bias_capacity_edge_cpsat(xt):
     """The CP-SAT path models the reserved slot too (capacity d_hidden-1):
-    a real solve under bias=False replays cleanly at the capacity edge."""
+    a real solve under bias=False replays cleanly at the capacity edge.
+    """
     _, out = _two_ffn_graph()
     compiled = compile_headless(
         out, d=D, d_head=D_HEAD, d_hidden=8, bias=False, optimize=1
@@ -184,7 +190,8 @@ def test_no_bias_capacity_edge_cpsat(xt):
 def test_schedule_fingerprint_keys_on_bias():
     """bias=False changes the schedule-cache key; bias=True hashes
     byte-identically to the pre-feature payload (compatibility: existing
-    cache entries keep hitting)."""
+    cache entries keep hitting).
+    """
     _, _, out = _relu_graph()
     common = dict(
         d=D,

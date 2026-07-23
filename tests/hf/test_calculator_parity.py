@@ -37,10 +37,9 @@ pytest.importorskip("transformers")
 pytest.importorskip("safetensors")
 pytest.importorskip("onnxruntime")
 
+from tests.hf._hf_parity import compile_example
 from torchwright.compiler.hf import compile_to_hf
 from torchwright.compiler.onnx_load import load_onnx
-
-from tests.hf._hf_parity import compile_example
 
 _BOS = "<bos>"
 _EOS = "<eos>"
@@ -166,6 +165,7 @@ def test_greedy_token_identical_and_correct(model, oracle, tok2id, artifact_path
 def test_save_load_generate_round_trip(tmp_path, artifact_path, model, oracle, tok2id):
     """Save → reload (classes imported) → tokenizer-driven generate == '408'."""
     from transformers import Phi3ForCausalLM
+
     from torchwright.compiler.hf import build_fast_tokenizer
 
     save_dir = tmp_path / "calc"

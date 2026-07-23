@@ -69,7 +69,8 @@ def test_out_of_range_clamps_to_edges():
 def test_in_band_linear_blend_is_contract():
     """A band on one axis gives the clean two-entry linear blend — the
     coefficient is the blend fraction itself (hinge(α) = α exactly for
-    α ≥ 17/scale); this was a disclaimer on relu and is a contract now."""
+    α ≥ 17/scale); this was a disclaimer on relu and is a contract now.
+    """
     out, table = _build()
     # j halfway across the 1.5 boundary ramp (sharpness 100 → ramp
     # [1.495, 1.505]); α = 0.5 blend of columns 1 and 2 at row 0.
@@ -105,7 +106,8 @@ def test_single_column_and_single_row():
 
 def test_chunked_axes_match_table():
     """Axes longer than the min_d_hidden//2 boundary cap split into
-    summed chunks on both stages; values stay exact on the grid."""
+    summed chunks on both stages; values stay exact on the grid.
+    """
     g = torch.Generator().manual_seed(83)
     tall = torch.rand(600, 3, generator=g) * 20.0 - 10.0
     i = create_input("i", 1, value_range=(0.0, 599.0))
@@ -154,7 +156,8 @@ def _build_ranged(i_range, j_range, table=_TABLE, **kw):
 
 def test_clamp_skip_matches_clamped_form():
     """In-range: the skipped build equals the clamped build value-for-value
-    on a dense grid — clamping an in-bounds index is the identity."""
+    on a dense grid — clamping an in-bounds index is the identity.
+    """
     # _TABLE is 3x4 -> top_i=2, top_j=3.
     skip, table = _build_ranged((0.0, 2.0), (0.0, 3.0))
     keep, _ = _build_ranged((-1e4, 1e4), (-1e4, 1e4))
@@ -171,7 +174,8 @@ def test_clamp_skip_matches_clamped_form():
 
 def test_clamp_skip_drops_one_ffn_per_axis():
     """Structural: a range that proves safety on both axes builds two fewer
-    FFNs (the two clamps) than the range-free build of the same lookup."""
+    FFNs (the two clamps) than the range-free build of the same lookup.
+    """
     keep, _ = _build_ranged((-1e4, 1e4), (-1e4, 1e4))
     skip, _ = _build_ranged((0.0, 2.0), (0.0, 3.0))
     assert _count_ffns(keep) - _count_ffns(skip) == 2
@@ -180,7 +184,8 @@ def test_clamp_skip_drops_one_ffn_per_axis():
 def test_clamp_kept_when_range_violates_bound():
     """Negative: a range crossing either bound (or the wide default, which
     stands in for "no useful range") keeps that axis's clamp.  The untested
-    axis is left wide so the FFN count isolates the tested one."""
+    axis is left wide so the FFN count isolates the tested one.
+    """
     keep, _ = _build_ranged((-1e4, 1e4), (-1e4, 1e4))
     base = _count_ffns(keep)
     # i upper bound exceeded (2.5 > top_i=2); j left wide.

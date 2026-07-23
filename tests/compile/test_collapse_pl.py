@@ -32,7 +32,8 @@ def _eval(node, xs):
 
 def _chain(machine, sharpness=50.0):
     """add_const -> compare -> add_const: depth-3 univariate chain a
-    continuous source can never hand to v1 (no integer claim)."""
+    continuous source can never hand to v1 (no integer claim).
+    """
     ops = _ops(machine)
     x = create_input("x", 1, value_range=(0.0, 10.0))
     c = ops.compare(ops.add_const(x, 1.0), 5.0, sharpness=sharpness)
@@ -59,7 +60,8 @@ def test_s1_take_matches_source_both_machines():
 
 def test_pl_takes_what_v1_leaves():
     """v1 (staircase, integer-gated) declines the continuous chain;
-    the pl pass takes it in the same lower() run."""
+    the pl pass takes it in the same lower() run.
+    """
     x, out = _chain("swish")
     lowered = lower(
         out, collapse_univariate=True, collapse_pl=True, collapse_lane_cap=64
@@ -101,7 +103,8 @@ def test_kink_prescreen_declines_before_the_sweep():
     declines at the pre-screen (the kink-explosion seam, before the
     member's oracle sweep) — the suite-cost mitigation for the
     default flip.  ~98 candidates (quadratic values: one gate lane
-    per knot) against cap 8 (screen 32)."""
+    per knot) against cap 8 (screen 32).
+    """
     ops = _ops("relu")
     x = create_input("x", 1, value_range=(0.0, 100.0))
     knots = [float(k) for k in range(1, 99)]
@@ -169,7 +172,8 @@ def test_emitted_step_survives_shallow_crossing_bands():
     was a straight chord through the step.  The locality bound on
     bands (pl_function) plus emitted-vs-ORIGINAL verification
     (collapse_pl) each independently prevent it; the value sweep pins
-    the end-to-end behavior."""
+    the end-to-end behavior.
+    """
     x, out = _chain("swish", sharpness=50.0)
     lowered = lower(out, collapse_pl=True, collapse_lane_cap=64)
     xs = torch.linspace(0.0, 10.0, 4001, dtype=torch.float64)
@@ -188,7 +192,8 @@ def test_output_concat_with_literal_field_compiles():
     synthesizes the Concatenate as a unit and the leaves orphan with
     the interior.  The source-facing output gather must then use the
     synthesized member's direct residual entry; flattening the source
-    Concatenate into its (now orphaned) leaves was a KeyError."""
+    Concatenate into its (now orphaned) leaves was a KeyError.
+    """
     x = create_input("x", 1, value_range=(0.0, 10.0))
     ops = _ops("relu")
     chain = ops.add_const(ops.compare(ops.add_const(x, 1.0), 5.0, sharpness=50.0), 2.0)

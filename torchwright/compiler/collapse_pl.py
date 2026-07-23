@@ -44,7 +44,7 @@ schedule-cache key.
 
 from __future__ import annotations
 
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any
 
 import torch
 
@@ -60,8 +60,8 @@ from torchwright.compiler.collapse import (
 )
 from torchwright.compiler.graph_clone import topological_order
 from torchwright.compiler.pl_function import (
-    SIMPLIFY_TOL,
     _HINGE_EXACT_Z,
+    SIMPLIFY_TOL,
     PLFunction,
     _in_intervals,
     band_skeleton,
@@ -98,13 +98,14 @@ _KINK_PRESCREEN_FACTOR = 4
 def _emit_s1(
     source: Node,
     skel: PLFunction,
-    machine: Optional[str],
+    machine: str | None,
     lane_cap: int,
     budget: float,
     name: str,
 ) -> Node:
     """One interpolating ``piecewise_linear`` (or constant) computing
-    the certified skeleton's values from the source."""
+    the certified skeleton's values from the source.
+    """
     deltas = skel.slope_deltas().abs()
     if not bool((deltas > 1e-12).any()):
         return LiteralValue(skel.y[0].to(torch.float32).clone().reshape(-1), name=name)
@@ -139,18 +140,19 @@ def _emit_s1(
 def _verify_emission(
     new: Node,
     member: Node,
-    members: List[Node],
+    members: list[Node],
     source: Node,
     skel: PLFunction,
-    bands: Optional[torch.Tensor],
+    bands: torch.Tensor | None,
     budget: float,
-) -> Tuple[bool, float, float]:
+) -> tuple[bool, float, float]:
     """Compare the emitted node's exact compute against the ORIGINAL
     member's oracle at every skeleton knot and segment midpoint outside
     the analytic hinge bands.  The original — not the skeleton — is the
     claim's reference: comparing against the skeleton would be circular
     (a degenerate skeleton trivially matches its own emission).
-    Returns ``(ok, worst, at)``."""
+    Returns ``(ok, worst, at)``.
+    """
     xs = torch.unique(torch.cat([skel.x, (skel.x[1:] + skel.x[:-1]) / 2.0]))
     if bands is not None and bands.numel():
         xs = xs[~_in_intervals(bands, xs, strict=True)]
@@ -173,7 +175,7 @@ def collapse_pl_subgraphs(
     budget: float = _SYNTH_CLAIM_ATOL,
     max_kinks: int = 100_000,
     verbose: bool = False,
-) -> Tuple[Node, CollapseReport]:
+) -> tuple[Node, CollapseReport]:
     """Run the v2 S1 pass on the compiler-private copy (after v1).
 
     Args:
@@ -200,20 +202,20 @@ def collapse_pl_subgraphs(
     src = scalar_sources(order)
     machine = _machine(order)
 
-    by_src: Dict[Node, List[Node]] = {}
+    by_src: dict[Node, list[Node]] = {}
     for n in order:  # topological, so member lists stay topological
         s = src[n]
         if s is not None and s is not n:
             by_src.setdefault(s, []).append(n)
 
-    consumers: Dict[Node, List[Node]] = {n: [] for n in order}
+    consumers: dict[Node, list[Node]] = {n: [] for n in order}
     for n in order:
         for u in n.inputs:
             if u in consumers:
                 consumers[u].append(n)
 
     topo_index = {n: i for i, n in enumerate(order)}
-    outcomes: List[SubgraphOutcome] = []
+    outcomes: list[SubgraphOutcome] = []
 
     for source in sorted(by_src, key=topo_index.__getitem__):
         members = by_src[source]
@@ -261,7 +263,7 @@ def collapse_pl_subgraphs(
 
         # Strict chord certificate + S1 admissibility, all synthesized
         # members (the emitted shape is the band skeleton).
-        skels: Dict[Node, PLFunction] = {}
+        skels: dict[Node, PLFunction] = {}
         fail = None
         for m in synthesized:
             c: Any = cert.members[m]
@@ -288,7 +290,7 @@ def collapse_pl_subgraphs(
 
         # Emit + verify every synthesized member BEFORE any rewiring —
         # a verification failure must leave the graph untouched.
-        emitted: Dict[Node, Node] = {}
+        emitted: dict[Node, Node] = {}
         for m in synthesized:
             m_name = m.name or f"m{topo_index[m]}"
             new = _emit_s1(

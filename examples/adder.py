@@ -9,20 +9,16 @@ See adder_v2 for the scalar-space alternative, which converts digits to
 a single number, adds as a scalar, and converts back.
 """
 
-from typing import Tuple
-
-import torch
-
-from torchwright.graph import Node, Embedding, RopeConfig
+from torchwright.graph import Embedding, Node
 from torchwright.graph.embedding import Unembedding
 from torchwright.ops.inout_nodes import (
-    create_literal_value,
     create_embedding,
+    create_literal_value,
     create_rope_config,
     create_unembedding,
 )
-from torchwright.ops.swiglu.logic_ops import equals_vector
 from torchwright.ops.swiglu.embedding_arithmetic import sum_digit_seqs
+from torchwright.ops.swiglu.logic_ops import equals_vector
 from torchwright.ops.swiglu.sequence_ops import (
     NumericSequence,
     output_sequence,
@@ -37,7 +33,7 @@ D_HEAD = 16
 MAX_POSITIONS = 512
 
 
-def create_network_parts() -> Tuple[Node, Embedding]:
+def create_network_parts() -> tuple[Node, Embedding]:
     """Build the 3-digit adder graph and return (output_node, embedding)."""
     vocab = list(
         " 0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ!@#$%^&*()-+="

@@ -11,22 +11,20 @@ result back to token embeddings. The scalar-space approach avoids the
 combinatorial lookup tables of embedding-space arithmetic, but requires
 thermometer coding (ReLU-based threshold detectors) for the conversions.
 
-See also:
+See Also:
     arithmetic_ops.thermometer_floor_div — the core integer division primitive
     arithmetic_ops.square — squaring via ReLU ramps
     embedding_arithmetic — the alternative: stay in embedding space throughout
 """
 
-from typing import List
-
 import torch
 
-from torchwright.graph import Node, Embedding
+from torchwright.graph import Embedding, Node
 from torchwright.graph.asserts import assert_matches_value_type
 from torchwright.graph.value_type import NodeValueType, Range
-from torchwright.ops.relu.arithmetic_ops import thermometer_floor_div
-from torchwright.ops.linear import add_scaled_nodes, sum_nodes
 from torchwright.ops.const import step_sharpness
+from torchwright.ops.linear import add_scaled_nodes, sum_nodes
+from torchwright.ops.relu.arithmetic_ops import thermometer_floor_div
 from torchwright.ops.relu.linear_relu_linear import linear_relu_linear
 from torchwright.ops.relu.map_select import map_to_table
 
@@ -47,7 +45,7 @@ def digit_to_scaled_scalar(
     return map_to_table(inp=digit_node, key_to_value=table, default=torch.tensor([0.0]))
 
 
-def digits_to_number(embedding: Embedding, digit_nodes: List[Node]) -> Node:
+def digits_to_number(embedding: Embedding, digit_nodes: list[Node]) -> Node:
     """Convert digit embeddings (MSB first) to a single scalar.
 
     Example: [embed("1"), embed("2"), embed("3")]
@@ -61,7 +59,7 @@ def digits_to_number(embedding: Embedding, digit_nodes: List[Node]) -> Node:
     return sum_nodes(scaled)
 
 
-def number_to_digit_scalars(inp: Node, num_digits: int, max_value: int) -> List[Node]:
+def number_to_digit_scalars(inp: Node, num_digits: int, max_value: int) -> list[Node]:
     """Extract individual digit scalars (0.0-9.0) from a scalar number, MSB first.
 
     Greedy extraction: peel off the most significant digit, subtract it,

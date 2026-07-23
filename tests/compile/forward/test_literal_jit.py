@@ -25,13 +25,13 @@ import torch
 from torchwright.compiler.forward.compile import forward_compile
 from torchwright.compiler.forward.graph_analysis import GraphAnalyzer
 from torchwright.graph import Linear
-from torchwright.ops.linear import add, concat
 from torchwright.ops.attention_ops import attend_to_offset
 from torchwright.ops.inout_nodes import (
     create_input,
     create_literal_value,
     create_rope_config,
 )
+from torchwright.ops.linear import add, concat
 from torchwright.ops.relu.map_select import select
 
 D = 256
@@ -41,7 +41,8 @@ D_HEAD = 16
 def _idchain(x, depth, name):
     """A chain of ``depth`` self-Adds — forces ``depth`` layers of
     dependency (each layer doubles the value; identity Linears would be
-    absorbed by the lowering boundary's fusion and force nothing)."""
+    absorbed by the lowering boundary's fusion and force nothing).
+    """
     h = x
     for _ in range(depth):
         h = add(h, h)
@@ -120,7 +121,8 @@ def test_deep_select_literal_matches_oracle(optimize):
     """``select(cond, <deep>, literal)`` — the constant is the false branch,
     consumed deep in the network.  Compiled output must match exact math
     under the heuristic (optimize=0) and CP-SAT (optimize=1) schedulers, and
-    the false-branch positions must equal the constant."""
+    the false-branch positions must equal the constant.
+    """
     cond = create_input("cond", 1, value_range=(-1.0, 1.0))
     base = create_input("t", 2, value_range=(-4.0, 4.0))
     deep_true = _idchain(base, 3, "t")
@@ -197,7 +199,8 @@ def test_deep_attention_fed_constant_matches_oracle():
     just-in-time and produce correct output.  ``Attn`` has no bias, so this
     constant could never be folded — JIT is the only mechanism that handles
     it.  The constant is part of the attention value via a Concatenate, needed
-    only when the (deep) attention op runs."""
+    only when the (deep) attention op runs.
+    """
     rope = create_rope_config(d_head=D_HEAD, max_positions=512)
     x = create_input("x", 2, value_range=(-5.0, 5.0))
     h = _idchain(x, 3, "d")
@@ -232,7 +235,8 @@ def test_literal_into_recycled_column_is_clean():
 
     A small ``d`` forces recycling; correctness of the output (the constant
     is a saturated value the stale data would visibly corrupt) validates the
-    cancel."""
+    cancel.
+    """
     x = create_input("x", 8, value_range=(-3.0, 3.0))
     # ``early`` is consumed immediately and then dies, freeing its (now
     # dirty) columns back into the pool.
@@ -257,7 +261,8 @@ def _consumer_layer(other_kind):
     """Compile ``Add(deep_chain(x), other)`` and return the layer the Add is
     materialized at.  ``other`` is either a constant (JIT-materialized) or a
     pre-seeded input (available from layer 0).  Structurally identical
-    otherwise, so the Add's layer reveals whether the JIT gate delayed it."""
+    otherwise, so the Add's layer reveals whether the JIT gate delayed it.
+    """
     x = create_input("x", 2, value_range=(-5.0, 5.0))
     deep = _idchain(x, 3, "d")
     if other_kind == "literal":
@@ -274,7 +279,8 @@ def test_jit_constant_adds_no_latency_to_consumer():
     as it would be if that constant were a pre-seeded input (available from
     layer 0).  Materializing the constant alongside the consumer's last
     non-constant input — rather than eagerly at layer 0 — costs the consumer
-    nothing.  This is the load-bearing scheduling claim from the design."""
+    nothing.  This is the load-bearing scheduling claim from the design.
+    """
     with_literal = _consumer_layer("literal")
     with_input = _consumer_layer("input")
     assert with_literal is not None and with_input is not None
@@ -294,7 +300,8 @@ def test_jit_graph_passes_end_of_layer_liveness(monkeypatch):
     walk on (``TW_COMPILER_VERIFY=1``).  It raises if any node — here a
     just-in-time constant — is freed while an effective consumer is still
     uncomputed.  Exercising it directly validates the new free-after-use
-    behavior for constants."""
+    behavior for constants.
+    """
     monkeypatch.setenv("TW_COMPILER_VERIFY", "1")
     x = create_input("x", 2, value_range=(-5.0, 5.0))
     deep = _idchain(x, 3, "d")
@@ -324,7 +331,8 @@ def test_cpsat_treats_constant_as_schedulable_not_prefilled():
     *indifferent* to the constant's birth layer and may place it early — which
     is harmless, since the column is uncontended and the layer count is
     unchanged.  The pressure-bound "places late" behavior is exercised on a
-    real, residual-bound graph (the DOOM graph), not here."""
+    real, residual-bound graph (the DOOM graph), not here.
+    """
     x = create_input("x", 2, value_range=(-5.0, 5.0))
     deep = _idchain(x, 4, "d")
     lit = create_literal_value(torch.tensor([1.0, 2.0]))

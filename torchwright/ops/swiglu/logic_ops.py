@@ -6,15 +6,12 @@ not their own.  ``equals_vector`` is a one-sided compare on a dot product;
 ``cond_gate`` is the one-branch gated select.
 """
 
-from typing import List
-
 import torch
 
 from torchwright.graph import Concatenate, Node
 from torchwright.graph.asserts import assert_matches_value_type
 from torchwright.graph.value_type import NodeValueType, Range
 from torchwright.ops.const import embedding_step_sharpness, scale, swish_dip
-
 from torchwright.ops.linear import sum_nodes
 from torchwright.ops.swiglu.arithmetic_ops import compare
 from torchwright.ops.swiglu.swiglu_ffn import swiglu_ffn
@@ -49,9 +46,8 @@ def _assert_cond_pm1(cond: Node, c_tol: float = _GATE_C_TOL) -> Node:
     )
 
 
-def bool_any_true(inp_list: List[Node]) -> Node:
-    """
-    Returns a node that evaluates to True if any of the input nodes are true.
+def bool_any_true(inp_list: list[Node]) -> Node:
+    """Returns a node that evaluates to True if any of the input nodes are true.
 
     Args:
         inp_list (List[Node]): List of nodes to be evaluated.
@@ -75,9 +71,8 @@ def bool_any_true(inp_list: List[Node]) -> Node:
     return compare(sum_node, thresh=0.5, true_level=1.0, false_level=-1.0)
 
 
-def bool_all_true(inp_list: List[Node]) -> Node:
-    """
-    Returns a node that evaluates to True if all of the input nodes are true.
+def bool_all_true(inp_list: list[Node]) -> Node:
+    """Returns a node that evaluates to True if all of the input nodes are true.
 
     Inputs must be clean ±1.0 booleans (as produced by compare/bool_* ops).
     Sum of N such inputs is +N only when all are +1; otherwise ≤ N-2.
@@ -103,8 +98,7 @@ def bool_all_true(inp_list: List[Node]) -> Node:
 
 
 def bool_not(inp: Node) -> Node:
-    """
-    Returns a node that evaluates to 1.0 if the input node is false, and -1.0 if the input node is true.
+    """Returns a node that evaluates to 1.0 if the input node is false, and -1.0 if the input node is true.
 
     Args:
         inp: Input node to be evaluated

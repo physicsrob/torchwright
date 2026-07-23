@@ -1,9 +1,9 @@
 import torch
 
-from torchwright.compiler.forward.graph_analysis import GraphAnalyzer
-from torchwright.graph import Linear, ReLU, Add, Concatenate
-from torchwright.graph.misc import InputNode
 from examples.adder import create_network_parts
+from torchwright.compiler.forward.graph_analysis import GraphAnalyzer
+from torchwright.graph import Add, Concatenate, Linear, ReLU
+from torchwright.graph.misc import InputNode
 
 
 def _make_linear(inp, d_out, name=""):
@@ -93,7 +93,8 @@ def test_adder_graph():
     """Load the 3-digit adder graph, verify topo order valid and all nodes reachable.
 
     Analyzes the lowered copy: GraphAnalyzer is pure analysis of the
-    graph the lowering boundary produces."""
+    graph the lowering boundary produces.
+    """
     from torchwright.compiler.lower import lower
 
     source_output, embedding = create_network_parts()

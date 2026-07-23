@@ -1,5 +1,3 @@
-from typing import Optional
-
 import torch
 
 from torchwright.compiler.components.attn import AttnLayerComponent
@@ -16,7 +14,7 @@ class AttnSubLayer:
         self,
         d: int,
         d_head: int,
-        n_heads: Optional[int] = None,
+        n_heads: int | None = None,
     ):
         self.d = d
         self.in_state = ResidualStreamState(name="AttnSubLayer In State")
@@ -32,8 +30,7 @@ class AttnSubLayer:
         states["skip_out_state"] = (self.out_state, x)
         if return_states:
             return x, states
-        else:
-            return x
+        return x
 
     def forward_cached(self, inp, past_kv=None):
         x, new_kv = self.attn.forward_cached(inp, past_kv)

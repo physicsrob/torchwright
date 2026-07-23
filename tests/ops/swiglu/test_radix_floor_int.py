@@ -52,7 +52,8 @@ def test_divisor_boundary_sliver_reconstructs_exactly():
     """Inputs in the HI ramp (just below a multiple of D=64) but out of
     the LO ramp: the flat form is exact here, and the radix form must be
     too — a fractional hi would be amplified x64 by the recombine, so
-    this pins the snap + extended-lo compensation."""
+    this pins the snap + extended-lo compensation.
+    """
     x, f = _native()
     for m in (-512, -64, 64, 512, 896):
         for delta in (1e-4 + 1e-6, 5e-4, 1e-3, 5e-3):
@@ -67,7 +68,8 @@ def test_divisor_boundary_sliver_reconstructs_exactly():
 def test_lo_ramp_stays_within_one_step():
     """Inside the LO ramp (within 1/s below an integer) the output is
     fractional — the same tolerated window as flat floor_int.  The pin:
-    it stays inside (true, true+1), never D-amplified."""
+    it stays inside (true, true+1), never D-amplified.
+    """
     x, f = _native()
     for k in (-512, -100, 0, 64, 1000):
         for frac in (0.2, 0.5, 0.9):
@@ -87,8 +89,9 @@ def test_negative_range_and_default_divisor():
 
 
 def test_falls_back_to_flat_when_range_within_divisor():
-    """n <= divisor takes the flat-floor_int early return (nothing to
-    split); the op must still floor correctly on that branch."""
+    """N <= divisor takes the flat-floor_int early return (nothing to
+    split); the op must still floor correctly on that branch.
+    """
     x = create_input("x", 1, value_range=(-2.0, 2.0))
     # n=4 <= d=8 -> fallback branch.
     f = radix_floor_int(x, -2, 2, divisor=8)
@@ -98,9 +101,10 @@ def test_falls_back_to_flat_when_range_within_divisor():
 
 def test_lane_cost_is_sqrtn_class():
     """The point of the op: ~8.5*sqrt(N) hidden lanes vs 3N flat, and no
-    residual intermediate wider than 2*max(ceil(N/D), D+1)."""
-    from torchwright.graph import FFN
+    residual intermediate wider than 2*max(ceil(N/D), D+1).
+    """
     from torchwright.compiler.utils import get_ancestor_nodes
+    from torchwright.graph import FFN
 
     x, f = _native()
     n = NATIVE_HI - NATIVE_LO
@@ -114,7 +118,8 @@ def test_lane_cost_is_sqrtn_class():
 
 def test_compiles_clean():
     """Compiled swish graph matches the exact-math oracle on a sweep of
-    legal inputs across the native range."""
+    legal inputs across the native range.
+    """
     x = create_input("x", 1, value_range=(-127.0, 127.0))
     f = radix_floor_int(x, -127, 127, sharpness=1000.0)
     g = torch.Generator().manual_seed(41)

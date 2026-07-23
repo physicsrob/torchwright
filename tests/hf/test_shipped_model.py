@@ -76,6 +76,7 @@ def test_direct_builder_does_not_import_onnx():
 
 def test_custom_architecture_is_explicit_and_renamed(tmp_path):
     from transformers import AutoModelForCausalLM
+
     from torchwright.compiler.hf import compile_hf_bundle
     from torchwright.graph.rope import rotary_offset_head
     from torchwright.ops.inout_nodes import create_onehot_embedding

@@ -23,12 +23,11 @@ import torch
 from torchwright.compiler.forward.compile import forward_compile
 from torchwright.compiler.forward.cpsat_scheduler import (
     ATTN,
-    DiagnosticHint,
     MLP,
+    DiagnosticHint,
     ScheduleAssignment,
     SolveStats,
     build_cpsat_model,
-    critical_path_layers,
     solve_schedule,
 )
 from torchwright.graph import Add, Concatenate, Linear
@@ -103,7 +102,8 @@ def test_solver_same_layer_handoff_replays_correctly():
     assignment, so nothing here re-solves (which equal-depth optimum a
     16-worker solve returns is a race).  Gap-zero and collective same-layer
     handoff semantics are pinned deterministically by the hard-fixed
-    fixtures below (atomic-attention-replay plan §§5.1–5.2)."""
+    fixtures below (atomic-attention-replay plan §§5.1–5.2).
+    """
     x, out = _width_starved_graph()
     net = forward_compile(
         d=48, d_head=8, output_node=out, device="cpu", verbose=False, optimize=1
@@ -131,7 +131,8 @@ def test_optimize1_compiles_where_eager_heuristic_cannot():
     heuristic (optimize=0) legitimately dead-locks, since it never
     self-consumer-reuses (that would change every golden layer count).  The
     optimize=1-vs-optimize=0 depth comparison on graphs both can schedule lives
-    in the step-8 example sweep, not here."""
+    in the step-8 example sweep, not here.
+    """
     import pytest
 
     x, out = _width_starved_graph()
@@ -150,7 +151,7 @@ def test_optimize1_compiles_where_eager_heuristic_cannot():
 
 
 def _chain_ab():
-    """x -> A(Linear) -> B(Linear); B is the output.  A's only consumer is B."""
+    """X -> A(Linear) -> B(Linear); B is the output.  A's only consumer is B."""
     torch.manual_seed(0)
     x = create_input("x", 8)
     a = Linear(x, torch.randn(8, 8), torch.zeros(8), name="A")
@@ -163,7 +164,8 @@ def test_same_layer_attn_handoff_feasible_mlp_infeasible():
     B's layer is feasible when B is attention-routed (gap 0) and infeasible when
     B is MLP-routed (gap 1).  A's mechanism is pinned to attention — otherwise
     the solver could flip A to MLP-cancel and satisfy the gap-0 bound even with
-    an MLP-routed B (that case is the next test)."""
+    an MLP-routed B (that case is the next test).
+    """
     x, a, b = _chain_ab()
     hint_layers = {a.node_id: 0, b.node_id: 1}
     hint_cancel = {a.node_id: 1}  # A cancelled at B's own layer
@@ -195,7 +197,8 @@ def test_mlp_cancel_same_layer_feasible_with_mlp_consumer():
     A cancelled at layer 1 (gap 0) is INFEASIBLE under an attention-mech cancel
     (bound cancel >= layer[B]+1) but FEASIBLE under an MLP-mech cancel (uniform
     bound cancel >= layer[B]).  This is the mirror of the routing test above and
-    pins that `cancel_in_mlp` actually relaxes the bound."""
+    pins that `cancel_in_mlp` actually relaxes the bound.
+    """
     x, a, b = _chain_ab()
     hint_layers = {a.node_id: 0, b.node_id: 1}
     hint_cancel = {a.node_id: 1}
@@ -226,7 +229,8 @@ def _reuse_pressure_graph():
     only fit if A's columns are already reclaimed there.  Tuned so d=19 is
     exactly the width where an attention-cancel of A (frees mid-attention,
     interval [0,1)) leaves room for C but an MLP-cancel of A (frees at the end
-    of layer 1, interval [0,2)) does not."""
+    of layer 1, interval [0,2)) does not.
+    """
     torch.manual_seed(0)
     x = create_input("x", 2)
     a = Linear(x, torch.randn(2, 8), torch.zeros(8), name="A")
@@ -246,7 +250,8 @@ def test_mlp_cancel_residual_extends_through_cancel_layer():
     via an MLP cancel — the columns are still live during layer 1's attention
     sublayer, where the replay would need them for C.  Were the model to give
     MLP-cancel the same [layer, cancel) interval, this would be (wrongly)
-    feasible and the directed replay would hit I4."""
+    feasible and the directed replay would hit I4.
+    """
     _, a, b, c, cc, out = _reuse_pressure_graph()
     hint_layers = {
         a.node_id: 0,
@@ -289,7 +294,8 @@ def test_solver_mlp_cancel_replays_correctly():
     some death cancels to the MLP mechanism (a single attention op saturates the
     layer's one head).  The directed replay realizes those `cancel_bypass` ops
     and the output matches the exact-math reference — the coupled model + replay
-    executing MLP-cancel end to end."""
+    executing MLP-cancel end to end.
+    """
     from torchwright.compiler.forward.cpsat_scheduler import MLP as _MLP
 
     torch.manual_seed(1)
@@ -321,7 +327,8 @@ def _eager_warm_start_hint(out, d, d_head, d_hidden, max_layers):
     """Run the eager heuristic in schedule-only mode (mirroring
     ``_run_heuristic_warm_start``) and return the layer / routing / cancel /
     cancel-mechanism hints plus the hint layer count.  Now that the warm start
-    is eager, this is the schedule the production compile hands CP-SAT."""
+    is eager, this is the schedule the production compile hands CP-SAT.
+    """
     import copy
 
     from torchwright.compiler.forward.compile import _TrackingResidualStreamMap
@@ -377,7 +384,8 @@ def test_eager_warm_start_hint_is_accepted_not_dropped():
     worse than the hint's — i.e. the incumbent was accepted, not silently
     dropped into a cold search.  Uses a one-head-per-layer geometry so the
     eager schedule leans on the MLP-cancel mechanism (15 MLP-cancels), the exact
-    density that was previously an infeasible hint."""
+    density that was previously an infeasible hint.
+    """
     from torchwright.compiler.forward.cpsat_scheduler import _validate_hint
 
     torch.manual_seed(0)
@@ -440,7 +448,8 @@ def test_validate_hint_flags_mlp_mechanism_on_input():
     """Inputs have no MLP cancel mechanism in the model (no cancel_in_mlp var
     for freeable inputs), so an MLP-mech hint on an input is a hint the model
     cannot represent and must be flagged — the former leniency read the MLP
-    mechanism as gap-0-for-everything and stayed silent."""
+    mechanism as gap-0-for-everything and stayed silent.
+    """
     from torchwright.compiler.forward.cpsat_scheduler import _validate_hint
 
     torch.manual_seed(0)
@@ -478,7 +487,8 @@ def test_validate_hint_checks_add_consumer_free_gap():
     `layer + is_free` regardless of mechanism, and is_free is a pure function
     of the layer assignment — so the validator derives it from the layer
     hints.  Here w's only consumer is the Add (dead addend -> free add), so
-    u's cancel needs gap 1; the gap-0 hint used to pass silently."""
+    u's cancel needs gap 1; the gap-0 hint used to pass silently.
+    """
     from torchwright.compiler.forward.cpsat_scheduler import _validate_hint
 
     torch.manual_seed(0)
@@ -509,7 +519,8 @@ def test_validate_hint_held_target_add_permits_gap_zero():
     """The held target is a forced fresh compute (the model pins its is_free
     to 0), so a gap-0 cancel of an addend at the target's own layer is legal
     — the derivation must special-case it instead of reading the sole-consumer
-    addend as `free` and demanding gap 1."""
+    addend as `free` and demanding gap 1.
+    """
     from torchwright.compiler.forward.cpsat_scheduler import _validate_hint
 
     torch.manual_seed(0)
@@ -545,7 +556,8 @@ def test_parked_escape_leaves_node_unfreed_and_charges_no_head():
     in-horizon.  Legacy model only: the pinned production default
     (``_pin_cancels``) removes the parked escape (every cancel is pinned to
     its earliest legal layer), so this pins the ``_pin_cancels=False``
-    escape hatch."""
+    escape hatch.
+    """
     x, a, b = _chain_ab()
     max_layers = 20
     built = build_cpsat_model(
@@ -618,7 +630,8 @@ def test_collective_readers_assignment_is_cpsat_feasible():
     free column on entry, S's eight released, A+B's four plus the MLP out's
     four allocated).  Paired with ``test_collective_readers_replay_atomically``
     this proves any replay failure is a model/replay mismatch, not an
-    infeasible assignment."""
+    infeasible assignment.
+    """
     _, _, s, a, b, out = _collective_readers_graph()
     built = build_cpsat_model(out, d=24, d_head=4, d_hidden=24, max_layers=8)
     built.model.Add(built.n_layers_var == 2)
@@ -642,7 +655,8 @@ def test_collective_readers_replay_atomically(monkeypatch):
     modifying or re-solving the assignment.  Before the atomic-batch fix this
     raised the one-free-column ``No progress`` deadlock: replay demanded a
     per-output bootstrap order (each output allocating after releasing at
-    most one input) that the aggregate-feasible layer does not admit."""
+    most one input) that the aggregate-feasible layer does not admit.
+    """
     from torchwright.compiler.forward import compile as compile_mod
     from torchwright.compiler.forward.graph_analysis import GraphAnalyzer
 
@@ -748,7 +762,8 @@ def _directed_scheduler(out, asg, inputs, *, d=24, d_head=4, d_hidden=24):
     """A ``DirectedLayerScheduler`` plus residual map set up the way
     ``forward_compile`` would: a width-1 stand-in for the reserved const-1
     column, then every input, allocated in order — so the scheduler-level
-    column arithmetic matches the production allocation exactly."""
+    column arithmetic matches the production allocation exactly.
+    """
     from torchwright.compiler.forward.graph_analysis import GraphAnalyzer
     from torchwright.compiler.forward.residual_map import ResidualStreamMap
     from torchwright.compiler.forward.scheduler import DirectedLayerScheduler
@@ -799,7 +814,8 @@ def _dual_release_graph():
 def _dual_release_assignment(x, y, blocker, sx, sy, c, out):
     """The plan §5.2 hard-fixed assignment: Sx, Sy at layer 0; C (attention)
     and out (MLP) at layer 1; both source cancels at layer 1 via the
-    attention mechanism; depth two."""
+    attention mechanism; depth two.
+    """
     return ScheduleAssignment(
         node_to_layer={sx.node_id: 0, sy.node_id: 0, c.node_id: 1, out.node_id: 1},
         node_to_cancel_layer={
@@ -827,7 +843,8 @@ def test_dual_release_assignment_is_cpsat_feasible():
     the source graph.  Compute (C reads Sx+Sy[8]: 2 heads) plus the coalesced
     eight-column cancel (2 heads) uses four of six attention heads; entry has
     one free column and the combined release of both sources fits C and the
-    MLP out exactly."""
+    MLP out exactly.
+    """
     x, y, blocker, sx, sy, c, out = _dual_release_graph()
     built = build_cpsat_model(out, d=24, d_head=4, d_hidden=24, max_layers=8)
     built.model.Add(built.n_layers_var == 2)
@@ -850,7 +867,8 @@ def test_dual_release_replays_atomically():
     released in one coalesced cancel, C's source columns are the pre-release
     capture, and C plus the layer's MLP output place without an extra layer.
     Before the atomic-batch fix, the unary reuse released one source, failed
-    C's six-column allocation against five free, and deferred the layer."""
+    C's six-column allocation against five free, and deferred the layer.
+    """
     x, y, blocker, sx, sy, c, out = _dual_release_graph()
     asg = _dual_release_assignment(x, y, blocker, sx, sy, c, out)
     sched, rmap, computed = _directed_scheduler(out, asg, (x, y, blocker))
@@ -904,7 +922,8 @@ def test_dual_release_replays_atomically():
 def test_batch_contract_a2_consumer_outside_batch():
     """A2: a value cancelled at a layer where one uncomputed consumer is not
     in the attention batch (here: its only reader rerouted to the MLP) fails
-    before any mutation."""
+    before any mutation.
+    """
     import dataclasses
 
     import pytest
@@ -933,7 +952,8 @@ def test_batch_contract_a3_head_overcharge():
     the batch's exact head charge exceed n_heads and fails before mutation.
     The moved node reads only the input, so it is genuinely ready during the
     handoff layer's attention pass (a same-layer reader of A or B would be
-    filtered by readiness, not by the head preflight)."""
+    filtered by readiness, not by the head preflight).
+    """
     import pytest
 
     torch.manual_seed(0)
@@ -992,7 +1012,8 @@ def test_batch_contract_a3_head_overcharge():
 
 def test_batch_contract_a4_width_underrelease():
     """A4: removing one release from an exactly-fitting assignment makes the
-    ordinary width preflight fail before any mutation."""
+    ordinary width preflight fail before any mutation.
+    """
     import dataclasses
 
     import pytest
@@ -1018,7 +1039,8 @@ def test_batch_contract_overdue_cancel():
     """Overdue: a cancel assigned one layer earlier than the value goes dead
     is still allocated when its assigned layer has passed — an assertion,
     not a silent reschedule (an assignment that fit only because the cancel
-    occurred on time is not soundly replayed by delaying it)."""
+    occurred on time is not soundly replayed by delaying it).
+    """
     import dataclasses
 
     import pytest
@@ -1046,7 +1068,8 @@ def test_batch_contract_must_allocate(monkeypatch):
     """Must-allocate: reachable only through a preflight bug, so it is pinned
     with a direct unit seam — force ``_try_allocate`` to return ``None`` past
     a passing preflight — rather than by weakening one of the four honest
-    corruptions above."""
+    corruptions above.
+    """
     import pytest
 
     x, y, blocker, sx, sy, c, out = _dual_release_graph()
@@ -1074,7 +1097,8 @@ def _entry_dead_graph():
     under its two layer-1 readers.  Before the atomic batch, entry-dead
     values flowed through the promotion/leftover paths that the batch now
     bypasses — a botched bypass (entry-dead values dropped instead of
-    batched) passes the §§5.1–5.2 fixtures and is caught only here."""
+    batched) passes the §§5.1–5.2 fixtures and is caught only here.
+    """
     torch.manual_seed(0)
     x = create_input("x", 4)
     blocker = create_input("blocker", 10)
@@ -1128,7 +1152,8 @@ def _entry_dead_assignment(x, blocker, w, p, s, a, b, out):
 def test_entry_dead_assignment_is_cpsat_feasible():
     """The §5.7 assignment is model-feasible at depth two (W's cancel is
     legal at layer 1 because its MLP consumer P ran at layer 0; S's is legal
-    gap-0 under its two attention readers)."""
+    gap-0 under its two attention readers).
+    """
     x, blocker, w, p, s, a, b, out = _entry_dead_graph()
     built = build_cpsat_model(out, d=24, d_head=4, d_hidden=24, max_layers=8)
     built.model.Add(built.n_layers_var == 2)
@@ -1162,7 +1187,8 @@ def test_entry_dead_and_mid_batch_releases_share_one_batch():
     """Bypass regression pin (green before and after the fix — the old
     promotion path also handled W): the entry-dead ``W`` and the mid-batch
     dying ``S`` are released by the same coalesced cancel, the overdue scan
-    stays silent, and the layer places everything at depth two."""
+    stays silent, and the layer places everything at depth two.
+    """
     x, blocker, w, p, s, a, b, out = _entry_dead_graph()
     asg = _entry_dead_assignment(x, blocker, w, p, s, a, b, out)
     sched, rmap, computed = _directed_scheduler(out, asg, (x, blocker))

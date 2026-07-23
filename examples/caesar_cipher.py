@@ -16,20 +16,18 @@ Uses a single 260-entry lookup table with 16D concatenated keys
 with switch dispatch.
 """
 
-from typing import Tuple
-
 import torch
 
-from torchwright.graph import Node, Embedding, Concatenate, RopeConfig
+from torchwright.graph import Embedding, Node
 from torchwright.graph.embedding import Unembedding
-from torchwright.ops.linear import concat
 from torchwright.ops.attention_ops import attend_to_offset, get_prev_value
 from torchwright.ops.inout_nodes import (
-    create_literal_value,
     create_embedding,
+    create_literal_value,
     create_rope_config,
     create_unembedding,
 )
+from torchwright.ops.linear import concat
 from torchwright.ops.swiglu.logic_ops import equals_vector
 from torchwright.ops.swiglu.map_select import map_to_table
 from torchwright.ops.swiglu.sequence_ops import output_sequence
@@ -47,7 +45,7 @@ MAX_POSITIONS = 512
 
 def create_network_parts(
     max_letters: int = MAX_LETTERS,
-) -> Tuple[Node, Embedding]:
+) -> tuple[Node, Embedding]:
     """Build the Caesar cipher computation graph.
 
     Args:

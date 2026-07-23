@@ -19,7 +19,6 @@ of the suite (built on ``randn`` weights) does not move.
 
 import json
 
-import pytest
 import torch
 
 from torchwright.compiler.forward.compile import forward_compile
@@ -89,7 +88,8 @@ def test_dense_weights_charge_the_old_formula():
 def test_zero_support_floors_at_one_head():
     """A zero-weight Linear keeps chunk 0: h == 0 would drop the node from
     the CP-SAT attention cumulative and — for a flex Linear — its routing
-    variable from the objective (the builder skips h == 0 nodes)."""
+    variable from the objective (the builder skips h == 0 nodes).
+    """
     x = create_input("x", 40, value_range=(-1.0, 1.0))
     lin = Linear(x, torch.zeros(40, 2), name="zero")
     assert linear_attn_chunks(lin, D_HEAD) == (0,)
@@ -98,7 +98,8 @@ def test_zero_support_floors_at_one_head():
 
 def test_bias_never_creates_support():
     """A bias needs no input read (it is written by the separate
-    ``compute_bias`` MLP op), so it must not make a weight row live."""
+    ``compute_bias`` MLP op), so it must not make a weight row live.
+    """
     x = create_input("x", 40, value_range=(-1.0, 1.0))
     lin = Linear(x, torch.zeros(40, 2), torch.ones(2), name="bias_only")
     assert live_weight_row_ranges(lin) == ()
@@ -108,7 +109,8 @@ def test_bias_never_creates_support():
 def test_fold_invalidates_the_support_cache():
     """The charge is memoized on the node; a fold that rewrites the weights
     must drop the cache or a pre-fusion query would freeze the pre-fold
-    support — and the emitter would skip chunks that are live post-fold."""
+    support — and the emitter would skip chunks that are live post-fold.
+    """
     x = create_input("x", 40, value_range=(-1.0, 1.0))
     l1 = Linear(x, _sparse_w(), name="l1")  # support rows 3, 25
     torch.manual_seed(0)
@@ -128,7 +130,8 @@ def test_fold_invalidates_the_support_cache():
 
 def _three_kinds():
     """Sparse (2 live chunks of 5), dense (5), zero (floor 1) — each on its
-    own input so the sibling merge cannot pool their support."""
+    own input so the sibling merge cannot pool their support.
+    """
     x1 = create_input("x1", 40, value_range=(-1.0, 1.0))
     x2 = create_input("x2", 40, value_range=(-1.0, 1.0))
     x3 = create_input("x3", 40, value_range=(-1.0, 1.0))
@@ -189,7 +192,8 @@ def test_emitter_allocates_exactly_the_charged_heads_and_values_match():
 def test_zero_support_flex_linear_solves_and_matches():
     """The h == 0 edge case, end to end: with the floor, a zero-weight flex
     Linear stays in the CP-SAT model, solves under require_solver, and its
-    (all-zero) value plus bias compiles correctly."""
+    (all-zero) value plus bias compiles correctly.
+    """
     with fresh_graph_session():
         x = create_input("x", 40, value_range=(-1.0, 1.0))
         zero = Linear(x, torch.zeros(40, 2), torch.tensor([1.5, -0.5]), name="z")
@@ -229,7 +233,8 @@ def _sparse_graph():
 
 def test_snapshot_roundtrip_proto_identity_with_sparse_weights():
     """The stand-in nodes carry no weights; the persisted live-row runs must
-    reproduce the identical charge, hence the identical proto."""
+    reproduce the identical charge, hence the identical proto.
+    """
     with fresh_graph_session():
         out = _sparse_graph()
         gm = build_graph_model(out)
@@ -243,7 +248,8 @@ def test_legacy_snapshot_without_ranges_builds_with_dense_charge():
     """A pre-support-charge snapshot has no ``live_row_ranges``; the rebuild
     falls back to the dense-equivalent run (the old width charge) instead of
     crashing.  Such snapshots also fail the identity fingerprint gate, so
-    this is determinism hygiene, not a supported measurement path."""
+    this is determinism hygiene, not a supported measurement path.
+    """
     with fresh_graph_session():
         out = _sparse_graph()
         gm = build_graph_model(out)
@@ -267,7 +273,8 @@ def test_fingerprint_sees_sparsity():
     """Two graphs with identical topology but different weight support now
     schedule differently; replaying a cached schedule across them would
     under-book heads in one direction.  The fingerprint must separate them
-    — and must stay stable across rebuilds of the same graph."""
+    — and must stay stable across rebuilds of the same graph.
+    """
     kw = dict(
         d=192,
         d_head=D_HEAD,

@@ -36,8 +36,8 @@ whose exact type has no entry fails loudly at clone time.
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass
-from typing import Callable, Dict, List, Set, Tuple
 
 from torchwright.graph import Node
 from torchwright.graph.affine_bound import AffineBound
@@ -60,16 +60,16 @@ class GraphCloneError(RuntimeError):
     """A graph could not be cloned (unhandled type or unremapped reference)."""
 
 
-def topological_order(output_node: Node) -> List[Node]:
+def topological_order(output_node: Node) -> list[Node]:
     """Inputs-before-consumers order over the ancestor cone (iterative).
 
     Purely structural: the order depends only on the ``inputs`` wiring,
     never on ``node_id`` values, so it is identical for a graph and its
     clone (and across processes for deterministic construction code).
     """
-    order: List[Node] = []
-    visited: Set[Node] = set()
-    stack: List[Tuple[Node, bool]] = [(output_node, False)]
+    order: list[Node] = []
+    visited: set[Node] = set()
+    stack: list[tuple[Node, bool]] = [(output_node, False)]
     while stack:
         node, expanded = stack.pop()
         if expanded:
@@ -118,7 +118,7 @@ _REBUILT_FIELDS = frozenset(
 )
 
 
-def _remap_bound_basis(ab: AffineBound, id_map: Dict[int, int]) -> AffineBound:
+def _remap_bound_basis(ab: AffineBound, id_map: dict[int, int]) -> AffineBound:
     """Re-key a bound's ``columns`` / ``input_ranges`` onto clone node ids.
 
     An ``AffineBound``'s basis is keyed by the ``node_id`` of its leaf
@@ -158,9 +158,9 @@ def _iter_stray_node_refs(value, depth: int = 0):
 
 def _clone_default(
     src: Node,
-    clone_map: Dict[Node, Node],
-    new_ids: Dict[Node, int],
-    id_map: Dict[int, int],
+    clone_map: dict[Node, Node],
+    new_ids: dict[Node, int],
+    id_map: dict[int, int],
 ) -> Node:
     """Structural clone: shared payload fields, rewired graph fields, fresh caches.
 
@@ -227,7 +227,7 @@ def _clone_default(
 # * ``Embedding`` — tokenizer object and table tensor shared by
 #   reference (``__init__`` cannot reconstruct a caller-supplied
 #   special-token split from stored fields).
-_CLONE_IMPLS: Dict[type, Callable] = {
+_CLONE_IMPLS: dict[type, Callable] = {
     FFN: _clone_default,
     Attn: _clone_default,
     Linear: _clone_default,
@@ -241,7 +241,7 @@ _CLONE_IMPLS: Dict[type, Callable] = {
 }
 
 
-def build_clone_dispatch(vocabulary: Tuple[type, ...]) -> Dict[type, Callable]:
+def build_clone_dispatch(vocabulary: tuple[type, ...]) -> dict[type, Callable]:
     """Generate the exact-type clone dispatch from a vocabulary tuple.
 
     Raises loudly if any vocabulary member lacks a registered clone
@@ -267,10 +267,10 @@ class GraphCopy:
     #: The source output node the copy was built from.
     source_output_node: Node
     #: source node -> its clone, one entry per reachable source node.
-    node_map: Dict[Node, Node]
+    node_map: dict[Node, Node]
 
 
-def clone_graph(output_node: Node, dispatch: Dict[type, Callable]) -> GraphCopy:
+def clone_graph(output_node: Node, dispatch: dict[type, Callable]) -> GraphCopy:
     """Deep-copy the graph reachable from ``output_node``.
 
     ``dispatch`` is the exact-type clone table from
@@ -278,8 +278,8 @@ def clone_graph(output_node: Node, dispatch: Dict[type, Callable]) -> GraphCopy:
     entry (including subclasses of vocabulary types) raises
     :class:`GraphCloneError`.
     """
-    from torchwright.graph.node import reserve_node_id_above
     import torchwright.graph.node as node_module
+    from torchwright.graph.node import reserve_node_id_above
 
     order = topological_order(output_node)
 
@@ -288,13 +288,13 @@ def clone_graph(output_node: Node, dispatch: Dict[type, Callable]) -> GraphCopy:
     # first: tests reset the global counter, and a clone id colliding
     # with a live source id would make the two compare equal.
     reserve_node_id_above(order)
-    new_ids: Dict[Node, int] = {}
+    new_ids: dict[Node, int] = {}
     for src in sorted(order, key=lambda n: n.node_id):
         new_ids[src] = node_module.global_node_id
         node_module.global_node_id += 1
     id_map = {src.node_id: cid for src, cid in new_ids.items()}
 
-    clone_map: Dict[Node, Node] = {}
+    clone_map: dict[Node, Node] = {}
     for src in order:
         impl = dispatch.get(type(src))
         if impl is None:

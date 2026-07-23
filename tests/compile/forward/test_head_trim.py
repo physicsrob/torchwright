@@ -63,7 +63,8 @@ def test_interior_dead_head_is_compacted():
 
 def test_all_dead_heads_keeps_one():
     """Degenerate case: every allocated head is dead — keep one zero head
-    rather than emitting empty-tensor shapes."""
+    rather than emitting empty-tensor shapes.
+    """
     attn = AttnLayerComponent(D, D_HEAD)
     attn.used_heads = 2  # allocated, but O left zero
     attn.trim_unused_heads()
@@ -73,7 +74,8 @@ def test_all_dead_heads_keeps_one():
 
 def test_trailing_trim_behavior_unchanged():
     """The old contract: no dead interior heads -> compaction equals the
-    trailing slice."""
+    trailing slice.
+    """
     attn = _component_with_interior_dead_head()
     attn.output_matrix[1] = torch.randn(D_HEAD, D) * 0.1  # make head 1 live too
     attn.trim_unused_heads()
@@ -85,7 +87,8 @@ def test_compiled_zero_support_floor_head_is_compacted():
     block is zero — the interior dead head the support-aware emitter still
     produces (a merely *sparse* Linear no longer emits dead heads at all:
     ``linear_attn_chunks`` skips its zero chunks).  Compaction reclaims it
-    and the compiled values still match node.compute."""
+    and the compiled values still match node.compute.
+    """
     torch.manual_seed(0)
     x = create_input("x", 2 * D_HEAD, value_range=(-1.0, 1.0))
     # `other` reads its own input: same-input siblings would merge

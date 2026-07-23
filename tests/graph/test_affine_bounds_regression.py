@@ -37,7 +37,7 @@ class TestTighteningContract:
             assert eager_range.hi <= affine.hi + 1e-10
 
     def test_add_cancel_tighter_than_eager(self):
-        """x + (-x) = 0: affine sees [0,0], eager interval would give [-2,2]."""
+        """X + (-x) = 0: affine sees [0,0], eager interval would give [-2,2]."""
         with fresh_graph_session():
             x = InputNode(1, name="x", value_range=(-1.0, 1.0))
             neg = Linear(x, torch.tensor([[-1.0]]))
@@ -70,7 +70,7 @@ class TestCancellationTightening:
     """The canonical use case: offset cancellation in cond_gate-style patterns."""
 
     def test_add_offset_then_subtract(self):
-        """x + M + (y - M) should give range(x) + range(y), not range(x) + range(y) + 2*M."""
+        """X + M + (y - M) should give range(x) + range(y), not range(x) + range(y) + 2*M."""
         with fresh_graph_session():
             x = InputNode(1, name="x", value_range=(-1.0, 1.0))
             y = InputNode(1, name="y", value_range=(-1.0, 1.0))

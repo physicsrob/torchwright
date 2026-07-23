@@ -24,17 +24,16 @@ Pure CPU, seconds per config::
 import argparse
 import importlib
 from collections import Counter
-from typing import Any, Callable, Dict, List, Tuple, cast
+from collections.abc import Callable
+from typing import Any, cast
 
-from torchwright.compiler.lower import lower
 from torchwright.compiler.forward.cpsat_scheduler import (
-    ATTN,
-    MLP,
     _compute_layer_bounds,
     build_graph_model,
     is_flex,
 )
 from torchwright.compiler.forward.scheduling_policy import LEGACY_POLICY
+from torchwright.compiler.lower import lower
 
 
 def _describe(node) -> str:
@@ -42,7 +41,7 @@ def _describe(node) -> str:
     return f"{type(node).__name__:12s} w={len(node):4d}  {name}"
 
 
-def longest_chain(gm, es: Dict[int, int]) -> List:
+def longest_chain(gm, es: dict[int, int]) -> list:
     """Backtrack one longest chain through the earliest-start bounds.
 
     Heuristic reconstruction (the bounds are mode-aware; this walk is not):
@@ -52,18 +51,18 @@ def longest_chain(gm, es: Dict[int, int]) -> List:
     the tightest predecessor (max es) so the walk follows the binding chain.
     """
     by_id = {n.node_id: n for n in gm.schedulable}
-    preds: Dict[int, List[int]] = {n.node_id: [] for n in gm.schedulable}
+    preds: dict[int, list[int]] = {n.node_id: [] for n in gm.schedulable}
     for u, v in gm.edges:
         if u.node_id in preds and v.node_id in preds:
             preds[v.node_id].append(u.node_id)
 
-    cur = max(es, key=cast(Callable[[int], int], es.get))
+    cur = max(es, key=cast("Callable[[int], int]", es.get))
     chain = [cur]
     while True:
         candidates = [u for u in preds[cur] if es[u] >= es[cur] - 1]
         if not candidates:
             break
-        cur = max(candidates, key=cast(Callable[[int], int], es.get))
+        cur = max(candidates, key=cast("Callable[[int], int]", es.get))
         chain.append(cur)
     return [by_id[i] for i in reversed(chain)]
 
@@ -89,7 +88,7 @@ def forensic_carry_sweep(output_node, lane_cap: int) -> None:
 
     order = topological_order(output_node)
     src = scalar_sources(order)
-    by_src: Dict = {}
+    by_src: dict = {}
     for n in order:
         s = src[n]
         if s is not None and s is not n:

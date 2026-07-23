@@ -27,8 +27,9 @@ from torchwright.ops.relu.linear_relu_linear import linear_relu_linear
 
 
 def _repro_graph():
-    """x -> FFN -> L_mid -> FFN -> L_out (a small serial FFN graph,
-    lightly fused)."""
+    """X -> FFN -> L_mid -> FFN -> L_out (a small serial FFN graph,
+    lightly fused).
+    """
     torch.manual_seed(0)
     x = create_input("x", 8)
     block_a = linear_relu_linear(
@@ -119,7 +120,8 @@ def test_solver_params_applied_and_solve_unchanged():
 def test_drop_decision_strategy_solves_same_depth():
     """Dropping the hand-rolled ``AddDecisionStrategy`` (C1 arm
     ``no_decision_strategy``) is search-only: on a graph the solver proves
-    optimal, the achieved depth is identical — only the search path changes."""
+    optimal, the achieved depth is identical — only the search path changes.
+    """
     out = _repro_graph()
     with_strategy, s0 = solve_schedule(out, **_SOLVE_KW)
     without, s1 = solve_schedule(out, drop_decision_strategy=True, **_SOLVE_KW)
@@ -154,7 +156,8 @@ def test_solution_trace_captures_incumbents():
 )
 def test_secondary_objectives_are_lexicographic(costs):
     """Secondaries must never trade a layer: primary optimum is preserved
-    and ``objective_value // objective_scale`` recovers it exactly."""
+    and ``objective_value // objective_scale`` recovers it exactly.
+    """
     out = _repro_graph()
     plain, _ = solve_schedule(out, **_SOLVE_KW)
     sec, stats = solve_schedule(out, costs=costs, **_SOLVE_KW)
@@ -184,7 +187,8 @@ def test_plain_costs_keep_scale_one():
 
 def test_descent_reaches_floor_at_slack_width():
     """With width slack, optimize=2's single warm-start descent lands at (or
-    below) critical_path+1 with a real solve (no floor probe)."""
+    below) critical_path+1 with a real solve (no floor probe).
+    """
     from torchwright.compiler.forward.compile import forward_compile
     from torchwright.compiler.forward.cpsat_scheduler import (
         critical_path_layers,
@@ -207,7 +211,8 @@ def test_descent_reaches_floor_at_slack_width():
 
 def test_schedule_cache_round_trip(tmp_path, monkeypatch):
     """Second compile of the same topology+geometry replays the cached
-    schedule (status CACHED), skips the solver, and computes identically."""
+    schedule (status CACHED), skips the solver, and computes identically.
+    """
     from torchwright.compiler.forward.compile import forward_compile
 
     monkeypatch.setenv("TW_SCHEDULE_CACHE_DIR", str(tmp_path))
@@ -279,7 +284,8 @@ def test_schedule_cache_keys_on_compiler_code(monkeypatch):
     """Any torchwright source change must invalidate cached schedules: the
     fingerprint includes a content hash of the package sources, so an edit
     the topology hash cannot see (warm-start heuristic, solver model) still
-    misses instead of replaying a stale schedule."""
+    misses instead of replaying a stale schedule.
+    """
     from torchwright.compiler import graph_identity
 
     out = _repro_graph()
@@ -302,7 +308,8 @@ def test_schedule_cache_keys_on_compiler_code(monkeypatch):
 def test_schedule_cache_min_optimize_gate(tmp_path, monkeypatch):
     """An entry solved at a lower optimize level misses a higher-level
     request; a failed higher-level improvement upgrades the entry's level
-    in place so the re-solve happens once, not per compile."""
+    in place so the re-solve happens once, not per compile.
+    """
     from torchwright.compiler.forward.cpsat_scheduler import (
         ScheduleAssignment,
     )
@@ -340,7 +347,8 @@ def test_schedule_cache_min_optimize_gate(tmp_path, monkeypatch):
 def test_schedule_cache_optimize_gate_end_to_end(tmp_path, monkeypatch):
     """Raising ``optimize`` in a compile actually re-solves instead of
     replaying the lower level's cached draw; the level then sticks and the
-    next same-level compile is CACHED."""
+    next same-level compile is CACHED.
+    """
     from torchwright.compiler.forward.compile import forward_compile
 
     monkeypatch.setenv("TW_SCHEDULE_CACHE_DIR", str(tmp_path))
@@ -370,7 +378,8 @@ def _deferred_cancel_hint(max_layers, cancel_slack=2):
     """Solve the repro graph, then craft a warm-start hint whose cancel for
     one node is pushed to ``last_consumer + 1 + K + 1`` — the shape the
     heuristic produces when a layer's attention heads are full and it defers
-    the free to the next layer.  Returns ``(out, hints, target_id)``."""
+    the free to the next layer.  Returns ``(out, hints, target_id)``.
+    """
     from torchwright.compiler.forward.cpsat_scheduler import Concatenate
 
     out = _repro_graph()
@@ -408,7 +417,8 @@ def _deferred_cancel_hint(max_layers, cancel_slack=2):
 
 def _hard_fix_and_solve(built, hint_layers, hint_routing, hint_cancel):
     """Add an equality per hinted variable and solve — is the hint a model
-    point?  Mirrors phase 2 of ``torchwright_doom/scripts/cpsat_hint_audit``."""
+    point?  Mirrors phase 2 of ``torchwright_doom/scripts/cpsat_hint_audit``.
+    """
     from ortools.sat.python import cp_model
 
     from torchwright.compiler.forward.cpsat_scheduler import ATTN
@@ -435,7 +445,8 @@ def test_deferred_cancel_hint_rejected_without_widening():
     """Pins the bug: a heuristic-shaped hint (one cancel deferred one layer
     past the uniform window) is INFEASIBLE under the hint-blind model — the
     root cause of the silent optimize=2 fallback — and becomes a model point
-    once ``build_cpsat_model`` sees the hint and widens that node's window."""
+    once ``build_cpsat_model`` sees the hint and widens that node's window.
+    """
     max_layers = _SOLVE_KW["max_layers"]
     out, (hint_layers, hint_routing, hint_cancel), target_id = _deferred_cancel_hint(
         max_layers
@@ -471,7 +482,8 @@ def test_deferred_cancel_hint_rejected_without_widening():
 
 def test_deferred_cancel_hint_accepted_by_solve_schedule():
     """End-to-end through ``solve_schedule``: the deferral-shaped hint passes
-    strict validation (the widened window admits it) and solves."""
+    strict validation (the widened window admits it) and solves.
+    """
     out, (hint_layers, hint_routing, hint_cancel), _ = _deferred_cancel_hint(
         _SOLVE_KW["max_layers"]
     )
@@ -495,7 +507,8 @@ def test_strict_hint_validation_raises_on_invalid_hint():
     ``strict_hint=True`` and warns under the default.  Legacy model only:
     the pinned default drops cancel-layer hints before validation (their
     values are forced by the pin), so this contract lives behind
-    ``_pin_cancels=False``."""
+    ``_pin_cancels=False``.
+    """
     out = _repro_graph()
     assignment, _ = solve_schedule(out, _pin_cancels=False, **_SOLVE_KW)
     assert assignment is not None
@@ -541,7 +554,8 @@ def test_strict_hint_validation_raises_on_keep_forever_cancel():
     """A cancel hint below max_layers for a keep-forever node (pinned or
     Concatenate-consumed) is a hint the model pins to max_layers — strict
     mode names it.  Legacy model only (the pinned default drops cancel-layer
-    hints before validation)."""
+    hints before validation).
+    """
     out = _repro_graph()
     assignment, _ = solve_schedule(out, _pin_cancels=False, **_SOLVE_KW)
     assert assignment is not None
@@ -565,7 +579,8 @@ def test_strict_hint_validation_raises_on_keep_forever_cancel():
 def test_descent_valid_compile_on_width_starved_graph():
     """Width-starved graph: the dependency floor cannot fit (parallel wide
     chains must serialize), so optimize=2's warm-start descent produces a
-    valid compile necessarily deeper than critical_path+1."""
+    valid compile necessarily deeper than critical_path+1.
+    """
     from torchwright.compiler.forward.compile import forward_compile
     from torchwright.compiler.forward.cpsat_scheduler import (
         critical_path_layers,
@@ -614,7 +629,8 @@ def test_descent_valid_compile_on_width_starved_graph():
 def test_schedule_cache_not_written_when_replay_fails(tmp_path, monkeypatch):
     """A successful solve whose directed replay fails must store NOTHING:
     no future model/replay defect may turn a transient failure into a
-    persistent cached one."""
+    persistent cached one.
+    """
     from torchwright.compiler.forward import compile as compile_mod
     from torchwright.compiler.forward.compile import forward_compile
 
@@ -652,7 +668,8 @@ def test_schedule_cache_not_written_when_replay_fails(tmp_path, monkeypatch):
 
 def test_schedule_cache_stores_once_after_replay_and_not_on_hit(tmp_path, monkeypatch):
     """The positive mirror: a successful non-cached solve stores exactly once
-    (after replay), and a cache hit does not store again."""
+    (after replay), and a cache hit does not store again.
+    """
     from torchwright.compiler.forward import compile as compile_mod
     from torchwright.compiler.forward.compile import forward_compile
 
@@ -682,7 +699,8 @@ def test_schedule_cache_solve_only_stores_nothing(tmp_path, monkeypatch):
     """A ``_solve_only`` measurement run returns before the replay and no
     longer populates the schedule cache — the deliberate behavior change of
     moving the store past the replay (a measurement seam should not write
-    production cache state)."""
+    production cache state).
+    """
     from torchwright.compiler.forward.compile import forward_compile
 
     monkeypatch.setenv("TW_SCHEDULE_CACHE_DIR", str(tmp_path))

@@ -10,8 +10,8 @@ matrix").
 import torch
 
 from torchwright.graph import FFN, Linear
-from torchwright.ops.linear import concat
 from torchwright.ops.inout_nodes import create_input, create_onehot_embedding
+from torchwright.ops.linear import concat
 from torchwright.ops.relu.onehot_table import onehot_lookup
 
 

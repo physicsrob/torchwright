@@ -20,7 +20,7 @@ here because they are easy to get wrong:
   FFN.
 """
 
-from typing import Optional, cast
+from typing import cast
 
 import torch
 
@@ -54,8 +54,8 @@ class FFN(Node):
 
     gate_proj: torch.Tensor
     gate_bias: torch.Tensor
-    up_proj: Optional[torch.Tensor]
-    up_bias: Optional[torch.Tensor]
+    up_proj: torch.Tensor | None
+    up_bias: torch.Tensor | None
     out_proj: torch.Tensor
     out_bias: torch.Tensor
     activation: str
@@ -67,8 +67,8 @@ class FFN(Node):
         gate_bias: torch.Tensor,
         out_proj: torch.Tensor,
         out_bias: torch.Tensor,
-        up_proj: Optional[torch.Tensor] = None,
-        up_bias: Optional[torch.Tensor] = None,
+        up_proj: torch.Tensor | None = None,
+        up_bias: torch.Tensor | None = None,
         activation: str = "relu",
         name: str = "",
     ):
@@ -100,8 +100,8 @@ class FFN(Node):
                 n_lanes,
                 d_input,
             ), f"up_proj shape {tuple(up_proj.shape)} != ({n_lanes}, {d_input})"
-            assert cast(torch.Tensor, up_bias).shape == (n_lanes,), (
-                f"up_bias shape {tuple(cast(torch.Tensor, up_bias).shape)} != ({n_lanes},)"
+            assert cast("torch.Tensor", up_bias).shape == (n_lanes,), (
+                f"up_bias shape {tuple(cast('torch.Tensor', up_bias).shape)} != ({n_lanes},)"
             )
 
         self.gate_proj = gate_proj
@@ -137,7 +137,7 @@ class FFN(Node):
         gate = torch.matmul(x, self.gate_proj.t()) + self.gate_bias
         lane = self._activate(gate)
         if self.up_proj is not None:
-            up = torch.matmul(x, self.up_proj.t()) + cast(torch.Tensor, self.up_bias)
+            up = torch.matmul(x, self.up_proj.t()) + cast("torch.Tensor", self.up_bias)
             lane = lane * up
         return torch.matmul(lane, self.out_proj) + self.out_bias
 

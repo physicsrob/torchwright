@@ -5,7 +5,7 @@ layer count and parameter overhead.
 """
 
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Set, Tuple, cast
+from typing import cast
 
 import torch
 
@@ -47,9 +47,9 @@ class FoldLog:
     drops the invalidated records.
     """
 
-    moves: Dict[Node, Node] = field(default_factory=dict)
-    value_changed: Set[Node] = field(default_factory=set)
-    slices: Dict[Node, Tuple[Node, int, int]] = field(default_factory=dict)
+    moves: dict[Node, Node] = field(default_factory=dict)
+    value_changed: set[Node] = field(default_factory=set)
+    slices: dict[Node, tuple[Node, int, int]] = field(default_factory=dict)
 
     def record_move(self, orphan: Node, survivor: Node) -> None:
         # A survivor absorbing a second downstream Linear stops holding
@@ -74,7 +74,7 @@ class FoldLog:
     def record_value_changed(self, node: Node) -> None:
         self.value_changed.add(node)
 
-    def record_merge(self, run: List[Node], widths: List[int]) -> None:
+    def record_merge(self, run: list[Node], widths: list[int]) -> None:
         """Record a sibling merge: ``run[0]`` widened in place to hold every
         run member's columns side by side, the rest orphaned.
 
@@ -151,12 +151,13 @@ class FoldLog:
 
 def _blocks_absorb(node: Node) -> bool:
     """True when *node*'s value may not be erased by a fold (the *erased*
-    predicate above — the relaxable checkability policy)."""
+    predicate above — the relaxable checkability policy).
+    """
     return bool(node.checks)
 
 
-def _consumer_map(all_nodes: Set[Node]) -> Dict[Node, List[Node]]:
-    consumers: Dict[Node, List[Node]] = {n: [] for n in all_nodes}
+def _consumer_map(all_nodes: set[Node]) -> dict[Node, list[Node]]:
+    consumers: dict[Node, list[Node]] = {n: [] for n in all_nodes}
     for node in all_nodes:
         for inp in node.inputs:
             if inp in consumers:
@@ -216,7 +217,7 @@ def _fold_linear_into_ffn_gate(u: Linear, b: FFN) -> None:
     b.gate_bias = u.output_bias @ b.gate_proj.t() + b.gate_bias
     b.gate_proj = b.gate_proj @ m_u.t()
     if b.up_proj is not None:
-        b.up_bias = u.output_bias @ b.up_proj.t() + cast(torch.Tensor, b.up_bias)
+        b.up_bias = u.output_bias @ b.up_proj.t() + cast("torch.Tensor", b.up_bias)
         b.up_proj = b.up_proj @ m_u.t()
     b.inputs = [u.inputs[0]]
     b.d_input = m_u.shape[0]
@@ -225,7 +226,7 @@ def _fold_linear_into_ffn_gate(u: Linear, b: FFN) -> None:
 
 
 def _fold_ffn_into_linear(
-    b: FFN, consumers: Dict[Node, List[Node]], fold_log: FoldLog
+    b: FFN, consumers: dict[Node, list[Node]], fold_log: FoldLog
 ) -> None:
     """Fold FFN ``b``'s output projection into its sole downstream Linear.
 
@@ -272,11 +273,11 @@ def _fold_ffn_into_linear(
 def _fold_through_concatenate(
     l: Linear,
     c: Concatenate,
-    output_nodes: Set[Node],
-    consumers: Dict[Node, List[Node]],
-    hint_targets: Set[Node],
-    touched: Set[Node],
-    mutated: Set[Node],
+    output_nodes: set[Node],
+    consumers: dict[Node, list[Node]],
+    hint_targets: set[Node],
+    touched: set[Node],
+    mutated: set[Node],
     fold_log: FoldLog,
 ) -> int:
     """Fold foldable leaves of single-consumer ``c`` into ``l``'s row blocks.
@@ -325,7 +326,7 @@ def _fold_through_concatenate(
     # can name a Concatenate: the scheduler marks one computed once its
     # leaves are).
     applied = 0
-    leaves: List[Node] = []
+    leaves: list[Node] = []
     for leaf in c.inputs:
         if (
             isinstance(leaf, Concatenate)
@@ -346,8 +347,8 @@ def _fold_through_concatenate(
     has_non_literal = any(not isinstance(x, LiteralValue) for x in leaves)
 
     d_out = l.d_output
-    blocks: List[torch.Tensor] = []
-    new_leaves: List[Node] = []
+    blocks: list[torch.Tensor] = []
+    new_leaves: list[Node] = []
     bias = l.output_bias
     offset = 0
     value_folds = 0  # leaf folds that change c's value (splices don't)
@@ -398,9 +399,9 @@ def _fold_through_concatenate(
     # merge exactly and the concat narrows — which also keeps duplicate
     # source columns out of the weight-writer scatters.
     if allow_value_folds and len({id(x) for x in new_leaves}) != len(new_leaves):
-        slot: Dict[int, int] = {}
-        merged_leaves: List[Node] = []
-        merged_blocks: List[torch.Tensor] = []
+        slot: dict[int, int] = {}
+        merged_leaves: list[Node] = []
+        merged_blocks: list[torch.Tensor] = []
         for leaf, block in zip(new_leaves, blocks):
             j = slot.get(id(leaf))
             if j is None:
@@ -436,7 +437,7 @@ def _fold_through_concatenate(
     return applied
 
 
-def _scheduling_hint_targets(all_nodes: Set[Node]) -> Set[Node]:
+def _scheduling_hint_targets(all_nodes: set[Node]) -> set[Node]:
     """Every node some other node names as a scheduling predecessor.
 
     Orphaning one of these leaves a dangling hint: ``GraphAnalyzer.is_ready``
@@ -446,13 +447,13 @@ def _scheduling_hint_targets(all_nodes: Set[Node]) -> Set[Node]:
     — not ``No progress``, whose raise requires a *ready* node, and a
     hint-blocked node is never ready.
     """
-    targets: Set[Node] = set()
+    targets: set[Node] = set()
     for node in all_nodes:
         targets |= node.scheduling_predecessors
     return targets
 
 
-def _blocks_orphan(node: Node, hint_targets: Set[Node]) -> bool:
+def _blocks_orphan(node: Node, hint_targets: set[Node]) -> bool:
     """True when orphaning *node* would break caller-declared scheduling.
 
     Two directions, both fatal in their own way:
@@ -483,7 +484,7 @@ def _blocks_orphan(node: Node, hint_targets: Set[Node]) -> bool:
     return bool(node.scheduling_predecessors) or node in hint_targets
 
 
-def _blocks_merge(node: Node, hint_targets: Set[Node]) -> bool:
+def _blocks_merge(node: Node, hint_targets: set[Node]) -> bool:
     """True when *node* may not be folded into a sibling merge.
 
     Wider than :func:`_blocks_absorb` on two counts.
@@ -507,7 +508,7 @@ def _blocks_merge(node: Node, hint_targets: Set[Node]) -> bool:
     )
 
 
-def _merge_run(run: List[Linear], fold_log: FoldLog) -> Linear:
+def _merge_run(run: list[Linear], fold_log: FoldLog) -> Linear:
     """Widen ``run[0]`` in place to span the whole run; orphan the rest.
 
     ``concat(Linear(x, W_0), ..., Linear(x, W_k))`` holds exactly the columns
@@ -546,11 +547,11 @@ def _merge_run(run: List[Linear], fold_log: FoldLog) -> Linear:
 
 def _merge_sibling_linear_leaves(
     c: Concatenate,
-    output_nodes: Set[Node],
-    consumers: Dict[Node, List[Node]],
-    hint_targets: Set[Node],
-    touched: Set[Node],
-    mutated: Set[Node],
+    output_nodes: set[Node],
+    consumers: dict[Node, list[Node]],
+    hint_targets: set[Node],
+    touched: set[Node],
+    mutated: set[Node],
     fold_log: FoldLog,
 ) -> int:
     """Merge maximal contiguous runs of same-input Linear leaves of ``c``.
@@ -585,7 +586,7 @@ def _merge_sibling_linear_leaves(
 
     Returns the number of runs merged.
     """
-    occurrences: Dict[int, int] = {}
+    occurrences: dict[int, int] = {}
     for leaf in c.inputs:
         occurrences[id(leaf)] = occurrences.get(id(leaf), 0) + 1
 
@@ -600,7 +601,7 @@ def _merge_sibling_linear_leaves(
         )
 
     inputs = c.inputs
-    new_inputs: List[Node] = []
+    new_inputs: list[Node] = []
     applied = 0
     i = 0
     while i < len(inputs):
@@ -618,11 +619,11 @@ def _merge_sibling_linear_leaves(
             and inputs[j].inputs[0] is shared_input
         ):
             j += 1
-        run: List[Linear] = cast(List[Linear], inputs[i:j])
+        run: list[Linear] = cast("list[Linear]", inputs[i:j])
 
         # A leaf occurring both inside and outside the run cannot merge: the
         # outside slot would read the widened survivor.
-        run_counts: Dict[int, int] = {}
+        run_counts: dict[int, int] = {}
         for leaf_in_run in run:
             run_counts[id(leaf_in_run)] = run_counts.get(id(leaf_in_run), 0) + 1
         escapes = any(occurrences[k] != v for k, v in run_counts.items())
@@ -651,11 +652,11 @@ def _merge_sibling_linear_leaves(
 
 def _bypass_trivial_concatenate(
     c: Concatenate,
-    output_nodes: Set[Node],
-    consumers: Dict[Node, List[Node]],
-    hint_targets: Set[Node],
-    touched: Set[Node],
-    mutated: Set[Node],
+    output_nodes: set[Node],
+    consumers: dict[Node, list[Node]],
+    hint_targets: set[Node],
+    touched: set[Node],
+    mutated: set[Node],
 ) -> int:
     """A one-leaf ``Concatenate`` *is* its leaf: rewire consumers, orphan it.
 
@@ -702,7 +703,7 @@ def _bypass_trivial_concatenate(
 
 
 def _fuse_one_pass(
-    output_nodes: Set[Node], verbose: bool, mutated: Set[Node], fold_log: FoldLog
+    output_nodes: set[Node], verbose: bool, mutated: set[Node], fold_log: FoldLog
 ) -> int:
     """One fusion round: apply a set of non-overlapping folds, return the count.
 
@@ -719,7 +720,7 @@ def _fuse_one_pass(
     consumers = _consumer_map(all_nodes)
     hint_targets = _scheduling_hint_targets(all_nodes)
 
-    touched: Set[Node] = set()
+    touched: set[Node] = set()
     applied = 0
 
     def param_delta_ok(new_params: int, old_params: int) -> bool:
@@ -847,9 +848,9 @@ def _fuse_one_pass(
 
 
 def fuse_consecutive_linears(
-    output_nodes: Set[Node],
+    output_nodes: set[Node],
     verbose: bool = False,
-    fold_log: Optional[FoldLog] = None,
+    fold_log: FoldLog | None = None,
 ) -> int:
     """Fuse adjacent linear maps, FFN-aware, until no more folds apply.
 
@@ -916,7 +917,7 @@ def fuse_consecutive_linears(
         Total number of folds performed.
     """
     total = 0
-    mutated: Set[Node] = set()
+    mutated: set[Node] = set()
     if fold_log is None:
         fold_log = FoldLog()
     while True:
@@ -931,7 +932,7 @@ def fuse_consecutive_linears(
     return total
 
 
-def _recompute_bounds_after_fusion(output_nodes: Set[Node], mutated: Set[Node]) -> None:
+def _recompute_bounds_after_fusion(output_nodes: set[Node], mutated: set[Node]) -> None:
     """Refresh ``_structural_type`` / ``_affine_bound`` on every node a fold
     made stale — the mutated survivors and everything downstream of one.
 
@@ -949,7 +950,7 @@ def _recompute_bounds_after_fusion(output_nodes: Set[Node], mutated: Set[Node]) 
     from torchwright.graph.affine_rules import refresh_node_caches
 
     reachable = get_ancestor_nodes(output_nodes)
-    dirty: Set[Node] = set(mutated)
+    dirty: set[Node] = set(mutated)
     for node in sorted(reachable, key=lambda n: n.node_id):
         if node in mutated or any(inp in dirty for inp in node.inputs):
             refresh_node_caches(node)
@@ -957,7 +958,7 @@ def _recompute_bounds_after_fusion(output_nodes: Set[Node], mutated: Set[Node]) 
 
 
 def optimize_graph(
-    output_nodes: Set[Node],
+    output_nodes: set[Node],
     verbose: bool = False,
 ) -> None:
     """Apply all graph optimization passes.

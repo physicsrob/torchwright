@@ -39,7 +39,8 @@ def _payload(n_pos: int) -> torch.Tensor:
 @pytest.mark.parametrize("delta", BACKWARD_DELTAS)
 def test_rotary_offset_token_identical_to_trig(delta):
     """Oracle: the rotary head selects the same key as trig ``attend_to_offset``
-    at every in-bounds position — the sign-convention lock across all Δ."""
+    at every in-bounds position — the sign-convention lock across all Δ.
+    """
     rope = create_rope_config(d_head=D_HEAD, max_positions=512)
     payload = create_input("payload", 1)
     vals = _payload(N_POS)
@@ -60,7 +61,8 @@ def test_rotary_offset_token_identical_to_trig(delta):
 @pytest.mark.parametrize("delta", [-1, -3, 1])
 def test_rotary_offset_compiled_matches_oracle_all_deltas(delta):
     """probe_compiled: the compiled rotary head matches its oracle at
-    representative backward, wider-backward, and forward Δ."""
+    representative backward, wider-backward, and forward Δ.
+    """
     payload = create_input("payload", 1)
     vals = _payload(N_POS)
     rotary = rotary_offset_head(payload, delta_pos=delta, d_qk=D_HEAD)

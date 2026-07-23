@@ -29,9 +29,10 @@ Scope and limits:
   that broke it rather than only the top output.
 """
 
+from collections.abc import Iterator, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass, field
-from typing import Any, Dict, Iterator, List, Optional, Protocol, Sequence, Tuple
+from typing import Any, Protocol
 
 import torch
 
@@ -48,7 +49,7 @@ from torchwright.debug.extraction import (
     first_state_with,
 )
 from torchwright.graph import Concatenate, Node
-from torchwright.graph.attn import Attn, CAUSAL_MASK_SENTINEL
+from torchwright.graph.attn import CAUSAL_MASK_SENTINEL, Attn
 from torchwright.graph.misc import (
     InputNode,
     LiteralValue,
@@ -75,17 +76,17 @@ class DebugRuntime(Protocol):
     maps each captured state to ``(residual_tensor, label)``.
     """
 
-    def debug_layout(self) -> Tuple[ResidualAssignment, List[tuple]]: ...
+    def debug_layout(self) -> tuple[ResidualAssignment, list[tuple]]: ...
 
     def run_with_states(
         self,
         prefill: torch.Tensor,
         past_len: int = 0,
         past_kvs: Any = None,
-    ) -> Tuple[ResidualAssignment, List[tuple], StateTensors]: ...
+    ) -> tuple[ResidualAssignment, list[tuple], StateTensors]: ...
 
     def build_prefill(
-        self, input_values: Dict[str, Any], n_pos: int
+        self, input_values: dict[str, Any], n_pos: int
     ) -> torch.Tensor: ...
 
     def capture_attention(
@@ -94,7 +95,7 @@ class DebugRuntime(Protocol):
         prefill: torch.Tensor,
         past_len: int = 0,
         past_kvs: Any = None,
-    ) -> Tuple[torch.Tensor, torch.Tensor]: ...
+    ) -> tuple[torch.Tensor, torch.Tensor]: ...
 
 
 # ---------------------------------------------------------------------------
@@ -104,10 +105,10 @@ class DebugRuntime(Protocol):
 
 def reference_eval(
     output_node: Node,
-    input_values: Dict[str, torch.Tensor],
+    input_values: dict[str, torch.Tensor],
     n_pos: int,
-    seed: Optional[Dict[Node, torch.Tensor]] = None,
-) -> Dict[Node, torch.Tensor]:
+    seed: dict[Node, torch.Tensor] | None = None,
+) -> dict[Node, torch.Tensor]:
     """Recursively evaluate the graph and return ``{Node: tensor}``.
 
     Walks the graph via ``node.compute`` — the same method the compiler
@@ -134,7 +135,7 @@ def reference_eval(
         itself) to its oracle value as an ``(n_pos, node.d_output)``
         tensor.  Seeded entries are included verbatim.
     """
-    cache: Dict[Node, torch.Tensor] = dict(seed) if seed else {}
+    cache: dict[Node, torch.Tensor] = dict(seed) if seed else {}
 
     # Collect all node subclasses reachable from the output graph so we
     # only patch classes actually in use.  Walking by class lets us
@@ -156,7 +157,7 @@ def reference_eval(
 
         return wrapped
 
-    patched: List[Tuple[type, Any]] = []
+    patched: list[tuple[type, Any]] = []
     try:
         for cls in classes_in_graph:
             if "compute" in cls.__dict__:
@@ -210,20 +211,20 @@ class ProbeReport:
     #: Graph nodes ordered by topological rank, excluding nodes the
     #: probe cannot check (Concatenate groupings, nodes with no column
     #: assignment in any snapshot).
-    nodes_checked: List[Node] = field(default_factory=list)
+    nodes_checked: list[Node] = field(default_factory=list)
 
     #: Per-node divergence records, keyed by the node's topological
     #: index.  Every entry in ``nodes_checked`` has a record; the record
     #: is considered "divergent" if ``max_abs_error`` exceeds the
     #: probe's ``atol``.
-    per_node: Dict[Node, NodeDivergence] = field(default_factory=dict)
+    per_node: dict[Node, NodeDivergence] = field(default_factory=dict)
 
     #: The first node in topological order whose compiled value
     #: exceeds ``atol``, or ``None`` if the probe found no divergence.
-    first_divergent: Optional[NodeDivergence] = None
+    first_divergent: NodeDivergence | None = None
 
     #: Graph nodes the probe deliberately skipped, with a reason.
-    skipped: Dict[Node, str] = field(default_factory=dict)
+    skipped: dict[Node, str] = field(default_factory=dict)
 
     #: Tolerance used for the "divergent" classification.
     atol: float = 1e-3
@@ -255,7 +256,7 @@ class ProbeReport:
 def _ordered_mlp_states(
     net: HeadlessTransformer,
     ra: ResidualAssignment,
-) -> List[Tuple[int, str, ResidualStreamState]]:
+) -> list[tuple[int, str, ResidualStreamState]]:
     """Post-MLP sublayer states in execution order.
 
     Returns ``(layer_index, state_name, state)`` triples, one per
@@ -265,7 +266,7 @@ def _ordered_mlp_states(
     output is reachable when the last layer happens to receive no new
     assignments.
     """
-    ordered: List[Tuple[int, str, ResidualStreamState]] = []
+    ordered: list[tuple[int, str, ResidualStreamState]] = []
     for i, layer in enumerate(net.layers):
         st = layer.mlp.out_state
         if st in ra.mapping:
@@ -282,10 +283,10 @@ def _run_with_states(
     prefill: torch.Tensor,
     past_len: int = 0,
     past_kvs: Any = None,
-) -> Tuple[
+) -> tuple[
     ResidualAssignment,
-    List[tuple],
-    Dict[ResidualStreamState, Tuple[torch.Tensor, str]],
+    list[tuple],
+    dict[ResidualStreamState, tuple[torch.Tensor, str]],
 ]:
     """Run the compiled backend once with per-sublayer state capture.
 
@@ -309,7 +310,7 @@ def _run_with_states(
 def probe_compiled(
     compiled: DebugRuntime,
     output_node: Node,
-    input_values: Dict[str, torch.Tensor],
+    input_values: dict[str, torch.Tensor],
     n_pos: int,
     atol: float = 1e-3,
 ) -> ProbeReport:
@@ -404,7 +405,7 @@ def probe_compiled(
 
 def _inputs_from_dict(
     compiled: DebugRuntime,
-    input_values: Dict[str, torch.Tensor],
+    input_values: dict[str, torch.Tensor],
     n_pos: int,
 ) -> torch.Tensor:
     """Pack an input-name → tensor dict into the flat row-tensor layout
@@ -416,11 +417,11 @@ def _inputs_from_dict(
 
 def probe_graph(
     output_node: Node,
-    input_values: Dict[str, torch.Tensor],
+    input_values: dict[str, torch.Tensor],
     n_pos: int,
     d: int = 1024,
     d_head: int = 16,
-    d_hidden: Optional[int] = None,
+    d_hidden: int | None = None,
     max_layers: int = 200,
     atol: float = 1e-3,
     verbose: bool = False,
@@ -466,7 +467,7 @@ def probe_graph(
 
 def build_prefill_from_input_values(
     compiled: DebugRuntime,
-    input_values: Dict[str, torch.Tensor],
+    input_values: dict[str, torch.Tensor],
     n_pos: int,
 ) -> torch.Tensor:
     """Pack an ``{input_name: tensor}`` dict into the flat prefill layout.
@@ -493,13 +494,13 @@ class ResidualProbe:
     """
 
     node: Node
-    per_layer: Dict[int, torch.Tensor] = field(default_factory=dict)
-    layers: List[int] = field(default_factory=list)
+    per_layer: dict[int, torch.Tensor] = field(default_factory=dict)
+    layers: list[int] = field(default_factory=list)
     # Shape of any per-layer tensor (all layers share the same shape by
     # construction); empty tuple if ``per_layer`` is empty.
-    shape: Tuple[int, ...] = ()
+    shape: tuple[int, ...] = ()
 
-    def at(self, layer: int) -> Optional[torch.Tensor]:
+    def at(self, layer: int) -> torch.Tensor | None:
         """Value at ``layer``, or ``None`` if the node is not materialised there."""
         return self.per_layer.get(layer)
 
@@ -525,7 +526,7 @@ def probe_residual(
     prefill: torch.Tensor,
     node: Node,
     *,
-    at_layer: Optional[int] = None,
+    at_layer: int | None = None,
     past_len: int = 0,
     past_kvs: Any = None,
 ) -> ResidualProbe:
@@ -568,8 +569,8 @@ def probe_residual(
         past_len,
         past_kvs=past_kvs,
     )
-    per_layer: Dict[int, torch.Tensor] = {}
-    shape: Tuple[int, ...] = ()
+    per_layer: dict[int, torch.Tensor] = {}
+    shape: tuple[int, ...] = ()
     for layer_i, _name, state in ordered:
         if at_layer is not None and layer_i != at_layer:
             continue
@@ -597,7 +598,7 @@ def probe_residual(
 def attention_capture(
     net: HeadlessTransformer,
     layer_index: int,
-) -> Iterator[Dict[str, Optional[torch.Tensor]]]:
+) -> Iterator[dict[str, torch.Tensor | None]]:
     """Monkey-patch ``net.layers[layer_index].attn.attn.forward_cached`` to
     capture the explicit softmax weights and raw logits produced on each
     call.
@@ -618,7 +619,7 @@ def attention_capture(
     ``None``; populated when the hook fires), each of shape
     ``(n_heads, n_queries, n_keys)``.
     """
-    captured: Dict[str, Optional[torch.Tensor]] = {
+    captured: dict[str, torch.Tensor | None] = {
         "logits": None,
         "weights": None,
     }
@@ -675,13 +676,13 @@ class AttentionProbe:
     logits: torch.Tensor
     #: Optional per-key labels (len == n_keys), supplied by the caller.
     #: Empty list if the caller did not pass ``position_labels``.
-    position_labels: List[str] = field(default_factory=list)
+    position_labels: list[str] = field(default_factory=list)
 
     def top(
         self,
         k: int = 8,
         head: int = 0,
-    ) -> List[Tuple[int, float, str]]:
+    ) -> list[tuple[int, float, str]]:
         """Return ``(key_pos, weight, label)`` for the ``k`` largest
         weights in head ``head``.  ``label`` is empty if
         ``position_labels`` was not supplied.
@@ -690,7 +691,7 @@ class AttentionProbe:
         n_keys = int(w.shape[0])
         k_eff = min(k, n_keys)
         topk = torch.topk(w, k=k_eff)
-        out: List[Tuple[int, float, str]] = []
+        out: list[tuple[int, float, str]] = []
         for val, idx in zip(topk.values.tolist(), topk.indices.tolist()):
             label = self.position_labels[idx] if idx < len(self.position_labels) else ""
             out.append((int(idx), float(val), label))
@@ -705,7 +706,7 @@ def probe_attention(
     query_pos: int,
     past_len: int = 0,
     past_kvs: Any = None,
-    position_labels: Optional[Sequence[str]] = None,
+    position_labels: Sequence[str] | None = None,
 ) -> AttentionProbe:
     """Capture softmax weights and logits at a specific query position.
 
@@ -745,7 +746,7 @@ def probe_attention(
     """
     ra, ordered = compiled.debug_layout()
 
-    layer_index: Optional[int] = None
+    layer_index: int | None = None
     for i, _name, state in ordered:
         if ra.has_node(state, attn_node):
             layer_index = i
@@ -788,17 +789,17 @@ class LayerDiffReport:
     node: Node
     #: One record per layer where ``node`` is materialised within
     #: ``layer_range``, in ascending layer order.
-    records: List[LayerDiffRecord] = field(default_factory=list)
+    records: list[LayerDiffRecord] = field(default_factory=list)
     #: Earliest layer with ``max_abs_delta > drift_threshold``; ``None``
     #: if the delta stayed within threshold across every observed layer.
-    first_drift_layer: Optional[int] = None
+    first_drift_layer: int | None = None
     #: Earliest layer where ``|value - sentinel| < sentinel_tol`` holds
     #: for at least one element; ``None`` either because the caller
     #: did not set ``sentinel`` or because the sentinel never surfaced.
-    first_sentinel_layer: Optional[int] = None
+    first_sentinel_layer: int | None = None
     #: Echoed back from the call for reference; ``None`` when sentinel
     #: detection was not requested.
-    sentinel_value: Optional[float] = None
+    sentinel_value: float | None = None
 
 
 def probe_layer_diff(
@@ -808,9 +809,9 @@ def probe_layer_diff(
     *,
     reference: torch.Tensor,
     positions: Sequence[int],
-    layer_range: Optional[Tuple[int, int]] = None,
+    layer_range: tuple[int, int] | None = None,
     drift_threshold: float = 1e-3,
-    sentinel: Optional[float] = None,
+    sentinel: float | None = None,
     sentinel_tol: float = 1e-4,
     past_len: int = 0,
     past_kvs: Any = None,
@@ -919,8 +920,8 @@ def probe_layer_diff(
 
 def check_asserts_on_compiled(
     compiled: DebugRuntime,
-    asserts: List[Node],
-    input_values: Dict[str, torch.Tensor],
+    asserts: list[Node],
+    input_values: dict[str, torch.Tensor],
     n_pos: int,
 ) -> None:
     """Run each checked node's assert predicates against the compiled residual stream.

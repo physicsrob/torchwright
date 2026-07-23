@@ -32,8 +32,6 @@ Run locally:         ../.venv/bin/python -m scripts.investigate_onehot_leak
 Cross-host (Modal):  make modal-run MODULE=scripts.investigate_onehot_leak CPU_ONLY=1
 """
 
-from typing import Dict, List, Optional, Tuple
-
 import torch
 
 import torchwright.ops.swiglu.map_select as _map_select
@@ -63,7 +61,7 @@ def _f32(x: float) -> torch.Tensor:
 # ---------------------------------------------------------------------------
 
 
-def _patched_scale(value: Optional[float]):
+def _patched_scale(value: float | None):
     class _Ctx:
         def __enter__(self):
             self.saved = (_map_select.scale, _onehot_table.scale)
@@ -77,8 +75,8 @@ def _patched_scale(value: Optional[float]):
     return _Ctx()
 
 
-def build_carry_chain(scale_override: Optional[float]) -> Dict[str, Node]:
-    """total -> in_range(total, total+1, 61) -> bool_to_01 -> lookups.
+def build_carry_chain(scale_override: float | None) -> dict[str, Node]:
+    """Total -> in_range(total, total+1, 61) -> bool_to_01 -> lookups.
 
     The exact shape of calculator_simple.multiply_digit_seqs' carry sweep,
     minus the embedding-valued digit table (replaced by a 0/1-valued table
@@ -111,7 +109,7 @@ def build_carry_chain(scale_override: Optional[float]) -> Dict[str, Node]:
     }
 
 
-def build_times_table(scale_override: Optional[float]) -> Dict[str, Node]:
+def build_times_table(scale_override: float | None) -> dict[str, Node]:
     """Two machine-built one-hot digits -> two-block times-table lookup.
 
     The multi-block (swiglu-lane) path of onehot_lookup, fed by the same
@@ -125,7 +123,7 @@ def build_times_table(scale_override: Optional[float]) -> Dict[str, Node]:
         b1h = bool_to_01(in_range(b, add_const(b, 1.0), 10))
         key_node = concat([a1h, b1h])
 
-        table: Dict[torch.Tensor, torch.Tensor] = {}
+        table: dict[torch.Tensor, torch.Tensor] = {}
         for da in range(10):
             for db in range(10):
                 k = torch.zeros(20)
@@ -142,8 +140,8 @@ def build_times_table(scale_override: Optional[float]) -> Dict[str, Node]:
 
 
 def sweep_carry(
-    nodes: Dict[str, Node], deltas: List[float], device: torch.device
-) -> Dict[str, torch.Tensor]:
+    nodes: dict[str, Node], deltas: list[float], device: torch.device
+) -> dict[str, torch.Tensor]:
     ts, dvals = [], []
     for t in range(N_SLOTS):
         for d in deltas:
@@ -181,9 +179,9 @@ def sweep_carry(
 
 
 def sweep_times_table(
-    nodes: Dict[str, Node], deltas: List[float], device: torch.device
-) -> Dict[str, torch.Tensor]:
-    rows: List[Tuple[int, int, float]] = []
+    nodes: dict[str, Node], deltas: list[float], device: torch.device
+) -> dict[str, torch.Tensor]:
+    rows: list[tuple[int, int, float]] = []
     for da in range(10):
         for db in range(10):
             for d in deltas:

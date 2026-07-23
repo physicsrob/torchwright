@@ -207,8 +207,8 @@ def test_equals_vector_has_bounded_range():
 
 
 def test_select_bounded_range():
-    from torchwright.ops.relu.map_select import select
     from torchwright.graph.asserts import assert_bool
+    from torchwright.ops.relu.map_select import select
 
     cond = assert_bool(LiteralValue(torch.tensor([1.0])))
     a = LiteralValue(torch.tensor([2.0, 3.0]))
@@ -220,8 +220,8 @@ def test_select_bounded_range():
 
 
 def test_select_binary_branches():
-    from torchwright.ops.relu.map_select import select
     from torchwright.graph.asserts import assert_bool
+    from torchwright.ops.relu.map_select import select
 
     cond = assert_bool(LiteralValue(torch.tensor([1.0])))
     a = LiteralValue(torch.tensor([0.0, 1.0]))
@@ -244,8 +244,8 @@ def test_select_unknown_cond():
 
 
 def test_cond_gate_bounded_range():
-    from torchwright.ops.relu.logic_ops import cond_gate
     from torchwright.graph.asserts import assert_bool
+    from torchwright.ops.relu.logic_ops import cond_gate
 
     cond = assert_bool(LiteralValue(torch.tensor([1.0])))
     inp = LiteralValue(torch.tensor([3.0, 5.0]))
@@ -256,8 +256,8 @@ def test_cond_gate_bounded_range():
 
 
 def test_cond_gate_binary_inp():
-    from torchwright.ops.relu.logic_ops import cond_gate
     from torchwright.graph.asserts import assert_bool
+    from torchwright.ops.relu.logic_ops import cond_gate
 
     cond = assert_bool(LiteralValue(torch.tensor([1.0])))
     inp = LiteralValue(torch.tensor([0.0, 1.0]))
@@ -291,8 +291,8 @@ def test_in_range_bounded():
 
 
 def test_floor_int_bounded():
-    from torchwright.ops.relu.arithmetic_ops import floor_int
     from torchwright.graph.asserts import assert_in_range
+    from torchwright.ops.relu.arithmetic_ops import floor_int
 
     inp = assert_in_range(LiteralValue(torch.tensor([2.5])), 0.0, 10.0)
     out = floor_int(inp, 0, 10)
@@ -302,8 +302,8 @@ def test_floor_int_bounded():
 
 
 def test_ceil_int_bounded():
-    from torchwright.ops.relu.arithmetic_ops import ceil_int
     from torchwright.graph.asserts import assert_in_range
+    from torchwright.ops.relu.arithmetic_ops import ceil_int
 
     inp = assert_in_range(LiteralValue(torch.tensor([2.5])), 0.0, 10.0)
     out = ceil_int(inp, 0, 10)

@@ -36,7 +36,8 @@ def _build_relu_chain_graph(d_input: int, d_hidden_chain: int, d_output: int):
 
 def test_mlp_sublayer_rectangular_shapes():
     """``MLPSubLayer(d, d_hidden)`` allocates rectangular weight matrices
-    and forwards correctly."""
+    and forwards correctly.
+    """
     mlp = MLPSubLayer(d=32, d_hidden=8)
     assert mlp.linear1.output_matrix.shape == (32, 8)
     assert mlp.linear1.output_bias.shape == (8,)
@@ -97,7 +98,8 @@ def test_compile_with_small_d_hidden():
 def test_compile_with_d_hidden_larger_than_d():
     """A chain whose hidden width exceeds ``d``.  Before the decoupling
     the scheduler would reject the chain because ``next_slot + d_hidden
-    > self.d`` (the per-layer pool was the residual stream itself)."""
+    > self.d`` (the per-layer pool was the residual stream itself).
+    """
     out_node, inp = _build_relu_chain_graph(d_input=4, d_hidden_chain=48, d_output=2)
 
     # d=32 is smaller than the chain's hidden width (48) — impossible

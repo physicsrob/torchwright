@@ -10,17 +10,16 @@ normal paths, so the only way to exercise it is to force it.
 import pytest
 import torch
 
-import torchwright.compiler.device as device_mod
 from torchwright.compiler.forward.compile import (
     _verify_end_of_layer_liveness,
     forward_compile,
 )
 from torchwright.compiler.forward.graph_analysis import GraphAnalyzer
-from torchwright.compiler.forward.residual_map import ResidualStreamMap
 from torchwright.compiler.forward.replay_plan import (
     PlannedAttentionOp,
     PlannedMlpOp,
 )
+from torchwright.compiler.forward.residual_map import ResidualStreamMap
 from torchwright.compiler.forward.weight_writer import (
     _write_compute_attn,
     _write_compute_literal_value,
@@ -40,7 +39,8 @@ D_HEAD = 16
 
 def test_D_allocate_rejects_overlap_with_live_node():
     """If _free somehow contained a column already owned by a live node,
-    allocate's pre-commit check fires with the overlap detail."""
+    allocate's pre-commit check fires with the overlap detail.
+    """
     rmap = ResidualStreamMap(32)
     a = InputNode("a", 4, value_range=(-100.0, 100.0))
     rmap.allocate(a)
@@ -58,7 +58,8 @@ def test_D_allocate_rejects_overlap_with_live_node():
 
 def test_D_check_invariants_catches_missing_column():
     """After mutation, if a column is neither in _free nor in any node's
-    indices, _check_invariants names the missing column(s)."""
+    indices, _check_invariants names the missing column(s).
+    """
     rmap = ResidualStreamMap(16)
     a = InputNode("a", 4, value_range=(-100.0, 100.0))
     rmap.allocate(a)
@@ -88,7 +89,8 @@ def test_D_check_invariants_catches_pairwise_overlap():
 
 def test_D_check_invariants_catches_held_overlap_with_allocated():
     """A held column that is also owned by a live node fires the
-    held-vs-allocated disjointness branch."""
+    held-vs-allocated disjointness branch.
+    """
     rmap = ResidualStreamMap(16)
     a = InputNode("a", 4, value_range=(-100.0, 100.0))
     rmap.allocate(a)
@@ -102,7 +104,8 @@ def test_D_check_invariants_catches_held_overlap_with_allocated():
 
 def test_D_check_invariants_catches_held_overlap_with_free():
     """A held column that is also in the free pool fires the
-    held-vs-free disjointness branch."""
+    held-vs-free disjointness branch.
+    """
     rmap = ResidualStreamMap(16)
 
     # Poison: mark a free column as held without removing it from _free.
@@ -114,7 +117,8 @@ def test_D_check_invariants_catches_held_overlap_with_free():
 
 def test_D_check_invariants_catches_held_overlap_with_reserved():
     """A held column that is also reserved fires the held-vs-reserved
-    disjointness branch."""
+    disjointness branch.
+    """
     rmap = ResidualStreamMap(16)
     rmap.reserve([0, 1])
 
@@ -128,7 +132,8 @@ def test_D_check_invariants_catches_held_overlap_with_reserved():
 def test_D_check_invariants_totality_covers_held():
     """A column dropped from the held bank (without landing anywhere else)
     fires the totality check — held columns are part of the
-    free/allocated/held/reserved partition of {0..d-1}."""
+    free/allocated/held/reserved partition of {0..d-1}.
+    """
     rmap = ResidualStreamMap(16)
     a = InputNode("a", 4, value_range=(-100.0, 100.0))
     rmap.allocate(a)
@@ -148,7 +153,8 @@ def test_D_check_invariants_totality_covers_held():
 
 def test_C_literal_write_rejects_truncation():
     """_write_compute_literal_value refuses when target_cols is shorter
-    than the literal's value tensor."""
+    than the literal's value tensor.
+    """
     layer = TransformerLayer(D, D_HEAD)
     lit = LiteralValue(torch.tensor([1.0, 2.0, 3.0, 4.0]), name="lit")
     # Only 2 target cols, but value has 4 entries — would silently drop.
@@ -180,7 +186,8 @@ def test_C_literal_write_rejects_extra_target_cols():
 
 def test_B_attn_rejects_v_source_cols_wrong_length():
     """_write_compute_attn raises when V source_cols length doesn't match
-    value_in width."""
+    value_in width.
+    """
     # A plain residual node feeding both Q and K (it stands in for whatever
     # the head reads; position is now a rotation inside attention, not an input).
     qk = InputNode("qk", 17, value_range=(-100.0, 100.0))
@@ -279,7 +286,8 @@ def test_attn_rejects_d_qk_not_equal_d_head(d_qk):
 
 def test_A_end_of_layer_catches_freed_too_early(monkeypatch):
     """If a node is freed while still having uncomputed consumers, the
-    gated end-of-layer check fires with the consumer names."""
+    gated end-of-layer check fires with the consumer names.
+    """
     # Two-node linear chain: x -> l (Linear). Compile expects l to read
     # x's columns, so x must stay allocated while l is uncomputed.
     x = InputNode("x", 4, value_range=(-100.0, 100.0))
@@ -308,7 +316,8 @@ def test_A_end_of_layer_catches_freed_too_early(monkeypatch):
 
 def test_A_require_live_raises_for_unallocated_input():
     """LayerScheduler._require_live surfaces unallocated source nodes with
-    op context before the downstream KeyError."""
+    op context before the downstream KeyError.
+    """
     from torchwright.compiler.forward.scheduler import LayerScheduler
 
     x = InputNode("x", 4, value_range=(-100.0, 100.0))
@@ -333,7 +342,8 @@ def test_A_require_live_raises_for_unallocated_input():
 def test_reserve_rejects_allocated_col():
     """reserve() must fail if any requested column is already allocated —
     the caller would otherwise silently lose that column from the free pool
-    without any effect (it was already not free)."""
+    without any effect (it was already not free).
+    """
     rmap = ResidualStreamMap(16)
     a = InputNode("a", 4, value_range=(-1.0, 1.0))
     rmap.allocate(a)  # takes [0,1,2,3]
@@ -344,7 +354,8 @@ def test_reserve_rejects_allocated_col():
 
 def test_reserve_blocks_subsequent_allocation():
     """Reserved columns cannot be handed out by allocate() — the
-    allocator-level guarantee that a reserved column is never reused."""
+    allocator-level guarantee that a reserved column is never reused.
+    """
     rmap = ResidualStreamMap(8)
     rmap.reserve([0, 1, 2, 3])
 
@@ -369,7 +380,8 @@ def _no_bias_setup():
 
 def test_no_bias_slot0_claim_fires():
     """An PlannedMlpOp claiming hidden slot 0 under bias=False is a scheduler bug:
-    slot 0 is the constant lane, packing must start at slot 1."""
+    slot 0 is the constant lane, packing must start at slot 1.
+    """
     from torchwright.compiler.forward.weight_writer import write_mlp_sublayer
     from torchwright.graph import FFN
 
@@ -399,7 +411,8 @@ def test_no_bias_slot0_claim_fires():
 
 def test_no_bias_const_column_aliasing_fires():
     """An FFN whose captured input columns include the pinned constant-1
-    column would collide with the bias-fold row — the writer must refuse."""
+    column would collide with the bias-fold row — the writer must refuse.
+    """
     from torchwright.compiler.forward.weight_writer import write_mlp_sublayer
     from torchwright.graph import FFN
 

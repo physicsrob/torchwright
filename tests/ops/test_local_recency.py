@@ -37,7 +37,7 @@ import pytest
 import torch
 
 from torchwright.graph import InputNode
-from torchwright.graph.rope import RopeConfig, rope_lobe_band, rope_inv_freq
+from torchwright.graph.rope import RopeConfig, rope_inv_freq, rope_lobe_band
 from torchwright.ops.attention_ops import get_prev_value
 from torchwright.ops.inout_nodes import create_rope_config
 
@@ -65,7 +65,8 @@ def _lobe_curve():
 # --------------------------------------------------------------------------- #
 def test_lobe_strictly_decreasing_within_window():
     """The distance-decay lobe is strictly decreasing over ``[0, W)`` — a nearer
-    key always outscores every farther one inside the window."""
+    key always outscores every farther one inside the window.
+    """
     peak, _, _, lobe = _lobe_curve()
     R = 600
     s = lobe(torch.arange(0, R + 1))
@@ -81,7 +82,8 @@ def test_lobe_strictly_decreasing_within_window():
 
 def test_lobe_breaks_down_past_window():
     """Past ``W`` the lobe is non-monotone: a concretely farther key outscores a
-    nearer one.  This is the local limit — tested, not a footnote (Phase 6)."""
+    nearer one.  This is the local limit — tested, not a footnote (Phase 6).
+    """
     _, _, _, lobe = _lobe_curve()
     R = 1500
     s = lobe(torch.arange(0, R + 1))
@@ -113,7 +115,8 @@ def _rope():
 def test_get_prev_value_latches_most_recent_true():
     """get_prev_value reads the value at the most recent position where cond is
     true; a single far trigger still latches (the content gate dominates the
-    bounded lobe regardless of distance)."""
+    bounded lobe regardless of distance).
+    """
     rope = _rope()
     value = InputNode("value", 1, value_range=(-100.0, 100.0))
     cond = InputNode("cond", 1, value_range=(-1.0, 1.0))
@@ -142,7 +145,8 @@ def test_get_prev_value_raises_on_degenerate_lobe_band():
     Hann-tapered to the endpoint floor: d_head=32, max_positions=64) must fail
     loudly at build time.  Before the guard this built a silently-leaky latch
     whose validity wobble, amplified 1000x by attend_mean_where, skewed
-    count_since_marker by 1.2 counts at a gap of 4."""
+    count_since_marker by 1.2 counts at a gap of 4.
+    """
     rope = create_rope_config(d_head=32, max_positions=64)
     value = InputNode("value", 1, value_range=(-1.0, 1.0))
     cond = InputNode("cond", 1, value_range=(-1.0, 1.0))
@@ -158,7 +162,8 @@ def test_get_prev_value_raises_when_rotation_defeats_the_gate():
     magnitude — yet θ_slow ≈ 0.116 turns the gate's cosine negative by
     Δ ≈ 14, inverting the cond ordering: the latch reads a false-cond
     position by distance 15.  The quasi-static precondition
-    (max_positions · θ_slow < π/2) must refuse the config at build time."""
+    (max_positions · θ_slow < π/2) must refuse the config at build time.
+    """
     rope = RopeConfig(d_head=32, max_positions=20, base=10.0)
     value = InputNode("value", 1, value_range=(-1.0, 1.0))
     cond = InputNode("cond", 1, value_range=(-1.0, 1.0))
@@ -178,7 +183,8 @@ def test_get_prev_value_raises_when_lobe_tiebreak_erodes_the_gap():
     proves nothing.  Reference eval at this config showed no actual misread
     (the lobe rides strictly faster planes than the gate, so its real decay
     preserves ordering) — the config is refused because the ordering can no
-    longer be *proven*, not because a failure reproduced."""
+    longer be *proven*, not because a failure reproduced.
+    """
     rope = RopeConfig(d_head=32, max_positions=20, base=16.0)
     value = InputNode("value", 1, value_range=(-1.0, 1.0))
     cond = InputNode("cond", 1, value_range=(-1.0, 1.0))
@@ -189,7 +195,8 @@ def test_get_prev_value_raises_when_lobe_tiebreak_erodes_the_gap():
 def test_get_prev_value_builds_on_healthy_bands():
     """Every config the repo actually uses clears the leak bound with orders of
     magnitude to spare — including the narrowest (d_head=16, max_positions=512,
-    a 3-plane band whose Hann midpoint survives)."""
+    a 3-plane band whose Hann midpoint survives).
+    """
     for d_head, max_positions in [(16, 512), (32, 512), (64, 4096), (256, 61440)]:
         rope = create_rope_config(d_head=d_head, max_positions=max_positions)
         value = InputNode("value", 1, value_range=(-1.0, 1.0))

@@ -22,7 +22,7 @@ from torchwright.graph import Concatenate, Embedding, Linear
 
 
 def _graph():
-    import examples.adder as adder
+    from examples import adder
 
     old = adder.max_digits
     adder.max_digits = 1
@@ -63,6 +63,7 @@ def test_padding_and_fusion_are_zero_filled(direct):
 
 def test_stock_streaming_bundle_loads_without_custom_code(tmp_path, monkeypatch):
     import importlib
+
     from transformers import AutoModelForCausalLM
 
     hf_build = importlib.import_module("torchwright.compiler.hf.build")

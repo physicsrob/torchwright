@@ -10,28 +10,27 @@ calculators that need it are swiglu graphs).
 """
 
 import math
-from typing import List, Optional, cast
+from typing import cast
 
 import torch
 
 from torchwright.graph import Embedding, Linear, Node, RopeConfig
 from torchwright.graph.rope import require_full_rotary, rope_inv_freq
-
 from torchwright.ops.attention_ops import (
     attend_argmax_dot,
     attend_to_offset,
     get_prev_value,
 )
+from torchwright.ops.inout_nodes import create_literal_value
 from torchwright.ops.linear import (
     add,
     add_const,
     bool_to_01,
-    multiply_const,
     concat,
+    multiply_const,
     negate,
     sum_nodes,
 )
-from torchwright.ops.inout_nodes import create_literal_value
 from torchwright.ops.swiglu.arithmetic_ops import compare
 from torchwright.ops.swiglu.logic_ops import (
     bool_all_true,
@@ -92,7 +91,7 @@ class NumericSequence:
 
         # Sliding window; at number boundaries, reset earlier positions
         # to "0".
-        current_digits: List[Node] = [embedding]
+        current_digits: list[Node] = [embedding]
         for i in range(digits - 1):
             current_digits.append(
                 select(
@@ -106,7 +105,7 @@ class NumericSequence:
         # delimiter token.
         self.digit_values = [attend_to_offset(rope, digit) for digit in current_digits]
 
-    def get_digits_at_event(self, termination_event: Node) -> List[Node]:
+    def get_digits_at_event(self, termination_event: Node) -> list[Node]:
         """Capture the digit window at the position where termination_event
         fires; the captured values persist forward via attention.
 
@@ -253,7 +252,7 @@ class IndexedRegion:
         assert max_len >= 1, "max_len must be >= 1"
         assert max_read_distance >= 1, "max_read_distance must be >= 1"
         assert default.numel() == len(embedding), "default must be an embedding row"
-        require_full_rotary(cast(int, rope.d_rot), rope.d_head, "IndexedRegion")
+        require_full_rotary(cast("int", rope.d_rot), rope.d_head, "IndexedRegion")
 
         # Build-time dominance bound (see _CONTENT_COS_FLOOR): the gather's
         # max_len + 1 content lanes land on planes d_head/2 − 1 (slowest)
@@ -360,7 +359,7 @@ class IndexedRegion:
 def output_sequence(
     rope: RopeConfig,
     trigger_condition: Node,
-    seq: List[Node],
+    seq: list[Node],
     default_output: torch.Tensor,
 ):
     """Gate a sequence of values for left-to-right autoregressive emission.
@@ -404,12 +403,12 @@ def output_sequence(
 
 def remove_leading_0s(
     embedding: Embedding,
-    seq: List[Node],
+    seq: list[Node],
     max_removals: int,
     *,
-    sign_cond: Optional[Node] = None,
-    sign_token: Optional[torch.Tensor] = None,
-) -> List[Node]:
+    sign_cond: Node | None = None,
+    sign_token: torch.Tensor | None = None,
+) -> list[Node]:
     """Remove leading zeros from a digit sequence by shifting left.
 
     With ``k`` the length of the leading run of ``"0"`` tokens capped at
@@ -497,14 +496,14 @@ def remove_leading_0s(
         else None
     )
 
-    out: List[Node] = []
+    out: list[Node] = []
     for i in range(n):
         candidates = [seq[min(i + k, n - 1)] for k in range(n_entries)]
         if sign_cond is not None:
             # Negative half: the sign at slot 0, the trimmed sequence
             # shifted right one everywhere else.
             candidates += [
-                cast(Node, sign) if i == 0 else seq[min(i - 1 + k, n - 1)]
+                cast("Node", sign) if i == 0 else seq[min(i - 1 + k, n - 1)]
                 for k in range(n_entries)
             ]
         masked = broadcast_select(

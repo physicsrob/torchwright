@@ -18,7 +18,6 @@ Reads the ONNX file directly (no onnxruntime), so it runs locally.
 import os
 import tempfile
 
-import numpy as np
 import onnx
 from onnx import numpy_helper
 
@@ -89,7 +88,8 @@ def test_token_onnx_embed_table_zeroes_free_pool_columns():
     """Every free-pool column (the ones the scheduler allocates for
     intermediate / output nodes assuming zero-init) is zero in the ONNX
     embed-table.  ``rms_norm=False`` so there are no reserved constant columns
-    to complicate the seedable set (embedding + const-1 only)."""
+    to complicate the seedable set (embedding + const-1 only).
+    """
     output_node, embedding = _adder_token_parts()
     seeded = _layer0_seeded_columns(output_node)
 
@@ -121,7 +121,8 @@ def test_token_onnx_embed_table_zeroes_free_pool_columns():
 
 def test_token_onnx_embed_table_is_not_trivially_empty():
     """Guard the guard: the embedding + const-1 columns really are seeded, so
-    the zero-check above is meaningful and not passing on an all-zero table."""
+    the zero-check above is meaningful and not passing on an all-zero table.
+    """
     output_node, embedding = _adder_token_parts()
     with tempfile.TemporaryDirectory() as tmpdir:
         onnx_path = os.path.join(tmpdir, "model.onnx")

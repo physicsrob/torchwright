@@ -13,7 +13,6 @@ from __future__ import annotations
 import importlib
 import os
 import tempfile
-from typing import List, Tuple
 
 import torch
 
@@ -47,8 +46,8 @@ def compile_example(name: str, d: int | None = None) -> str:
 
 
 def oracle_decode(
-    oracle, prefill_ids: List[int], n_steps: int
-) -> Tuple[List[int], List[torch.Tensor]]:
+    oracle, prefill_ids: list[int], n_steps: int
+) -> tuple[list[int], list[torch.Tensor]]:
     """Greedy argmax decode through the ONNX oracle's static-cache step loop.
 
     Returns (generated_ids, per_step_last_logits) — the last-position logits at
@@ -57,8 +56,8 @@ def oracle_decode(
     """
     past = oracle.empty_past()
     logits, past = oracle.step(torch.tensor(prefill_ids, dtype=torch.int64), past)
-    out_ids: List[int] = []
-    out_logits: List[torch.Tensor] = [logits[-1].clone()]
+    out_ids: list[int] = []
+    out_logits: list[torch.Tensor] = [logits[-1].clone()]
     for _ in range(n_steps):
         nid = int(logits[-1].argmax())
         out_ids.append(nid)
@@ -68,8 +67,8 @@ def oracle_decode(
 
 
 def hf_decode(
-    model, prefill_ids: List[int], n_steps: int
-) -> Tuple[List[int], List[torch.Tensor]]:
+    model, prefill_ids: list[int], n_steps: int
+) -> tuple[list[int], list[torch.Tensor]]:
     """Greedy argmax decode through the HF model with a stock DynamicCache.
 
     Mirrors :func:`oracle_decode` step-for-step so the two are directly
@@ -89,8 +88,8 @@ def hf_decode(
         )
     logits = out.logits[0]
     past = out.past_key_values
-    out_ids: List[int] = []
-    out_logits: List[torch.Tensor] = [logits[-1].clone()]
+    out_ids: list[int] = []
+    out_logits: list[torch.Tensor] = [logits[-1].clone()]
     for _ in range(n_steps):
         nid = int(logits[-1].argmax())
         out_ids.append(nid)
@@ -109,8 +108,8 @@ def hf_decode(
 
 
 def hf_teacher_forced(
-    model, prefill_ids: List[int], forced_ids: List[int]
-) -> List[torch.Tensor]:
+    model, prefill_ids: list[int], forced_ids: list[int]
+) -> list[torch.Tensor]:
     """Decode the HF model along a FIXED token stream (teacher forcing).
 
     Mirrors :func:`hf_decode` step-for-step but feeds ``forced_ids`` (the
@@ -135,7 +134,7 @@ def hf_teacher_forced(
             cache_position=torch.arange(n),
         )
     past = out.past_key_values
-    out_logits: List[torch.Tensor] = [out.logits[0][-1].clone()]
+    out_logits: list[torch.Tensor] = [out.logits[0][-1].clone()]
     for nid in forced_ids:
         with torch.no_grad():
             out = model(
@@ -150,6 +149,6 @@ def hf_teacher_forced(
     return out_logits
 
 
-def max_logit_diff(a: List[torch.Tensor], b: List[torch.Tensor]) -> float:
+def max_logit_diff(a: list[torch.Tensor], b: list[torch.Tensor]) -> float:
     """Max abs logit difference across all compared (prefill + per-step) rows."""
     return max((x - y).abs().max().item() for x, y in zip(a, b))

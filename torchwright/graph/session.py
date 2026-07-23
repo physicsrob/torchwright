@@ -14,7 +14,7 @@ from __future__ import annotations
 
 from contextlib import contextmanager
 from contextvars import ContextVar
-from typing import TYPE_CHECKING, List, Optional
+from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
     from torchwright.graph.misc import InputNode
@@ -24,15 +24,15 @@ class GraphSession:
     """Holds state for one graph-construction session."""
 
     def __init__(self) -> None:
-        self.input_nodes: List["InputNode"] = []
+        self.input_nodes: list[InputNode] = []
 
-    def register_input(self, node: "InputNode") -> None:
+    def register_input(self, node: InputNode) -> None:
         self.input_nodes.append(node)
 
 
 _implicit_session = GraphSession()
 
-_current_session: ContextVar[Optional[GraphSession]] = ContextVar(
+_current_session: ContextVar[GraphSession | None] = ContextVar(
     "_current_session",
     default=None,
 )

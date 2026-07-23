@@ -41,11 +41,9 @@ layer; invariants that hold on aggregated values (``{0, 1}`` bools
 after broadcast) take a tolerance large enough to absorb that fuzz.
 """
 
-from typing import List, Optional, Set
-
 import torch
 
-from torchwright.graph import Node, Concatenate
+from torchwright.graph import Concatenate, Node
 from torchwright.graph.misc import Check, Predicate
 from torchwright.graph.node import _current_annotation
 from torchwright.graph.value_type import NodeValueType, Range, tightened_with
@@ -56,7 +54,7 @@ def attach_assert(
     predicate: Predicate,
     message: str = "",
     *,
-    claimed_type: Optional[NodeValueType] = None,
+    claimed_type: NodeValueType | None = None,
     integer_claim: bool = False,
 ) -> Node:
     """Attach an assert-kind check (and optional range claim) to ``node``.
@@ -105,7 +103,7 @@ def debug_watch(node: Node, predicate: Predicate, message: str = "") -> Node:
     return node
 
 
-def collect_asserts(output_node: Node) -> List[Node]:
+def collect_asserts(output_node: Node) -> list[Node]:
     """Nodes reachable from ``output_node`` carrying assert-kind checks.
 
     Safe before or after compiling: compilation never mutates the
@@ -115,20 +113,20 @@ def collect_asserts(output_node: Node) -> List[Node]:
     return [n for n in _walk(output_node) if any(c.kind == "assert" for c in n.checks)]
 
 
-def collect_watches(output_node: Node) -> List[Node]:
+def collect_watches(output_node: Node) -> list[Node]:
     """Nodes reachable from ``output_node`` carrying watch-kind checks."""
     return [n for n in _walk(output_node) if any(c.kind == "watch" for c in n.checks)]
 
 
-def collect_debug_nodes(output_node: Node) -> List[Node]:
+def collect_debug_nodes(output_node: Node) -> list[Node]:
     """Nodes reachable from ``output_node`` carrying any checks."""
     return [n for n in _walk(output_node) if n.checks]
 
 
-def _walk(output_node: Node) -> List[Node]:
-    seen: Set[int] = set()
-    ordered: List[Node] = []
-    stack: List[Node] = [output_node]
+def _walk(output_node: Node) -> list[Node]:
+    seen: set[int] = set()
+    ordered: list[Node] = []
+    stack: list[Node] = [output_node]
     while stack:
         node = stack.pop()
         if node.node_id in seen:
@@ -724,7 +722,7 @@ def assert_softmax_hardness(
     argmax, argmin_unmasked, etc.).  Not appropriate for
     ``attend_mean_where`` which intentionally spreads mass.
     """
-    from torchwright.graph.attn import Attn, CAUSAL_MASK_SENTINEL
+    from torchwright.graph.attn import CAUSAL_MASK_SENTINEL, Attn
 
     if not isinstance(attn_node, Attn):
         raise TypeError(

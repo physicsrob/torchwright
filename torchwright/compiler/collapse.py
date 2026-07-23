@@ -57,12 +57,11 @@ decline is recorded with its reason in the :class:`CollapseReport`.
 """
 
 from dataclasses import dataclass
-from typing import Dict, List, Optional, Tuple, cast
+from typing import cast
 
 import torch
 
 from torchwright.compiler.graph_clone import topological_order
-from torchwright.compiler.utils import get_ancestor_nodes
 from torchwright.graph import Node
 from torchwright.graph.ffn import FFN
 from torchwright.graph.linear import Linear
@@ -96,7 +95,8 @@ _SYNTH_CLAIM_ATOL = 1e-3
 
 def _ulp32(magnitude: float) -> float:
     """fp32 ulp at ``magnitude`` — the accumulation-error quantum of a
-    lane sum whose intermediates reach that magnitude."""
+    lane sum whose intermediates reach that magnitude.
+    """
     import math
 
     if magnitude <= 0.0:
@@ -104,7 +104,7 @@ def _ulp32(magnitude: float) -> float:
     return 2.0 ** (math.floor(math.log2(magnitude)) - 23)
 
 
-def scalar_sources(order: List[Node]) -> Dict[Node, Optional[Node]]:
+def scalar_sources(order: list[Node]) -> dict[Node, Node | None]:
     """For each node, the single 1-D node it is a pointwise function of.
 
     Returns ``src[n] = s`` when n's only non-literal ancestry, walked
@@ -116,7 +116,7 @@ def scalar_sources(order: List[Node]) -> Dict[Node, Optional[Node]]:
     longer interrupts the walk — a subgraph extends straight through a
     claim (the wrapper-node representation used to end it there).
     """
-    raw: Dict[Node, object] = {}
+    raw: dict[Node, object] = {}
     for n in order:
         if isinstance(n, LiteralValue):
             raw[n] = None
@@ -144,7 +144,7 @@ def scalar_sources(order: List[Node]) -> Dict[Node, Optional[Node]]:
         else:
             raw[n] = acc
     return {
-        n: (cast(Node, s) if (s is not None and s is not _TOP) else None)
+        n: (cast("Node", s) if (s is not None and s is not _TOP) else None)
         for n, s in raw.items()
     }
 
@@ -192,7 +192,7 @@ class SubgraphOutcome:
 class CollapseReport:
     """All subgraph outcomes of one pass run, collapses and declines."""
 
-    outcomes: List[SubgraphOutcome]
+    outcomes: list[SubgraphOutcome]
 
     @property
     def n_collapsed(self) -> int:
@@ -203,8 +203,8 @@ class CollapseReport:
 
 
 def _seeded_oracle(
-    members: List[Node], source: Node, grid: torch.Tensor
-) -> Dict[Node, torch.Tensor]:
+    members: list[Node], source: Node, grid: torch.Tensor
+) -> dict[Node, torch.Tensor]:
     """Evaluate every member's exact-math value with ``source`` pinned to
     ``grid`` — the re-rooted oracle of the plan's synthesis step.
 
@@ -229,22 +229,23 @@ def _seeded_oracle(
     return {m: cache[m] for m in members}
 
 
-def _member_depths(source: Node, members: List[Node]) -> Dict[Node, int]:
+def _member_depths(source: Node, members: list[Node]) -> dict[Node, int]:
     """Depth in costly sublayers of each member above the source.
 
     Concatenate is virtual (cost 0); FFN/Linear/Add cost 1.  Inputs
     outside the subgraph (literals) contribute depth 0.
     """
-    depth: Dict[Node, int] = {source: 0}
+    depth: dict[Node, int] = {source: 0}
     for m in members:  # members arrive in topological order
         base = max((depth.get(u, 0) for u in m.inputs), default=0)
         depth[m] = base + (0 if isinstance(m, Concatenate) else 1)
     return depth
 
 
-def _machine(all_nodes) -> Optional[str]:
+def _machine(all_nodes) -> str | None:
     """The graph's FFN machine: 'relu', 'swish', None (no FFNs), or
-    'mixed'."""
+    'mixed'.
+    """
     activations = {n.activation for n in all_nodes if isinstance(n, FFN)}
     if not activations:
         return None
@@ -253,11 +254,12 @@ def _machine(all_nodes) -> Optional[str]:
     return next(iter(activations))
 
 
-def _piecewise_linear_fn(machine: Optional[str]):
+def _piecewise_linear_fn(machine: str | None):
     """The machine-matching staircase builder.  ``None`` (no FFNs in the
     graph) can only ever synthesize constants, which take the
     LiteralValue path before this builder is called — relu is a safe
-    default for that unreachable case."""
+    default for that unreachable case.
+    """
     if machine == "swish":
         from torchwright.ops.swiglu.arithmetic_ops import piecewise_linear
     else:
@@ -270,7 +272,7 @@ def _synthesize_member(
     table: torch.Tensor,
     lo_int: int,
     lane_cap: int,
-    machine: Optional[str],
+    machine: str | None,
     name: str,
 ) -> Node:
     """One staircase ``piecewise_linear`` (or constant) computing
@@ -288,7 +290,7 @@ def _synthesize_member(
         return LiteralValue(table[0].clone(), name=name)
 
     h = _PLATEAU_SLACK
-    breakpoints: List[float] = []
+    breakpoints: list[float] = []
     for i in torch.nonzero(changed, as_tuple=False).flatten().tolist():
         mid = lo_int + i + 0.5
         breakpoints.extend((mid - h, mid + h))
@@ -296,7 +298,7 @@ def _synthesize_member(
     values = table.tolist()
     n_max = len(values) - 1
 
-    def fn(x: float) -> List[float]:
+    def fn(x: float) -> list[float]:
         idx = min(max(round(x) - lo_int, 0), n_max)
         return values[idx]
 
@@ -318,7 +320,7 @@ def collapse_univariate_subgraphs(
     lane_cap: int,
     fold_log: FoldLog,
     verbose: bool = False,
-) -> Tuple[Node, CollapseReport]:
+) -> tuple[Node, CollapseReport]:
     """Run the collapse pass on the compiler-private copy.
 
     Args:
@@ -340,20 +342,20 @@ def collapse_univariate_subgraphs(
     src = scalar_sources(order)
     machine = _machine(order)
 
-    by_src: Dict[Node, List[Node]] = {}
+    by_src: dict[Node, list[Node]] = {}
     for n in order:  # topological, so member lists stay topological
         s = src[n]
         if s is not None and s is not n:
             by_src.setdefault(s, []).append(n)
 
-    consumers: Dict[Node, List[Node]] = {n: [] for n in order}
+    consumers: dict[Node, list[Node]] = {n: [] for n in order}
     for n in order:
         for u in n.inputs:
             if u in consumers:
                 consumers[u].append(n)
 
     topo_index = {n: i for i, n in enumerate(order)}
-    outcomes: List[SubgraphOutcome] = []
+    outcomes: list[SubgraphOutcome] = []
 
     for source in sorted(by_src, key=topo_index.__getitem__):
         members = by_src[source]
@@ -427,7 +429,7 @@ def collapse_univariate_subgraphs(
         # A deviation past the whole budget means "not a staircase" —
         # decline with the location; a sub-budget deviation is charged
         # against the composite budget in gate 3 below.
-        member_dev: Dict[Node, float] = {}
+        member_dev: dict[Node, float] = {}
         stair_fail = None
         for m in synthesized:
             v = values[m].reshape(n_plateaus, n_offsets, -1)
@@ -465,7 +467,7 @@ def collapse_univariate_subgraphs(
         }
         range_width = float(hi_int - lo_int)
         gate_fail = None
-        member_lanes: Dict[Node, int] = {}
+        member_lanes: dict[Node, int] = {}
         for m in synthesized:
             t = tables[m]
             lanes = 2 * int((t[1:] != t[:-1]).any(dim=1).sum())

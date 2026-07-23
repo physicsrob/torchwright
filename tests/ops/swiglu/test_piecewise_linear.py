@@ -6,7 +6,6 @@ inherit it).  Fillet radius/dip magnitudes are pinned in
 tests/docs/test_swish_constants.py (test_hinge_fillet_width).
 """
 
-import pytest
 import torch
 
 from torchwright.compiler.export import compile_headless
@@ -40,7 +39,8 @@ def _unwrap(node):
 
 def test_pl_knots_and_segment_interiors():
     """Away from the fillets (|x - x_i| > 17/K) the op computes the exact
-    interpolation to the folded ulp class; knots included."""
+    interpolation to the folded ulp class; knots included.
+    """
     x = create_input("x", 1, value_range=(-2.0, 6.0))
     out = piecewise_linear(x, [0.0, 1.0, 3.0, 4.0], lambda v: v * v)
     xs = torch.tensor([[0.0], [1.0], [3.0], [4.0], [0.5], [2.0], [3.5]])
@@ -68,7 +68,8 @@ def test_pl_no_clamp_extrapolates():
 
 def test_pl_fillet_dip_bounded_by_slope_change():
     """Inside a fillet the gap to the exact PL is ≤ swish_dip·|Δm|/K,
-    and the fillet is really there."""
+    and the fillet is really there.
+    """
     x = create_input("x", 1, value_range=(-2.0, 4.0))
     # single corner at 1.0 with slope change 3.0 (0 -> 3)
     out = piecewise_linear(x, [-1.0, 1.0, 3.0], lambda v: 3.0 * max(v - 1.0, 0.0))
@@ -98,7 +99,8 @@ def test_pl_vector_fn_and_range_slack():
 
 def test_pl_chunking_matches_single_ffn():
     """d_max chunking splits lanes across FFNs joined by sum_nodes; the
-    math is identical."""
+    math is identical.
+    """
     bps = [float(k) for k in range(9)]
 
     def f(v):
@@ -143,7 +145,8 @@ def test_clamp_identity_and_edges():
 def test_reciprocal_accuracy_vs_true_function():
     """Smooth-target grid: fillets bend toward 1/x, so the dense low-end
     grid keeps the error in the relu class (measured entry is the
-    authority; this is the sanity ceiling)."""
+    authority; this is the sanity ceiling).
+    """
     x = create_input("x", 1, value_range=(0.3, 200.0))
     out = reciprocal(x, min_value=0.3, max_value=200.0, step=1.0)
     g = torch.Generator().manual_seed(79)
@@ -170,7 +173,8 @@ def test_thermometer_floor_div_and_mod_const_exact_on_integers():
 def test_global_position_from_bos_integer_recovery():
     """Position recovery within the relu op's empirical ceiling (0.15;
     hard requirement is 0.5 for integer rounding).  The inversion table
-    is the library's densest grid — this is its stacked-fillet audit."""
+    is the library's densest grid — this is its stacked-fillet audit.
+    """
     rope = create_rope_config(d_head=256, max_positions=61440)
     n = 80
     bos_indicator = InputNode("bos", 1, value_range=(0.0, 1.0))

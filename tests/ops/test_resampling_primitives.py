@@ -14,7 +14,6 @@ ad-hoc band-sum workaround would never have been built.
 
 import math
 
-import numpy as np
 import pytest
 import torch
 
@@ -357,7 +356,8 @@ def test_dynamic_extract_random_indices():
 def test_table_lookup_2d_out_of_range_index_clamps_to_edge():
     """Trigger (a): a row index far outside [0, rows-1] clamps to the table
     edge instead of collapsing (index 1e5 at sharpness 100 -> sharpness*index
-    1e7 > 2^24 used to return ~0)."""
+    1e7 > 2^24 used to return ~0).
+    """
     rows = 256
     table = torch.arange(rows * 2, dtype=torch.float32).reshape(rows, 2)
     out_node = _build_table_lookup_2d_graph(table)  # default sharpness=100
@@ -393,7 +393,8 @@ def test_table_lookup_2d_tall_table_stays_exact():
     """Trigger (b): a 20000-row table at sharpness 100 and 1000 keeps in-range
     indices exact (an in-range index used to collapse to 0).  Oracle-only:
     compiling a 20000-row table is needlessly expensive and the cancellation is
-    in the exact-math fp32 sum, like the floor_int wide-range regression."""
+    in the exact-math fp32 sum, like the floor_int wide-range regression.
+    """
     rows = 20000
     table = torch.arange(rows, dtype=torch.float32).reshape(rows, 1)
     idxs = [0.0, 1.0, 9999.0, 12345.0, 19998.0, 19999.0]

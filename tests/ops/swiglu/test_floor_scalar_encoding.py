@@ -49,7 +49,8 @@ def test_floor_int_intermediates_carry_tight_range_pins():
     flagship's rms_norm residual-energy certifier — which reads every
     residual-resident value's claim-tightened type, not just the op's
     asserted output — blows its fp32-feasible budget.  Found by the doom
-    D2 cutover compile gate."""
+    D2 cutover compile gate.
+    """
     from collections import deque
 
     x = create_input("x", 1, value_range=(-1023.0, 1023.0))
@@ -86,7 +87,8 @@ def test_floor_int_intermediates_carry_tight_range_pins():
 def test_floor_int_chunking_matches_unchunked():
     """A range wide enough to split into multiple 512-boundary chunks
     computes the same floor as exact math (the W-slack keeps saturated
-    chunks exact)."""
+    chunks exact).
+    """
     x = create_input("x", 1, value_range=(0.0, 1300.0))
     out = floor_int(x, min_value=0, max_value=1300)  # 1300 boundaries > 512
     xs = torch.tensor([[0.5], [511.3], [512.5], [1024.2], [1299.5], [1300.0]])
@@ -136,7 +138,8 @@ def _saturate_ffns(node):
 
 def test_floor_int_output_map_default_byte_identical():
     """No new argument -> no behavior change: the stage-2 output weights are
-    exactly the pre-output_map ``-ones/scale``, and the op still floors."""
+    exactly the pre-output_map ``-ones/scale``, and the op still floors.
+    """
     x = create_input("x", 1, value_range=(-5.0, 10.0))
     out = floor_int(x, min_value=-5, max_value=10)  # output_map absent
     (sat,) = _saturate_ffns(out)
@@ -150,7 +153,8 @@ def test_floor_int_output_map_default_byte_identical():
 def test_floor_int_output_map_sawtooth_matches_mod(H):
     """``output_map = k % H`` reproduces ``floor(x) % H`` exactly on
     flat-zone inputs, including inputs just past multiples of H (the
-    ``-(H-1)`` boundaries, where the largest |delta| lives)."""
+    ``-(H-1)`` boundaries, where the largest |delta| lives).
+    """
     lo, hi = 0, 3 * H + 2
     x = create_input("x", 1, value_range=(float(lo), float(hi)))
     out = floor_int(x, min_value=lo, max_value=hi, output_map=lambda k: float(k % H))
@@ -176,7 +180,8 @@ def test_floor_int_output_map_sawtooth_compiles_clean():
 
 def test_floor_int_output_map_lookup_step_function():
     """A non-sawtooth piecewise-constant map (arbitrary per-integer lookup)
-    pins the generality: any g(floor(x)) folds in, not just modular ones."""
+    pins the generality: any g(floor(x)) folds in, not just modular ones.
+    """
     lut = {-4: 2.0, -3: 2.0, -2: -7.5, -1: 0.0, 0: 9.0, 1: 9.0, 2: -3.25, 3: 1.0}
     lo, hi = -4, 3
     x = create_input("x", 1, value_range=(float(lo), float(hi)))
@@ -190,7 +195,8 @@ def test_floor_int_output_map_lookup_step_function():
 
 def test_floor_int_output_map_integers_and_flat_zones_exact():
     """Contract inputs — exact integers and flat-zone interiors — are exact
-    under output_map, same as the plain floor path."""
+    under output_map, same as the plain floor path.
+    """
     H, lo, hi = 5, 0, 14
     x = create_input("x", 1, value_range=(float(lo), float(hi)))
     out = floor_int(x, min_value=lo, max_value=hi, output_map=lambda k: float(k % H))
@@ -229,7 +235,8 @@ def test_scalar_to_embedding_reconstructs_digit_embeddings():
 def test_scalar_to_embedding_noise_headroom():
     """A digit scalar off by ±0.4 reconstructs the same embedding (the
     nearest threshold is 0.5 away; saturation holds to 17/(scale·S) of
-    a ramp edge)."""
+    a ramp edge).
+    """
     emb = create_embedding(vocab=_VOCAB)
     x = create_input("x", 1, value_range=(0.0, 9.0))
     out = scalar_to_embedding(x, emb)

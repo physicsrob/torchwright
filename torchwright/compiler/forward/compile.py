@@ -10,21 +10,13 @@ import hashlib
 import os
 import time
 import warnings
+from collections.abc import Callable
 from dataclasses import dataclass, field, replace
-from typing import Any, Callable, Dict, Optional, Set, Tuple, cast
+from typing import Any, cast
 
 import torch
 
 from torchwright.compiler.device import get_device
-from torchwright.compiler.realization import (
-    ATTN_ADD,
-    ATTN_TRANSPORT,
-    CLASS_SUBLAYER,
-    RealizationTable,
-    is_schedulable,
-    usable_hidden_slots,
-)
-from torchwright.compiler.residual_assignment import ResidualAssignment
 from torchwright.compiler.forward.cpsat_scheduler import (
     Costs,
     ScheduleAssignment,
@@ -35,22 +27,22 @@ from torchwright.compiler.forward.cpsat_scheduler import (
     objective_blocks,
     solve_schedule,
 )
-from torchwright.compiler.forward.schedule_cache import (
-    graph_fingerprint,
-    load_assignment,
-    store_assignment,
-)
 from torchwright.compiler.forward.graph_analysis import GraphAnalyzer
-from torchwright.compiler.forward.residual_map import (
-    HeldOutputLayout,
-    ResidualStreamMap,
-)
 from torchwright.compiler.forward.replay_plan import (
     PlannedAttentionOp,
     PlannedLayer,
     PlannedMlpOp,
     ReplayPlan,
     planned_layer_shape,
+)
+from torchwright.compiler.forward.residual_map import (
+    HeldOutputLayout,
+    ResidualStreamMap,
+)
+from torchwright.compiler.forward.schedule_cache import (
+    graph_fingerprint,
+    load_assignment,
+    store_assignment,
 )
 from torchwright.compiler.forward.scheduler import (
     DirectedLayerScheduler,
@@ -66,13 +58,24 @@ from torchwright.compiler.forward.weight_writer import (
     write_mlp_sublayer,
 )
 from torchwright.compiler.groups.transformer_layer import TransformerLayer
-from torchwright.compiler.transformer import HeadlessTransformer
+from torchwright.compiler.realization import (
+    ATTN_ADD,
+    ATTN_TRANSPORT,
+    CLASS_SUBLAYER,
+    RealizationTable,
+    is_schedulable,
+    usable_hidden_slots,
+)
+from torchwright.compiler.residual_assignment import (
+    ResidualAssignment,
+    flatten_concat_nodes,
+)
 from torchwright.compiler.token_model import LayerShape
+from torchwright.compiler.transformer import HeadlessTransformer
 from torchwright.compiler.utils import resolve_n_heads
-from torchwright.compiler.residual_assignment import flatten_concat_nodes
-from torchwright.graph import Add, Attn, Embedding, Node, Linear, Concatenate
-from torchwright.graph.node import reserve_node_id_above
+from torchwright.graph import Add, Attn, Concatenate, Embedding, Linear, Node
 from torchwright.graph.misc import LiteralValue
+from torchwright.graph.node import reserve_node_id_above
 
 # Default constant magnitude exponent q for the pinned-RMS norm: the smallest
 # reserved column holds 2^q (at a power-of-two width every reserved column
@@ -117,8 +120,8 @@ class RmsNormSpec:
             eps-independent in the pinned regime).
     """
 
-    reserved_cols: Tuple[int, ...]
-    const_values: Tuple[float, ...]
+    reserved_cols: tuple[int, ...]
+    const_values: tuple[float, ...]
     gain: float
     eps: float
 
@@ -140,7 +143,7 @@ def rms_norm_width_supported(d: int) -> bool:
     return (d & (d - 1)) == 0
 
 
-def _rms_norm_pinned_layout(d: int, const_exp: int) -> Tuple[Tuple[int, ...], int]:
+def _rms_norm_pinned_layout(d: int, const_exp: int) -> tuple[tuple[int, ...], int]:
     """Pinned-column value exponents and forced-rms exponent for width ``d``.
 
     Factor ``d = c·2^k`` with ``c`` odd.  The norm is the bit-exact identity
@@ -411,10 +414,10 @@ class _TrackingResidualStreamMap(ResidualStreamMap):
 
 @dataclass(frozen=True)
 class HeuristicScheduleTrace:
-    node_to_layer: Dict[int, int]
-    node_to_routing: Dict[int, str]
-    observed_cancel_layer: Dict[int, int]
-    observed_cancel_mech: Dict[int, str]
+    node_to_layer: dict[int, int]
+    node_to_routing: dict[int, str]
+    observed_cancel_layer: dict[int, int]
+    observed_cancel_mech: dict[int, str]
     n_layers: int
     # Physical observation per Add: (is_reused, reuse_input_index) from the
     # operation actually emitted on either route — add_into/add_into_bypass
@@ -423,7 +426,7 @@ class HeuristicScheduleTrace:
     # exists so assignment completion can compare the physical walk against
     # the independent derivation before the residual map has erased the old
     # ownership, including for add(x, x).
-    observed_add_placement: Dict[int, Tuple[bool, Optional[int]]] = field(
+    observed_add_placement: dict[int, tuple[bool, int | None]] = field(
         default_factory=dict
     )
 
@@ -440,14 +443,14 @@ def _build_heuristic_schedule_trace(
     pos_encoding,
     d_hidden: int,
     residual_map: ResidualStreamMap,
-    computed: Set[Node],
+    computed: set[Node],
     clusters,
     *,
     bias: bool = True,
     admission_budget_fraction: float,
-    policy: Optional[SchedulingPolicy],
+    policy: SchedulingPolicy | None,
     realization_table: RealizationTable,
-    held_output_layout: Optional[HeldOutputLayout],
+    held_output_layout: HeldOutputLayout | None,
     output_node: Node,
     max_layers: int,
 ) -> HeuristicScheduleTrace:
@@ -483,7 +486,7 @@ def _build_heuristic_schedule_trace(
     )
     hint_layers: dict = {}
     hint_routing: dict = {}
-    hint_add_placement: Dict[int, Tuple[bool, Optional[int]]] = {}
+    hint_add_placement: dict[int, tuple[bool, int | None]] = {}
     for hi in range(max_layers):
         if output_node in hint_computed:
             break
@@ -542,14 +545,14 @@ def _build_heuristic_schedule_trace(
     )
 
 
-def _effective_consumers(graph: GraphAnalyzer, node: Node) -> Set[Node]:
+def _effective_consumers(graph: GraphAnalyzer, node: Node) -> set[Node]:
     """Walk through Concatenate consumers transparently.
 
     Mirrors ``LayerScheduler._get_effective_consumers``: a Concatenate is
     not a real consumer — its own consumers are.  Terminal Concatenates
     (output nodes) are kept so their leaves never get freed.
     """
-    result: Set[Node] = set()
+    result: set[Node] = set()
     for consumer in graph.get_consumers(node):
         if isinstance(consumer, Concatenate):
             downstream = _effective_consumers(graph, consumer)
@@ -565,7 +568,7 @@ def _effective_consumers(graph: GraphAnalyzer, node: Node) -> Set[Node]:
 def _verify_end_of_layer_liveness(
     graph: GraphAnalyzer,
     residual_map,
-    computed: Set[Node],
+    computed: set[Node],
     layer_idx: int,
 ) -> None:
     """Invariant A (cross-layer): every node with uncomputed effective
@@ -622,7 +625,7 @@ def _check_replay_depth(
         )
     # Placement divergence: the earliest schedulable node whose replayed
     # birth layer differs from its assigned layer (the executor-slip case).
-    first_bad: Optional[tuple[int, int, int, int]] = None
+    first_bad: tuple[int, int, int, int] | None = None
     for node_id, assigned in n2l.items():
         actual = replay_birth_layer.get(node_id)
         if actual is not None and actual != assigned:
@@ -656,9 +659,9 @@ def _check_replay_depth(
 def _verify_end_of_layer_writes(
     attn_ops: list,
     mlp_ops: list,
-    prev_computed: Set[Node],
-    prev_allocated: Set[Node],
-    computed: Set[Node],
+    prev_computed: set[Node],
+    prev_allocated: set[Node],
+    computed: set[Node],
     residual_map,
     layer_idx: int,
 ) -> None:
@@ -677,7 +680,7 @@ def _verify_end_of_layer_writes(
     :func:`_verify_end_of_layer_liveness` — the walk is cheap but
     the assertion machinery is debug-mode only.
     """
-    written_nodes: Set[Node] = set()
+    written_nodes: set[Node] = set()
     for op in attn_ops:
         if op.op_type == "cancel":
             continue
@@ -815,7 +818,7 @@ def _build_replay_plan(
     scheduler: DirectedLayerScheduler,
     graph: GraphAnalyzer,
     residual_map: ResidualStreamMap,
-    computed: Set[Node],
+    computed: set[Node],
     input_nodes: list[Node],
     output_node: Node,
     const_one: Node,
@@ -874,7 +877,7 @@ def _build_replay_plan(
                 attn_ops,
                 mlp_ops,
                 previous,
-                cast(Set[Node], previous_allocated),
+                cast("set[Node]", previous_allocated),
                 planned_computed,
                 planned_rmap,
                 layer_idx,
@@ -1048,16 +1051,16 @@ def forward_compile(
     output_node: Node,
     verbose: bool = True,
     max_layers: int = 100,
-    device: Optional[str] = "auto",
-    on_layer_compiled: Optional[Callable[[int, TransformerLayer], None]] = None,
-    d_hidden: Optional[int] = None,
-    on_node_scheduled: Optional[Callable[[Node, int], None]] = None,
+    device: str | None = "auto",
+    on_layer_compiled: Callable[[int, TransformerLayer], None] | None = None,
+    d_hidden: int | None = None,
+    on_node_scheduled: Callable[[Node, int], None] | None = None,
     trim_heads: bool = True,
     admission_control: bool = False,
     admission_budget_fraction: float = 0.4,
     admission_min_chains: int = 4,
     admission_min_peak_width: int = 32,
-    policy: Optional[SchedulingPolicy] = None,
+    policy: SchedulingPolicy | None = None,
     optimize: int = 0,
     cpsat_costs: Costs = Costs(),
     cpsat_flex_routing: bool = True,
@@ -1066,17 +1069,17 @@ def forward_compile(
     rms_norm_eps: float = 1e-5,
     rms_norm_const_exp: int = _RMS_NORM_CONST_EXP,
     bias: bool = True,
-    output_layout_source: Optional[Node] = None,
-    machine: Optional[str] = None,
-    n_heads: Optional[int] = None,
+    output_layout_source: Node | None = None,
+    machine: str | None = None,
+    n_heads: int | None = None,
     _disabled_families: frozenset = frozenset(),
-    _solver_seed: Optional[int] = None,
+    _solver_seed: int | None = None,
     _force_resolve: bool = False,
     _solve_only: bool = False,
-    _solve_budget_s: Optional[float] = None,
+    _solve_budget_s: float | None = None,
     _canonical_cancel_reps: bool = False,
     _pin_cancels: bool = True,
-    _solver_params: Optional[Dict[str, object]] = None,
+    _solver_params: dict[str, object] | None = None,
     _drop_decision_strategy: bool = False,
 ) -> HeadlessTransformer:
     """Compile a computation graph into a HeadlessTransformer.
@@ -1284,7 +1287,7 @@ def forward_compile(
         verbose=verbose,
         collapse_univariate=True,
         collapse_pl=True,
-        collapse_lane_cap=(d_hidden if d_hidden else d) // 4,
+        collapse_lane_cap=(d_hidden or d) // 4,
     )
     output_node = lowered.output_node
 
@@ -1298,9 +1301,9 @@ def forward_compile(
         key=lambda n: n.node_id,
     )
 
-    held_source: Optional[Node] = None
+    held_source: Node | None = None
     direct_held_handoff = False
-    forced_realization_classes: Dict[int, str] = {}
+    forced_realization_classes: dict[int, str] = {}
     if output_layout_source is not None:
         try:
             held_source = lowered.copy_of(output_layout_source)
@@ -1465,7 +1468,7 @@ def forward_compile(
     residual_map.allocate(const_one)
     for node in input_nodes:
         residual_map.allocate(node)
-    held_output_layout: Optional[HeldOutputLayout] = None
+    held_output_layout: HeldOutputLayout | None = None
     if held_source is not None:
         held_output_layout = HeldOutputLayout(
             source=held_source,
@@ -1637,7 +1640,7 @@ def forward_compile(
             d=d,
             d_head=d_head,
             n_heads=n_heads,
-            d_hidden=d_hidden if d_hidden else d,
+            d_hidden=d_hidden or d,
             flex_routing=cpsat_flex_routing,
             cancel_slack=2,
             policy=policy,
@@ -1703,7 +1706,7 @@ def forward_compile(
                 status_name="CACHED",
                 # Pre-existing runtime value is a float; SolveStats declares int.
                 objective_value=cast(
-                    int,
+                    "int",
                     float(_cached_meta.get("realized_objective", assignment.n_layers)),
                 ),
                 best_objective_bound=float(
@@ -1786,7 +1789,7 @@ def forward_compile(
             # ``_solver_params["random_seed"]`` would win, but the sweep passes
             # the seed via ``_solver_seed`` and the arm params separately, so
             # the seed is applied first and never shadowed.
-            _merged_solver_params: Optional[Dict[str, object]] = None
+            _merged_solver_params: dict[str, object] | None = None
             if _solver_seed is not None or _solver_params:
                 _merged_solver_params = {}
                 if _solver_seed is not None:
@@ -1902,7 +1905,7 @@ def forward_compile(
                 )
                 print(
                     f"  solve-only measurement ({mode}): {claim}, "
-                    f"bound={cast(SolveStats, net.cpsat_solve_stats).best_objective_bound}"
+                    f"bound={cast('SolveStats', net.cpsat_solve_stats).best_objective_bound}"
                 )
             return net
 
@@ -1999,7 +2002,7 @@ def forward_compile(
 
             incumbent_plan = _plan_candidate(heuristic_assignment)
             candidate_plan = _plan_candidate(solver_candidate)
-            objective_scale = cast(SolveStats, net.cpsat_solve_stats).objective_scale
+            objective_scale = cast("SolveStats", net.cpsat_solve_stats).objective_scale
             prebuilt_replay_plan, diagnostics = _choose_dominating_replay_plan(
                 cpsat_costs,
                 incumbent_plan,
@@ -2011,7 +2014,7 @@ def forward_compile(
         if assignment is not None:
             if (
                 verbose
-                and cast(SolveStats, net.cpsat_solve_stats).status_name != "CACHED"
+                and cast("SolveStats", net.cpsat_solve_stats).status_name != "CACHED"
                 and assignment is not heuristic_assignment
             ):
                 solve_time = time.perf_counter() - t_solve_start
@@ -2113,7 +2116,7 @@ def forward_compile(
     # pure consumer of this immutable plan and never touches allocator state.
     if prebuilt_replay_plan is None:
         replay_plan = _build_replay_plan(
-            assignment=cast(ScheduleAssignment, assignment),
+            assignment=cast("ScheduleAssignment", assignment),
             scheduler=scheduler,
             graph=graph,
             residual_map=residual_map,
@@ -2140,15 +2143,15 @@ def forward_compile(
         realized_objective = _replay_plan_objective(
             replay_plan,
             cpsat_costs,
-            objective_scale=cast(SolveStats, net.cpsat_solve_stats).objective_scale,
+            objective_scale=cast("SolveStats", net.cpsat_solve_stats).objective_scale,
         )
         realized_objective_blocks = _replay_plan_objective_blocks(
             replay_plan, cpsat_costs
         )
-        provenance = cast(ScheduleResult, net.schedule_result).provenance
+        provenance = cast("ScheduleResult", net.schedule_result).provenance
         if cached is None:
             selected_is_optimal = bool(
-                cast(SolveStats, net.cpsat_solve_stats).is_optimal
+                cast("SolveStats", net.cpsat_solve_stats).is_optimal
                 and cpsat_costs.alpha > 0
                 and cpsat_costs.beta
                 == cpsat_costs.gamma
@@ -2165,30 +2168,30 @@ def forward_compile(
             selected_objective_blocks=realized_objective_blocks,
         )
         net.schedule_result = ScheduleResult(
-            cast(ScheduleAssignment, assignment), provenance
+            cast("ScheduleAssignment", assignment), provenance
         )
 
     if use_cpsat and cached is None and solver_candidate is not None:
-        provenance = cast(ScheduleResult, net.schedule_result).provenance
+        provenance = cast("ScheduleResult", net.schedule_result).provenance
         solver_attempt = provenance.solver_attempt
         stored = store_assignment(
             schedule_fp,
-            cast(ScheduleAssignment, assignment),
+            cast("ScheduleAssignment", assignment),
             {
-                "status_name": cast(SolveStats, net.cpsat_solve_stats).status_name,
+                "status_name": cast("SolveStats", net.cpsat_solve_stats).status_name,
                 "best_objective_bound": cast(
-                    SolveStats, net.cpsat_solve_stats
+                    "SolveStats", net.cpsat_solve_stats
                 ).best_objective_bound,
                 "is_optimal": provenance.selected_is_optimal,
                 "origin": provenance.origin,
                 "optimize": optimize,
                 "d": d,
                 "d_head": d_head,
-                "d_hidden": d_hidden if d_hidden else d,
+                "d_hidden": d_hidden or d,
                 "realized_objective": realized_objective,
                 "realized_objective_blocks": realized_objective_blocks,
                 "objective_scale": cast(
-                    SolveStats, net.cpsat_solve_stats
+                    "SolveStats", net.cpsat_solve_stats
                 ).objective_scale,
                 "costs": weighted_cost_key,
                 "selected": {
@@ -2215,7 +2218,7 @@ def forward_compile(
         if stored and verbose:
             print(
                 f"  CP-SAT schedule cached ({schedule_fp[:12]}...): "
-                f"n_layers={cast(ScheduleAssignment, assignment).n_layers}"
+                f"n_layers={cast('ScheduleAssignment', assignment).n_layers}"
             )
     on_replay_plan = getattr(on_layer_compiled, "on_replay_plan", None)
     if on_replay_plan is not None:

@@ -25,8 +25,8 @@ from torchwright.compiler.forward.replay_plan import (
     ReplayPlan,
     planned_layer_shape,
 )
-from torchwright.compiler.forward.scheduler import DirectedLayerScheduler, _AttentionOp
 from torchwright.compiler.forward.schedule_cache import store_assignment
+from torchwright.compiler.forward.scheduler import DirectedLayerScheduler, _AttentionOp
 from torchwright.compiler.forward.weight_writer import write_attn_sublayer
 from torchwright.compiler.groups.transformer_layer import TransformerLayer
 from torchwright.compiler.token_model import (
@@ -64,7 +64,8 @@ def test_planned_operations_reject_tensor_indices():
 def test_reuse_records_require_the_occurrence_index():
     """Every reuse record (add_into, add_into_bypass) carries exactly one
     valid target-occurrence index; every fresh or unrelated record rejects
-    one (docs/plan_additional_mlp_routing.md)."""
+    one (docs/plan_additional_mlp_routing.md).
+    """
     from torchwright.graph import Add
 
     a = create_input("a", 2)
@@ -139,7 +140,8 @@ def test_reuse_records_require_the_occurrence_index():
 
 def test_compute_add_bypass_source_field_rules():
     """compute_add_bypass requires both source lists; every other MLP record
-    rejects source_cols_b."""
+    rejects source_cols_b.
+    """
     from torchwright.graph import Add
 
     a = create_input("a", 2)

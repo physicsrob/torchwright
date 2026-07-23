@@ -17,20 +17,17 @@ starts as True (adding 1), propagates through "1" bits (which flip to
     Output: 1 0 0 0 0  (overflow adds a bit)
 """
 
-from typing import Tuple
-
 import torch
 
-from torchwright.graph import Node, Embedding, RopeConfig
+from torchwright.graph import Embedding, Node
 from torchwright.graph.embedding import Unembedding
 from torchwright.ops.attention_ops import attend_to_offset, get_prev_value
 from torchwright.ops.inout_nodes import (
-    create_literal_value,
     create_embedding,
+    create_literal_value,
     create_rope_config,
     create_unembedding,
 )
-
 from torchwright.ops.swiglu.logic_ops import bool_all_true, equals_vector
 from torchwright.ops.swiglu.map_select import map_to_table, select
 from torchwright.ops.swiglu.sequence_ops import output_sequence, remove_leading_0s
@@ -44,7 +41,7 @@ MAX_POSITIONS = 512
 
 def create_network_parts(
     max_bits: int = 4,
-) -> Tuple[Node, Embedding]:
+) -> tuple[Node, Embedding]:
     """Build the binary increment computation graph.
 
     Args:

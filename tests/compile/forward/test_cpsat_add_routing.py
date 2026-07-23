@@ -9,18 +9,18 @@ Adds to MLP.
 import pytest
 import torch
 
+from torchwright.compiler.export import compile_headless
 from torchwright.compiler.forward.compile import forward_compile
 from torchwright.compiler.forward.cpsat_scheduler import (
     ScheduleAssignment,
-    build_cpsat_model,
     _solve_built,
+    build_cpsat_model,
 )
 from torchwright.compiler.forward.scheduling_policy import (
     LEGACY_POLICY,
     SchedulingPolicy,
 )
 from torchwright.debug.probe import probe_compiled
-from torchwright.compiler.export import compile_headless
 from torchwright.graph import Add, Concatenate, Linear
 from torchwright.ops.inout_nodes import create_input
 
@@ -68,7 +68,8 @@ def _op_types(plan):
 def test_flex_solve_replays_and_matches_oracle():
     """optimize=1 with default flex routing: whatever routes the solver
     picks, the assignment replays through the directed scheduler and the
-    compiled values match the recursive oracle."""
+    compiled values match the recursive oracle.
+    """
     out, x, add_reuse, add_fresh = _mixed_add_graph()
     compiled = compile_headless(out, d=D, d_head=D_HEAD, d_hidden=64, optimize=1)
     torch.manual_seed(1)
@@ -83,7 +84,8 @@ def test_flex_solve_replays_and_matches_oracle():
 
 def test_legacy_policy_with_flex_off_pins_cpsat_adds_to_attention():
     """The documented legacy configuration: policy=LEGACY_POLICY plus
-    cpsat_flex_routing=False keeps every Add on the attention writers."""
+    cpsat_flex_routing=False keeps every Add on the attention writers.
+    """
     out, *_ = _mixed_add_graph()
     net, plan = _capture_plan(
         output_node=out,
@@ -130,7 +132,8 @@ def _head_starved_graph():
 def test_low_head_geometry_feasible_via_mlp_adds():
     """The headline win: attention-only Add routing cannot fit n_heads=1,
     and MLP Add routing makes the CP-SAT compile feasible (require_solver
-    turns the silent heuristic fallback into a raise) and exact."""
+    turns the silent heuristic fallback into a raise) and exact.
+    """
     out = _head_starved_graph()
     net, plan = _capture_plan(
         output_node=out,
@@ -157,7 +160,8 @@ def test_low_head_geometry_feasible_via_mlp_adds_heuristic_path():
     Add to MLP and the heuristic + directed replay compile it.  (The
     shipping default keeps Adds on attention statically — at optimize=0
     this geometry needs the explicit knob; at optimize>0 the solver's flex
-    routing rescues it regardless, per the test above.)"""
+    routing rescues it regardless, per the test above.)
+    """
     out = _head_starved_graph()
     compiled = compile_headless(
         out,
@@ -175,7 +179,8 @@ def test_low_head_geometry_feasible_via_mlp_adds_heuristic_path():
 
 def test_reused_input_target_gets_virtual_handoff_in_assignment():
     """A CP-SAT solve that reuses a graph-input target records the canonical
-    virtual cancel `layer[A] + 1` for it, with no mechanism entry."""
+    virtual cancel `layer[A] + 1` for it, with no mechanism entry.
+    """
     out, x, add_reuse, add_fresh = _mixed_add_graph()
     net, plan = _capture_plan(output_node=out, optimize=1, require_solver=True)
     assignment = plan.assignment
@@ -199,7 +204,8 @@ def test_reused_input_target_gets_virtual_handoff_in_assignment():
 def test_extraction_tripwire_fires_on_corrupted_literal():
     """A deliberately inconsistent model — the extraction reads a literal
     that no constraint ties to the layer assignment — must trip the named
-    invariant before a ScheduleAssignment is returned."""
+    invariant before a ScheduleAssignment is returned.
+    """
     from torchwright.compiler.lower import lower
 
     out, *_ = _mixed_add_graph()
@@ -222,7 +228,8 @@ def test_a2_trips_on_mlp_add_source_with_same_layer_attention_cancel():
     """A corrupted assignment that gives an MLP-routed Add's source a
     same-layer attention cancel must raise contract check A2 at replay
     rather than mis-execute (the batch would release a value whose
-    uncomputed consumer is outside the attention batch)."""
+    uncomputed consumer is outside the attention batch).
+    """
     from torchwright.compiler.forward.graph_analysis import GraphAnalyzer
     from torchwright.compiler.forward.residual_map import ResidualStreamMap
     from torchwright.compiler.forward.scheduler import DirectedLayerScheduler

@@ -26,10 +26,12 @@ from __future__ import annotations
 import json
 import os
 from pathlib import Path
-from typing import Any, Dict, Optional, Tuple
+from typing import Any
 
 from torchwright.compiler.graph_identity import (
     canonical_ids as _canonical_ids,
+)
+from torchwright.compiler.graph_identity import (
     graph_fingerprint,
 )
 from torchwright.graph import Node
@@ -46,7 +48,7 @@ __all__ = [
 _ENV_DIR = "TW_SCHEDULE_CACHE_DIR"
 
 
-def cache_dir() -> Optional[Path]:
+def cache_dir() -> Path | None:
     """The active cache directory, or None when the cache is disabled."""
     value = os.environ.get(_ENV_DIR, "").strip()
     return Path(value) if value else None
@@ -65,7 +67,7 @@ def load_assignment(
     output_node: Node,
     *,
     min_optimize: int = 0,
-) -> Optional[Tuple[ScheduleAssignment, Dict[str, Any]]]:
+) -> tuple[ScheduleAssignment, dict[str, Any]] | None:
     """Return (assignment, meta) for a cached fingerprint, or None.
 
     Stored keys are canonical ids; they are remapped onto the CURRENT
@@ -78,7 +80,8 @@ def load_assignment(
     draw.  The level is validated, not just provenance — a higher-level
     re-solve that fails to beat the cached schedule upgrades the entry's
     level in place (see :func:`store_assignment`), so the re-solve
-    happens once per level, not per compile."""
+    happens once per level, not per compile.
+    """
     base = cache_dir()
     if base is None:
         return None
@@ -90,7 +93,7 @@ def load_assignment(
         return None
     current_by_canon = {c: nid for nid, c in _canonical_ids(output_node).items()}
 
-    def _remap(table: Dict[str, Any]) -> Dict[int, Any]:
+    def _remap(table: dict[str, Any]) -> dict[int, Any]:
         return {current_by_canon[int(k)]: v for k, v in table.items()}
 
     try:
@@ -115,7 +118,7 @@ def load_assignment(
 def store_assignment(
     fingerprint: str,
     assignment: ScheduleAssignment,
-    meta: Dict[str, Any],
+    meta: dict[str, Any],
     output_node: Node,
 ) -> bool:
     """Persist ``assignment`` unless an equal-or-better entry exists.

@@ -40,8 +40,8 @@ held source is never reusable — its columns end through the held-bank
 cancel/hold transition, not through ``reassign``.
 """
 
+from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass
-from typing import Callable, Iterable, Mapping, Optional
 
 from torchwright.graph import Concatenate, Node
 
@@ -61,7 +61,7 @@ class AddPlacement:
 
     reusable_0: bool
     reusable_1: bool
-    reuse_input_index: Optional[int]
+    reuse_input_index: int | None
 
     @property
     def is_free(self) -> bool:
@@ -74,8 +74,8 @@ def derive_add_placement(
     effective_consumers: Callable[[Node], Iterable[Node]],
     node_to_layer: Mapping[int, int],
     node_to_routing: Mapping[int, str],
-    held_source_id: Optional[int] = None,
-    held_target_id: Optional[int] = None,
+    held_source_id: int | None = None,
+    held_target_id: int | None = None,
 ) -> AddPlacement:
     """Derive one Add's ``(reusable_0, reusable_1, reuse_input_index)``.
 
@@ -128,7 +128,7 @@ def derive_add_placement(
     reusable_0 = occurrence_reusable(a0)
     reusable_1 = occurrence_reusable(a1)
     if reusable_0:
-        index: Optional[int] = 0
+        index: int | None = 0
     elif reusable_1:
         index = 1
     else:

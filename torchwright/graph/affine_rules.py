@@ -9,7 +9,7 @@ a dataflow graph) and produces the output bound.
 from __future__ import annotations
 
 import math
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING
 
 import torch
 
@@ -26,20 +26,20 @@ def _safe_matvec(W: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
     return product.sum(dim=1)
 
 
-def compute_affine_bound(node: "Node") -> AffineBound:
+def compute_affine_bound(node: Node) -> AffineBound:
     """Dispatch to the appropriate affine rule for *node*."""
+    from torchwright.graph.attn import Attn
+    from torchwright.graph.embedding import Embedding
+    from torchwright.graph.ffn import FFN
+    from torchwright.graph.linear import Linear
     from torchwright.graph.misc import (
-        InputNode,
-        LiteralValue,
         Add,
         Concatenate,
+        InputNode,
+        LiteralValue,
         ValueLogger,
     )
-    from torchwright.graph.linear import Linear
     from torchwright.graph.relu import ReLU
-    from torchwright.graph.ffn import FFN
-    from torchwright.graph.embedding import Embedding
-    from torchwright.graph.attn import Attn
 
     if isinstance(node, InputNode):
         ab = AffineBound.identity(node)
@@ -90,12 +90,13 @@ def compute_affine_bound(node: "Node") -> AffineBound:
 def _linear_affine(
     inp_ab: AffineBound, W: torch.Tensor, c: torch.Tensor
 ) -> AffineBound:
-    """y = x @ W + c through a bound: sign-split GEMM.
+    """Y = x @ W + c through a bound: sign-split GEMM.
 
     ``W`` is ``(d_input, d_output)`` and ``c`` is ``(d_output,)``, both
     float64.  Pure function of the input bound and the affine params — shared
     by :func:`_linear_rule` (the ``Linear`` node) and :func:`_ffn_rule` (the
-    gate/out projections of an ``FFN``)."""
+    gate/out projections of an ``FFN``).
+    """
     W_plus = torch.clamp(W, min=0)
     W_minus = torch.clamp(W, max=0)
 
@@ -119,7 +120,7 @@ def _linear_affine(
 
 
 def _linear_rule(node) -> AffineBound:
-    """y = x @ W + c: sign-split GEMM."""
+    """Y = x @ W + c: sign-split GEMM."""
     inp_ab = node.inputs[0]._affine_bound
     W = node.output_matrix.to(torch.float64)
     c = node.output_bias.to(torch.float64)
@@ -175,15 +176,14 @@ def _concat_rule(node) -> AffineBound:
     )
 
 
-def _relu_affine(
-    inp_ab: AffineBound, warn_node: Optional["Node"] = None
-) -> AffineBound:
+def _relu_affine(inp_ab: AffineBound, warn_node: Node | None = None) -> AffineBound:
     """ReLU per-component case analysis using the linear envelope.
 
     Pure function of the input bound.  ``warn_node`` (optional) is only used
     to emit the "infinite affine interval but finite value_type" warning
     against a real node; pass ``None`` when there is no single node behind the
-    bound (e.g. an ``FFN``'s internal gate values)."""
+    bound (e.g. an ``FFN``'s internal gate values).
+    """
     intervals = inp_ab.to_interval()
     d = inp_ab.d_output
     n = inp_ab.n_cols
@@ -254,7 +254,8 @@ def _swish_affine(inp_ab: AffineBound) -> AffineBound:
     Sound pointwise because relu(z) - C <= swish(z) <= relu(z) everywhere,
     so any linear under-estimator of ReLU minus C under-estimates swish and
     any linear over-estimator of ReLU over-estimates it.  The slack is the
-    constant C per lane — it does not grow with the value magnitude."""
+    constant C per lane — it does not grow with the value magnitude.
+    """
     ab = _relu_affine(inp_ab, warn_node=None)
     return AffineBound(
         A_lo=ab.A_lo,
@@ -281,7 +282,8 @@ def _swish_interval(lo: float, hi: float) -> tuple:
     minimum when the interval contains swish's argmin.  (Swish decreases
     until the argmin and increases after it, so the maximum is always at an
     endpoint.)  Uses -C for the interior minimum — rounded below the true
-    minimum, keeping the range sound."""
+    minimum, keeping the range sound.
+    """
     f_lo, f_hi = _swish_scalar(lo), _swish_scalar(hi)
     out_lo, out_hi = min(f_lo, f_hi), max(f_lo, f_hi)
     if lo <= _SWISH_ARGMIN <= hi:
@@ -300,7 +302,8 @@ def _bilinear_comb(
     """Per-lane affine under-estimator (``lower=True``) or over-estimator of
     ``a_s*s + a_u*u + g``: route each coefficient to the factor's lower or
     upper affine expression by sign — the same clamp-and-route logic as the
-    sign-split GEMM in :func:`_linear_affine`, per lane."""
+    sign-split GEMM in :func:`_linear_affine`, per lane.
+    """
 
     def pick(coef, ab):
         take_lo = (coef >= 0) if lower else (coef < 0)
@@ -334,7 +337,8 @@ def _gated_lane_affine(
     keeps the result affine in the graph inputs.  Per side, both candidates
     are built and the tighter one (by concretized interval over the input
     box) is kept per lane.  A lane with a non-finite factor interval falls
-    back to an unbounded row — sound, and it degenerates only that lane."""
+    back to an unbounded row — sound, and it degenerates only that lane.
+    """
     assert s_ab.columns == u_ab.columns, "gate/up bounds must share a basis"
     sl = torch.tensor([iv[0] for iv in s_iv], dtype=torch.float64)
     sh = torch.tensor([iv[1] for iv in s_iv], dtype=torch.float64)
@@ -403,7 +407,8 @@ def _ffn_rule(node) -> AffineBound:
     (see :func:`_gated_lane_affine`), whose pointwise-valid factor
     intervals come from the exact 1-D activation range over the gate's
     concretized interval — not from concretizing the activation envelope,
-    which is far looser at wide gate intervals."""
+    which is far looser at wide gate intervals.
+    """
     inp_ab = node.inputs[0]._affine_bound
     # Gate projection: y = x @ gate_proj.T + gate_bias.  gate_proj is
     # (n_lanes, d_input) in math orientation, so W = gate_proj.T.
@@ -434,7 +439,7 @@ def _ffn_rule(node) -> AffineBound:
     return _linear_affine(lane_ab, out_W, out_c)
 
 
-def _apply_claim_to_bound(node: "Node") -> None:
+def _apply_claim_to_bound(node: Node) -> None:
     """Fold ``node.claimed_type`` into ``node._affine_bound`` in place.
 
     The two channels that used to live in the Assert wrapper's affine
@@ -455,8 +460,8 @@ def _apply_claim_to_bound(node: "Node") -> None:
     """
     if node.claimed_type is None:
         return
-    from torchwright.graph.misc import InputNode
     from torchwright.graph.embedding import Embedding
+    from torchwright.graph.misc import InputNode
 
     claimed_range = node.claimed_type.value_range
     ab = node._affine_bound
@@ -562,7 +567,7 @@ def _embedding_rule(node) -> AffineBound:
 # --- Semantic overrides for composite ops ----------------------------------
 
 
-def _apply_semantic_override(node: "Node", semantic_ab: Optional[AffineBound]) -> None:
+def _apply_semantic_override(node: Node, semantic_ab: AffineBound | None) -> None:
     """Replace *node*'s affine bound with a semantic override.
 
     The override is also recorded on the node
@@ -591,7 +596,7 @@ def _apply_semantic_override(node: "Node", semantic_ab: Optional[AffineBound]) -
     node._affine_bound = semantic_ab
 
 
-def refresh_node_caches(node: "Node") -> None:
+def refresh_node_caches(node: Node) -> None:
     """Recompute *node*'s eagerly-cached derived data from its inputs.
 
     Recomputes ``_structural_type`` and ``_affine_bound`` (both computed
@@ -623,7 +628,7 @@ def refresh_node_caches(node: "Node") -> None:
 
 def _cond_gate_semantic_bound(
     inp_ab: AffineBound,
-    inp_node: Optional["Node"] = None,
+    inp_node: Node | None = None,
     c_tol: float = 0.0,
     M: float = 0.0,
     rel_tol: float = 0.0,
@@ -719,8 +724,6 @@ def _select_semantic_bound(
     the extreme scaled values are ``lo − δ·|lo|`` and ``hi + δ·|hi|``).
     """
     import torch
-
-    from torchwright.graph.affine_bound import _merge_layouts, _scatter
 
     a_ab, b_ab = AffineBound.align(a_ab, b_ab)
     a_intervals = a_ab.to_interval()

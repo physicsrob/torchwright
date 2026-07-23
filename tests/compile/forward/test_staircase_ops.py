@@ -21,8 +21,8 @@ import torch
 
 from torchwright.compiler.export import compile_headless
 from torchwright.graph import Concatenate
-from torchwright.ops.relu.arithmetic_ops import mod_const, thermometer_floor_div
 from torchwright.ops.inout_nodes import create_input
+from torchwright.ops.relu.arithmetic_ops import mod_const, thermometer_floor_div
 
 # Representative (divisor, max_value) sweep:
 #   (2, 32)    — baseline, small divisor/small scale
@@ -57,7 +57,8 @@ def _compile_unary(op_fn, input_name: str = "x", d: int = 1024):
 
 def _run_module_on_integer_range(module, max_value: int) -> torch.Tensor:
     """Feed every integer in [0, max_value] through the module as one
-    prefill pass and return the (max_value+1,) output row."""
+    prefill pass and return the (max_value+1,) output row.
+    """
     inputs = torch.arange(max_value + 1, dtype=torch.float32).unsqueeze(-1)
     with torch.no_grad():
         return module(inputs).squeeze(-1)
@@ -110,7 +111,8 @@ def test_mod_const_crosses_every_wraparound(divisor, max_value):
     """Stricter check: every ``v`` that sits immediately on either side of a
     multiple of ``divisor`` is within 0.25 of the ground truth.  This
     catches drift near the staircase transitions that a looser tolerance
-    might hide."""
+    might hide.
+    """
     module = _compile_unary(
         lambda x: mod_const(x, divisor, max_value),
     )

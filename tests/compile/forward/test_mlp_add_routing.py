@@ -112,7 +112,8 @@ def test_mlp_add_policy_routes_adds_to_mlp_with_zero_add_heads():
 def test_default_and_legacy_policies_retain_attention_add_ops(policy):
     """The shipping default keeps Adds on attention (the 2026-07-14 fallback
     decision: a static MLP default costs one layer per Add wedged between
-    MLP-sublayer ops), as does LEGACY_POLICY."""
+    MLP-sublayer ops), as does LEGACY_POLICY.
+    """
     out, *_ = _mixed_add_graph()
     kwargs = {} if policy is None else {"policy": policy}
     net, plan = _capture_plan(output_node=out, **kwargs)
@@ -128,7 +129,8 @@ def test_mlp_routed_adds_match_compute():
     """Value parity through compile_headless: the compiled transformer with
     MLP-routed Adds matches the recursive oracle.  (Per-machine ReLU/Swish
     coverage of the writers lives in test_weight_writer.py; the machine
-    here is whatever the default compile selects.)"""
+    here is whatever the default compile selects.)
+    """
     out, *_ = _mixed_add_graph()
     compiled = compile_headless(
         out, d=D, d_head=D_HEAD, d_hidden=64, policy=MLP_ADD_POLICY
@@ -147,7 +149,8 @@ def test_corrupted_observation_trips_the_derivation_tripwire():
     """A trace whose observed Add placement disagrees with the assignment-
     level derivation must raise the named invariant before an assignment is
     returned — for the fresh/reused form and for the occurrence, including
-    add(x, x)."""
+    add(x, x).
+    """
     x = create_input("x", 4, value_range=(-1.0, 1.0))
     a = Linear(x, torch.randn(4, 3) * 0.2, name="a")
     b = Linear(x, torch.randn(4, 3) * 0.2, name="b")

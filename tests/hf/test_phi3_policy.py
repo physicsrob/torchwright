@@ -33,7 +33,6 @@ def test_examples_do_not_import_relu_dialect():
 
 
 def test_named_example_widths_are_rmsnorm_compatible():
-    from torchwright.compiler.forward.compile import rms_norm_width_supported
     from examples import (
         adder,
         binary_increment,
@@ -43,6 +42,7 @@ def test_named_example_widths_are_rmsnorm_compatible():
         fibonacci,
         sort_digits_v1,
     )
+    from torchwright.compiler.forward.compile import rms_norm_width_supported
 
     modules = [
         adder,

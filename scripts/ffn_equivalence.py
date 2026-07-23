@@ -28,8 +28,9 @@ compared under the same scheduler mode by construction here.
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass, field
-from typing import Any, Callable, Dict, List, Optional, cast
+from typing import Any, cast
 
 import torch
 
@@ -37,8 +38,8 @@ from torchwright.compiler.forward.compile import _count_heads_by_type
 from torchwright.compiler.forward.graph_analysis import GraphAnalyzer
 from torchwright.compiler.forward.residual_map import ResidualStreamMap
 from torchwright.compiler.forward.scheduler import LayerScheduler
-from torchwright.compiler.residual_assignment import flatten_concat_nodes
 from torchwright.compiler.lower import lower
+from torchwright.compiler.residual_assignment import flatten_concat_nodes
 from torchwright.graph import Concatenate, Node
 from torchwright.graph.misc import LiteralValue
 from torchwright.graph.node import reserve_node_id_above
@@ -48,7 +49,7 @@ from torchwright.graph.node import reserve_node_id_above
 class ScheduleMetrics:
     n_layers: int
     total_heads: int
-    per_layer_heads: List[int]
+    per_layer_heads: list[int]
     peak_hidden: int
     residual_peak: int
 
@@ -60,10 +61,10 @@ class ScheduleMetrics:
 class EquivalenceReport:
     chain_metrics: ScheduleMetrics
     ffn_metrics: ScheduleMetrics
-    max_output_divergence: Optional[float] = None
-    notes: List[str] = field(default_factory=list)
+    max_output_divergence: float | None = None
+    notes: list[str] = field(default_factory=list)
 
-    def regressions(self) -> List[str]:
+    def regressions(self) -> list[str]:
         """Metrics where the FFN path is worse than the chain path."""
         out = []
         c, b = self.chain_metrics, self.ffn_metrics
@@ -116,7 +117,8 @@ def _seed_residual_map(graph: GraphAnalyzer, d: int):
     the const-1 self-match column and every input node (no RMSNorm reservation
     — off by default, and irrelevant to the chain-vs-FFN comparison as long as
     both paths use the same seed).  The runtime always zero-initialises, so the
-    whole free pool starts clean and no cancel bookkeeping is needed."""
+    whole free pool starts clean and no cancel bookkeeping is needed.
+    """
     input_nodes = [n for n in graph.get_all_nodes() if graph.is_input_node(n)]
     rmap = ResidualStreamMap(d)
     reserve_node_id_above(graph.get_all_nodes())
@@ -132,18 +134,19 @@ def schedule_metrics(
     *,
     d: int,
     d_head: int,
-    d_hidden: Optional[int] = None,
+    d_hidden: int | None = None,
     max_layers: int = 800,
 ) -> ScheduleMetrics:
     """Run the heuristic scheduler schedule-only (no weight tensors) and capture
-    the compile-metrics tuple.  Memory-safe at flagship scale."""
+    the compile-metrics tuple.  Memory-safe at flagship scale.
+    """
     d_hidden = d if d_hidden is None else d_hidden
     graph = GraphAnalyzer(output_node)
     output_node = graph.get_output_node()
     rmap, computed = _seed_residual_map(graph, d)
     sched = LayerScheduler(graph, d, d_head, pos_encoding=None, d_hidden=d_hidden)
 
-    per_layer_heads: List[int] = []
+    per_layer_heads: list[int] = []
     peak_hidden = 0
     residual_peak = d - rmap.get_free_count()
     n_layers = 0
@@ -151,7 +154,7 @@ def schedule_metrics(
         if output_node in computed:
             break
         attn_ops, mlp_ops, _biased = sched.schedule_layer(rmap, computed)
-        heads = sum(_count_heads_by_type(cast(Any, attn_ops), d_head).values())
+        heads = sum(_count_heads_by_type(cast("Any", attn_ops), d_head).values())
         per_layer_heads.append(heads)
         slots = sum(len(op.mlp_slots) for op in mlp_ops if op.mlp_slots)
         peak_hidden = max(peak_hidden, slots)
@@ -178,9 +181,9 @@ def schedule_trace(
     *,
     d: int,
     d_head: int,
-    d_hidden: Optional[int] = None,
+    d_hidden: int | None = None,
     max_layers: int = 800,
-) -> List[dict]:
+) -> list[dict]:
     """Schedule-only, but return per-layer detail for tracing occupancy diffs.
 
     Each list entry is a dict for one layer: ``hidden`` (total MLP slots used),
@@ -194,7 +197,7 @@ def schedule_trace(
     rmap, computed = _seed_residual_map(graph, d)
     sched = LayerScheduler(graph, d, d_head, pos_encoding=None, d_hidden=d_hidden)
 
-    trace: List[dict] = []
+    trace: list[dict] = []
     for i in range(max_layers):
         if output_node in computed:
             break
@@ -207,10 +210,10 @@ def schedule_trace(
             if op.op_type == "compute_ffn":
                 composites.append(
                     (
-                        cast(Node, op.node).annotation,
-                        cast(Node, op.node).d_output,
+                        cast("Node", op.node).annotation,
+                        cast("Node", op.node).d_output,
                         len(op.mlp_slots),
-                        cast(Node, op.node).node_id,
+                        cast("Node", op.node).node_id,
                     )
                 )
         trace.append({"layer": i, "hidden": hidden, "composites": composites})
@@ -228,9 +231,9 @@ def equivalence_report(
     *,
     d: int,
     d_head: int,
-    d_hidden: Optional[int] = None,
+    d_hidden: int | None = None,
     run_output: bool = False,
-    input_tensor: Optional[torch.Tensor] = None,
+    input_tensor: torch.Tensor | None = None,
     n_pos: int = 4,
 ) -> EquivalenceReport:
     """Compile both paths from ``build_fn`` and report metrics (+ optional

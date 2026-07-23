@@ -1,8 +1,9 @@
 """Immutable physical plans produced by directed schedule realization."""
 
+from collections.abc import Mapping
 from dataclasses import dataclass
 from numbers import Integral
-from typing import TYPE_CHECKING, Literal, Mapping, Optional, Union, cast
+from typing import TYPE_CHECKING, Literal, Union, cast
 
 from torchwright.compiler.forward.cpsat_scheduler import ScheduleAssignment
 from torchwright.compiler.realization import linear_attn_live_heads
@@ -57,7 +58,8 @@ def _check_reuse_input_index(op_type: str, index, reuse_op_types: tuple[str, ...
     (0 or 1); every fresh or unrelated operation carries None.  The index is
     occurrence-level, not node-level — for ``add(x, x)`` both addends name
     one node and only the index says which occurrence owns the reused
-    columns (docs/plan_additional_mlp_routing.md)."""
+    columns (docs/plan_additional_mlp_routing.md).
+    """
     if op_type in reuse_op_types:
         if index not in (0, 1):
             raise ValueError(
@@ -78,17 +80,17 @@ class PlannedAttentionOp:
         "cancel",
         "add_into",
     ]
-    node: Optional[Node]
+    node: Node | None
     target_cols: tuple[int, ...]
-    source_cols: Optional[tuple[int, ...]] = None
-    source_cols_b: Optional[tuple[int, ...]] = None
-    q_source_cols: Optional[tuple[int, ...]] = None
-    k_source_cols: Optional[tuple[int, ...]] = None
+    source_cols: tuple[int, ...] | None = None
+    source_cols_b: tuple[int, ...] | None = None
+    q_source_cols: tuple[int, ...] | None = None
+    k_source_cols: tuple[int, ...] | None = None
     #: The reused target occurrence (0 or 1) of an ``add_into``; None on
     #: every other op.  The attention writer does not read it — the physical
     #: trace and the replay-plan validator preserve which input occurrence
     #: was selected (node identity cannot express it for ``add(x, x)``).
-    reuse_input_index: Optional[int] = None
+    reuse_input_index: int | None = None
 
     def __post_init__(self) -> None:
         for name in (
@@ -176,17 +178,17 @@ class PlannedMlpOp:
         # scheduler walk).
         "clear_literal_seed",
     ]
-    node: Optional[Node]
+    node: Node | None
     target_cols: tuple[int, ...]
     mlp_slots: tuple[int, ...] = ()
-    source_cols: Optional[tuple[int, ...]] = None
+    source_cols: tuple[int, ...] | None = None
     #: Second addend of ``compute_add_bypass``; None on every other op.
-    source_cols_b: Optional[tuple[int, ...]] = None
+    source_cols_b: tuple[int, ...] | None = None
     #: The reused target occurrence (0 or 1) of an ``add_into_bypass``; None
     #: on every other op.  The live source occurrence is ``1 - index``; the
     #: writer folds that occurrence's deferred bias and must not infer it
     #: from node identity (``add(x, x)``) or post-reassignment ownership.
-    reuse_input_index: Optional[int] = None
+    reuse_input_index: int | None = None
 
     def __post_init__(self) -> None:
         for name in ("target_cols", "mlp_slots", "source_cols", "source_cols_b"):
@@ -411,7 +413,7 @@ def planned_layer_shape(
     d_head: int,
     d_hidden: int,
     trim_heads: bool,
-    n_heads: Optional[int] = None,
+    n_heads: int | None = None,
 ) -> tuple[LayerShape, int, int]:
     n_heads = resolve_n_heads(d, d_head, n_heads, require_divisible=False)
     emitted_heads = sum(op.emitted_heads(d_head) for op in attention_ops)

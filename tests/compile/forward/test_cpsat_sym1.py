@@ -153,7 +153,8 @@ def test_knob_on_changes_proto(name):
 
     Every example graph has at least one non-keep-forever node with a cancel
     window (``cancel_slack`` default 2), so each gets a ``parked`` var and the
-    D-2 converse ``cancel_layer <= max_layers - 1`` under ``parked.Not()``."""
+    D-2 converse ``cancel_layer <= max_layers - 1`` under ``parked.Not()``.
+    """
     node, d, d_head = _build(name)
     cfg = dict(
         d=d,

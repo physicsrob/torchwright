@@ -45,7 +45,8 @@ def _build_width_graph():
     """A width-tight fan-out/fan-in graph (6 Linears -> pairs -> concat -> out).
 
     Small, deterministic, and CPU-compilable; the same geometry the
-    intra-layer tests use to exercise the directed replay."""
+    intra-layer tests use to exercise the directed replay.
+    """
     torch.manual_seed(1)
     x = create_input("x", 4)
     mids = []
@@ -59,7 +60,8 @@ def _build_width_graph():
 
 def test_tripwire_silent_on_faithful_replay():
     """A normal optimize=1 compile replays the assignment faithfully, so the
-    tripwire never fires and the compile produces the reference output."""
+    tripwire never fires and the compile produces the reference output.
+    """
     out = _build_width_graph()
     net = forward_compile(
         d=80, d_head=80, output_node=out, device="cpu", verbose=False, optimize=1
@@ -71,10 +73,11 @@ def test_tripwire_silent_on_faithful_replay():
 
 
 def test_tripwire_fires_on_deeper_replay(monkeypatch):
-    """gap #5: a schedule the machine replays one layer deeper than the model
+    """Gap #5: a schedule the machine replays one layer deeper than the model
     claimed.  We intercept the solve and push the output node one layer past
     its assigned layer (keeping ``n_layers``); the faithful replay then emits
-    ``n_layers + 1`` layers and the tripwire must catch it."""
+    ``n_layers + 1`` layers and the tripwire must catch it.
+    """
     out = _build_width_graph()
     real_solve = solve_schedule
 
@@ -122,7 +125,8 @@ def test_tripwire_helper_placement_divergence():
     """The placement-divergence branch: a node replayed at a layer other than
     its assigned one.  Tested against the helper directly — the current
     executor cannot slip a node (the strict ready filter starves instead), so
-    this guards a future relaxed executor."""
+    this guards a future relaxed executor.
+    """
     assignment = ScheduleAssignment(
         node_to_layer={1: 0, 2: 1, 3: 2},
         node_to_cancel_layer={1: 1, 2: 2, 3: 3},
@@ -137,7 +141,8 @@ def test_tripwire_helper_placement_divergence():
 
 def test_tripwire_helper_silent_on_match():
     """The helper is silent when replay birth layers and emitted depth all
-    agree with the assignment."""
+    agree with the assignment.
+    """
     assignment = ScheduleAssignment(
         node_to_layer={1: 0, 2: 1, 3: 2},
         node_to_cancel_layer={1: 1, 2: 2, 3: 3},

@@ -10,7 +10,7 @@ import tempfile
 from contextlib import contextmanager
 from dataclasses import dataclass, replace
 from pathlib import Path
-from typing import Any, List, Literal, Optional, Union, cast
+from typing import Any, Literal, Union, cast
 
 import numpy as np
 
@@ -18,7 +18,6 @@ from torchwright.compiler.forward.compile import (
     forward_compile,
     rms_norm_width_supported,
 )
-from torchwright.compiler.utils import get_ancestor_nodes
 from torchwright.compiler.token_model import (
     CompileHeader,
     CompileProfile,
@@ -31,7 +30,7 @@ from torchwright.compiler.token_model import (
     resolve_rope,
     schedule_provenance,
 )
-from torchwright.compiler.utils import resolve_n_heads
+from torchwright.compiler.utils import get_ancestor_nodes, resolve_n_heads
 from torchwright.graph import Embedding, Node
 
 HFArchitecture = Union[CompileProfile, str]
@@ -45,7 +44,7 @@ class HFBundleReport:
     it does not retain the graph, emitted weights, or private compiler state.
     """
 
-    output_dir: Union[str, os.PathLike]
+    output_dir: str | os.PathLike
     n_layers: int
     schedule_provenance: ScheduleProvenance
 
@@ -114,7 +113,8 @@ def _staged_bundle_directory(output_dir):
 
 def _write_generation_config(output_dir, bos_id, eos_id) -> None:
     """Compiled vocabs carry no pad token: alias pad to eos so
-    ``generate()`` and ``pipeline()`` run without an explicit pad_token_id."""
+    ``generate()`` and ``pipeline()`` run without an explicit pad_token_id.
+    """
     from transformers import GenerationConfig
 
     GenerationConfig(
@@ -320,7 +320,7 @@ def compile_hf_bundle(
     rms_norm_eps=1e-5,
     rms_norm_const_exp=None,
     architecture: HFArchitecture = "phi3",
-    bias: Optional[bool] = None,
+    bias: bool | None = None,
     bos_token="<bos>",
     eos_token="<eos>",
     verbose=False,
@@ -385,7 +385,7 @@ def _compile_hf_bundle_into(
     rms_norm_eps=1e-5,
     rms_norm_const_exp=None,
     architecture: HFArchitecture = "phi3",
-    bias: Optional[bool] = None,
+    bias: bool | None = None,
     bos_token="<bos>",
     eos_token="<eos>",
     verbose=False,
@@ -522,7 +522,7 @@ def _compile_hf_bundle_into(
         token = build_token_weights(compiled, output_node, embedding, d)
         heads = [m[1] for m in sink.meta]
         hidden = [m[2] for m in sink.meta]
-        proxy_layers: List[Any] = []
+        proxy_layers: list[Any] = []
         for kind, nh, dh, base, drot in sink.meta:
             # Only RoPE metadata is inspected by resolve_rope.
             class A:
@@ -544,7 +544,7 @@ def _compile_hf_bundle_into(
             max_seq_len,
             vocab,
             token.embed_table.shape[0],
-            cast(Literal["relu", "swish"], compiled.activation),
+            cast("Literal['relu', 'swish']", compiled.activation),
             bool(bias),
             compiled.rms_norm_spec is not None,
             float(
@@ -593,7 +593,7 @@ def _compile_hf_bundle_into(
             from transformers import Phi3Config
 
             max_heads, inter = max(heads), max(hidden)
-            config = cast(Any, Phi3Config)(
+            config = cast("Any", Phi3Config)(
                 vocab_size=spec.vocab_size,
                 hidden_size=d,
                 intermediate_size=inter,
@@ -643,7 +643,7 @@ def _compile_hf_bundle_into(
             # the tied readout never sees the folded RMS constants — the
             # same fold the ONNX exporter's final_norm carries.
             final_gain = gain.copy()
-            final_gain[list(cast(Any, compiled.rms_norm_spec).reserved_cols)] = 0.0
+            final_gain[list(cast("Any", compiled.rms_norm_spec).reserved_cols)] = 0.0
             final_sd["model.norm.weight"] = _torch(final_gain)
             for i in range(spec.n_layers):
                 p = f"model.layers.{i}"
@@ -717,7 +717,7 @@ def compile_to_hf(
     rms_norm_eps=1e-5,
     rms_norm_const_exp=None,
     architecture: HFArchitecture = "phi3",
-    bias: Optional[bool] = None,
+    bias: bool | None = None,
     bos_token="<bos>",
     eos_token="<eos>",
     verbose=False,

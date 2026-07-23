@@ -95,7 +95,8 @@ def require_full_rotary(d_rot: int, d_head: int, feature: str) -> None:
     The content heads (:func:`rotary_content_head`) and the offset head
     (:func:`rotary_offset_head`) now *support* partial rotary — content rides the
     NoPE tail (:func:`place_on_nope_tail`); the local lobe is left full-rotary only
-    because DOOM uses the global recency mechanism past the lobe window."""
+    because DOOM uses the global recency mechanism past the lobe window.
+    """
     if d_rot != d_head:
         raise NotImplementedError(
             f"{feature} assumes full rotary (d_rot == d_head) but got "
@@ -152,7 +153,8 @@ def apply_rope(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.T
     pairing dim ``i`` with ``i + d_rot/2``) and the last ``d_head - d_rot`` dims pass
     through unrotated (the NoPE tail).  When ``d_rot == d_head`` (``cos`` as wide as
     ``x``) this is full rotary and takes the exact pre-partial expression, so existing
-    full-width callers are byte-identical."""
+    full-width callers are byte-identical.
+    """
     d_rot = cos.shape[-1]
     assert d_rot <= x.shape[-1], (
         f"RoPE cos width {d_rot} exceeds x width {x.shape[-1]}; cos/sin must be the "

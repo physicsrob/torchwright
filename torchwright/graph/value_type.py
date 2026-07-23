@@ -35,32 +35,32 @@ class Range:
             raise ValueError(f"Range lo must be <= hi, got lo={self.lo}, hi={self.hi}")
 
     @staticmethod
-    def unbounded() -> "Range":
+    def unbounded() -> Range:
         return Range(-_INF, _INF)
 
     @staticmethod
-    def point(v: float) -> "Range":
+    def point(v: float) -> Range:
         return Range(v, v)
 
-    def contains(self, other: "Range") -> bool:
+    def contains(self, other: Range) -> bool:
         return self.lo <= other.lo and other.hi <= self.hi
 
     def is_finite(self) -> bool:
         return math.isfinite(self.lo) and math.isfinite(self.hi)
 
-    def __add__(self, other: "Range") -> "Range":
+    def __add__(self, other: Range) -> Range:
         return Range(self.lo + other.lo, self.hi + other.hi)
 
-    def __neg__(self) -> "Range":
+    def __neg__(self) -> Range:
         return Range(-self.hi, -self.lo)
 
-    def __sub__(self, other: "Range") -> "Range":
+    def __sub__(self, other: Range) -> Range:
         return self + (-other)
 
-    def union(self, other: "Range") -> "Range":
+    def union(self, other: Range) -> Range:
         return Range(min(self.lo, other.lo), max(self.hi, other.hi))
 
-    def intersect(self, other: "Range") -> "Range":
+    def intersect(self, other: Range) -> Range:
         lo = max(self.lo, other.lo)
         hi = min(self.hi, other.hi)
         if lo > hi:
@@ -70,7 +70,7 @@ class Range:
             )
         return Range(lo, hi)
 
-    def relu(self) -> "Range":
+    def relu(self) -> Range:
         return Range(max(0.0, self.lo), max(0.0, self.hi))
 
 
@@ -87,16 +87,16 @@ class NodeValueType:
     # --- Factory helpers ------------------------------------------------
 
     @staticmethod
-    def unknown() -> "NodeValueType":
+    def unknown() -> NodeValueType:
         return NodeValueType()
 
     @staticmethod
-    def bounded(lo: float, hi: float) -> "NodeValueType":
+    def bounded(lo: float, hi: float) -> NodeValueType:
         return NodeValueType(value_range=Range(float(lo), float(hi)))
 
     # --- Combinators ----------------------------------------------------
 
-    def with_range(self, r: Range) -> "NodeValueType":
+    def with_range(self, r: Range) -> NodeValueType:
         return replace(self, value_range=r)
 
 

@@ -20,20 +20,16 @@ The input prompt must have enough tokens before \\n to avoid out-of-bounds
 attention at the trigger position (at least n_terms * digit_width tokens).
 """
 
-from typing import Tuple
-
-import torch
-
-from torchwright.graph import Node, Embedding
+from torchwright.graph import Embedding, Node
 from torchwright.graph.embedding import Unembedding
-from torchwright.ops.linear import add
 from torchwright.ops.attention_ops import attend_to_offset
 from torchwright.ops.inout_nodes import (
-    create_literal_value,
     create_embedding,
+    create_literal_value,
     create_rope_config,
     create_unembedding,
 )
+from torchwright.ops.linear import add
 from torchwright.ops.swiglu.logic_ops import equals_vector
 from torchwright.ops.swiglu.scalar_encoding import (
     digits_to_number,
@@ -58,7 +54,7 @@ N_TERMS = 8
 def create_network_parts(
     digit_width: int = DIGIT_WIDTH,
     n_terms: int = N_TERMS,
-) -> Tuple[Node, Embedding]:
+) -> tuple[Node, Embedding]:
     """Build the Fibonacci generator computation graph.
 
     Args:

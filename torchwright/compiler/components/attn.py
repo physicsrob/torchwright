@@ -1,11 +1,8 @@
-from typing import Optional, Tuple
-
 import torch
 import torch.nn.functional as F
 from torch.nn.attention import SDPBackend, sdpa_kernel
 
 from torchwright.compiler.components.component import Component
-from torchwright.graph.attn import CAUSAL_MASK_SENTINEL  # kept for compat
 from torchwright.graph.rope import ROPE_BASE, apply_rope, rope_cos_sin
 
 # F.scaled_dot_product_attention's default backend on A100 with fp32
@@ -33,9 +30,7 @@ class AttnLayerComponent(Component):
         output_matrix: (n_heads, d_head, d)
     """
 
-    def __init__(
-        self, d: int, d_head: int, name: str = "", n_heads: Optional[int] = None
-    ):
+    def __init__(self, d: int, d_head: int, name: str = "", n_heads: int | None = None):
         super().__init__(d, name)
         from torchwright.compiler.utils import resolve_n_heads
 
@@ -65,13 +60,14 @@ class AttnLayerComponent(Component):
 
     def _apply_rope(
         self, Q: torch.Tensor, K: torch.Tensor, positions: torch.Tensor
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         """Rotate Q/K of every head by ``positions`` (rotate_half over the rotary
         front ``rope_d_rot``; the last ``d_head - rope_d_rot`` dims pass through
         unrotated — the NoPE tail).  Q/K are ``(n_heads, P, d_head)``;
         ``positions`` is ``(P,)`` of absolute positions.  ``apply_rope`` reads the
         rotary width from ``cos`` and slices; unused (all-zero) heads rotate
-        harmlessly (zeros stay zero)."""
+        harmlessly (zeros stay zero).
+        """
         d_rot = self.d_head if self.rope_d_rot is None else self.rope_d_rot
         cos, sin = rope_cos_sin(positions, d_rot, self.rope_base)  # (P, d_rot)
         cos = cos.to(Q.dtype)
@@ -112,8 +108,8 @@ class AttnLayerComponent(Component):
     def forward_cached(
         self,
         inp: torch.Tensor,
-        past_kv: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
-    ) -> Tuple[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
+        past_kv: tuple[torch.Tensor, torch.Tensor] | None = None,
+    ) -> tuple[torch.Tensor, tuple[torch.Tensor, torch.Tensor]]:
         """Forward pass with KV cache.
 
         Args:

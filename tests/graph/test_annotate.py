@@ -25,31 +25,26 @@ def test_basic_nesting():
 
 
 def test_distinct_labels_still_nest():
-    with annotate("proj"):
-        with annotate("paint"):
-            assert _cur() == "proj/paint"
+    with annotate("proj"), annotate("paint"):
+        assert _cur() == "proj/paint"
 
 
 def test_dedup_consecutive_same_label():
-    with annotate("paint"):
-        with annotate("paint"):
-            with annotate("paint"):
-                assert _cur() == "paint"
+    with annotate("paint"), annotate("paint"), annotate("paint"):
+        assert _cur() == "paint"
 
 
 def test_dedup_compound_label():
-    with annotate("pmrk/R_CheckPlane"):
-        with annotate("pmrk/R_CheckPlane"):
-            assert _cur() == "pmrk/R_CheckPlane"
+    with annotate("pmrk/R_CheckPlane"), annotate("pmrk/R_CheckPlane"):
+        assert _cur() == "pmrk/R_CheckPlane"
 
 
 def test_dedup_interleaved_components():
     # the A/B/A/B shape produced by sibling functions calling each other
-    with annotate("stor/R_StoreWallRange"):
+    with annotate("stor/R_StoreWallRange"), annotate("pix/R_DrawColumn"):
         with annotate("pix/R_DrawColumn"):
-            with annotate("pix/R_DrawColumn"):
-                with annotate("tex"):
-                    assert _cur() == "stor/R_StoreWallRange/pix/R_DrawColumn/tex"
+            with annotate("tex"):
+                assert _cur() == "stor/R_StoreWallRange/pix/R_DrawColumn/tex"
 
 
 def test_reset_on_exit_even_on_error():

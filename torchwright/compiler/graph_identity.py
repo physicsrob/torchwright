@@ -24,12 +24,11 @@ import hashlib
 import json
 from dataclasses import asdict
 from functools import lru_cache
-from typing import cast
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import cast
 
-from torchwright.graph import Node
 from torchwright.compiler.utils import resolve_n_heads
+from torchwright.graph import Node
 
 
 @lru_cache(maxsize=1)
@@ -60,15 +59,15 @@ def compiler_code_fingerprint() -> str:
     return h.hexdigest()
 
 
-def _canonical_walk(output_node: Node) -> List[Node]:
+def _canonical_walk(output_node: Node) -> list[Node]:
     """Nodes in canonical (preorder-DFS) order.
 
     Preorder DFS from the output following each node's ORDERED
     ``inputs`` list; first visit assigns the next canonical number.
     """
     seen: set = set()
-    ordered: List[Node] = []
-    stack: List[Node] = [output_node]
+    ordered: list[Node] = []
+    stack: list[Node] = [output_node]
     while stack:
         n = stack.pop()
         if n.node_id in seen:
@@ -80,17 +79,17 @@ def _canonical_walk(output_node: Node) -> List[Node]:
     return ordered
 
 
-def canonical_ids(output_node: Node) -> Dict[int, int]:
+def canonical_ids(output_node: Node) -> dict[int, int]:
     """Map current ``node_id`` -> canonical id, independent of creation order."""
     return {n.node_id: i for i, n in enumerate(_canonical_walk(output_node))}
 
 
-def nodes_by_canonical_id(output_node: Node) -> Dict[int, Node]:
+def nodes_by_canonical_id(output_node: Node) -> dict[int, Node]:
     """Map canonical id -> live node object (the remap direction loaders need)."""
     return dict(enumerate(_canonical_walk(output_node)))
 
 
-def topology_entries(output_node: Node) -> List[tuple]:
+def topology_entries(output_node: Node) -> list[tuple]:
     """Per-node ``(canon_id, type_name, width, input_canon_ids)`` tuples.
 
     The hashable topology encoding shared by the schedule-cache
@@ -114,15 +113,15 @@ def graph_fingerprint(
     *,
     d: int,
     d_head: int,
-    n_heads: Optional[int] = None,
+    n_heads: int | None = None,
     d_hidden: int,
     flex_routing: bool,
-    cancel_slack: Optional[int],
+    cancel_slack: int | None,
     policy,
     reserve_residual: int = 0,
     bias: bool = True,
-    held_output_source: Optional[Node] = None,
-    held_output_target: Optional[Node] = None,
+    held_output_source: Node | None = None,
+    held_output_target: Node | None = None,
 ) -> str:
     """Topology + geometry + solver-knob hash for the CP-SAT schedule cache.
 
@@ -159,8 +158,8 @@ def graph_fingerprint(
     "Ran out of attention heads" assert deep in the weight-writer, on a
     cache *hit*).
     """
-    from torchwright.graph.linear import Linear as _Linear
     from torchwright.compiler.realization import live_weight_row_ranges
+    from torchwright.graph.linear import Linear as _Linear
 
     n_heads = resolve_n_heads(d, d_head, n_heads, require_divisible=False)
     canon = canonical_ids(output_node)
@@ -237,14 +236,14 @@ def debug_fingerprint(
     return hashlib.sha256(encoded).hexdigest()
 
 
-def encode_cols(cols: List[int]) -> List[Tuple[int, int]]:
+def encode_cols(cols: list[int]) -> list[tuple[int, int]]:
     """Run-length encode an ORDERED column list as ``(start, length)`` runs.
 
     Column order is meaningful (column k holds component k of the node's
     value), so runs only merge consecutive ASCENDING indices — decoding
     reproduces the exact original order.
     """
-    runs: List[Tuple[int, int]] = []
+    runs: list[tuple[int, int]] = []
     for c in cols:
         if runs and c == runs[-1][0] + runs[-1][1]:
             runs[-1] = (runs[-1][0], runs[-1][1] + 1)
@@ -253,9 +252,9 @@ def encode_cols(cols: List[int]) -> List[Tuple[int, int]]:
     return runs
 
 
-def decode_cols(runs: List) -> List[int]:
+def decode_cols(runs: list) -> list[int]:
     """Inverse of :func:`encode_cols` (accepts JSON-decoded lists)."""
-    cols: List[int] = []
+    cols: list[int] = []
     for start, length in runs:
         cols.extend(range(int(start), int(start) + int(length)))
     return cols

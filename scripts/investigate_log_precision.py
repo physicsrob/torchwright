@@ -14,8 +14,8 @@ import math
 
 import torch
 
-from torchwright.ops.relu.arithmetic_ops import log  # type: ignore[attr-defined]
 from torchwright.ops.inout_nodes import create_input
+from torchwright.ops.relu.arithmetic_ops import log  # type: ignore[attr-defined]
 
 
 def _measure(x_min: float, x_max: float, n_bp: int, n_samples: int = 4096) -> dict:

@@ -1,16 +1,16 @@
+import torch
+
 from torchwright.graph.asserts import assert_matches_value_type
 from torchwright.graph.spherical_codes import index_to_vector
 from torchwright.graph.value_type import NodeValueType, Range
-from torchwright.ops.inout_nodes import create_literal_value, create_input
+from torchwright.ops.inout_nodes import create_input, create_literal_value
 from torchwright.ops.relu.logic_ops import (
-    equals_vector,
-    cond_gate,
-    bool_any_true,
     bool_all_true,
+    bool_any_true,
     bool_not,
+    cond_gate,
+    equals_vector,
 )
-
-import torch
 
 
 def test_equals_vector():
@@ -49,7 +49,8 @@ def test_cond_gate():
 
 def test_cond_gate_adaptive_M_uses_value_range():
     """cond_gate picks M from inp.value_type.value_range, so small inputs survive
-    that would be lost under the old global big_offset=1000."""
+    that would be lost under the old global big_offset=1000.
+    """
     x = create_input("x", 1)
     x_bounded = assert_matches_value_type(
         x, NodeValueType(value_range=Range(-1.0, 1.0))

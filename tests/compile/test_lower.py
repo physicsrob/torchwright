@@ -128,7 +128,8 @@ def test_lower_copy_has_fresh_bounds_source_keeps_stale():
     describing the pre-mutation graph.  The *copy* lower() builds must
     have cached == fresh for every reachable node (its caches are
     recomputed at clone time), while the source — compilation is a pure
-    function — keeps whatever caches it had, stale or not."""
+    function — keeps whatever caches it had, stale or not.
+    """
     x = create_input("x", 4, value_range=(-1.0, 1.0))
     l1 = Linear(x, torch.randn(4, 6) * 0.2, torch.randn(6) * 0.1)
     blk = _block(l1, 6, 8, 5, seed=3)
@@ -168,7 +169,8 @@ def test_lower_preserves_semantic_overrides_on_copy():
 
     ``compare()`` installs its override on the node it returns (which
     also carries compare's range claim); the copy must re-apply both,
-    and consumers' bounds must match the source's bit-identically."""
+    and consumers' bounds must match the source's bit-identically.
+    """
     from torchwright.ops.relu.arithmetic_ops import compare
 
     x = create_input("x", 1, value_range=(-10.0, 10.0))
@@ -200,7 +202,8 @@ def test_lower_preserves_semantic_overrides_on_copy():
 def test_lower_twice_is_bit_identical_and_source_untouched():
     """D6 for L1: lowering the same source twice yields per-node
     value_types that are bit-identical across the two copies, and the
-    source — node set, checks, bounds — is untouched by both."""
+    source — node set, checks, bounds — is untouched by both.
+    """
     from torchwright.compiler.utils import get_ancestor_nodes
     from torchwright.graph.asserts import assert_in_range, collect_asserts
 
@@ -254,7 +257,8 @@ def test_forward_compile_rejects_uncertified_graph():
 
 def test_lower_fuses_copy_and_leaves_source_unfused():
     """lower() fuses the compiler-private copy; the source keeps its
-    Linear -> Linear chain, and the fused copy computes the same value."""
+    Linear -> Linear chain, and the fused copy computes the same value.
+    """
     x = create_input("x", 4, value_range=(-2.0, 2.0))
     l1 = Linear(x, torch.randn(4, 3) * 0.3, torch.randn(3) * 0.1, name="l1")
     l2 = Linear(l1, torch.randn(3, 2) * 0.3, torch.randn(2) * 0.1, name="l2")
@@ -282,7 +286,8 @@ def test_lower_fuses_copy_and_leaves_source_unfused():
 
 def test_lower_node_map_drops_fused_away_nodes():
     """A source node whose value was absorbed into a survivor's weights has
-    no counterpart; copy_of names fusion in the error."""
+    no counterpart; copy_of names fusion in the error.
+    """
     x = create_input("x", 4, value_range=(-2.0, 2.0))
     l1 = Linear(x, torch.randn(4, 3), torch.randn(3), name="l1")
     l2 = Linear(l1, torch.randn(3, 2), torch.randn(2), name="l2")
@@ -296,7 +301,8 @@ def test_lower_node_map_drops_fused_away_nodes():
 def test_lower_node_map_follows_value_move():
     """The FFN->Linear fold moves the Linear's value onto the FFN: the source
     Linear maps to the surviving copy FFN, and the source FFN (whose own
-    value no longer exists) has no counterpart."""
+    value no longer exists) has no counterpart.
+    """
     x = create_input("x", 6, value_range=(-2.0, 2.0))
     blk = _block(x, 6, 8, 4, seed=11)
     l = Linear(blk, torch.randn(4, 3) * 0.2, torch.randn(3) * 0.1, name="l")
@@ -317,7 +323,8 @@ def test_lower_node_map_follows_value_move():
 
 def test_lower_node_map_concat_fold():
     """Concat-fold survivors keep their mapping; absorbed leaves and the
-    value-changed concat lose theirs."""
+    value-changed concat lose theirs.
+    """
     a = create_input("a", 4, value_range=(-2.0, 2.0))
     b = create_input("b", 5, value_range=(-2.0, 2.0))
     leaf1 = Linear(a, torch.randn(4, 3) * 0.3, torch.randn(3) * 0.1, name="leaf1")
@@ -347,7 +354,8 @@ def test_lower_checks_on_moved_value_migrate_to_survivor():
     """The FFN->Linear fold moves the orphaned Linear's value onto the
     FFN — and its checks and claim move with it, so the value stays
     runtime-checkable on the copy (the old wrapper used to be rewired
-    onto the survivor; metadata migrates instead)."""
+    onto the survivor; metadata migrates instead).
+    """
     x = create_input("x", 6, value_range=(-1.0, 1.0))
     blk = _block(x, 6, 8, 4, seed=12)
     l = Linear(blk, torch.randn(4, 3) * 0.1, torch.randn(3) * 0.05, name="l")
@@ -365,7 +373,8 @@ def test_lower_checks_on_moved_value_migrate_to_survivor():
 
 def test_compiled_debug_value_speaks_source_after_fusion():
     """debug_value keys by source node: the fused-away Linear returns None,
-    the survivor returns the oracle value."""
+    the survivor returns the oracle value.
+    """
     from torchwright.compiler.export import compile_headless
 
     x = create_input("x", 4, value_range=(-2.0, 2.0))

@@ -18,7 +18,6 @@ docstring states.
 from typing import cast
 
 import pytest
-import torch
 
 from examples import calculator_memorize as cm
 from torchwright.compiler.forward.cpsat_scheduler import critical_path_layers
@@ -41,10 +40,11 @@ def model_n2():
 
 def _check_expr(out_node, embedding, expr: str, expected: str) -> None:
     """Teacher-forced check: the model's argmax at the newline and every
-    answer position predicts the expected next token."""
+    answer position predicts the expected next token.
+    """
     tokens = [bos_token] + list(expr) + ["\n"] + list(expected) + ["<eos>"]
     cache = reference_eval(
-        out_node, cast(dict, {"embedding_input": tokens}), len(tokens)
+        out_node, cast("dict", {"embedding_input": tokens}), len(tokens)
     )
     logits = cache[out_node]
     vocab = embedding.tokenizer.vocab
@@ -132,7 +132,8 @@ def test_n3_is_stated_as_unbuildable():
 def test_compiled_layers_law_matches_measured_compiles():
     """Pin the capacity law to the three witnessed optimize=0 compiles
     (2026-07-20, scripts.measure_calculator_compiled_layers on Modal).
-    The default d_hidden is the family's canonical D_HIDDEN."""
+    The default d_hidden is the family's canonical D_HIDDEN.
+    """
     assert cm.compiled_layers(1, d_hidden=8192) == 15
     assert cm.compiled_layers(2, d_hidden=8192) == 18
     assert cm.compiled_layers(2, d_hidden=16384) == 16

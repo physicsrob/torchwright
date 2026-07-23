@@ -20,8 +20,8 @@ from torchwright.compiler.export import compile_headless
 from torchwright.debug.probe import probe_compiled
 from torchwright.graph.spherical_codes import index_to_vector
 from torchwright.ops.attention_ops import attend_most_recent_globally
-from torchwright.ops.relu.global_recency import global_position_from_bos
 from torchwright.ops.inout_nodes import create_input, create_rope_config
+from torchwright.ops.relu.global_recency import global_position_from_bos
 
 D_HEAD = 256
 CAP = 61440
@@ -98,7 +98,8 @@ def test_probe_compiled_parity():
 
 def test_prefill_equals_cached_decode():
     """Global recency selection is identical between a prefill and an unbounded
-    cached decode — the BOS/K-already-rotated cache invariant (§5)."""
+    cached decode — the BOS/K-already-rotated cache invariant (§5).
+    """
     sel = _global_recency_graph()
     stride = 8
     n = 40
@@ -148,7 +149,8 @@ def test_compiled_picks_most_recent_globally_larger_n():
 def test_partial_global_recency_placement():
     """Under partial rotary the global-recency head splits placement: the 8-wide
     content rides the NoPE tail [d_rot:d_rot+8] and the position tiebreak rides the
-    slowest rotated plane d_rot/2-1; the head carries rope_d_rot == d_rot."""
+    slowest rotated plane d_rot/2-1; the head carries rope_d_rot == d_rot.
+    """
     from torchwright.compiler.utils import get_ancestor_nodes
     from torchwright.graph.attn import Attn
 
@@ -166,7 +168,8 @@ def test_partial_global_recency_placement():
 
 def test_partial_compiled_picks_most_recent_globally():
     """Partial-rotary global recency (d_head=128, d_rot=64): most recent match
-    selected over a stride-10 prefill, compiled path."""
+    selected over a stride-10 prefill, compiled path.
+    """
     sel = _global_recency_graph(d_head=D_HEAD_PARTIAL, d_rot=D_ROT_PARTIAL)
     stride = 10
     n = 60
@@ -195,7 +198,8 @@ def test_partial_probe_compiled_parity():
 
 def test_partial_prefill_equals_cached_decode():
     """Partial-rotary global recency is identical between prefill and unbounded
-    cached decode (the NoPE tail and rotated position column both cache cleanly)."""
+    cached decode (the NoPE tail and rotated position column both cache cleanly).
+    """
     sel = _global_recency_graph(d_head=D_HEAD_PARTIAL, d_rot=D_ROT_PARTIAL)
     n = 40
     matches = set(range(0, n, 8))

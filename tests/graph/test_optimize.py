@@ -1,7 +1,7 @@
 """Tests for graph optimization passes."""
 
-import torch
 import pytest
+import torch
 
 from torchwright.compiler.export import compile_headless
 from torchwright.graph import FFN, Concatenate, InputNode, Linear
@@ -251,7 +251,8 @@ def test_fold_block_out_into_downstream_linear():
 
 def test_block_out_fold_declined_at_output_boundary():
     """The FFN-into-Linear fold is declined when the Linear is a caller-held
-    output node, preserving the caller's output identity."""
+    output node, preserving the caller's output identity.
+    """
     inp = InputNode("x", 6, value_range=(-2.0, 2.0))
     b = _block(inp, 6, 8, 4, seed=3)
     l = Linear(b, torch.randn(4, 3) * 0.2, torch.randn(3) * 0.1, name="l")
@@ -326,7 +327,8 @@ def test_block_folds_preserve_compiled_output():
 
 def test_fold_linear_leaves_through_concat():
     """Single-consumer Linear leaves fold into the downstream Linear's row
-    blocks; the concat survives, rewired to the leaves' inputs."""
+    blocks; the concat survives, rewired to the leaves' inputs.
+    """
     in1 = InputNode("a", 4, value_range=(-2.0, 2.0))
     in2 = InputNode("b", 5, value_range=(-2.0, 2.0))
     l1 = Linear(in1, torch.randn(4, 3) * 0.3, torch.randn(3) * 0.1, name="l1")
@@ -398,7 +400,8 @@ def test_concat_fold_declined_output_leaf():
 
 def test_literal_leaf_folds_into_bias():
     """A LiteralValue leaf's contribution moves into the bias; the leaf and
-    its block rows are dropped."""
+    its block rows are dropped.
+    """
     from torchwright.graph import LiteralValue
 
     in1 = InputNode("a", 4, value_range=(-2.0, 2.0))
@@ -421,7 +424,8 @@ def test_literal_leaf_folds_into_bias():
 
 def test_all_literal_concat_declined():
     """Literal folds never empty the concat (a 0-input Linear is not
-    representable)."""
+    representable).
+    """
     from torchwright.graph import LiteralValue
 
     lit1 = LiteralValue(torch.tensor([1.0, 2.0]))
@@ -451,7 +455,8 @@ def test_concat_fold_param_guard():
 def test_accumulator_chain_collapses():
     """The ``sum_nodes`` fanout-limited accumulator shape —
     ``Linear(Concat(acc_Linear, ...))`` chains — collapses to one flat
-    Linear over the leaves' inputs across passes (fold, splice, fold)."""
+    Linear over the leaves' inputs across passes (fold, splice, fold).
+    """
     ins = [InputNode(f"x{i}", 4, value_range=(-2.0, 2.0)) for i in range(3)]
     gates = [
         Linear(ins[i], torch.randn(4, 3) * 0.3, torch.randn(3) * 0.1, name=f"g{i}")
@@ -489,7 +494,8 @@ def test_accumulator_chain_collapses():
 def test_concat_fold_refreshes_stale_bounds():
     """Concat folds mutate the survivor Linear and the concat in place; the
     cached bounds of both — and everything downstream — must equal a fresh
-    recompute afterwards."""
+    recompute afterwards.
+    """
     from torchwright.compiler.utils import get_ancestor_nodes
     from torchwright.graph.affine_rules import compute_affine_bound
 
@@ -583,7 +589,8 @@ def test_concat_fold_merges_duplicate_leaves():
 
 def test_concat_fold_merges_hand_built_duplicate_leaves():
     """A hand-built Concat([x, x]) under a Linear merges to a single leaf
-    with summed blocks even though no leaf fold fires."""
+    with summed blocks even though no leaf fold fires.
+    """
     x = InputNode("x", 2, value_range=(-5.0, 5.0))
     l = Linear(
         Concatenate([x, x]),
@@ -607,7 +614,8 @@ def test_concat_fold_merges_hand_built_duplicate_leaves():
 def test_duplicate_selector_shape_compiles_correct():
     """End-to-end pin of the doom instance-index regression: two selectors
     over one input, concatenated into a combining Linear, must compile to
-    the oracle value (it compiled to the second block only)."""
+    the oracle value (it compiled to the second block only).
+    """
     from torchwright.ops.inout_nodes import create_input
 
     occ = create_input("occ", 4, value_range=(0.0, 300.0))
@@ -668,7 +676,8 @@ def test_ffn_fold_declined_on_checked_ffn():
 
 def test_ffn_fold_migrates_checks_from_orphaned_linear():
     """The one fold where the orphan's VALUE survives (on the FFN): its
-    checks and claim migrate to the survivor instead of blocking."""
+    checks and claim migrate to the survivor instead of blocking.
+    """
     from torchwright.graph.asserts import assert_in_range
 
     inp = InputNode("x", 6, value_range=(-1.0, 1.0))
@@ -690,7 +699,8 @@ def test_ffn_fold_migrates_checks_from_orphaned_linear():
 def test_concat_fold_declined_on_checked_concat():
     """The composite two-input asserts attach to a Concatenate; every
     concat fold changes its value or width, so a checked concat stays
-    whole (splices included)."""
+    whole (splices included).
+    """
     from torchwright.graph.asserts import assert_unique_values
 
     a = InputNode("a", 2, value_range=(-2.0, 2.0))
@@ -751,7 +761,8 @@ def _hinted(node):
 
 def _waited_on(node, out_width=1):
     """Make node a hint target: some sibling in the graph waits on it.
-    Returns the waiter (must stay reachable from the test's output)."""
+    Returns the waiter (must stay reachable from the test's output).
+    """
     from torchwright.graph.scheduling_hints import add_scheduling_dependency
 
     src = node
@@ -808,7 +819,8 @@ def test_gate_fold_declines_hinted_upstream_linear():
 def test_ffn_fold_declines_hinted_downstream_linear():
     """The FFN->Linear fold orphans l even though l's VALUE moves onto the
     FFN: hint edges are keyed by node identity, so a waiter naming l would
-    never see it computed."""
+    never see it computed.
+    """
     inp = InputNode("x", 6, value_range=(-2.0, 2.0))
     b = _block(inp, 6, 8, 4, seed=2)
     l = _hinted(Linear(b, torch.randn(4, 3) * 0.2, name="l"))
@@ -857,7 +869,8 @@ def _waited_on_literal(lit, src):
 def test_concat_fold_declines_hinted_nested_concat_splice():
     """A splice is value-identical but still orphans the nested concat; a
     waiter can name a Concatenate (the scheduler marks one computed once its
-    leaves are), so the gate applies."""
+    leaves are), so the gate applies.
+    """
     from torchwright.graph.scheduling_hints import add_scheduling_dependency
 
     inp = InputNode("x", 4, value_range=(-2.0, 2.0))
@@ -939,7 +952,8 @@ def test_sequential_scope_serializes_under_forward_compile():
 
 def test_assert_hints_intact_names_the_pass():
     """The lower()-level tripwire: a pass that orphans a hint target (the
-    collapse passes have no orphan gates) fails loudly, attributed."""
+    collapse passes have no orphan gates) fails loudly, attributed.
+    """
     from torchwright.graph.scheduling_hints import (
         add_scheduling_dependency,
         assert_hints_intact,
@@ -963,7 +977,8 @@ def test_ffn_fold_clears_survivor_stale_claim_without_checks():
     replaced by the fold, so a claim it carried — installed WITHOUT a check,
     which nothing forbids — must not survive onto the new value, where it
     would wrongly tighten bounds.  The gate that made this safe by accident
-    is ``bool(b.checks)``; this constructs the case that gate misses."""
+    is ``bool(b.checks)``; this constructs the case that gate misses.
+    """
     from torchwright.graph.value_type import NodeValueType, Range
 
     inp = InputNode("x", 6, value_range=(-1.0, 1.0))
@@ -987,7 +1002,8 @@ def test_ffn_fold_clears_survivor_stale_claim_without_checks():
 def test_ffn_fold_unconditional_transfer_still_migrates():
     """The unconditional transfer changes nothing for the covered case: l's
     checks and claim still land on b (regression guard alongside
-    test_ffn_fold_migrates_checks_from_orphaned_linear)."""
+    test_ffn_fold_migrates_checks_from_orphaned_linear).
+    """
     from torchwright.graph.asserts import assert_in_range
     from torchwright.graph.value_type import NodeValueType, Range
 

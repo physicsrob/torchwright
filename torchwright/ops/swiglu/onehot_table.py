@@ -42,8 +42,6 @@ winner's indicator by exactly ε (the saturated gate is linear down to a
 count deviation of 0.33), so output error is ``2ε·|value_i − default|``.
 """
 
-from typing import Dict
-
 import torch
 
 from torchwright.graph import Linear, Node
@@ -70,7 +68,7 @@ def _count_one_hot_blocks(key: torch.Tensor) -> int:
 
 def onehot_lookup(
     inp: Node,
-    key_to_value: Dict[torch.Tensor, torch.Tensor],
+    key_to_value: dict[torch.Tensor, torch.Tensor],
     default: torch.Tensor,
 ) -> Node:
     """Map a one-hot (or concatenation of one-hots) input to a lookup table.

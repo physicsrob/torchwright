@@ -15,20 +15,18 @@ Key components:
     remove_leading_0s — shifts a digit sequence left to drop leading zeros.
 """
 
-from typing import List
-
 import torch
 
-from torchwright.graph import Linear, Node, Embedding, RopeConfig
-from torchwright.ops.linear import add_const, bool_to_01, concat, negate, sum_nodes
+from torchwright.graph import Embedding, Linear, Node, RopeConfig
 from torchwright.ops.attention_ops import attend_to_offset, get_prev_value
 from torchwright.ops.inout_nodes import create_literal_value
+from torchwright.ops.linear import add_const, bool_to_01, concat, negate, sum_nodes
 from torchwright.ops.relu.arithmetic_ops import compare
 from torchwright.ops.relu.logic_ops import (
-    equals_vector,
-    cond_gate,
-    bool_not,
     bool_all_true,
+    bool_not,
+    cond_gate,
+    equals_vector,
 )
 from torchwright.ops.relu.map_select import (
     broadcast_select,
@@ -94,7 +92,7 @@ class NumericSequence:
         # Build the sliding window: current_digits[0] = current token,
         # current_digits[1] = token one position back, etc.
         # At number boundaries, reset earlier positions to "0".
-        current_digits: List[Node] = [embedding]
+        current_digits: list[Node] = [embedding]
         for i in range(digits - 1):
             current_digits.append(
                 select(
@@ -108,7 +106,7 @@ class NumericSequence:
         # delimiter token (one step after the last digit).
         self.digit_values = [attend_to_offset(rope, digit) for digit in current_digits]
 
-    def get_digits_at_event(self, termination_event: Node) -> List[Node]:
+    def get_digits_at_event(self, termination_event: Node) -> list[Node]:
         """Capture the digit window at the position where termination_event fires.
 
         The captured values persist forward via attention -- once latched,
@@ -129,7 +127,7 @@ class NumericSequence:
 def output_sequence(
     rope: RopeConfig,
     trigger_condition: Node,
-    seq: List[Node],
+    seq: list[Node],
     default_output: torch.Tensor,
 ):
     """Gate a sequence of values for left-to-right autoregressive emission.
@@ -194,8 +192,8 @@ def output_sequence(
 
 
 def remove_leading_0s(
-    embedding: Embedding, seq: List[Node], max_removals: int
-) -> List[Node]:
+    embedding: Embedding, seq: list[Node], max_removals: int
+) -> list[Node]:
     """Remove leading zeros from a digit sequence by shifting left.
 
     With ``k`` the length of the leading run of ``"0"`` tokens capped at
@@ -258,7 +256,7 @@ def remove_leading_0s(
     zero_fill = create_literal_value(torch.zeros(d), name="remove_leading_0s_zero")
     collapse = torch.eye(d).repeat(n_entries, 1)
 
-    out: List[Node] = []
+    out: list[Node] = []
     for i in range(n):
         candidates = concat([seq[min(i + k, n - 1)] for k in range(n_entries)])
         masked = broadcast_select(

@@ -51,8 +51,8 @@ import time
 # Cold solves: isolate the schedule cache before torchwright imports read it.
 os.environ["TW_SCHEDULE_CACHE_DIR"] = tempfile.mkdtemp(prefix="tw-add-flip-")
 
-from torchwright.compiler.forward.compile import forward_compile  # noqa: E402
-from torchwright.compiler.forward.scheduling_policy import (  # noqa: E402
+from torchwright.compiler.forward.compile import forward_compile
+from torchwright.compiler.forward.scheduling_policy import (
     LEGACY_POLICY,
     SchedulingPolicy,
 )

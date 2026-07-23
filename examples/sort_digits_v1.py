@@ -50,15 +50,11 @@ Residual footprint. 10 key-side indicator columns + 1 score column +
 narrowest of the four variants (D_MODEL = 512, a supported Phi-3/RMSNorm width).
 """
 
-from typing import List, Tuple
-
 import torch
 
-from torchwright.graph import Concatenate, Node, Embedding
+from torchwright.graph import Concatenate, Embedding, Node
 from torchwright.graph.asserts import assert_integer
 from torchwright.graph.embedding import Unembedding
-from torchwright.ops.swiglu.arithmetic_ops import compare
-from torchwright.ops.linear import add_scaled_nodes
 from torchwright.ops.attention_ops import attend_argmin_above_integer, get_prev_value
 from torchwright.ops.inout_nodes import (
     create_embedding,
@@ -66,6 +62,8 @@ from torchwright.ops.inout_nodes import (
     create_rope_config,
     create_unembedding,
 )
+from torchwright.ops.linear import add_scaled_nodes
+from torchwright.ops.swiglu.arithmetic_ops import compare
 from torchwright.ops.swiglu.logic_ops import (
     bool_all_true,
     bool_any_true,
@@ -144,7 +142,7 @@ def _threshold_onehot(prev_digit: Node) -> Node:
 
 def create_network_parts(
     max_out: int = MAX_OUT,
-) -> Tuple[Node, Embedding]:
+) -> tuple[Node, Embedding]:
     """Build the V1 distinct-digit selection-sort graph."""
     vocab = list("0123456789") + [" ", "\n", "<bos>", "<eos>"]
     embedding = create_embedding(vocab=vocab)
@@ -206,7 +204,7 @@ def create_network_parts(
     # of the integer answer even under softmax leakage.
     prev_digit: Node = create_literal_value(torch.tensor([-1.0]))
 
-    seq: List[Node] = []
+    seq: list[Node] = []
     for _ in range(max_out):
         threshold_onehot = _threshold_onehot(prev_digit)
         selected_embed = attend_argmin_above_integer(

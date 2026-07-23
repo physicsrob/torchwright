@@ -38,7 +38,8 @@ Q = 30  # constant magnitude 2^Q
 def doom_like_stream(d_data, n, scale=1.0):
     """A residual stream spanning DOOM-ish magnitudes (distances ~1e3, their
     reciprocals ~1e-3..1e-4, unit-ish trig, mid-range), scaled by ``scale``
-    (``>1`` simulates the larger residual energy of a deep layer)."""
+    (``>1`` simulates the larger residual energy of a deep layer).
+    """
     x = torch.zeros(n, d_data)
     w = d_data // 5
     x[:, 0 * w : 1 * w] = torch.empty(n, w).uniform_(-2000, 2000)  # coords/dist

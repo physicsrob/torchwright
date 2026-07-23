@@ -5,19 +5,20 @@ captured in a replay plan. No scheduler, allocator, or ResidualAssignment —
 just scatter writes.
 """
 
+from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
-from typing import Dict, Iterable, List, Literal, Optional, Sequence, Set, Tuple, cast
+from typing import Literal, cast
 
 import torch
 import torch.nn.functional as F
 
-from torchwright.compiler.realization import linear_attn_chunks
-from torchwright.compiler.residual_assignment import flatten_concat_nodes
 from torchwright.compiler.forward.replay_plan import PlannedAttentionOp, PlannedMlpOp
 from torchwright.compiler.groups.transformer_layer import TransformerLayer
-from torchwright.graph import Node, Linear, Attn, Add, Concatenate
-from torchwright.graph.misc import LiteralValue
+from torchwright.compiler.realization import linear_attn_chunks
+from torchwright.compiler.residual_assignment import flatten_concat_nodes
+from torchwright.graph import Add, Attn, Concatenate, Linear, Node
 from torchwright.graph.ffn import FFN
+from torchwright.graph.misc import LiteralValue
 from torchwright.graph.rope import ROPE_BASE
 
 # The swish machine's hinge-sharpening constant (a sideways import of a leaf
@@ -26,7 +27,11 @@ from torchwright.graph.rope import ROPE_BASE
 # The bias-lane constants build the no-bias constant lane (see BiasFold).
 from torchwright.ops.const import (
     bias_lane_gate as _BIAS_LANE_GATE,
+)
+from torchwright.ops.const import (
     bias_lane_up as _BIAS_LANE_UP,
+)
+from torchwright.ops.const import (
     scale as _SWISH_SCALE,
 )
 
@@ -56,10 +61,10 @@ class PlacementEntry:
 
     layer: int
     matrix_kind: str
-    node: Optional[Node]
-    op_type: Optional[str]
-    rows: List[int]
-    cols: List[int]
+    node: Node | None
+    op_type: str | None
+    rows: list[int]
+    cols: list[int]
     mode: Literal["dense", "diag"]
 
 
@@ -73,7 +78,7 @@ class PlacementRecorder:
     """
 
     def __init__(self):
-        self.entries: List[PlacementEntry] = []
+        self.entries: list[PlacementEntry] = []
         self._layer = -1
 
     def set_layer(self, layer: int) -> None:
@@ -82,8 +87,8 @@ class PlacementRecorder:
     def add(
         self,
         matrix_kind: str,
-        node: Optional[Node],
-        op_type: Optional[str],
+        node: Node | None,
+        op_type: str | None,
         rows: Sequence[int],
         cols: Sequence[int],
         mode: Literal["dense", "diag"],
@@ -99,7 +104,7 @@ def write_attn_sublayer(
     layer: TransformerLayer,
     ops: Iterable[PlannedAttentionOp],
     const_one_col: int,
-    recorder: Optional[PlacementRecorder] = None,
+    recorder: PlacementRecorder | None = None,
 ):
     """Write attention head operations into a layer's AttnLayerComponent.
 
@@ -137,8 +142,8 @@ def write_mlp_sublayer(
     layer: TransformerLayer,
     ops: Iterable[PlannedMlpOp],
     const_one_col: int,
-    biased_linears: Optional[Set[Node]] = None,
-    recorder: Optional[PlacementRecorder] = None,
+    biased_linears: set[Node] | None = None,
+    recorder: PlacementRecorder | None = None,
     bias: bool = True,
 ):
     """Write MLP operations into a layer's MLPSubLayer components.
@@ -154,7 +159,7 @@ def write_mlp_sublayer(
         raise TypeError("MLP writer requires immutable PlannedMlpOp records")
     if biased_linears is None:
         biased_linears = set()
-    bias_fold: Optional[BiasFold] = None
+    bias_fold: BiasFold | None = None
     if not bias:
         bias_fold = BiasFold(layer.mlp, const_one_col, recorder)
         for op in ops:
@@ -196,7 +201,7 @@ def write_mlp_sublayer(
 
 def _coalesce_source_rows(
     idx: Sequence[int], mat: torch.Tensor
-) -> "Tuple[Sequence[int], torch.Tensor]":
+) -> "tuple[Sequence[int], torch.Tensor]":
     """Sum matrix rows that share a source column index.
 
     Weight scatters assign rows by advanced indexing, which is
@@ -210,9 +215,9 @@ def _coalesce_source_rows(
     """
     if len(set(idx)) == len(idx):
         return idx, mat
-    order: List[int] = []
-    row_of: Dict[int, int] = {}
-    rows: List[torch.Tensor] = []
+    order: list[int] = []
+    row_of: dict[int, int] = {}
+    rows: list[torch.Tensor] = []
     for i, col in enumerate(idx):
         j = row_of.get(col)
         if j is None:
@@ -237,9 +242,9 @@ def _scatter_attn_head(
     o_mat,
     d_head,
     *,
-    recorder: Optional[PlacementRecorder] = None,
-    node: Optional[Node] = None,
-    op_type: Optional[str] = None,
+    recorder: PlacementRecorder | None = None,
+    node: Node | None = None,
+    op_type: str | None = None,
 ):
     """Scatter strategy matrices into one attention head's weight tensors."""
     if recorder is not None:
@@ -288,7 +293,7 @@ def _allocate_head(attn):
 def _write_compute_attn(
     attn,
     op: PlannedAttentionOp,
-    recorder: Optional[PlacementRecorder] = None,
+    recorder: PlacementRecorder | None = None,
 ):
     """Copy an Attn node's Q/K/V/O matrices into attention heads.
 
@@ -415,7 +420,7 @@ def _write_compute_linear(
     attn,
     op: PlannedAttentionOp,
     const_one_col: int,
-    recorder: Optional[PlacementRecorder] = None,
+    recorder: PlacementRecorder | None = None,
 ):
     """Compile a zero-bias Linear via current-position attention.
 
@@ -486,7 +491,7 @@ def _write_compute_add(
     attn,
     op: PlannedAttentionOp,
     const_one_col: int,
-    recorder: Optional[PlacementRecorder] = None,
+    recorder: PlacementRecorder | None = None,
 ):
     """Compute Add(a, b) by copying both inputs to fresh columns via attention.
 
@@ -607,7 +612,7 @@ def _write_cancel(
     attn,
     op: PlannedAttentionOp,
     const_one_col: int,
-    recorder: Optional[PlacementRecorder] = None,
+    recorder: PlacementRecorder | None = None,
 ):
     """Cancel target_cols: V=identity, O=-identity. Skip adds x + (-x) = 0.
 
@@ -655,7 +660,7 @@ def _write_add_into(
     attn,
     op: PlannedAttentionOp,
     const_one_col: int,
-    recorder: Optional[PlacementRecorder] = None,
+    recorder: PlacementRecorder | None = None,
 ):
     """Add(dead, live): copy live's values to dead's columns via attention.
 
@@ -737,7 +742,7 @@ class BiasFold:
         self,
         mlp,
         const_col: int,
-        recorder: Optional[PlacementRecorder] = None,
+        recorder: PlacementRecorder | None = None,
     ):
         self.mlp = mlp
         self.const_col = const_col
@@ -751,8 +756,8 @@ class BiasFold:
         slots: Sequence[int],
         values: torch.Tensor,
         *,
-        node: Optional[Node],
-        op_type: Optional[str],
+        node: Node | None,
+        op_type: str | None,
         accumulate: bool = False,
     ) -> None:
         """Fold 1: write ``values`` at ``lin.output_matrix[const_col, slots]``."""
@@ -773,8 +778,8 @@ class BiasFold:
         cols: Sequence[int],
         values: torch.Tensor,
         *,
-        node: Optional[Node],
-        op_type: Optional[str],
+        node: Node | None,
+        op_type: str | None,
         accumulate: bool = False,
     ) -> None:
         """Fold 2: write ``values`` at the constant lane's down-projection row."""
@@ -794,7 +799,7 @@ class BiasFold:
                 "mlp.W_out", node, op_type, [self.LANE_SLOT], list(cols), "dense"
             )
 
-    def _ensure_lane(self, node: Optional[Node], op_type: Optional[str]) -> None:
+    def _ensure_lane(self, node: Node | None, op_type: str | None) -> None:
         """Write the lane's gate/up rows once per layer, on first use."""
         if self._lane_written:
             return
@@ -842,9 +847,9 @@ def _mlp_in_out(mlp):
 def _write_compute_ffn(
     mlp,
     op: PlannedMlpOp,
-    biased_linears: Optional[Set[Node]] = None,
-    recorder: Optional[PlacementRecorder] = None,
-    bias_fold: Optional[BiasFold] = None,
+    biased_linears: set[Node] | None = None,
+    recorder: PlacementRecorder | None = None,
+    bias_fold: BiasFold | None = None,
 ):
     """Compile an :class:`FFN` through the MLP sublayer (either machine).
 
@@ -935,7 +940,7 @@ def _write_compute_ffn(
             up_bias = torch.ones(len(mlp_slots))
         else:
             up_matrix = ffn.up_proj.t()
-            up_bias = cast(torch.Tensor, ffn.up_bias)
+            up_bias = cast("torch.Tensor", ffn.up_bias)
             _, up_rows = _coalesce_source_rows(in_idx, up_matrix)
             mlp.up_proj.output_matrix[
                 scatter_idx_t.unsqueeze(1), slots_t.unsqueeze(0)
@@ -1018,7 +1023,7 @@ def _write_compute_ffn(
 
 
 def _write_compute_literal_value(
-    mlp, op: PlannedMlpOp, bias_fold: Optional[BiasFold] = None
+    mlp, op: PlannedMlpOp, bias_fold: BiasFold | None = None
 ):
     """Write a constant value via MLP output bias (or the constant lane).
 
@@ -1045,7 +1050,7 @@ def _write_compute_literal_value(
     out_lin.output_bias[cols_t] = node.value.to(target_dtype)
 
 
-def _write_compute_bias(mlp, op: PlannedMlpOp, bias_fold: Optional[BiasFold] = None):
+def _write_compute_bias(mlp, op: PlannedMlpOp, bias_fold: BiasFold | None = None):
     """Add bias to MLP output bias (for biased Linear split).
 
     Under ``bias=False`` the deferred bias rides the constant lane's
@@ -1075,9 +1080,7 @@ def _write_compute_bias(mlp, op: PlannedMlpOp, bias_fold: Optional[BiasFold] = N
     out_lin.output_bias[cols_t] += node.output_bias.to(target_dtype)
 
 
-def _write_clear_literal_seed(
-    mlp, op: PlannedMlpOp, bias_fold: Optional[BiasFold] = None
-):
+def _write_clear_literal_seed(mlp, op: PlannedMlpOp, bias_fold: BiasFold | None = None):
     """Cancel a compiler-internal literal in the final MLP residual update.
 
     The literal remains live through final attention (self-match heads read
@@ -1111,10 +1114,10 @@ def _write_bypass_lane_pair(
     mlp_slots: Sequence[int],
     W: torch.Tensor,
     *,
-    node: Optional[Node],
+    node: Node | None,
     op_type: str,
-    bias_fold: Optional[BiasFold] = None,
-    recorder: Optional[PlacementRecorder] = None,
+    bias_fold: BiasFold | None = None,
+    recorder: PlacementRecorder | None = None,
 ):
     """Emit the activation bypass lane-pair computing ``W.T @ x`` from
     ``in_idx`` into ``out_idx`` over ``mlp_slots`` (== ``2 * len(out_idx)``).
@@ -1189,13 +1192,13 @@ def _write_bypass_lane_pair(
 
 def _fold_deferred_source_bias(
     mlp,
-    leaves: List[Node],
+    leaves: list[Node],
     W: torch.Tensor,
     mlp_slots,
-    biased_linears: Set[Node],
-    bias_fold: Optional[BiasFold],
+    biased_linears: set[Node],
+    bias_fold: BiasFold | None,
     *,
-    node: Optional[Node],
+    node: Node | None,
     op_type: str,
 ):
     """Fold same-layer deferred attention-Linear biases into a bypass pair's
@@ -1253,10 +1256,11 @@ def _fold_deferred_source_bias(
         offset += len(leaf)
 
 
-def _flatten_input_leaves(input_node: Node) -> List[Node]:
+def _flatten_input_leaves(input_node: Node) -> list[Node]:
     """The flat leaf list a bypass pair's ``resolve_indices`` capture reads,
     in column order — one entry per occurrence (a Concatenate holding the
-    same leaf twice yields it twice)."""
+    same leaf twice yields it twice).
+    """
     if isinstance(input_node, Concatenate):
         return flatten_concat_nodes([input_node])
     return [input_node]
@@ -1265,8 +1269,8 @@ def _flatten_input_leaves(input_node: Node) -> List[Node]:
 def _write_cancel_bypass(
     mlp,
     op: PlannedMlpOp,
-    recorder: Optional[PlacementRecorder] = None,
-    bias_fold: Optional[BiasFold] = None,
+    recorder: PlacementRecorder | None = None,
+    bias_fold: BiasFold | None = None,
 ):
     """Zero a dying node's columns from the MLP sublayer via the bypass pair
     with ``W = -I``: the lane-pair emits ``-x`` and the skip connection turns
@@ -1299,9 +1303,9 @@ def _write_cancel_bypass(
 def _write_compute_linear_bypass(
     mlp,
     op: PlannedMlpOp,
-    biased_linears: Optional[Set[Node]] = None,
-    recorder: Optional[PlacementRecorder] = None,
-    bias_fold: Optional[BiasFold] = None,
+    biased_linears: set[Node] | None = None,
+    recorder: PlacementRecorder | None = None,
+    bias_fold: BiasFold | None = None,
 ):
     """Compile a standalone Linear via MLP using the activation bypass pair.
 
@@ -1393,9 +1397,9 @@ def _write_compute_linear_bypass(
 def _write_add_into_bypass(
     mlp,
     op: PlannedMlpOp,
-    biased_linears: Optional[Set[Node]] = None,
-    recorder: Optional[PlacementRecorder] = None,
-    bias_fold: Optional[BiasFold] = None,
+    biased_linears: set[Node] | None = None,
+    recorder: PlacementRecorder | None = None,
+    bias_fold: BiasFold | None = None,
 ):
     """Add the live addend into a reused dead addend's columns from the MLP
     sublayer via the bypass pair with ``W = I``.
@@ -1436,7 +1440,7 @@ def _write_add_into_bypass(
     )
 
     if biased_linears:
-        source_occurrence = node.inputs[1 - cast(int, op.reuse_input_index)]
+        source_occurrence = node.inputs[1 - cast("int", op.reuse_input_index)]
         _fold_deferred_source_bias(
             mlp,
             _flatten_input_leaves(source_occurrence),
@@ -1452,9 +1456,9 @@ def _write_add_into_bypass(
 def _write_compute_add_bypass(
     mlp,
     op: PlannedMlpOp,
-    biased_linears: Optional[Set[Node]] = None,
-    recorder: Optional[PlacementRecorder] = None,
-    bias_fold: Optional[BiasFold] = None,
+    biased_linears: set[Node] | None = None,
+    recorder: PlacementRecorder | None = None,
+    bias_fold: BiasFold | None = None,
 ):
     """Compute both addends into fresh, zeroed columns from the MLP sublayer
     via the bypass pair over the concatenated source rows with

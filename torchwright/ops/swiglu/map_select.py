@@ -8,7 +8,6 @@ lands proportionally to the actual branch values.
 """
 
 import math
-from typing import Dict, List, Tuple
 
 import torch
 
@@ -16,6 +15,7 @@ from torchwright.graph import Concatenate, Linear, Node
 from torchwright.graph.asserts import assert_matches_value_type
 from torchwright.graph.misc import LiteralValue
 from torchwright.graph.value_type import NodeValueType, Range
+from torchwright.ops._math import _lookup_axis_scale, _lookup_numeric_slack
 from torchwright.ops.const import (
     embedding_step_sharpness,
     min_d_hidden,
@@ -23,8 +23,6 @@ from torchwright.ops.const import (
     step_sharpness,
     swish_dip,
 )
-
-from torchwright.ops._math import _lookup_axis_scale, _lookup_numeric_slack
 from torchwright.ops.linear import add_const, sum_nodes
 from torchwright.ops.swiglu.logic_ops import _GATE_C_TOL, _assert_cond_pm1, cond_gate
 from torchwright.ops.swiglu.swiglu_ffn import swiglu_ffn
@@ -117,7 +115,7 @@ def select(cond: Node, true_node: Node, false_node: Node) -> Node:
     return result
 
 
-def switch(conditions: List[Node], values: List[Node]) -> Node:
+def switch(conditions: list[Node], values: list[Node]) -> Node:
     """Select one of N values based on which condition is true.
 
     Assumes exactly one condition is true (1.0), rest are false (-1.0).
@@ -466,7 +464,7 @@ def dynamic_extract(
 
 
 def map_to_table(
-    inp: Node, key_to_value: Dict[torch.Tensor, torch.Tensor], default: torch.Tensor
+    inp: Node, key_to_value: dict[torch.Tensor, torch.Tensor], default: torch.Tensor
 ) -> Node:
     """Map the value of the input node to a lookup table.
 
@@ -506,7 +504,7 @@ def map_to_table(
        Max error: 0 abs, 0 rel over 4096 samples;
        measured at commit a39e4c6. See docs/numerical_noise.md.
     """
-    d_keys = {len(x) for x in key_to_value.keys()}
+    d_keys = {len(x) for x in key_to_value}
     d_values = {len(x) for x in key_to_value.values()}
     assert len(d_keys) == 1
     assert len(d_values) == 1
@@ -579,7 +577,7 @@ def _upper_clamp(index: Node, top: float, gate_mult: float, name: str) -> Node:
 
 def _clamp_or_skip(
     index: Node, top: float, gate_mult: float, name: str
-) -> Tuple[Node, float]:
+) -> tuple[Node, float]:
     """Feed an axis index to the staircase, spending the clamp FFN only
     when the input range doesn't already prove it in-bounds.
 
@@ -597,7 +595,7 @@ def _clamp_or_skip(
     or out-of-bounds range keeps the clamp.
     """
     r = index.value_type.value_range
-    if r.is_finite() and 0.0 <= gate_mult * r.lo and gate_mult * r.hi <= top:
+    if r.is_finite() and gate_mult * r.lo >= 0.0 and gate_mult * r.hi <= top:
         return index, gate_mult
     return _upper_clamp(index, top, gate_mult, name=name), 1.0
 
@@ -610,7 +608,7 @@ def _bounded_step_chunks(
     name: str,
     *,
     gate_mult: float = 1.0,
-) -> List[tuple]:
+) -> list[tuple]:
     """floor_int's bounded-step stage per boundary ``k − 0.5``, chunked.
 
     Returns ``[(ks, step_node), ...]`` where ``step_node`` is the
@@ -680,7 +678,7 @@ def _table_lookup_row_vector(
         index, float(rows - 1), gate_mult, name=f"{name}_clamp_i"
     )
     deltas = table[1:] - table[:-1]
-    partials: List[Node] = []
+    partials: list[Node] = []
     for ci, (ks, step) in enumerate(
         _bounded_step_chunks(
             step_input, rows, sharpness, chunk_size, f"{name}_row", gate_mult=step_mult
@@ -820,7 +818,7 @@ def table_lookup_2d(
         j_input, cols, s, chunk_size, f"{name}_col", gate_mult=j_mult
     )
 
-    chunks: List[Node] = []
+    chunks: list[Node] = []
     for ci, (ks, step) in enumerate(step_chunks):
         c = len(ks)
         first = ci == 0

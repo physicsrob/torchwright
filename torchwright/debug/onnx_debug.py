@@ -45,7 +45,7 @@ from __future__ import annotations
 
 import json
 import os
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any
 
 import numpy as np
 import torch
@@ -251,7 +251,6 @@ class OnnxDebugSession:
         providers=None,
     ) -> None:
         import onnx
-        import onnxruntime as ort
 
         sidecar = _sidecar_or_raise(onnx_path)
 
@@ -259,10 +258,10 @@ class OnnxDebugSession:
         self._kind: str = sidecar["kind"]  # "token" | "headless"
         self._d: int = int(sidecar["d"])
         self._n_layers: int = int(sidecar["n_layers"])
-        self._input_specs: List[tuple] = [
+        self._input_specs: list[tuple] = [
             (str(n), int(s), int(w)) for n, s, w in sidecar["input_specs"]
         ]
-        self.input_names: List[str] = [n for n, _, _ in self._input_specs]
+        self.input_names: list[str] = [n for n, _, _ in self._input_specs]
 
         # --- Fingerprint: the rebuilt graph must be the compiled graph.
         out = output_node
@@ -319,8 +318,8 @@ class OnnxDebugSession:
                 f"rebuilt graph's FFNs give {rebuilt_act!r}.  Rebuild with the "
                 f"same op package the compile used."
             )
-        states: List[ResidualStreamState] = []
-        key_to_state: Dict[str, ResidualStreamState] = {}
+        states: list[ResidualStreamState] = []
+        key_to_state: dict[str, ResidualStreamState] = {}
         for entry in sidecar["states"]:
             st = ResidualStreamState(name=entry["key"])
             key_to_state[entry["key"]] = st
@@ -345,7 +344,7 @@ class OnnxDebugSession:
         # objects so callers can look one up by node (mirroring
         # node.annotation on the in-process backend).  Nodes that carried
         # no annotation are simply absent.
-        self._annotation_by_node_id: Dict[int, str] = {}
+        self._annotation_by_node_id: dict[int, str] = {}
         for cid_str, meta in (sidecar.get("nodes") or {}).items():
             label = meta.get("annotation")
             if label is None:
@@ -355,11 +354,11 @@ class OnnxDebugSession:
                 self._annotation_by_node_id[node.node_id] = label
         # Post-MLP triples — the ordered states every check/probe scans,
         # mirroring the in-process backend.
-        self._ordered: List[tuple] = [
+        self._ordered: list[tuple] = [
             (i, f"L{i}.mlp", key_to_state[f"L{i}.mlp"]) for i in range(self._n_layers)
         ]
         # state -> ONNX tensor name, every capturable state.
-        self._state_fetch: List[Tuple[ResidualStreamState, str, str]] = []
+        self._state_fetch: list[tuple[ResidualStreamState, str, str]] = []
         if "input" in key_to_state:
             self._state_fetch.append((key_to_state["input"], "res_0", "input_res_0"))
         for i in range(self._n_layers):
@@ -379,7 +378,7 @@ class OnnxDebugSession:
             )
 
         # --- Token graphs: the Embedding node translates token strings.
-        self._embedding: Optional[Embedding] = None
+        self._embedding: Embedding | None = None
         if self._kind == "token":
             stack = [out]
             seen: set = set()
@@ -444,7 +443,7 @@ class OnnxDebugSession:
         self._d_head = int(_dim(graph_inputs["past_K_0"], 2))
         # Symbolic slot dim => prefix bindings allowed (stride
         # bucketing); a static dim (old export) forces full-width feeds.
-        self._static_slot_dim: Optional[int] = _dim(graph_inputs["past_K_0"], 0)
+        self._static_slot_dim: int | None = _dim(graph_inputs["past_K_0"], 0)
         self._cache_stride: int = int(self._static_slot_dim or sidecar["cache_stride"])
 
         from onnx import TensorProto, helper
@@ -474,19 +473,20 @@ class OnnxDebugSession:
         self._external_data_dir = None
         self._session = _make_session(model, providers, self)
         self._primary_output = "logits" if self._kind == "token" else "outputs"
-        self._debug_state: Optional[_DebugState] = None
+        self._debug_state: _DebugState | None = None
 
     # ---- feed/run plumbing ----------------------------------------------
 
     def empty_past(self) -> tuple:
         """Zero-length sequence-major KV tuples, mirroring
         ``CompiledHeadless.empty_past``'s grow-per-step representation
-        (each entry ``(n_committed, n_heads_i, d_head)``)."""
+        (each entry ``(n_committed, n_heads_i, d_head)``).
+        """
         k = tuple(torch.zeros(0, nh, self._d_head) for nh in self._per_layer_n_heads)
         v = tuple(torch.zeros(0, nh, self._d_head) for nh in self._per_layer_n_heads)
         return (k, v)
 
-    def _feeds(self, prefill: torch.Tensor, base: int, past: Optional[tuple]) -> dict:
+    def _feeds(self, prefill: torch.Tensor, base: int, past: tuple | None) -> dict:
         """Build ORT feeds for ``n_new`` rows at absolute positions
         ``base..base+n_new``.
 
@@ -528,7 +528,7 @@ class OnnxDebugSession:
             feeds[f"past_V_{i}"] = buf_v
         return feeds
 
-    def _resolve_base(self, past: Optional[tuple], past_len: Optional[int]) -> int:
+    def _resolve_base(self, past: tuple | None, past_len: int | None) -> int:
         base = 0 if past is None else int(past[0][0].shape[0])
         if past_len is not None and int(past_len) != base:
             raise ValueError(
@@ -544,7 +544,7 @@ class OnnxDebugSession:
         self,
         inputs: torch.Tensor,
         past: tuple,
-        past_len: Optional[int] = None,
+        past_len: int | None = None,
         debug: bool = False,
         debug_atol: float = 1e-7,
     ) -> tuple:
@@ -603,7 +603,7 @@ class OnnxDebugSession:
         )
         return outputs
 
-    def eval(self) -> "OnnxDebugSession":
+    def eval(self) -> OnnxDebugSession:
         return self
 
     # ---- debug surface ------------------------------------------------------
@@ -631,7 +631,7 @@ class OnnxDebugSession:
             self._checked_nodes, self._ra, ordered_states, state_tensor
         )
 
-    def debug_value(self, node: Node) -> Optional[torch.Tensor]:
+    def debug_value(self, node: Node) -> torch.Tensor | None:
         """Compiled value of ``node`` from the last debug=True run, or None."""
         if self._debug_state is None:
             raise RuntimeError("debug_value() requires a prior debug=True run")
@@ -650,7 +650,7 @@ class OnnxDebugSession:
         res_tensor, _ = tensor_pair
         return extract_compiled_value(node, ds.ra, state, res_tensor)
 
-    def annotation(self, node: Node) -> Optional[str]:
+    def annotation(self, node: Node) -> str | None:
         """The ``annotate()`` path recorded for ``node`` at compile time.
 
         Looks the rebuilt ``node`` up against the annotations the sidecar
@@ -670,7 +670,7 @@ class OnnxDebugSession:
         self,
         prefill: torch.Tensor,
         past_len: int = 0,
-        past_kvs: Optional[tuple] = None,
+        past_kvs: tuple | None = None,
     ) -> tuple:
         """Run once fetching every residual snapshot.
 
@@ -680,7 +680,7 @@ class OnnxDebugSession:
         """
         if prefill.ndim == 1:
             prefill = prefill.reshape(-1, 1)
-        base = self._resolve_base(past_kvs, past_len if past_len else None)
+        base = self._resolve_base(past_kvs, past_len or None)
         feeds = self._feeds(prefill, base, past_kvs)
         fetch = [tensor_name for _s, tensor_name, _l in self._state_fetch]
         results = self._session.run(fetch, feeds)
@@ -692,7 +692,7 @@ class OnnxDebugSession:
 
     def build_prefill(
         self,
-        input_values: Dict[str, Any],
+        input_values: dict[str, Any],
         n_pos: int,
     ) -> torch.Tensor:
         """Pack an input-name → value dict into the flat prefill layout.
@@ -729,7 +729,7 @@ class OnnxDebugSession:
         layer_index: int,
         prefill: torch.Tensor,
         past_len: int = 0,
-        past_kvs: Optional[tuple] = None,
+        past_kvs: tuple | None = None,
     ) -> tuple:
         """Softmax ``(weights, logits)`` at one attention layer.
 
@@ -741,7 +741,7 @@ class OnnxDebugSession:
         """
         if prefill.ndim == 1:
             prefill = prefill.reshape(-1, 1)
-        base = self._resolve_base(past_kvs, past_len if past_len else None)
+        base = self._resolve_base(past_kvs, past_len or None)
         feeds = self._feeds(prefill, base, past_kvs)
         weights_np, logits_np = self._session.run(
             [f"l{layer_index}_weights", f"l{layer_index}_logits_masked"], feeds

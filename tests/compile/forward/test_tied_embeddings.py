@@ -1,7 +1,7 @@
 """Held-bank embedding/output allocation and scheduling regressions."""
 
-import torch
 import pytest
+import torch
 
 from torchwright.compiler.forward.compile import (
     _build_heuristic_schedule_trace,
@@ -179,7 +179,8 @@ def test_output_add_is_fresh_compute_not_add_into():
 
 def _add_output_graph():
     """The canonical tied Add shape: each addend's only consumer is the
-    output, so the model's E_dead for both addends is the constant 1."""
+    output, so the model's E_dead for both addends is the constant 1.
+    """
     embedding = _embedding()
     left = _identity(embedding, "left")
     right = _identity(embedding, "right")
@@ -190,7 +191,8 @@ def test_add_target_held_model_is_feasible():
     """Regression: the held-target pin `is_free == 0` posted ON TOP of the
     is_free <=> OR(E_dead) biconditional made the model hard-INFEASIBLE for
     any Add target with a sole-consumer addend — the canonical
-    `logits = transported_embedding + correction` shape."""
+    `logits = transported_embedding + correction` shape.
+    """
     embedding, output = _add_output_graph()
     asg, stats = solve_schedule(
         output,
@@ -211,7 +213,8 @@ def test_add_target_held_model_is_feasible():
 def test_output_add_compiles_at_optimize_1_without_fallback():
     """The production-path companion: an optimize>=1 tied Add compile must
     come from a real solve, never the silent eager fallback
-    (require_solver=True turns the fallback into a hard error)."""
+    (require_solver=True turns the fallback into a hard error).
+    """
     embedding, output = _add_output_graph()
     net = forward_compile(
         d=20,
@@ -234,7 +237,8 @@ def _held_warm_start_hints(output, embedding, *, d, d_head, d_hidden, max_layers
     """Run the REAL warm-start seam (`compile._build_heuristic_schedule_trace`)
     on a held-layout graph, mirroring forward_compile's setup: inputs allocated
     in node_id order, the bank captured immediately after the source
-    allocates."""
+    allocates.
+    """
     graph = GraphAnalyzer(output)
     nodes = graph.get_all_nodes()
     input_nodes = sorted(
@@ -272,7 +276,8 @@ def _held_warm_start_hints(output, embedding, *, d, d_head, d_hidden, max_layers
 def _ffn_chain_graph():
     """The held-across-layers fixture shape: the source's last (and only)
     reader is MLP-routed, so an MLP-mechanism hold of the source would fire
-    at the reader's own layer — a timing the model cannot represent."""
+    at the reader's own layer — a timing the model cannot represent.
+    """
     embedding = _embedding()
     a = _relu_identity(embedding, "a")
     b = _relu_identity(a, "b")
@@ -285,7 +290,8 @@ def test_warm_start_holds_source_via_attention_at_reader_layer_plus_one():
     mechanism in the CP-SAT model (no cancel_in_mlp var; MLP readers bound the
     held source at cl >= layer + 1), so the heuristic must hold the tied bank
     via an attention cancel at the last MLP reader's layer + 1 — never via an
-    MLP cancel at the reader's own layer."""
+    MLP cancel at the reader's own layer.
+    """
     embedding, a, output = _ffn_chain_graph()
     trace, _ = _held_warm_start_hints(output, embedding, d=20, d_head=4, d_hidden=16)
     assert trace.n_layers > 0, "warm start deadlocked"
@@ -301,7 +307,8 @@ def test_warm_start_held_hint_is_model_feasible_knob_off():
     (_pin_cancels=False) held model: hard-fix every hinted variable as an
     equality and assert the point is feasible.  Before the fix the source's
     MLP-mechanism gap-0 hold hard-fixed cancel[emb] below the model's
-    lower bound and this point was INFEASIBLE."""
+    lower bound and this point was INFEASIBLE.
+    """
     from ortools.sat.python import cp_model
 
     embedding, _a, output = _ffn_chain_graph()
@@ -351,7 +358,8 @@ def test_held_handoff_declines_same_layer_live_addend():
     schedule_layer today — a free Add consuming the source is an ancestor of
     the single-output target, so the two are never in one layer-start ready
     set — so the attention sublayer is driven directly with the co-resident
-    state to pin the guard against future placement-rule changes."""
+    state to pin the guard against future placement-rule changes.
+    """
     embedding = _embedding()
     x = _identity(embedding, "x")
     free_add = Add(x, embedding)
@@ -487,7 +495,8 @@ def test_held_live_and_snapshot_models_are_identical():
     """The snapshot alone carries the held contract: a captured-with-held
     problem round-trips through JSON and rebuilds the live proto with NO
     re-supplied kwargs.  A held-less capture builds a different (relaxed)
-    proto — the non-vacuity check."""
+    proto — the non-vacuity check.
+    """
     from torchwright.compiler.forward.cpsat_snapshot import SchedulingProblem
 
     embedding = _embedding()
@@ -527,7 +536,8 @@ def test_held_live_and_snapshot_models_are_identical():
 def test_snapshot_held_contract_validation():
     """Loud misses on every malformed held contract: unpaired endpoints,
     ids that name no captured node, kwargs conflicting with the stored
-    contract, and unknown ids reaching the model builder."""
+    contract, and unknown ids reaching the model builder.
+    """
     from torchwright.compiler.forward.cpsat_snapshot import SchedulingProblem
 
     embedding = _embedding()
@@ -574,7 +584,8 @@ def test_snapshot_held_contract_validation():
 def test_canonicalized_snapshot_remaps_and_rebuilds_held_ids():
     """canonicalized() carries the held endpoints into the canonical id
     space, and the canonical problem still rebuilds without re-supplied
-    kwargs."""
+    kwargs.
+    """
     from torchwright.compiler.graph_identity import canonical_ids
 
     embedding = _embedding()
@@ -606,7 +617,8 @@ def test_canonicalized_snapshot_remaps_and_rebuilds_held_ids():
 def test_snapshot_identity_matches_production_cache_key_for_tied_graph(tmp_path):
     """with_identity derives the held endpoints from the snapshot's own
     stored ids, so a tied fixture's fingerprint equals the production
-    schedule-cache key — and load() gates on exactly that key."""
+    schedule-cache key — and load() gates on exactly that key.
+    """
     embedding = _embedding()
     output = _identity(embedding, "output")
     fp_cfg = dict(
@@ -745,7 +757,8 @@ def test_direct_held_handoff_shares_the_atomic_attention_batch():
     allocator-level facts (held columns are never ordinary-free; ordinary
     ``allocate`` cannot draw them; only the full ordered bank claim succeeds)
     are unit-pinned in ``test_residual_map.py``; the end-to-end tied parity
-    tests remain the primary artifact check."""
+    tests remain the primary artifact check.
+    """
     from torchwright.compiler.forward.cpsat_scheduler import ScheduleAssignment
     from torchwright.compiler.forward.graph_analysis import GraphAnalyzer
     from torchwright.compiler.forward.residual_map import (
@@ -825,7 +838,8 @@ def test_compile_headless_reproduces_the_tied_schedule(tmp_path):
     """compile_headless(output_layout_source=...) solves the same tied
     (token.v6) schedule compile_to_onnx always builds, so the documented
     OnnxDebugSession discrimination recompile (CLAUDE.md, D1) reproduces a
-    v6 artifact's structure instead of silently compiling an untied one."""
+    v6 artifact's structure instead of silently compiling an untied one.
+    """
     from torchwright.compiler.export import compile_headless, compile_to_onnx
 
     embedding = _embedding()
@@ -850,7 +864,8 @@ def test_directed_scheduler_rejects_sibling_clusters():
     must run ungated: an admission deferral after the atomic attention batch
     committed its releases would strand a batch member whose inputs were
     already cancelled.  forward_compile rejects optimize>0 with
-    admission_control=True; direct construction must be rejected too."""
+    admission_control=True; direct construction must be rejected too.
+    """
     from torchwright.compiler.forward.cpsat_scheduler import ScheduleAssignment
     from torchwright.compiler.forward.scheduler import DirectedLayerScheduler
     from torchwright.compiler.forward.sibling_clusters import SiblingClusters
@@ -879,7 +894,8 @@ def test_unheld_bank_skip_names_the_held_output_bank():
     is skipped for the "held output bank", not for "residual columns" —
     the latter would report demand <= free, a self-contradictory line
     pointing at column exhaustion when the real blocker is that the tied
-    source was never cancelled into the held state."""
+    source was never cancelled into the held state.
+    """
     emb = _embedding()
     out = _identity(emb, "output")
 

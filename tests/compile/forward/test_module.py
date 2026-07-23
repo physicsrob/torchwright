@@ -17,8 +17,8 @@ import torch
 from examples.adder import create_network_parts
 from torchwright.compiler.export import (
     TOKEN_META_FORMAT,
-    meta_path_for,
     compile_to_onnx,
+    meta_path_for,
 )
 from torchwright.compiler.forward.compile import forward_compile
 
@@ -448,7 +448,8 @@ def _ids(embedding, tokens):
 @pytest.fixture(scope="module")
 def adder_artifact(tmp_path_factory):
     """A compiled 1-digit adder token artifact (max_seq_len=32) shared by the
-    cached-protocol self-consistency tests below."""
+    cached-protocol self-consistency tests below.
+    """
     output_node, embedding = _build_1digit()
     tmpdir = str(tmp_path_factory.mktemp("token_onnx_proto"))
     onnx_path = os.path.join(tmpdir, "adder.onnx")
@@ -466,7 +467,8 @@ def adder_artifact(tmp_path_factory):
 
 def test_token_onnx_chunked_decode_matches_full_prefill(adder_artifact):
     """Prefill 2 rows, then decode a 3-row chunk (n_new>1 at base>0) — the
-    dynamic-mask seam the single-row decode test does not cover."""
+    dynamic-mask seam the single-row decode test does not cover.
+    """
     onnx_path, embedding = adder_artifact
     token_ids = _ids(embedding, _PROTO_TOKENS)
     session = onnxruntime.InferenceSession(onnx_path)
@@ -493,7 +495,8 @@ def test_token_onnx_chunked_decode_matches_full_prefill(adder_artifact):
 def test_token_onnx_static_tail_is_inert(adder_artifact):
     """Finite garbage in masked tail slots (positions > cache_position) must
     not change the decode output — the in-graph mask zeroes those weights
-    exactly.  (Slot n itself is overwritten by the ScatterND diagonal.)"""
+    exactly.  (Slot n itself is overwritten by the ScatterND diagonal.)
+    """
     onnx_path, embedding = adder_artifact
     token_ids = _ids(embedding, _PROTO_TOKENS)
     n = 4
@@ -534,7 +537,8 @@ def test_token_onnx_static_tail_is_inert(adder_artifact):
 def test_token_onnx_prefix_window_binding(adder_artifact):
     """Every covering prefix window cache[:S_eff] (base+n_new <= S_eff <= S)
     must produce bit-identical outputs — the symbolic cache_slots dim derives
-    the mask width from Shape(past_K_0)."""
+    the mask width from Shape(past_K_0).
+    """
     onnx_path, embedding = adder_artifact
     token_ids = _ids(embedding, _PROTO_TOKENS)
     n = 4
@@ -567,7 +571,8 @@ def test_token_onnx_prefix_window_binding(adder_artifact):
 
 def test_token_onnx_module_step_matches_full_call(adder_artifact):
     """OnnxTokenModule.step threads the cache: prefill 4 + decode 1 == one
-    full-sequence call."""
+    full-sequence call.
+    """
     from torchwright.compiler.onnx_load import OnnxTokenModule
 
     onnx_path, embedding = adder_artifact
@@ -619,7 +624,8 @@ def _export_token(tmpdir, name="model.onnx", trim_heads=True):
 
 def _l_w1_d_hidden(onnx_path):
     """Per-layer MLP hidden widths read off the l{i}_W1 initializers
-    (shape (d, d_hidden_i)); densify-aware (sparse protos carry full dims)."""
+    (shape (d, d_hidden_i)); densify-aware (sparse protos carry full dims).
+    """
     import onnx
 
     model = onnx.load(onnx_path)
@@ -643,7 +649,8 @@ def _l_w1_d_hidden(onnx_path):
 
 def test_token_onnx_trim_heads_shrinks_kv_cache():
     """trim_heads=True drops per-layer past_K widths below the full head count
-    and leaves them non-uniform across layers."""
+    and leaves them non-uniform across layers.
+    """
     max_heads = D // D_HEAD
     with tempfile.TemporaryDirectory() as tmpdir:
         onnx_path, _ = _export_token(tmpdir, trim_heads=True)
@@ -689,7 +696,8 @@ def test_token_onnx_trim_shrinks_mlp_slots():
 
 def test_token_onnx_trim_is_numerical_noop():
     """Trimmed and full-width ONNX produce the same logits on the same prefill
-    (trimming removes only all-zero heads/slots)."""
+    (trimming removes only all-zero heads/slots).
+    """
     with tempfile.TemporaryDirectory() as tmpdir:
         trim_path, emb = _export_token(tmpdir, "trim.onnx", trim_heads=True)
         notrim_path, _ = _export_token(tmpdir, "notrim.onnx", trim_heads=False)

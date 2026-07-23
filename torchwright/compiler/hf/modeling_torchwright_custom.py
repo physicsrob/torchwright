@@ -25,13 +25,12 @@ sequence — stock ``generate(do_sample=False)`` over an unbounded
 
 from __future__ import annotations
 
-from typing import Optional, cast
+from typing import cast
 
 import torch
-import torch.nn as nn
 import torch.nn.functional as F
+from torch import nn
 from torch.nn.attention import SDPBackend, sdpa_kernel
-
 from transformers import GenerationMixin, PreTrainedModel
 from transformers.cache_utils import Cache, DynamicCache
 from transformers.modeling_outputs import (
@@ -103,7 +102,7 @@ class TorchwrightCustomAttention(nn.Module):
         self,
         hidden_states: torch.Tensor,
         attn_mask: torch.Tensor,
-        past_key_values: Optional[Cache],
+        past_key_values: Cache | None,
         cache_position: torch.Tensor,
     ) -> torch.Tensor:
         B, T, _ = hidden_states.shape
@@ -153,7 +152,8 @@ class TorchwrightCustomMLP(nn.Module):
 
 class TorchwrightCustomRMSNorm(nn.Module):
     """Root-mean-square norm, ``x / sqrt(mean(x^2, -1) + eps) * weight`` —
-    the same form as Llama's."""
+    the same form as Llama's.
+    """
 
     def __init__(self, d: int, eps: float):
         super().__init__()
@@ -167,7 +167,8 @@ class TorchwrightCustomRMSNorm(nn.Module):
 
 class TorchwrightCustomDecoderLayer(nn.Module):
     """Pre-norm decoder block: ``x = x + attn(norm(x)); x = x + mlp(norm(x))``.
-    The norms are ``nn.Identity`` when ``config.rms_norm`` is off."""
+    The norms are ``nn.Identity`` when ``config.rms_norm`` is off.
+    """
 
     def __init__(self, config: TorchwrightCustomConfig, layer_idx: int):
         super().__init__()
@@ -190,7 +191,7 @@ class TorchwrightCustomDecoderLayer(nn.Module):
         self,
         hidden_states: torch.Tensor,
         attn_mask: torch.Tensor,
-        past_key_values: Optional[Cache],
+        past_key_values: Cache | None,
         cache_position: torch.Tensor,
     ) -> torch.Tensor:
         hidden_states = hidden_states + self.self_attn(
@@ -252,13 +253,13 @@ class TorchwrightCustomModel(TorchwrightCustomPreTrainedModel):
 
     def forward(
         self,
-        input_ids: Optional[torch.LongTensor] = None,
-        attention_mask: Optional[torch.Tensor] = None,
-        position_ids: Optional[torch.LongTensor] = None,
-        past_key_values: Optional[Cache] = None,
-        inputs_embeds: Optional[torch.FloatTensor] = None,
-        use_cache: Optional[bool] = None,
-        cache_position: Optional[torch.LongTensor] = None,
+        input_ids: torch.LongTensor | None = None,
+        attention_mask: torch.Tensor | None = None,
+        position_ids: torch.LongTensor | None = None,
+        past_key_values: Cache | None = None,
+        inputs_embeds: torch.FloatTensor | None = None,
+        use_cache: bool | None = None,
+        cache_position: torch.LongTensor | None = None,
         **kwargs,
     ) -> BaseModelOutputWithPast:
         if inputs_embeds is not None:
@@ -305,12 +306,12 @@ class TorchwrightCustomModel(TorchwrightCustomPreTrainedModel):
                 # cache_position, so map position_ids onto it rather than
                 # silently ignoring it.
                 cache_position = cast(
-                    torch.LongTensor,
+                    "torch.LongTensor",
                     position_ids[0].to(device=device, dtype=torch.long),
                 )
             else:
                 cache_position = cast(
-                    torch.LongTensor,
+                    "torch.LongTensor",
                     torch.arange(past_seen, past_seen + T, device=device),
                 )
 
@@ -376,17 +377,17 @@ class TorchwrightCustomForCausalLM(TorchwrightCustomPreTrainedModel, GenerationM
 
     def forward(
         self,
-        input_ids: Optional[torch.LongTensor] = None,
-        attention_mask: Optional[torch.Tensor] = None,
-        position_ids: Optional[torch.LongTensor] = None,
-        past_key_values: Optional[Cache] = None,
-        inputs_embeds: Optional[torch.FloatTensor] = None,
-        labels: Optional[torch.LongTensor] = None,
-        use_cache: Optional[bool] = None,
-        output_attentions: Optional[bool] = None,
-        output_hidden_states: Optional[bool] = None,
-        return_dict: Optional[bool] = None,
-        cache_position: Optional[torch.LongTensor] = None,
+        input_ids: torch.LongTensor | None = None,
+        attention_mask: torch.Tensor | None = None,
+        position_ids: torch.LongTensor | None = None,
+        past_key_values: Cache | None = None,
+        inputs_embeds: torch.FloatTensor | None = None,
+        labels: torch.LongTensor | None = None,
+        use_cache: bool | None = None,
+        output_attentions: bool | None = None,
+        output_hidden_states: bool | None = None,
+        return_dict: bool | None = None,
+        cache_position: torch.LongTensor | None = None,
         logits_to_keep: int = 0,
         **kwargs,
     ) -> CausalLMOutputWithPast:
@@ -421,7 +422,7 @@ class TorchwrightCustomForCausalLM(TorchwrightCustomPreTrainedModel, GenerationM
             )
 
         return CausalLMOutputWithPast(
-            loss=cast(Optional[torch.FloatTensor], loss),
+            loss=cast("torch.FloatTensor | None", loss),
             logits=logits,
             past_key_values=outputs.past_key_values,
         )
@@ -429,7 +430,7 @@ class TorchwrightCustomForCausalLM(TorchwrightCustomPreTrainedModel, GenerationM
 
 __all__ = [
     "TorchwrightCustomConfig",
-    "TorchwrightCustomPreTrainedModel",
-    "TorchwrightCustomModel",
     "TorchwrightCustomForCausalLM",
+    "TorchwrightCustomModel",
+    "TorchwrightCustomPreTrainedModel",
 ]

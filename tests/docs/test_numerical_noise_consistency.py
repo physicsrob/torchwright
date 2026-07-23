@@ -18,9 +18,6 @@ which regenerates all three artefacts from a fresh measurement run.
 from __future__ import annotations
 
 import json
-from pathlib import Path
-
-import pytest
 
 from scripts.measure_op_noise import (
     DOCS_JSON,
@@ -64,7 +61,8 @@ def test_footer_source_files_cover_both_libraries() -> None:
     target op's module in both library subpackages.  Pins the B0-split
     regression where a non-recursive ``ops/*.py`` glob returned zero
     footer-bearing files once the ops moved into ``ops/relu/`` and
-    ``ops/swiglu/``."""
+    ``ops/swiglu/``.
+    """
     files = footer_source_files()
     declared = {REPO_ROOT / t.source_file for t in _target_ops()}
     assert declared <= set(files), (

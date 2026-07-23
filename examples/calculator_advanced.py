@@ -39,40 +39,37 @@ documents the input width the caller must supply so the fixed-width result is
 exact with no dropped nonzero carry.
 """
 
-from typing import Dict, List, Tuple
-
 import torch
 
-from torchwright.graph import Embedding, Linear, Node
-from torchwright.ops.linear import add_const, bool_to_01, concat, sum_nodes
-from torchwright.ops.inout_nodes import create_literal_value
-from torchwright.ops.swiglu.map_select import in_range
-from torchwright.ops.swiglu.onehot_table import onehot_lookup
-
 from examples._calculator_common import (
+    _CARRY_W,
+    _NO,
+    _YES,
     CALC_VOCAB,
     D_HEAD,
     D_HIDDEN,
     D_MODEL,
-    _CARRY_W,
-    _NO,
-    _YES,
     _slice,
     _state,
     build_calculator,
     compare_digit_seqs,  # shared verbatim — re-exported as part of this variant
 )
+from torchwright.graph import Embedding, Linear, Node
+from torchwright.ops.inout_nodes import create_literal_value
+from torchwright.ops.linear import add_const, bool_to_01, concat, sum_nodes
+from torchwright.ops.swiglu.map_select import in_range
+from torchwright.ops.swiglu.onehot_table import onehot_lookup
 
 __all__ = [
     "CALC_VOCAB",
-    "D_MODEL",
     "D_HEAD",
     "D_HIDDEN",
+    "D_MODEL",
     "add_digit_seqs",
-    "subtract_digit_seqs",
     "compare_digit_seqs",
-    "multiply_digit_seqs",
     "create_network_parts",
+    "multiply_digit_seqs",
+    "subtract_digit_seqs",
 ]
 
 
@@ -89,14 +86,14 @@ _KILL, _PROPAGATE, _GENERATE = 0, 1, 2
 _SEG_W = 3
 
 
-def _combine_table() -> Dict[torch.Tensor, torch.Tensor]:
+def _combine_table() -> dict[torch.Tensor, torch.Tensor]:
     """The associative carry-status combine for a lower block X then a higher Y.
 
     The combined block GENERATEs iff Y does, or Y propagates X's generate; it
     PROPAGATEs iff both propagate.  Equivalently: ``Y`` wins unless ``Y``
     propagates, in which case the block behaves like ``X``.
     """
-    table: Dict[torch.Tensor, torch.Tensor] = {}
+    table: dict[torch.Tensor, torch.Tensor] = {}
     for x in range(_SEG_W):
         for y in range(_SEG_W):
             combined = x if y == _PROPAGATE else y
@@ -106,7 +103,7 @@ def _combine_table() -> Dict[torch.Tensor, torch.Tensor]:
     return table
 
 
-def carry_lookahead(segments: List[Node]) -> List[Node]:
+def carry_lookahead(segments: list[Node]) -> list[Node]:
     """Carry into each column (LSB-first) from per-column carry statuses.
 
     ``segments`` is the LSB-first list of carry-status one-hots
@@ -141,7 +138,7 @@ def carry_lookahead(segments: List[Node]) -> List[Node]:
         _state(_PROPAGATE, _SEG_W): _state(_NO, _CARRY_W),
         _state(_GENERATE, _SEG_W): _state(_YES, _CARRY_W),
     }
-    carries: List[Node] = [create_literal_value(_state(_NO, _CARRY_W))]
+    carries: list[Node] = [create_literal_value(_state(_NO, _CARRY_W))]
     for j in range(1, n):
         carries.append(onehot_lookup(prefix[j - 1], generated, _state(_NO, _CARRY_W)))
     return carries
@@ -149,12 +146,12 @@ def carry_lookahead(segments: List[Node]) -> List[Node]:
 
 def _carry_lookahead_op(
     embedding: Embedding,
-    seq1: List[Node],
-    seq2: List[Node],
+    seq1: list[Node],
+    seq2: list[Node],
     *,
     status_of,
     digit_of,
-) -> List[Node]:
+) -> list[Node]:
     """Add or subtract two MSB-first digit sequences via carry-lookahead.
 
     ``status_of(a, b)`` returns the column's carry status (KILL / PROPAGATE /
@@ -163,8 +160,8 @@ def _carry_lookahead_op(
     carries between them come from :func:`carry_lookahead`.
     """
     assert len(seq1) == len(seq2)
-    status_table: Dict[torch.Tensor, torch.Tensor] = {}
-    digit_table: Dict[torch.Tensor, torch.Tensor] = {}
+    status_table: dict[torch.Tensor, torch.Tensor] = {}
+    digit_table: dict[torch.Tensor, torch.Tensor] = {}
     for a in range(10):
         for b in range(10):
             ab = torch.cat(
@@ -189,8 +186,8 @@ def _carry_lookahead_op(
 
 
 def add_digit_seqs(
-    embedding: Embedding, seq1: List[Node], seq2: List[Node]
-) -> List[Node]:
+    embedding: Embedding, seq1: list[Node], seq2: list[Node]
+) -> list[Node]:
     """Add two equal-length MSB-first digit sequences with carry-lookahead.
 
     Returns a sequence of the **same length**, dropping the final carry.  Size
@@ -209,8 +206,8 @@ def add_digit_seqs(
 
 
 def subtract_digit_seqs(
-    embedding: Embedding, seq1: List[Node], seq2: List[Node]
-) -> List[Node]:
+    embedding: Embedding, seq1: list[Node], seq2: list[Node]
+) -> list[Node]:
     """``seq1 - seq2`` via borrow-lookahead (assumes ``seq1 >= seq2``).
 
     Equal length in, equal length out.  A column generates a borrow when
@@ -232,9 +229,9 @@ def subtract_digit_seqs(
 # ---------------------------------------------------------------------------
 
 
-def _times_table(embedding: Embedding) -> Dict[torch.Tensor, torch.Tensor]:
+def _times_table(embedding: Embedding) -> dict[torch.Tensor, torch.Tensor]:
     """``a ⊕ b`` (two one-hot digits) -> ``tens ⊕ ones`` of ``a*b`` (one-hots)."""
-    table: Dict[torch.Tensor, torch.Tensor] = {}
+    table: dict[torch.Tensor, torch.Tensor] = {}
     for a in range(10):
         for b in range(10):
             key = torch.cat(
@@ -291,8 +288,8 @@ def _make_compressor(embedding: Embedding):
         for t in range(n_buckets)
     }
 
-    def compress(digits: List[Node]):
-        values: List[Node] = [Linear(d, value_proj, name="digit_value") for d in digits]
+    def compress(digits: list[Node]):
+        values: list[Node] = [Linear(d, value_proj, name="digit_value") for d in digits]
         total = sum_nodes(values)  # plain-number add of up to 11 digits, 0..99
         bucket = bool_to_01(in_range(total, add_const(total, 1.0), n_buckets))
         sum_digit = onehot_lookup(bucket, sum_table, zero_digit)
@@ -303,8 +300,8 @@ def _make_compressor(embedding: Embedding):
 
 
 def multiply_digit_seqs(
-    embedding: Embedding, seq1: List[Node], seq2: List[Node]
-) -> List[Node]:
+    embedding: Embedding, seq1: list[Node], seq2: list[Node]
+) -> list[Node]:
     """Multiply ``seq1 * seq2`` (both ``n`` digits MSB-first) -> ``2n`` digits.
 
     Carry-save (Wallace) multiplication, all in one-hot space:
@@ -341,7 +338,7 @@ def multiply_digit_seqs(
 
     # Step 1: drop each product's (tens, ones) into its place-value columns, then
     # transpose the column bags into rows (one digit per place, zero-padded).
-    columns: List[List[Node]] = [[] for _ in range(width)]
+    columns: list[list[Node]] = [[] for _ in range(width)]
     for i in range(n):
         for j in range(n):
             product = onehot_lookup(
@@ -354,7 +351,7 @@ def multiply_digit_seqs(
             columns[place + 1].append(tens)  # place+1 <= 2n-1 = width-1
 
     height = max((len(bag) for bag in columns), default=0)
-    rows: List[List[Node]] = [
+    rows: list[list[Node]] = [
         [columns[c][r] if len(columns[c]) > r else zero for c in range(width)]
         for r in range(height)
     ] or [[zero] * width]
@@ -364,7 +361,7 @@ def multiply_digit_seqs(
     compress = _make_compressor(embedding)
 
     while len(rows) > 2:
-        nxt: List[List[Node]] = []
+        nxt: list[list[Node]] = []
         k = 0
         while k < len(rows):
             chunk = rows[k : k + _RADIX]
@@ -394,9 +391,10 @@ def multiply_digit_seqs(
 
 def create_network_parts(
     max_digits: int = 3,
-) -> Tuple[Node, Embedding]:
+) -> tuple[Node, Embedding]:
     """The advanced calculator: the depth-optimized arithmetic wired up by
-    :func:`examples._calculator_common.build_calculator`."""
+    :func:`examples._calculator_common.build_calculator`.
+    """
     return build_calculator(
         max_digits,
         add_digit_seqs=add_digit_seqs,

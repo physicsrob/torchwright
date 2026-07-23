@@ -25,12 +25,11 @@ is set by *base*, not d_head, so d_head only buys plane count.  d_head=256
 (the recency analyses' grid) gives ample slow planes for the widest content.
 """
 
-import pytest
 import torch
 
 from torchwright.compiler.export import compile_headless
 from torchwright.debug.probe import probe_compiled
-from torchwright.graph import Attn, LiteralValue
+from torchwright.graph import LiteralValue
 from torchwright.graph.rope import (
     ROPE_BASE,
     apply_rope,
@@ -55,7 +54,8 @@ def _rotary_logits(query_matrix, key_matrix, q_in, k_in, q_pos, k_positions):
     """Logit row of a content head made rotary-on-slow-planes: a query at
     absolute ``q_pos`` against keys at ``k_positions``.  Mirrors the rotary path
     of ``Attn.compute`` (place content on slow planes, project, rotate by
-    absolute position, dot) without materialising an n_pos×n_pos matrix."""
+    absolute position, dot) without materialising an n_pos×n_pos matrix.
+    """
     qm = place_on_slow_planes(query_matrix, D_HEAD)
     km = place_on_slow_planes(key_matrix, D_HEAD)
     Q = q_in @ qm  # (1, d_head)
@@ -70,7 +70,8 @@ def _rotary_logits(query_matrix, key_matrix, q_in, k_in, q_pos, k_positions):
 def test_rotary_logits_anchored_to_attn_compute():
     """``_rotary_logits`` equals ``Attn.compute`` on a small case, so using it
     as the 42k-distance proxy is faithful (it can't be exercised at 42k via the
-    full matrix without OOM)."""
+    full matrix without OOM).
+    """
     W = 4
     query_matrix = _QUERY_GAIN * torch.eye(1, W)  # score in col 0
     key_matrix = torch.zeros(1, W)
@@ -104,7 +105,8 @@ def test_rotary_logits_anchored_to_attn_compute():
 def test_dot_match_selects_at_production_distance():
     """attend_argmax_dot shape (W=8 one-hot, match_gain=200): a matching key at
     the far end of a 42k rollout beats non-matching keys crowded at the near
-    end — content match survives the rotation with a wide margin."""
+    end — content match survives the rotation with a wide margin.
+    """
     W, MG = 8, 200.0
     query_matrix = MG * torch.eye(W)
     key_matrix = torch.eye(W)
@@ -129,7 +131,8 @@ def test_fine_score_resolution_at_production_distance():
     """The binding gate: a unit score delta (gain=8) must still resolve when the
     winner is at the far end (most attenuated) and the runner-up is adjacent to
     the query (un-attenuated) — the worst case for the slow-plane cosine.
-    Tested at the max score magnitude (``_MAX_SCORE_ABS``)."""
+    Tested at the max score magnitude (``_MAX_SCORE_ABS``).
+    """
     query_matrix = torch.tensor([[_QUERY_GAIN]])  # (1,1)
     key_matrix = torch.tensor([[1.0]])  # argmax: K col0 = +score
     q_in = torch.ones(1, 1)
@@ -152,7 +155,8 @@ def test_bucket_rendezvous_selects_at_production_distance():
     """Bucket-equality rendezvous (one-hot, bonus=256): a key whose bucket
     matches the query — at the far end — beats non-matching keys at the near end.
     Matching is what gates validity; the per-key score (separate slow plane)
-    breaks ties among matches."""
+    breaks ties among matches.
+    """
     nb = 12
     query_matrix = _VALIDITY_BONUS * torch.eye(nb)
     key_matrix = torch.eye(nb)
@@ -175,7 +179,8 @@ def test_bucket_rendezvous_selects_at_production_distance():
 def test_rotary_content_head_compiled_matches_oracle():
     """A rotary content head built via ``rotary_content_head`` compiles and
     matches its exact-math oracle — the rotation is correctly wired through the
-    compiler at full-width d_head (the ONNX/HF full-width rotary contract)."""
+    compiler at full-width d_head (the ONNX/HF full-width rotary contract).
+    """
     W = 4
     query_matrix = _QUERY_GAIN * torch.eye(1, W)
     key_matrix = torch.zeros(1, W)

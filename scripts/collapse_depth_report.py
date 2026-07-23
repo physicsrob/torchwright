@@ -39,16 +39,14 @@ import argparse
 import importlib
 import json
 import time
-from typing import Optional, Tuple
 
+from scripts.measure_fusion_opportunities import _EXAMPLES
 from torchwright.compiler.export import compile_headless
 from torchwright.compiler.lower import lower
 from torchwright.graph import Node
 
-from scripts.measure_fusion_opportunities import _EXAMPLES
 
-
-def _build_example(mod_name: str) -> Tuple[Node, int, int]:
+def _build_example(mod_name: str) -> tuple[Node, int, int]:
     """Build one example graph; return ``(output, d, d_head)``.
 
     ``d`` / ``d_head`` follow the token-test convention
@@ -73,7 +71,8 @@ def _build_example(mod_name: str) -> Tuple[Node, int, int]:
 def _load_spec(spec: str, kwargs_json: str) -> Node:
     """``module:callable`` loader (same contract as
     measure_fusion_opportunities): the output node is the result itself
-    or the first element of a result tuple."""
+    or the first element of a result tuple.
+    """
     mod_name, fn_name = spec.split(":")
     fn = getattr(importlib.import_module(mod_name), fn_name)
     result = fn(**json.loads(kwargs_json))
@@ -99,7 +98,8 @@ def _print_v2_report(output: Node, lane_cap: int) -> None:
     """Phase A analysis (docs/univariate_collapse_plan.md v2): certify
     the composed PL of every subgraph v1 leaves, model the S1/S2
     emission shapes, and model the layer floor via stand-in nodes.
-    Report-only — a fresh throwaway lowering, no compile-path change."""
+    Report-only — a fresh throwaway lowering, no compile-path change.
+    """
     from torchwright.compiler.collapse_analysis import analyze_collapse_v2
 
     lowered = lower(output, collapse_univariate=True, collapse_lane_cap=lane_cap)
@@ -143,7 +143,7 @@ def report_graph(
     d: int,
     d_head: int,
     device: str,
-    lane_cap: Optional[int] = None,
+    lane_cap: int | None = None,
     lower_only: bool = False,
     optimize: int = 0,
     v2: bool = False,

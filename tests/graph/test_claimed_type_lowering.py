@@ -90,7 +90,8 @@ def test_claim_does_not_regress_existing_inferred_type():
 def test_claim_survives_cache_refresh():
     """The refresh-proof property itself: recomputing a claimed node's
     caches (any pass may do this at any time) re-applies the claim
-    instead of widening back to the propagated bound."""
+    instead of widening back to the propagated bound.
+    """
     x = InputNode("x", 2, value_range=(-10.0, 10.0))
     lin = Linear(x, torch.ones(2, 2) * 3.0)  # propagated range [-60, 60]
     assert_in_range(lin, -1.0, 1.0)
@@ -106,7 +107,8 @@ def test_general_target_claim_reaches_consumer_bounds():
     than its propagated bound: the claim degenerates the node's affine
     bound to the claim-intersected constant box, and a consumer built
     after the attach derives through that box — on the source and
-    bit-identically on the lowering copy."""
+    bit-identically on the lowering copy.
+    """
     x = InputNode("x", 2, value_range=(-10.0, 10.0))
     lin = Linear(x, torch.ones(2, 2) * 3.0)  # propagated range [-60, 60]
     assert lin.value_type.value_range == Range(-60.0, 60.0)
@@ -135,7 +137,8 @@ def test_general_target_claim_reaches_consumer_bounds():
 def test_leaf_claim_tightens_input_ranges_channel():
     """A claim on an InputNode tightens the leaf's own input_ranges entry
     (the leaf channel), so downstream bounds inherit it through normal
-    affine propagation — with coefficients intact, not a constant box."""
+    affine propagation — with coefficients intact, not a constant box.
+    """
     x = InputNode("x", 2, value_range=(-10.0, 10.0))
     assert_in_range(x, -2.0, 2.0)
 

@@ -55,7 +55,8 @@ def test_compare_contract_points_and_false_side_bit_exact():
     (Swish(0) = 0; σ underflows to exactly 0), so the output IS the
     out_bias; at the true contract point the live lane is exactly scale
     and `scale·fl((T−F)/scale)` rounds to T−F (fl(0.02)'s relative
-    representation error, 2.2e-8, is under fp32's half-ulp 6e-8)."""
+    representation error, 2.2e-8, is under fp32's half-ulp 6e-8).
+    """
     x = create_input("x", 1, value_range=(-80.0, 80.0))
     out = compare(x, thresh=0.0)  # ramp width 1/step_sharpness = 0.1
     s = step_sharpness
@@ -70,7 +71,8 @@ def test_compare_true_side_far_field_ulp_class():
     the lane-contribution magnitude s·(x−thresh)·|T−F| — the same
     far-field class as the ReLU machine (kernel-dependent: FMA vs
     per-product rounding), NOT bit-exactness. Bounded by a few ulps of
-    the contribution."""
+    the contribution.
+    """
     x = create_input("x", 1, value_range=(-80.0, 80.0))
     out = compare(x, thresh=0.0)
     s = step_sharpness
@@ -87,7 +89,8 @@ def test_compare_true_side_far_field_ulp_class():
 def test_compare_bend_overshoot_bounded():
     """Inputs inside the fillets overshoot the levels by at most
     swish_dip/scale·|T−F|, and the value-range assert carries exactly
-    that slack."""
+    that slack.
+    """
     x = create_input("x", 1, value_range=(-80.0, 80.0))
     out = compare(x, thresh=0.0)
     s = step_sharpness
@@ -123,7 +126,8 @@ def test_compare_custom_levels_and_sharpness():
 def test_compare_semantic_bound_collapse_carries_slack():
     """An input interval clearing thresh collapses the semantic bound to
     the level ± the dip slack (the swish constant collapse is an
-    interval, not a constant)."""
+    interval, not a constant).
+    """
     x = create_input("x", 1, value_range=(1.0, 5.0))
     out = compare(x, thresh=0.0)
     slack = swish_dip / scale * 2.0
@@ -237,7 +241,8 @@ def test_equals_vector_structure():
 def test_equals_vector_match_and_margin_exact():
     """A match is bit-exact +1 (hinge argument scale/speed, saturated);
     a non-match exactly at the 1/speed margin is exact -1 (argument 0,
-    Swish(0)=0); a deep non-match is bit-exact -1 (sigmoid underflow)."""
+    Swish(0)=0); a deep non-match is bit-exact -1 (sigmoid underflow).
+    """
     x = create_input("x", 3, value_range=(-5.0, 5.0))
     out = equals_vector(x, _KEY)
     speed = 1.0  # embedding_step_sharpness
@@ -253,7 +258,8 @@ def test_equals_vector_match_and_margin_exact():
 def test_equals_vector_dip_and_range_slack():
     """A non-match engineered just past the margin lands in the hinge dip
     and reads below -1 by up to 2·swish_dip·speed/scale; the value-range
-    assert's low side carries exactly that slack."""
+    assert's low side carries exactly that slack.
+    """
     x = create_input("x", 3, value_range=(-5.0, 5.0))
     out = equals_vector(x, _KEY)
     speed = 1.0

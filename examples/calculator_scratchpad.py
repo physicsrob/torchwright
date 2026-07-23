@@ -70,13 +70,37 @@ reader that lands on a carry glyph returns its default ``0``, not a
 wrong-but-valid number.
 """
 
-from typing import Callable, Dict, List, Optional, Tuple, Union, cast
+from collections.abc import Callable
+from typing import cast
 
 import torch
 
+from examples._calculator_common import (
+    _CMP_W,
+    _EQUAL,
+    _GREATER,
+    _LESS,
+    CALC_VOCAB,
+    D_HEAD,
+    D_HIDDEN,
+    D_MODEL,
+    MAX_POSITIONS,
+    _slice,
+    _state,
+    parse_expression,
+)
 from torchwright.graph import Embedding, Node, RopeConfig
 from torchwright.graph.asserts import assert_integer
-from torchwright.ops.swiglu.arithmetic_ops import compare
+from torchwright.ops.attention_ops import (
+    attend_argmax_dot,
+    attend_to_offset,
+    get_prev_value,
+)
+from torchwright.ops.inout_nodes import (
+    create_literal_value,
+    create_onehot_embedding,
+    create_rope_config,
+)
 from torchwright.ops.linear import (
     add,
     add_const,
@@ -86,12 +110,8 @@ from torchwright.ops.linear import (
     subtract,
     sum_nodes,
 )
+from torchwright.ops.swiglu.arithmetic_ops import compare
 from torchwright.ops.swiglu.arithmetic_ops import min as min_node
-from torchwright.ops.inout_nodes import (
-    create_literal_value,
-    create_onehot_embedding,
-    create_rope_config,
-)
 from torchwright.ops.swiglu.logic_ops import (
     bool_all_true,
     bool_not,
@@ -99,28 +119,8 @@ from torchwright.ops.swiglu.logic_ops import (
     equals_vector,
 )
 from torchwright.ops.swiglu.map_select import in_range, select, switch
-from torchwright.ops.swiglu.onehot_table import onehot_lookup
-from torchwright.ops.attention_ops import (
-    attend_argmax_dot,
-    attend_to_offset,
-    get_prev_value,
-)
 from torchwright.ops.swiglu.marker_count import count_since_marker
-
-from examples._calculator_common import (
-    CALC_VOCAB,
-    D_HEAD,
-    D_HIDDEN,
-    D_MODEL,
-    MAX_POSITIONS,
-    _CMP_W,
-    _EQUAL,
-    _GREATER,
-    _LESS,
-    _slice,
-    _state,
-    parse_expression,
-)
+from torchwright.ops.swiglu.onehot_table import onehot_lookup
 
 # Geometry notes (the constants themselves are the family-wide set in
 # ``_calculator_common``):
@@ -147,14 +147,14 @@ from examples._calculator_common import (
 #   columns (the old ``dynamic_extract`` trim needed 8192).
 
 __all__ = [
-    "D_MODEL",
     "D_HEAD",
     "D_HIDDEN",
-    "THINKING_START",
+    "D_MODEL",
     "RESULT",
-    "scratch_vocab",
-    "decode_steps",
+    "THINKING_START",
     "create_network_parts",
+    "decode_steps",
+    "scratch_vocab",
 ]
 
 
@@ -206,13 +206,15 @@ RESULT = "</THINKING>"
 
 def _thinking_text(k: int) -> str:
     """Display string for the carry/borrow/verdict glyph carrying value ``k``
-    (e.g. ``"¹² "``)."""
+    (e.g. ``"¹² "``).
+    """
     return str(k).translate(_SUP) + " "
 
 
 def _count_text(k: int) -> str:
     """Display string for the normalization glyph carrying leading-zero count
-    ``k`` (e.g. ``"₁₂ "``)."""
+    ``k`` (e.g. ``"₁₂ "``).
+    """
     return str(k).translate(_SUB) + " "
 
 
@@ -229,7 +231,7 @@ def _n_thinking(max_digits: int) -> int:
     return 2 * max_digits + 1
 
 
-def scratch_vocab(max_digits: int) -> List[str]:
+def scratch_vocab(max_digits: int) -> list[str]:
     """Full vocabulary for a ``max_digits``-wide scratchpad calculator.
 
     The base calculator alphabet (digits, ``+ - *``, newline, space, BOS, EOS)
@@ -408,19 +410,20 @@ DigitFn = Callable[[int, int], Node]
 def _emit_from_total(
     embedding: Embedding,
     total: Node,
-    table: Dict[torch.Tensor, torch.Tensor],
+    table: dict[torch.Tensor, torch.Tensor],
     default: torch.Tensor,
     W: int,
 ) -> Node:
     """Turn a column total (an integer ``0..W-1``) into a one-hot index, then
     read off the emitted token via ``table`` — the carry-sweep idiom shared with
     ``calculator_simple``'s multiply: ``in_range`` makes the one-hot,
-    ``onehot_lookup`` reads the table."""
+    ``onehot_lookup`` reads the table.
+    """
     onehot = bool_to_01(in_range(total, add_const(total, 1.0), W))
     return onehot_lookup(onehot, table, default)
 
 
-def _carry_sweep(embedding: Embedding, T: List[Node], W: int, n: int) -> List[Node]:
+def _carry_sweep(embedding: Embedding, T: list[Node], W: int, n: int) -> list[Node]:
     """Carry sweep over LSB-first column totals ``T`` → one thinking glyph per
     column (each carrying that column's carry-out).
 
@@ -451,7 +454,7 @@ def _carry_digit_fn(
     rope: RopeConfig,
     embedding: Embedding,
     layout: _SeqLayout,
-    T: List[Node],
+    T: list[Node],
     W: int,
     n: int,
 ) -> DigitFn:
@@ -459,7 +462,8 @@ def _carry_digit_fn(
     ``m`` (place-value column ``kc = len(T)-1-m``): ``total = T[kc] + carry_in``,
     where the carry-in is the carry-out of column ``kc-1`` read from the carry
     sweep at a statically-known offset.  Only ``total % 10`` (the digit) is
-    returned; the carry half lives in :func:`_carry_sweep`."""
+    returned; the carry half lives in :func:`_carry_sweep`.
+    """
     embed = embedding.get_embedding
     n_state = _n_thinking(n)
     num_cols = len(T)
@@ -488,7 +492,7 @@ def _stream_normalize(
     embedding: Embedding,
     layout: _SeqLayout,
     N: int,
-) -> List[Node]:
+) -> list[Node]:
     """Normalization sweep: MSB-first, one count glyph per answer column,
     threading a single running leading-zero count.
 
@@ -509,7 +513,7 @@ def _stream_normalize(
     count_table = {_state(k, n_state): embed(_count_text(k)) for k in range(n_state)}
     count_default = embed(_count_text(0))
 
-    glyphs: List[Node] = []
+    glyphs: list[Node] = []
     for m in range(N):
         here = layout.norm_start + m
         prev = _scalar(0.0) if m == 0 else _count_value(embedding, embedding, n_state)
@@ -533,7 +537,8 @@ def _read_count(
 ) -> Node:
     """The total leading-zero count ``L`` carried by the last normalization
     glyph (``layout.norm_last``), read from the token emitted at list-index
-    ``here``."""
+    ``here``.
+    """
     token = attend_to_offset(
         rope, embedding, delta_pos=_read_offset(layout.norm_last, here)
     )
@@ -580,8 +585,8 @@ def _emit_gathered_answer(
     col_onehot: Node,
     N: int,
     *,
-    sign_at: Optional[Callable[[int], Node]] = None,
-) -> List[Node]:
+    sign_at: Callable[[int], Node] | None = None,
+) -> list[Node]:
     """The trimmed, MSB-first answer, one slot per ``layout.n_answer``.
 
     Each slot reads the leading-zero count ``L`` (capped to ``min(L, N-1)`` so an
@@ -604,7 +609,7 @@ def _emit_gathered_answer(
     eos = create_literal_value(embed("<eos>"))
     minus = create_literal_value(embed("-"))
 
-    answer: List[Node] = []
+    answer: list[Node] = []
     for t in range(layout.n_answer):
         here = layout.answer_start + t
         L_capped = min_node(
@@ -624,7 +629,7 @@ def _emit_gathered_answer(
             match_gain=_MATCH_GAIN,
         )
         if t == 0 and sign_at is not None:
-            answer.append(select(cast(Node, ge), picked, minus))
+            answer.append(select(cast("Node", ge), picked, minus))
         else:
             answer.append(select(compare(idx, thresh=N - 0.5), eos, picked))
     return answer
@@ -633,14 +638,15 @@ def _emit_gathered_answer(
 def _build_carry_op(
     rope: RopeConfig,
     embedding: Embedding,
-    T: List[Node],
+    T: list[Node],
     W: int,
     n: int,
     steps_since: Node,
-) -> Tuple[List[Node], List[Node]]:
+) -> tuple[list[Node], list[Node]]:
     """Carry-based op (addition / multiplication): carry sweep, scratch digits,
     normalization sweep, pointer-gathered answer.  Returns ``(thinking, answer)``
-    where ``thinking`` is ``carry ++ scratch ++ norm``."""
+    where ``thinking`` is ``carry ++ scratch ++ norm``.
+    """
     N = len(T)
     # Column totals are sums of digit-table lookups — genuinely integer.
     T = [assert_integer(t) for t in T]
@@ -664,13 +670,14 @@ def _build_carry_op(
 def _add_op(
     rope: RopeConfig,
     embedding: Embedding,
-    A: List[Node],
-    B: List[Node],
+    A: list[Node],
+    B: list[Node],
     n: int,
     steps_since: Node,
-) -> Tuple[List[Node], List[Node]]:
+) -> tuple[list[Node], list[Node]]:
     """Streamed addition.  ``num_cols = n + 1`` columns give the top carry a home;
-    the column total is just ``a_k + b_k``."""
+    the column total is just ``a_k + b_k``.
+    """
     a_scalar = [_digit_scalar(embedding, d) for d in A]  # MSB-first
     b_scalar = [_digit_scalar(embedding, d) for d in B]
 
@@ -690,11 +697,11 @@ def _add_op(
 def _mul_op(
     rope: RopeConfig,
     embedding: Embedding,
-    A: List[Node],
-    B: List[Node],
+    A: list[Node],
+    B: list[Node],
     n: int,
     steps_since: Node,
-) -> Tuple[List[Node], List[Node]]:
+) -> tuple[list[Node], list[Node]]:
     """Streamed multiplication.  The ``n²`` digit products and the per-column
     number sums are ``calculator_simple``'s multiply steps 1–2 verbatim (all
     ``O(1)`` depth); only the serial carry loop is replaced by the streamed
@@ -714,7 +721,7 @@ def _mul_op(
 
     # Steps 1–2: drop each product's digits into their place-value columns and
     # collect the (free) per-column number contributions.
-    columns: List[List[Node]] = [[] for _ in range(2 * n)]
+    columns: list[list[Node]] = [[] for _ in range(2 * n)]
     for i in range(n):
         for j in range(n):
             product = onehot_lookup(
@@ -737,11 +744,11 @@ def _mul_op(
 def _sub_op(
     rope: RopeConfig,
     embedding: Embedding,
-    A: List[Node],
-    B: List[Node],
+    A: list[Node],
+    B: list[Node],
     n: int,
     steps_since: Node,
-) -> Tuple[List[Node], List[Node]]:
+) -> tuple[list[Node], list[Node]]:
     """Streamed subtraction.  Three streamed thinking phases precede the answer:
 
     1. **comparison** (MSB-first) — a 3-state less/equal/greater verdict folded
@@ -766,8 +773,8 @@ def _sub_op(
     # the graph calculators retired when compare_digit_seqs went
     # constant-depth; here the recurrence rides the decode axis, where
     # serial is the point. ---
-    combine_table: Dict[torch.Tensor, torch.Tensor] = {}
-    nxt: Union[int, Node]
+    combine_table: dict[torch.Tensor, torch.Tensor] = {}
+    nxt: int | Node
     for v in range(_CMP_W):
         for a in range(10):
             for b in range(10):
@@ -889,8 +896,8 @@ def _sub_op(
 
 
 def _assemble(
-    embedding: Embedding, thinking: List[Node], answer: List[Node]
-) -> List[Node]:
+    embedding: Embedding, thinking: list[Node], answer: list[Node]
+) -> list[Node]:
     """Wrap a (thinking, answer) pair into the full emitted token list:
     ``[THINKING_START] + thinking + [RESULT] + answer + [<eos>]``.
 
@@ -913,7 +920,7 @@ def _emit_by_slot_index(
     rope: RopeConfig,
     steps_since: Node,
     is_trigger: Node,
-    seq: List[Node],
+    seq: list[Node],
     default_output: torch.Tensor,
 ) -> Node:
     """Autoregressive emission gated by the exact integer step counter.
@@ -969,7 +976,7 @@ def _emit_by_slot_index(
 
 def create_network_parts(
     max_digits: int = 3,
-) -> Tuple[Node, Embedding]:
+) -> tuple[Node, Embedding]:
     """Build the scratchpad calculator graph: parse, three streamed ops, dispatch.
 
     The parse is the shared constant-depth

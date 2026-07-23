@@ -24,10 +24,6 @@ from typing import cast
 import torch
 
 import examples.calculator_simple as calc
-from torchwright.compiler.export import compile_headless, compile_to_onnx
-from torchwright.graph import Concatenate
-from torchwright.ops.linear import concat
-from torchwright.ops.inout_nodes import create_input, create_onehot_embedding
 from examples._calculator_common import _CARRY_W, _NO, _state
 from examples.calculator_simple import (
     add_digit_seqs,
@@ -35,6 +31,9 @@ from examples.calculator_simple import (
     multiply_digit_seqs,
     subtract_digit_seqs,
 )
+from torchwright.compiler.export import compile_headless, compile_to_onnx
+from torchwright.graph import Concatenate
+from torchwright.ops.inout_nodes import create_input, create_onehot_embedding
 from torchwright.ops.relu.onehot_table import onehot_lookup
 
 D = 1024
@@ -64,7 +63,7 @@ def whole_calculator_stats() -> None:
             d_head=D_HEAD,
             verbose=False,
         )
-        sidecar = json.load(open(cast(str, artifact.debug_path)))
+        sidecar = json.load(open(cast("str", artifact.debug_path)))
 
     peak = _peak_residual_occupancy(sidecar)
     print(f"  layers              : {artifact.n_layers}")
@@ -152,7 +151,8 @@ def addition_table_figure() -> None:
 
 def times_table_figure() -> None:
     """The compiled digit-products lookup, reconstructed as the 10x10 times
-    table — multiply now sums these products per column and carries once."""
+    table — multiply now sums these products per column and carries once.
+    """
     print("\n== compiled times-table lookup (digit x digit) ==")
     embedding = create_onehot_embedding(calc.CALC_VOCAB)
     d_embed = embedding.d_embed

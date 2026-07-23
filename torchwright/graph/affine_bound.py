@@ -14,9 +14,9 @@ All coefficient tensors are stored as ``torch.float64``, CPU-only.
 
 from __future__ import annotations
 
-import torch
 from dataclasses import dataclass
-from typing import Dict, Tuple
+
+import torch
 
 from torchwright.graph.value_type import Range
 
@@ -38,8 +38,8 @@ class AffineBound:
     A_hi: torch.Tensor
     b_lo: torch.Tensor
     b_hi: torch.Tensor
-    columns: Dict[int, Tuple[int, int]]
-    input_ranges: Dict[int, Tuple[torch.Tensor, torch.Tensor]]
+    columns: dict[int, tuple[int, int]]
+    input_ranges: dict[int, tuple[torch.Tensor, torch.Tensor]]
 
     def __post_init__(self):
         d = self.A_lo.shape[0]
@@ -67,7 +67,7 @@ class AffineBound:
         return self.A_lo.shape[0]
 
     @classmethod
-    def identity(cls, input_node) -> "AffineBound":
+    def identity(cls, input_node) -> AffineBound:
         """One-hot rows for *input_node*'s columns, zero offsets."""
         from torchwright.graph.misc import InputNode
 
@@ -88,7 +88,7 @@ class AffineBound:
         )
 
     @classmethod
-    def constant(cls, values: torch.Tensor) -> "AffineBound":
+    def constant(cls, values: torch.Tensor) -> AffineBound:
         """Zero ``A``, ``b_lo = b_hi = values``."""
         d = values.shape[0]
         A = torch.zeros(d, 0, dtype=torch.float64)
@@ -109,7 +109,7 @@ class AffineBound:
         *,
         lo: float = float("-inf"),
         hi: float = float("inf"),
-    ) -> "AffineBound":
+    ) -> AffineBound:
         """Zero ``A``, broadcast scalar offsets."""
         A = torch.zeros(d_output, 0, dtype=torch.float64)
         b_lo = torch.full((d_output,), lo, dtype=torch.float64)
@@ -124,9 +124,7 @@ class AffineBound:
         )
 
     @staticmethod
-    def align(
-        a: "AffineBound", b: "AffineBound"
-    ) -> tuple["AffineBound", "AffineBound"]:
+    def align(a: AffineBound, b: AffineBound) -> tuple[AffineBound, AffineBound]:
         """Reindex *a* and *b* to share the same column layout."""
         if a.columns == b.columns:
             merged_ranges = _merge_ranges(a.input_ranges, b.input_ranges)
@@ -229,8 +227,8 @@ class AffineBound:
 
 
 def _ranges_equal(
-    a: Dict[int, Tuple[torch.Tensor, torch.Tensor]],
-    b: Dict[int, Tuple[torch.Tensor, torch.Tensor]],
+    a: dict[int, tuple[torch.Tensor, torch.Tensor]],
+    b: dict[int, tuple[torch.Tensor, torch.Tensor]],
 ) -> bool:
     if a.keys() != b.keys():
         return False
@@ -240,9 +238,9 @@ def _ranges_equal(
 
 
 def _merge_ranges(
-    a: Dict[int, Tuple[torch.Tensor, torch.Tensor]],
-    b: Dict[int, Tuple[torch.Tensor, torch.Tensor]],
-) -> Dict[int, Tuple[torch.Tensor, torch.Tensor]]:
+    a: dict[int, tuple[torch.Tensor, torch.Tensor]],
+    b: dict[int, tuple[torch.Tensor, torch.Tensor]],
+) -> dict[int, tuple[torch.Tensor, torch.Tensor]]:
     """Intersect input ranges from two bounds."""
     merged = dict(a)
     for k, (blo, bhi) in b.items():
@@ -257,11 +255,11 @@ def _merge_ranges(
 def _merge_layouts(
     *bounds: AffineBound,
 ) -> tuple[
-    Dict[int, Tuple[int, int]], Dict[int, Tuple[torch.Tensor, torch.Tensor]], int
+    dict[int, tuple[int, int]], dict[int, tuple[torch.Tensor, torch.Tensor]], int
 ]:
     """Build a merged column layout from multiple bounds."""
-    merged_columns: Dict[int, Tuple[int, int]] = {}
-    merged_ranges: Dict[int, Tuple[torch.Tensor, torch.Tensor]] = {}
+    merged_columns: dict[int, tuple[int, int]] = {}
+    merged_ranges: dict[int, tuple[torch.Tensor, torch.Tensor]] = {}
     offset = 0
     all_keys = sorted(set().union(*(b.columns for b in bounds)))
     for key in all_keys:
@@ -289,8 +287,8 @@ def _merge_layouts(
 
 def _scatter(
     ab: AffineBound,
-    merged_columns: Dict[int, Tuple[int, int]],
-    merged_ranges: Dict[int, Tuple[torch.Tensor, torch.Tensor]],
+    merged_columns: dict[int, tuple[int, int]],
+    merged_ranges: dict[int, tuple[torch.Tensor, torch.Tensor]],
     n: int,
 ) -> AffineBound:
     """Scatter *ab*'s columns into a merged layout."""

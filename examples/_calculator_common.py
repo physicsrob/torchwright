@@ -37,27 +37,25 @@ end-to-end depth now tracks its carry-lookahead / carry-save arithmetic —
 the shared parse, comparison, and leading-zero trim are all constant-depth.)
 """
 
-from typing import Dict, List, Tuple
-
 import torch
 
 from torchwright.graph import Embedding, Linear, Node, RopeConfig
 from torchwright.graph.embedding import bos_token
-from torchwright.ops.swiglu.arithmetic_ops import compare as _compare_scalar
-from torchwright.ops.linear import add_const, bool_to_01, concat, sum_nodes
 from torchwright.ops.attention_ops import get_prev_value
 from torchwright.ops.inout_nodes import (
     create_literal_value,
     create_onehot_embedding,
     create_rope_config,
 )
+from torchwright.ops.linear import add_const, concat
+from torchwright.ops.swiglu.arithmetic_ops import compare as _compare_scalar
 from torchwright.ops.swiglu.logic_ops import (
     bool_all_true,
     bool_any_true,
     bool_not,
     equals_vector,
 )
-from torchwright.ops.swiglu.map_select import broadcast_select, in_range, select, switch
+from torchwright.ops.swiglu.map_select import select, switch
 from torchwright.ops.swiglu.onehot_table import onehot_lookup
 from torchwright.ops.swiglu.sequence_ops import (
     IndexedRegion,
@@ -140,7 +138,7 @@ def _slice(node: Node, start: int, width: int, name: str = "slice") -> Node:
 
 
 def compare_digit_seqs(
-    embedding: Embedding, seq1: List[Node], seq2: List[Node]
+    embedding: Embedding, seq1: list[Node], seq2: list[Node]
 ) -> Node:
     """Lexicographic comparison at constant depth: weight the digit flags so
     the first difference outweighs everything after it.
@@ -174,7 +172,7 @@ def compare_digit_seqs(
 
     # key = concat([a, b]) -> three-way flag.  The default reads "equal"
     # (0.0) — a non-digit pair defers the verdict to later positions.
-    pair_table: Dict[torch.Tensor, torch.Tensor] = {}
+    pair_table: dict[torch.Tensor, torch.Tensor] = {}
     for a in range(10):
         for b in range(10):
             key = torch.cat(
@@ -216,7 +214,7 @@ def parse_expression(
     rope: RopeConfig,
     embedding: Embedding,
     max_digits: int,
-) -> Tuple[List[Node], List[Node], Node, Node, Node, Node]:
+) -> tuple[list[Node], list[Node], Node, Node, Node, Node]:
     """Parse ``"A op B\\n"`` from the token stream, at constant depth.
 
     Returns ``(first, second, is_plus, is_minus, is_times, saw_newline)``:
@@ -326,13 +324,14 @@ def parse_expression(
     return first, second, which_plus, which_minus, which_times, saw_newline
 
 
-def _pad_result(embedding: Embedding, digits: List[Node], seq_len: int) -> List[Node]:
+def _pad_result(embedding: Embedding, digits: list[Node], seq_len: int) -> list[Node]:
     """Align a digit sequence into the shared result frame (free literals):
     leading ``"0"`` digits out to the widest answer width (``seq_len - 2``,
     multiplication's ``2·max_digits``), then ``<eos>`` padding.  Every branch
     then has the same digit width, so the one post-dispatch trim's
     ``max_removals`` cap keeps exactly one digit of an all-zero answer no
-    matter which branch won."""
+    matter which branch won.
+    """
     zero = create_literal_value(embedding.get_embedding("0"))
     eos = create_literal_value(embedding.get_embedding("<eos>"))
     return [zero] * (seq_len - 2 - len(digits)) + digits + [eos, eos]
@@ -342,10 +341,11 @@ def emit_result(
     rope: RopeConfig,
     embedding: Embedding,
     saw_newline: Node,
-    result_digits: List[Node],
+    result_digits: list[Node],
 ) -> Node:
     """Emit ``result_digits`` autoregressively once the newline fires, printing
-    a space at every position before then."""
+    a space at every position before then.
+    """
     return output_sequence(
         rope, saw_newline, result_digits, embedding.get_embedding(" ")
     )
@@ -357,7 +357,7 @@ def build_calculator(
     add_digit_seqs,
     subtract_digit_seqs,
     multiply_digit_seqs,
-) -> Tuple[Node, Embedding]:
+) -> tuple[Node, Embedding]:
     """Assemble the calculator graph from one variant's arithmetic.
 
     The three depth-differentiating algorithms — ``add_digit_seqs``,

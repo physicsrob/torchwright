@@ -14,7 +14,6 @@ import json
 import os
 import tempfile
 
-import pytest
 import torch
 
 from torchwright.compiler.export import (
@@ -28,9 +27,9 @@ from torchwright.compiler.export import (
 from torchwright.compiler.forward.compile import forward_compile
 from torchwright.compiler.graph_identity import canonical_ids
 from torchwright.graph import Embedding, Linear
-from torchwright.ops.relu.arithmetic_ops import multiply_2d
-from torchwright.ops.linear import add
 from torchwright.ops.inout_nodes import create_input
+from torchwright.ops.linear import add
+from torchwright.ops.relu.arithmetic_ops import multiply_2d
 
 D = 256
 D_HEAD = 16

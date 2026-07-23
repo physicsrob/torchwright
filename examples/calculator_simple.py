@@ -22,44 +22,41 @@ function documents how wide the caller must size the inputs so the fixed-width
 result never drops a nonzero carry.
 """
 
-from typing import Dict, List, Tuple
-
 import torch
 
-from torchwright.graph import Embedding, Node
-from torchwright.ops.linear import add, add_const, bool_to_01, concat, sum_nodes
-from torchwright.ops.inout_nodes import create_literal_value
-from torchwright.ops.const import step_sharpness
-from torchwright.ops.swiglu.arithmetic_ops import piecewise_linear
-from torchwright.ops.swiglu.map_select import in_range
-from torchwright.ops.swiglu.onehot_table import onehot_lookup
-
 from examples._calculator_common import (
+    _CARRY_W,
+    _NO,
+    _YES,
     CALC_VOCAB,
     D_HEAD,
     D_HIDDEN,
     D_MODEL,
     MAX_POSITIONS,
-    _CARRY_W,
-    _NO,
-    _YES,
     _slice,
     _state,
     build_calculator,
     compare_digit_seqs,  # shared verbatim — re-exported as part of this variant
 )
+from torchwright.graph import Embedding, Node
+from torchwright.ops.const import step_sharpness
+from torchwright.ops.inout_nodes import create_literal_value
+from torchwright.ops.linear import add, add_const, bool_to_01, concat, sum_nodes
+from torchwright.ops.swiglu.arithmetic_ops import piecewise_linear
+from torchwright.ops.swiglu.map_select import in_range
+from torchwright.ops.swiglu.onehot_table import onehot_lookup
 
 __all__ = [
     "CALC_VOCAB",
-    "D_MODEL",
     "D_HEAD",
     "D_HIDDEN",
+    "D_MODEL",
     "MAX_POSITIONS",
     "add_digit_seqs",
-    "subtract_digit_seqs",
     "compare_digit_seqs",
-    "multiply_digit_seqs",
     "create_network_parts",
+    "multiply_digit_seqs",
+    "subtract_digit_seqs",
 ]
 
 # Model-card fields consumed by ``examples.compile`` when publishing this
@@ -75,13 +72,13 @@ DEMO_PROMPTS = ["12*34\n", "7+8\n", "100-99\n", "123*4\n"]
 
 def digitwise_fold(
     embedding: Embedding,
-    seq1: List[Node],
-    seq2: List[Node],
+    seq1: list[Node],
+    seq2: list[Node],
     *,
-    digit_table: Dict[torch.Tensor, torch.Tensor],
-    state_table: Dict[torch.Tensor, torch.Tensor],
+    digit_table: dict[torch.Tensor, torch.Tensor],
+    state_table: dict[torch.Tensor, torch.Tensor],
     init_state: torch.Tensor,
-) -> List[Node]:
+) -> list[Node]:
     """Right-to-left (LSB-first) fold threading one state one-hot.
 
     At each digit position the key ``concat([a, b, state])`` is looked up in
@@ -105,7 +102,7 @@ def digitwise_fold(
     default_digit = embedding.get_embedding("0")
     default_state = init_state
     state = create_literal_value(init_state)
-    out: List[Node] = []
+    out: list[Node] = []
     for a, b in reversed(list(zip(seq1, seq2))):
         key = concat([a, b, state])
         out.append(onehot_lookup(key, digit_table, default_digit))
@@ -119,8 +116,8 @@ def digitwise_fold(
 
 
 def add_digit_seqs(
-    embedding: Embedding, seq1: List[Node], seq2: List[Node]
-) -> List[Node]:
+    embedding: Embedding, seq1: list[Node], seq2: list[Node]
+) -> list[Node]:
     """Add two equal-length MSB-first digit sequences with a carry fold.
 
     Returns a sequence of the **same length**, dropping the final carry.
@@ -130,8 +127,8 @@ def add_digit_seqs(
     ``n``-digit + ``n``-digit sum has a home for its top carry.  Within the cap
     the dropped carry is always zero, so the result is exact.
     """
-    digit_table: Dict[torch.Tensor, torch.Tensor] = {}
-    state_table: Dict[torch.Tensor, torch.Tensor] = {}
+    digit_table: dict[torch.Tensor, torch.Tensor] = {}
+    state_table: dict[torch.Tensor, torch.Tensor] = {}
     for a in range(10):
         for b in range(10):
             for carry in range(2):
@@ -161,16 +158,16 @@ def add_digit_seqs(
 
 
 def subtract_digit_seqs(
-    embedding: Embedding, seq1: List[Node], seq2: List[Node]
-) -> List[Node]:
+    embedding: Embedding, seq1: list[Node], seq2: list[Node]
+) -> list[Node]:
     """``seq1 - seq2`` digit by digit with a borrow fold (assumes ``seq1 >= seq2``).
 
     Equal length in, equal length out.  Because ``seq1 >= seq2`` the final
     borrow is always zero, so dropping it is exact — the caller handles the
     sign separately (see :func:`compare_digit_seqs`).
     """
-    digit_table: Dict[torch.Tensor, torch.Tensor] = {}
-    state_table: Dict[torch.Tensor, torch.Tensor] = {}
+    digit_table: dict[torch.Tensor, torch.Tensor] = {}
+    state_table: dict[torch.Tensor, torch.Tensor] = {}
     for a in range(10):
         for b in range(10):
             for borrow in range(2):
@@ -200,8 +197,8 @@ def subtract_digit_seqs(
 
 
 def multiply_digit_seqs(
-    embedding: Embedding, seq1: List[Node], seq2: List[Node]
-) -> List[Node]:
+    embedding: Embedding, seq1: list[Node], seq2: list[Node]
+) -> list[Node]:
     """Multiply ``seq1 * seq2`` (both ``n`` digits MSB-first) -> ``2n`` digits.
 
     Rather than building whole partial-product rows and adding them with a
@@ -231,7 +228,7 @@ def multiply_digit_seqs(
     zero_scalar = create_literal_value(torch.tensor([0.0]))
 
     # Step 1: the times table.  Two one-hot digits -> (tens, ones) as numbers.
-    product_table: Dict[torch.Tensor, torch.Tensor] = {}
+    product_table: dict[torch.Tensor, torch.Tensor] = {}
     for a in range(10):
         for b in range(10):
             key = torch.cat(
@@ -243,7 +240,7 @@ def multiply_digit_seqs(
     # Steps 1-2: drop each product's digits into their place-value columns and
     # collect the (free) per-column number contributions.  Column p is the
     # 10^p place; columns run 0 (least significant) .. 2n-1.
-    columns: List[List[Node]] = [[] for _ in range(2 * n)]
+    columns: list[list[Node]] = [[] for _ in range(2 * n)]
     for i in range(n):
         for j in range(n):
             product = onehot_lookup(
@@ -278,13 +275,13 @@ def multiply_digit_seqs(
     # Staircase knot pairs (one step per ten): carry k−1 up to 10k−0.5,
     # carry k from 10k−0.4 — the standard 1/sharpness ramp width, so
     # integer totals sit ≥ 0.4 from every knot (bit-exact reads).
-    carry_knots: Dict[float, float] = {}
+    carry_knots: dict[float, float] = {}
     for k in range(1, max_total // 10 + 1):
         carry_knots[10.0 * k - 0.5] = float(k - 1)
         carry_knots[10.0 * k - 0.4] = float(k)
 
     carry: Node = zero_scalar
-    out_lsb_first: List[Node] = []
+    out_lsb_first: list[Node] = []
     for place in range(2 * n):
         contributions = columns[place] or [zero_scalar]
         total = add(sum_nodes(contributions), carry)  # free number addition
@@ -304,9 +301,10 @@ def multiply_digit_seqs(
 
 def create_network_parts(
     max_digits: int = 3,
-) -> Tuple[Node, Embedding]:
+) -> tuple[Node, Embedding]:
     """The simple calculator: the legible serial folds wired up by
-    :func:`examples._calculator_common.build_calculator`."""
+    :func:`examples._calculator_common.build_calculator`.
+    """
     return build_calculator(
         max_digits,
         add_digit_seqs=add_digit_seqs,

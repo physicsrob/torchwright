@@ -16,9 +16,9 @@ import torch
 
 from torchwright.compiler.forward.compile import forward_compile
 from torchwright.compiler.forward.cpsat_scheduler import Costs
-from torchwright.graph import Add, Linear
-from torchwright.ops.linear import add, add_scaled_nodes, concat, sum_nodes
+from torchwright.graph import Linear
 from torchwright.ops.inout_nodes import create_input, create_literal_value
+from torchwright.ops.linear import add, add_scaled_nodes, concat, sum_nodes
 from torchwright.ops.relu.linear_relu_linear import linear_relu_linear
 
 D = 256

@@ -14,8 +14,8 @@ See ``docs/numerical_noise.md`` for the methodology this module implements.
 from __future__ import annotations
 
 import ast
-from dataclasses import dataclass, field
-from typing import Callable, Dict, List, Optional
+from collections.abc import Callable
+from dataclasses import dataclass
 
 import torch
 
@@ -41,7 +41,7 @@ class InputDistribution:
 
     name: str
     description: str
-    inputs: Dict[str, torch.Tensor]
+    inputs: dict[str, torch.Tensor]
     n_samples: int
 
 
@@ -75,7 +75,7 @@ class NoiseMeasurement:
     mean_rel_error: float
     p99_rel_error: float
     rel_valid_samples: int
-    worst_input: Dict[str, float]
+    worst_input: dict[str, float]
     notes: str = ""
     machine: str = "relu"
 
@@ -89,9 +89,9 @@ def measure_op_isolated(
     *,
     op_name: str,
     module: str,
-    build_graph: Callable[[Dict[str, Node]], Node],
-    input_specs: Dict[str, int],
-    reference_fn: Callable[[Dict[str, torch.Tensor]], torch.Tensor],
+    build_graph: Callable[[dict[str, Node]], Node],
+    input_specs: dict[str, int],
+    reference_fn: Callable[[dict[str, torch.Tensor]], torch.Tensor],
     distribution: InputDistribution,
     notes: str = "",
     machine: str = "relu",
@@ -163,7 +163,7 @@ def measure_op_isolated(
         name: [float(v) for v in distribution.inputs[name][worst_idx].tolist()]
         for name in distribution.inputs
     }
-    worst_input_flat: Dict[str, float] = {}
+    worst_input_flat: dict[str, float] = {}
     for name, vals in worst_input.items():
         if len(vals) == 1:
             worst_input_flat[name] = vals[0]
@@ -229,7 +229,7 @@ def render_footer_block(
     total_samples: int,
     commit: str,
     indent: str,
-) -> List[str]:
+) -> list[str]:
     """Return the lines (no trailing newlines) of a noise-footer block.
 
     The footer is deliberately distribution-agnostic: it reports the worst
@@ -273,7 +273,7 @@ def update_docstring_footer(
     closing = doc_lines[-1]
     indent = " " * (len(closing) - len(closing.lstrip()))
 
-    marker_idx: Optional[int] = None
+    marker_idx: int | None = None
     for i, line in enumerate(doc_lines):
         if line.strip() == NOISE_FOOTER_MARKER:
             marker_idx = i

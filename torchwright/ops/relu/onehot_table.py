@@ -30,11 +30,9 @@ pessimistic ``default ± Σ|value − default|`` widening, which is what blew up
 the interval arithmetic through a long chain of lookups.
 """
 
-from typing import Dict
-
 import torch
 
-from torchwright.graph import Node, Linear
+from torchwright.graph import Linear, Node
 from torchwright.graph.asserts import assert_matches_value_type
 from torchwright.graph.value_type import NodeValueType, Range
 from torchwright.ops.relu.linear_relu_linear import linear_relu_linear
@@ -60,7 +58,7 @@ def _count_one_hot_blocks(key: torch.Tensor) -> int:
 
 def onehot_lookup(
     inp: Node,
-    key_to_value: Dict[torch.Tensor, torch.Tensor],
+    key_to_value: dict[torch.Tensor, torch.Tensor],
     default: torch.Tensor,
 ) -> Node:
     """Map a one-hot (or concatenation of one-hots) input to a lookup table.

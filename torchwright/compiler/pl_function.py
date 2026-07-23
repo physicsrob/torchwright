@@ -62,8 +62,8 @@ is called by ``lower()``; see ``torchwright/compiler/collapse_analysis.py``.
 
 from __future__ import annotations
 
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
-from typing import Callable, Dict, List, Optional, Sequence, Tuple
 
 import torch
 
@@ -149,9 +149,10 @@ class PLFunction:
     @staticmethod
     def line(
         slope: torch.Tensor, intercept: torch.Tensor, lo: float, hi: float
-    ) -> "PLFunction":
+    ) -> PLFunction:
         """The affine function ``slope·x + intercept`` on ``[lo, hi]``,
-        clamped outside (zero tail slopes)."""
+        clamped outside (zero tail slopes).
+        """
         slope = torch.as_tensor(slope, dtype=_F64).reshape(-1)
         intercept = torch.as_tensor(intercept, dtype=_F64).reshape(-1)
         x = torch.tensor([lo, hi], dtype=_F64)
@@ -160,7 +161,7 @@ class PLFunction:
         return PLFunction(x, y, zero, zero)
 
     @staticmethod
-    def constant(values: torch.Tensor, lo: float, hi: float) -> "PLFunction":
+    def constant(values: torch.Tensor, lo: float, hi: float) -> PLFunction:
         values = torch.as_tensor(values, dtype=_F64).reshape(-1)
         x = torch.tensor([lo, hi], dtype=_F64)
         y = torch.stack([values, values])
@@ -198,8 +199,8 @@ class PLFunction:
     # --- algebra --------------------------------------------------------
 
     def map_affine(
-        self, matrix: torch.Tensor, bias: Optional[torch.Tensor] = None
-    ) -> "PLFunction":
+        self, matrix: torch.Tensor, bias: torch.Tensor | None = None
+    ) -> PLFunction:
         """Post-compose with an affine map: ``f'(x) = f(x) @ matrix + bias``.
 
         ``matrix`` is ``(d, d_out)``.  Creates no kinks (an affine image
@@ -211,7 +212,7 @@ class PLFunction:
             y = y + torch.as_tensor(bias, dtype=_F64).reshape(1, -1)
         return PLFunction(self.x, y, self.slope_lo @ matrix, self.slope_hi @ matrix)
 
-    def add(self, other: "PLFunction") -> "PLFunction":
+    def add(self, other: PLFunction) -> PLFunction:
         """Pointwise sum — knot union (each PL is exact at the union)."""
         assert self.d == other.d
         xs = torch.unique(torch.cat([self.x, other.x]))
@@ -223,7 +224,7 @@ class PLFunction:
         )
 
     @staticmethod
-    def concat(fns: Sequence["PLFunction"]) -> "PLFunction":
+    def concat(fns: Sequence[PLFunction]) -> PLFunction:
         """Vector concatenation — knot union, values side by side."""
         assert fns
         xs = torch.unique(torch.cat([f.x for f in fns]))
@@ -234,13 +235,13 @@ class PLFunction:
             torch.cat([f.slope_hi for f in fns]),
         )
 
-    def refined(self, extra: torch.Tensor) -> "PLFunction":
+    def refined(self, extra: torch.Tensor) -> PLFunction:
         """The same function with additional knots inserted."""
         extra = torch.as_tensor(extra, dtype=_F64).reshape(-1)
         xs = torch.unique(torch.cat([self.x, extra]))
         return PLFunction(xs, self.eval(xs), self.slope_lo, self.slope_hi)
 
-    def simplified(self, tol: float) -> "PLFunction":
+    def simplified(self, tol: float) -> PLFunction:
         """Drop interior knots that are chord-consistent — a sequential
         sleeve scan: knot ``i`` is dropped when it sits within ``tol``
         of the chord from the last *kept* knot to knot ``i+1``.  Keeps
@@ -250,7 +251,8 @@ class PLFunction:
         wrong here: a bend hugged by its ulp brackets looks consistent
         with them even though it is the structure.  Callers measuring
         deviation against the simplified function stay honest — any
-        error a removal introduces shows up in the measurement."""
+        error a removal introduces shows up in the measurement.
+        """
         n = self.n_knots
         if n <= 2:
             return self
@@ -288,9 +290,10 @@ class PLFunction:
         after = torch.cat([segs, self.slope_hi.unsqueeze(0)])
         return after - before
 
-    def lanes(self, tol: Optional[float] = None) -> int:
+    def lanes(self, tol: float | None = None) -> int:
         """Emitted-lane count of an S1 ``piecewise_linear`` of this
-        function: one lane per knot whose slope changes in any dim."""
+        function: one lane per knot whose slope changes in any dim.
+        """
         deltas = self.slope_deltas().abs()
         if tol is None:
             segs = self.segment_slopes().abs()
@@ -324,7 +327,7 @@ class PLFunction:
 
 def transition_runs(
     fn: PLFunction, plateau_tol: float = _SYNTH_CLAIM_ATOL
-) -> Tuple[torch.Tensor, List[Tuple[int, int]]]:
+) -> tuple[torch.Tensor, list[tuple[int, int]]]:
     """Segment ``fn`` into plateaus and value transitions.
 
     A segment is a **plateau** when no output dim's value changes
@@ -338,7 +341,7 @@ def transition_runs(
     dy = (fn.y[1:] - fn.y[:-1]).abs().amax(dim=1)
     n_seg = int(dy.shape[0])
     is_plateau = dy <= plateau_tol
-    runs: List[Tuple[int, int]] = []
+    runs: list[tuple[int, int]] = []
     i = 0
     while i < n_seg:
         j = i
@@ -434,12 +437,12 @@ class MemberCertificate:
     n_samples: int
     # Merged analytic hinge-band intervals ((k, 2), see _HINGE_EXACT_Z)
     # over the member's ancestry — band_skeleton() consumes these.
-    bands: Optional[torch.Tensor] = None
+    bands: torch.Tensor | None = None
     # Forensics (populated only under ``certify_subgraph(keep_raw=True)``):
     # the candidate kink set and the measurement-frame function (every
     # candidate and ±1-ulp bracket kept, before the sleeve simplify).
-    kinks_raw: Optional[torch.Tensor] = None
-    fn_raw: Optional["PLFunction"] = None
+    kinks_raw: torch.Tensor | None = None
+    fn_raw: PLFunction | None = None
 
     def linear(self, budget: float = _SYNTH_CLAIM_ATOL) -> bool:
         return self.deviation <= budget
@@ -451,12 +454,13 @@ class MemberCertificate:
 @dataclass
 class SubgraphCertificate:
     """All member certificates of one univariate subgraph, or the
-    reason the walk stopped."""
+    reason the walk stopped.
+    """
 
     source: Node
-    domain: Tuple[float, float]
-    members: Dict[Node, MemberCertificate]
-    declined: Optional[str] = None
+    domain: tuple[float, float]
+    members: dict[Node, MemberCertificate]
+    declined: str | None = None
     n_oracle_points: int = 0
 
 
@@ -479,7 +483,8 @@ def _in_intervals(
     iv: torch.Tensor, xs: torch.Tensor, strict: bool = False
 ) -> torch.Tensor:
     """Boolean mask: which ``xs`` lie inside the merged intervals.
-    ``strict`` excludes the interval endpoints."""
+    ``strict`` excludes the interval endpoints.
+    """
     if iv.numel() == 0:
         return torch.zeros(xs.shape[0], dtype=torch.bool)
     idx = torch.searchsorted(iv[:, 0].contiguous(), xs, right=True) - 1
@@ -490,7 +495,7 @@ def _in_intervals(
     return inside
 
 
-def band_skeleton(fn: PLFunction, bands: Optional[torch.Tensor]) -> PLFunction:
+def band_skeleton(fn: PLFunction, bands: torch.Tensor | None) -> PLFunction:
     """The skeleton of a certified function with each analytic hinge
     band reduced to one segment: the band-edge positions are refined
     IN first (values interpolated on the certified function — the
@@ -502,7 +507,8 @@ def band_skeleton(fn: PLFunction, bands: Optional[torch.Tensor]) -> PLFunction:
     recreates with its own hinges — the inherited-ramp clause).
     The emission-shape models (S1 lanes, S2 steps) and the S1 emitter
     consume this skeleton; the chord certificate keeps measuring the
-    full frame."""
+    full frame.
+    """
     if bands is None or bands.numel() == 0 or fn.n_knots <= 2:
         return fn
     edges = bands.reshape(-1)
@@ -526,10 +532,10 @@ class _OracleCache:
     introduces new positions, not per point.
     """
 
-    def __init__(self, oracle: Callable[[torch.Tensor], Dict[Node, torch.Tensor]]):
+    def __init__(self, oracle: Callable[[torch.Tensor], dict[Node, torch.Tensor]]):
         self._oracle = oracle
-        self._index: Dict[float, int] = {}
-        self._vals: Dict[Node, List[torch.Tensor]] = {}
+        self._index: dict[float, int] = {}
+        self._vals: dict[Node, list[torch.Tensor]] = {}
         self.n_points = 0
 
     def ensure(self, xs: torch.Tensor) -> None:
@@ -552,9 +558,9 @@ def certify_subgraph(
     source: Node,
     members: Sequence[Node],
     *,
-    domain: Optional[Tuple[float, float]] = None,
+    domain: tuple[float, float] | None = None,
     max_kinks: int = 100_000,
-    oracle: Optional[Callable[[torch.Tensor], Dict[Node, torch.Tensor]]] = None,
+    oracle: Callable[[torch.Tensor], dict[Node, torch.Tensor]] | None = None,
     keep_raw: bool = False,
     hinge_exact: float = 0.0,
 ) -> SubgraphCertificate:
@@ -609,22 +615,22 @@ def certify_subgraph(
     members = list(members)
     if oracle is None:
 
-        def oracle(xs: torch.Tensor) -> Dict[Node, torch.Tensor]:
+        def oracle(xs: torch.Tensor) -> dict[Node, torch.Tensor]:
             grid = xs.to(torch.float32).reshape(-1, 1)
             return _seeded_oracle(members, source, grid)
 
     cache = _OracleCache(oracle)
-    plmap: Dict[Node, PLFunction] = {}
-    kinks: Dict[Node, torch.Tensor] = {}
+    plmap: dict[Node, PLFunction] = {}
+    kinks: dict[Node, torch.Tensor] = {}
     # Per-member analytic hinge-band intervals (merged (k, 2) rows),
     # unioned through inputs like the kink sets — see _HINGE_EXACT_Z.
-    bands: Dict[Node, torch.Tensor] = {}
-    certs: Dict[Node, MemberCertificate] = {}
+    bands: dict[Node, torch.Tensor] = {}
+    certs: dict[Node, MemberCertificate] = {}
     # Whether a hinge bend coincides with a domain endpoint — the
     # endpoint knot is then band-bearing for the fillet-zone split.
-    edge_bends: Dict[Node, Tuple[bool, bool]] = {}
+    edge_bends: dict[Node, tuple[bool, bool]] = {}
 
-    consts: Dict[Node, PLFunction] = {}
+    consts: dict[Node, PLFunction] = {}
 
     def input_pl(u: Node) -> PLFunction:
         if u is source:
@@ -661,7 +667,7 @@ def certify_subgraph(
         return bands[u]
 
     ladder = torch.tensor(_LADDER, dtype=_F64)
-    declined: Optional[str] = None
+    declined: str | None = None
 
     for m in members:
         ks = [input_kinks(u) for u in m.inputs]
@@ -857,7 +863,7 @@ def certify_subgraph(
             return width > 64.0 * 2.0 ** (_math.floor(_math.log2(mag)) - 23)
 
         # Coalesced transition runs: (start_knot, end_knot) spans.
-        coalesced: List[Tuple[int, int]] = []
+        coalesced: list[tuple[int, int]] = []
         for i, j in _runs:
             if coalesced and not _plateau_is_separator(coalesced[-1][1], i):
                 coalesced[-1] = (coalesced[-1][0], j)
@@ -886,7 +892,7 @@ def certify_subgraph(
                 seg_in_narrow_run[i:j] = True
         band_zone = seg_in_narrow_run[seg]
 
-        def _worst(mask: torch.Tensor) -> Tuple[float, float]:
+        def _worst(mask: torch.Tensor) -> tuple[float, float]:
             if not bool(mask.any()):
                 return 0.0, 0.0
             e = torch.where(mask, err, torch.zeros_like(err))
@@ -983,7 +989,8 @@ def model_s1(fn: PLFunction, measured_dev: float) -> S1Model:
 @dataclass(frozen=True)
 class S2Model:
     """Two-sublayer bounded-step emission (chain → 2), the
-    ``floor_int`` ``output_map`` shape generalized."""
+    ``floor_int`` ``output_map`` shape generalized.
+    """
 
     n_steps: int  # value-changing transitions
     stage1_lanes: int  # 2 per step
@@ -1018,7 +1025,7 @@ def model_s2(
     fn: PLFunction,
     measured_dev: float,
     *,
-    machine: Optional[str],
+    machine: str | None,
     plateau_tol: float = _SYNTH_CLAIM_ATOL,
 ) -> S2Model:
     """Segment ``fn`` into plateaus and transitions and model the

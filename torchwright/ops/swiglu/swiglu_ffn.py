@@ -1,5 +1,3 @@
-from typing import Optional
-
 import torch
 
 from torchwright.graph import Node
@@ -13,8 +11,8 @@ def swiglu_ffn(
     output_proj: torch.Tensor,
     output_bias: torch.Tensor,
     *,
-    up_proj: Optional[torch.Tensor] = None,
-    up_bias: Optional[torch.Tensor] = None,
+    up_proj: torch.Tensor | None = None,
+    up_bias: torch.Tensor | None = None,
     name: str = "",
 ) -> Node:
     """Build a swish :class:`~torchwright.graph.ffn.FFN`.

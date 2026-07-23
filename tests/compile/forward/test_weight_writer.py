@@ -12,27 +12,25 @@ Conventions:
   The scheduler (Phase 3) enforces this ordering.
 """
 
-from typing import cast, Literal
+from typing import Literal, cast
 
 import pytest
-
 import torch
-import torch.nn.functional as F
 
 import torchwright.compiler.device as device_mod
-from torchwright.compiler.forward.residual_map import ResidualStreamMap
 from torchwright.compiler.forward.replay_plan import (
     PlannedAttentionOp,
     PlannedMlpOp,
 )
+from torchwright.compiler.forward.residual_map import ResidualStreamMap
 from torchwright.compiler.forward.weight_writer import (
     write_attn_sublayer,
     write_mlp_sublayer,
 )
 from torchwright.compiler.groups.transformer_layer import TransformerLayer
-from torchwright.graph import Linear, Attn, Add, Concatenate
-from torchwright.ops.relu.linear_relu_linear import linear_relu_linear
+from torchwright.graph import Add, Attn, Concatenate, Linear
 from torchwright.graph.misc import InputNode, LiteralValue
+from torchwright.ops.relu.linear_relu_linear import linear_relu_linear
 
 D = 64
 D_HEAD = 16
@@ -53,7 +51,8 @@ def _const_one(residual_map: ResidualStreamMap) -> LiteralValue:
     """Allocate the reserved constant-1 self-match column the transport ops
     (compute_linear/compute_add/cancel/add_into) read.  ``write_attn_sublayer``
     requires it; :func:`_build_residual_stream` fills its column with 1.0 so the
-    rotary Δ=0 self-match concentrates on the diagonal."""
+    rotary Δ=0 self-match concentrates on the diagonal.
+    """
     const_one = LiteralValue(torch.ones(1), name="const_one")
     residual_map.allocate(const_one)
     return const_one
@@ -108,13 +107,7 @@ def _make_op(rmap: ResidualStreamMap, op_type: str, node, target_cols, **kwargs)
         kwargs.setdefault("reuse_input_index", 1 if a0_live else 0)
     return PlannedAttentionOp(
         op_type=cast(
-            Literal[
-                "compute_attn",
-                "compute_linear",
-                "compute_add",
-                "cancel",
-                "add_into",
-            ],
+            "Literal['compute_attn', 'compute_linear', 'compute_add', 'cancel', 'add_into']",
             op_type,
         ),
         node=node,
@@ -136,12 +129,7 @@ def _make_mlp_op(
         kwargs.setdefault("source_cols", rmap.resolve_indices(node.inputs[0]))
     return PlannedMlpOp(
         op_type=cast(
-            Literal[
-                "compute_ffn",
-                "compute_literal_value",
-                "compute_bias",
-                "compute_linear_bypass",
-            ],
+            "Literal['compute_ffn', 'compute_literal_value', 'compute_bias', 'compute_linear_bypass']",
             op_type,
         ),
         node=node,
@@ -216,7 +204,8 @@ def test_attn_compute_small_d_v():
     """Attn node whose value width d_v is smaller than the layer d_head — the
     V/O projection is padded up to d_head.  (Q/K are full-width d_head: every
     head is rotary on the one global grid, so partial-width Q/K no longer
-    exists.)"""
+    exists.)
+    """
     pos = _make_reserved_block()
     value_in = InputNode("v", 4, value_range=(-100.0, 100.0))
     small_d_v = 8  # smaller than D_HEAD=16 -> V/O padded up to d_head
@@ -746,7 +735,8 @@ def test_compute_add_self_add():
     """Add(a, a) with ``a`` live (compute_add, not add_into): both addends
     resolve to the SAME columns.  Reproducer for the combined-single-head
     scatter collision — the duplicated V-matrix indices were last-write-wins,
-    dropping one addend and emitting ``a`` instead of ``2a``."""
+    dropping one addend and emitting ``a`` instead of ``2a``.
+    """
     pos = _make_reserved_block()
     a = InputNode("a", 4, value_range=(-100.0, 100.0))
     add_node = Add(a, a)
@@ -776,7 +766,8 @@ def test_compute_add_self_add():
 def test_compute_add_self_add_wide():
     """Self-add wider than d_head: chunks of both shapes (a full-d_head chunk
     that would take the per-input-head path, and a narrow tail chunk that
-    would take the combined-head path) must be exact."""
+    would take the combined-head path) must be exact.
+    """
     pos = _make_reserved_block()
     a = InputNode("a", 20, value_range=(-100.0, 100.0))  # chunks: 16 + 4
     add_node = Add(a, a)
@@ -837,7 +828,7 @@ def test_mlp_block():
     x_cols = rmap.allocate(x)
     out_cols = rmap.allocate(ffn)
 
-    mlp_slots = list(range(0, 8))  # 8 hidden slots for the 8-lane FFN
+    mlp_slots = list(range(8))  # 8 hidden slots for the 8-lane FFN
 
     layer = TransformerLayer(D, D_HEAD)
     op = _make_mlp_op(rmap, "compute_ffn", ffn, out_cols, mlp_slots=mlp_slots)
@@ -885,7 +876,7 @@ def test_mlp_block_multiple():
 
     layer = TransformerLayer(D, D_HEAD)
     ops = [
-        _make_mlp_op(rmap, "compute_ffn", ffn1, out1_cols, mlp_slots=list(range(0, 6))),
+        _make_mlp_op(rmap, "compute_ffn", ffn1, out1_cols, mlp_slots=list(range(6))),
         _make_mlp_op(
             rmap, "compute_ffn", ffn2, out2_cols, mlp_slots=list(range(6, 11))
         ),
@@ -1155,7 +1146,7 @@ def test_mlp_linear_bypass_zero_bias():
     rmap.allocate(x)
     out_cols = rmap.allocate(linear_node)
 
-    mlp_slots = list(range(0, 2 * 3))  # 2 slots per output column
+    mlp_slots = list(range(2 * 3))  # 2 slots per output column
 
     layer = TransformerLayer(D, D_HEAD)
     op = _make_mlp_op(
@@ -1178,12 +1169,13 @@ def test_mlp_cancel_bypass_zeroes_columns():
     """cancel_bypass (W = -I) zeroes a dying node's columns from the MLP
     sublayer: the bypass pair emits -x and the skip turns x into x + (-x) = 0.
     ReLU machine is bit-exact; the swish machine leaves only the tiny two-lane
-    fp32 residue (step 3).  ``node is None`` — it is not a graph node."""
+    fp32 residue (step 3).  ``node is None`` — it is not a graph node.
+    """
     for activation, atol in (("relu", 1e-6), ("swish", 1e-4)):
         x = InputNode("x", 5, value_range=(-100.0, 100.0))
         rmap = ResidualStreamMap(D)
         x_cols = rmap.allocate(x)
-        mlp_slots = list(range(0, 2 * 5))  # 2 slots per column
+        mlp_slots = list(range(2 * 5))  # 2 slots per column
 
         layer = TransformerLayer(D, D_HEAD, activation=activation)
         op = PlannedMlpOp(
@@ -1215,7 +1207,7 @@ def test_mlp_linear_bypass_with_bias():
     rmap.allocate(x)
     out_cols = rmap.allocate(linear_node)
 
-    mlp_slots = list(range(0, 2 * 3))
+    mlp_slots = list(range(2 * 3))
 
     layer = TransformerLayer(D, D_HEAD)
     op = _make_mlp_op(
@@ -1245,7 +1237,7 @@ def test_mlp_linear_bypass_different_dims():
     rmap.allocate(x)
     out_cols = rmap.allocate(linear_node)
 
-    mlp_slots = list(range(0, 2 * 3))
+    mlp_slots = list(range(2 * 3))
 
     layer = TransformerLayer(D, D_HEAD)
     op = _make_mlp_op(
@@ -1274,7 +1266,7 @@ def test_mlp_linear_bypass_preserves_input():
     x_cols = rmap.allocate(x)
     out_cols = rmap.allocate(linear_node)
 
-    mlp_slots = list(range(0, 2 * 3))
+    mlp_slots = list(range(2 * 3))
 
     layer = TransformerLayer(D, D_HEAD)
     op = _make_mlp_op(
@@ -1302,7 +1294,7 @@ def test_mlp_linear_bypass_wide_output():
     rmap.allocate(x)
     out_cols = rmap.allocate(linear_node)
 
-    mlp_slots = list(range(0, 2 * 8))
+    mlp_slots = list(range(2 * 8))
 
     layer = TransformerLayer(D, D_HEAD)
     op = _make_mlp_op(
@@ -1353,7 +1345,7 @@ def test_mlp_linear_bypass_matches_attention():
     mlp_out_cols = rmap_mlp.allocate(linear_node)
 
     layer_mlp = TransformerLayer(D, D_HEAD)
-    mlp_slots = list(range(0, 2 * 3))
+    mlp_slots = list(range(2 * 3))
     mlp_op = _make_mlp_op(
         rmap_mlp,
         "compute_linear_bypass",
@@ -1385,7 +1377,7 @@ def test_mlp_linear_bypass_concatenated_input():
     rmap.allocate(b)
     out_cols = rmap.allocate(linear_node)
 
-    mlp_slots = list(range(0, 2 * 4))
+    mlp_slots = list(range(2 * 4))
 
     layer = TransformerLayer(D, D_HEAD)
     op = _make_mlp_op(
@@ -1412,7 +1404,8 @@ def test_mlp_linear_bypass_concatenated_input():
 
 def _swish_ffn(x, n_lanes=6, d_out=3, gated=True, seed=0):
     """A directly-authored swish FFN fixture (the spec's constructions are
-    op-level; writer tests need only the node shape)."""
+    op-level; writer tests need only the node shape).
+    """
     from torchwright.graph import FFN
 
     g = torch.Generator().manual_seed(seed)
@@ -1456,7 +1449,8 @@ def test_swish_mlp_ffn_gated():
 
 def test_swish_mlp_ffn_degenerate():
     """A degenerate swish FFN (up ≡ 1): the writer emits up-row 0 / up-bias 1
-    and the compiled value matches the node's bare-swish math."""
+    and the compiled value matches the node's bare-swish math.
+    """
     x = InputNode("x", 4, value_range=(-10.0, 10.0))
     ffn = _swish_ffn(x, gated=False)
     slots = list(range(3, 9))  # off-origin slots to catch indexing slips
@@ -1485,7 +1479,8 @@ def test_swish_mlp_ffn_degenerate():
 def test_swish_mlp_ffn_deferred_bias_fold():
     """A gated FFN reading a deferred-bias Linear folds the leaf bias into
     BOTH hidden biases (gate and up) — the up matmul reads the biasless
-    columns too."""
+    columns too.
+    """
     x = InputNode("x", 4, value_range=(-10.0, 10.0))
     W_leaf = torch.randn(4, 5)
     b_leaf = torch.randn(5)
@@ -1589,7 +1584,8 @@ def test_swish_mlp_constant_literal():
 def test_machine_mismatch_asserts():
     """A node/machine activation mismatch is a compiler bug and must fire the
     writer's assert (the uniformity check makes it unreachable in a real
-    compile)."""
+    compile).
+    """
     import pytest
 
     x = InputNode("x", 4, value_range=(-10.0, 10.0))
@@ -1670,7 +1666,8 @@ def _const_col(rmap, const_one):
 def test_no_bias_literal_bit_exact(activation):
     """A literal under bias=False rides the constant lane and lands
     BITWISE-equal: the lane's value is exactly 1.0 (power-of-two gate/up,
-    saturated sigma) and no other lane touches the literal's columns."""
+    saturated sigma) and no other lane touches the literal's columns.
+    """
     const_value = torch.tensor([1.0, -2.0, 3.5, 0.3333333])
     const = LiteralValue(const_value)
 
@@ -1705,7 +1702,8 @@ def test_no_bias_literal_bit_exact(activation):
 def test_no_bias_swish_ffn_const_row(gated):
     """A swish FFN under bias=False: gate/up biases land as const-column
     rows (a degenerate lane's up signature is const-row 1.0), out_bias
-    rides the lane, and the compiled value still matches the oracle."""
+    rides the lane, and the compiled value still matches the oracle.
+    """
     x = InputNode("x", 4, value_range=(-10.0, 10.0))
     ffn = _swish_ffn(x, gated=gated)
     slots = list(range(1, 7))  # slot 0 is the constant lane
@@ -1741,7 +1739,8 @@ def test_no_bias_swish_ffn_const_row(gated):
 
 def test_no_bias_relu_ffn():
     """A relu FFN under bias=False: gate bias as const-column row, out
-    bias via the lane, oracle agreement."""
+    bias via the lane, oracle agreement.
+    """
     from torchwright.graph import FFN
 
     x = InputNode("x", 4, value_range=(-10.0, 10.0))
@@ -1777,7 +1776,8 @@ def test_no_bias_relu_ffn():
 
 def test_no_bias_deferred_bias_fold():
     """The deferred biased-Linear fold under bias=False targets the
-    const-column rows of gate AND up instead of the hidden bias vectors."""
+    const-column rows of gate AND up instead of the hidden bias vectors.
+    """
     x = InputNode("x", 4, value_range=(-10.0, 10.0))
     W_leaf = torch.randn(4, 5)
     b_leaf = torch.randn(5)
@@ -1814,7 +1814,8 @@ def test_no_bias_deferred_bias_fold():
 @pytest.mark.parametrize("activation", ["relu", "swish"])
 def test_no_bias_compute_bias_via_lane(activation):
     """A deferred compute_bias under bias=False adds the Linear's bias to
-    columns already holding the attention-computed matmul, via the lane."""
+    columns already holding the attention-computed matmul, via the lane.
+    """
     x = InputNode("x", 4, value_range=(-10.0, 10.0))
     W = torch.randn(4, 3)
     b = torch.tensor([0.5, -1.5, 2.0])
@@ -1842,7 +1843,8 @@ def test_no_bias_compute_bias_via_lane(activation):
 @pytest.mark.parametrize("activation", ["relu", "swish"])
 def test_no_bias_linear_bypass(activation):
     """A biased Linear through the MLP bypass under bias=False: folds into
-    const-column rows (degenerate up rows on swish), out bias via lane."""
+    const-column rows (degenerate up rows on swish), out bias via lane.
+    """
     x = InputNode("x", 4, value_range=(-10.0, 10.0))
     W = torch.randn(4, 3)
     b = torch.tensor([1.0, -0.5, 0.25])
@@ -1870,7 +1872,8 @@ def test_no_bias_linear_bypass(activation):
 
 def test_no_bias_zero_out_bias_leaves_lane_unwritten():
     """An all-zero output-side write must not activate the constant lane —
-    a layer whose constants are all zero stays lane-free (trimmable)."""
+    a layer whose constants are all zero stays lane-free (trimmable).
+    """
     const = LiteralValue(torch.zeros(3))
 
     rmap = ResidualStreamMap(D)
@@ -1896,7 +1899,8 @@ def test_compute_linear_duplicate_concat_leaf():
     """Linear over Concat([x, x]) via attention transport: the duplicated
     source columns must contribute the SUM of their weight rows.  Reproducer
     for the last-write-wins scatter that read only the second block (the doom
-    instance-index regression's mechanism)."""
+    instance-index regression's mechanism).
+    """
     pos = _make_reserved_block()
     x = InputNode("x", 2, value_range=(-100.0, 100.0))
     node = Linear(
@@ -1930,7 +1934,8 @@ def test_compute_linear_duplicate_concat_leaf():
 def test_compute_ffn_duplicate_concat_leaf():
     """FFN whose input is Concat([x, x]): gate rows for the duplicated
     columns must sum (the fold never rewrites FFN inputs, so this reaches the
-    writer directly)."""
+    writer directly).
+    """
     x = InputNode("x", 2, value_range=(-100.0, 100.0))
     ffn = linear_relu_linear(
         Concatenate([x, x]),
@@ -1962,7 +1967,8 @@ def test_compute_ffn_duplicate_concat_leaf():
 
 def test_mlp_linear_bypass_duplicate_concat_leaf():
     """Linear over Concat([x, x]) via the MLP bypass: the ±gain W rows for
-    the duplicated columns must sum."""
+    the duplicated columns must sum.
+    """
     x = InputNode("x", 2, value_range=(-100.0, 100.0))
     node = Linear(
         Concatenate([x, x]),
@@ -2003,7 +2009,8 @@ def test_mlp_linear_bypass_duplicate_concat_leaf():
 @pytest.mark.parametrize("activation,atol", [("relu", 1e-5), ("swish", 1e-4)])
 def test_mlp_add_into_bypass(activation, atol):
     """Add(dead, live): the pair reads the live addend and adds it into the
-    dead addend's reused columns — the residual leaves as dead + live."""
+    dead addend's reused columns — the residual leaves as dead + live.
+    """
     a = InputNode("a", 4, value_range=(-100.0, 100.0))
     b = InputNode("b", 4, value_range=(-100.0, 100.0))
     add_node = Add(a, b)
@@ -2069,7 +2076,8 @@ def test_mlp_add_into_bypass_dead_at_inputs1():
 @pytest.mark.parametrize("activation,atol", [("relu", 1e-5), ("swish", 1e-4)])
 def test_mlp_compute_add_bypass(activation, atol):
     """Fresh MLP Add: W = [I; I] over the concatenated sources into zeroed
-    fresh columns."""
+    fresh columns.
+    """
     a = InputNode("a", 5, value_range=(-100.0, 100.0))
     b = InputNode("b", 5, value_range=(-100.0, 100.0))
     add_node = Add(a, b)
@@ -2102,7 +2110,8 @@ def test_mlp_compute_add_bypass(activation, atol):
 
 def test_mlp_compute_add_bypass_self_add():
     """add(x, x): duplicate source columns coalesce by row-summing, not
-    last-write-wins — the result is 2x."""
+    last-write-wins — the result is 2x.
+    """
     x = InputNode("x", 4, value_range=(-100.0, 100.0))
     add_node = Add(x, x)
 
@@ -2171,7 +2180,8 @@ def test_mlp_compute_add_bypass_concatenated_source():
 def test_mlp_add_bypass_bias_false(op_kind):
     """Under bias=False the pair's swish up-lane constant and any folded
     bias ride the reserved constant lane (hidden slot 0); packing starts at
-    slot 1."""
+    slot 1.
+    """
     a = InputNode("a", 3, value_range=(-100.0, 100.0))
     b = InputNode("b", 3, value_range=(-100.0, 100.0))
     add_node = Add(a, b)
@@ -2220,7 +2230,8 @@ def test_mlp_add_bypass_bias_false(op_kind):
 
 def _biased_linear_missing_its_bias(rmap, name, d_in=4, d_out=3):
     """A same-layer biased attention Linear as the MLP Add sees it: its
-    columns hold W·x only (the output_bias is deferred to compute_bias)."""
+    columns hold W·x only (the output_bias is deferred to compute_bias).
+    """
     x = InputNode(f"{name}_x", d_in, value_range=(-100.0, 100.0))
     lin = Linear(x, torch.randn(d_in, d_out), torch.randn(d_out), name=name)
     rmap.allocate(lin)
@@ -2230,7 +2241,8 @@ def _biased_linear_missing_its_bias(rmap, name, d_in=4, d_out=3):
 def test_mlp_compute_add_bypass_folds_biased_source():
     """A fresh MLP Add reading a same-layer biased attention Linear folds
     that Linear's deferred bias into its lanes: the result carries the full
-    W·x + b even though the residual holds only W·x."""
+    W·x + b even though the residual holds only W·x.
+    """
     rmap = ResidualStreamMap(D)
     x, lin = _biased_linear_missing_its_bias(rmap, "lin")
     other = InputNode("other", 3, value_range=(-100.0, 100.0))
@@ -2262,7 +2274,8 @@ def test_mlp_compute_add_bypass_folds_biased_source():
 
 def test_mlp_add_into_bypass_folds_biased_live_source():
     """The live/source occurrence of a reused MLP Add folds its deferred
-    bias into the Add delta."""
+    bias into the Add delta.
+    """
     rmap = ResidualStreamMap(D)
     x, lin = _biased_linear_missing_its_bias(rmap, "lin")
     dead = InputNode("dead", 3, value_range=(-100.0, 100.0))
@@ -2296,7 +2309,8 @@ def test_mlp_add_into_bypass_biased_reused_target_applies_bias_once():
     """A same-layer biased Linear as the reused TARGET occurrence: its bias
     arrives through its own direct compute_bias write (target columns
     captured before reassignment), and the Add must NOT also fold it —
-    occurrence-based, not node-based."""
+    occurrence-based, not node-based.
+    """
     rmap = ResidualStreamMap(D)
     x, lin = _biased_linear_missing_its_bias(rmap, "lin")
     live = InputNode("live", 3, value_range=(-100.0, 100.0))
@@ -2337,7 +2351,8 @@ def test_mlp_add_into_bypass_biased_reused_target_applies_bias_once():
 def test_mlp_add_into_bypass_biased_self_add():
     """Biased add(x, x) reused: occurrence 0 gets one direct compute_bias,
     occurrence 1 folds one bias into the delta — 2·(Wx + b) in total even
-    though both occurrences name the same node."""
+    though both occurrences name the same node.
+    """
     rmap = ResidualStreamMap(D)
     x, lin = _biased_linear_missing_its_bias(rmap, "lin")
     add_node = Add(lin, lin)
@@ -2373,7 +2388,8 @@ def test_mlp_add_into_bypass_biased_self_add():
 
 def test_mlp_compute_add_bypass_two_biased_sources():
     """Two distinct same-layer biased Linears as the two fresh sources: each
-    occurrence's bias folds exactly once."""
+    occurrence's bias folds exactly once.
+    """
     rmap = ResidualStreamMap(D)
     xa, lin_a = _biased_linear_missing_its_bias(rmap, "lin_a")
     xb, lin_b = _biased_linear_missing_its_bias(rmap, "lin_b")

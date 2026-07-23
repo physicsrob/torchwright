@@ -1,5 +1,4 @@
 from numbers import Integral
-from typing import Optional, Set
 
 from torchwright.graph import Node
 
@@ -7,7 +6,7 @@ from torchwright.graph import Node
 def resolve_n_heads(
     d: int,
     d_head: int,
-    n_heads: Optional[int],
+    n_heads: int | None,
     *,
     require_divisible: bool = True,
 ) -> int:
@@ -35,7 +34,7 @@ def resolve_n_heads(
     return int(n_heads)
 
 
-def get_ancestor_nodes(start_nodes: Set[Node]) -> Set[Node]:
+def get_ancestor_nodes(start_nodes: set[Node]) -> set[Node]:
     # Find all ancestors via iterative BFS
     result = set(start_nodes)
     queue = list(start_nodes)

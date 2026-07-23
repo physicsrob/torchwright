@@ -80,8 +80,9 @@ def _theta_slow(rope: RopeConfig) -> float:
     ``rope_inv_freq(d_rot, base)[-1]``.  Under full rotary ``d_rot == d_head`` and
     this is the slowest plane of the ``d_head`` grid — byte-identical to the
     pre-partial form.  This is the plane the BOS-weight feature must ride so its
-    ``cos(m·θ_slow)`` attenuation matches the PWL inversion table."""
-    return float(rope_inv_freq(cast(int, rope.d_rot), rope.base)[-1])
+    ``cos(m·θ_slow)`` attenuation matches the PWL inversion table.
+    """
+    return float(rope_inv_freq(cast("int", rope.d_rot), rope.base)[-1])
 
 
 def _w_of_m(m: float, max_len: int, theta: float) -> float:

@@ -1,11 +1,11 @@
 import builtins
-from typing import List, Optional, Tuple
 
-from torchwright.graph import Node, Add, Concatenate, Linear
 import torch
 
+from torchwright.graph import Add, Concatenate, Linear, Node
 from torchwright.graph.asserts import assert_matches_value_type
 from torchwright.graph.value_type import NodeValueType, Range
+from torchwright.ops.const import step_sharpness
 from torchwright.ops.linear import (
     add,
     add_const,
@@ -17,8 +17,6 @@ from torchwright.ops.linear import (
 )
 from torchwright.ops.relu.linear_relu_linear import linear_relu_linear
 
-from torchwright.ops.const import step_sharpness
-
 _builtin_abs = builtins.abs  # save before module-level def abs() shadows the builtin
 
 
@@ -28,8 +26,7 @@ _builtin_abs = builtins.abs  # save before module-level def abs() shadows the bu
 
 
 def relu_add(inp1: Node, inp2: Node) -> Node:
-    """
-    Applies the ReLU function to both input nodes and then adds them together.
+    """Applies the ReLU function to both input nodes and then adds them together.
 
     Args:
         inp1 (Node): First node for ReLU and addition.
@@ -98,8 +95,7 @@ def compare(
     false_level: float = -1.0,
     sharpness: float | None = None,
 ) -> Node:
-    """
-    Compare input with threshold and return boolean valued node (1.0 for true, -1.0 for false)
+    """Compare input with threshold and return boolean valued node (1.0 for true, -1.0 for false)
 
     Args:
         inp: Node to compare. Must be length 1.
@@ -123,7 +119,6 @@ def compare(
        Max error: 1.998 abs, 1.998 rel over 8192 samples;
        measured at commit a39e4c6. See docs/numerical_noise.md.
     """
-
     assert len(inp) == 1, "Input must be a 1D scalar node"
 
     s = step_sharpness if sharpness is None else sharpness
@@ -197,7 +192,7 @@ def min(inp1: Node, inp2: Node) -> Node:
 
 def piecewise_linear(
     inp: Node,
-    breakpoints: List[float],
+    breakpoints: list[float],
     fn,
     clamp: bool = True,
     d_max: int = 1024,
@@ -402,7 +397,7 @@ def _product_2d_quarter_square(
     # where m0 = t_0 + t_1 is the leading segment slope (carried by the
     # affine part so the ReLUs, inactive left of t_0, never need a left
     # ramp) and const = t_0² − m0·t_0.
-    def _square_expansion(t_bps: List[float]) -> Tuple[float, float, list]:
+    def _square_expansion(t_bps: list[float]) -> tuple[float, float, list]:
         t0 = t_bps[0]
         m0 = t_bps[0] + t_bps[1]
         const = t0 * t0 - m0 * t0
@@ -477,8 +472,8 @@ def multiply_2d(
     max_abs2: float,
     step1: float = 1.0,
     step2: float = 1.0,
-    breakpoints1: Optional[List[float]] = None,
-    breakpoints2: Optional[List[float]] = None,
+    breakpoints1: list[float] | None = None,
+    breakpoints2: list[float] | None = None,
     d_max: int = 1024,
     name: str = "multiply_2d",
 ) -> Node:
@@ -564,83 +559,82 @@ def multiply_2d(
             f"(range1={range1}, range2={range2}); multiply_2d requires each "
             "axis to span a positive range."
         )
-    else:
-        n = builtins.max(len(breakpoints1), len(breakpoints2))
-        bp_unit = [i / (n - 1) for i in range(n)]
-        bp_unit[-1] = 1.0
+    n = builtins.max(len(breakpoints1), len(breakpoints2))
+    bp_unit = [i / (n - 1) for i in range(n)]
+    bp_unit[-1] = 1.0
 
-        inp1_norm = Linear(
-            inp1,
-            torch.tensor([[1.0 / range1]]),
-            torch.tensor([-lo1_f / range1]),
-            name=f"{name}_norm1",
-        )
-        inp2_norm = Linear(
-            inp2,
-            torch.tensor([[1.0 / range2]]),
-            torch.tensor([-lo2_f / range2]),
-            name=f"{name}_norm2",
-        )
+    inp1_norm = Linear(
+        inp1,
+        torch.tensor([[1.0 / range1]]),
+        torch.tensor([-lo1_f / range1]),
+        name=f"{name}_norm1",
+    )
+    inp2_norm = Linear(
+        inp2,
+        torch.tensor([[1.0 / range2]]),
+        torch.tensor([-lo2_f / range2]),
+        name=f"{name}_norm2",
+    )
 
-        # Analytic O(n) product construction (quarter-square multiplier).
-        #
-        # The generic piecewise_linear_2d path solves a least-squares
-        # system over an O(n²)-row vertex design matrix and an SVD-derived
-        # nullspace — O(n⁴) work and O(n²) memory that OOMs at ~257
-        # breakpoints per axis.  A product is exactly bilinear, so we build
-        # its piecewise-linear interpolant in closed form instead:
-        #
-        #     P(u, v) = (lo₁ + r₁·u)·(lo₂ + r₂·v)
-        #             = lo₁·lo₂ + lo₁·r₂·v + lo₂·r₁·u + r₁·r₂·(u·v)
-        #
-        # The only nonlinear term is u·v, and u·v = ((u+v)² − (u−v)²)/4.
-        # The piecewise-linear interpolant of t² on a uniform grid of
-        # spacing h has a *constant* slope change of 2h at every interior
-        # breakpoint, so each square is a ReLU staircase with equal-weight
-        # neurons.  On the common unit grid (h = 1/(n−1)) the sum axis
-        # u+v ∈ [0, 2] and the difference axis u−v ∈ [−1, 1] are both
-        # uniform with spacing h, so the whole product is one ReLU bank of
-        # ~2·(2n−2) neurons (O(n)) — same single MLP sublayer, no solve.
-        result = _product_2d_quarter_square(
-            inp1_norm,
-            inp2_norm,
-            n,
-            lo1_f,
-            range1,
-            lo2_f,
-            range2,
-            d_max=d_max,
-            name=name,
-        )
+    # Analytic O(n) product construction (quarter-square multiplier).
+    #
+    # The generic piecewise_linear_2d path solves a least-squares
+    # system over an O(n²)-row vertex design matrix and an SVD-derived
+    # nullspace — O(n⁴) work and O(n²) memory that OOMs at ~257
+    # breakpoints per axis.  A product is exactly bilinear, so we build
+    # its piecewise-linear interpolant in closed form instead:
+    #
+    #     P(u, v) = (lo₁ + r₁·u)·(lo₂ + r₂·v)
+    #             = lo₁·lo₂ + lo₁·r₂·v + lo₂·r₁·u + r₁·r₂·(u·v)
+    #
+    # The only nonlinear term is u·v, and u·v = ((u+v)² − (u−v)²)/4.
+    # The piecewise-linear interpolant of t² on a uniform grid of
+    # spacing h has a *constant* slope change of 2h at every interior
+    # breakpoint, so each square is a ReLU staircase with equal-weight
+    # neurons.  On the common unit grid (h = 1/(n−1)) the sum axis
+    # u+v ∈ [0, 2] and the difference axis u−v ∈ [−1, 1] are both
+    # uniform with spacing h, so the whole product is one ReLU bank of
+    # ~2·(2n−2) neurons (O(n)) — same single MLP sublayer, no solve.
+    result = _product_2d_quarter_square(
+        inp1_norm,
+        inp2_norm,
+        n,
+        lo1_f,
+        range1,
+        lo2_f,
+        range2,
+        d_max=d_max,
+        name=name,
+    )
 
-        # Declare the output range.  The interpolant equals the exact
-        # product at grid vertices and extrapolates linearly outside, so
-        # over an axis-aligned input box its extreme is attained at a
-        # corner.  Bound over the box covering both the grid extent and
-        # the (finite) declared input ranges; a product over a rectangle
-        # is monotone in each argument, so the min/max sit at the four
-        # corners.  This mirrors the tight range the generic
-        # piecewise_linear_2d path declared, so downstream gating that
-        # reads multiply_2d's value range is unaffected.
-        r1v = inp1.value_type.value_range
-        r2v = inp2.value_type.value_range
-        if r1v.is_finite() and r2v.is_finite():
-            ax_lo = builtins.min(lo1_f, r1v.lo)
-            ax_hi = builtins.max(hi1_f, r1v.hi)
-            bx_lo = builtins.min(lo2_f, r2v.lo)
-            bx_hi = builtins.max(hi2_f, r2v.hi)
-            corners = [
-                ax_lo * bx_lo,
-                ax_lo * bx_hi,
-                ax_hi * bx_lo,
-                ax_hi * bx_hi,
-            ]
-            result = assert_matches_value_type(
-                result,
-                NodeValueType(
-                    value_range=Range(builtins.min(corners), builtins.max(corners))
-                ),
-            )
+    # Declare the output range.  The interpolant equals the exact
+    # product at grid vertices and extrapolates linearly outside, so
+    # over an axis-aligned input box its extreme is attained at a
+    # corner.  Bound over the box covering both the grid extent and
+    # the (finite) declared input ranges; a product over a rectangle
+    # is monotone in each argument, so the min/max sit at the four
+    # corners.  This mirrors the tight range the generic
+    # piecewise_linear_2d path declared, so downstream gating that
+    # reads multiply_2d's value range is unaffected.
+    r1v = inp1.value_type.value_range
+    r2v = inp2.value_type.value_range
+    if r1v.is_finite() and r2v.is_finite():
+        ax_lo = builtins.min(lo1_f, r1v.lo)
+        ax_hi = builtins.max(hi1_f, r1v.hi)
+        bx_lo = builtins.min(lo2_f, r2v.lo)
+        bx_hi = builtins.max(hi2_f, r2v.hi)
+        corners = [
+            ax_lo * bx_lo,
+            ax_lo * bx_hi,
+            ax_hi * bx_lo,
+            ax_hi * bx_hi,
+        ]
+        result = assert_matches_value_type(
+            result,
+            NodeValueType(
+                value_range=Range(builtins.min(corners), builtins.max(corners))
+            ),
+        )
 
     return result
 
@@ -857,7 +851,7 @@ def floor_int(
     inp: Node,
     min_value: int,
     max_value: int,
-    sharpness: Optional[float] = None,
+    sharpness: float | None = None,
 ) -> Node:
     """Compute floor(x) for a continuous-valued scalar input.
 
@@ -987,7 +981,7 @@ def ceil_int(
     inp: Node,
     min_value: int,
     max_value: int,
-    sharpness: Optional[float] = None,
+    sharpness: float | None = None,
 ) -> Node:
     """Compute ceil(x) using the identity ``ceil(x) = -floor(-x)``.
 

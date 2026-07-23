@@ -8,20 +8,18 @@ This example keeps its helpers inline for self-containment — see
 embedding_arithmetic for the general multi-digit versions.
 """
 
-from typing import Tuple
-
 import torch
 
-from torchwright.graph import Node, Embedding
+from torchwright.graph import Embedding, Node
 from torchwright.graph.embedding import Unembedding
-from torchwright.ops.linear import concat
 from torchwright.ops.attention_ops import attend_to_offset, get_prev_value
 from torchwright.ops.inout_nodes import (
-    create_literal_value,
     create_embedding,
+    create_literal_value,
     create_rope_config,
     create_unembedding,
 )
+from torchwright.ops.linear import concat
 from torchwright.ops.swiglu.logic_ops import equals_vector
 from torchwright.ops.swiglu.map_select import map_to_table, select
 
@@ -41,9 +39,8 @@ def check_is_num(embedding_value: Node, embedding: Embedding) -> Node:
     )
 
 
-def sum_numbers(embedding: Embedding, num1: Node, num2: Node) -> Tuple[Node, Node]:
-    """
-    Adds num1 with num2.
+def sum_numbers(embedding: Embedding, num1: Node, num2: Node) -> tuple[Node, Node]:
+    """Adds num1 with num2.
     Assumes num1 and num2 are both embedding-valued nodes.
     return result as embedding-valued node and carry as boolean.
     """

@@ -68,7 +68,8 @@ def test_select_picks_branch_winner_ulp_class():
 
 def test_cond_gate_losing_branch_exactly_zero():
     """At cond=-1, σ(-scale) computes as exactly 0.0 in fp32, so the
-    gated value is exactly zero — the pinned losing-branch claim."""
+    gated value is exactly zero — the pinned losing-branch claim.
+    """
     c = create_input("c", 1, value_range=(-1.0, 1.0))
     v = create_input("v", 2, value_range=(-1000.0, 1000.0))
     out = cond_gate(c, v)
@@ -92,7 +93,8 @@ def test_cond_gate_structure_and_pass_through():
 def test_no_finite_range_requirement():
     """The ReLU-era offset apparatus is gone: unbounded branch ranges
     build fine (relu select/cond_gate raise TypeError via the M
-    derivation)."""
+    derivation).
+    """
     c = create_input("c", 1, value_range=(-1.0, 1.0))
     a = create_input("a", 1)  # no value_range — unbounded
     b = create_input("b", 1)
@@ -115,7 +117,8 @@ def test_cond_assert_fires_on_junk_cond():
 
 def test_cond_deviation_scales_with_actual_value():
     """A cond off ±1 by δ mis-scales the winner by exactly δ·|value| —
-    the saturated gate is linear in the cond (no M anywhere)."""
+    the saturated gate is linear in the cond (no M anywhere).
+    """
     c = create_input("c", 1, value_range=(-1.0, 1.0))
     v = create_input("v", 1, value_range=(-1000.0, 1000.0))
     out = cond_gate(c, v)
@@ -128,7 +131,8 @@ def test_cond_deviation_scales_with_actual_value():
 
 def test_select_semantic_bound_relative_widening():
     """The semantic hull widens by c_tol·|side| per side — actual-value
-    terms, replacing the ReLU-era c_tol·M."""
+    terms, replacing the ReLU-era c_tol·M.
+    """
     c = create_input("c", 1, value_range=(-1.0, 1.0))
     a = create_input("a", 1, value_range=(2.0, 5.0))
     b = create_input("b", 1, value_range=(-3.0, 4.0))
@@ -141,7 +145,8 @@ def test_select_semantic_bound_relative_widening():
 
 def test_cond_gate_semantic_bound_sign_determined_scaling():
     """Sign-determined inputs keep the pass-through affine bound, scaled
-    by (1 + c_tol) for cond noise."""
+    by (1 + c_tol) for cond noise.
+    """
     c = create_input("c", 1, value_range=(-1.0, 1.0))
     v = create_input("v", 1, value_range=(1.0, 6.0))
     out = cond_gate(c, v)
@@ -226,8 +231,9 @@ def test_in_range_structure_and_integer_bounds():
 
 def test_in_range_dip_slack_and_claimed_range():
     """Continuous bounds near a ramp edge dip past ±1 by up to
-    4·swish_dip/scale; the claimed value range carries that slack."""
-    from torchwright.ops.const import scale, swish_dip
+    4·swish_dip/scale; the claimed value range carries that slack.
+    """
+    from torchwright.ops.const import swish_dip
     from torchwright.ops.swiglu import in_range
 
     lo = create_input("lo", 1, value_range=(0.0, 4.0))
@@ -271,7 +277,8 @@ def test_broadcast_select_per_slot_and_broadcast():
 
 def test_broadcast_select_junk_mask_safe_no_assert():
     """Fractional masks blend smoothly — no ±1 assert fires, and the
-    blend stays inside the hull plus the dip term."""
+    blend stays inside the hull plus the dip term.
+    """
     from torchwright.ops.swiglu import broadcast_select
 
     m = create_input("m", 1, value_range=(-1.0, 1.0))
@@ -314,7 +321,8 @@ def test_broadcast_select_both_branches_zero_collapses_to_literal():
     empty per-lane comparison lists, whose torch.tensor([]) defaults to
     float32 and crashes torch.where.  The flagship hits this construction
     through pick_by_one_hot over an all-zero table (a missing-texture
-    bank's palette rows)."""
+    bank's palette rows).
+    """
     from torchwright.graph.misc import LiteralValue
     from torchwright.ops.swiglu import broadcast_select
 

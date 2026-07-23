@@ -1,16 +1,16 @@
-from torchwright.graph import Node, Concatenate, Linear
-from torchwright.graph.misc import LiteralValue
-from typing import List, Dict
 import math
+
 import torch
 
-from torchwright.graph.asserts import assert_integer, assert_matches_value_type
+from torchwright.graph import Concatenate, Linear, Node
+from torchwright.graph.asserts import assert_matches_value_type
+from torchwright.graph.misc import LiteralValue
 from torchwright.graph.value_type import NodeValueType, Range
-from torchwright.ops.const import step_sharpness, embedding_step_sharpness
+from torchwright.ops.const import embedding_step_sharpness, step_sharpness
 from torchwright.ops.relu.logic_ops import (
-    cond_gate,
-    _max_abs_or_raise,
     _intersect_intervals,
+    _max_abs_or_raise,
+    cond_gate,
     per_column_offsets,
 )
 
@@ -27,7 +27,8 @@ def _select_per_column_offsets(true_node, false_node, scalar_M):
     """Per-output-column gate offsets for a two-way select. The output column
     ``j`` equals ``true_j`` or ``false_j``, so size ``M_j`` from the union of
     the two operands' per-column affine intervals (falls back to the scalar
-    ``M`` if a per-column bound is unavailable). See ``per_column_offsets``."""
+    ``M`` if a per-column bound is unavailable). See ``per_column_offsets``.
+    """
     ti = _intersect_intervals(true_node)
     fi = _intersect_intervals(false_node)
     if ti is None or fi is None or len(ti) != len(fi):
@@ -41,7 +42,8 @@ def _broadcast_select_per_column_offsets(
 ):
     """Per-output-column gate offsets for broadcast_select. Output column
     ``i*d_fill+j`` equals ``true``/``false`` at its (possibly broadcast)
-    source column, so union those two per-column intervals."""
+    source column, so union those two per-column intervals.
+    """
     ti = _intersect_intervals(true_value)
     fi = _intersect_intervals(false_value)
     if ti is None or fi is None:
@@ -61,10 +63,9 @@ from torchwright.ops.relu.linear_relu_linear import linear_relu_linear
 
 
 def map_to_table(
-    inp: Node, key_to_value: Dict[torch.Tensor, torch.Tensor], default: torch.Tensor
+    inp: Node, key_to_value: dict[torch.Tensor, torch.Tensor], default: torch.Tensor
 ) -> Node:
-    """
-    Maps the value of the input node to a lookup table.
+    """Maps the value of the input node to a lookup table.
 
     Args:
         inp (Node): Node whose values will be looked up.
@@ -74,7 +75,7 @@ def map_to_table(
     Returns:
         Node: Output node with mapped values.
     """
-    d_keys = {len(x) for x in key_to_value.keys()}
+    d_keys = {len(x) for x in key_to_value}
     d_values = {len(x) for x in key_to_value.values()}
     assert len(d_keys) == 1
     assert len(d_values) == 1
@@ -424,9 +425,8 @@ def table_lookup_2d(
     )
 
 
-def switch(conditions: List[Node], values: List[Node]) -> Node:
-    """
-    Select one of N values based on which condition is true.
+def switch(conditions: list[Node], values: list[Node]) -> Node:
+    """Select one of N values based on which condition is true.
 
     Assumes exactly one condition is true (1.0), rest are false (-1.0).
 
@@ -462,8 +462,7 @@ def _select_offset(true_node: Node, false_node: Node, caller: str) -> float:
 
 
 def select(cond: Node, true_node: Node, false_node: Node) -> Node:
-    """
-    Outputs one of two nodes based on a boolean condition.
+    """Outputs one of two nodes based on a boolean condition.
 
     Uses a single L→ReLU→L sublayer with an additive cancellation trick: both
     branches compute ``(M + v) − M`` where ``M`` is derived from the union of

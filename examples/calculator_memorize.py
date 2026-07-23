@@ -60,13 +60,7 @@ outside a partition mismatches at least one one-hot block, so exactly
 one partition fires and their free sum is the answer.
 """
 
-from typing import List, Tuple
-
 import torch
-
-from torchwright.graph import Embedding, Node
-from torchwright.ops.linear import bool_to_01, concat, sum_nodes
-from torchwright.ops.swiglu.onehot_table import onehot_lookup
 
 from examples._calculator_common import (
     CALC_VOCAB,
@@ -78,18 +72,21 @@ from examples._calculator_common import (
     emit_result,
     parse_expression,
 )
+from torchwright.graph import Embedding, Node
 from torchwright.ops.inout_nodes import create_onehot_embedding, create_rope_config
+from torchwright.ops.linear import bool_to_01, concat, sum_nodes
+from torchwright.ops.swiglu.onehot_table import onehot_lookup
 
 __all__ = [
     "CALC_VOCAB",
-    "D_MODEL",
     "D_HEAD",
     "D_HIDDEN",
+    "D_MODEL",
     "MAX_POSITIONS",
-    "n_facts",
-    "n_params",
     "compiled_layers",
     "create_network_parts",
+    "n_facts",
+    "n_params",
 ]
 
 # Build-time cap: the fact table is 3 * 10^(2n) lanes.  n=2 is 30,000
@@ -138,14 +135,15 @@ def compiled_layers(max_digits: int, d_hidden: int = 16384) -> int:
 def _format_answer(embedding: Embedding, value: int, seq_len: int) -> torch.Tensor:
     """The complete formatted answer as a flat ``seq_len * 17`` vector:
     sign and decimal digits, then <eos> padding — exactly what the other
-    calculators spend their comparison / borrow / trim machinery producing."""
+    calculators spend their comparison / borrow / trim machinery producing.
+    """
     text = str(value)
     assert len(text) <= seq_len
     slots = list(text) + ["<eos>"] * (seq_len - len(text))
     return torch.cat([embedding.get_embedding(t) for t in slots])
 
 
-def create_network_parts(max_digits: int = 2) -> Tuple[Node, Embedding]:
+def create_network_parts(max_digits: int = 2) -> tuple[Node, Embedding]:
     """The memorizing calculator: parse, one fact lookup, emit."""
     if max_digits > MAX_SUPPORTED_DIGITS:
         raise ValueError(
@@ -179,7 +177,7 @@ def create_network_parts(max_digits: int = 2) -> Tuple[Node, Embedding]:
     # width; see the module docstring's d_model row.
     ops = [("+", 10), ("-", 11), ("*", 12)]
     d_answer = seq_len * 17
-    partitions: List[Node] = []
+    partitions: list[Node] = []
     for op_text, op_index in ops:
         for lead in range(10):
             table = {}

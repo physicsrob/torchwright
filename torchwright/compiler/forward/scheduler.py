@@ -8,20 +8,8 @@ Mutates residual_map (allocate, free, reassign) and computed_nodes (add).
 """
 
 from dataclasses import dataclass, field
-from typing import Dict, List, Literal, Optional, Set, Tuple
+from typing import Literal
 
-from torchwright.compiler.realization import (
-    RealizationTable,
-    add_attn_heads,
-    class_hidden_slots,
-    first_hidden_slot,
-    flex_route_classes,
-    has_flex_choice,
-    linear_attn_heads,
-    usable_hidden_slots,
-)
-from torchwright.compiler.utils import resolve_n_heads
-from torchwright.compiler.residual_assignment import flatten_concat_nodes
 from torchwright.compiler.forward.add_placement import (
     AddPlacement,
     derive_add_placement,
@@ -32,11 +20,23 @@ from torchwright.compiler.forward.residual_map import (
     HeldOutputLayout,
     ResidualStreamMap,
 )
-from torchwright.compiler.forward.sibling_clusters import SiblingClusters
 from torchwright.compiler.forward.scheduling_policy import SchedulingPolicy
-from torchwright.graph import Node, Linear, Attn, Add, Concatenate
-from torchwright.graph.misc import LiteralValue
+from torchwright.compiler.forward.sibling_clusters import SiblingClusters
+from torchwright.compiler.realization import (
+    RealizationTable,
+    add_attn_heads,
+    class_hidden_slots,
+    first_hidden_slot,
+    flex_route_classes,
+    has_flex_choice,
+    linear_attn_heads,
+    usable_hidden_slots,
+)
+from torchwright.compiler.residual_assignment import flatten_concat_nodes
+from torchwright.compiler.utils import resolve_n_heads
+from torchwright.graph import Add, Attn, Concatenate, Linear, Node
 from torchwright.graph.ffn import FFN
+from torchwright.graph.misc import LiteralValue
 
 
 @dataclass
@@ -57,13 +57,13 @@ class _AttentionOp:
         "cancel",
         "add_into",
     ]
-    node: Optional[Node]
-    target_cols: List[int]
-    source_cols: Optional[List[int]] = None
-    source_cols_b: Optional[List[int]] = None
-    q_source_cols: Optional[List[int]] = None
-    k_source_cols: Optional[List[int]] = None
-    reuse_input_index: Optional[int] = None
+    node: Node | None
+    target_cols: list[int]
+    source_cols: list[int] | None = None
+    source_cols_b: list[int] | None = None
+    q_source_cols: list[int] | None = None
+    k_source_cols: list[int] | None = None
+    reuse_input_index: int | None = None
 
 
 @dataclass
@@ -85,12 +85,12 @@ class _MlpOp:
         "add_into_bypass",
         "compute_add_bypass",
     ]
-    node: Optional[Node]
-    target_cols: List[int]
-    mlp_slots: List[int] = field(default_factory=list)
-    source_cols: Optional[List[int]] = None
-    source_cols_b: Optional[List[int]] = None
-    reuse_input_index: Optional[int] = None
+    node: Node | None
+    target_cols: list[int]
+    mlp_slots: list[int] = field(default_factory=list)
+    source_cols: list[int] | None = None
+    source_cols_b: list[int] | None = None
+    reuse_input_index: int | None = None
 
 
 @dataclass(frozen=True)
@@ -128,7 +128,7 @@ class SkipReason:
     available: int  # free right now, this layer
     capacity: int  # the most a layer could ever supply
     misroute: bool  # the selected class violates resolver-enforced eligibility
-    alternative: Optional[str] = None  # the other route family's demand/status
+    alternative: str | None = None  # the other route family's demand/status
 
     @property
     def structural(self) -> bool:
@@ -171,14 +171,14 @@ class LayerScheduler:
         d: int,
         d_head: int,
         pos_encoding=None,
-        d_hidden: Optional[int] = None,
-        clusters: Optional[SiblingClusters] = None,
+        d_hidden: int | None = None,
+        clusters: SiblingClusters | None = None,
         admission_budget_fraction: float = 0.4,
-        policy: Optional[SchedulingPolicy] = None,
-        realization_table: Optional[RealizationTable] = None,
+        policy: SchedulingPolicy | None = None,
+        realization_table: RealizationTable | None = None,
         bias: bool = True,
-        held_output_layout: Optional[HeldOutputLayout] = None,
-        n_heads: Optional[int] = None,
+        held_output_layout: HeldOutputLayout | None = None,
+        n_heads: int | None = None,
     ):
         self.graph = graph
         self.d = d
@@ -217,25 +217,25 @@ class LayerScheduler:
         # ``_freshly_dead_inputs``.
         # Why each ready node was passed over in the layer being scheduled;
         # rebuilt per pass, read only by ``_deadlock_message``.
-        self._skips: List[SkipReason] = []
+        self._skips: list[SkipReason] = []
 
         # Admission control state (see _is_admissible).  When clusters
         # is None or empty, admission is disabled and the scheduler
         # behaves as it did before this feature.
         self._clusters = clusters
         self._admission_budget_fraction = admission_budget_fraction
-        self._in_flight: Dict[int, Set[int]] = {}
+        self._in_flight: dict[int, set[int]] = {}
         if clusters is not None:
             for cluster_id in clusters.clusters:
                 self._in_flight[cluster_id] = set()
 
         # Layer index for diagnostics.  The heuristic walk never sets it;
         # ``DirectedLayerScheduler`` drives it via ``set_current_layer``.
-        self._current_layer: Optional[int] = None
+        self._current_layer: int | None = None
 
     def schedule_layer(
-        self, residual_map: ResidualStreamMap, computed_nodes: Set[Node]
-    ) -> Tuple[List[_AttentionOp], List[_MlpOp], List[Node]]:
+        self, residual_map: ResidualStreamMap, computed_nodes: set[Node]
+    ) -> tuple[list[_AttentionOp], list[_MlpOp], list[Node]]:
         """Schedule one transformer layer's worth of operations.
 
         Phases:
@@ -290,7 +290,7 @@ class LayerScheduler:
         return attn_ops, mlp_ops, biased_linears
 
     def _deadlock_message(
-        self, remaining: Set[Node], residual_map: ResidualStreamMap
+        self, remaining: set[Node], residual_map: ResidualStreamMap
     ) -> str:
         """The ``No progress`` text, itemized by why each ready node was
         passed over.
@@ -313,7 +313,7 @@ class LayerScheduler:
 
         # One line per node, keeping its first (most specific) skip.  A node
         # skipped for slots in the MLP pass is not also reported for columns.
-        seen: Set[int] = set()
+        seen: set[int] = set()
         misrouted, too_big, transient = [], [], []
         for skip in self._skips:
             if skip.node.node_id in seen:
@@ -326,7 +326,7 @@ class LayerScheduler:
             else:
                 too_big.append(skip)
 
-        def section(header: str, skips: List[SkipReason], limit: int = 8) -> None:
+        def section(header: str, skips: list[SkipReason], limit: int = 8) -> None:
             if not skips:
                 return
             lines.append(header)
@@ -393,7 +393,7 @@ class LayerScheduler:
             )
         )
 
-    def _route_alternative_note(self, node: Node) -> Optional[str]:
+    def _route_alternative_note(self, node: Node) -> str | None:
         """The other route family's demand and status, for skip diagnostics.
 
         ``None`` for nodes without a route choice.  Never consults
@@ -436,8 +436,8 @@ class LayerScheduler:
         return f"alternative {attn_cls} fits: {demand} within n_heads={self.n_heads}"
 
     def _schedule_layer_inner(
-        self, residual_map: ResidualStreamMap, computed_nodes: Set[Node]
-    ) -> Tuple[List[_AttentionOp], List[_MlpOp], List[Node], bool]:
+        self, residual_map: ResidualStreamMap, computed_nodes: set[Node]
+    ) -> tuple[list[_AttentionOp], list[_MlpOp], list[Node], bool]:
         # Skip reasons for THIS pass only.  ``schedule_layer`` may call this
         # twice (the admission-bypass retry), and it is the retry's skips that
         # explain a deadlock — the first pass's were provisional.
@@ -777,7 +777,7 @@ class LayerScheduler:
             residual_map,
             computed_nodes,
         )
-        batch_sources: Optional[Dict[Node, Dict[str, List[int]]]] = None
+        batch_sources: dict[Node, dict[str, list[int]]] | None = None
         if batch_releases is not None:
             layer_label = self._current_layer
             # A1: capture every batch member's sources while all inputs are
@@ -801,7 +801,7 @@ class LayerScheduler:
             # cancel charge rounds to the same head count), so a
             # model-feasible assignment can never fail here — a failure is a
             # model/replay contract violation, never a legitimate deferral.
-            distinct_cancel_cols: Set[int] = set()
+            distinct_cancel_cols: set[int] = set()
             for cols in release_cols.values():
                 distinct_cancel_cols.update(cols)
             compute_heads = sum(h for _, _, h in compute_candidates)
@@ -898,7 +898,8 @@ class LayerScheduler:
         # 2b-2d. Schedule compute ops with cancellation promotion
         def _try_place(op_type, node, n_heads_needed) -> bool:
             """Place one compute candidate; return True if placed, False if
-            deferred (over budget, inadmissible, or no columns available)."""
+            deferred (over budget, inadmissible, or no columns available).
+            """
             nonlocal heads_used
             if heads_used + n_heads_needed > self.n_heads:
                 # Recorded, but believed unreachable as a *deadlock* cause: a
@@ -1146,7 +1147,7 @@ class LayerScheduler:
         # add_into_live_addends contract extended to the MLP route — known
         # optimality gap #2 stays open); their earliest cancel is the layer
         # after the Add.
-        mlp_add_live_sources: Set[Node] = set()
+        mlp_add_live_sources: set[Node] = set()
 
         # Dead nodes to zero via `cancel_bypass` this layer (attention batch was
         # full, or the directed replay routed them here).  MLP-phase placements
@@ -1346,7 +1347,7 @@ class LayerScheduler:
         if mlp_adds:
             reuse_candidates = []
             fresh_candidates = []
-            selected_index: Dict[int, int] = {}
+            selected_index: dict[int, int] = {}
             for add_node in sorted(mlp_adds, key=lambda n: n.node_id):
                 if add_node in computed_nodes:
                     continue
@@ -1556,7 +1557,7 @@ class LayerScheduler:
     # ------------------------------------------------------------------
 
     def _net_column_cost(
-        self, node: Node, computed_nodes: Set[Node], residual_map: ResidualStreamMap
+        self, node: Node, computed_nodes: set[Node], residual_map: ResidualStreamMap
     ) -> int:
         """Net residual stream columns consumed by scheduling this node.
 
@@ -1579,7 +1580,7 @@ class LayerScheduler:
                     cost -= len(leaf)
         return cost
 
-    def _get_effective_consumers(self, node: Node) -> Set[Node]:
+    def _get_effective_consumers(self, node: Node) -> set[Node]:
         """Get consumers, resolving through Concatenate nodes.
 
         Terminal Concatenates (no consumers, i.e. output nodes) are kept
@@ -1599,7 +1600,7 @@ class LayerScheduler:
                 result.add(consumer)
         return result
 
-    def _literal_needed_now(self, node: Node, computed_nodes: Set[Node]) -> bool:
+    def _literal_needed_now(self, node: Node, computed_nodes: set[Node]) -> bool:
         """Just-in-time gate for a ``LiteralValue`` (heuristic scheduler).
 
         A constant has no inputs, so it is "ready" from layer 0; scheduling
@@ -1626,13 +1627,14 @@ class LayerScheduler:
                 return True
         return False
 
-    def _ready_except_literals(self, node: Node, computed_nodes: Set[Node]) -> bool:
+    def _ready_except_literals(self, node: Node, computed_nodes: set[Node]) -> bool:
         """True if every non-``LiteralValue`` effective input of ``node`` (and
         every scheduling predecessor) is in ``computed_nodes``.
 
         Concatenate inputs are walked transparently to their leaves.  A node
         whose only inputs are constants is trivially ready-except-literals, so
-        a pure-constant computation materializes immediately."""
+        a pure-constant computation materializes immediately.
+        """
         for inp in node.inputs:
             leaves = (
                 flatten_concat_nodes([inp]) if isinstance(inp, Concatenate) else [inp]
@@ -1647,7 +1649,7 @@ class LayerScheduler:
                 return False
         return True
 
-    def _is_dead(self, node: Node, computed_nodes: Set[Node]) -> bool:
+    def _is_dead(self, node: Node, computed_nodes: set[Node]) -> bool:
         if node is self.pos_encoding:
             return False
         if node not in self.graph.get_all_nodes():
@@ -1666,7 +1668,8 @@ class LayerScheduler:
         and the compile stops once the output is done; the MLP-cancel recompute
         runs within the output's own layer, so it needs the guard.  Mirrors the
         directed replay's own protection (keep-forever nodes carry
-        ``cancel_layer == max_layers``)."""
+        ``cancel_layer == max_layers``).
+        """
         cons = self._get_effective_consumers(node)
         return (not cons) or any(isinstance(c, Concatenate) for c in cons)
 
@@ -1724,15 +1727,16 @@ class LayerScheduler:
         layer (freeing it later would overflow the `[layer, cancel + 1)`
         residual budget); reading the live addend in the attention sublayer
         happens before the MLP-sublayer `cancel_bypass` zeroes it, so it is
-        safe."""
+        safe.
+        """
         return True
 
     def _assigned_attention_releases(
         self,
-        batch_nodes: List[Node],
+        batch_nodes: list[Node],
         residual_map: ResidualStreamMap,
-        computed_nodes: Set[Node],
-    ) -> Optional[List[Node]]:
+        computed_nodes: set[Node],
+    ) -> list[Node] | None:
         """The complete release set of this layer's atomic attention batch,
         or ``None`` to keep the greedy heuristic behavior.
 
@@ -1762,8 +1766,8 @@ class LayerScheduler:
         return False
 
     def _dying_input_to_reuse(
-        self, node: Node, residual_map: ResidualStreamMap, computed_nodes: Set[Node]
-    ) -> Optional[Node]:
+        self, node: Node, residual_map: ResidualStreamMap, computed_nodes: set[Node]
+    ) -> Node | None:
         """An input leaf of ``node`` that placing ``node`` makes dead, whose
         columns may be cancelled+freed to allocate ``node``'s own output.
 
@@ -1776,7 +1780,7 @@ class LayerScheduler:
         return self._held_handoff_dying_source(node, residual_map, computed_nodes)
 
     def _is_dead_for_add(
-        self, addend: Node, add_node: Add, computed_nodes: Set[Node]
+        self, addend: Node, add_node: Add, computed_nodes: set[Node]
     ) -> bool:
         """True if all effective consumers of addend, except add_node, are computed.
 
@@ -1800,9 +1804,9 @@ class LayerScheduler:
     def _freshly_dead_inputs(
         self,
         node: Node,
-        computed_nodes: Set[Node],
+        computed_nodes: set[Node],
         residual_map: ResidualStreamMap,
-    ) -> List[Node]:
+    ) -> list[Node]:
         """Inputs of ``node`` that are now dead because ``node`` just got placed.
 
         Walks through ``Concatenate`` inputs since Concatenate nodes aren't
@@ -1811,9 +1815,9 @@ class LayerScheduler:
         eager freeing is always on (the warm start and the production heuristic
         share it); the density it produces is now CP-SAT-representable.
         """
-        result: List[Node] = []
-        seen: Set[Node] = set()
-        stack: List[Node] = list(node.inputs)
+        result: list[Node] = []
+        seen: set[Node] = set()
+        stack: list[Node] = list(node.inputs)
         while stack:
             cur = stack.pop()
             if cur in seen:
@@ -1843,8 +1847,8 @@ class LayerScheduler:
         return result
 
     def _find_dead_nodes(
-        self, residual_map: ResidualStreamMap, computed_nodes: Set[Node]
-    ) -> List[Node]:
+        self, residual_map: ResidualStreamMap, computed_nodes: set[Node]
+    ) -> list[Node]:
         graph_nodes = self.graph.get_all_nodes()
         dead = []
         for node in sorted(residual_map.get_allocated_nodes(), key=lambda n: n.node_id):
@@ -1860,7 +1864,7 @@ class LayerScheduler:
     # Hook methods — overridden by DirectedLayerScheduler
     # ------------------------------------------------------------------
 
-    def _get_ready_nodes(self, computed_nodes: Set[Node]) -> Set[Node]:
+    def _get_ready_nodes(self, computed_nodes: set[Node]) -> set[Node]:
         """Return the set of nodes eligible to schedule this layer.
 
         The default returns ``graph.get_ready_nodes(...)`` unchanged.
@@ -1903,7 +1907,7 @@ class LayerScheduler:
 
     def _try_allocate(
         self, node: Node, residual_map: ResidualStreamMap
-    ) -> Optional[List[int]]:
+    ) -> list[int] | None:
         if (
             self.held_output_layout is not None
             and node is self.held_output_layout.target
@@ -1922,7 +1926,7 @@ class LayerScheduler:
             and node is self.held_output_layout.target
         )
 
-    def _check_add_placement(self, add_node: Add, reuse_index: Optional[int]) -> None:
+    def _check_add_placement(self, add_node: Add, reuse_index: int | None) -> None:
         """Hook: verify the walk's fresh/reused decision for one Add just
         before its operation is emitted.  ``reuse_index`` is the selected
         target occurrence (0 or 1) for a reuse, ``None`` for fresh.
@@ -1953,8 +1957,8 @@ class LayerScheduler:
         residual_map.free(node, mech=mech)
 
     def _held_handoff_dying_source(
-        self, node: Node, residual_map: ResidualStreamMap, computed_nodes: Set[Node]
-    ) -> Optional[Node]:
+        self, node: Node, residual_map: ResidualStreamMap, computed_nodes: set[Node]
+    ) -> Node | None:
         """The tied input when ``node`` is its final attention reader/writer."""
         layout = self.held_output_layout
         if layout is None or node is not layout.target:
@@ -1999,7 +2003,7 @@ class LayerScheduler:
     # terminal is placed.  Once in flight, the chain is always
     # admitted — we never leave work half-scheduled.
 
-    def _chain_of(self, node: Node) -> Optional[Tuple[int, int]]:
+    def _chain_of(self, node: Node) -> tuple[int, int] | None:
         if self._clusters is None:
             return None
         return self._clusters.node_to_chain.get(node)
@@ -2055,8 +2059,8 @@ class LayerScheduler:
                 in_flight.discard(t_chain_id)
 
     def _filter_admissible(
-        self, candidates: List, node_getter=lambda t: t[1]
-    ) -> Tuple[List, List]:
+        self, candidates: list, node_getter=lambda t: t[1]
+    ) -> tuple[list, list]:
         """Partition candidates into (admissible, deferred).
 
         Accepts a list of tuples/nodes and a ``node_getter`` to extract
@@ -2077,7 +2081,7 @@ class LayerScheduler:
 
     def _capture_attn_sources(
         self, op_type: str, node: Node, residual_map: ResidualStreamMap
-    ) -> Dict[str, List[int]]:
+    ) -> dict[str, list[int]]:
         """Capture an attention compute op's source columns while every input
         is still allocated.
 
@@ -2091,7 +2095,7 @@ class LayerScheduler:
         never invalidates it — callers consume the saved result and must not
         re-run the liveness lookup afterwards.
         """
-        sources: Dict[str, List[int]] = {}
+        sources: dict[str, list[int]] = {}
         if op_type == "compute_linear":
             self._require_live(
                 node.inputs[0],
@@ -2200,14 +2204,14 @@ class DirectedLayerScheduler(LayerScheduler):
         d_head: int,
         pos_encoding,
         assignment: ScheduleAssignment,
-        d_hidden: Optional[int] = None,
-        clusters: Optional[SiblingClusters] = None,
+        d_hidden: int | None = None,
+        clusters: SiblingClusters | None = None,
         admission_budget_fraction: float = 0.4,
-        policy: Optional[SchedulingPolicy] = None,
-        realization_table: Optional[RealizationTable] = None,
+        policy: SchedulingPolicy | None = None,
+        realization_table: RealizationTable | None = None,
         bias: bool = True,
-        held_output_layout: Optional[HeldOutputLayout] = None,
-        n_heads: Optional[int] = None,
+        held_output_layout: HeldOutputLayout | None = None,
+        n_heads: int | None = None,
     ):
         # The CP-SAT model does not represent the sibling-cluster admission
         # constraint (docs/cpsat_scheduler.md §3 Model preconditions), so a
@@ -2256,7 +2260,7 @@ class DirectedLayerScheduler(LayerScheduler):
         """
         self._current_layer = layer
 
-    def _get_ready_nodes(self, computed_nodes: Set[Node]) -> Set[Node]:
+    def _get_ready_nodes(self, computed_nodes: set[Node]) -> set[Node]:
         if self._current_layer < 0:
             raise RuntimeError(
                 "DirectedLayerScheduler.set_current_layer() must be called "
@@ -2287,10 +2291,10 @@ class DirectedLayerScheduler(LayerScheduler):
 
     def _assigned_attention_releases(
         self,
-        batch_nodes: List[Node],
+        batch_nodes: list[Node],
         residual_map: ResidualStreamMap,
-        computed_nodes: Set[Node],
-    ) -> List[Node]:
+        computed_nodes: set[Node],
+    ) -> list[Node]:
         """The solver-assigned attention transition for the current layer.
 
         Returns every allocated value whose assigned cancel mechanism is
@@ -2319,7 +2323,7 @@ class DirectedLayerScheduler(LayerScheduler):
         n2cl = self._assignment.node_to_cancel_layer
         graph_nodes = self.graph.get_all_nodes()
         batch = set(batch_nodes)
-        releases: List[Node] = []
+        releases: list[Node] = []
         for node in sorted(residual_map.get_allocated_nodes(), key=lambda n: n.node_id):
             if node not in graph_nodes:
                 continue  # compile-internal allocations (const_one) never cancel
@@ -2362,7 +2366,8 @@ class DirectedLayerScheduler(LayerScheduler):
 
     def _expected_add_placement(self, add_node: Add) -> AddPlacement:
         """The assignment-level derivation of this Add's placement — the
-        expectation the physical residual-map state must reproduce."""
+        expectation the physical residual-map state must reproduce.
+        """
         layout = self.held_output_layout
         return derive_add_placement(
             add_node,
@@ -2373,7 +2378,7 @@ class DirectedLayerScheduler(LayerScheduler):
             held_target_id=None if layout is None else layout.target.node_id,
         )
 
-    def _check_add_placement(self, add_node: Add, reuse_index: Optional[int]) -> None:
+    def _check_add_placement(self, add_node: Add, reuse_index: int | None) -> None:
         expected = self._expected_add_placement(add_node)
         if expected.reuse_input_index == reuse_index:
             return
@@ -2390,7 +2395,7 @@ class DirectedLayerScheduler(LayerScheduler):
                 parts.append(f"{c!r}@L{n2l.get(c.node_id)}/{n2r.get(c.node_id)}")
             return ", ".join(parts) or "none"
 
-        def _form(index: Optional[int]) -> str:
+        def _form(index: int | None) -> str:
             return "fresh" if index is None else f"reused occurrence {index}"
 
         a0, a1 = add_node.inputs
@@ -2407,15 +2412,15 @@ class DirectedLayerScheduler(LayerScheduler):
             f"{a1!r}: {_describe(a1)}."
         )
 
-    def _literal_needed_now(self, node: Node, computed_nodes: Set[Node]) -> bool:
+    def _literal_needed_now(self, node: Node, computed_nodes: set[Node]) -> bool:
         # Assignment-driven: the CP-SAT layer assignment already places each
         # constant just-in-time, and ``_get_ready_nodes`` only releases it at
         # its assigned layer.  No consumer-readiness gate here.
         return True
 
     def _find_dead_nodes(
-        self, residual_map: ResidualStreamMap, computed_nodes: Set[Node]
-    ) -> List[Node]:
+        self, residual_map: ResidualStreamMap, computed_nodes: set[Node]
+    ) -> list[Node]:
         if self._current_layer < 0:
             raise RuntimeError(
                 "DirectedLayerScheduler.set_current_layer() must be called "
@@ -2423,7 +2428,7 @@ class DirectedLayerScheduler(LayerScheduler):
             )
         graph_nodes = self.graph.get_all_nodes()
         n2cl = self._assignment.node_to_cancel_layer
-        dead: List[Node] = []
+        dead: list[Node] = []
         for node in sorted(residual_map.get_allocated_nodes(), key=lambda n: n.node_id):
             if node not in graph_nodes:
                 continue
@@ -2448,9 +2453,9 @@ class DirectedLayerScheduler(LayerScheduler):
     def _freshly_dead_inputs(
         self,
         node: Node,
-        computed_nodes: Set[Node],
+        computed_nodes: set[Node],
         residual_map: ResidualStreamMap,
-    ) -> List[Node]:
+    ) -> list[Node]:
         # Mid-layer freeing restricted to the assignment's cancel timing:
         # surface a freshly-dead input only when the solver scheduled its
         # cancel at (or before) the current layer.  On the attention side

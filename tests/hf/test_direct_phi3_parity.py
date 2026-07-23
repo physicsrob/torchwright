@@ -27,16 +27,15 @@ pytest.importorskip("transformers")
 pytest.importorskip("safetensors")
 pytest.importorskip("onnxruntime")
 
-from torchwright.compiler.export import debug_meta_path_for
-from torchwright.compiler.hf import compile_to_hf
-from torchwright.compiler.onnx_load import load_onnx
-
 from tests.hf._hf_parity import (
     compile_example,
     hf_teacher_forced,
     max_logit_diff,
     oracle_decode,
 )
+from torchwright.compiler.export import debug_meta_path_for
+from torchwright.compiler.hf import compile_to_hf
+from torchwright.compiler.onnx_load import load_onnx
 
 # binary_increment: "<bos> 1 0 1 1 \n" -> "1 1 0 0". Single-char vocab tokens.
 _EXAMPLE = "binary_increment"
@@ -74,7 +73,8 @@ def test_custom_config_rejects_explicit_untied():
     silently overridden — HF's tie_weights() would otherwise clone the
     embedding over a checkpoint's real lm_head and return wrong logits with
     no error.  (The stock Phi3 target ties through its ordinary
-    tie_word_embeddings flag instead — no custom guard needed there.)"""
+    tie_word_embeddings flag instead — no custom guard needed there.)
+    """
     from torchwright.compiler.hf.configuration_torchwright_custom import (
         TorchwrightCustomConfig,
     )
@@ -228,7 +228,8 @@ def test_standard_attention_mask(direct_model):
 
 def test_direct_model_is_storage_tied(direct_model):
     """The compiled model's lm_head and embed_tokens are one tensor, not two
-    equal copies — the token.v6 tie survives the from_pretrained load path."""
+    equal copies — the token.v6 tie survives the from_pretrained load path.
+    """
     model, _ = direct_model
     assert model.config.tie_word_embeddings
     assert model.lm_head.weight.data_ptr() == model.model.embed_tokens.weight.data_ptr()

@@ -22,8 +22,9 @@ or the output goes to fresh columns).  Residual placement is scheduler
 state, not a realization class (docs/plan_additional_mlp_routing.md).
 """
 
+from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, replace
-from typing import Any, Dict, Iterable, Mapping, Optional, Tuple, cast
+from typing import Any, cast
 
 from torchwright.compiler.forward.scheduling_policy import SchedulingPolicy
 from torchwright.graph import Add, Attn, Linear, Node
@@ -54,7 +55,7 @@ ATTN_ADD = "attn_add"
 MLP_ADD = "mlp_add"
 
 #: Which sublayer each class occupies.
-CLASS_SUBLAYER: Dict[str, str] = {
+CLASS_SUBLAYER: dict[str, str] = {
     ATTN_TRANSPORT: "attn",
     ATTN_HEADS: "attn",
     ATTN_ADD: "attn",
@@ -65,7 +66,7 @@ CLASS_SUBLAYER: Dict[str, str] = {
 }
 
 
-def candidate_classes(node: Node) -> Tuple[str, ...]:
+def candidate_classes(node: Node) -> tuple[str, ...]:
     """The candidate realization classes for a schedulable node.
 
     THE single declaration of the option set.  A single-candidate result is
@@ -94,11 +95,12 @@ def is_schedulable(node: Node) -> bool:
 def has_flex_choice(node: Node) -> bool:
     """True when the node's class is a *free* choice a resolver must make
     (a CP-SAT decision variable in the directed path) — the standalone
-    ``Linear`` and the ``Add``."""
+    ``Linear`` and the ``Add``.
+    """
     return len(candidate_classes(node)) > 1
 
 
-def flex_route_classes(node: Node) -> Tuple[str, str]:
+def flex_route_classes(node: Node) -> tuple[str, str]:
     """The (attention-family, MLP-family) candidate classes of a node with
     a free routing choice.
 
@@ -183,7 +185,7 @@ def static_flex_class(node: Node, policy: SchedulingPolicy, usable_slots: int) -
 # ---------------------------------------------------------------------------
 
 
-def live_weight_row_ranges(node: Node) -> Tuple[Tuple[int, int], ...]:
+def live_weight_row_ranges(node: Node) -> tuple[tuple[int, int], ...]:
     """The rows of ``node.output_matrix`` with any nonzero entry, as
     ``(start, length)`` runs.
 
@@ -209,7 +211,7 @@ def live_weight_row_ranges(node: Node) -> Tuple[Tuple[int, int], ...]:
     cached = getattr(node, "_live_weight_row_ranges", None)
     if cached is not None:
         return cached
-    live = cast(Any, node).output_matrix.ne(0).any(dim=1)
+    live = cast("Any", node).output_matrix.ne(0).any(dim=1)
     runs = []
     start = None
     for i, flag in enumerate(live.tolist()):
@@ -225,7 +227,7 @@ def live_weight_row_ranges(node: Node) -> Tuple[Tuple[int, int], ...]:
     return ranges
 
 
-def _linear_live_attn_chunks(node: Node, d_head: int) -> Tuple[int, ...]:
+def _linear_live_attn_chunks(node: Node, d_head: int) -> tuple[int, ...]:
     """Attention chunks with a nonzero output block, without the model floor."""
     return tuple(
         sorted(
@@ -241,7 +243,7 @@ def _linear_live_attn_chunks(node: Node, d_head: int) -> Tuple[int, ...]:
     )
 
 
-def linear_attn_chunks(node: Node, d_head: int) -> Tuple[int, ...]:
+def linear_attn_chunks(node: Node, d_head: int) -> tuple[int, ...]:
     """The ``d_head``-wide input chunks a Linear's attention transport
     actually needs, in ascending order.
 
@@ -262,12 +264,13 @@ def linear_attn_chunks(node: Node, d_head: int) -> Tuple[int, ...]:
     variable from the objective and its interval from the cumulative).
     """
     chunks = _linear_live_attn_chunks(node, d_head)
-    return chunks if chunks else (0,)
+    return chunks or (0,)
 
 
 def linear_attn_heads(node: Node, d_head: int) -> int:
     """Attention-transport head demand of a standalone Linear: one head per
-    live input chunk (:func:`linear_attn_chunks`), floor 1."""
+    live input chunk (:func:`linear_attn_chunks`), floor 1.
+    """
     return len(linear_attn_chunks(node, d_head))
 
 
@@ -300,9 +303,10 @@ def class_heads(node: Node, cls: str, d_head: int) -> int:
     classes).  ``ATTN_ADD`` demand depends on reused-versus-fresh residual
     placement, which is scheduler state, not part of the class — callers
     that know the placement use :func:`add_attn_heads`; callers that don't
-    report the range (see :func:`summarize_cost`)."""
+    report the range (see :func:`summarize_cost`).
+    """
     if cls == ATTN_HEADS:
-        return (cast(Any, node).d_v + d_head - 1) // d_head
+        return (cast("Any", node).d_v + d_head - 1) // d_head
     if cls == ATTN_TRANSPORT:
         return linear_attn_heads(node, d_head)
     if cls == ATTN_ADD:
@@ -315,11 +319,12 @@ def class_heads(node: Node, cls: str, d_head: int) -> int:
 
 def class_hidden_slots(node: Node, cls: str) -> int:
     """MLP hidden-slot demand of realizing *node* as *cls* (0 for
-    attention classes; a literal's constant write costs no hidden slot)."""
+    attention classes; a literal's constant write costs no hidden slot).
+    """
     if cls in (MLP_BYPASS, MLP_ADD):
         return 2 * node.d_output
     if cls == MLP_COMPOSITE:
-        return cast(int, cast(Any, node).n_lanes)
+        return cast("int", cast("Any", node).n_lanes)
     return 0
 
 
@@ -337,8 +342,8 @@ class CostSummary:
     (and the cancel heads it emits) is the scheduler's business.
     """
 
-    nodes_by_class: Dict[str, int]
-    heads_by_class: Dict[str, int]  # fixed-demand attention classes only
+    nodes_by_class: dict[str, int]
+    heads_by_class: dict[str, int]  # fixed-demand attention classes only
     add_heads_if_all_reuse: int
     add_heads_if_all_copy: int
     mlp_bypass_slots: int
@@ -375,12 +380,12 @@ def summarize_cost(
     """
     nodes = [n for n in nodes if is_schedulable(n)]
     table.check_complete(nodes)
-    nodes_by_class: Dict[str, int] = {}
-    heads_by_class: Dict[str, int] = {}
+    nodes_by_class: dict[str, int] = {}
+    heads_by_class: dict[str, int] = {}
     add_reuse = add_copy = bypass_slots = lanes = 0
     for node in nodes:
         entry = table.entries[node.node_id]
-        cls = cast(str, entry.resolved)
+        cls = cast("str", entry.resolved)
         nodes_by_class[cls] = nodes_by_class.get(cls, 0) + 1
         if cls == ATTN_ADD:
             add_reuse += add_attn_heads(node, d_head, reused=True)
@@ -415,8 +420,8 @@ class Entry:
     ``resolved`` is the chosen class (None while unresolved).
     """
 
-    candidates: Tuple[str, ...]
-    resolved: Optional[str] = None
+    candidates: tuple[str, ...]
+    resolved: str | None = None
 
 
 class UnresolvedRealizationError(RuntimeError):
@@ -435,7 +440,7 @@ class RealizationTable:
     cannot alias.
     """
 
-    def __init__(self, entries: Dict[int, Entry]):
+    def __init__(self, entries: dict[int, Entry]):
         self.entries = entries
 
     @classmethod
@@ -446,7 +451,7 @@ class RealizationTable:
         multi-candidate entries (standalone Linears and Adds) are born
         unresolved.
         """
-        entries: Dict[int, Entry] = {}
+        entries: dict[int, Entry] = {}
         for node in nodes:
             if not is_schedulable(node):
                 continue
@@ -464,7 +469,7 @@ class RealizationTable:
         nodes: Iterable[Node],
         policy: SchedulingPolicy,
         usable_slots: int,
-        forced_classes: Optional[Dict[int, str]] = None,
+        forced_classes: dict[int, str] | None = None,
     ) -> "RealizationTable":
         """The optimize=0 resolver: :func:`static_flex_class` picks every free
         choice.
@@ -481,7 +486,7 @@ class RealizationTable:
         """
         by_id = {n.node_id: n for n in nodes if is_schedulable(n)}
         forced_classes = forced_classes or {}
-        resolved: Dict[int, Entry] = {}
+        resolved: dict[int, Entry] = {}
         for node_id, entry in self.entries.items():
             forced = forced_classes.get(node_id)
             if forced is not None:
@@ -513,7 +518,7 @@ class RealizationTable:
         choice.  Raises if the assignment contradicts a locked entry's
         sublayer — the tripwire for the two option sets drifting apart.
         """
-        resolved: Dict[int, Entry] = {}
+        resolved: dict[int, Entry] = {}
         for node_id, entry in self.entries.items():
             routing = node_to_routing.get(node_id)
             if entry.resolved is not None:
@@ -561,7 +566,8 @@ class RealizationTable:
 
     def check_complete(self, nodes: Iterable[Node]) -> None:
         """Every schedulable node has a resolved entry.  Runs before the
-        layer walk."""
+        layer walk.
+        """
         problems = []
         for node in nodes:
             if not is_schedulable(node):

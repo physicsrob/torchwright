@@ -32,7 +32,6 @@ from torchwright.ops.swiglu.embedding_arithmetic import (
     sum_digits,
 )
 from torchwright.ops.swiglu.global_recency import global_position_from_bos
-from torchwright.ops.swiglu.marker_count import count_since_marker
 from torchwright.ops.swiglu.logic_ops import (
     bool_all_true,
     bool_any_true,
@@ -49,6 +48,7 @@ from torchwright.ops.swiglu.map_select import (
     switch,
     table_lookup_2d,
 )
+from torchwright.ops.swiglu.marker_count import count_since_marker
 from torchwright.ops.swiglu.onehot_table import onehot_lookup
 from torchwright.ops.swiglu.scalar_encoding import (
     digit_to_scaled_scalar,

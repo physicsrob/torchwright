@@ -98,7 +98,6 @@ not exist yet, so they are NOT derisked here:
 """
 
 import math
-from typing import Dict, List, Tuple
 
 import numpy as np
 import pytest
@@ -228,7 +227,7 @@ def _wall_on_circle(k: int, n: int, radius: float, wall_id: float) -> dict:
     }
 
 
-def _walls_on_circle(n_walls: int, radius: float = 5.0) -> List[dict]:
+def _walls_on_circle(n_walls: int, radius: float = 5.0) -> list[dict]:
     """``n_walls`` walls spaced evenly on a circle around the player.
 
     ``wall_id`` is ``k + 1`` so the "no wall selected" output of 0
@@ -247,9 +246,9 @@ def _query_from_angle(ray_angle: float) -> dict:
 
 
 def _build_input_dict(
-    walls: List[dict],
-    queries: List[dict],
-) -> Tuple[Dict[str, torch.Tensor], int]:
+    walls: list[dict],
+    queries: list[dict],
+) -> tuple[dict[str, torch.Tensor], int]:
     """Pack wall + query records into ``{name: (n_pos, 1)}`` input tensors.
 
     Wall rows come first, queries after.  Every slot gets zero by
@@ -283,8 +282,8 @@ def _build_input_dict(
 
 
 def _expected_softmax_weights(
-    walls: List[dict],
-    queries: List[dict],
+    walls: list[dict],
+    queries: list[dict],
     query_idx: int,
     logit_scale: float,
     dist_scale: float,
@@ -322,8 +321,8 @@ def _expected_softmax_weights(
 
 
 def _expected_output(
-    walls: List[dict],
-    queries: List[dict],
+    walls: list[dict],
+    queries: list[dict],
     query_idx: int,
     logit_scale: float,
     dist_scale: float,

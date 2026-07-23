@@ -24,8 +24,8 @@ Two usage shapes:
 
 import json
 import os
+from collections.abc import Iterator
 from dataclasses import dataclass
-from typing import Iterator, List, Optional, Tuple
 
 import numpy as np
 import torch
@@ -88,8 +88,8 @@ class OnnxPast:
     functional state).
     """
 
-    k: Tuple[torch.Tensor, ...]
-    v: Tuple[torch.Tensor, ...]
+    k: tuple[torch.Tensor, ...]
+    v: tuple[torch.Tensor, ...]
     length: int
 
 
@@ -127,7 +127,7 @@ class OnnxTokenModule:
                 f"{meta_path}: unexpected format {fmt!r}, "
                 f"expected {TOKEN_META_FORMAT!r}"
             )
-        self.vocab: List[str] = list(meta["vocab"])
+        self.vocab: list[str] = list(meta["vocab"])
         self._token_to_id = {t: i for i, t in enumerate(self.vocab)}
         self.metadata: dict = dict(meta.get("extra") or {})
 
@@ -164,7 +164,7 @@ class OnnxTokenModule:
         return self._n_layers
 
     @property
-    def per_layer_n_heads(self) -> List[int]:
+    def per_layer_n_heads(self) -> list[int]:
         return list(self._per_layer_n_heads)
 
     @property
@@ -199,8 +199,8 @@ class OnnxTokenModule:
         self,
         token_ids: torch.Tensor,
         past: OnnxPast,
-        past_len: Optional[int] = None,
-    ) -> Tuple[torch.Tensor, OnnxPast]:
+        past_len: int | None = None,
+    ) -> tuple[torch.Tensor, OnnxPast]:
         """Run one cached-protocol call and return (logits, new_past).
 
         Args:

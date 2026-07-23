@@ -41,17 +41,12 @@ big graphs (e.g. the DOOM renderer) fit in realistic RAM.
 import json
 import os
 import time
-from dataclasses import dataclass, field
+from collections.abc import Callable
+from dataclasses import dataclass
 from typing import (
     TYPE_CHECKING,
     Any,
-    Callable,
-    Dict,
-    List,
     Literal,
-    Optional,
-    Tuple,
-    Union,
     cast,
 )
 
@@ -81,8 +76,8 @@ from torchwright.compiler.token_model import (
 from torchwright.compiler.utils import resolve_n_heads
 from torchwright.graph import Concatenate, Embedding, LiteralValue, Node
 from torchwright.graph.attn import CAUSAL_MASK_SENTINEL
-from torchwright.graph.rope import ROPE_BASE
 from torchwright.graph.misc import InputNode
+from torchwright.graph.rope import ROPE_BASE
 
 # v6: the token table is physically tied.  The compiler returns the logical
 # output in the embedding's exact ordered residual bank, clears every folded
@@ -140,14 +135,14 @@ class OnnxArtifact:
 
     path: str
     meta_path: str
-    debug_path: Optional[str]  # None when debug_sidecar=False
+    debug_path: str | None  # None when debug_sidecar=False
     kind: str  # always "token"
     n_layers: int
-    per_layer_n_heads: Tuple[int, ...]  # tuple copy, not the exporter's live list
+    per_layer_n_heads: tuple[int, ...]  # tuple copy, not the exporter's live list
     d: int
     d_head: int
     cache_stride: int
-    vocab_size: Optional[int] = None  # token kind only
+    vocab_size: int | None = None  # token kind only
     # Machine kind ("relu" | "swish") — which MLP-sublayer emission the
     # artifact carries.  Uniform per network by the compile-time check.
     activation: str = "relu"
@@ -247,7 +242,7 @@ def _diag_rects(matrix_id, rows, cols):
 
 
 def _build_matrix_occupancy(
-    compiled, canon, d: int, d_head: int, n_heads: Optional[int] = None
+    compiled, canon, d: int, d_head: int, n_heads: int | None = None
 ):
     """Build the ``matrices`` table and ``placements`` map for the sidecar.
 
@@ -262,8 +257,8 @@ def _build_matrix_occupancy(
     n_heads = resolve_n_heads(d, d_head, n_heads)
     head_dim = n_heads * d_head
 
-    matrices: Dict[str, dict] = {}
-    d_hidden_per_layer: List[int] = []
+    matrices: dict[str, dict] = {}
+    d_hidden_per_layer: list[int] = []
     for i, layer in enumerate(compiled.layers):
         d_hidden = int(getattr(layer.mlp, "d_hidden", d))
         d_hidden_per_layer.append(d_hidden)
@@ -287,7 +282,7 @@ def _build_matrix_occupancy(
                 "axis1": axis1,
             }
 
-    placements: Dict[str, list] = {}
+    placements: dict[str, list] = {}
     recorder = getattr(compiled, "placements", None)
     if recorder is not None:
         for e in recorder.entries:
@@ -315,12 +310,12 @@ def _write_debug_sidecar(
     d_head: int,
     n_heads: int,
     kind: str,
-    input_specs: List[tuple],
-    checked_nodes: List[Node],
+    input_specs: list[tuple],
+    checked_nodes: list[Node],
     cache_stride: int,
     verbose: bool,
     optimize: int = 0,
-    extra: Optional[dict] = None,
+    extra: dict | None = None,
 ) -> str:
     """Write ``<stem>.debug.json`` — everything OnnxDebugSession needs.
 
@@ -362,20 +357,20 @@ def _write_debug_sidecar(
     ra = compiled.residual_assignment
     assert ra is not None
 
-    state_list: List[tuple] = [("input", compiled.layers[0].attn.in_state)]
+    state_list: list[tuple] = [("input", compiled.layers[0].attn.in_state)]
     for i, layer in enumerate(compiled.layers):
         state_list.append((f"L{i}.attn", layer.attn.out_state))
         state_list.append((f"L{i}.mlp", layer.mlp.out_state))
 
-    seen_tables: Dict[int, str] = {}  # id(mapping dict) -> first state key
-    state_entries: List[dict] = []
+    seen_tables: dict[int, str] = {}  # id(mapping dict) -> first state key
+    state_entries: list[dict] = []
     # Earliest state in which each canonical id appears.  The state_list
     # is ordered input → L0.attn → L0.mlp → L1.attn …, and a node sits in
     # the residual stream from the sublayer that computes it until it is
     # freed, so its FIRST appearance pins where it was computed.  Used as
     # the layer/sublayer source for nodes the placement recorder doesn't
     # log (literals, concatenations).
-    first_state: Dict[str, str] = {}
+    first_state: dict[str, str] = {}
     for key, st in state_list:
         table = ra.mapping.get(st)
         if table is None:
@@ -386,7 +381,7 @@ def _write_debug_sidecar(
             state_entries.append({"key": key, "same_as": prior})
             continue
         seen_tables[id(table)] = key
-        nodes: Dict[str, list] = {}
+        nodes: dict[str, list] = {}
         for node, cols in table.items():
             cid = canon.get(node.node_id)
             if cid is None:
@@ -418,7 +413,7 @@ def _write_debug_sidecar(
     # gives the sublayer.  Nodes it doesn't log (literals, concatenations)
     # fall back to their first residual-state appearance, and pre-layer
     # input nodes (Embedding) report sublayer "embed".
-    place_loc: Dict[str, tuple] = {}
+    place_loc: dict[str, tuple] = {}
     recorder = getattr(compiled, "placements", None)
     if recorder is not None:
         for e in recorder.entries:
@@ -447,11 +442,11 @@ def _write_debug_sidecar(
     # Baked weight tensors probed by attribute name, summed into a
     # parameter count and per-tensor shape list.  0 / [] for pure ops.
     baked_attrs = ("table", "output_matrix", "matrix", "weight", "value")
-    nodes_meta: Dict[str, dict] = {}
+    nodes_meta: dict[str, dict] = {}
     for cid, node in nodes_by_canonical_id(out).items():
         cid_s = str(cid)
         weight_params = 0
-        weight_shapes: List[list] = []
+        weight_shapes: list[list] = []
         for attr in baked_attrs:
             t: Any = getattr(node, attr, None)
             shape = getattr(t, "shape", None)
@@ -462,7 +457,7 @@ def _write_debug_sidecar(
                 continue
             weight_params += int(t.numel()) if hasattr(t, "numel") else 1
             weight_shapes.append([attr, dims])
-        input_cids: List[str] = []
+        input_cids: list[str] = []
         for inp in getattr(node, "inputs", None) or []:
             icid = canon.get(inp.node_id)
             if icid is not None:
@@ -678,7 +673,8 @@ def _add_rope_inits(
 ) -> tuple[float, int]:
     """Add the global RoPE initializers (``rope_freq``, ``rope_split``, and — for
     partial rotary — ``rope_partial_split``).  Returns ``(base, d_rot)`` for the
-    sidecar meta.  All layers must share one ``base`` AND one ``d_rot``."""
+    sidecar meta.  All layers must share one ``base`` AND one ``d_rot``.
+    """
     bases = {r["base"] for r in per_layer_rotary if r.get("base") is not None}
     if len(bases) > 1:
         raise NotImplementedError(
@@ -736,7 +732,7 @@ def _make_stream_layer_weights_cb(
     dense_inits: list,
     sparse_inits: list,
     per_layer_n_heads: list,
-    per_layer_rotary: Optional[list] = None,
+    per_layer_rotary: list | None = None,
     trim_heads: bool = True,
     bias: bool = True,
 ) -> Callable[[int, object], None]:
@@ -955,7 +951,7 @@ def _emit_cached_layer_nodes(
     d_rot: int,
     scatter_idx_col: str = "_cache_pos_col",
     rms_norm: bool = False,
-    rms_eps_name: Optional[str] = None,
+    rms_eps_name: str | None = None,
     activation: str = "relu",
     bias: bool = True,
 ) -> str:
@@ -1008,7 +1004,7 @@ def _emit_cached_layer_nodes(
             node,
             current_res,
             f"{p}_input_layernorm",
-            cast(str, rms_eps_name),
+            cast("str", rms_eps_name),
             attn_in,
             f"{p}_attn_norm",
         )
@@ -1148,7 +1144,7 @@ def _emit_cached_layer_nodes(
             node,
             f"{p}_res_attn",
             f"{p}_post_attention_layernorm",
-            cast(str, rms_eps_name),
+            cast("str", rms_eps_name),
             mlp_in,
             f"{p}_mlp_norm",
         )
@@ -1199,7 +1195,7 @@ def _emit_cached_layer_nodes(
     return f"{p}_res_next"
 
 
-def _kv_io_value_info(per_layer_n_heads: List[int], d_head: int) -> tuple[list, list]:
+def _kv_io_value_info(per_layer_n_heads: list[int], d_head: int) -> tuple[list, list]:
     """Build ValueInfoProto entries for the KV-cache inputs and outputs.
 
     ``per_layer_n_heads`` gives the (possibly trimmed) head count for
@@ -1260,7 +1256,7 @@ def _kv_io_value_info(per_layer_n_heads: List[int], d_head: int) -> tuple[list, 
 
 
 def _resolve_cache_stride(
-    cache_stride: Optional[int],
+    cache_stride: int | None,
     max_seq_len: int,
 ) -> int:
     """Resolve the static cache slot count ``S`` (default: max_seq_len).
@@ -1291,18 +1287,18 @@ def compile_to_onnx(
     verbose: bool = False,
     trim_heads: bool = True,
     optimize: int = 0,
-    d_hidden: Optional[int] = None,
-    extra_metadata: Optional[dict] = None,
-    cache_stride: Optional[int] = None,
+    d_hidden: int | None = None,
+    extra_metadata: dict | None = None,
+    cache_stride: int | None = None,
     debug_sidecar: bool = True,
-    rms_norm: Optional[bool] = None,
+    rms_norm: bool | None = None,
     rms_norm_eps: float = 1e-5,
-    rms_norm_const_exp: Optional[int] = None,
+    rms_norm_const_exp: int | None = None,
     bias: bool = True,
-    profile: Optional[Union[CompileProfile, str]] = None,
-    n_heads: Optional[int] = None,
-    policy: Optional[SchedulingPolicy] = None,
-    _solver_seed: Optional[int] = None,
+    profile: CompileProfile | str | None = None,
+    n_heads: int | None = None,
+    policy: SchedulingPolicy | None = None,
+    _solver_seed: int | None = None,
     _force_resolve: bool = False,
 ) -> OnnxArtifact:
     """Compile a token-I/O graph to a KV-cached ONNX model.
@@ -1482,7 +1478,7 @@ def compile_to_onnx(
         # None -> forward_compile's default q; an explicit value tunes the
         # pinned constant for a graph whose deepest-layer energy needs it.
         **cast(
-            Dict[str, Any],
+            "dict[str, Any]",
             (
                 {}
                 if rms_norm_const_exp is None
@@ -1516,7 +1512,7 @@ def compile_to_onnx(
     # Input-state literal seeds as (column, value) pairs, folded into
     # embed_table rows below (token.v6) — there is no separate
     # constant_values initializer or post-Gather seed Add anymore.
-    literal_seeds: List[Tuple[int, float]] = []
+    literal_seeds: list[tuple[int, float]] = []
 
     for node in compiled.residual_assignment.get_nodes(in_state):
         indices = compiled.residual_assignment.get_node_indices(in_state, node)
@@ -1664,14 +1660,14 @@ def compile_to_onnx(
     rope_base_val, rope_d_rot_val = _add_rope_inits(
         per_layer_rotary, d_head, dense_inits
     )
-    cast(Any, on_layer_compiled).token_model_sink.finalize(
+    cast("Any", on_layer_compiled).token_model_sink.finalize(
         TokenModelSpec(
             d=d,
             d_head=d_head,
             max_seq_len=max_seq_len,
             vocab=tuple(embedding.tokenizer.vocab),
             vocab_size=vocab_size,
-            activation=cast(Literal["relu", "swish"], compiled.activation),
+            activation=cast("Literal['relu', 'swish']", compiled.activation),
             bias=bool(bias),
             rms_norm=rms_spec is not None,
             rms_norm_eps=float(rms_spec.eps if rms_spec else rms_norm_eps),
@@ -1864,12 +1860,12 @@ def compile_to_onnx(
 class _DebugState:
     """Captured residual-stream snapshots from a debug=True forward pass."""
 
-    state_tensor: Dict  # ResidualStreamState -> (tensor, label)
-    ordered_states: List  # [ResidualStreamState, ...]
+    state_tensor: dict  # ResidualStreamState -> (tensor, label)
+    ordered_states: list  # [ResidualStreamState, ...]
     ra: "ResidualAssignment"
 
 
-def _ordered_mlp_state_triples(net, ra) -> List[tuple]:
+def _ordered_mlp_state_triples(net, ra) -> list[tuple]:
     """Post-MLP sublayer states in execution order.
 
     Returns ``(layer_index, state_name, state)`` triples, one per
@@ -1879,7 +1875,7 @@ def _ordered_mlp_state_triples(net, ra) -> List[tuple]:
     output is reachable when the last layer happens to receive no new
     assignments.
     """
-    ordered: List[tuple] = []
+    ordered: list[tuple] = []
     for i, layer in enumerate(net.layers):
         st = layer.mlp.out_state
         if st in ra.mapping:
@@ -1909,21 +1905,21 @@ class CompiledHeadless:
     def __init__(
         self,
         net,
-        input_specs: List[tuple],
+        input_specs: list[tuple],
         output_indices: torch.Tensor,
-        metadata: Optional[dict] = None,
-        checked_nodes: Optional[List] = None,
+        metadata: dict | None = None,
+        checked_nodes: list | None = None,
     ) -> None:
         self._net = net
         # input_specs: list of (name, start_col, width) in input-tensor column order.
         self._input_specs = list(input_specs)
         self._output_indices = output_indices
-        self.input_names: List[str] = [name for name, _, _ in input_specs]
+        self.input_names: list[str] = [name for name, _, _ in input_specs]
         self.metadata: dict = dict(metadata or {})
         # Source-graph nodes carrying attached checks (node.checks) —
         # re-checked against compiled residual values on debug=True.
         self._checked_nodes = list(checked_nodes) if checked_nodes else []
-        self._debug_state: Optional[_DebugState] = None
+        self._debug_state: _DebugState | None = None
 
         # KV cache shape metadata — discovered from the compiled transformer
         # so empty_past() can build zero-length tensors of the right shape.
@@ -1935,7 +1931,8 @@ class CompiledHeadless:
     @property
     def n_layers(self) -> int:
         """Compiled layer count — the number the depth-oriented passes
-        (and their before/after reports) are measured by."""
+        (and their before/after reports) are measured by.
+        """
         return self._n_layers
 
     def _build_res_stream(self, inputs: torch.Tensor, past_len: int) -> torch.Tensor:
@@ -1972,7 +1969,7 @@ class CompiledHeadless:
 
     def empty_past(
         self,
-        max_len: Optional[int] = None,
+        max_len: int | None = None,
     ) -> tuple:
         """Zero-length past tensors suitable for a first prefill call.
 
@@ -1995,7 +1992,7 @@ class CompiledHeadless:
         self,
         inputs: torch.Tensor,
         past: tuple,
-        past_len: Optional[int] = None,
+        past_len: int | None = None,
         debug: bool = False,
         debug_atol: float = 1e-7,
     ) -> tuple:
@@ -2089,7 +2086,7 @@ class CompiledHeadless:
                 return inputs[..., s : s + w]
         raise KeyError(f"input field {name!r} not found")
 
-    def debug_value(self, node: "Node") -> Optional[torch.Tensor]:
+    def debug_value(self, node: "Node") -> torch.Tensor | None:
         """Return the compiled value of ``node`` from the last debug=True forward.
 
         Requires a prior call to ``__call__(inputs, debug=True)`` or
@@ -2133,7 +2130,7 @@ class CompiledHeadless:
         Returns ``(res, new_kvs_or_None, state_tensor)``.
         """
         net = self._net
-        state_tensor: Dict = {}
+        state_tensor: dict = {}
         if past_kvs is None:
             res, all_states = net.forward(res_stream, return_states=True)
             for key, (state, tensor) in all_states.items():
@@ -2187,7 +2184,7 @@ class CompiledHeadless:
 
     def build_prefill(
         self,
-        input_values: Dict[str, torch.Tensor],
+        input_values: dict[str, torch.Tensor],
         n_pos: int,
     ) -> torch.Tensor:
         """Pack an input-name → tensor dict into the flat row-tensor layout."""
@@ -2207,7 +2204,8 @@ class CompiledHeadless:
         past_kvs=None,
     ) -> tuple:
         """Softmax ``(weights, logits)`` at one attention layer, each
-        ``(n_heads, n_queries, n_keys)``."""
+        ``(n_heads, n_queries, n_keys)``.
+        """
         from torchwright.debug.probe import attention_capture
 
         net = self._net
@@ -2280,17 +2278,17 @@ def compile_headless(
     *,
     d: int = 1024,
     d_head: int = 16,
-    n_heads: Optional[int] = None,
+    n_heads: int | None = None,
     max_layers: int = 400,
     verbose: bool = False,
     device: str = "cpu",
-    extra_metadata: Optional[dict] = None,
-    d_hidden: Optional[int] = None,
+    extra_metadata: dict | None = None,
+    d_hidden: int | None = None,
     trim_heads: bool = True,
     optimize: int = 0,
     bias: bool = True,
-    output_layout_source: Optional[Node] = None,
-    policy: Optional[SchedulingPolicy] = None,
+    output_layout_source: Node | None = None,
+    policy: SchedulingPolicy | None = None,
 ) -> CompiledHeadless:
     """Compile a graph to an in-process callable.
 
@@ -2357,7 +2355,7 @@ def compile_headless(
     out_state = net.layers[-1].mlp.out_state
     in_state = net.layers[0].attn.in_state
 
-    input_nodes_list: List[tuple] = []  # (name, width)
+    input_nodes_list: list[tuple] = []  # (name, width)
     declared_names: set = set()
     for node in net.residual_assignment.get_nodes(in_state):
         if isinstance(node, InputNode):
@@ -2380,7 +2378,7 @@ def compile_headless(
             declared_names.add(node.input_name)
     input_nodes_list.sort(key=lambda x: x[0])
 
-    node_input_specs: List[tuple] = []
+    node_input_specs: list[tuple] = []
     offset = 0
     for name, width in input_nodes_list:
         node_input_specs.append((name, offset, width))

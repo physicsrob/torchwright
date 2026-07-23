@@ -25,14 +25,14 @@ import torch
 
 from torchwright.graph import Attn, LiteralValue, Node, RopeConfig
 from torchwright.graph.asserts import assert_in_range
-from torchwright.ops.attention_ops import attend_causal_mean
-from torchwright.ops.const import scale
 from torchwright.ops._math import (
     _N_BPS,
     _bisect_m,
     _theta_slow,
     _w_of_m,
 )
+from torchwright.ops.attention_ops import attend_causal_mean
+from torchwright.ops.const import scale
 from torchwright.ops.swiglu.arithmetic_ops import piecewise_linear
 
 
@@ -111,7 +111,7 @@ def global_position_from_bos(
     # feature rides the slowest *rotated* plane so its cos(m·θ_slow)
     # attenuation matches the inversion table.
     query_one = LiteralValue(torch.tensor([1.0]), name="bos_weight_query_one")
-    plane = cast(int, rope.d_rot) // 2 - 1
+    plane = cast("int", rope.d_rot) // 2 - 1
     query_matrix = torch.zeros((1, rope.d_head))
     query_matrix[0, plane] = A
     key_matrix = torch.zeros((1, rope.d_head))

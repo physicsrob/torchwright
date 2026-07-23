@@ -149,7 +149,8 @@ def test_onehot_lookup_tight_range_claim():
 
 def test_onehot_lookup_noise_passthrough_linear_in_epsilon():
     """An input one-hot off by ε shifts the winner's indicator by
-    exactly ε: output error 2ε·|value − default| — today's coefficient."""
+    exactly ε: output error 2ε·|value − default| — today's coefficient.
+    """
     table, key = _two_block_table()
     x = create_input("x", 5, value_range=(0.0, 1.0))
     default = torch.tensor([-7.0])
@@ -179,7 +180,8 @@ def test_onehot_lookup_wide_key_accumulated_leak_within_guard():
     (d_key = 61 on the digit pipeline) sums d_key of them, each weighted
     by up to the largest table magnitude — past the old fixed 1e-3
     closing-assert slack in exact math.  The guard is now sized by
-    _lookup_numeric_slack(max_abs, 1.0, d_key)."""
+    _lookup_numeric_slack(max_abs, 1.0, d_key).
+    """
     d_key = 61
     keys = [torch.zeros(d_key) for _ in range(d_key)]
     for i, k in enumerate(keys):
@@ -200,7 +202,8 @@ def test_onehot_lookup_wide_key_accumulated_leak_within_guard():
 def test_onehot_lookup_small_table_guard_stays_tight():
     """The derived slack stays small for small tables (max_abs=300,
     d_key=5 → 0.015): a gross input error that pushes the output past
-    the claimed [min, max] still fires the closing assert."""
+    the claimed [min, max] still fires the closing assert.
+    """
     table, key = _two_block_table()
     x = create_input("x", 5, value_range=(0.0, 1.0))
     out = onehot_lookup(x, table, torch.tensor([-7.0]))

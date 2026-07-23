@@ -1,9 +1,7 @@
-from typing import Optional
+import torch
 
 from torchwright.graph import Node
 from torchwright.graph.value_type import NodeValueType
-
-import torch
 
 
 class Linear(Node):
@@ -24,7 +22,7 @@ class Linear(Node):
         self,
         input_node: Node,
         output_matrix: torch.Tensor,
-        output_bias: Optional[torch.Tensor] = None,
+        output_bias: torch.Tensor | None = None,
         name: str = "",
     ):
         # output_matrix shape (d_input, d_output)

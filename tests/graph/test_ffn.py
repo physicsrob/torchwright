@@ -142,7 +142,8 @@ def test_block_rejects_bad_shapes():
 
 def test_gated_swish_block_compute():
     """A gated swish FFN computes the SwiGLU lane math (oracle only — the
-    compiler path is degenerate-ReLU this phase; this pins the node's spec)."""
+    compiler path is degenerate-ReLU this phase; this pins the node's spec).
+    """
     d_input, n_lanes, d_output, n_pos = 4, 5, 3, 6
     g = torch.Generator().manual_seed(3)
     gate_proj = torch.randn(n_lanes, d_input, generator=g)

@@ -19,7 +19,6 @@ def reset_node_id_counter():
     its first node, independent of test-suite execution order.
     """
     _node_module.global_node_id = 0
-    yield
 
 
 def pytest_addoption(parser):

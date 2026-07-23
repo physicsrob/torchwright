@@ -16,8 +16,8 @@ from torchwright.debug.probe import (
     reference_eval,
 )
 from torchwright.graph import Attn
-from torchwright.ops.linear import add_const, multiply_const
 from torchwright.ops.inout_nodes import create_input
+from torchwright.ops.linear import add_const, multiply_const
 
 
 def test_reference_eval_matches_direct_compute_tiny():
@@ -28,7 +28,6 @@ def test_reference_eval_matches_direct_compute_tiny():
     second unmemoised compute after reference_eval must still produce
     the identical tensor.
     """
-    from torchwright.graph.linear import Linear
     from torchwright.graph.misc import InputNode
     from torchwright.ops.linear import add, add_const, multiply_const
 

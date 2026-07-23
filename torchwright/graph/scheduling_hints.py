@@ -11,11 +11,11 @@ would otherwise create residual-stream pressure.  See
 :func:`sequential_scope`.
 """
 
-from typing import Callable, List, Optional
+from collections.abc import Callable
 
 from torchwright.compiler.residual_assignment import flatten_concat_nodes
-from torchwright.graph.node import Node, global_node_id
 from torchwright.graph.misc import Concatenate
+from torchwright.graph.node import Node
 
 
 def add_scheduling_dependency(node: Node, depends_on: Node) -> None:
@@ -47,7 +47,7 @@ def assert_hints_intact(output_node: Node, context: str) -> None:
     edge must point at a node something will actually compute).
     """
     reachable = set()
-    stack: List[Node] = [output_node]
+    stack: list[Node] = [output_node]
     while stack:
         cur = stack.pop()
         if cur in reachable:
@@ -75,7 +75,7 @@ def _current_node_id() -> int:
     return _node_mod.global_node_id
 
 
-def _find_entry_nodes(terminal: Node, lo: int, hi: int) -> List[Node]:
+def _find_entry_nodes(terminal: Node, lo: int, hi: int) -> list[Node]:
     """Non-Concatenate nodes in id-range [lo, hi) reachable backward
     from ``terminal`` whose flattened-input ids are all < lo.
 
@@ -89,8 +89,8 @@ def _find_entry_nodes(terminal: Node, lo: int, hi: int) -> List[Node]:
         return lo <= n.node_id < hi
 
     visited = set()
-    entries: List[Node] = []
-    stack: List[Node] = [terminal]
+    entries: list[Node] = []
+    stack: list[Node] = [terminal]
     while stack:
         cur = stack.pop()
         if cur in visited:
@@ -125,9 +125,9 @@ def _find_entry_nodes(terminal: Node, lo: int, hi: int) -> List[Node]:
 
 
 def sequential_scope(
-    factories: List[Callable[[], Node]],
+    factories: list[Callable[[], Node]],
     batch_size: int = 1,
-) -> List[Node]:
+) -> list[Node]:
     """Call ``factories`` in order, wiring scheduling deps so that at
     most ``batch_size`` iterations are in flight concurrently.
 
@@ -151,7 +151,7 @@ def sequential_scope(
     batch_size
         Maximum concurrency.  Must be >= 1.
 
-    Returns
+    Returns:
     -------
     List of terminal nodes, one per iteration, in the order ``factories``
     were given.
@@ -159,7 +159,7 @@ def sequential_scope(
     if batch_size < 1:
         raise ValueError(f"batch_size must be >= 1, got {batch_size}")
 
-    iterations: List[tuple] = []  # (lo_id, hi_id, terminal)
+    iterations: list[tuple] = []  # (lo_id, hi_id, terminal)
     for factory in factories:
         lo = _current_node_id()
         terminal = factory()

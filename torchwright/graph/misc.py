@@ -1,9 +1,10 @@
+from collections.abc import Callable
 from dataclasses import dataclass
-from typing import Callable, List, Dict, Optional, Tuple
-from torchwright.graph import Node
-from torchwright.graph.value_type import NodeValueType
 
 import torch
+
+from torchwright.graph import Node
+from torchwright.graph.value_type import NodeValueType
 
 # A predicate maps a value tensor to ``(ok, detail)`` where ``detail`` is a
 # short human-readable hint included in the assertion message when ``ok``
@@ -11,7 +12,7 @@ import torch
 # position-gating (e.g. "only at WALL positions") is the *caller*'s
 # responsibility — wrap the value in ``select(is_wall, ...)`` before
 # asserting so the predicate operates on the already-gated tensor.
-Predicate = Callable[[torch.Tensor], Tuple[bool, str]]
+Predicate = Callable[[torch.Tensor], tuple[bool, str]]
 
 
 @dataclass
@@ -34,7 +35,7 @@ class Check:
     predicate: Predicate
     message: str = ""
     kind: str = "assert"  # "assert" (raises) | "watch" (prints)
-    annotation: Optional[str] = None
+    annotation: str | None = None
 
     def run(self, x: torch.Tensor, node: Node) -> None:
         """Run the predicate on ``x``; raise (assert) or print (watch) on failure.
@@ -69,7 +70,7 @@ class InputNode(Node):
         d_output_or_nothing=None,
         name: str = "",
         *,
-        value_range: Tuple[float, float],
+        value_range: tuple[float, float],
     ):
         # Support both old and new constructor patterns:
         # - InputNode(d_output) - new anonymous pattern
@@ -120,7 +121,7 @@ class InputNode(Node):
 
 
 class Concatenate(Node):
-    def __init__(self, inputs: List[Node]):
+    def __init__(self, inputs: list[Node]):
         super().__init__(sum(len(x) for x in inputs), inputs)
 
     def compute(self, n_pos: int, input_values: dict) -> torch.Tensor:
@@ -129,7 +130,7 @@ class Concatenate(Node):
     def compute_value_type(self) -> NodeValueType:
         return NodeValueType()
 
-    def flatten_inputs(self: Node) -> List[Node]:
+    def flatten_inputs(self: Node) -> list[Node]:
         # Flatten concatenation and return the list of nodes
         inputs = []
         for n in self.inputs:
@@ -154,10 +155,9 @@ class Add(Node):
     def other_input(self, node: Node):
         if self.inputs[0] == node:
             return self.inputs[1]
-        elif self.inputs[1] == node:
+        if self.inputs[1] == node:
             return self.inputs[0]
-        else:
-            raise ValueError("Invalid node choice")
+        raise ValueError("Invalid node choice")
 
 
 class LiteralValue(Node):
@@ -187,8 +187,7 @@ class LiteralValue(Node):
     def node_type(self):
         if self.is_zero():
             return "Zero"
-        else:
-            return "LiteralValue"
+        return "LiteralValue"
 
 
 class Placeholder(Node):

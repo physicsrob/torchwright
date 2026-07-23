@@ -37,7 +37,7 @@ Constructing a :class:`LoweredGraph` does three things:
 """
 
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Dict, List, Optional, Set, Tuple, cast
+from typing import TYPE_CHECKING, Optional, cast
 
 if TYPE_CHECKING:
     from torchwright.compiler.collapse import CollapseReport
@@ -54,11 +54,9 @@ from torchwright.compiler.realization import (
 )
 from torchwright.compiler.utils import get_ancestor_nodes
 from torchwright.graph import Node
-from torchwright.graph.optimize import FoldLog, fuse_consecutive_linears
-from torchwright.graph.scheduling_hints import assert_hints_intact
 from torchwright.graph.attn import Attn
-from torchwright.graph.ffn import FFN
 from torchwright.graph.embedding import Embedding
+from torchwright.graph.ffn import FFN
 from torchwright.graph.linear import Linear
 from torchwright.graph.misc import (
     Add,
@@ -68,13 +66,15 @@ from torchwright.graph.misc import (
     Placeholder,
     ValueLogger,
 )
+from torchwright.graph.optimize import FoldLog, fuse_consecutive_linears
 from torchwright.graph.relu import ReLU
+from torchwright.graph.scheduling_hints import assert_hints_intact
 
 # The closed vocabulary a compilable graph may contain.  Anything outside
 # this tuple has no scheduler routing and no weight-writer emission; it is
 # rejected at the boundary with a construction-bug error instead of failing
 # deep inside scheduling.
-VOCABULARY: Tuple[type, ...] = (
+VOCABULARY: tuple[type, ...] = (
     FFN,
     Attn,
     Linear,
@@ -123,8 +123,8 @@ class LoweredGraph:
 
     output_node: Node
     realization_table: RealizationTable
-    source_output_node: Optional[Node] = None
-    node_map: Dict[Node, Node] = field(default_factory=dict)
+    source_output_node: Node | None = None
+    node_map: dict[Node, Node] = field(default_factory=dict)
     # Source node -> (copy node, column offset, width) for source values that
     # survive fusion as a column slice of a widened copy node (the sibling
     # merge).  ``node_map`` cannot express these — it maps whole values — and
@@ -132,7 +132,7 @@ class LoweredGraph:
     # nothing to gather.  Consumed by forward_compile's source re-key, which
     # turns each record into the matching slice of the holder's residual
     # columns.
-    slice_map: Dict[Node, tuple] = field(default_factory=dict)
+    slice_map: dict[Node, tuple] = field(default_factory=dict)
     # Per-subgraph collapse/decline log when the univariate collapse
     # pass ran (None when it didn't) — see torchwright.compiler.collapse.
     collapse_report: Optional["CollapseReport"] = None
@@ -156,9 +156,9 @@ class LoweredGraph:
     def cost_summary(
         self,
         d_head: int,
-        realization_table: Optional[RealizationTable] = None,
+        realization_table: RealizationTable | None = None,
         policy: Optional["SchedulingPolicy"] = None,
-        usable_slots: Optional[int] = None,
+        usable_slots: int | None = None,
     ) -> CostSummary:
         """Hardware demand readable *before* scheduling.
 
@@ -201,23 +201,24 @@ class _ChainMiner:
     ``Concatenate``.
     """
 
-    def __init__(self, all_nodes: Set[Node]):
-        self._direct_consumers: Dict[Node, List[Node]] = {n: [] for n in all_nodes}
+    def __init__(self, all_nodes: set[Node]):
+        self._direct_consumers: dict[Node, list[Node]] = {n: [] for n in all_nodes}
         for node in all_nodes:
             for inp in node.inputs:
                 if inp in self._direct_consumers:
                     self._direct_consumers[inp].append(node)
-        self._eff_cache: Dict[Node, Set[Node]] = {}
+        self._eff_cache: dict[Node, set[Node]] = {}
 
-    def effective_consumers(self, node: Node) -> Set[Node]:
+    def effective_consumers(self, node: Node) -> set[Node]:
         """Consumers resolving through Concatenate.
 
         A terminal Concatenate (an output concat with no further
         consumers) is kept as the effective consumer so the node it
-        groups is never treated as dead."""
+        groups is never treated as dead.
+        """
         if node in self._eff_cache:
             return self._eff_cache[node]
-        result: Set[Node] = set()
+        result: set[Node] = set()
         for consumer in self._direct_consumers.get(node, []):
             if isinstance(consumer, Concatenate):
                 downstream = self.effective_consumers(consumer)
@@ -230,10 +231,10 @@ class _ChainMiner:
         self._eff_cache[node] = result
         return result
 
-    def mine(self) -> List[Tuple[Linear, ReLU, Linear]]:
-        chains: List[Tuple[Linear, ReLU, Linear]] = []
-        seen_relus: Set[Node] = set()
-        seen_linears: Set[Node] = set()
+    def mine(self) -> list[tuple[Linear, ReLU, Linear]]:
+        chains: list[tuple[Linear, ReLU, Linear]] = []
+        seen_relus: set[Node] = set()
+        seen_linears: set[Node] = set()
 
         linears = sorted(
             (n for n in self._direct_consumers if isinstance(n, Linear)),
@@ -266,13 +267,13 @@ class _ChainMiner:
         return chains
 
 
-def _check_vocabulary(all_nodes: Set[Node]) -> None:
+def _check_vocabulary(all_nodes: set[Node]) -> None:
     """Raise :class:`LoweringError` if any node is outside the vocabulary."""
     strays = [n for n in all_nodes if not isinstance(n, VOCABULARY)]
     if not strays:
         return
 
-    parts: List[str] = []
+    parts: list[str] = []
     relus = [n for n in strays if isinstance(n, ReLU)]
     if relus:
         miner = _ChainMiner(all_nodes)
@@ -296,7 +297,7 @@ def _check_vocabulary(all_nodes: Set[Node]) -> None:
             )
     others = [n for n in strays if not isinstance(n, ReLU)]
     if others:
-        by_type: Dict[str, List[int]] = {}
+        by_type: dict[str, list[int]] = {}
         for n in others:
             by_type.setdefault(type(n).__name__, []).append(n.node_id)
         desc = ", ".join(f"{t} {sorted(ids)}" for t, ids in sorted(by_type.items()))
@@ -313,7 +314,7 @@ def lower(
     verbose: bool = False,
     collapse_univariate: bool = False,
     collapse_pl: bool = False,
-    collapse_lane_cap: Optional[int] = None,
+    collapse_lane_cap: int | None = None,
 ) -> LoweredGraph:
     """Certify the graph reachable from ``output_node`` and return its copy.
 
@@ -396,7 +397,7 @@ def lower(
 
         copy_output, collapse_report = collapse_univariate_subgraphs(
             copy_output,
-            lane_cap=cast(int, collapse_lane_cap),
+            lane_cap=cast("int", collapse_lane_cap),
             fold_log=fold_log,
             verbose=verbose,
         )
@@ -407,7 +408,7 @@ def lower(
 
         copy_output, collapse_pl_report = collapse_pl_subgraphs(
             copy_output,
-            lane_cap=cast(int, collapse_lane_cap),
+            lane_cap=cast("int", collapse_lane_cap),
             fold_log=fold_log,
             verbose=verbose,
         )
@@ -416,8 +417,8 @@ def lower(
 
     copy_nodes = get_ancestor_nodes({copy_output})
 
-    slice_map: Dict[Node, tuple] = {}
-    node_map: Dict[Node, Node]
+    slice_map: dict[Node, tuple] = {}
+    node_map: dict[Node, Node]
     if not n_fused and not n_collapsed:
         node_map = dict(copy.node_map)
     else:

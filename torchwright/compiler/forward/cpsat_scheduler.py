@@ -33,14 +33,22 @@ from __future__ import annotations
 import os
 import time
 import warnings
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from types import MappingProxyType
-from typing import Any, Dict, FrozenSet, List, Mapping, Optional, Set, Tuple, cast
+from typing import Any, cast
 
 from ortools.sat.python import cp_model
 
 from torchwright.compiler.forward.add_placement import derive_add_placement
+from torchwright.compiler.forward.cpsat_snapshot import (
+    SchedulingProblem,
+)
 from torchwright.compiler.forward.graph_analysis import GraphAnalyzer
+from torchwright.compiler.forward.scheduling_policy import (
+    LEGACY_POLICY,
+    SchedulingPolicy,
+)
 from torchwright.compiler.realization import (
     CLASS_SUBLAYER,
     candidate_classes,
@@ -48,12 +56,8 @@ from torchwright.compiler.realization import (
     linear_attn_heads,
     static_flex_class,
 )
-from torchwright.compiler.utils import resolve_n_heads
-from torchwright.compiler.forward.scheduling_policy import (
-    LEGACY_POLICY,
-    SchedulingPolicy,
-)
 from torchwright.compiler.residual_assignment import flatten_concat_nodes
+from torchwright.compiler.utils import resolve_n_heads
 from torchwright.graph import (
     Add,
     Attn,
@@ -63,12 +67,8 @@ from torchwright.graph import (
     Linear,
     Node,
 )
-from torchwright.graph.misc import LiteralValue
 from torchwright.graph.ffn import FFN
-from torchwright.compiler.forward.cpsat_snapshot import (
-    SchedulingProblem,
-    snapshot_from_graph_model,
-)
+from torchwright.graph.misc import LiteralValue
 
 # ---------------------------------------------------------------------------
 # Public dataclasses
@@ -228,15 +228,15 @@ class ScheduleAssignment:
         cls,
         output_node: Node,
         *,
-        node_to_layer: Dict[int, int],
-        node_to_routing: Dict[int, str],
-        observed_cancel_layer: Dict[int, int],
-        observed_cancel_mech: Dict[int, str],
+        node_to_layer: dict[int, int],
+        node_to_routing: dict[int, str],
+        observed_cancel_layer: dict[int, int],
+        observed_cancel_mech: dict[int, str],
         n_layers: int,
-        observed_add_placement: Optional[Dict[int, Tuple[bool, Optional[int]]]] = None,
-        held_source_id: Optional[int] = None,
-        held_target_id: Optional[int] = None,
-    ) -> "ScheduleAssignment":
+        observed_add_placement: dict[int, tuple[bool, int | None]] | None = None,
+        held_source_id: int | None = None,
+        held_target_id: int | None = None,
+    ) -> ScheduleAssignment:
         """Complete and validate a schedule-only heuristic trace.
 
         Before canonicalizing target metadata, each Add's expected placement
@@ -272,8 +272,8 @@ class ScheduleAssignment:
         # Physical-versus-derived Add placement tripwire + reused-target
         # canonicalization (docs/plan_additional_mlp_routing.md).
         observed_add_placement = observed_add_placement or {}
-        canonical_cancel: Dict[int, int] = {}
-        canonical_mech: Dict[int, str] = {}
+        canonical_cancel: dict[int, int] = {}
+        canonical_mech: dict[int, str] = {}
         for node in gm.schedulable:
             if not isinstance(node, Add):
                 continue
@@ -430,7 +430,7 @@ class DiagnosticHint:
             )
 
     @classmethod
-    def from_assignment(cls, assignment: ScheduleAssignment) -> "DiagnosticHint":
+    def from_assignment(cls, assignment: ScheduleAssignment) -> DiagnosticHint:
         return cls(
             layers=assignment.node_to_layer,
             routing=assignment.node_to_routing,
@@ -438,7 +438,7 @@ class DiagnosticHint:
             cancel_mech=assignment.node_to_cancel_mech,
         )
 
-    def without_cancel_layers(self) -> "DiagnosticHint":
+    def without_cancel_layers(self) -> DiagnosticHint:
         return DiagnosticHint(
             layers=self.layers,
             routing=self.routing,
@@ -448,9 +448,9 @@ class DiagnosticHint:
 
 def choose_dominating_assignment(
     costs: Costs,
-    incumbent: Optional[ScheduleAssignment],
-    candidate: Optional[ScheduleAssignment],
-) -> Optional[ScheduleAssignment]:
+    incumbent: ScheduleAssignment | None,
+    candidate: ScheduleAssignment | None,
+) -> ScheduleAssignment | None:
     """Select a candidate only when its comparable objective dominates.
 
     Pure-depth is the production default and is fully evaluable from an
@@ -512,9 +512,9 @@ class SchedulingProvenance:
     origin: str  # "heuristic" or "solver"
     delivery: str  # "fresh" or "cache"
     selected_is_optimal: bool = False
-    selected_objective: Optional[int] = None
-    selected_objective_blocks: Optional[Tuple[int, int]] = None
-    solver_attempt: Optional[SolveStats] = None
+    selected_objective: int | None = None
+    selected_objective_blocks: tuple[int, int] | None = None
+    solver_attempt: SolveStats | None = None
 
     @property
     def is_optimal(self) -> bool:
@@ -578,16 +578,16 @@ class BuiltModel:
 
     model: cp_model.CpModel
     gm: GraphModel
-    layer_var: Dict[int, cp_model.IntVar]
-    cancel_layer: Dict[int, cp_model.IntVar]
-    is_attn: Dict[int, cp_model.IntVar]
-    is_free: Dict[int, cp_model.IntVar]
+    layer_var: dict[int, cp_model.IntVar]
+    cancel_layer: dict[int, cp_model.IntVar]
+    is_attn: dict[int, cp_model.IntVar]
+    is_free: dict[int, cp_model.IntVar]
     # Per non-keep-forever schedulable node: 1 when its cancel runs as a
     # ``cancel_bypass`` MLP op (cost on the MLP hidden-slot budget), 0 when it
     # runs as a batched attention cancel head (cost on the attention-head
     # budget).  Absent for keep-forever nodes (they never cancel in-horizon)
     # and freeable inputs (always attention-cancelled — decision #3).
-    cancel_in_mlp: Dict[int, cp_model.IntVar]
+    cancel_in_mlp: dict[int, cp_model.IntVar]
     n_layers_var: cp_model.IntVar
     total_attn_heads: cp_model.IntVar
     total_mlp_bypass: cp_model.IntVar
@@ -597,13 +597,13 @@ class BuiltModel:
     # from `cancel_layer` (which is keyed by schedulable node) so the
     # schedulable iteration stays clean; `solve_schedule` reads these into the
     # assignment so `DirectedLayerScheduler` frees the inputs at replay.
-    input_cancel_layer: Dict[int, cp_model.IntVar]
+    input_cancel_layer: dict[int, cp_model.IntVar]
     # Optional held-bank contract.  The source is a freeable input whose
     # physically-cancelled columns remain unavailable until the target (the
     # graph output) is born.  Retained here so hint validation uses the same
     # gap-0 source semantics as the model.
-    held_source_id: Optional[int] = None
-    held_target_id: Optional[int] = None
+    held_source_id: int | None = None
+    held_target_id: int | None = None
     # The lexicographic multiplier applied to the primary objective block
     # when Costs has secondary terms (earliness/waste); 1 otherwise.
     # ObjectiveValue() // objective_scale recovers the primary value.
@@ -614,12 +614,12 @@ class BuiltModel:
     # domains without re-deriving them (and without reading IntVar.Proto(),
     # which returns corrupted memory in the installed ortools build and
     # segfaults a later Solve()).
-    layer_bounds: Optional[Dict[int, Tuple[int, int]]] = None
+    layer_bounds: dict[int, tuple[int, int]] | None = None
     # Schedulable nodes whose cancel var is pinned to `max_layers` (pinned
     # nodes and nodes consumed by a terminal Concatenate), and the same for
     # freeable inputs.  Retained for hint validation.
-    keep_forever_ids: FrozenSet[int] = frozenset()
-    input_keep_ids: FrozenSet[int] = frozenset()
+    keep_forever_ids: frozenset[int] = frozenset()
+    input_keep_ids: frozenset[int] = frozenset()
     # Per-occurrence Add placement literals, keyed (add_id, occurrence):
     # `add_reusable` reifies the sublayer-order deadness predicate;
     # `add_reuse` is the deterministic selector (occurrence 0 wins).
@@ -628,23 +628,23 @@ class BuiltModel:
     # the extracted layers/routes (`add_placement.derive_add_placement`) and
     # asserts they match while these literals still exist.  The held target
     # has no entries (its is_free is pinned 0 without the biconditional).
-    add_reusable: Dict[Tuple[int, int], cp_model.IntVar] = field(default_factory=dict)
-    add_reuse: Dict[Tuple[int, int], cp_model.IntVar] = field(default_factory=dict)
+    add_reusable: dict[tuple[int, int], cp_model.IntVar] = field(default_factory=dict)
+    add_reuse: dict[tuple[int, int], cp_model.IntVar] = field(default_factory=dict)
     # Old value id -> OR of the selectors that reassign it (an ownership
     # handoff: no physical cancel, parked forced false).
-    reused_as_target: Dict[int, cp_model.IntVar] = field(default_factory=dict)
+    reused_as_target: dict[int, cp_model.IntVar] = field(default_factory=dict)
     # Hint-aware cancel-window widening actually applied: `node_id -> delta`
     # for every node whose window was widened past the uniform
     # `last_consumer + 1 + K` (only nonzero deltas appear).  None when the
     # model was built without hints.
-    cancel_window_delta: Optional[Dict[int, int]] = None
+    cancel_window_delta: dict[int, int] | None = None
     # The cancel-window slack K the model actually posted (None when the
     # window family is disabled or `cancel_slack=None`).
-    eff_cancel_slack: Optional[int] = None
+    eff_cancel_slack: int | None = None
     # Per-node routing as the model sees it: "attn"/"mlp" for pinned nodes,
     # "flex" when routing is a free decision variable.  Used by hint
     # validation to mirror the routing-aware cancel bounds.
-    static_routing: Optional[Dict[int, str]] = None
+    static_routing: dict[int, str] | None = None
     # True when the model was built with `_pin_cancels` (cancel layers
     # equality-pinned; no parked/window/widening families) — the production
     # default since 2026-07-10.  `_solve_built` reads it to drop the
@@ -664,22 +664,22 @@ class GraphModel:
     """Static analysis of the graph that the CP-SAT model is built over."""
 
     graph: GraphAnalyzer
-    schedulable: List[Node]  # nodes that need a time slot
-    edges: List[Tuple[Node, Node]]  # (u, v) Concatenate-transparent
-    consumers_eff: Dict[Node, Set[Node]]  # effective consumers (Concat-transparent)
+    schedulable: list[Node]  # nodes that need a time slot
+    edges: list[tuple[Node, Node]]  # (u, v) Concatenate-transparent
+    consumers_eff: dict[Node, set[Node]]  # effective consumers (Concat-transparent)
     output_node: Node
     pos_encoding: object  # vestigial (always None) — position is rotary, no node
-    input_nodes: List[Node]  # pre-allocated inputs (incl. LiteralValue)
-    pinned_nodes: Set[Node]  # never freed
+    input_nodes: list[Node]  # pre-allocated inputs (incl. LiteralValue)
+    pinned_nodes: set[Node]  # never freed
 
 
 def _effective_consumers(
-    graph: GraphAnalyzer, node: Node, cache: Dict[Node, Set[Node]]
-) -> Set[Node]:
+    graph: GraphAnalyzer, node: Node, cache: dict[Node, set[Node]]
+) -> set[Node]:
     """Mirror `LayerScheduler._get_effective_consumers`."""
     if node in cache:
         return cache[node]
-    result: Set[Node] = set()
+    result: set[Node] = set()
     for consumer in graph.get_consumers(node):
         if isinstance(consumer, Concatenate):
             downstream = _effective_consumers(graph, consumer, cache)
@@ -706,9 +706,9 @@ def build_graph_model(output_node: Node, pos_encoding=None) -> GraphModel:
     # deliberately NOT an input node — it's materialized just-in-time near its
     # consumer (see is_input_node / docs/constants_plan.md), so it lands in
     # `schedulable` below, not here.
-    input_nodes: List[Node] = [n for n in all_nodes if graph.is_input_node(n)]
+    input_nodes: list[Node] = [n for n in all_nodes if graph.is_input_node(n)]
 
-    schedulable: List[Node] = sorted(
+    schedulable: list[Node] = sorted(
         (
             n
             for n in all_nodes
@@ -718,15 +718,15 @@ def build_graph_model(output_node: Node, pos_encoding=None) -> GraphModel:
     )
 
     # Effective-consumers cache (Concat-transparent).
-    consumers_eff: Dict[Node, Set[Node]] = {}
+    consumers_eff: dict[Node, set[Node]] = {}
     for n in all_nodes:
         if isinstance(n, Concatenate):
             continue
         _effective_consumers(graph, n, consumers_eff)
 
     # Edges: every direct dependency, traversing Concatenate inputs.
-    edges_set: Set[Tuple[int, int]] = set()
-    edges: List[Tuple[Node, Node]] = []
+    edges_set: set[tuple[int, int]] = set()
+    edges: list[tuple[Node, Node]] = []
     for v in schedulable:
         for inp in v.inputs:
             if isinstance(inp, Concatenate):
@@ -744,7 +744,7 @@ def build_graph_model(output_node: Node, pos_encoding=None) -> GraphModel:
                 edges_set.add(key)
                 edges.append((pred, v))
 
-    pinned_nodes: Set[Node] = set(input_nodes)
+    pinned_nodes: set[Node] = set(input_nodes)
     pinned_nodes.add(output_node)
 
     return GraphModel(
@@ -772,7 +772,7 @@ def routing(
     node: Node,
     gm: GraphModel,
     policy: SchedulingPolicy,
-    usable_slots: Optional[int],
+    usable_slots: int | None,
 ) -> str:
     """Static routing decision under the given policy and geometry.
 
@@ -892,13 +892,13 @@ def uses_residual(node: Node, gm: GraphModel) -> bool:
 
 
 def _compute_layer_bounds(
-    gm: "GraphModel",
+    gm: GraphModel,
     policy: SchedulingPolicy,
     flex_routing: bool,
     max_layers: int,
     *,
-    usable_slots: Optional[int] = None,
-) -> Tuple[Dict[int, int], Dict[int, int]]:
+    usable_slots: int | None = None,
+) -> tuple[dict[int, int], dict[int, int]]:
     """Per-node [earliest, latest] layer bounds from the dependency DAG.
 
     Mirrors the dependency-constraint semantics exactly: edge u->v allows
@@ -921,7 +921,7 @@ def _compute_layer_bounds(
     # producer).  Tracking earliest/latest per mode captures that; the
     # per-edge relaxation without modes is sound but visibly weaker (proved
     # 40 vs presolve's 50 on the d8192 DOOM graph).
-    def modes(n: Node) -> Tuple[str, ...]:
+    def modes(n: Node) -> tuple[str, ...]:
         if flex_routing and is_flex(n, gm):
             return (ATTN, MLP)
         return (routing(n, gm, policy, usable_slots),)
@@ -931,15 +931,15 @@ def _compute_layer_bounds(
 
     input_ids = {n.node_id for n in gm.input_nodes}
     node_modes = {n.node_id: modes(n) for n in gm.schedulable}
-    edges: List[Tuple[int, int]] = []
+    edges: list[tuple[int, int]] = []
     for nu, nv in gm.edges:
         if nu.node_id in input_ids:
             continue
         edges.append((nu.node_id, nv.node_id))
 
     ids = [n.node_id for n in gm.schedulable]
-    es = {i: {m: 0 for m in node_modes[i]} for i in ids}
-    ls = {i: {m: max_layers - 1 for m in node_modes[i]} for i in ids}
+    es = {i: dict.fromkeys(node_modes[i], 0) for i in ids}
+    ls = {i: dict.fromkeys(node_modes[i], max_layers - 1) for i in ids}
     # Fixpoint over the dependency edges; converges in one forward+backward
     # sweep when edges are in topological order (gm.schedulable is
     # build-ordered), but loop defensively in case they are not.
@@ -973,9 +973,9 @@ def critical_path_layers(
     output_node: Node,
     pos_encoding=None,
     *,
-    policy: Optional[SchedulingPolicy] = None,
+    policy: SchedulingPolicy | None = None,
     flex_routing: bool = True,
-    usable_slots: Optional[int] = None,
+    usable_slots: int | None = None,
 ) -> int:
     """Exact minimum layer count imposed by the dependency DAG alone.
 
@@ -1023,19 +1023,19 @@ def build_cpsat_model(
     *,
     d: int,
     d_head: int,
-    n_heads: Optional[int] = None,
+    n_heads: int | None = None,
     d_hidden: int,
     costs: Costs = Costs(),
     flex_routing: bool = True,
     max_layers: int = 60,
-    cancel_slack: Optional[int] = 2,
-    policy: Optional[SchedulingPolicy] = None,
+    cancel_slack: int | None = 2,
+    policy: SchedulingPolicy | None = None,
     reserve_heads: int = 0,
     reserve_residual: int = 0,
     tighten_domains: bool = False,
-    diagnostic_hint: Optional[DiagnosticHint] = None,
-    held_source_id: Optional[int] = None,
-    held_target_id: Optional[int] = None,
+    diagnostic_hint: DiagnosticHint | None = None,
+    held_source_id: int | None = None,
+    held_target_id: int | None = None,
     _disabled_families: frozenset = frozenset(),
     _canonical_cancel_reps: bool = False,
     _pin_cancels: bool = True,
@@ -1088,19 +1088,19 @@ def build_cpsat_model_from_gm(
     *,
     d: int,
     d_head: int,
-    n_heads: Optional[int] = None,
+    n_heads: int | None = None,
     d_hidden: int,
     costs: Costs = Costs(),
     flex_routing: bool = True,
     max_layers: int = 60,
-    cancel_slack: Optional[int] = 2,
-    policy: Optional[SchedulingPolicy] = None,
+    cancel_slack: int | None = 2,
+    policy: SchedulingPolicy | None = None,
     reserve_heads: int = 0,
     reserve_residual: int = 0,
     tighten_domains: bool = False,
-    diagnostic_hint: Optional[DiagnosticHint] = None,
-    held_source_id: Optional[int] = None,
-    held_target_id: Optional[int] = None,
+    diagnostic_hint: DiagnosticHint | None = None,
+    held_source_id: int | None = None,
+    held_target_id: int | None = None,
     _disabled_families: frozenset = frozenset(),
     _canonical_cancel_reps: bool = False,
     _pin_cancels: bool = True,
@@ -1192,7 +1192,7 @@ def build_cpsat_model_from_gm(
     if held_source_id is not None:
         by_id = {n.node_id: n for n in gm.graph.get_all_nodes()}
         held_source = by_id.get(held_source_id)
-        held_target = by_id.get(cast(int, held_target_id))
+        held_target = by_id.get(cast("int", held_target_id))
         if held_source is None:
             raise ValueError(
                 f"held_source_id {held_source_id} does not name a node in "
@@ -1234,12 +1234,10 @@ def build_cpsat_model_from_gm(
         if tighten_domains
         else None
     )
-    layer_var: Dict[int, cp_model.IntVar] = {}
+    layer_var: dict[int, cp_model.IntVar] = {}
     layer_var_hi_sum = 0
-    layer_var_lo: Dict[int, int] = {}
-    layer_bounds: Optional[Dict[int, Tuple[int, int]]] = (
-        {} if bounds is not None else None
-    )
+    layer_var_lo: dict[int, int] = {}
+    layer_bounds: dict[int, tuple[int, int]] | None = {} if bounds is not None else None
     for n in gm.schedulable:
         lo, hi = (
             (bounds[0][n.node_id], bounds[1][n.node_id])
@@ -1261,8 +1259,8 @@ def build_cpsat_model_from_gm(
     # ---- Routing: is_attn[n] BoolVar (or fixed literal) per node ----
     # is_attn[n] == 1 means the node runs in the attention sublayer
     # at its layer; is_attn[n] == 0 means it runs in MLP.
-    is_attn: Dict[int, cp_model.IntVar] = {}
-    static_routing: Dict[int, str] = {}
+    is_attn: dict[int, cp_model.IntVar] = {}
+    static_routing: dict[int, str] = {}
     held_direct_handoff = (
         held_source is not None
         and held_target in gm.consumers_eff.get(held_source, set())
@@ -1348,22 +1346,22 @@ def build_cpsat_model_from_gm(
     # deadness biconditional (the 32983b0 contract).  Assignment-level
     # mirror: `add_placement.derive_add_placement` — extraction asserts the
     # two agree while the literals still exist.
-    is_free: Dict[int, cp_model.IntVar] = {}
-    add_reusable: Dict[Tuple[int, int], cp_model.IntVar] = {}
-    add_reuse: Dict[Tuple[int, int], cp_model.IntVar] = {}
+    is_free: dict[int, cp_model.IntVar] = {}
+    add_reusable: dict[tuple[int, int], cp_model.IntVar] = {}
+    add_reuse: dict[tuple[int, int], cp_model.IntVar] = {}
     # `add_attn_gap[A]` = OR(is_free[A], NOT is_attn[A]): the extra layer an
     # ordinary source of A must stay alive under an ATTENTION-mechanism
     # cancel — 1 for any reuse (gap #2 conservatism, both routes) and for an
     # MLP-routed Add (its sources are read after the attention cancel would
     # fire).  The MLP-mechanism term stays `is_free[A]` alone.
-    add_attn_gap: Dict[int, cp_model.IntVar] = {}
+    add_attn_gap: dict[int, cp_model.IntVar] = {}
     # Old value -> the selector literals that reassign it; mutually exclusive
     # by construction (posted below) so one residual owner cannot be
     # reassigned twice.
-    target_selectors: Dict[int, List[cp_model.IntVar]] = {}
+    target_selectors: dict[int, list[cp_model.IntVar]] = {}
     # (selector, add_id, target node): the virtual-handoff equality
     # `cancel == layer[A] + 1` is posted after the cancel vars exist.
-    target_cancel_specs: List[Tuple[cp_model.IntVar, int, Node]] = []
+    target_cancel_specs: list[tuple[cp_model.IntVar, int, Node]] = []
     for A in gm.schedulable:
         if not isinstance(A, Add):
             continue
@@ -1395,7 +1393,7 @@ def build_cpsat_model_from_gm(
             continue
         a_layer = layer_var[A.node_id]
         a_attn = is_attn[A.node_id]
-        occurrence_literals: List[cp_model.IntVar] = []
+        occurrence_literals: list[cp_model.IntVar] = []
         for i, E in enumerate(A.inputs):
             if i == 1 and E is A.inputs[0]:
                 # add(x, x): one node, one consumer set, one deadness value —
@@ -1424,7 +1422,7 @@ def build_cpsat_model_from_gm(
                 # consumer) can never be sequenced before A's snapshot.
                 model.add(r == 0)
                 continue
-            complete_bools: List[cp_model.IntVar] = []
+            complete_bools: list[cp_model.IntVar] = []
             for C in sorted(other_consumers, key=lambda c: c.node_id):
                 c_layer = layer_var[C.node_id]
                 b_lt = model.new_bool_var(
@@ -1491,10 +1489,10 @@ def build_cpsat_model_from_gm(
     # One residual owner is reassigned at most once; `reused_as_target[E]`
     # is the OR of the selectors naming E (an ownership handoff, not a
     # parked value or a cancel).
-    reused_as_target: Dict[int, cp_model.IntVar] = {}
+    reused_as_target: dict[int, cp_model.IntVar] = {}
     for eid, sels in target_selectors.items():
         model.add_at_most_one(sels)
-        rat: Optional[cp_model.IntVar]
+        rat: cp_model.IntVar | None
         rat = model.new_bool_var(f"reused_as_target_n{eid}")
         model.add_bool_or(sels).OnlyEnforceIf(rat)
         model.add_bool_and([s.Not() for s in sels]).OnlyEnforceIf(rat.Not())
@@ -1536,9 +1534,9 @@ def build_cpsat_model_from_gm(
     # interval still spans [layer, cancel), so no invalid schedule becomes
     # expressible — the window just admits the schedules the heuristic
     # actually emits, preserving the moving near-last-consumer shape.
-    cancel_window_delta: Dict[int, int] = {}
+    cancel_window_delta: dict[int, int] = {}
 
-    def _widen_delta(nid: int, hint_base: Optional[int]) -> int:
+    def _widen_delta(nid: int, hint_base: int | None) -> int:
         if hint_cancel is None or hint_base is None or eff_cancel_slack is None:
             return 0
         hinted = hint_cancel.get(nid)
@@ -1549,20 +1547,20 @@ def build_cpsat_model_from_gm(
             cancel_window_delta[nid] = delta
         return delta
 
-    def _hinted_last_consumer(consumer_ids: List[int]) -> Optional[int]:
+    def _hinted_last_consumer(consumer_ids: list[int]) -> int | None:
         if hint_layers is None or not consumer_ids:
             return None
         hinted = [hint_layers.get(cid) for cid in consumer_ids]
         if any(L is None for L in hinted):
             return None
-        return max(cast(List[int], hinted))
+        return max(cast("list[int]", hinted))
 
-    cancel_layer: Dict[int, cp_model.IntVar] = {}
-    keep_forever_ids: Set[int] = set()
+    cancel_layer: dict[int, cp_model.IntVar] = {}
+    keep_forever_ids: set[int] = set()
     # Nodes whose cancel window carries a `parked` escape (cl == max_layers
     # allowed instead of the near-last-consumer window).  Their cancel-head
     # interval is gated absent when parked (below), so parking charges no head.
-    parked_by_id: Dict[int, cp_model.IntVar] = {}
+    parked_by_id: dict[int, cp_model.IntVar] = {}
     # `cancel_in_mlp[n]` == 1 routes n's death cancel to the MLP sublayer (a
     # `cancel_bypass` op charged 2·len(n) hidden slots) instead of a batched
     # attention cancel head.  Built only for non-keep-forever schedulable nodes;
@@ -1570,17 +1568,17 @@ def build_cpsat_model_from_gm(
     # to the uniform gap-0 `cl >= layer[c]` for every consumer (an MLP cancel
     # fires after both sublayers' reads) and moves the cancel cost from the
     # attention-head cumulative to the MLP-slot cumulative.
-    cancel_in_mlp: Dict[int, cp_model.IntVar] = {}
+    cancel_in_mlp: dict[int, cp_model.IntVar] = {}
     # Add-consumer cancel lower bounds are posted with the mechanism-specific
     # Add terms (below): the gap between a source's cancel and the Add's
     # layer depends on the reuse regime, the Add's route, and the cancel
     # mechanism.
-    deferred_add_consumer_lbs: List[Tuple[cp_model.IntVar, cp_model.IntVar, int]] = []
+    deferred_add_consumer_lbs: list[tuple[cp_model.IntVar, cp_model.IntVar, int]] = []
     # `_pin_cancels` equality pins are likewise deferred until `is_free`
     # exists (Add-consumer terms read it): per node, (node_id, cl, cim,
     # non-Add consumer ids with layer vars, Add consumer ids with layer vars).
-    deferred_pin_specs: List[
-        Tuple[int, cp_model.IntVar, cp_model.IntVar, List[int], List[int]]
+    deferred_pin_specs: list[
+        tuple[int, cp_model.IntVar, cp_model.IntVar, list[int], list[int]]
     ] = []
 
     def _canonicalize_cancel_reps(cl, parked, cim, rat=None):
@@ -1623,11 +1621,11 @@ def build_cpsat_model_from_gm(
             keep_forever_ids.add(n.node_id)
             continue
         # Non-keep-forever: this node gets a mechanism choice.
-        cim: Optional[cp_model.IntVar]
+        cim: cp_model.IntVar | None
         cim = model.new_bool_var(f"cancel_in_mlp_n{n.node_id}")
         cancel_in_mlp[n.node_id] = cim
-        consumer_layer_vars: List[cp_model.IntVar] = []
-        consumer_ids: List[int] = []
+        consumer_layer_vars: list[cp_model.IntVar] = []
+        consumer_ids: list[int] = []
         for c in consumers:
             if c.node_id in layer_var:
                 if "cancel_consumer_lb" not in _disabled_families:
@@ -1687,7 +1685,7 @@ def build_cpsat_model_from_gm(
             # ownership handoff, not a parked value: its parked literal is
             # forced false and the ordinary window is gated off — the
             # selector posts the exact `layer[A] + 1` handoff instead.
-            parked: Optional[cp_model.IntVar]
+            parked: cp_model.IntVar | None
             parked = model.new_bool_var(f"parked_n{n.node_id}")
             parked_by_id[n.node_id] = parked
             window_gate = [parked.Not()] if rat is None else [parked.Not(), rat.Not()]
@@ -1719,9 +1717,9 @@ def build_cpsat_model_from_gm(
     # before the layer loop) and live until their last consumer runs, mirroring
     # the schedulable cancel logic with a fixed birth at 0.  An input feeding a
     # terminal `Concatenate` (output cone) is kept forever.
-    input_cancel_layer: Dict[int, cp_model.IntVar] = {}
-    input_keep_ids: Set[int] = set()
-    parked_input_by_id: Dict[int, cp_model.IntVar] = {}
+    input_cancel_layer: dict[int, cp_model.IntVar] = {}
+    input_keep_ids: set[int] = set()
+    parked_input_by_id: dict[int, cp_model.IntVar] = {}
     held_input_pin_spec = None
     for n in freeable_inputs:
         cl = model.new_int_var(0, max_layers, f"cl_in{n.node_id}")
@@ -1768,7 +1766,7 @@ def build_cpsat_model_from_gm(
             ]
             held_input_pin_spec = (cl, non_add_ids, add_ids)
             # The bank is held from this physical cancel until target birth.
-            model.add(cl <= layer_var[cast(Node, held_target).node_id])
+            model.add(cl <= layer_var[cast("Node", held_target).node_id])
             # The held source has its own equality/window treatment below,
             # after Add classification exists.
             continue
@@ -1938,12 +1936,12 @@ def build_cpsat_model_from_gm(
     # ⌈d_out/d_head⌉` heads) — each additionally gated by `is_attn[A]`:
     # an MLP-routed Add charges no heads (its `2·d_out` hidden slots ride
     # the MLP cumulative via `slots_for`).
-    attn_intervals: List = []
-    attn_demands: List[int] = []
+    attn_intervals: list = []
+    attn_demands: list[int] = []
     # Reused/fresh presence bools per attention-routed Add, shared with the
     # objective counters below.
-    add_attn_free_pres: Dict[int, cp_model.IntVar] = {}
-    add_attn_comp_pres: Dict[int, cp_model.IntVar] = {}
+    add_attn_free_pres: dict[int, cp_model.IntVar] = {}
+    add_attn_comp_pres: dict[int, cp_model.IntVar] = {}
     for n in gm.schedulable:
         h = heads_for(n, d_head)
         if h <= 0:
@@ -1998,13 +1996,13 @@ def build_cpsat_model_from_gm(
         attn_intervals.append(iv)
         attn_demands.append(h * d_head)
 
-    cancel_intervals: List = []
-    cancel_demands: List[int] = []
+    cancel_intervals: list = []
+    cancel_demands: list[int] = []
     # MLP-cancel cost intervals accumulate here and join the MLP-slot cumulative
     # below (demand 2·len — the bypass lane-pair costs two hidden slots per
     # column), positioned at the cancel layer rather than the compute layer.
-    mlp_cancel_intervals: List = []
-    mlp_cancel_demands: List[int] = []
+    mlp_cancel_intervals: list = []
+    mlp_cancel_demands: list[int] = []
     for n in gm.schedulable:
         if n in gm.pinned_nodes:
             continue
@@ -2136,8 +2134,8 @@ def build_cpsat_model_from_gm(
     # For flex nodes, MLP demand is gated by NOT(is_attn).  An FFN carries
     # its lane slots and is pinned to MLP (is_attn == 0), so its interval is
     # always present.
-    mlp_intervals: List = []
-    mlp_demands: List[int] = []
+    mlp_intervals: list = []
+    mlp_demands: list[int] = []
     for n in gm.schedulable:
         s = slots_for(n, gm)
         if s <= 0:
@@ -2163,8 +2161,8 @@ def build_cpsat_model_from_gm(
 
     # ---- Residual cumulative ----
     residual_nodes = [n for n in gm.schedulable if uses_residual(n, gm)]
-    resid_intervals: List = []
-    resid_demands: List[int] = []
+    resid_intervals: list = []
+    resid_demands: list[int] = []
     for n in residual_nodes:
         # Residual-occupancy end.  An attention cancel frees the columns mid-
         # attention-sublayer, so the node stops occupying at `cancel_layer`
@@ -2226,7 +2224,7 @@ def build_cpsat_model_from_gm(
         # unavailable to ordinary allocation until target birth.  Model that
         # ownership gap by extending residual occupancy to layer[target].
         rend_in = (
-            layer_var[cast(Node, held_target).node_id] if n is held_source else cl_in
+            layer_var[cast("Node", held_target).node_id] if n is held_source else cl_in
         )
         iv = model.new_interval_var(0, rend_in, rend_in, f"riv_in{n.node_id}")
         resid_intervals.append(iv)
@@ -2235,8 +2233,8 @@ def build_cpsat_model_from_gm(
         model.add_cumulative(resid_intervals, resid_demands, available_residual)
 
     # ---- Aggregate counters for the objective ----
-    attn_term: List = []
-    mlp_bypass_term: List = []
+    attn_term: list = []
+    mlp_bypass_term: list = []
     fixed_attn_heads = 0
     for n in gm.schedulable:
         h = heads_for(n, d_head)
@@ -2327,7 +2325,7 @@ def build_cpsat_model_from_gm(
             occupancy.append(
                 len(n)
                 * (
-                    layer_var[cast(Node, held_target).node_id]
+                    layer_var[cast("Node", held_target).node_id]
                     if n is held_source
                     else input_cancel_layer[n.node_id]
                 )
@@ -2404,9 +2402,10 @@ class _StandInGraph:
     ``gm.graph``: ``get_all_nodes`` (validator id→node map) and
     ``get_critical_path_length`` (solver decision strategy).  Raw-consumer /
     topo-order queries are not reconstructed from a snapshot (the builder uses
-    ``gm.consumers_eff``, not ``gm.graph``); they raise loudly if ever read."""
+    ``gm.consumers_eff``, not ``gm.graph``); they raise loudly if ever read.
+    """
 
-    def __init__(self, all_nodes, critical_path: Dict[int, int]):
+    def __init__(self, all_nodes, critical_path: dict[int, int]):
         self._all_nodes = set(all_nodes)
         self._critical_path = critical_path
 
@@ -2432,7 +2431,8 @@ class _StandInGraph:
 class _ShapeCarrier:
     """Minimal stand-in for a weight tensor: exposes only ``.shape`` so
     ``FFN.n_lanes`` (``self.gate_proj.shape[0]``) returns the captured lane
-    count without materializing a tensor."""
+    count without materializing a tensor.
+    """
 
     __slots__ = ("shape",)
 
@@ -2473,7 +2473,7 @@ def graph_model_from_problem(problem: SchedulingProblem) -> GraphModel:
     only iterates them) so the constraint order — and thus the proto — matches
     the capturing process byte-for-byte.
     """
-    by_id: Dict[int, Node] = {
+    by_id: dict[int, Node] = {
         rec.node_id: _stand_in_node(rec) for rec in problem.nodes.values()
     }
     for rec in problem.nodes.values():
@@ -2500,10 +2500,10 @@ def graph_model_from_problem(problem: SchedulingProblem) -> GraphModel:
         # The stand-in implements exactly the GraphAnalyzer slice the builder
         # reads; the ordered-tuple consumer values are likewise duck-typed
         # (the builder only iterates them) — see the docstrings above.
-        graph=cast(GraphAnalyzer, graph),
+        graph=cast("GraphAnalyzer", graph),
         schedulable=[by_id[i] for i in problem.schedulable_ids],
         edges=[(by_id[u], by_id[v]) for u, v in problem.edges],
-        consumers_eff=cast(Dict[Node, Set[Node]], consumers_eff),
+        consumers_eff=cast("dict[Node, set[Node]]", consumers_eff),
         output_node=by_id[problem.output_id],
         pos_encoding=None,
         input_nodes=[by_id[i] for i in problem.input_ids],
@@ -2516,19 +2516,19 @@ def build_model_from_snapshot(
     *,
     d: int,
     d_head: int,
-    n_heads: Optional[int] = None,
+    n_heads: int | None = None,
     d_hidden: int,
     costs: Costs = Costs(),
     flex_routing: bool = True,
     max_layers: int = 60,
-    cancel_slack: Optional[int] = 2,
-    policy: Optional[SchedulingPolicy] = None,
+    cancel_slack: int | None = 2,
+    policy: SchedulingPolicy | None = None,
     reserve_heads: int = 0,
     reserve_residual: int = 0,
     tighten_domains: bool = False,
-    diagnostic_hint: Optional[DiagnosticHint] = None,
-    held_source_id: Optional[int] = None,
-    held_target_id: Optional[int] = None,
+    diagnostic_hint: DiagnosticHint | None = None,
+    held_source_id: int | None = None,
+    held_target_id: int | None = None,
     _disabled_families: frozenset = frozenset(),
     _canonical_cancel_reps: bool = False,
     _pin_cancels: bool = True,
@@ -2588,7 +2588,7 @@ def build_model_from_snapshot(
 # ---------------------------------------------------------------------------
 
 
-def dump_model_proto(built: BuiltModel, path) -> "os.PathLike":
+def dump_model_proto(built: BuiltModel, path) -> os.PathLike:
     """Serialize a built CP-SAT model to disk for a zero-rebuild re-solve.
 
     Writes the OR-Tools model proto (text format — the installed pybind build
@@ -2618,9 +2618,9 @@ def resolve_model_proto(
     path,
     *,
     time_budget_s: float = 60.0,
-    workers: Optional[int] = None,
-    solver_params: Optional[Dict[str, object]] = None,
-) -> Dict[str, object]:
+    workers: int | None = None,
+    solver_params: dict[str, object] | None = None,
+) -> dict[str, object]:
     """Load a dumped model proto and re-solve it — no graph, no model rebuild.
 
     Returns ``{status_name, objective, best_bound, wall_time_s, n_layers}``;
@@ -2711,7 +2711,7 @@ def _validate_hint(
     *,
     max_layers: int,
     strict: bool = False,
-) -> List[str]:
+) -> list[str]:
     """Cross-check a warm-start hint against the built model — the tripwire.
 
     The hint-application loop in :func:`solve_schedule` guards every
@@ -2742,9 +2742,9 @@ def _validate_hint(
     hint_routing = hint.routing
     hint_cancel = hint.cancel
     hint_cancel_mech = hint.cancel_mech
-    violations: List[str] = []
+    violations: list[str] = []
     gm = built.gm
-    all_nodes: Dict[int, Node] = {n.node_id: n for n in gm.graph.get_all_nodes()}
+    all_nodes: dict[int, Node] = {n.node_id: n for n in gm.graph.get_all_nodes()}
     input_ids = {n.node_id for n in gm.input_nodes}
 
     def _desc(nid: int) -> str:
@@ -2779,7 +2779,7 @@ def _validate_hint(
                 f"{_desc(nid)} hint={L}"
             )
 
-    route: Optional[str]
+    route: str | None
     for nid, route in (hint_routing or {}).items():
         if route not in (ATTN, MLP):
             violations.append(
@@ -2824,7 +2824,8 @@ def _validate_hint(
     def _hinted_add_placement_complete(A: Add) -> bool:
         """True when every hint the derivation read actually existed — a
         missing consumer layer/route makes the derivation conservative
-        (not reusable), which must not be mistaken for a derived fresh."""
+        (not reusable), which must not be mistaken for a derived fresh.
+        """
         if hint_layers is None or A.node_id not in hint_layers:
             return False
         if (hint_routing or {}).get(A.node_id) is None:
@@ -2842,7 +2843,7 @@ def _validate_hint(
         return True
 
     # The selected reuse target per the hints: target nid -> (add, placement).
-    hinted_target_of: Dict[int, Tuple[Add, object]] = {}
+    hinted_target_of: dict[int, tuple[Add, object]] = {}
     for _A in gm.schedulable:
         if not isinstance(_A, Add):
             continue
@@ -2871,7 +2872,7 @@ def _validate_hint(
             continue
         keep = nid in (built.keep_forever_ids if in_sched else built.input_keep_ids)
         if keep:
-            if L != max_layers:
+            if max_layers != L:
                 violations.append(
                     f"cancel hint below max_layers={max_layers} for "
                     f"keep-forever node: {_desc(nid)} hint={L}"
@@ -2879,7 +2880,7 @@ def _validate_hint(
             continue
         birth = (hint_layers or {}).get(nid) if in_sched else 0
         min_lifetime = 0 if nid == built.held_source_id else 1
-        if birth is not None and L < birth + min_lifetime:
+        if birth is not None and birth + min_lifetime > L:
             violations.append(
                 f"cancel hint before birth+{min_lifetime}: {_desc(nid)} "
                 f"cancel={L} birth={birth}"
@@ -2895,7 +2896,7 @@ def _validate_hint(
             # selector constraints and would sink the incumbent.
             sel_add, _sel_p = selected
             sel_layer = (hint_layers or {}).get(sel_add.node_id)
-            if sel_layer is not None and L != sel_layer + 1:
+            if sel_layer is not None and sel_layer + 1 != L:
                 violations.append(
                     f"selected reuse target's cancel hint is not the "
                     f"virtual handoff layer[A]+1={sel_layer + 1}: "
@@ -2919,9 +2920,9 @@ def _validate_hint(
                 f"always attention-cancelled in the model): {_desc(nid)}"
             )
             mech = ATTN
-        hinted_cons: List[int] = []
+        hinted_cons: list[int] = []
         all_cons_hinted = True
-        for c in gm.consumers_eff.get(cast(Node, node), set()):
+        for c in gm.consumers_eff.get(cast("Node", node), set()):
             if c.node_id not in built.layer_var:
                 continue
             c_hint = (hint_layers or {}).get(c.node_id)
@@ -2961,7 +2962,7 @@ def _validate_hint(
                 if route is None and built.static_routing is not None:
                     route = built.static_routing.get(c.node_id)
                 gap = 1 if route == MLP else 0
-            if L < c_hint + gap:
+            if c_hint + gap > L:
                 violations.append(
                     f"cancel hint before consumer's layer+{gap}: {_desc(nid)} "
                     f"cancel={L}, consumer {_desc(c.node_id)} layer={c_hint}"
@@ -2970,7 +2971,7 @@ def _validate_hint(
             base = max(hinted_cons) if hinted_cons else birth
             if base is not None:
                 ub = base + 1 + K + deltas.get(nid, 0)
-                if L > ub:
+                if ub < L:
                     violations.append(
                         f"cancel hint outside the (widened) window: "
                         f"{_desc(nid)} cancel={L} > ub={ub} (base={base}, "
@@ -2999,30 +3000,30 @@ def solve_schedule(
     *,
     d: int,
     d_head: int,
-    n_heads: Optional[int] = None,
+    n_heads: int | None = None,
     d_hidden: int,
     costs: Costs = Costs(),
     flex_routing: bool = True,
     time_budget_s: float = 60.0,
     max_layers: int = 60,
-    incumbent: Optional[ScheduleAssignment] = None,
-    held_source_id: Optional[int] = None,
-    held_target_id: Optional[int] = None,
-    cancel_slack: Optional[int] = 2,
-    policy: Optional[SchedulingPolicy] = None,
+    incumbent: ScheduleAssignment | None = None,
+    held_source_id: int | None = None,
+    held_target_id: int | None = None,
+    cancel_slack: int | None = 2,
+    policy: SchedulingPolicy | None = None,
     log_search_progress: bool = False,
     reserve_heads: int = 0,
     reserve_residual: int = 0,
     tighten_domains: bool = False,
-    solver_params: Optional[Dict[str, object]] = None,
-    solution_trace: Optional[List[dict]] = None,
+    solver_params: dict[str, object] | None = None,
+    solution_trace: list[dict] | None = None,
     strict_hint: bool = False,
     drop_decision_strategy: bool = False,
     _disabled_families: frozenset = frozenset(),
     _canonical_cancel_reps: bool = False,
     _pin_cancels: bool = True,
-    _diagnostic_hint: Optional[DiagnosticHint] = None,
-) -> Tuple[Optional[ScheduleAssignment], SolveStats]:
+    _diagnostic_hint: DiagnosticHint | None = None,
+) -> tuple[ScheduleAssignment | None, SolveStats]:
     """Build and solve the CP-SAT scheduling model.
 
     Returns ``(assignment, stats)``.  ``assignment`` is ``None`` when
@@ -3089,7 +3090,7 @@ def solve_schedule(
     """
     if incumbent is not None and _diagnostic_hint is not None:
         raise ValueError("pass either incumbent or _diagnostic_hint, not both")
-    hint: Optional[DiagnosticHint]
+    hint: DiagnosticHint | None
     if incumbent is not None:
         incumbent.validate(output_node)
         hint = DiagnosticHint.from_assignment(incumbent)
@@ -3136,30 +3137,30 @@ def solve_schedule_from_snapshot(
     *,
     d: int,
     d_head: int,
-    n_heads: Optional[int] = None,
+    n_heads: int | None = None,
     d_hidden: int,
     costs: Costs = Costs(),
     flex_routing: bool = True,
     time_budget_s: float = 60.0,
     max_layers: int = 60,
-    incumbent: Optional[ScheduleAssignment] = None,
-    held_source_id: Optional[int] = None,
-    held_target_id: Optional[int] = None,
-    cancel_slack: Optional[int] = 2,
-    policy: Optional[SchedulingPolicy] = None,
+    incumbent: ScheduleAssignment | None = None,
+    held_source_id: int | None = None,
+    held_target_id: int | None = None,
+    cancel_slack: int | None = 2,
+    policy: SchedulingPolicy | None = None,
     log_search_progress: bool = False,
     reserve_heads: int = 0,
     reserve_residual: int = 0,
     tighten_domains: bool = False,
-    solver_params: Optional[Dict[str, object]] = None,
-    solution_trace: Optional[List[dict]] = None,
+    solver_params: dict[str, object] | None = None,
+    solution_trace: list[dict] | None = None,
     strict_hint: bool = False,
     drop_decision_strategy: bool = False,
     _disabled_families: frozenset = frozenset(),
     _canonical_cancel_reps: bool = False,
     _pin_cancels: bool = True,
-    _diagnostic_hint: Optional[DiagnosticHint] = None,
-) -> Tuple[Optional[ScheduleAssignment], SolveStats]:
+    _diagnostic_hint: DiagnosticHint | None = None,
+) -> tuple[ScheduleAssignment | None, SolveStats]:
     """Build and solve the model from a captured snapshot — no live graph.
 
     The zero-build re-solve path (C1 parameter sweeps, C2 probes): rebuild the
@@ -3211,15 +3212,15 @@ def solve_schedule_from_snapshot(
 def _solve_built(
     built: BuiltModel,
     *,
-    hint: Optional[DiagnosticHint] = None,
+    hint: DiagnosticHint | None = None,
     max_layers: int = 60,
     time_budget_s: float = 60.0,
     log_search_progress: bool = False,
-    solver_params: Optional[Dict[str, object]] = None,
-    solution_trace: Optional[List[dict]] = None,
+    solver_params: dict[str, object] | None = None,
+    solution_trace: list[dict] | None = None,
     strict_hint: bool = False,
     drop_decision_strategy: bool = False,
-) -> Tuple[Optional[ScheduleAssignment], SolveStats]:
+) -> tuple[ScheduleAssignment | None, SolveStats]:
     """Validate + apply the warm-start hint, set the decision strategy, solve,
     and read the assignment back off a pre-built model.  Shared by
     :func:`solve_schedule` (live) and :func:`solve_schedule_from_snapshot`.
@@ -3229,7 +3230,8 @@ def _solve_built(
     ``AddDecisionStrategy`` below is not emitted, freeing CP-SAT's fixed-search
     subsolver slot for its default portfolio.  It cannot change the feasible
     set — only which schedule the search finds first — so it is never set in
-    production."""
+    production.
+    """
     if built.pin_cancels:
         # The pinned model (`_pin_cancels`) equality-pins every cancel layer,
         # so a captured cancel-layer hint would almost always contradict the
@@ -3329,7 +3331,7 @@ def _solve_built(
             else:
                 setattr(solver.parameters, key, value)
 
-    log_buf: List[str] = []
+    log_buf: list[str] = []
 
     def _log(msg: str) -> None:
         log_buf.append(msg)
@@ -3357,10 +3359,10 @@ def _solve_built(
 
     has_solution = status in (cp_model.OPTIMAL, cp_model.FEASIBLE)
     if has_solution:
-        node_to_layer: Dict[int, int] = {}
-        node_to_cancel_layer: Dict[int, int] = {}
-        node_to_routing: Dict[int, str] = {}
-        node_to_cancel_mech: Dict[int, str] = {}
+        node_to_layer: dict[int, int] = {}
+        node_to_cancel_layer: dict[int, int] = {}
+        node_to_routing: dict[int, str] = {}
+        node_to_cancel_mech: dict[int, str] = {}
         for n in gm.schedulable:
             node_to_layer[n.node_id] = solver.Value(layer_var[n.node_id])
             node_to_cancel_layer[n.node_id] = solver.Value(cancel_layer[n.node_id])
@@ -3383,7 +3385,7 @@ def _solve_built(
         # literals WHILE those literals still exist — this is the last
         # moment a bad reification is distinguishable from a bad replay
         # liveness calculation.
-        selected_target_ids: Set[int] = set()
+        selected_target_ids: set[int] = set()
         for A in gm.schedulable:
             if not isinstance(A, Add):
                 continue
@@ -3452,7 +3454,7 @@ def _solve_built(
         total_heads = solver.Value(total_attn_heads)
         total_bypass = solver.Value(total_mlp_bypass)
         objective = int(solver.ObjectiveValue())
-        assignment: Optional[ScheduleAssignment] = ScheduleAssignment(
+        assignment: ScheduleAssignment | None = ScheduleAssignment(
             node_to_layer=node_to_layer,
             node_to_cancel_layer=node_to_cancel_layer,
             node_to_routing=node_to_routing,

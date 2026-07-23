@@ -1,8 +1,6 @@
-from typing import List, Optional
-
-from torchwright.graph import Node
 import torch
 
+from torchwright.graph import Node
 from torchwright.graph.spherical_codes import get_spherical_codes
 from torchwright.graph.value_type import NodeValueType
 
@@ -12,9 +10,9 @@ default_special_tokens = [unk_token]
 
 
 class Tokenizer:
-    vocab: List[str]
+    vocab: list[str]
 
-    def __init__(self, vocab: List[str], special_tokens: Optional[List[str]] = None):
+    def __init__(self, vocab: list[str], special_tokens: list[str] | None = None):
         if special_tokens is None:
             special_tokens = default_special_tokens
         self.vocab = list(special_tokens) + list(vocab)
@@ -22,14 +20,12 @@ class Tokenizer:
     def get_token_id(self, text: str) -> int:
         if text in self.vocab:
             return self.vocab.index(text)
-        else:
-            return self.vocab.index(unk_token)
+        return self.vocab.index(unk_token)
 
     def decode_id(self, token_id: int) -> str:
         if token_id < len(self.vocab):
             return self.vocab[token_id]
-        else:
-            return unk_token
+        return unk_token
 
     def __len__(self):
         return len(self.vocab)
@@ -44,11 +40,11 @@ class Embedding(Node):
 
     def __init__(
         self,
-        vocab: List[str],
+        vocab: list[str],
         d_embed: int = 8,
-        table: Optional[torch.Tensor] = None,
+        table: torch.Tensor | None = None,
         input_name: str = "embedding_input",
-        special_tokens: Optional[List[str]] = None,
+        special_tokens: list[str] | None = None,
     ):
         """Embedding lookup node.
 
@@ -136,7 +132,7 @@ class Unembedding:
         self.inp = inp
         assert len(self.inp) == self.embedding.d_embed
 
-    def compute(self, n_pos: int, input_values: dict) -> List[str]:
+    def compute(self, n_pos: int, input_values: dict) -> list[str]:
         input_value = self.inp.compute(n_pos, input_values)
         result = []
         for pos in range(n_pos):

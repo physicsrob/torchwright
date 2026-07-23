@@ -26,7 +26,6 @@ document as a manual obligation.
 from __future__ import annotations
 
 import json
-from typing import List
 
 from scripts.measure_op_noise import (
     DOCS_JSON,
@@ -89,7 +88,8 @@ def _close_enough(a: float, b: float) -> bool:
 
 def _ratio_close(a: float, b: float, factor: float) -> bool:
     """True when the two magnitudes are within ``factor`` of each other —
-    the machine-dependent-row guard (see _STAIRCASE_RATIO)."""
+    the machine-dependent-row guard (see _STAIRCASE_RATIO).
+    """
     if a is None and b is None:
         return True
     if a is None or b is None:
@@ -102,7 +102,7 @@ def _ratio_close(a: float, b: float, factor: float) -> bool:
     return hi / lo <= factor
 
 
-def _compare_ops(committed: dict, regenerated: dict) -> List[str]:
+def _compare_ops(committed: dict, regenerated: dict) -> list[str]:
     """Compare two stripped JSON dicts and return a list of failure messages.
 
     Ops are keyed by ``(machine, name)`` — the relu and swiglu libraries
@@ -111,7 +111,7 @@ def _compare_ops(committed: dict, regenerated: dict) -> List[str]:
     c_ops = {(op["machine"], op["name"]): op for op in committed["ops"]}
     r_ops = {(op["machine"], op["name"]): op for op in regenerated["ops"]}
 
-    failures: List[str] = []
+    failures: list[str] = []
 
     missing = sorted(c_ops.keys() - r_ops.keys())
     if missing:

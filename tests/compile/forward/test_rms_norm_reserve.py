@@ -31,10 +31,9 @@ from torchwright.compiler.forward.cpsat_scheduler import (
 )
 from torchwright.compiler.forward.residual_map import ResidualStreamMap
 from torchwright.compiler.graph_identity import graph_fingerprint
-from torchwright.graph import Linear
-from torchwright.ops.relu.linear_relu_linear import linear_relu_linear
 from torchwright.graph.value_type import Range
 from torchwright.ops.inout_nodes import create_input
+from torchwright.ops.relu.linear_relu_linear import linear_relu_linear
 
 
 class _FakeVT:
@@ -88,7 +87,7 @@ def test_column_count_from_width_parity(d, n_const_expected):
 
 @pytest.mark.parametrize("d", [256, 1024, 2048, 8192, 3072, 5120, 15360])
 def test_gain_exactly_cancels_forced_rms(d):
-    """gain == forced rms == 2^m, so x/rms*gain == x — the identity."""
+    """Gain == forced rms == 2^m, so x/rms*gain == x — the identity."""
     rmap = ResidualStreamMap(d)
     spec = _reserve_rms_norm_columns(rmap, d, 0.0, _RMS_NORM_CONST_EXP)
     import math
@@ -103,7 +102,8 @@ def test_gain_exactly_cancels_forced_rms(d):
 def test_distinct_column_values_at_5120():
     """d=5120 = 5·2^10 pins two *different* constants (2^q and 2^(q+1)):
     5·2^(2q) = 2^(2q) + 2^(2q+2).  Guards the per-column value plumbing that
-    equal-constant widths cannot distinguish from a single shared value."""
+    equal-constant widths cannot distinguish from a single shared value.
+    """
     q = _RMS_NORM_CONST_EXP
     spec = _reserve_rms_norm_columns(ResidualStreamMap(5120), 5120, 1e-5, q)
     assert spec.const_values == (2.0**q, 2.0 ** (q + 1))
@@ -123,7 +123,8 @@ def test_reserved_columns_are_freed_from_pool_and_not_allocated(d):
 def test_unbuildable_width_raises():
     """Odd factor 41 is the smallest whose fp32 mean arithmetic cannot land
     exactly on a power of two (the reciprocal-multiply path rounds off it) —
-    the reservation must refuse rather than ship a near-identity norm."""
+    the reservation must refuse rather than ship a near-identity norm.
+    """
     d = 41 * 32
     rmap = ResidualStreamMap(d)
     with pytest.raises(ValueError, match="no bit-exact pinned layout"):
@@ -133,7 +134,8 @@ def test_unbuildable_width_raises():
 def test_width_contract_predicate():
     """The public promise: any multiple of 1024 up to 16384, or any power of
     two.  17408 (a multiple of 1024 past the cap) and 1280 (odd·2^8 —
-    buildable by the mechanism, but unpromised) are outside the contract."""
+    buildable by the mechanism, but unpromised) are outside the contract.
+    """
     assert all(rms_norm_width_supported(n * 1024) for n in range(1, 17))
     assert all(rms_norm_width_supported(2**k) for k in range(6, 16))
     for bad in (0, -1024, 1000, 1280, 17408):
@@ -144,7 +146,8 @@ def test_compile_to_onnx_rejects_unsupported_width_before_compiling():
     """The front door fails fast: with the norm on (the default), an
     unsupported d raises at entry — before the graph is even touched
     (graph=None is never dereferenced), so a bad width can't waste a long
-    streaming compile."""
+    streaming compile.
+    """
     from torchwright.compiler.export import compile_to_onnx
 
     with pytest.raises(ValueError, match="supported width"):
@@ -153,7 +156,8 @@ def test_compile_to_onnx_rejects_unsupported_width_before_compiling():
 
 def test_const_exp_overflow_raises():
     """A q so large the pinned energy overflows fp32 fails loudly, not silently
-    to inf inside the norm's square."""
+    to inf inside the norm's square.
+    """
     rmap = ResidualStreamMap(1024)
     with pytest.raises(ValueError, match="overflows fp32"):
         _reserve_rms_norm_columns(rmap, 1024, 1e-5, 64)  # 2^128 -> inf
@@ -165,7 +169,8 @@ def test_overflow_boundary_is_inclusive_doom_q63_at_8192():
     d=8192, rms_norm_const_exp=63, forced energy 2^127 — sits exactly on
     this boundary and must be accepted; q=64 must overflow.  Regression for
     the off-by-one guard that rejected the boundary and blocked the
-    production compile."""
+    production compile.
+    """
     spec = _reserve_rms_norm_columns(ResidualStreamMap(8192), 8192, 1e-5, 63)
     assert spec.const_values == (2.0**63, 2.0**63)  # 2·2^126 = 2^127
     assert spec.gain == 2.0**57
@@ -174,8 +179,9 @@ def test_overflow_boundary_is_inclusive_doom_q63_at_8192():
 
 
 def test_eps_above_rms_lsb_raises_but_zero_is_fine():
-    """eps large enough to perturb the forced mean-square breaks the identity and
-    must raise; eps=0.0 (falsy but valid, below the LSB) must be accepted."""
+    """Eps large enough to perturb the forced mean-square breaks the identity and
+    must raise; eps=0.0 (falsy but valid, below the LSB) must be accepted.
+    """
     rmap = ResidualStreamMap(1024)
     with pytest.raises(ValueError, match="too large for the forced RMS"):
         _reserve_rms_norm_columns(rmap, 1024, 1e20, _RMS_NORM_CONST_EXP)
@@ -192,7 +198,8 @@ def test_contract_width_fp32_mean_exactness(d):
     16384, plus small powers of two) has a pinned layout whose forced
     mean-of-squares lands exactly on 2^(2m) under BOTH mean strategies a
     runtime may use (sum/d, or sum·(1/d)) — the property the reservation
-    guard enforces, swept explicitly over the whole promised set."""
+    guard enforces, swept explicitly over the whole promised set.
+    """
     import numpy as np
 
     assert rms_norm_width_supported(d)
@@ -209,7 +216,8 @@ def test_contract_width_fp32_mean_exactness(d):
 
 def _rmsnorm_identity_holds_general(d, const_values, gain, data_energy, eps=1e-5):
     """Like :func:`_rmsnorm_identity_holds` but takes the per-column pinned
-    values directly, so it covers layouts with unequal constants."""
+    values directly, so it covers layouts with unequal constants.
+    """
     n_const = len(const_values)
     d_data = d - n_const
     torch.manual_seed(0)
@@ -229,7 +237,8 @@ def test_identity_holds_at_non_power_of_two_widths(d):
     certified budget comes back bit-for-bit; far over it, the mean drifts
     off the power of two and the identity breaks.  (The certified budget
     2^(2q-24) is deliberately conservative — sound in every fp32 summation
-    order — so the observable break point sits above it, never below.)"""
+    order — so the observable break point sits above it, never below.)
+    """
     q = _RMS_NORM_CONST_EXP
     spec = _reserve_rms_norm_columns(ResidualStreamMap(d), d, 1e-5, q)
     assert _rmsnorm_identity_holds_general(
@@ -243,7 +252,8 @@ def test_identity_holds_at_non_power_of_two_widths(d):
 def _rmsnorm_identity_holds(d, n_const, q, data_energy, eps=1e-5):
     """Build a residual with the pinned constant + random data scaled to a given
     Sigma data^2, run a real RMSNorm with gain=2^m, and report whether the data
-    columns come back bit-for-bit (the identity)."""
+    columns come back bit-for-bit (the identity).
+    """
     b = d.bit_length() - 1
     e_exp = 2 * q + (0 if n_const == 1 else 1)
     m = (e_exp - b) // 2
@@ -288,7 +298,8 @@ def test_certify_raises_on_non_finite_range():
 
 def test_certify_ignores_reserved_columns():
     """The pinned constant columns are the pin, not data — excluded from the
-    energy sum (so a huge value there does not trip the budget)."""
+    energy sum (so a huge value there does not trip the budget).
+    """
     spec = _spec(reserved=(1023,))
     # the only node sits on the reserved column at the constant magnitude
     ra = _FakeRA({"s0": {_FakeNode(-(2.0**44), 2.0**44): [1023]}})
@@ -298,7 +309,8 @@ def test_certify_ignores_reserved_columns():
 def test_energy_bound_identity_holds_below_and_breaks_above():
     """The Open-Q5 finding, at the math layer: identity below the half-ULP bound
     2^(2q-24), broken above it.  This is why the default q must clear the
-    deepest-layer energy of the *shipping* graph, not just calculator_simple."""
+    deepest-layer energy of the *shipping* graph, not just calculator_simple.
+    """
     d, n_const, q = 1024, 1, 30  # the original (too-small) calculator setting
     bound = 2.0 ** (2 * q - 24)  # ~6.9e10
     # calculator_simple-scale energy: well under the bound -> identity holds
@@ -307,7 +319,7 @@ def test_energy_bound_identity_holds_below_and_breaks_above():
     assert not _rmsnorm_identity_holds(d, n_const, q, data_energy=2.6e13)
     # the default q clears the same high energy with margin
     assert _rmsnorm_identity_holds(d, n_const, _RMS_NORM_CONST_EXP, data_energy=2.6e13)
-    assert 2.6e13 < 2.0 ** (2 * _RMS_NORM_CONST_EXP - 24)  # the margin is real
+    assert 2.0 ** (2 * _RMS_NORM_CONST_EXP - 24) > 2.6e13  # the margin is real
 
 
 # ===========================================================================
@@ -322,8 +334,9 @@ def test_energy_bound_identity_holds_below_and_breaks_above():
 
 
 def _tiny_graph():
-    """x -> FFN (a degenerate-ReLU FFN); small enough to solve
-    sub-second."""
+    """X -> FFN (a degenerate-ReLU FFN); small enough to solve
+    sub-second.
+    """
     torch.manual_seed(0)
     x = create_input("x", 8)
     return linear_relu_linear(
@@ -341,7 +354,8 @@ _CPSAT_KW = dict(d=64, d_head=8, d_hidden=128)
 
 def test_cpsat_available_residual_excludes_reserved():
     """build_cpsat_model subtracts reserve_residual from the residual budget,
-    matching how the reservation shrinks the replay pool (GAP 1 root cause)."""
+    matching how the reservation shrinks the replay pool (GAP 1 root cause).
+    """
     out = _tiny_graph()
     # Position is rotary post-RoPE, so build_cpsat_model takes no pos node (its
     # ``pos_encoding`` param is vestigial); the self-match column is the fixed
@@ -355,7 +369,8 @@ def test_cpsat_available_residual_excludes_reserved():
 def test_cpsat_residual_oversubscription_raises():
     """Reserving every data column fails loud at model build, not as a confusing
     downstream solve failure, and the message names the reserved columns. With
-    the RoPE self-match base of 1, reserving d-1 leaves zero room."""
+    the RoPE self-match base of 1, reserving d-1 leaves zero room.
+    """
     out = _tiny_graph()
     with pytest.raises(RuntimeError, match="reserved columns"):
         build_cpsat_model(out, reserve_residual=64 - 1, **_CPSAT_KW)
@@ -363,7 +378,8 @@ def test_cpsat_residual_oversubscription_raises():
 
 def test_solve_schedule_threads_reserve_residual():
     """reserve_residual flows end-to-end through solve_schedule and the solver
-    still produces a feasible schedule under the reduced budget."""
+    still produces a feasible schedule under the reduced budget.
+    """
     out = _tiny_graph()
     assignment, _ = solve_schedule(
         out, reserve_residual=2, time_budget_s=10.0, max_layers=20, **_CPSAT_KW
@@ -374,7 +390,8 @@ def test_solve_schedule_threads_reserve_residual():
 def test_schedule_fingerprint_keys_on_reserved_residual():
     """The schedule cache must distinguish a norm-on (reserved) compile from a
     norm-off one (GAP 2), while keeping the no-reservation hash byte-identical
-    so existing cache entries still hit (the conditional payload field)."""
+    so existing cache entries still hit (the conditional payload field).
+    """
     out = _tiny_graph()
     fp_kw = dict(
         d=64,
@@ -400,7 +417,8 @@ def test_certify_uses_per_column_max_across_states():
     not one state: a column small in one snapshot and large in another is bounded
     by the large one.  Here neither state alone exceeds the budget, but the
     per-column max over both does — so the cross-snapshot reduction must catch
-    it (the soundness-bearing path, untested before)."""
+    it (the soundness-bearing path, untested before).
+    """
     spec = _spec(reserved=(9999,))  # q=44 -> budget 2^64; reserved col disjoint
     big = _FakeNode(-(2.0**27), 2.0**27)  # energy 2^54 per column
     small = _FakeNode(-1.0, 1.0)

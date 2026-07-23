@@ -104,7 +104,8 @@ def test_partial_rotary_factor_is_honored(base):
     width ``d_rot/2``, not the full ``d_head/2``.  Stock Llama fails exactly
     this check (factor accepted by the config, full-width table built); if a
     transformers upgrade regresses Phi-3 the same way, the GLM fallback
-    decision triggers (docs/phi3_conversion_plan.md, Risks)."""
+    decision triggers (docs/phi3_conversion_plan.md, Risks).
+    """
     emb = _phi3_rope(base)
     assert emb.inv_freq.shape[0] == D_ROT // 2, (
         f"Phi3RotaryEmbedding built a {emb.inv_freq.shape[0] * 2}-dim rotation "
@@ -120,7 +121,8 @@ def test_inv_freq_one_ulp_agreement(base):
 
     Both are fp32 storage of ``base^(-2p/d_rot)`` computed through one
     differently-rounded intermediate; the residual table difference is the
-    only non-bit-exact ingredient of the conversion's rotation parity."""
+    only non-bit-exact ingredient of the conversion's rotation parity.
+    """
     hf = _phi3_rope(base).inv_freq.float()
     tw = rope_inv_freq(D_ROT, base)
     assert hf.shape == tw.shape
@@ -134,7 +136,8 @@ def test_rotation_semantics_bit_exact_on_shared_tables(base):
     bit-exact with ``graph/rope.py::apply_rope`` — pinning the split (first
     ``rotary_dim`` dims), the pairing (half-split: dim ``i`` with
     ``i + rotary_dim/2``), and the tail passthrough in one shot.  Any
-    re-pairing (e.g. GLM's interleaved ``2p, 2p+1``) breaks this exactly."""
+    re-pairing (e.g. GLM's interleaved ``2p, 2p+1``) breaks this exactly.
+    """
     from transformers.models.phi3.modeling_phi3 import apply_rotary_pos_emb
 
     n_pos = 512
@@ -152,7 +155,8 @@ def test_nope_tail_bit_exact_through_hf_stack(base):
     """The unrotated tail ``[d_rot:d_head]`` passes through Phi-3's rotary
     application bit-exactly at every position, on HF's OWN tables — the
     property the engineered content-equality heads rely on (a direct_model
-    checkpoint that rotated these dims would be silently wrong, not noisy)."""
+    checkpoint that rotated these dims would be silently wrong, not noisy).
+    """
     from transformers.models.phi3.modeling_phi3 import apply_rotary_pos_emb
 
     n_pos = 512
@@ -170,7 +174,8 @@ def test_cos_sin_tables_within_propagated_ulp_bound(base):
     ``inv_freq`` error propagated through the angle: ``|Δcos| ≲ pos · θ ·
     2^-23`` (θ ≤ 1), so the divergence grows linearly with position and is
     *bounded*, never bit-exact.  This is rounding source (1) of the
-    conversion's numerical budget (docs/phi3_conversion_plan.md)."""
+    conversion's numerical budget (docs/phi3_conversion_plan.md).
+    """
     n_pos = 4096
     emb = _phi3_rope(base)
     x = torch.zeros(1, 1, n_pos, D_HEAD)
@@ -198,7 +203,8 @@ def test_head_dim_accepted_persisted_and_honored(tmp_path):
     round trip, and the modeling code honors it (attention projections and
     the rotary table are sized from it).  This finding selects the cheaper
     pad-to-per-layer-max padding in the direct compiler; if an upgrade drops the
-    field, the direct compiler must fall back to padding heads to ``d/d_head``."""
+    field, the direct compiler must fall back to padding heads to ``d/d_head``.
+    """
     from transformers.models.phi3.modeling_phi3 import Phi3ForCausalLM
 
     cfg = _phi3_config(10_000.0, num_attention_heads=3)  # 3·128 ≠ hidden 512

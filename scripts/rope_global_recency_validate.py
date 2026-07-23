@@ -204,7 +204,7 @@ def main(machine: str = "relu") -> None:
     min_gap_pos = diffs.index(min_gap)
     fp32_floor = 6e-8
     assert min_gap > 0, f"w(m) is NOT monotone! Inversion at m={min_gap_pos}"
-    print(f"w(m) strictly monotone: ✓")
+    print("w(m) strictly monotone: ✓")
     print(f"Min adjacent-m gap = {min_gap:.3e}  (at m={min_gap_pos})")
     print(f"fp32 weight floor   = {fp32_floor:.1e}")
     print(f"Safety margin       = {min_gap / fp32_floor:.1f}×  (need >> 1)")
@@ -267,7 +267,7 @@ def main(machine: str = "relu") -> None:
                 worst_m = m_true
 
     print(f"Worst-case error: {max_err:.4f} positions (at m={worst_m})")
-    print(f"Rounding threshold: 0.5 positions")
+    print("Rounding threshold: 0.5 positions")
     print(f"Rounding margin: {0.5 / max_err:.1f}× below threshold  (need >> 1)")
     print()
 
@@ -294,7 +294,7 @@ def main(machine: str = "relu") -> None:
 
     combined = max_err + max_fp32_err
     print(f"Combined (PWL + fp32):        {combined:.4f} positions")
-    print(f"Rounding threshold:           0.5")
+    print("Rounding threshold:           0.5")
     print(f"Rounding margin:              {0.5 / combined:.1f}×")
     print()
 

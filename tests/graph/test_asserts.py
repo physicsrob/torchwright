@@ -14,8 +14,6 @@ Covers:
   works).
 """
 
-import math
-
 import pytest
 import torch
 
@@ -714,7 +712,8 @@ def test_range_violation_raises():
 def test_contradictory_claim_rejected_at_attach():
     """A claim disjoint from the node's structural type is a bug in one
     of the two; it fails loudly at attach time (the old wrapper design
-    only caught it at the compile-time strip)."""
+    only caught it at the compile-time strip).
+    """
     from torchwright.graph import LiteralValue
 
     lit = LiteralValue(torch.tensor([15.0]))  # structural type [15, 15]
@@ -727,7 +726,8 @@ def test_format_bad_multidim_reports_true_positions():
     tensor and pair with the actual offending values. (Regression: a
     multi-dim nonzero returns coordinate rows; flattening those produced
     coordinates misread as flat indices, pairing wrong values with wrong
-    positions.)"""
+    positions.)
+    """
     from torchwright.graph.asserts import _format_bad
 
     x = torch.tensor([[1.0, 2.0], [-3.0, -4.0], [5.0, 6.0], [-7.0, -8.0]])

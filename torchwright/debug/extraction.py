@@ -22,8 +22,6 @@ it is imported by ``compiler/export.py``, ``debug/probe.py``, and
 
 from __future__ import annotations
 
-from typing import Dict, List, Optional, Tuple
-
 import torch
 
 from torchwright.compiler.residual_assignment import (
@@ -35,7 +33,7 @@ from torchwright.graph import Concatenate, Node
 #: ``{state: (residual_tensor, label)}`` — the label embeds the layer
 #: index (e.g. ``"layer_5_mlp_out_state"``) because ``state.name`` alone
 #: is ambiguous (every layer's MLP out state shares the same name).
-StateTensors = Dict[ResidualStreamState, Tuple[torch.Tensor, str]]
+StateTensors = dict[ResidualStreamState, tuple[torch.Tensor, str]]
 
 
 def extract_compiled_value(
@@ -43,7 +41,7 @@ def extract_compiled_value(
     ra: ResidualAssignment,
     state: ResidualStreamState,
     res_tensor: torch.Tensor,
-) -> Optional[torch.Tensor]:
+) -> torch.Tensor | None:
     """Pull a graph node's compiled value out of a post-sublayer residual stream.
 
     Returns ``None`` if the node is not materialised at ``state``.
@@ -65,14 +63,14 @@ def extract_compiled_value(
 def first_state_with(
     node: Node,
     ra: ResidualAssignment,
-    ordered_states: List[ResidualStreamState],
-) -> Optional[ResidualStreamState]:
+    ordered_states: list[ResidualStreamState],
+) -> ResidualStreamState | None:
     """Earliest sublayer state in which ``node`` is materialised."""
     if isinstance(node, Concatenate):
         # Concatenate is resolved transparently — pick the earliest
         # state where *all* of its leaves are present.
         children = [i for i in node.inputs]
-        best: Optional[ResidualStreamState] = None
+        best: ResidualStreamState | None = None
         for st in ordered_states:
             if all(first_state_with(c, ra, [st]) is not None for c in children):
                 best = st
@@ -85,7 +83,7 @@ def first_state_with(
 
 
 def run_consistency_check(
-    ordered_states: List[ResidualStreamState],
+    ordered_states: list[ResidualStreamState],
     state_tensor: StateTensors,
     ra: ResidualAssignment,
     atol: float,
@@ -113,8 +111,8 @@ def run_consistency_check(
     """
     captured_states = [s for s in ordered_states if s in state_tensor]
     # Each entry: (value_tensor, label_from_state_tensor, cols_list).
-    node_first_value: Dict[Node, Tuple[torch.Tensor, str, list]] = {}
-    violations: List[tuple] = []
+    node_first_value: dict[Node, tuple[torch.Tensor, str, list]] = {}
+    violations: list[tuple] = []
     violated_nodes: set = set()
     for state in captured_states:
         state_label = state_tensor[state][1]
@@ -211,9 +209,9 @@ def run_consistency_check(
 
 
 def check_debug_predicates(
-    checked_nodes: List[Node],
+    checked_nodes: list[Node],
     ra: ResidualAssignment,
-    ordered_states: List[ResidualStreamState],
+    ordered_states: list[ResidualStreamState],
     state_tensor: StateTensors,
 ) -> None:
     """Run every checked node's attached checks on its captured compiled value.

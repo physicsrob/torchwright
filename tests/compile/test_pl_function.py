@@ -127,7 +127,8 @@ def _sawtooth_knots(n_teeth=3, period=4.0, drop=0.2):
 
 def test_sawtooth_pullback_multiplies_crossings():
     """One threshold crossing per monotone run of the sawtooth — the
-    reason per-lane counts are not a valid kink bound."""
+    reason per-lane counts are not a valid kink bound.
+    """
     knots, vals = _sawtooth_knots()
     saw = PLFunction(torch.tensor(knots), torch.tensor(vals).reshape(-1, 1), 0.0, 0.0)
     phi = saw.map_affine(torch.tensor([[1.0]]), torch.tensor([-2.0]))
@@ -136,7 +137,8 @@ def test_sawtooth_pullback_multiplies_crossings():
 
 def test_sawtooth_graph_kink_pin():
     """Graph-level: compare-after-sawtooth candidates = the sawtooth's 5
-    interior knots + 2 hinges x 6 monotone runs = 17."""
+    interior knots + 2 hinges x 6 monotone runs = 17.
+    """
     ops = _ops("relu")
     knots, vals = _sawtooth_knots()
     x = create_input("x", 1, value_range=(0.0, 12.0))
@@ -157,7 +159,8 @@ def test_sawtooth_graph_kink_pin():
 
 def test_saturation_tails_keep_kinks_finite():
     """A huge interval-arithmetic source range costs nothing: every kink
-    lives inside the clamp contract and the tails are flat."""
+    lives inside the clamp contract and the tails are flat.
+    """
     ops = _ops("relu")
     x = create_input("x", 1, value_range=(-1e9, 1e9))
     c = ops.clamp(x, -100.0, 100.0)
@@ -225,7 +228,8 @@ def test_kink_pin_clamp(machine):
 
 def test_kink_pin_floor_int():
     """floor_int realizes 2 slope changes per boundary; its two-stage
-    construction contributes at most 3 candidates per boundary."""
+    construction contributes at most 3 candidates per boundary.
+    """
     ops = _ops("swish")
     x = create_input("x", 1, value_range=(0.0, 8.0))
     f = ops.floor_int(x, 0, 8)
@@ -244,7 +248,8 @@ def test_kink_pin_floor_int():
 
 def test_kink_pin_table_lookup_2d():
     """(rows-1) row transitions + (cols-1) column transitions when the
-    two index chains hit their half-integer boundaries at distinct x."""
+    two index chains hit their half-integer boundaries at distinct x.
+    """
     from torchwright.ops.swiglu.map_select import table_lookup_2d
 
     x = create_input("x", 1, value_range=(0.0, 6.0))
@@ -267,7 +272,8 @@ def test_kink_pin_table_lookup_2d():
 def test_keystone_random_chains_match_reference(machine):
     """Random small op chains: the certified PL function reproduces the
     exact oracle on a dense mid-segment grid — exactly on relu,
-    fillet-bounded on swish."""
+    fillet-bounded on swish.
+    """
     from torchwright.ops.const import step_sharpness
 
     ops = _ops(machine)
@@ -309,7 +315,8 @@ def test_keystone_random_chains_match_reference(machine):
 def test_same_source_multiply_declines_midpoint_linearity():
     """x·x is piecewise-quadratic: measured, located decline — under
     BOTH policies (its curvature spans the whole domain, so the banded
-    policy's narrow-run excusal never applies)."""
+    policy's narrow-run excusal never applies).
+    """
     ops = _ops("swish")
     x = create_input("x", 1, value_range=(0.0, 9.0))
     m = ops.multiply(x, x)
@@ -326,7 +333,8 @@ def test_resolution_floor_excuses_position_quantization():
     """A sharp compare at |x| ~ 1400: transition position is only
     representable to one fp32 spacing (1.2e-4), so mid-ramp chord
     deviation up to ~slope·eps32(x) is the machine's own quantization
-    — excused, not charged (the doom is_type guard class)."""
+    — excused, not charged (the doom is_type guard class).
+    """
     ops = _ops("swish")
     x = create_input("x", 1, value_range=(0.0, 3000.0))
     c = ops.compare(x, 1400.05, sharpness=100.0)
@@ -339,7 +347,8 @@ def test_banded_policy_excuses_shifted_band_strict_declines():
     0.03 right of the weight-derived candidates.  Inside the narrow
     candidate-bracketed band the chord reads full-scale deviation —
     strict charges it, the banded policy (inherited-ramp clause) bins
-    it as in-band."""
+    it as in-band.
+    """
     from torchwright.compiler.collapse import _seeded_oracle
 
     ops = _ops("relu")
@@ -362,7 +371,8 @@ def test_banded_policy_excuses_shifted_band_strict_declines():
 
 def test_relu_square_is_pl_and_certifies():
     """The relu machine's square is a PL *approximation* — the same
-    shape that declines as an exact product certifies as a table."""
+    shape that declines as an exact product certifies as a table.
+    """
     ops = _ops("relu")
     x = create_input("x", 1, value_range=(0.0, 9.0))
     s = ops.square(x, max_value=9.0)
@@ -372,7 +382,8 @@ def test_relu_square_is_pl_and_certifies():
 
 def test_swish_abs_curvature_lands_in_fillet_split():
     """|x|'s rounding near zero is fillet-class: reported in
-    fillet_deviation, not charged against the chord certificate."""
+    fillet_deviation, not charged against the chord certificate.
+    """
     ops = _ops("swish")
     x = create_input("x", 1, value_range=(-5.0, 5.0))
     a = ops.abs(x)
@@ -389,7 +400,8 @@ def test_hinge_band_zones_classify_dip_as_fillet():
     zone samples classify as fillet — reported, never chargeable — the
     band-edge knots appear in the candidate set, and the composed
     select member (whose ancestry inherits the compare's band) stays
-    chord-certifiable."""
+    chord-certifiable.
+    """
     from torchwright.ops.swiglu.map_select import select
 
     x = create_input("x", 1, value_range=(-8192.0, 8192.0))
@@ -412,7 +424,8 @@ def test_hinge_bands_expose_saturated_lane_fp_wander():
     accidentally excused it (the steep candidate bracket was the
     plateau chord's direct neighbor); the band-edge knot buffers the
     plateau from the bracket, so the wander is now honestly charged
-    while the dip itself stays in the reported fillet bucket."""
+    while the dip itself stays in the reported fillet bucket.
+    """
     ops = _ops("swish")
     x = create_input("x", 1, value_range=(0.0, 8192.0))
     p = ops.piecewise_linear(
@@ -451,7 +464,8 @@ def test_unbounded_source_declines():
 
 def _synthetic_staircase(n_steps=2046, ramp=1e-3):
     """A doom-floor-shaped staircase: unit steps at integer boundaries
-    across [-1023, 1023], ramps ``ramp`` wide (slope 1/ramp)."""
+    across [-1023, 1023], ramps ``ramp`` wide (slope 1/ramp).
+    """
     xs, ys = [-1023.5], [0.0]
     for k in range(n_steps):
         b = -1023.0 + k
@@ -464,7 +478,8 @@ def _synthetic_staircase(n_steps=2046, ramp=1e-3):
 
 def test_s1_infeasible_s2_feasible_on_doom_scale_staircase():
     """The recon insight, pinned: fp32 kills the single-FFN emission of
-    a sharp wide staircase; the bounded-step shape stays in budget."""
+    a sharp wide staircase; the bounded-step shape stays in budget.
+    """
     fn = _synthetic_staircase()
     s1 = model_s1(fn, measured_dev=0.0)
     assert s1.lanes == 2 * 2046
@@ -486,7 +501,8 @@ def test_s1_infeasible_s2_feasible_on_doom_scale_staircase():
 
 def test_analysis_takes_v1_declined_continuous_chain():
     """A staircase chain with NO integer claim: v1 declines (gate 1),
-    v2 certifies the composed PL directly and takes it as S1."""
+    v2 certifies the composed PL directly and takes it as S1.
+    """
     from torchwright.compiler.collapse_analysis import analyze_collapse_v2
     from torchwright.compiler.lower import lower
 
@@ -503,7 +519,8 @@ def test_analysis_takes_v1_declined_continuous_chain():
 
 def test_analysis_picks_s2_for_sharp_wide_staircase_chain():
     """A sharp wide floor chain: the single-FFN shape dies on fp32
-    accumulation, the bounded-step shape is taken at chain -> 2."""
+    accumulation, the bounded-step shape is taken at chain -> 2.
+    """
     from torchwright.compiler.collapse_analysis import analyze_collapse_v2
     from torchwright.compiler.lower import lower
 
@@ -526,7 +543,8 @@ def test_s2_swish_fillet_is_reported_not_charged():
     """Per-step jumps of 100 (a colormap-scale delta) carry an in-band
     fillet excursion of 2·swish_dip/scale·|δ| — the class the original
     chain already has.  The model reports it and keeps it out of the
-    charged bound."""
+    charged bound.
+    """
     xs = [0.0]
     ys = [0.0]
     for k in range(4):

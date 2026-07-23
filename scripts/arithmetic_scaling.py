@@ -119,14 +119,16 @@ def log(message: str) -> None:
 
 def _is_neuron(node) -> bool:
     """A node that lowers to hidden compute: an FFN (the packable lane unit
-    the swiglu ops build), a legacy ReLU layer, or an attention sublayer."""
+    the swiglu ops build), a legacy ReLU layer, or an attention sublayer.
+    """
     t = type(node).__name__
     return t == "FFN" or "ReLU" in t or "Attn" in t
 
 
 def _neuron_width(node) -> int:
     """The hidden width a neuron node contributes: an FFN's lane count
-    (``gate_proj`` rows), otherwise the node's output width."""
+    (``gate_proj`` rows), otherwise the node's output width.
+    """
     if type(node).__name__ == "FFN":
         return node.gate_proj.shape[0]
     return len(node)
@@ -221,7 +223,8 @@ def measure_scratchpad_op(op_fn, n):
     """Build the streamed scratchpad ``op(a, b)`` kernel; return (depth, neurons).
 
     Depth is flat in ``n`` (the streaming moves the serial recurrence onto the
-    decode-step axis); only the neuron count grows."""
+    decode-step axis); only the neuron count grows.
+    """
     embedding = create_onehot_embedding(calculator_scratchpad.scratch_vocab(n))
     rope = create_rope_config(
         d_head=calculator_scratchpad.D_HEAD,
@@ -270,7 +273,7 @@ def run(digit_sweep, multiply_cap=DEFAULT_MULTIPLY_CAP):
     for op_name, op_fn in _SCRATCHPAD_OPS.items():
         records = []
         cap = SCRATCHPAD_OP_CAP
-        if op_name == "multiply" and SCRATCHPAD_MULTIPLY_PLANE_CAP < cap:
+        if op_name == "multiply" and cap > SCRATCHPAD_MULTIPLY_PLANE_CAP:
             cap = SCRATCHPAD_MULTIPLY_PLANE_CAP
             log(
                 f"scratchpad/multiply: capping at n<={cap} — the answer gather's "
@@ -288,7 +291,8 @@ def run(digit_sweep, multiply_cap=DEFAULT_MULTIPLY_CAP):
 
 def measure_model(impl, n):
     """Build the whole model ``create_network_parts(n)``; return its end-to-end
-    (depth, neurons) — parse + arithmetic + dispatch + emit, not one op."""
+    (depth, neurons) — parse + arithmetic + dispatch + emit, not one op.
+    """
     output_node, _ = impl.create_network_parts(max_digits=n)
     return critical_path_depth([output_node]), total_neurons([output_node])
 
@@ -297,7 +301,8 @@ def run_models(digit_sweep):
     """End-to-end model depth/size for every implementation, plus the scratchpad
     worst-case decode-step count (its O(n) cost, the axis that grows instead of
     depth — the multiply transcript's length; add/sub stop at their own <eos>
-    earlier)."""
+    earlier).
+    """
     results = {}
     for name, impl in MODEL_IMPLEMENTATIONS.items():
         records = []

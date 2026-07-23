@@ -66,7 +66,8 @@ def test_multiply_dead_lane_exact_zero_bit_exact_fp32():
     contributes nothing and the live lane is a·b in one rounding —
     bit-identical to the reference.  (At merely-saturated |a| ≈ 17-88
     the dead lane's σ is a representable ~e^{-|a|}, leaving ulp-class
-    relative error — covered by the allclose tests above.)"""
+    relative error — covered by the allclose tests above.)
+    """
     at = torch.tensor([100.0, -100.0, 150.0, -200.0]).unsqueeze(1)
     bt = torch.tensor([3.25, -0.5, -123.456, 0.875]).unsqueeze(1)
     a = create_input("a", 1, value_range=(-200.0, 200.0))
@@ -101,7 +102,8 @@ def test_square_structure_and_oracle():
 
 def test_square_near_zero_relative_error_gone():
     """The ReLU-era piecewise square was worst near zero (231x rel error
-    in the noise table); the gated form stays ~ulp-relative there."""
+    in the noise table); the gated form stays ~ulp-relative there.
+    """
     xt = torch.linspace(-0.1, 0.1, 201).unsqueeze(1)
     x = create_input("x", 1, value_range=(-1.0, 1.0))
     val = square(x).compute(201, {"x": xt})
@@ -139,7 +141,8 @@ def test_compiles_clean(op_name):
 def test_abs_structure_and_integer_grid_bit_exact():
     """2·d degenerate lanes; for |x| >= 0.2 tanh saturates and abs is
     bit-exact in fp32 — the entire integer grid (pinned in
-    test_swish_constants::test_abs_integer_grid_bit_exact_fp32)."""
+    test_swish_constants::test_abs_integer_grid_bit_exact_fp32).
+    """
     from torchwright.ops.swiglu import abs as abs_op
 
     x = create_input("x", 2, value_range=(-1000.0, 1000.0))
@@ -154,7 +157,8 @@ def test_abs_structure_and_integer_grid_bit_exact():
 
 def test_abs_one_sided_dip_near_zero():
     """Output lies in [0, |x|]: never negative, never above the true
-    value; worst underestimate 2·swish_dip/scale at |x| = 1.278/scale."""
+    value; worst underestimate 2·swish_dip/scale at |x| = 1.278/scale.
+    """
     from torchwright.ops.const import scale, swish_dip
     from torchwright.ops.swiglu import abs as abs_op
 
@@ -190,9 +194,10 @@ def test_min_ties_and_integer_far_field():
 
 
 def test_min_one_sided_overestimate_and_symmetry():
-    """min is over-estimated by at most swish_dip/scale, only when
+    """Min is over-estimated by at most swish_dip/scale, only when
     |a-b| is small; and min(a,b) == min(b,a) despite the asymmetric
-    construction (the hinge's gap to ReLU is even in a-b)."""
+    construction (the hinge's gap to ReLU is even in a-b).
+    """
     from torchwright.ops.const import scale, swish_dip
     from torchwright.ops.swiglu import min as min_op
 

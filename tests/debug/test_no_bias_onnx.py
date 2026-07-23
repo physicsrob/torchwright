@@ -121,7 +121,8 @@ def test_artifact_records_collapse_provenance(artifacts):
     top-level like "bias" (never inside "extra", which is the caller's
     verbatim metadata).  Lives here to reuse this module's exported
     artifacts; both passes are unconditional, so this pins the emitted
-    keys, not a knob."""
+    keys, not a knob.
+    """
     artifact, onnx_path = artifacts["biased"]
     with open(meta_path_for(onnx_path)) as f:
         meta = json.load(f)
@@ -135,7 +136,8 @@ def test_artifact_records_collapse_provenance(artifacts):
 
 def test_no_bias_emission_has_no_bias_tensors(artifacts):
     """No bias initializers exist and no node reads one — each projection
-    is its bare MatMul."""
+    is its bare MatMul.
+    """
     import onnx
 
     _, onnx_path = artifacts["biasless"]
@@ -158,7 +160,8 @@ def test_no_bias_emission_has_no_bias_tensors(artifacts):
 
 def test_no_bias_logits_match_biased_twin(artifacts):
     """The two emissions of the same graph agree at the logits (the folds
-    are the same math, shifted into the matmuls)."""
+    are the same math, shifted into the matmuls).
+    """
     _, biased_path = artifacts["biased"]
     _, biasless_path = artifacts["biasless"]
     out_a, emb = _build()
@@ -178,7 +181,8 @@ def test_no_bias_logits_match_biased_twin(artifacts):
 
 def test_no_bias_debug_session_roundtrips(artifacts):
     """probe_compiled over the executing biasless artifact matches the
-    exact oracle; debug=True passes residual self-consistency."""
+    exact oracle; debug=True passes residual self-consistency.
+    """
     _, onnx_path = artifacts["biasless"]
     out2, emb2 = _build()
     session = OnnxDebugSession(onnx_path, out2)
@@ -199,7 +203,8 @@ def test_no_bias_debug_session_roundtrips(artifacts):
 
 def test_sidecar_artifact_mode_mismatch_trips(artifacts, tmp_path):
     """A biasless model paired with a biased compile's sidecars must trip
-    the emission-mode cross-check (the fingerprint cannot see the flag)."""
+    the emission-mode cross-check (the fingerprint cannot see the flag).
+    """
     _, biased_path = artifacts["biased"]
     _, biasless_path = artifacts["biasless"]
     # Assemble a mismatched pair: the biased export's sidecars next to the

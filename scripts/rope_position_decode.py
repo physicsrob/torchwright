@@ -44,6 +44,7 @@ Run:  python scripts/rope_position_decode.py        (CPU, numpy only)
 from __future__ import annotations
 
 import math
+
 import numpy as np
 
 TWO_PI = 2.0 * math.pi
@@ -215,7 +216,7 @@ def main() -> None:
         knots = n_breakpoints(radix, n_levels)
         print(
             f"{radix:>6} {n_levels:>7} {n_levels:>7} {knots:>7} "
-            f"{str(exact):>7} {margin:>18.4f} {math.pi / radix:>10.4f}"
+            f"{exact!s:>7} {margin:>18.4f} {math.pi / radix:>10.4f}"
         )
 
     print("\nReadings:")

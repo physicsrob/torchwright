@@ -46,7 +46,6 @@ Limitations
 """
 
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Set, Tuple
 
 from torchwright.compiler.forward.graph_analysis import GraphAnalyzer
 from torchwright.graph import Concatenate, Node
@@ -65,7 +64,7 @@ class ChainInfo:
     """
 
     chain_id: int
-    nodes: Set[Node]
+    nodes: set[Node]
     terminal: Node
     peak_width: int
 
@@ -74,7 +73,7 @@ class ChainInfo:
 class ClusterInfo:
     cluster_id: int
     join: Node
-    chains: List[ChainInfo]
+    chains: list[ChainInfo]
     peak_chain_width: int
 
 
@@ -91,9 +90,9 @@ class SiblingClusters:
     completed" transitions as terminals are scheduled.
     """
 
-    clusters: Dict[int, ClusterInfo] = field(default_factory=dict)
-    node_to_chain: Dict[Node, Tuple[int, int]] = field(default_factory=dict)
-    terminal_to_chain: Dict[Node, Tuple[int, int]] = field(default_factory=dict)
+    clusters: dict[int, ClusterInfo] = field(default_factory=dict)
+    node_to_chain: dict[Node, tuple[int, int]] = field(default_factory=dict)
+    terminal_to_chain: dict[Node, tuple[int, int]] = field(default_factory=dict)
 
     def is_empty(self) -> bool:
         return not self.clusters
@@ -161,16 +160,16 @@ class SiblingClusterAnalyzer:
     # Per-join cluster construction
     # ------------------------------------------------------------------
 
-    def _try_build_cluster(self, join: Node, cluster_id: int) -> Optional[ClusterInfo]:
+    def _try_build_cluster(self, join: Node, cluster_id: int) -> ClusterInfo | None:
         inputs = list(join.inputs)
 
         # Step 1: per-input backward-reachable set (Concatenate-transparent).
-        per_input_reachable: List[Set[Node]] = [
+        per_input_reachable: list[set[Node]] = [
             self._backward_reachable(inp) for inp in inputs
         ]
 
         # Step 2: per-input exclusive set = reachable_i \ union_{j≠i} reachable_j.
-        chains: List[ChainInfo] = []
+        chains: list[ChainInfo] = []
         union_others_cache = self._union_others(per_input_reachable)
         for idx, inp in enumerate(inputs):
             exclusive = per_input_reachable[idx] - union_others_cache[idx]
@@ -234,16 +233,16 @@ class SiblingClusterAnalyzer:
     # Helpers
     # ------------------------------------------------------------------
 
-    def _backward_reachable(self, start: Node) -> Set[Node]:
+    def _backward_reachable(self, start: Node) -> set[Node]:
         """All non-Concatenate nodes reachable backward from ``start``.
 
         Concatenates are transparent: walked through but not included
         in the result.  The start node itself is included (unless it's
         a Concatenate, in which case its children are).
         """
-        result: Set[Node] = set()
-        visited: Set[Node] = set()
-        stack: List[Node] = [start]
+        result: set[Node] = set()
+        visited: set[Node] = set()
+        stack: list[Node] = [start]
         while stack:
             cur = stack.pop()
             if cur in visited:
@@ -255,18 +254,18 @@ class SiblingClusterAnalyzer:
                 stack.append(inp)
         return result
 
-    def _union_others(self, per_input_reachable: List[Set[Node]]) -> List[Set[Node]]:
+    def _union_others(self, per_input_reachable: list[set[Node]]) -> list[set[Node]]:
         """For each index i, return the union of all other reachable sets."""
-        out: List[Set[Node]] = []
+        out: list[set[Node]] = []
         for i, _ in enumerate(per_input_reachable):
-            u: Set[Node] = set()
+            u: set[Node] = set()
             for j, s_j in enumerate(per_input_reachable):
                 if j != i:
                     u |= s_j
             out.append(u)
         return out
 
-    def _prune_external_consumers(self, exclusive: Set[Node], join: Node) -> Set[Node]:
+    def _prune_external_consumers(self, exclusive: set[Node], join: Node) -> set[Node]:
         """Iteratively drop nodes with consumers outside ``exclusive ∪ {join}``.
 
         Concatenates on the consumer side are walked through: a node n
@@ -274,9 +273,9 @@ class SiblingClusterAnalyzer:
         C's downstream non-Concatenate consumers are in the exclusive
         set or are the join.
         """
-        valid_downstream_cache: Dict[Node, bool] = {}
+        valid_downstream_cache: dict[Node, bool] = {}
 
-        def is_valid(node: Node, within: Set[Node]) -> bool:
+        def is_valid(node: Node, within: set[Node]) -> bool:
             if node is join:
                 return True
             if node in within:
@@ -295,7 +294,7 @@ class SiblingClusterAnalyzer:
         # Pruning can invalidate the cache, so clear it each iteration.
         while True:
             valid_downstream_cache.clear()
-            to_remove: Set[Node] = set()
+            to_remove: set[Node] = set()
             for n in exclusive:
                 for c in self.graph.get_consumers(n):
                     if not is_valid(c, exclusive):
@@ -306,11 +305,11 @@ class SiblingClusterAnalyzer:
             exclusive -= to_remove
         return exclusive
 
-    def _effective_consumers(self, node: Node) -> Set[Node]:
+    def _effective_consumers(self, node: Node) -> set[Node]:
         """Consumers of ``node``, walking through ``Concatenate``."""
-        result: Set[Node] = set()
+        result: set[Node] = set()
         stack = list(self.graph.get_consumers(node))
-        seen: Set[Node] = set()
+        seen: set[Node] = set()
         while stack:
             cur = stack.pop()
             if cur in seen:

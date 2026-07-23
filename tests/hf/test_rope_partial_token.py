@@ -18,7 +18,6 @@ CPU-only; skips where onnxruntime / transformers are unavailable.
 
 from __future__ import annotations
 
-import os
 import tempfile
 
 import pytest
@@ -106,7 +105,8 @@ def test_hf_partial_rope_prefill_equals_cached_decode():
 
 def _build_content_model(tmpdir):
     """Predict the highest-vocab-index token seen so far via a content head whose
-    content (a width-1 score) rides the NoPE tail under partial rotary."""
+    content (a width-1 score) rides the NoPE tail under partial rotary.
+    """
     from torchwright.graph.linear import Linear
     from torchwright.ops.attention_ops import attend_argmax_dot
     from torchwright.ops.inout_nodes import create_literal_value
@@ -126,7 +126,8 @@ def _build_content_model(tmpdir):
 def test_hf_partial_content_head_selects_by_content():
     """A content head on the NoPE tail survives ONNX export + direct HF compilation and still
     selects by content: each position predicts the highest-vocab-index token in its
-    causal window."""
+    causal window.
+    """
     seq = ["<bos>", "a", "c", "b", "e", "d"]  # indices 0,2,4,3,6,5
     ids = torch.tensor([[_VOCAB.index(t) for t in seq]])
     with tempfile.TemporaryDirectory() as tmp:

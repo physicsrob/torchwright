@@ -54,11 +54,11 @@ input rather than synthesising the step function inside the attention op.
 """
 
 import math
-from typing import Optional, cast
+from typing import cast
 
 import torch
 
-from torchwright.graph import Node, Concatenate, Attn, LiteralValue, RopeConfig
+from torchwright.graph import Attn, Concatenate, LiteralValue, Node, RopeConfig
 from torchwright.graph.asserts import (
     assert_in_range,
     assert_matches_value_type,
@@ -88,7 +88,7 @@ def _wrap_hard_selection_output(
     attn: Attn,
     value: Node,
     atol: float = _HARD_SELECTION_ATOL,
-    assert_hardness_gt: Optional[float] = None,
+    assert_hardness_gt: float | None = None,
 ) -> Node:
     """Bake a value-type guarantee onto a hard-selection primitive's output.
 
@@ -285,7 +285,7 @@ def attend_argmin_above_integer(
     indicators_above: Node,
     threshold_onehot: Node,
     value: Node,
-    assert_hardness_gt: Optional[float] = None,
+    assert_hardness_gt: float | None = None,
 ) -> Node:
     """Argmin of ``score`` among positions strictly above a runtime threshold.
 
@@ -411,7 +411,7 @@ def attend_argmin_above_in_bucket(
     query_bucket_onehot: Node,
     threshold_onehot: Node,
     value: Node,
-    assert_hardness_gt: Optional[float] = None,
+    assert_hardness_gt: float | None = None,
 ) -> Node:
     """Smallest-``score`` row that is valid, in a requested bucket, and above
     a requested threshold — read its ``value``.
@@ -589,7 +589,7 @@ def attend_argmin_unmasked(
     mask_vector: Node,
     position_onehot: Node,
     value: Node,
-    assert_hardness_gt: Optional[float] = None,
+    assert_hardness_gt: float | None = None,
 ) -> Node:
     """Argmin of ``score`` over positions whose index isn't set in the mask.
 
@@ -749,7 +749,7 @@ def attend_mean_where(
         Attn node of width ``len(value)`` equal to the uniform mean of
         ``value`` across valid key positions in the causal window.
 
-    See also:
+    See Also:
         :func:`attend_argmin_where` — selects one position (min score)
         instead of averaging.
     """
@@ -838,7 +838,7 @@ def attend_causal_mean(
         Attn node of width ``len(value)`` equal to ``output_scale`` times the
         uniform causal mean of ``value``.
 
-    See also:
+    See Also:
         :func:`attend_mean_where` — validity-selected mean (one subset).
     """
     query_one = LiteralValue(torch.tensor([1.0]), name="causal_mean_query_one")
@@ -877,7 +877,7 @@ def attend_argmax_dot(
     key_vector: Node,
     value: Node,
     match_gain: float = 200.0,
-    assert_hardness_gt: Optional[float] = None,
+    assert_hardness_gt: float | None = None,
 ) -> Node:
     """Argmax of a vector dot-product score.
 
@@ -917,7 +917,7 @@ def attend_argmax_dot(
         Attn node of width ``len(value)`` equal to ``value`` at the
         best-matching key position within the causal window.
 
-    See also:
+    See Also:
         :func:`attend_argmax_where` — scalar-score variant with
         explicit validity.
     """
@@ -1218,7 +1218,7 @@ def attend_most_recent_globally(
 
     d_head = rope.d_head
     attn: Node
-    if cast(int, rope.d_rot) < d_head:
+    if cast("int", rope.d_rot) < d_head:
         # --- Partial rotary ---
         # Content (W match dims) rides the unrotated NoPE tail [d_rot:d_rot+W]: an
         # EXACT, position-free content dot product at any distance.  The position
@@ -1229,14 +1229,14 @@ def attend_most_recent_globally(
         # cannot delegate to rotary_content_head, which would route ALL columns
         # uniformly (content to the tail AND the position column to the tail, where
         # there is no rotation to order keys at distance — wrong).
-        tail = d_head - cast(int, rope.d_rot)
-        if W > tail:
+        tail = d_head - cast("int", rope.d_rot)
+        if tail < W:
             raise ValueError(
                 f"attend_most_recent_globally: content width W={W} exceeds the "
                 f"{tail}-wide NoPE tail (d_head={d_head}, d_rot={rope.d_rot}); "
                 f"raise d_head or lower d_rot."
             )
-        pos_plane = cast(int, rope.d_rot) // 2 - 1
+        pos_plane = cast("int", rope.d_rot) // 2 - 1
         theta_pos = _theta_slow(rope)
         if rope.max_positions * theta_pos >= math.pi / 2:
             raise ValueError(
@@ -1250,10 +1250,10 @@ def attend_most_recent_globally(
         query_matrix = torch.zeros((W + 1, d_head))
         key_matrix = torch.zeros((W + 1, d_head))
         for c in range(W):
-            query_matrix[c, cast(int, rope.d_rot) + c] = (
+            query_matrix[c, cast("int", rope.d_rot) + c] = (
                 match_gain  # content on the tail
             )
-            key_matrix[c, cast(int, rope.d_rot) + c] = 1.0
+            key_matrix[c, cast("int", rope.d_rot) + c] = 1.0
         query_matrix[W, pos_plane] = alpha  # position tiebreak on a rotated plane
         key_matrix[W, pos_plane] = 1.0  # global_position passes through identity
         d_v = len(value)

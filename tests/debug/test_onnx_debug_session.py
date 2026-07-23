@@ -36,12 +36,11 @@ from torchwright.compiler.graph_identity import (
 from torchwright.debug.probe import (
     probe_attention,
     probe_compiled,
-    probe_residual,
 )
 from torchwright.graph.asserts import assert_in_range
 from torchwright.graph.attn import Attn
-from torchwright.ops.linear import add, multiply_const
 from torchwright.ops.inout_nodes import create_input
+from torchwright.ops.linear import add, multiply_const
 
 onnxruntime = pytest.importorskip("onnxruntime")
 
@@ -155,7 +154,8 @@ def _build_annotated_graph():
 
 def test_sidecar_carries_annotations(tmp_path):
     """The ``annotate()`` label path round-trips through the debug sidecar
-    and onto OnnxDebugSession.annotation() against a fresh rebuild."""
+    and onto OnnxDebugSession.annotation() against a fresh rebuild.
+    """
     out, embedding, prod, top = _build_annotated_graph()
     onnx_path = str(tmp_path / "annotated.onnx")
     compile_to_onnx(
@@ -189,7 +189,8 @@ def test_sidecar_carries_annotations(tmp_path):
 
 def test_sidecar_nodes_table_schema(tmp_path):
     """The per-node table keys by canonical id (same space as placements /
-    states) and carries op/width/weights/inputs/layer/sublayer per node."""
+    states) and carries op/width/weights/inputs/layer/sublayer per node.
+    """
     out, embedding, prod, top = _build_annotated_graph()
     onnx_path = str(tmp_path / "nodes.onnx")
     compile_to_onnx(
@@ -388,7 +389,8 @@ def test_corrupted_initializer_is_detected(token_artifact, tmp_path):
     """D6 reproducer: an artifact whose weights differ from what the
     compiler computed must show up as oracle divergence on the ONNX
     backend.  (The in-process backend never reads the artifact, so it
-    is structurally blind to this class.)"""
+    is structurally blind to this class.)
+    """
     import numpy as np
     import onnx
 
@@ -562,7 +564,8 @@ def test_oversized_conversion_external_metadata_and_bytes(token_artifact, monkey
     when several tensors convert.  (The true >2 GiB representation cannot run
     in a unit test; it is exercised for real by the W6 landing gate, which
     opens a production e1m1_lowres artifact whose embed_table declares
-    3.3 GB.  This pins the metadata arithmetic that gate relies on.)"""
+    3.3 GB.  This pins the metadata arithmetic that gate relies on.)
+    """
     import numpy as np
     import onnx
     from onnx import helper as onnx_helper
@@ -617,7 +620,8 @@ def test_oversized_conversion_chunk_seams(token_artifact, monkeypatch):
     """Densification writes in fixed flat blocks; the risk is at the seams
     (an entry landing exactly on a block boundary, blocks with no entries).
     Shrink the block size so every converted tensor spans many blocks and
-    verify the session still computes identically."""
+    verify the session still computes identically.
+    """
     from torchwright.debug import onnx_debug as od
 
     out_ref, emb = _build_adder()
@@ -637,7 +641,8 @@ def test_suppress_checks_reaches_the_onnx_backend(token_artifact):
     """suppress_checks() must silence predicate re-checks on THIS backend
     too — checks are rebuild-side metadata (outside the fingerprint), so a
     deliberately-violated assert attached to the rebuilt graph discriminates
-    cleanly: raises on a debug step normally, silent inside the context."""
+    cleanly: raises on a debug step normally, silent inside the context.
+    """
     import pytest
 
     from torchwright.graph.asserts import assert_in_range

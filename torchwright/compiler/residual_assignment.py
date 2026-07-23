@@ -1,7 +1,4 @@
-from torchwright.graph import Node, Concatenate
-
-from typing import Dict, List, Set, Optional
-
+from torchwright.graph import Concatenate, Node
 from torchwright.graph.misc import Placeholder
 
 global_state_id = 0
@@ -29,12 +26,12 @@ class ResidualAssignment:
     in activation space.)
     """
 
-    mapping: Dict[ResidualStreamState, Dict[Node, List[int]]]
+    mapping: dict[ResidualStreamState, dict[Node, list[int]]]
 
-    def __init__(self, states: Set[ResidualStreamState]):
+    def __init__(self, states: set[ResidualStreamState]):
         self.mapping = {state: {} for state in states}
 
-    def assign(self, state: ResidualStreamState, node: Node, indices: List[int]):
+    def assign(self, state: ResidualStreamState, node: Node, indices: list[int]):
         self.mapping[state][node] = indices
 
     def duplicate_state(self, src: ResidualStreamState, dst: ResidualStreamState):
@@ -43,13 +40,13 @@ class ResidualAssignment:
     def has_node(self, state: ResidualStreamState, node: Node) -> bool:
         return node in self.mapping[state]
 
-    def get_nodes(self, state: ResidualStreamState) -> Set[Node]:
+    def get_nodes(self, state: ResidualStreamState) -> set[Node]:
         return set(self.mapping.get(state, {}).keys())
 
-    def get_node_indices(self, state: ResidualStreamState, node: Node) -> List[int]:
+    def get_node_indices(self, state: ResidualStreamState, node: Node) -> list[int]:
         if isinstance(node, Placeholder):
             return []
-        elif isinstance(node, Concatenate):
+        if isinstance(node, Concatenate):
             # A collapse pass can synthesize a whole Concatenate member as
             # one node; the source re-key then gives the source Concatenate
             # a direct entry (full row, children in order) while its leaves
@@ -65,7 +62,7 @@ class ResidualAssignment:
         return self.mapping[state][node]
 
 
-def flatten_concat_nodes(nodes: List[Node]) -> List[Node]:
+def flatten_concat_nodes(nodes: list[Node]) -> list[Node]:
     """Flatten Concatenate nodes to leaf children, remove Placeholder."""
     simplified_other_nodes = []
     for n in nodes:

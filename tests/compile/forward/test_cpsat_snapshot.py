@@ -139,7 +139,8 @@ def test_problem_object_roundtrips(name):
 
 def test_canonicalized_snapshot_rebuilds_a_valid_model():
     """A canonical (on-disk) snapshot rebuilds a self-consistent model that
-    re-solves; its ids differ from live, so its proto is its own — but stable."""
+    re-solves; its ids differ from live, so its proto is its own — but stable.
+    """
     node, d, d_head = _build("caesar")
     cfg = dict(d=d, d_head=d_head, d_hidden=d, max_layers=40)
     problem = snapshot_from_graph_model(build_graph_model(node)).canonicalized(node)

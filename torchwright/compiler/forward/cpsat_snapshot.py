@@ -44,7 +44,7 @@ import json
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, FrozenSet, Optional, Tuple, cast
+from typing import cast
 
 from torchwright.compiler.graph_identity import (
     canonical_ids,
@@ -102,12 +102,12 @@ class NodeRecord:
     node_id: int
     kind: str
     d_output: int
-    input_ids: Tuple[int, ...]
-    d_v: Optional[int] = None
-    n_lanes: Optional[int] = None
+    input_ids: tuple[int, ...]
+    d_v: int | None = None
+    n_lanes: int | None = None
     critical_path_len: int = 0
-    name: Optional[str] = None
-    live_row_ranges: Optional[Tuple[Tuple[int, int], ...]] = None
+    name: str | None = None
+    live_row_ranges: tuple[tuple[int, int], ...] | None = None
 
     def to_json(self) -> dict:
         return {
@@ -127,7 +127,7 @@ class NodeRecord:
         }
 
     @classmethod
-    def from_json(cls, d: dict) -> "NodeRecord":
+    def from_json(cls, d: dict) -> NodeRecord:
         return cls(
             node_id=int(d["node_id"]),
             kind=d["kind"],
@@ -146,7 +146,7 @@ class NodeRecord:
             ),
         )
 
-    def remap(self, mapping: Dict[int, int]) -> "NodeRecord":
+    def remap(self, mapping: dict[int, int]) -> NodeRecord:
         """Return a copy with every node id relabeled through ``mapping``."""
         return NodeRecord(
             node_id=mapping[self.node_id],
@@ -180,8 +180,8 @@ class SnapshotIdentity:
 
     fingerprint: str
     critical_path_layers: int
-    torchwright_commit: Optional[str]
-    geometry: Dict[str, object]
+    torchwright_commit: str | None
+    geometry: dict[str, object]
 
     def to_json(self) -> dict:
         return {
@@ -192,7 +192,7 @@ class SnapshotIdentity:
         }
 
     @classmethod
-    def from_json(cls, d: dict) -> "SnapshotIdentity":
+    def from_json(cls, d: dict) -> SnapshotIdentity:
         return cls(
             fingerprint=d["fingerprint"],
             critical_path_layers=int(d["critical_path_layers"]),
@@ -211,10 +211,10 @@ class FrozenHint:
     semantic fields are available.
     """
 
-    layers: Dict[int, int]
-    routing: Dict[int, str]
-    cancel: Dict[int, int]
-    cancel_mech: Dict[int, str]
+    layers: dict[int, int]
+    routing: dict[int, str]
+    cancel: dict[int, int]
+    cancel_mech: dict[int, str]
     n_layers: int
 
     def to_json(self) -> dict:
@@ -227,7 +227,7 @@ class FrozenHint:
         }
 
     @classmethod
-    def from_json(cls, d: dict) -> "FrozenHint":
+    def from_json(cls, d: dict) -> FrozenHint:
         return cls(
             layers={int(k): int(v) for k, v in d["layers"].items()},
             routing={int(k): v for k, v in d["routing"].items()},
@@ -236,7 +236,7 @@ class FrozenHint:
             n_layers=int(d["n_layers"]),
         )
 
-    def remap(self, mapping: Dict[int, int]) -> "FrozenHint":
+    def remap(self, mapping: dict[int, int]) -> FrozenHint:
         def rm(t):
             return {mapping[k]: v for k, v in t.items() if k in mapping}
 
@@ -277,18 +277,18 @@ class SchedulingProblem:
     the direct handoff — and pin an unattainable layer count.
     """
 
-    nodes: Dict[int, NodeRecord]
-    schedulable_ids: Tuple[int, ...]
-    input_ids: Tuple[int, ...]
+    nodes: dict[int, NodeRecord]
+    schedulable_ids: tuple[int, ...]
+    input_ids: tuple[int, ...]
     output_id: int
-    pinned_ids: FrozenSet[int]
-    edges: Tuple[Tuple[int, int], ...]
-    consumers: Dict[int, Tuple[int, ...]]
-    held_source_id: Optional[int] = None
-    held_target_id: Optional[int] = None
+    pinned_ids: frozenset[int]
+    edges: tuple[tuple[int, int], ...]
+    consumers: dict[int, tuple[int, ...]]
+    held_source_id: int | None = None
+    held_target_id: int | None = None
     id_space: str = "live"
-    identity: Optional[SnapshotIdentity] = None
-    hint: Optional[FrozenHint] = None
+    identity: SnapshotIdentity | None = None
+    hint: FrozenHint | None = None
 
     def __post_init__(self) -> None:
         if (self.held_source_id is None) != (self.held_target_id is None):
@@ -306,7 +306,7 @@ class SchedulingProblem:
 
     # -- id-space transforms ----------------------------------------------
 
-    def canonicalized(self, output_node) -> "SchedulingProblem":
+    def canonicalized(self, output_node) -> SchedulingProblem:
         """Return a copy with every id relabeled to canonical (topology) ids.
 
         ``output_node`` is the live graph the problem was captured from; its
@@ -325,7 +325,7 @@ class SchedulingProblem:
             )
         return self._remap(mapping, "canonical")
 
-    def _remap(self, mapping: Dict[int, int], id_space: str) -> "SchedulingProblem":
+    def _remap(self, mapping: dict[int, int], id_space: str) -> SchedulingProblem:
         return SchedulingProblem(
             nodes={mapping[k]: r.remap(mapping) for k, r in self.nodes.items()},
             schedulable_ids=tuple(mapping[i] for i in self.schedulable_ids),
@@ -368,7 +368,7 @@ class SchedulingProblem:
         }
 
     @classmethod
-    def from_json(cls, d: dict) -> "SchedulingProblem":
+    def from_json(cls, d: dict) -> SchedulingProblem:
         version = d.get("format_version")
         if version != FORMAT_VERSION:
             raise ValueError(
@@ -409,13 +409,14 @@ class SchedulingProblem:
         return json.dumps(self.to_json(), sort_keys=True)
 
     @classmethod
-    def loads(cls, text: str) -> "SchedulingProblem":
+    def loads(cls, text: str) -> SchedulingProblem:
         return cls.from_json(json.loads(text))
 
     def save(self, path) -> Path:
         """Persist to ``path`` (JSON).  Requires canonical ids + identity so a
         fixture is self-describing and reproducible; a live-id or
-        identity-less problem is a program error to persist."""
+        identity-less problem is a program error to persist.
+        """
         if self.id_space != "canonical":
             raise ValueError(
                 "refusing to save a live-id snapshot; call .canonicalized("
@@ -438,8 +439,8 @@ class SchedulingProblem:
         cls,
         path,
         *,
-        expected_fingerprint: Optional[str] = None,
-    ) -> "SchedulingProblem":
+        expected_fingerprint: str | None = None,
+    ) -> SchedulingProblem:
         """Load a fixture, refusing on a stale/mismatched identity.
 
         ``expected_fingerprint`` (from rebuilding the current graph) gates the
@@ -466,18 +467,18 @@ class SchedulingProblem:
         output_node,
         d: int,
         d_head: int,
-        n_heads: Optional[int] = None,
+        n_heads: int | None = None,
         d_hidden: int,
         flex_routing: bool,
-        cancel_slack: Optional[int],
+        cancel_slack: int | None,
         policy,
         critical_path_layers: int,
         reserve_residual: int = 0,
         reserve_heads: int = 0,
         max_layers: int = 60,
         bias: bool = True,
-        fingerprint_d_hidden: Optional[int] = None,
-    ) -> "SchedulingProblem":
+        fingerprint_d_hidden: int | None = None,
+    ) -> SchedulingProblem:
         """Attach identity metadata (fingerprint + critical path + geometry).
 
         Kept separate from structural capture so the production build path (via
@@ -506,7 +507,7 @@ class SchedulingProblem:
                 by_key = {n.node_id: n for n in by_key.values()}
             try:
                 held_source_node = by_key[self.held_source_id]
-                held_target_node = by_key[cast(int, self.held_target_id)]
+                held_target_node = by_key[cast("int", self.held_target_id)]
             except KeyError as exc:
                 raise ValueError(
                     f"held endpoint id {exc.args[0]} not found in the "
@@ -528,7 +529,7 @@ class SchedulingProblem:
             held_output_source=held_source_node,
             held_output_target=held_target_node,
         )
-        geometry: Dict[str, object] = {
+        geometry: dict[str, object] = {
             "d": d,
             "d_head": d_head,
             "d_hidden": d_hidden,
@@ -553,10 +554,10 @@ class SchedulingProblem:
         )
         return self._replace(identity=identity)
 
-    def with_hint(self, hint: Optional[FrozenHint]) -> "SchedulingProblem":
+    def with_hint(self, hint: FrozenHint | None) -> SchedulingProblem:
         return self._replace(hint=hint)
 
-    def _replace(self, **changes) -> "SchedulingProblem":
+    def _replace(self, **changes) -> SchedulingProblem:
         from dataclasses import replace as _replace
 
         return _replace(self, **changes)
@@ -592,8 +593,8 @@ def _record_for(node, graph) -> NodeRecord:
 def snapshot_from_graph_model(
     gm,
     *,
-    held_source_id: Optional[int] = None,
-    held_target_id: Optional[int] = None,
+    held_source_id: int | None = None,
+    held_target_id: int | None = None,
 ) -> SchedulingProblem:
     """Capture the structural problem from a live ``GraphModel`` (cheap).
 
@@ -609,11 +610,11 @@ def snapshot_from_graph_model(
     them describes a strictly relaxed scheduling problem.
     """
     graph = gm.graph
-    nodes: Dict[int, NodeRecord] = {}
+    nodes: dict[int, NodeRecord] = {}
     for node in graph.get_all_nodes():
         nodes[node.node_id] = _record_for(node, graph)
 
-    consumers: Dict[int, Tuple[int, ...]] = {}
+    consumers: dict[int, tuple[int, ...]] = {}
     for node, cons in gm.consumers_eff.items():
         consumers[node.node_id] = tuple(c.node_id for c in cons)
 
@@ -631,7 +632,7 @@ def snapshot_from_graph_model(
     )
 
 
-def _git_commit() -> Optional[str]:
+def _git_commit() -> str | None:
     """Best-effort torchwright commit for provenance (None if unavailable)."""
     try:
         here = Path(__file__).resolve()

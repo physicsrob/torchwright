@@ -170,10 +170,9 @@ class TestSession:
             assert s2.input_nodes[0] is y
 
     def test_nested_session_raises(self):
-        with fresh_graph_session():
-            with pytest.raises(RuntimeError, match="Nested"):
-                with fresh_graph_session():
-                    pass
+        with fresh_graph_session(), pytest.raises(RuntimeError, match="Nested"):
+            with fresh_graph_session():
+                pass
 
 
 # --- Eager bounds (computed in __init__) -----------------------------------
@@ -275,10 +274,10 @@ class TestLinearRule:
 
 class TestAddRule:
     def test_add_tracks_correlation(self):
-        """x + (-x) should give [0, 0] via affine tracking, not [-2, 2]."""
+        """X + (-x) should give [0, 0] via affine tracking, not [-2, 2]."""
         with fresh_graph_session():
             x = InputNode(1, name="x", value_range=(-1.0, 1.0))
-            from torchwright.graph import Linear, Add
+            from torchwright.graph import Add, Linear
 
             neg_x = Linear(x, torch.tensor([[-1.0]]), name="neg")
             s = Add(x, neg_x, name="cancel")
@@ -330,7 +329,7 @@ class TestDualRail:
         """Affine bounds should tighten value_type range eagerly."""
         with fresh_graph_session():
             x = InputNode(1, name="x", value_range=(-1.0, 1.0))
-            from torchwright.graph import Linear, Add
+            from torchwright.graph import Add, Linear
 
             neg_x = Linear(x, torch.tensor([[-1.0]]), name="neg")
             s = Add(x, neg_x, name="cancel")
@@ -369,7 +368,7 @@ class TestSoundness:
     def test_add_cancel_soundness(self):
         with fresh_graph_session():
             x = InputNode(1, name="x", value_range=(-10.0, 10.0))
-            from torchwright.graph import Linear, Add
+            from torchwright.graph import Add, Linear
 
             neg = Linear(x, torch.tensor([[-1.0]]))
             s = Add(x, neg)
@@ -437,7 +436,8 @@ class TestReluRule:
 class TestClaimChannels:
     def test_leaf_claim_preserves_coefficients(self):
         """A claim on an InputNode tightens its input_ranges entry, not
-        its coefficients (the leaf channel keeps the affine structure)."""
+        its coefficients (the leaf channel keeps the affine structure).
+        """
         with fresh_graph_session():
             x = InputNode(1, name="x", value_range=(-5.0, 5.0))
             from torchwright.graph.asserts import assert_in_range
@@ -479,7 +479,8 @@ class TestClaimChannels:
         """The claim is a fact about the node's value: the node's own
         bound tightens, and every consumer — including ones reading the
         node through another handle — sees it (sound: the claim is
-        runtime-checked)."""
+        runtime-checked).
+        """
         with fresh_graph_session():
             x = InputNode(1, name="x", value_range=(-10.0, 10.0))
             from torchwright.graph.asserts import assert_in_range
@@ -491,7 +492,8 @@ class TestClaimChannels:
 
     def test_parallel_claims_intersect_for_all_consumers(self):
         """Two claims on the same node intersect; every consumer sees
-        the intersection (claims commute — attach order irrelevant)."""
+        the intersection (claims commute — attach order irrelevant).
+        """
         with fresh_graph_session():
             x = InputNode(1, name="x", value_range=(-10.0, 10.0))
             from torchwright.graph import Linear
@@ -602,7 +604,7 @@ class TestSemanticBounds:
             assert width <= 6.0, f"Semantic bound width {width} should be <= 6 (0 to 5)"
 
     def test_select_hull(self):
-        """select bound is the hull of true/false intervals, widened by c_tol * M."""
+        """Select bound is the hull of true/false intervals, widened by c_tol * M."""
         with fresh_graph_session():
             cond = InputNode(1, name="cond", value_range=(-1.0, 1.0))
             a = InputNode(1, name="a", value_range=(2.0, 5.0))
@@ -862,7 +864,8 @@ class TestReluChord:
 
 class TestClaimDegenerate:
     """A finite claim on a non-leaf collapses its bound to the
-    claim-intersected constant box (the general channel)."""
+    claim-intersected constant box (the general channel).
+    """
 
     def test_degenerate_tight_range(self):
         """Claim on a Linear gives per-component intersected intervals."""
@@ -908,7 +911,8 @@ class TestToIntervalFpCrossing:
     accumulation noise on a point-valued component — instead of raising; a gross
     crossing still raises. Regression: a token embedding column at exactly 0.5
     had its lower bound eval land ~1 ULP above 0.5, tripping the strict ``Range``
-    check during ``value_type`` propagation through a ``select``."""
+    check during ``value_type`` propagation through a ``select``.
+    """
 
     @staticmethod
     def _point_bound(lo_b: float, hi_b: float) -> AffineBound:
@@ -1058,7 +1062,8 @@ class TestGatedFFNRule:
 
     def test_gated_swish_value_type_finite(self):
         """The RMSNorm energy certification requirement: a gated swish FFN
-        over bounded inputs must expose a finite value range."""
+        over bounded inputs must expose a finite value range.
+        """
         with fresh_graph_session():
             g = torch.Generator().manual_seed(13)
             x = InputNode(5, name="x", value_range=(-10.0, 10.0))
@@ -1074,7 +1079,8 @@ class TestGatedFFNRule:
     def test_unbounded_input_degenerates_without_crash(self):
         """An unbounded gated lane must fall back to an unbounded row —
         constructed and concretized NaN-free (to_interval asserts on NaN),
-        never a crash at graph build."""
+        never a crash at graph build.
+        """
         with fresh_graph_session():
             g = torch.Generator().manual_seed(17)
             x = InputNode(3, name="x", value_range=(float("-inf"), float("inf")))
@@ -1091,7 +1097,8 @@ class TestGatedFFNRule:
 class TestGatedFFNTightness:
     """The ops_plain_english.md constructions: the rule must stay within a
     small factor of the true output range (regression-pinned from the spike:
-    multiply 1.06x, select 1.10x, cond_gate 1.05x)."""
+    multiply 1.06x, select 1.10x, cond_gate 1.05x).
+    """
 
     def test_multiply_construction(self):
         # multiply(a, b) = swish(a)*b + swish(-a)*(-b), a, b in [-10, 10];

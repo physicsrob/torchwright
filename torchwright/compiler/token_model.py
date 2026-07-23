@@ -7,14 +7,12 @@ by every artifact sink.
 
 from __future__ import annotations
 
+from collections.abc import Callable, Mapping
 from dataclasses import asdict, dataclass, field, replace
 from enum import Enum
 from typing import (
     Any,
-    Callable,
     Literal,
-    Mapping,
-    Optional,
     Protocol,
     TypeAlias,
     Union,
@@ -27,8 +25,8 @@ from torchwright.graph import Concatenate, Embedding, LiteralValue, Node
 from torchwright.graph.misc import InputNode
 from torchwright.graph.rope import ROPE_BASE
 
-JSONScalar: TypeAlias = Union[None, bool, int, float, str]
-JSONValue: TypeAlias = Union[JSONScalar, list["JSONValue"], dict[str, "JSONValue"]]
+JSONScalar: TypeAlias = None | bool | int | float | str
+JSONValue: TypeAlias = JSONScalar | list["JSONValue"] | dict[str, "JSONValue"]
 
 
 class CompileProfile(str, Enum):
@@ -53,15 +51,15 @@ class CompileProfile(str, Enum):
 @dataclass(frozen=True)
 class ScheduleProvenance:
     optimize: int
-    selected_origin: Optional[str] = None
-    delivery: Optional[str] = None
-    selected_objective: Optional[int] = None
-    selected_objective_blocks: Optional[tuple[int, int]] = None
-    selected_is_optimal: Optional[bool] = None
-    solver_status: Optional[str] = None
-    solver_objective: Optional[float] = None
-    solver_best_bound: Optional[float] = None
-    solver_is_optimal: Optional[bool] = None
+    selected_origin: str | None = None
+    delivery: str | None = None
+    selected_objective: int | None = None
+    selected_objective_blocks: tuple[int, int] | None = None
+    selected_is_optimal: bool | None = None
+    solver_status: str | None = None
+    solver_objective: float | None = None
+    solver_best_bound: float | None = None
+    solver_is_optimal: bool | None = None
 
     def to_dict(self) -> dict:
         return {key: value for key, value in asdict(self).items() if value is not None}
@@ -80,7 +78,7 @@ class CompileHeader:
     trim_heads: bool
     bias: bool
     layer_shapes: tuple[LayerShape, ...] = ()
-    n_heads: Optional[int] = None
+    n_heads: int | None = None
 
 
 @dataclass
@@ -90,17 +88,17 @@ class AttentionWeights:
     wv: np.ndarray
     wo: np.ndarray
     n_heads: int
-    rope_base: Optional[float]
-    d_rot: Optional[int]
+    rope_base: float | None
+    d_rot: int | None
 
 
 @dataclass
 class ReluLayerWeights:
     attention: AttentionWeights
     w1: np.ndarray
-    b1: Optional[np.ndarray]
+    b1: np.ndarray | None
     w2: np.ndarray
-    b2: Optional[np.ndarray]
+    b2: np.ndarray | None
 
     @property
     def d_hidden(self) -> int:
@@ -111,11 +109,11 @@ class ReluLayerWeights:
 class SwishLayerWeights:
     attention: AttentionWeights
     wgate: np.ndarray
-    bgate: Optional[np.ndarray]
+    bgate: np.ndarray | None
     wup: np.ndarray
-    bup: Optional[np.ndarray]
+    bup: np.ndarray | None
     wdown: np.ndarray
-    bdown: Optional[np.ndarray]
+    bdown: np.ndarray | None
 
     @property
     def d_hidden(self) -> int:
@@ -141,14 +139,14 @@ class TokenModelSpec:
     n_layers: int
     per_layer_n_heads: tuple[int, ...]
     per_layer_d_hidden: tuple[int, ...]
-    schedule_provenance: Optional[ScheduleProvenance] = None
+    schedule_provenance: ScheduleProvenance | None = None
     extra_metadata: Mapping[str, JSONValue] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
 class TokenModelWeights:
     embed_table: np.ndarray
-    norm_gain: Optional[np.ndarray]
+    norm_gain: np.ndarray | None
 
 
 class TokenModelSink(Protocol):
@@ -223,8 +221,8 @@ def make_layer_callback(header: CompileHeader, sink: TokenModelSink) -> Callable
             record = ReluLayerWeights(aw, w1, b1, w2, b2)
         sink.write_layer(index, record)
 
-    cast(Any, callback).token_model_sink = sink
-    cast(Any, callback).on_replay_plan = on_replay_plan
+    cast("Any", callback).token_model_sink = sink
+    cast("Any", callback).on_replay_plan = on_replay_plan
     return callback
 
 

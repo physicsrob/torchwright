@@ -1,13 +1,12 @@
 from collections import defaultdict, deque
-from typing import Dict, List, Set
 
 from torchwright.compiler.residual_assignment import flatten_concat_nodes
 from torchwright.compiler.utils import get_ancestor_nodes
 from torchwright.graph import (
-    Node,
     Concatenate,
-    InputNode,
     Embedding,
+    InputNode,
+    Node,
 )
 
 
@@ -22,20 +21,20 @@ class GraphAnalyzer:
         self._all_nodes = get_ancestor_nodes({output_node})
 
         # Build reverse dependency map: node -> set of nodes that consume it
-        self._consumers: Dict[Node, Set[Node]] = defaultdict(set)
+        self._consumers: dict[Node, set[Node]] = defaultdict(set)
         for node in self._all_nodes:
             for inp in node.inputs:
                 self._consumers[inp].add(node)
 
         self._topo_order = self._build_topo_order()
-        self._critical_path: Dict[Node, int] = {}
+        self._critical_path: dict[Node, int] = {}
         self._compute_critical_paths()
 
     def get_output_node(self) -> Node:
         """Return the analyzed graph's output node (as passed in)."""
         return self._output_node
 
-    def _build_topo_order(self) -> List[Node]:
+    def _build_topo_order(self) -> list[Node]:
         """Kahn's algorithm — returns nodes with inputs before dependents.
 
         Seeds and consumer drains iterate in ``node_id`` order: the
@@ -43,7 +42,7 @@ class GraphAnalyzer:
         scheduling decisions, and set iteration keyed on absolute id
         values would not survive a graph rebuild or the lowering copy.
         """
-        in_degree: Dict[Node, int] = {node: 0 for node in self._all_nodes}
+        in_degree: dict[Node, int] = dict.fromkeys(self._all_nodes, 0)
         for node in self._all_nodes:
             # Use set to avoid double-counting duplicate inputs
             # (e.g. Attn nodes where query_in == key_in)
@@ -82,16 +81,16 @@ class GraphAnalyzer:
                     if dist > self._critical_path.get(inp, 0):
                         self._critical_path[inp] = dist
 
-    def get_consumers(self, node: Node) -> Set[Node]:
+    def get_consumers(self, node: Node) -> set[Node]:
         return self._consumers.get(node, set())
 
-    def get_topological_order(self) -> List[Node]:
+    def get_topological_order(self) -> list[Node]:
         return self._topo_order
 
     def get_critical_path_length(self, node: Node) -> int:
         return self._critical_path.get(node, 0)
 
-    def get_all_nodes(self) -> Set[Node]:
+    def get_all_nodes(self) -> set[Node]:
         return self._all_nodes
 
     def is_input_node(self, node: Node) -> bool:
@@ -102,7 +101,7 @@ class GraphAnalyzer:
         # network.  See docs/constants_plan.md.
         return isinstance(node, (Embedding, InputNode))
 
-    def is_ready(self, node: Node, available: Set[Node]) -> bool:
+    def is_ready(self, node: Node, available: set[Node]) -> bool:
         """Check if all of a node's inputs are available.
 
         Concatenate nodes are transparent — we check their leaf children instead.
@@ -114,15 +113,14 @@ class GraphAnalyzer:
                 for leaf in flatten_concat_nodes([inp]):
                     if leaf not in available:
                         return False
-            else:
-                if inp not in available:
-                    return False
+            elif inp not in available:
+                return False
         for pred in node.scheduling_predecessors:
             if pred not in available:
                 return False
         return True
 
-    def get_ready_nodes(self, available: Set[Node]) -> Set[Node]:
+    def get_ready_nodes(self, available: set[Node]) -> set[Node]:
         """Return all nodes whose inputs are all in the available set.
 
         Excludes nodes already in available and Concatenate nodes

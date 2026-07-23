@@ -10,8 +10,8 @@ import torch
 
 from torchwright.compiler.export import compile_headless
 from torchwright.graph import Concatenate
-from torchwright.ops.relu.arithmetic_ops import compare
 from torchwright.ops.inout_nodes import create_input
+from torchwright.ops.relu.arithmetic_ops import compare
 
 
 def test_concatenate_output_node():

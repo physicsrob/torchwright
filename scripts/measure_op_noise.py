@@ -27,9 +27,10 @@ import datetime as _dt
 import json
 import subprocess
 import sys
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Callable, Dict, List, Optional, Sequence, TypedDict
+from typing import TypedDict
 
 import torch
 
@@ -40,14 +41,16 @@ from torchwright.debug.noise import (
     update_docstring_footer,
 )
 from torchwright.graph import Node
+from torchwright.ops import swiglu as swiglu_ops
 from torchwright.ops.const import step_sharpness
 from torchwright.ops.relu.arithmetic_ops import (
     abs as abs_op,
+)
+from torchwright.ops.relu.arithmetic_ops import (
     ceil_int,
     clamp,
     compare,
     floor_int,
-    min as min_op,
     mod_const,
     multiply_2d,
     multiply_integers,
@@ -56,6 +59,9 @@ from torchwright.ops.relu.arithmetic_ops import (
     square,
     thermometer_floor_div,
 )
+from torchwright.ops.relu.arithmetic_ops import (
+    min as min_op,
+)
 from torchwright.ops.relu.logic_ops import (
     bool_all_true,
     bool_any_true,
@@ -63,7 +69,6 @@ from torchwright.ops.relu.logic_ops import (
     cond_gate,
     equals_vector,
 )
-from torchwright.ops import swiglu as swiglu_ops
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 DOCS_JSON = REPO_ROOT / "docs" / "op_noise_data.json"
@@ -112,18 +117,18 @@ class TargetOp:
 
     name: str
     module: str
-    build_graph: Callable[[Dict[str, Node]], Node]
-    input_specs: Dict[str, int]
-    reference_fn: Callable[[Dict[str, torch.Tensor]], torch.Tensor]
+    build_graph: Callable[[dict[str, Node]], Node]
+    input_specs: dict[str, int]
+    reference_fn: Callable[[dict[str, torch.Tensor]], torch.Tensor]
     distribution_names: Sequence[str]
     source_file: str
     notes: str = ""
     machine: str = "relu"
-    build_graphs_per_distribution: Dict[str, Callable[[Dict[str, Node]], Node]] = field(
+    build_graphs_per_distribution: dict[str, Callable[[dict[str, Node]], Node]] = field(
         default_factory=dict
     )
-    reference_fns_per_distribution: Dict[
-        str, Callable[[Dict[str, torch.Tensor]], torch.Tensor]
+    reference_fns_per_distribution: dict[
+        str, Callable[[dict[str, torch.Tensor]], torch.Tensor]
     ] = field(default_factory=dict)
 
 
@@ -265,7 +270,8 @@ def _integer_with_plateau_jitter_1d(
     """Integer samples in [lo, hi] with uniform jitter inside the plateau
     contract band ±1/(2·step_sharpness) — the in-contract inputs of a
     collapse-synthesized staircase (integer ± tolerated noise), plus the
-    exact-integer grid so every plateau center is covered."""
+    exact-integer grid so every plateau center is covered.
+    """
     gen = torch.Generator().manual_seed(seed)
     n_grid = min(hi - lo + 1, 1024)
     n_random = n_samples - n_grid
@@ -389,7 +395,8 @@ def _below_multiples_1d(
 ) -> InputDistribution:
     """Samples at ``m·multiple − offset`` with the offset log-uniform in
     ``[off_lo, off_hi]`` — stresses the sliver just below staircase
-    boundaries (``radix_floor_int``'s divisor boundaries, ramp zones)."""
+    boundaries (``radix_floor_int``'s divisor boundaries, ramp zones).
+    """
     gen = torch.Generator().manual_seed(seed)
     m = torch.randint(m_lo, m_hi + 1, (n_samples, 1), generator=gen).to(torch.float32)
     u = torch.rand((n_samples, 1), generator=gen)
@@ -464,7 +471,8 @@ def _map_to_table_distribution(
 ) -> InputDistribution:
     """Half exact key matches (cycling three keys), half far-off vectors in
     [-1, 1]^3 (no-match → default; dot products stay below every key's
-    self-dot, per the op contract — see _equals_vector_distribution)."""
+    self-dot, per the op contract — see _equals_vector_distribution).
+    """
     gen = torch.Generator().manual_seed(seed)
     keys = torch.tensor([[2.0, 0.0, 1.0], [0.0, 3.0, -1.0], [-1.0, -1.0, 2.0]])
     n_match = n_samples // 2
@@ -483,7 +491,8 @@ def _onehot_lookup_distribution(
     name: str, description: str, n_samples: int = 4096, seed: int = 0
 ) -> InputDistribution:
     """Two-block one-hot inputs (digit 3 ⊕ carry 2), uniformly over all six
-    combinations — half hit the three-row table, half miss → default."""
+    combinations — half hit the three-row table, half miss → default.
+    """
     gen = torch.Generator().manual_seed(seed)
     d = torch.randint(0, 3, (n_samples,), generator=gen)
     c = torch.randint(0, 2, (n_samples,), generator=gen)
@@ -536,7 +545,8 @@ def _in_range_distribution(
     name: str, description: str, n_slots: int = 8, n_samples: int = 4096, seed: int = 0
 ) -> InputDistribution:
     """Integer (lower, upper) bound pairs over [0, n_slots], lower ≤ upper
-    (the op contract — inverted bounds are out of contract and read -3)."""
+    (the op contract — inverted bounds are out of contract and read -3).
+    """
     gen = torch.Generator().manual_seed(seed)
     a = torch.randint(0, n_slots + 1, (n_samples, 1), generator=gen).to(torch.float32)
     b = torch.randint(0, n_slots + 1, (n_samples, 1), generator=gen).to(torch.float32)
@@ -593,7 +603,8 @@ def _table_lookup_2d_distribution(
     name: str, description: str, n_samples: int = 4096, seed: int = 0
 ) -> InputDistribution:
     """Integer (i, j) index pairs over an 8×6 table, plus 25% out-of-range
-    indices (the clamp path)."""
+    indices (the clamp path).
+    """
     gen = torch.Generator().manual_seed(seed)
     i = torch.randint(-2, 10, (n_samples, 1), generator=gen).to(torch.float32)
     j = torch.randint(-2, 8, (n_samples, 1), generator=gen).to(torch.float32)
@@ -639,7 +650,7 @@ _ATAN_BP_CROSS = [-2.0, -1.0, -0.5, -0.1, 0.0, 0.1, 0.5, 1.0, 2.0]
 _ATAN_BP_DOT = [0.5, 1.0, 2.0, 5.0, 10.0]
 
 
-def _distributions() -> Dict[str, InputDistribution]:
+def _distributions() -> dict[str, InputDistribution]:
     """All named input distributions, keyed by name."""
     return {
         "reciprocal_03_200": _uniform_1d(
@@ -1069,13 +1080,13 @@ def _onehot_lookup_ref(x: torch.Tensor) -> torch.Tensor:
 _TL2D_TABLE = (torch.arange(48, dtype=torch.float32).reshape(8, 6) * 7.0) % 23.0 - 11.0
 
 
-def _table_lookup_2d_ref(inputs: Dict[str, torch.Tensor]) -> torch.Tensor:
+def _table_lookup_2d_ref(inputs: dict[str, torch.Tensor]) -> torch.Tensor:
     i = inputs["i"].flatten().long().clamp(0, 7)
     j = inputs["j"].flatten().long().clamp(0, 5)
     return _TL2D_TABLE[i, j].unsqueeze(1)
 
 
-def _target_ops() -> List[TargetOp]:
+def _target_ops() -> list[TargetOp]:
     _ARITH = "torchwright.ops.relu.arithmetic_ops"
     _ARITH_FILE = "torchwright/ops/relu/arithmetic_ops.py"
     _SWIGLU_ARITH = "torchwright.ops.swiglu.arithmetic_ops"
@@ -2021,10 +2032,10 @@ def _target_ops() -> List[TargetOp]:
 # ---------------------------------------------------------------------------
 
 
-def _measure_all() -> List[NoiseMeasurement]:
+def _measure_all() -> list[NoiseMeasurement]:
     torch.set_default_device("cpu")
     dists = _distributions()
-    out: List[NoiseMeasurement] = []
+    out: list[NoiseMeasurement] = []
     for target in _target_ops():
         for dname in target.distribution_names:
             if dname not in dists:
@@ -2054,9 +2065,10 @@ def _measure_all() -> List[NoiseMeasurement]:
 # ---------------------------------------------------------------------------
 
 
-def _round_float(x: float, sig: int = 6) -> Optional[float]:
+def _round_float(x: float, sig: int = 6) -> float | None:
     """Round ``x`` to ``sig`` sig figs. Returns ``None`` for NaN/inf so the
-    JSON encoder emits ``null`` instead of a non-portable ``NaN`` literal."""
+    JSON encoder emits ``null`` instead of a non-portable ``NaN`` literal.
+    """
     if x != x or x in (float("inf"), float("-inf")):
         return None
     if x == 0:
@@ -2076,7 +2088,7 @@ def render_json(
     share op names — and sorted machine-first, so the frozen relu block
     stays contiguous and diff-stable as swiglu entries land.
     """
-    by_op: Dict[tuple, Dict] = {}
+    by_op: dict[tuple, dict] = {}
     for m in measurements:
         key = (m.machine, m.op_name)
         by_op.setdefault(
@@ -2125,15 +2137,15 @@ def _fmt(x: float) -> str:
     return f"{x:.4g}"
 
 
-def _fmt_opt(x: Optional[float]) -> str:
+def _fmt_opt(x: float | None) -> str:
     return "n/a" if x is None else f"{x:.4g}"
 
 
-def render_markdown(data: Dict) -> str:
+def render_markdown(data: dict) -> str:
     """Render the human-facing doc from parsed JSON."""
     commit = data["commit"]
     measured_at = data["measured_at"]
-    lines: List[str] = []
+    lines: list[str] = []
     lines.append("# Numerical noise reference")
     lines.append("")
     lines.append("*Generated by `scripts/measure_op_noise.py`; do not edit by hand.*")
@@ -2307,7 +2319,7 @@ class FooterSummary(TypedDict):
     total_samples: int
 
 
-def _footer_summary(op: Dict) -> FooterSummary:
+def _footer_summary(op: dict) -> FooterSummary:
     """Aggregate across every distribution of ``op``.
 
     The docstring footer reports the worst-case abs and rel error and the
@@ -2327,13 +2339,13 @@ def _footer_summary(op: Dict) -> FooterSummary:
     }
 
 
-def _apply_docstring_footers(data: Dict, *, check: bool) -> List[str]:
+def _apply_docstring_footers(data: dict, *, check: bool) -> list[str]:
     """Update (or check) docstring footers for every op in the JSON.
 
     Returns the list of file paths that were (or would be) changed.
     """
     target_map = {(t.machine, t.name): t for t in _target_ops()}
-    changed: List[str] = []
+    changed: list[str] = []
     for op in data["ops"]:
         target = target_map.get((op["machine"], op["name"]))
         if target is None:
@@ -2380,7 +2392,7 @@ def _today_utc() -> str:
     return _dt.datetime.now(_dt.timezone.utc).date().isoformat()
 
 
-def main(argv: Optional[Sequence[str]] = None) -> int:
+def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Measure per-op numerical noise.")
     parser.add_argument(
         "--check",
@@ -2396,7 +2408,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     data = json.loads(json_text)
     md_text = render_markdown(data)
 
-    changed: List[str] = []
+    changed: list[str] = []
     if not DOCS_JSON.exists() or DOCS_JSON.read_text() != json_text:
         changed.append(str(DOCS_JSON.relative_to(REPO_ROOT)))
         if not args.check:

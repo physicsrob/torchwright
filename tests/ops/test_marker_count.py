@@ -10,14 +10,11 @@ compiled check confirms the inversion resolves to the right integer through the
 real transformer.
 """
 
-import math
-
 import torch
 
 from torchwright.compiler.export import compile_headless
 from torchwright.debug.probe import reference_eval
 from torchwright.graph.asserts import assert_in_range
-from torchwright.graph.value_type import NodeValueType, Range
 from torchwright.ops.inout_nodes import create_input, create_rope_config
 from torchwright.ops.relu.marker_count import count_since_marker
 
@@ -89,7 +86,8 @@ def test_oracle_marker_not_at_zero():
 def test_unsafe_dhead_raises():
     """count_since_marker raises ValueError for d_head too small to give <0.5
     gap error at the given max_gap (the quasi-static approximation breaks down).
-    d_head=16 with max_gap=350 gives analytic error ~1.5 >> 0.45 threshold."""
+    d_head=16 with max_gap=350 gives analytic error ~1.5 >> 0.45 threshold.
+    """
     import pytest
 
     rope = create_rope_config(d_head=16, max_positions=512)

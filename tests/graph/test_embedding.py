@@ -1,5 +1,6 @@
-from torchwright.graph import Embedding
 import torch
+
+from torchwright.graph import Embedding
 
 
 def test_embedding():

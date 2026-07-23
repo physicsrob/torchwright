@@ -74,7 +74,8 @@ def test_save_load_logits_identical(tmp_path, rope_base):
 
 def test_save_load_cached_decode_finite(tmp_path):
     """The reloaded model also decodes (cached single step after prefill) finite —
-    the path generate() exercises."""
+    the path generate() exercises.
+    """
     model = _tiny_model(500000.0)
     model.save_pretrained(tmp_path)
     reloaded = TorchwrightCustomForCausalLM.from_pretrained(tmp_path).eval()

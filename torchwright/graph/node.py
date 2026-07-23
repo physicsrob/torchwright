@@ -2,7 +2,7 @@ import functools
 import os
 from contextlib import contextmanager
 from contextvars import ContextVar
-from typing import TYPE_CHECKING, List, Dict, Optional, Set, Tuple
+from typing import TYPE_CHECKING, Optional
 
 import torch
 
@@ -64,7 +64,7 @@ def _verify_tensor_against_value_type(node: "Node", tensor: torch.Tensor) -> Non
         )
 
 
-_current_annotation: ContextVar[Optional[str]] = ContextVar(
+_current_annotation: ContextVar[str | None] = ContextVar(
     "current_annotation",
     default=None,
 )
@@ -177,14 +177,14 @@ class Node:
             collapse pass gates on it.
     """
 
-    inputs: List["Node"]
+    inputs: list["Node"]
     d_output: int
     node_id: int
     name: str
-    annotation: Optional[str]
-    scheduling_predecessors: Set["Node"]
-    checks: List
-    claimed_type: Optional[NodeValueType]
+    annotation: str | None
+    scheduling_predecessors: set["Node"]
+    checks: list
+    claimed_type: NodeValueType | None
     integer_claim: bool
     # Derived caches, set eagerly in ``__init__`` and recomputed only via
     # ``affine_rules.refresh_node_caches`` (the claim-application choke point).
@@ -196,7 +196,7 @@ class Node:
     # Weight-support cache attached lazily by
     # ``compiler.realization.live_weight_row_ranges`` (and injected directly
     # onto CP-SAT snapshot stand-in nodes); absent until first query.
-    _live_weight_row_ranges: Tuple[Tuple[int, int], ...]
+    _live_weight_row_ranges: tuple[tuple[int, int], ...]
 
     def __init_subclass__(cls, **kwargs):
         super().__init_subclass__(**kwargs)
@@ -229,7 +229,7 @@ class Node:
         wrapped._tw_verified = True
         cls.compute = wrapped
 
-    def __init__(self, d_output: int, inputs: List["Node"], name: str = ""):
+    def __init__(self, d_output: int, inputs: list["Node"], name: str = ""):
         global global_node_id
         self.d_output = d_output
         self.inputs = inputs
@@ -241,7 +241,7 @@ class Node:
         # similar helpers; honored by ``GraphAnalyzer.is_ready`` so the
         # node isn't scheduled until every listed predecessor is in
         # ``computed_nodes``.  Empty by default.
-        self.scheduling_predecessors: Set["Node"] = set()
+        self.scheduling_predecessors: set[Node] = set()
         global_node_id += 1
         # Semantic affine override installed by an op via
         # ``affine_rules._apply_semantic_override`` (None for most nodes).
@@ -308,7 +308,7 @@ class Node:
         return NodeValueType.unknown()
 
     def compute(self, n_pos: int, input_values: dict) -> torch.Tensor:
-        raise NotImplementedError()
+        raise NotImplementedError
 
     def __len__(self):
         return self.d_output
@@ -325,19 +325,18 @@ class Node:
         type_name = self.node_type()
         if len(self.inputs) == 0:
             return f"{type_name}(id={self.node_id}, name='{self.name}', d={len(self)})"
-        elif len(self.inputs) == 1:
+        if len(self.inputs) == 1:
             inp = self.inputs[0]
             inp_type_name = inp.node_type()
             return f"{type_name}(id={self.node_id}, name='{self.name}', inp={inp_type_name}(id={inp.node_id}, name='{inp.name}', d={len(inp)}), d={len(self)})"
-        else:
-            inp_strings = []
-            for i, inp in enumerate(self.inputs):
-                inp_type_name = inp.node_type()
-                inp_strings.append(
-                    f"inp{i}={inp_type_name}(id={inp.node_id}, name='{inp.name}', d={len(inp)})"
-                )
-            inp_str = ", ".join(inp_strings)
-            return f"{type_name}(id={self.node_id}, name='{self.name}', {inp_str}, d={len(self)})"
+        inp_strings = []
+        for i, inp in enumerate(self.inputs):
+            inp_type_name = inp.node_type()
+            inp_strings.append(
+                f"inp{i}={inp_type_name}(id={inp.node_id}, name='{inp.name}', d={len(inp)})"
+            )
+        inp_str = ", ".join(inp_strings)
+        return f"{type_name}(id={self.node_id}, name='{self.name}', {inp_str}, d={len(self)})"
 
     def num_params(self):
         return 0

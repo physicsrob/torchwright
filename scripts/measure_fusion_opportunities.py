@@ -46,7 +46,7 @@ import argparse
 import importlib
 import json
 from collections import Counter
-from typing import Any, Dict, List, Optional, Tuple, cast
+from typing import Any, cast
 
 from torchwright.compiler.collapse import scalar_sources
 from torchwright.compiler.graph_clone import topological_order
@@ -62,9 +62,9 @@ def _cost(n: Node) -> int:
     return 1 if isinstance(n, _COSTLY) else 0
 
 
-def _effective_inputs(n: Node) -> List[Node]:
+def _effective_inputs(n: Node) -> list[Node]:
     """Inputs with Concatenates flattened away (they are virtual)."""
-    out: List[Node] = []
+    out: list[Node] = []
     stack = list(n.inputs)
     while stack:
         u = stack.pop()
@@ -75,17 +75,17 @@ def _effective_inputs(n: Node) -> List[Node]:
     return out
 
 
-def _effective_consumers(order: List[Node]) -> Dict[Node, List[Node]]:
-    """node -> the non-Concatenate nodes that read it (through concats)."""
-    direct: Dict[Node, List[Node]] = {n: [] for n in order}
+def _effective_consumers(order: list[Node]) -> dict[Node, list[Node]]:
+    """Node -> the non-Concatenate nodes that read it (through concats)."""
+    direct: dict[Node, list[Node]] = {n: [] for n in order}
     for n in order:
         for u in n.inputs:
             direct[u].append(n)
-    eff: Dict[Node, List[Node]] = {}
+    eff: dict[Node, list[Node]] = {}
     # order is inputs-first; walk it reversed so a Concatenate's own
     # effective consumers are resolved before the nodes feeding it ask.
     for n in reversed(order):
-        acc: List[Node] = []
+        acc: list[Node] = []
         for c in direct[n]:
             if isinstance(c, Concatenate):
                 acc.extend(eff[c])
@@ -95,8 +95,8 @@ def _effective_consumers(order: List[Node]) -> Dict[Node, List[Node]]:
     return eff
 
 
-def _levels(order: List[Node], zero_cost: frozenset = frozenset()) -> Dict[Node, int]:
-    lv: Dict[Node, int] = {}
+def _levels(order: list[Node], zero_cost: frozenset = frozenset()) -> dict[Node, int]:
+    lv: dict[Node, int] = {}
     for n in order:
         base = max((lv[u] for u in n.inputs), default=0)
         lv[n] = base + (0 if n in zero_cost else _cost(n))
@@ -104,11 +104,12 @@ def _levels(order: List[Node], zero_cost: frozenset = frozenset()) -> Dict[Node,
 
 
 def _collapsed_levels(
-    order: List[Node], src: Dict[Node, Optional[Node]]
-) -> Dict[Node, int]:
+    order: list[Node], src: dict[Node, Node | None]
+) -> dict[Node, int]:
     """Levels under family 2: any member of a univariate subgraph lands one
-    sublayer above its source (one FFN computes any function of it)."""
-    lv: Dict[Node, int] = {}
+    sublayer above its source (one FFN computes any function of it).
+    """
+    lv: dict[Node, int] = {}
     for n in order:
         s = src[n]
         if s is not None and s is not n:
@@ -119,9 +120,10 @@ def _collapsed_levels(
     return lv
 
 
-def _critical_edges(output: Node, lv: Dict[Node, int]) -> Tuple[set, Counter]:
+def _critical_edges(output: Node, lv: dict[Node, int]) -> tuple[set, Counter]:
     """Nodes on some longest path, and a bigram histogram of the costly
-    producer->consumer pairs along those paths (concats skipped)."""
+    producer->consumer pairs along those paths (concats skipped).
+    """
     critical = {output}
     bigrams: Counter = Counter()
     stack = [output]
@@ -149,8 +151,8 @@ def _critical_edges(output: Node, lv: Dict[Node, int]) -> Tuple[set, Counter]:
 
 
 def _subgraph_details(
-    order: List[Node],
-    src: Dict[Node, Optional[Node]],
+    order: list[Node],
+    src: dict[Node, Node | None],
     critical: set,
     top: int = 15,
 ) -> None:
@@ -164,18 +166,18 @@ def _subgraph_details(
     FFN in parens): the breakpoint-cost proxy for re-tabulating the
     composed function.
     """
-    by_src: Dict[Node, List[Node]] = {}
+    by_src: dict[Node, list[Node]] = {}
     for n in order:
         s = src[n]
         if s is not None and s is not n:
             by_src.setdefault(s, []).append(n)
 
-    reports: List[Dict[str, Any]] = []
+    reports: list[dict[str, Any]] = []
     for s, members in by_src.items():
         mset = set(members)
         # Longest chain inside the subgraph, overall and critical-only.
-        depth_in: Dict[Node, int] = {}
-        depth_crit: Dict[Node, int] = {}
+        depth_in: dict[Node, int] = {}
+        depth_crit: dict[Node, int] = {}
         for n in order:  # order is topological; members appear after s
             if n not in mset:
                 continue
@@ -272,7 +274,7 @@ def analyze(
     lv2 = _collapsed_levels(order, src)
     depth2 = lv2[out]
     subgraph_sizes = Counter(
-        cast(Node, src[n]).name or type(src[n]).__name__ for n in members
+        cast("Node", src[n]).name or type(src[n]).__name__ for n in members
     )
 
     # Feasibility-filtered variant: a collapsed univariate subgraph is one
@@ -306,7 +308,7 @@ def analyze(
     ]
 
     # Families 1+2 combined.
-    lv12: Dict[Node, int] = {}
+    lv12: dict[Node, int] = {}
     for n in order:
         s = src[n]
         if s is not None and s is not n:

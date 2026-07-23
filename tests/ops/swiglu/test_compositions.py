@@ -73,7 +73,8 @@ def test_number_to_digit_scalars_roundtrip():
 
 def test_full_digit_pipeline_compiles(embedding):
     """digits_to_number → arithmetic → number_to_digit_scalars →
-    scalar_to_embedding, compiled end to end on the swish machine."""
+    scalar_to_embedding, compiled end to end on the swish machine.
+    """
     from torchwright.ops.linear import add_const
 
     number = digits_to_number(embedding, [embedding])
@@ -200,7 +201,8 @@ def test_remove_leading_0s_signed_requires_both_kwargs(embedding):
 def test_remove_leading_0s_depth_constant(embedding):
     """The trim's critical path must not grow with the removal budget —
     the property that keeps the calculators' result formatting out of
-    their depth budgets."""
+    their depth budgets.
+    """
     from scripts.arithmetic_scaling import critical_path_depth
 
     def depth(n, max_removals):
