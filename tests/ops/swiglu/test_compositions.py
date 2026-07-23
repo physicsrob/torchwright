@@ -156,7 +156,9 @@ def test_remove_leading_0s_cap_beyond_length(embedding):
     _assert_trimmed(embedding, ["0", "6"], 9, ["6", "6"])
 
 
-def _assert_signed_trim(embedding, seq_tokens, max_removals, negate, expected_tokens):
+def _assert_signed_trim(
+    embedding, seq_tokens, max_removals, *, negate, expected_tokens
+):
     from torchwright.ops.inout_nodes import create_literal_value
 
     cond = create_literal_value(torch.tensor([1.0 if negate else -1.0]))
@@ -176,7 +178,11 @@ def _assert_signed_trim(embedding, seq_tokens, max_removals, negate, expected_to
 def test_remove_leading_0s_signed_positive_matches_plain(embedding):
     # A false sign cond reproduces the unsigned trim exactly.
     _assert_signed_trim(
-        embedding, ["0", "0", "7", "<eos>"], 3, False, ["7", "<eos>", "<eos>", "<eos>"]
+        embedding,
+        ["0", "0", "7", "<eos>"],
+        3,
+        negate=False,
+        expected_tokens=["7", "<eos>", "<eos>", "<eos>"],
     )
 
 
@@ -184,7 +190,11 @@ def test_remove_leading_0s_signed_prepends_and_shifts(embedding):
     # A true sign cond prepends the sign token; the trimmed digits follow,
     # shifted right one slot ("007<eos>" -> "-7<eos>").
     _assert_signed_trim(
-        embedding, ["0", "0", "7", "<eos>"], 3, True, ["-", "7", "<eos>", "<eos>"]
+        embedding,
+        ["0", "0", "7", "<eos>"],
+        3,
+        negate=True,
+        expected_tokens=["-", "7", "<eos>", "<eos>"],
     )
 
 

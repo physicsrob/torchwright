@@ -56,7 +56,7 @@ def test_both_addends_dead_earlier_selects_occurrence_0():
     layers = {add.node_id: 3, a.node_id: 1, b.node_id: 1}
     routes = {add.node_id: "attn", a.node_id: "attn", b.node_id: "attn"}
     p = _derive(add, pairs, layers, routes)
-    assert p == AddPlacement(True, True, 0)
+    assert p == AddPlacement(reusable_0=True, reusable_1=True, reuse_input_index=0)
     assert p.is_free
 
 
@@ -66,7 +66,9 @@ def test_only_occurrence_1_reusable():
     pairs = {a.node_id: [add, later], b.node_id: [add]}
     layers = {add.node_id: 3, later.node_id: 5}
     routes = {add.node_id: "attn", later.node_id: "attn"}
-    assert _derive(add, pairs, layers, routes) == AddPlacement(False, True, 1)
+    assert _derive(add, pairs, layers, routes) == AddPlacement(
+        reusable_0=False, reusable_1=True, reuse_input_index=1
+    )
 
 
 def test_same_layer_attention_consumer_counts_for_mlp_add_only():
@@ -77,12 +79,14 @@ def test_same_layer_attention_consumer_counts_for_mlp_add_only():
     routes_attn_peer = {add.node_id: "mlp", peer.node_id: "attn"}
     # MLP-routed Add: a same-layer attention consumer is complete by the
     # MLP phase-start snapshot.
-    assert _derive(add, pairs, layers, routes_attn_peer) == AddPlacement(True, True, 0)
+    assert _derive(add, pairs, layers, routes_attn_peer) == AddPlacement(
+        reusable_0=True, reusable_1=True, reuse_input_index=0
+    )
     # Attention-routed Add: the same consumer is NOT complete (attention
     # phase-start snapshot).
     routes_attn_add = {add.node_id: "attn", peer.node_id: "attn"}
     assert _derive(add, pairs, layers, routes_attn_add) == AddPlacement(
-        False, False, None
+        reusable_0=False, reusable_1=False, reuse_input_index=None
     )
 
 
@@ -93,7 +97,9 @@ def test_same_layer_mlp_consumer_never_counts():
     layers = {add.node_id: 3, peer.node_id: 3}
     routes = {add.node_id: "mlp", peer.node_id: "mlp"}
     # a blocked by the same-layer MLP peer; b is free.
-    assert _derive(add, pairs, layers, routes) == AddPlacement(False, True, 1)
+    assert _derive(add, pairs, layers, routes) == AddPlacement(
+        reusable_0=False, reusable_1=True, reuse_input_index=1
+    )
 
 
 def test_unordered_consumer_blocks_reuse():
@@ -102,7 +108,9 @@ def test_unordered_consumer_blocks_reuse():
     pairs = {a.node_id: [add, terminal], b.node_id: [add]}
     layers = {add.node_id: 3}
     routes = {add.node_id: "attn"}
-    assert _derive(add, pairs, layers, routes) == AddPlacement(False, True, 1)
+    assert _derive(add, pairs, layers, routes) == AddPlacement(
+        reusable_0=False, reusable_1=True, reuse_input_index=1
+    )
 
 
 def test_concatenate_occurrence_is_not_reusable():
@@ -115,7 +123,9 @@ def test_concatenate_occurrence_is_not_reusable():
     routes = {add.node_id: "attn"}
     # Occurrence 0 is a Concatenate (never residual-allocated); occurrence 1
     # is a graph input with no other consumers.
-    assert _derive(add, pairs, layers, routes) == AddPlacement(False, True, 1)
+    assert _derive(add, pairs, layers, routes) == AddPlacement(
+        reusable_0=False, reusable_1=True, reuse_input_index=1
+    )
 
 
 def test_graph_input_target_needs_no_own_layer():
@@ -127,7 +137,9 @@ def test_graph_input_target_needs_no_own_layer():
     layers = {add.node_id: 4, reader.node_id: 2}
     routes = {add.node_id: "attn", reader.node_id: "attn"}
     # y has no layer entry of its own — only its consumers need one.
-    assert _derive(add, pairs, layers, routes) == AddPlacement(True, True, 0)
+    assert _derive(add, pairs, layers, routes) == AddPlacement(
+        reusable_0=True, reusable_1=True, reuse_input_index=0
+    )
 
 
 def test_self_add_selects_occurrence_0():
@@ -137,7 +149,9 @@ def test_self_add_selects_occurrence_0():
     pairs = {a.node_id: [add]}
     layers = {add.node_id: 2}
     routes = {add.node_id: "mlp"}
-    assert _derive(add, pairs, layers, routes) == AddPlacement(True, True, 0)
+    assert _derive(add, pairs, layers, routes) == AddPlacement(
+        reusable_0=True, reusable_1=True, reuse_input_index=0
+    )
 
 
 def test_held_target_short_circuits_fresh():
@@ -146,7 +160,7 @@ def test_held_target_short_circuits_fresh():
     layers = {add.node_id: 3}
     routes = {add.node_id: "attn"}
     p = _derive(add, pairs, layers, routes, held_target_id=add.node_id)
-    assert p == AddPlacement(False, False, None)
+    assert p == AddPlacement(reusable_0=False, reusable_1=False, reuse_input_index=None)
     assert not p.is_free
 
 
@@ -160,7 +174,7 @@ def test_held_source_occurrence_never_reusable():
     p = _derive(add, pairs, layers, routes, held_source_id=emb.node_id)
     # The held source's columns end through the held-bank cancel/hold
     # transition, never through reassign; occurrence 1 stays eligible.
-    assert p == AddPlacement(False, True, 1)
+    assert p == AddPlacement(reusable_0=False, reusable_1=True, reuse_input_index=1)
 
 
 def test_missing_add_layer_or_route_raises():

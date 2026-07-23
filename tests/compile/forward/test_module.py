@@ -611,7 +611,7 @@ def test_token_onnx_module_empty_past_shape(adder_artifact):
 # ---- Head / MLP-slot trimming (compile_to_onnx trim_heads) ----------------
 
 
-def _export_token(tmpdir, name="model.onnx", trim_heads=True):
+def _export_token(tmpdir, name="model.onnx", *, trim_heads=True):
     output_node, embedding = _build_1digit()
     onnx_path = str(Path(tmpdir) / name)
     compile_to_onnx(

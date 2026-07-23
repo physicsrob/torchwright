@@ -183,6 +183,24 @@ class ResidualStreamMap:
     def get_free_count(self) -> int:
         return len(self._free)
 
+    def free_columns(self) -> list[int]:
+        """Sorted columns currently in the free pool (a snapshot copy)."""
+        return sorted(self._free)
+
+    def reserved_columns(self) -> list[int]:
+        """Sorted permanently-withheld columns (a snapshot copy)."""
+        return sorted(self._reserved)
+
+    def assignments(self) -> dict[Node, list[int]]:
+        """Snapshot of the node -> allocated-columns mapping.
+
+        Returns a fresh dict with fresh per-node lists, so callers can
+        inspect or copy the allocation state without any risk of mutating
+        the map's internals (mutating internals from outside is an I1
+        violation).
+        """
+        return {node: list(cols) for node, cols in self._node_to_indices.items()}
+
     def has_held(self) -> bool:
         """Whether the one transient held bank currently exists."""
         return bool(self._held)

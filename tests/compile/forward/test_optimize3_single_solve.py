@@ -114,7 +114,7 @@ def test_solve_budget_override_is_accepted():
     assert net.cpsat_assignment.n_layers >= 1
 
 
-def _fake_stats(n_layers, optimal):
+def _fake_stats(n_layers, *, optimal):
     return SolveStats(
         status_name="OPTIMAL" if optimal else "FEASIBLE",
         objective_value=n_layers,
@@ -153,7 +153,7 @@ def test_optimize3_is_one_solve_with_the_full_budget_and_the_mech_hint(
             n_layers=6,
             node_to_cancel_mech={},
         )
-        return asg, _fake_stats(6, False)
+        return asg, _fake_stats(6, optimal=False)
 
     monkeypatch.setattr(cmod, "solve_schedule", fake_solve)
 

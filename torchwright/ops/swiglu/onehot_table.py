@@ -66,6 +66,35 @@ def _count_one_hot_blocks(key: torch.Tensor) -> int:
     return int(near_one.sum().item())
 
 
+def _validate_table(
+    d_key: int,
+    d_value: int,
+    key_to_value: dict[torch.Tensor, torch.Tensor],
+) -> int:
+    """Check key/value widths and block counts; return ``n_blocks``."""
+    for key in key_to_value:
+        if len(key) != d_key:
+            raise ValueError(
+                f"onehot_lookup key width {len(key)} != input width {d_key}"
+            )
+    for value in key_to_value.values():
+        if len(value) != d_value:
+            raise ValueError(
+                f"onehot_lookup value width {len(value)} != default width {d_value}"
+            )
+
+    block_counts = {_count_one_hot_blocks(key) for key in key_to_value}
+    if len(block_counts) != 1:
+        raise ValueError(
+            f"onehot_lookup keys must all have the same number of one-hot "
+            f"blocks; got {sorted(block_counts)}"
+        )
+    n_blocks = block_counts.pop()
+    if n_blocks < 1:
+        raise ValueError("onehot_lookup keys must have at least one one-hot block")
+    return n_blocks
+
+
 def onehot_lookup(
     inp: Node,
     key_to_value: dict[torch.Tensor, torch.Tensor],
@@ -95,26 +124,7 @@ def onehot_lookup(
 
     d_key = len(inp)
     d_value = len(default)
-    for key in key_to_value:
-        if len(key) != d_key:
-            raise ValueError(
-                f"onehot_lookup key width {len(key)} != input width {d_key}"
-            )
-    for value in key_to_value.values():
-        if len(value) != d_value:
-            raise ValueError(
-                f"onehot_lookup value width {len(value)} != default width {d_value}"
-            )
-
-    block_counts = {_count_one_hot_blocks(key) for key in key_to_value}
-    if len(block_counts) != 1:
-        raise ValueError(
-            f"onehot_lookup keys must all have the same number of one-hot "
-            f"blocks; got {sorted(block_counts)}"
-        )
-    n_blocks = block_counts.pop()
-    if n_blocks < 1:
-        raise ValueError("onehot_lookup keys must have at least one one-hot block")
+    n_blocks = _validate_table(d_key, d_value, key_to_value)
 
     # Tight output range: the output is always exactly one value row (or the
     # default), so [min, max] over them all bounds every element.

@@ -263,6 +263,24 @@ def _fmt(x: float) -> str:
     return f"{x:.3e}"
 
 
+def _report_thread_spread(chain: dict[str, Node], device: torch.device) -> None:
+    """P2b: environment sensitivity (CPU reduction order across thread counts)."""
+    base = None
+    spreads = []
+    saved_threads = torch.get_num_threads()
+    for nthreads in (1, 2, 4, saved_threads):
+        torch.set_num_threads(nthreads)
+        si = sweep_carry(chain, [0.0], device)
+        if base is None:
+            base = si["carry"]
+        spreads.append((nthreads, float((si["carry"] - base).abs().max())))
+    torch.set_num_threads(saved_threads)
+    print(
+        "P2b carry-value spread across torch thread counts: "
+        + ", ".join(f"{n}t:{_fmt(sp)}" for n, sp in spreads)
+    )
+
+
 def run(device: torch.device) -> None:
     torch.set_default_dtype(torch.float32)
     fl_002 = float((_f32(2.0) / _f32(100.0)).item())
@@ -349,20 +367,7 @@ def run(device: torch.device) -> None:
 
         # ---- P2b: environment sensitivity (CPU reduction order) ----
         if device.type == "cpu":
-            base = None
-            spreads = []
-            saved_threads = torch.get_num_threads()
-            for nthreads in (1, 2, 4, saved_threads):
-                torch.set_num_threads(nthreads)
-                si = sweep_carry(chain, [0.0], device)
-                if base is None:
-                    base = si["carry"]
-                spreads.append((nthreads, float((si["carry"] - base).abs().max())))
-            torch.set_num_threads(saved_threads)
-            print(
-                "P2b carry-value spread across torch thread counts: "
-                + ", ".join(f"{n}t:{_fmt(sp)}" for n, sp in spreads)
-            )
+            _report_thread_spread(chain, device)
         print()
 
 

@@ -311,6 +311,37 @@ class PlannedLayer:
             raise ValueError("planned resource counts cannot be negative")
 
 
+def _validate_nodes_by_id(
+    resolver_items: tuple,
+) -> tuple[list[tuple[int, Node]], set[int]]:
+    """Validate and sort (node_id, Node) resolver pairs.
+
+    Returns the sorted pair list and the id set.
+    """
+    resolver: list[tuple[int, Node]] = []
+    resolver_ids: set[int] = set()
+    pair_len = 2
+    for item in resolver_items:
+        if not isinstance(item, (tuple, list)) or len(item) != pair_len:
+            raise TypeError("nodes_by_id entries must be (node_id, Node) pairs")
+        node_id, node = item
+        if not isinstance(node_id, Integral) or isinstance(node_id, bool):
+            raise TypeError("nodes_by_id keys must be integers")
+        if not isinstance(node, Node):
+            raise TypeError("nodes_by_id values must be Node instances")
+        node_id = int(node_id)
+        if node.node_id != node_id:
+            raise ValueError(
+                f"nodes_by_id key {node_id} does not match node ID {node.node_id}"
+            )
+        if node_id in resolver_ids:
+            raise ValueError(f"nodes_by_id contains duplicate node ID {node_id}")
+        resolver_ids.add(node_id)
+        resolver.append((node_id, node))
+    resolver.sort(key=lambda item: item[0])
+    return resolver, resolver_ids
+
+
 @dataclass(frozen=True)
 class ReplayPlan:
     assignment: ScheduleAssignment
@@ -338,28 +369,7 @@ class ReplayPlan:
             _freeze_node_indices(self.final_indices, "final_indices", sort=False),
         )
 
-        resolver_items = tuple(self.nodes_by_id)
-        resolver: list[tuple[int, Node]] = []
-        resolver_ids: set[int] = set()
-        pair_len = 2
-        for item in resolver_items:
-            if not isinstance(item, (tuple, list)) or len(item) != pair_len:
-                raise TypeError("nodes_by_id entries must be (node_id, Node) pairs")
-            node_id, node = item
-            if not isinstance(node_id, Integral) or isinstance(node_id, bool):
-                raise TypeError("nodes_by_id keys must be integers")
-            if not isinstance(node, Node):
-                raise TypeError("nodes_by_id values must be Node instances")
-            node_id = int(node_id)
-            if node.node_id != node_id:
-                raise ValueError(
-                    f"nodes_by_id key {node_id} does not match node ID {node.node_id}"
-                )
-            if node_id in resolver_ids:
-                raise ValueError(f"nodes_by_id contains duplicate node ID {node_id}")
-            resolver_ids.add(node_id)
-            resolver.append((node_id, node))
-        resolver.sort(key=lambda item: item[0])
+        resolver, resolver_ids = _validate_nodes_by_id(tuple(self.nodes_by_id))
         object.__setattr__(self, "nodes_by_id", tuple(resolver))
         resolver_by_id = dict(resolver)
 

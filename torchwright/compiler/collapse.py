@@ -325,6 +325,310 @@ def _synthesize_member(
     )
 
 
+def _node_label(n: Node, topo_index: dict[Node, int]) -> str:
+    """A node's name, falling back to ``TypeName#topo_index``."""
+    return n.name or f"{type(n).__name__}#{topo_index[n]}"
+
+
+def _index_subgraphs(
+    order: list[Node],
+) -> tuple[dict[Node, list[Node]], dict[Node, list[Node]], dict[Node, int]]:
+    """(by_src, consumers, topo_index) over a topological order.
+
+    ``by_src`` groups each scalar source's member nodes (topological, so
+    member lists stay topological).  Shared by the v1 collapse pass and
+    the v2 analysis pass.
+    """
+    src = scalar_sources(order)
+
+    by_src: dict[Node, list[Node]] = {}
+    for n in order:  # topological, so member lists stay topological
+        s = src[n]
+        if s is not None and s is not n:
+            by_src.setdefault(s, []).append(n)
+
+    consumers: dict[Node, list[Node]] = {n: [] for n in order}
+    for n in order:
+        for u in n.inputs:
+            if u in consumers:
+                consumers[u].append(n)
+
+    topo_index = {n: i for i, n in enumerate(order)}
+    return by_src, consumers, topo_index
+
+
+@dataclass(frozen=True)
+class _PassCtx:
+    """Loop-invariant context shared by the per-subgraph gate/apply steps."""
+
+    consumers: dict[Node, list[Node]]
+    topo_index: dict[Node, int]
+    machine: str | None
+    lane_cap: int
+
+
+@dataclass
+class _CollapsePlan:
+    """A subgraph that passed every gate, ready to synthesize and rewire."""
+
+    source: Node
+    src_name: str
+    members: list[Node]
+    member_set: set[Node]
+    boundary: list[Node]
+    depth: dict[Node, int]
+    chain_depth: int
+    synthesized: list[Node]
+    tables: dict[Node, torch.Tensor]
+    member_lanes: dict[Node, int]
+    lo_int: int
+
+
+def _prescreen_reason(
+    source: Node,
+    synthesized: list[Node],
+    machine: str | None,
+    lane_cap: int,
+) -> tuple[str | None, int, int]:
+    """Gates 1-2 plus the depth/machine pre-checks.
+
+    Returns (decline_reason_or_None, lo_int, hi_int).
+    """
+    import math
+
+    reason: str | None = None
+    lo_int = hi_int = 0
+    if not synthesized:
+        reason = "no depth gain (no boundary member at depth >= 2)"
+    elif machine == "mixed":
+        reason = "graph mixes relu and swish FFNs"
+    # Gate 1 — integer contract on the source (metadata rode the copy).
+    elif not source.integer_claim:
+        reason = "source carries no assert_integer"
+    else:
+        # Gate 2 — plateau pre-screen on the trusted value_range.
+        vr = source.value_type.value_range
+        if not vr.is_finite():
+            reason = "source value_range is unbounded"
+        else:
+            lo_int = math.ceil(vr.lo)
+            hi_int = math.floor(vr.hi)
+            if hi_int < lo_int:
+                reason = "value_range contains no integer"
+            elif hi_int - lo_int + 1 > lane_cap:
+                reason = (
+                    f"{hi_int - lo_int + 1} plateaus exceed the {lane_cap}-lane cap"
+                )
+    return reason, lo_int, hi_int
+
+
+def _gate_plateau_constancy(
+    synthesized: list[Node],
+    values: dict[Node, torch.Tensor],
+    n_plateaus: int,
+    lo_int: int,
+    topo_index: dict[Node, int],
+) -> tuple[dict[Node, float], str | None]:
+    """Gate 4 — plateau constancy, measured.
+
+    Each member's max deviation from its plateau-center value across the
+    sampled band.  Relu compositions compose exactly (deviation 0); swish
+    fillet tails may leave an ulp-scale residue at the band edge.  A
+    deviation past the whole budget means "not a staircase" — decline
+    with the location; a sub-budget deviation is charged against the
+    composite budget in gate 3.
+    """
+    n_offsets = len(_OFFSET_FRACTIONS)
+    member_dev: dict[Node, float] = {}
+    for m in synthesized:
+        v = values[m].reshape(n_plateaus, n_offsets, -1)
+        dev = float((v - v[:, :1, :]).abs().max())
+        member_dev[m] = dev
+        if dev > _SYNTH_CLAIM_ATOL:
+            bad_k = (
+                int(torch.nonzero((v != v[:, :1, :]).any(dim=2).any(dim=1))[0]) + lo_int
+            )
+            m_name = m.name or f"{type(m).__name__}#{topo_index[m]}"
+            return member_dev, (
+                f"not constant on the plateau at k={bad_k} "
+                f"(member {m_name}, max deviation {dev:.3g} > "
+                f"budget {_SYNTH_CLAIM_ATOL:g})"
+            )
+    return member_dev, None
+
+
+def _gate_lane_budget(
+    synthesized: list[Node],
+    tables: dict[Node, torch.Tensor],
+    member_dev: dict[Node, float],
+    range_width: float,
+    ctx: _PassCtx,
+) -> tuple[dict[Node, int], str | None]:
+    """Gate 3 — emitted lanes per synthesized member and error budget.
+
+    Two lanes per value-changing step; equal-value steps are free.  The
+    composite error budget: a staircase's saturated ramp lanes carry
+    intermediates of magnitude ~ step_sharpness · R · max|adjacent value
+    change|, and the fp32 lane sum quantizes the recovered plateau to
+    ulps of that magnitude (measured at 1-4 ulps — the staircase entries
+    in docs/op_noise_data.json).  The measured band deviation plus this
+    predicted accumulation must fit the synthesized claim's tolerance —
+    decline rather than exceed it.
+    """
+    member_lanes: dict[Node, int] = {}
+    for m in synthesized:
+        t = tables[m]
+        lanes = 2 * int((t[1:] != t[:-1]).any(dim=1).sum())
+        member_lanes[m] = lanes
+        m_name = m.name or f"{type(m).__name__}#{ctx.topo_index[m]}"
+        if lanes > ctx.lane_cap:
+            return member_lanes, (
+                f"member {m_name} needs {lanes} lanes (cap {ctx.lane_cap})"
+            )
+        err_bound = 0.0
+        if lanes:
+            max_dv = float((t[1:] - t[:-1]).abs().max())
+            err_bound = 4.0 * _ulp32(step_sharpness * range_width * max_dv)
+        if member_dev[m] + err_bound > _SYNTH_CLAIM_ATOL:
+            return member_lanes, (
+                f"member {m_name}: band deviation {member_dev[m]:.2e} "
+                f"+ predicted fp32 accumulation {err_bound:.2e} "
+                f"exceeds the synthesized claim tolerance "
+                f"{_SYNTH_CLAIM_ATOL:g}"
+            )
+    return member_lanes, None
+
+
+def _gate_subgraph(
+    source: Node,
+    members: list[Node],
+    output_node: Node,
+    ctx: _PassCtx,
+) -> SubgraphOutcome | _CollapsePlan:
+    """Run the four feasibility gates on one univariate subgraph.
+
+    Returns a declined :class:`SubgraphOutcome`, or a :class:`_CollapsePlan`
+    when every gate passes.
+    """
+    member_set = set(members)
+    depth = _member_depths(source, members)
+    chain_depth = max(depth[m] for m in members)
+    src_name = source.name or f"{type(source).__name__}#{ctx.topo_index[source]}"
+
+    def declined(reason: str) -> SubgraphOutcome:
+        return SubgraphOutcome(
+            source=src_name,
+            n_members=len(members),
+            chain_depth=chain_depth,
+            collapsed=False,
+            reason=reason,
+        )
+
+    boundary = [
+        m
+        for m in members
+        if m is output_node or any(c not in member_set for c in ctx.consumers[m])
+    ]
+    synthesized = [m for m in boundary if depth[m] >= _MIN_SYNTH_DEPTH]
+    reason, lo_int, hi_int = _prescreen_reason(
+        source, synthesized, ctx.machine, ctx.lane_cap
+    )
+    if reason is not None:
+        return declined(reason)
+    n_plateaus = hi_int - lo_int + 1
+
+    # Re-rooted oracle over the full sampled grid, one batched call.
+    n_offsets = len(_OFFSET_FRACTIONS)
+    ks = torch.arange(lo_int, hi_int + 1, dtype=torch.float32)
+    offsets = torch.tensor(
+        [f * _PLATEAU_SLACK for f in _OFFSET_FRACTIONS], dtype=torch.float32
+    )
+    grid = (ks.unsqueeze(1) + offsets.unsqueeze(0)).reshape(-1, 1)
+    values = _seeded_oracle(synthesized, source, grid)
+
+    member_dev, stair_fail = _gate_plateau_constancy(
+        synthesized, values, n_plateaus, lo_int, ctx.topo_index
+    )
+    if stair_fail is not None:
+        return declined(stair_fail)
+
+    tables = {
+        m: values[m].reshape(n_plateaus, n_offsets, -1)[:, 0, :] for m in synthesized
+    }
+    member_lanes, gate_fail = _gate_lane_budget(
+        synthesized, tables, member_dev, float(hi_int - lo_int), ctx
+    )
+    if gate_fail is not None:
+        return declined(gate_fail)
+
+    return _CollapsePlan(
+        source=source,
+        src_name=src_name,
+        members=members,
+        member_set=member_set,
+        boundary=boundary,
+        depth=depth,
+        chain_depth=chain_depth,
+        synthesized=synthesized,
+        tables=tables,
+        member_lanes=member_lanes,
+        lo_int=lo_int,
+    )
+
+
+def _apply_collapse(
+    plan: _CollapsePlan,
+    ctx: _PassCtx,
+    output_node: Node,
+    fold_log: FoldLog,
+) -> tuple[Node, SubgraphOutcome]:
+    """Synthesize, rewire, orphan.  Returns the (possibly new) output + outcome.
+
+    Kept boundary members (depth < 2) survive with their whole
+    in-subgraph input cone (which is depth-0 Concatenates over the
+    source and literals only, so no FFN survives through them);
+    every other member becomes unreachable once the synthesized
+    nodes take over, freeing its lanes.
+    """
+    kept = {m for m in plan.boundary if plan.depth[m] < _MIN_SYNTH_DEPTH}
+    freed = sum(
+        m.gate_proj.shape[0]
+        for m in plan.members
+        if isinstance(m, FFN) and m not in kept
+    )
+    for m in plan.synthesized:
+        m_name = m.name or f"m{ctx.topo_index[m]}"
+        new = _synthesize_member(
+            plan.source,
+            plan.tables[m],
+            plan.lo_int,
+            ctx.lane_cap,
+            ctx.machine,
+            name=f"collapse_{plan.src_name}_{m_name}",
+        )
+        for c in list(ctx.consumers[m]):
+            if c not in plan.member_set:
+                c.replace_input(m, new)
+        if m is output_node:
+            output_node = new
+        # The synthesized value IS m's value: record the move so the
+        # source->copy node_map follows it.  (piecewise_linear's
+        # clamp-range claim is metadata on ``new`` itself.)
+        fold_log.record_move(orphan=m, survivor=new)
+
+    outcome = SubgraphOutcome(
+        source=plan.src_name,
+        n_members=len(plan.members),
+        chain_depth=plan.chain_depth,
+        collapsed=True,
+        n_synthesized=len(plan.synthesized),
+        n_kept=len(plan.boundary) - len(plan.synthesized),
+        emitted_lanes=sum(plan.member_lanes.values()),
+        freed_lanes=freed,
+    )
+    return output_node, outcome
+
+
 def collapse_univariate_subgraphs(
     output_node: Node,
     *,
@@ -350,203 +654,20 @@ def collapse_univariate_subgraphs(
         metadata.
     """
     order = topological_order(output_node)
-    src = scalar_sources(order)
     machine = _machine(order)
-
-    by_src: dict[Node, list[Node]] = {}
-    for n in order:  # topological, so member lists stay topological
-        s = src[n]
-        if s is not None and s is not n:
-            by_src.setdefault(s, []).append(n)
-
-    consumers: dict[Node, list[Node]] = {n: [] for n in order}
-    for n in order:
-        for u in n.inputs:
-            if u in consumers:
-                consumers[u].append(n)
-
-    topo_index = {n: i for i, n in enumerate(order)}
+    by_src, consumers, topo_index = _index_subgraphs(order)
+    ctx = _PassCtx(
+        consumers=consumers, topo_index=topo_index, machine=machine, lane_cap=lane_cap
+    )
     outcomes: list[SubgraphOutcome] = []
 
     for source in sorted(by_src, key=topo_index.__getitem__):
-        members = by_src[source]
-        member_set = set(members)
-        depth = _member_depths(source, members)
-        chain_depth = max(depth[m] for m in members)
-        src_name = source.name or f"{type(source).__name__}#{topo_index[source]}"
-
-        def declined(reason: str) -> SubgraphOutcome:
-            return SubgraphOutcome(
-                source=src_name,
-                n_members=len(members),
-                chain_depth=chain_depth,
-                collapsed=False,
-                reason=reason,
-            )
-
-        boundary = [
-            m
-            for m in members
-            if m is output_node or any(c not in member_set for c in consumers[m])
-        ]
-        synthesized = [m for m in boundary if depth[m] >= _MIN_SYNTH_DEPTH]
-        if not synthesized:
-            outcomes.append(
-                declined("no depth gain (no boundary member at depth >= 2)")
-            )
+        result = _gate_subgraph(source, by_src[source], output_node, ctx)
+        if isinstance(result, SubgraphOutcome):
+            outcomes.append(result)
             continue
-
-        if machine == "mixed":
-            outcomes.append(declined("graph mixes relu and swish FFNs"))
-            continue
-
-        # Gate 1 — integer contract on the source (metadata rode the copy).
-        if not source.integer_claim:
-            outcomes.append(declined("source carries no assert_integer"))
-            continue
-
-        # Gate 2 — plateau pre-screen on the trusted value_range.
-        vr = source.value_type.value_range
-        if not vr.is_finite():
-            outcomes.append(declined("source value_range is unbounded"))
-            continue
-        import math
-
-        lo_int = math.ceil(vr.lo)
-        hi_int = math.floor(vr.hi)
-        if hi_int < lo_int:
-            outcomes.append(declined("value_range contains no integer"))
-            continue
-        n_plateaus = hi_int - lo_int + 1
-        if n_plateaus > lane_cap:
-            outcomes.append(
-                declined(f"{n_plateaus} plateaus exceed the {lane_cap}-lane cap")
-            )
-            continue
-
-        # Re-rooted oracle over the full sampled grid, one batched call.
-        n_offsets = len(_OFFSET_FRACTIONS)
-        ks = torch.arange(lo_int, hi_int + 1, dtype=torch.float32)
-        offsets = torch.tensor(
-            [f * _PLATEAU_SLACK for f in _OFFSET_FRACTIONS], dtype=torch.float32
-        )
-        grid = (ks.unsqueeze(1) + offsets.unsqueeze(0)).reshape(-1, 1)
-        values = _seeded_oracle(synthesized, source, grid)
-
-        # Gate 4 — plateau constancy, measured: each member's max
-        # deviation from its plateau-center value across the sampled
-        # band.  Relu compositions compose exactly (deviation 0); swish
-        # fillet tails may leave an ulp-scale residue at the band edge.
-        # A deviation past the whole budget means "not a staircase" —
-        # decline with the location; a sub-budget deviation is charged
-        # against the composite budget in gate 3 below.
-        member_dev: dict[Node, float] = {}
-        stair_fail = None
-        for m in synthesized:
-            v = values[m].reshape(n_plateaus, n_offsets, -1)
-            dev = float((v - v[:, :1, :]).abs().max())
-            member_dev[m] = dev
-            if dev > _SYNTH_CLAIM_ATOL:
-                bad_k = (
-                    int(torch.nonzero((v != v[:, :1, :]).any(dim=2).any(dim=1))[0])
-                    + lo_int
-                )
-                m_name = m.name or f"{type(m).__name__}#{topo_index[m]}"
-                stair_fail = (
-                    f"not constant on the plateau at k={bad_k} "
-                    f"(member {m_name}, max deviation {dev:.3g} > "
-                    f"budget {_SYNTH_CLAIM_ATOL:g})"
-                )
-                break
-        if stair_fail is not None:
-            outcomes.append(declined(stair_fail))
-            continue
-
-        # Gate 3 — emitted lanes per synthesized member (2 per
-        # value-changing step; equal-value steps are free), and the
-        # composite error budget: a staircase's saturated ramp lanes
-        # carry intermediates of magnitude ~ step_sharpness · R ·
-        # max|adjacent value change|, and the fp32 lane sum quantizes
-        # the recovered plateau to ulps of that magnitude (measured at
-        # 1-4 ulps — the staircase entries in docs/op_noise_data.json).
-        # The measured band deviation plus this predicted accumulation
-        # must fit the synthesized claim's tolerance — decline rather
-        # than exceed it.
-        tables = {
-            m: values[m].reshape(n_plateaus, n_offsets, -1)[:, 0, :]
-            for m in synthesized
-        }
-        range_width = float(hi_int - lo_int)
-        gate_fail = None
-        member_lanes: dict[Node, int] = {}
-        for m in synthesized:
-            t = tables[m]
-            lanes = 2 * int((t[1:] != t[:-1]).any(dim=1).sum())
-            member_lanes[m] = lanes
-            m_name = m.name or f"{type(m).__name__}#{topo_index[m]}"
-            if lanes > lane_cap:
-                gate_fail = f"member {m_name} needs {lanes} lanes (cap {lane_cap})"
-                break
-            err_bound = 0.0
-            if lanes:
-                max_dv = float((t[1:] - t[:-1]).abs().max())
-                err_bound = 4.0 * _ulp32(step_sharpness * range_width * max_dv)
-            if member_dev[m] + err_bound > _SYNTH_CLAIM_ATOL:
-                gate_fail = (
-                    f"member {m_name}: band deviation {member_dev[m]:.2e} "
-                    f"+ predicted fp32 accumulation {err_bound:.2e} "
-                    f"exceeds the synthesized claim tolerance "
-                    f"{_SYNTH_CLAIM_ATOL:g}"
-                )
-                break
-        if gate_fail is not None:
-            outcomes.append(declined(gate_fail))
-            continue
-
-        # --- All gates passed: synthesize, rewire, orphan. -------------
-        # Kept boundary members (depth < 2) survive with their whole
-        # in-subgraph input cone (which is depth-0 Concatenates over the
-        # source and literals only, so no FFN survives through them);
-        # every other member becomes unreachable once the synthesized
-        # nodes take over, freeing its lanes.
-        kept = {m for m in boundary if depth[m] < _MIN_SYNTH_DEPTH}
-        freed = sum(
-            m.gate_proj.shape[0]
-            for m in members
-            if isinstance(m, FFN) and m not in kept
-        )
-        for m in synthesized:
-            m_name = m.name or f"m{topo_index[m]}"
-            new = _synthesize_member(
-                source,
-                tables[m],
-                lo_int,
-                lane_cap,
-                machine,
-                name=f"collapse_{src_name}_{m_name}",
-            )
-            for c in list(consumers[m]):
-                if c not in member_set:
-                    c.replace_input(m, new)
-            if m is output_node:
-                output_node = new
-            # The synthesized value IS m's value: record the move so the
-            # source->copy node_map follows it.  (piecewise_linear's
-            # clamp-range claim is metadata on ``new`` itself.)
-            fold_log.record_move(orphan=m, survivor=new)
-
-        outcomes.append(
-            SubgraphOutcome(
-                source=src_name,
-                n_members=len(members),
-                chain_depth=chain_depth,
-                collapsed=True,
-                n_synthesized=len(synthesized),
-                n_kept=len(boundary) - len(synthesized),
-                emitted_lanes=sum(member_lanes.values()),
-                freed_lanes=freed,
-            )
-        )
+        output_node, outcome = _apply_collapse(result, ctx, output_node, fold_log)
+        outcomes.append(outcome)
 
     report = CollapseReport(outcomes)
     if verbose and outcomes:

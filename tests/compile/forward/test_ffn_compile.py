@@ -82,7 +82,7 @@ def test_debug_value_and_assert_on_block_output(xt):
     assert torch.allclose(val, ref, atol=1e-3)
 
 
-def _build_swish(gated_second=True):
+def _build_swish(*, gated_second=True):
     """Build a two-FFN swish graph (gated feeding degenerate-or-gated).
 
     New node ids each call. Directly-authored fixture (plan phase A: no

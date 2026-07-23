@@ -34,18 +34,15 @@ def build_scene() -> tuple[PyScene, PyGameState]:
     return py_scene, py_state
 
 
-def main() -> None:
-    py_scene, py_state = build_scene()
-    tokens = expected_ar_tokens(py_scene, py_state)
-    print(
-        f"PIXEL_WIDTH={PIXEL_WIDTH} COLUMN_COUNT={COLUMN_COUNT} "
-        f"VIEW_HEIGHT={VIEW_HEIGHT}"
-    )
-    print(f"total tokens in frame: {len(tokens)}")
+def _scan_clip_writes(tokens: list) -> tuple[list[tuple[int, int]], int, int, int]:
+    """Scan the token stream for clip writes.
 
+    Returns (writes, n_clip_update, n_screen_range_total,
+    n_screen_range_after_clip) where ``writes`` is a list of
+    (position, column) for every clip write.
+    """
     cur_col = None
     prev_type = None
-    # list of (position, column) for every clip write
     writes: list[tuple[int, int]] = []
     n_clip_update = 0
     n_screen_range_total = 0
@@ -64,6 +61,39 @@ def main() -> None:
                 n_screen_range_after_clip += 1
                 writes.append((pos, cur_col if cur_col is not None else -1))
         prev_type = t
+    return writes, n_clip_update, n_screen_range_total, n_screen_range_after_clip
+
+
+def _summ(name: str, xs: list[int]) -> None:
+    """Print a one-line summary of a distribution."""
+    if not xs:
+        print(f"  {name}: (none)")
+        return
+    xs = sorted(xs)
+    n = len(xs)
+
+    def p(q: float) -> int:
+        return xs[min(n - 1, int(q * n))]
+
+    print(
+        f"  {name}: n={n} min={xs[0]} median={statistics.median(xs):.0f} "
+        f"mean={statistics.mean(xs):.0f} p90={p(0.90)} p95={p(0.95)} "
+        f"p99={p(0.99)} max={xs[-1]}"
+    )
+
+
+def main() -> None:
+    py_scene, py_state = build_scene()
+    tokens = expected_ar_tokens(py_scene, py_state)
+    print(
+        f"PIXEL_WIDTH={PIXEL_WIDTH} COLUMN_COUNT={COLUMN_COUNT} "
+        f"VIEW_HEIGHT={VIEW_HEIGHT}"
+    )
+    print(f"total tokens in frame: {len(tokens)}")
+
+    writes, n_clip_update, n_screen_range_total, n_screen_range_after_clip = (
+        _scan_clip_writes(tokens)
+    )
 
     print(f"CLIP_UPDATE tokens: {n_clip_update}")
     print(f"SCREEN_RANGE tokens total: {n_screen_range_total}")
@@ -95,33 +125,17 @@ def main() -> None:
     # than this. The MIN (not the median) is what matters.
     winner_runnerup_gaps = same_col_gaps
 
-    def summ(name: str, xs: list[int]) -> None:
-        if not xs:
-            print(f"  {name}: (none)")
-            return
-        xs = sorted(xs)
-        n = len(xs)
-
-        def p(q: float) -> int:
-            return xs[min(n - 1, int(q * n))]
-
-        print(
-            f"  {name}: n={n} min={xs[0]} median={statistics.median(xs):.0f} "
-            f"mean={statistics.mean(xs):.0f} p90={p(0.90)} p95={p(0.95)} "
-            f"p99={p(0.99)} max={xs[-1]}"
-        )
-
     print("\n=== (a) position-gap between consecutive writes to the SAME column ===")
-    summ("same_col_gap", same_col_gaps)
+    _summ("same_col_gap", same_col_gaps)
 
     print("\n=== writes per column ===")
-    summ("writes_per_col", writes_per_col)
+    _summ("writes_per_col", writes_per_col)
     # columns written exactly once never produce a same-col gap; report how many.
     once = sum(1 for c in writes_per_col if c == 1)
     print(f"  columns written exactly once (no gap): {once} / {len(writes_per_col)}")
 
     print("\n=== (b) recency winner-vs-runner-up gap (R13: MIN is binding) ===")
-    summ("winner_vs_runnerup_gap", winner_runnerup_gaps)
+    _summ("winner_vs_runnerup_gap", winner_runnerup_gaps)
 
     if winner_runnerup_gaps:
         min_gap = min(winner_runnerup_gaps)

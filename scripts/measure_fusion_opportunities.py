@@ -229,6 +229,7 @@ def _subgraph_details(
 def analyze(
     output: Node,
     name: str,
+    *,
     detail_subgraphs: bool = False,
     collapse: bool = False,
 ) -> None:

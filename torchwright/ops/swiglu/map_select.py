@@ -107,8 +107,8 @@ def select(cond: Node, true_node: Node, false_node: Node) -> Node:
     _apply_semantic_override(
         result,
         _select_semantic_bound(
-            true_node._affine_bound,
-            false_node._affine_bound,
+            true_node.affine_bound,
+            false_node.affine_bound,
             rel_tolerance=_GATE_C_TOL,
         ),
     )
@@ -382,12 +382,12 @@ def broadcast_select(
     _apply_semantic_override(
         result,
         _broadcast_select_semantic_bound(
-            true_value._affine_bound,
-            false_value._affine_bound,
+            true_value.affine_bound,
+            false_value.affine_bound,
             n_slots,
             d_fill,
-            true_is_broadcast,
-            false_is_broadcast,
+            true_is_broadcast=true_is_broadcast,
+            false_is_broadcast=false_is_broadcast,
             rel_tolerance=_MASK_TOL,
         ),
     )
@@ -714,6 +714,53 @@ def _table_lookup_row_vector(
     )
 
 
+def _column_gate_chunks(
+    step_chunks: list[tuple[list[int], Node]],
+    row: Node,
+    cols: int,
+    name: str,
+) -> list[Node]:
+    """Column-stage FFN chunks: gated lanes reading the live row vector."""
+    chunks: list[Node] = []
+    for ci, (ks, step) in enumerate(step_chunks):
+        c = len(ks)
+        first = ci == 0
+        n_lanes = c + (1 if first else 0)
+        d_input = c + cols
+        gate_proj = torch.zeros(n_lanes, d_input)
+        gate_bias = torch.zeros(n_lanes)
+        up_proj = torch.zeros(n_lanes, d_input)
+        out_proj = torch.zeros(n_lanes, 1)
+        for lj, k in enumerate(ks):
+            # gate: scale·(1 - step_k(j)) — indicator snapped by saturation
+            gate_proj[lj, lj] = -scale
+            gate_bias[lj] = scale
+            # up: row_{k-1} - row_k, read from the live row section
+            up_proj[lj, c + k - 1] = 1.0
+            up_proj[lj, c + k] = -1.0
+            out_proj[lj, 0] = 1.0 / scale
+        if first:
+            # Always-on lane carrying the live top entry (out_bias cannot —
+            # row_{B-1} is a live value, not a constant).
+            gate_bias[c] = scale
+            up_proj[c, c + cols - 1] = 1.0
+            out_proj[c, 0] = 1.0 / scale
+        x = Concatenate([step, row])
+        chunks.append(
+            swiglu_ffn(
+                x,
+                gate_proj,
+                gate_bias,
+                out_proj,
+                torch.zeros(1),
+                up_proj=up_proj,
+                up_bias=torch.zeros(n_lanes),
+                name=f"{name}_col_gate",
+            )
+        )
+    return chunks
+
+
 def table_lookup_2d(
     i: Node,
     j: Node,
@@ -823,43 +870,7 @@ def table_lookup_2d(
         j_input, cols, s, chunk_size, f"{name}_col", gate_mult=j_mult
     )
 
-    chunks: list[Node] = []
-    for ci, (ks, step) in enumerate(step_chunks):
-        c = len(ks)
-        first = ci == 0
-        n_lanes = c + (1 if first else 0)
-        d_input = c + cols
-        gate_proj = torch.zeros(n_lanes, d_input)
-        gate_bias = torch.zeros(n_lanes)
-        up_proj = torch.zeros(n_lanes, d_input)
-        out_proj = torch.zeros(n_lanes, 1)
-        for lj, k in enumerate(ks):
-            # gate: scale·(1 - step_k(j)) — indicator snapped by saturation
-            gate_proj[lj, lj] = -scale
-            gate_bias[lj] = scale
-            # up: row_{k-1} - row_k, read from the live row section
-            up_proj[lj, c + k - 1] = 1.0
-            up_proj[lj, c + k] = -1.0
-            out_proj[lj, 0] = 1.0 / scale
-        if first:
-            # Always-on lane carrying the live top entry (out_bias cannot —
-            # row_{B-1} is a live value, not a constant).
-            gate_bias[c] = scale
-            up_proj[c, c + cols - 1] = 1.0
-            out_proj[c, 0] = 1.0 / scale
-        x = Concatenate([step, row])
-        chunks.append(
-            swiglu_ffn(
-                x,
-                gate_proj,
-                gate_bias,
-                out_proj,
-                torch.zeros(1),
-                up_proj=up_proj,
-                up_bias=torch.zeros(n_lanes),
-                name=f"{name}_col_gate",
-            )
-        )
+    chunks = _column_gate_chunks(step_chunks, row, cols, name)
 
     result = chunks[0] if len(chunks) == 1 else sum_nodes(chunks)
     lo = float(table_t.min().item())

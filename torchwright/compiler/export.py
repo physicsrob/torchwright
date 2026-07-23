@@ -61,6 +61,7 @@ import torch
 from onnx import TensorProto, helper
 
 from torchwright.compiler.forward.compile import (
+    RmsNormSpec,
     forward_compile,
     rms_norm_width_supported,
 )
@@ -310,6 +311,151 @@ def _build_matrix_occupancy(
     return matrices, placements, n_heads, d_hidden_per_layer
 
 
+def _encode_state_entries(
+    compiled: "HeadlessTransformer",
+    canon: dict[int, int],
+) -> tuple[list[dict], dict[str, str]]:
+    """Residual-assignment state entries keyed by canonical node id.
+
+    Returns the encoded per-state entries and the earliest state in which
+    each canonical id appears.  The state list is ordered input → L0.attn
+    → L0.mlp → L1.attn …, and a node sits in the residual stream from the
+    sublayer that computes it until it is freed, so its FIRST appearance
+    pins where it was computed.  Used as the layer/sublayer source for
+    nodes the placement recorder doesn't log (literals, concatenations).
+    """
+    from torchwright.compiler.graph_identity import encode_cols
+
+    ra = compiled.residual_assignment
+    assert ra is not None
+
+    state_list: list[tuple] = [("input", compiled.layers[0].attn.in_state)]
+    for i, layer in enumerate(compiled.layers):
+        state_list.append((f"L{i}.attn", layer.attn.out_state))
+        state_list.append((f"L{i}.mlp", layer.mlp.out_state))
+
+    seen_tables: dict[int, str] = {}  # id(mapping dict) -> first state key
+    state_entries: list[dict] = []
+    first_state: dict[str, str] = {}
+    for key, st in state_list:
+        table = ra.mapping.get(st)
+        if table is None:
+            state_entries.append({"key": key, "nodes": {}})
+            continue
+        prior = seen_tables.get(id(table))
+        if prior is not None:
+            state_entries.append({"key": key, "same_as": prior})
+            continue
+        seen_tables[id(table)] = key
+        nodes: dict[str, list] = {}
+        for node, cols in table.items():
+            cid = canon.get(node.node_id)
+            if cid is None:
+                # Not reachable from the output via inputs (e.g. the
+                # PosEncoding leaf) — cannot be keyed canonically.
+                continue
+            nodes.setdefault(str(cid), encode_cols(list(cols)))
+            first_state.setdefault(str(cid), key)
+        state_entries.append({"key": key, "nodes": nodes})
+    return state_entries, first_state
+
+
+def _placement_locations(
+    compiled: "HeadlessTransformer",
+    canon: dict[int, int],
+) -> dict[str, tuple]:
+    """First recorded (layer, sublayer) per canonical id, from the recorder."""
+    place_loc: dict[str, tuple] = {}
+    recorder = getattr(compiled, "placements", None)
+    if recorder is not None:
+        for e in recorder.entries:
+            if e.node is None:
+                continue
+            cid = canon.get(e.node.node_id)
+            if cid is None:
+                continue
+            cid_s = str(cid)
+            if cid_s in place_loc:
+                continue
+            sub = "attn" if e.matrix_kind.startswith("attn") else "mlp"
+            place_loc[cid_s] = (int(e.layer), sub)
+    return place_loc
+
+
+def _baked_weights(node: Node) -> tuple[int, list[list]]:
+    """Baked weight tensors probed by attribute name.
+
+    Summed into a parameter count and per-tensor shape list; 0 / [] for
+    pure ops.
+    """
+    baked_attrs = ("table", "output_matrix", "matrix", "weight", "value")
+    weight_params = 0
+    weight_shapes: list[list] = []
+    for attr in baked_attrs:
+        t: Any = getattr(node, attr, None)
+        shape = getattr(t, "shape", None)
+        if shape is None:
+            continue
+        dims = [int(s) for s in shape]
+        if not dims:  # 0-d scalar — no parameters to attribute
+            continue
+        weight_params += int(t.numel()) if hasattr(t, "numel") else 1
+        weight_shapes.append([attr, dims])
+    return weight_params, weight_shapes
+
+
+def _nodes_metadata(
+    out: Node,
+    canon: dict[int, int],
+    place_loc: dict[str, tuple],
+    first_state: dict[str, str],
+) -> dict[str, dict]:
+    """Per-node metadata keyed by canonical id — one entry per reachable node.
+
+    layer/sublayer: the placement recorder logs the layer + matrix for
+    every weight-bearing op (Linear/Attn/ReLU/Add), so it is the
+    authoritative source where present; matrix_kind "attn.*"/"mlp.*"
+    gives the sublayer.  Nodes it doesn't log (literals, concatenations)
+    fall back to their first residual-state appearance, and pre-layer
+    input nodes (Embedding) report sublayer "embed".
+    """
+    from torchwright.compiler.graph_identity import nodes_by_canonical_id
+
+    def _layer_sublayer(cid_s: str, node: Node) -> tuple:
+        if cid_s in place_loc:
+            return place_loc[cid_s]
+        key = first_state.get(cid_s)
+        if key is not None and key != "input":
+            lpart, sub = key.split(".")  # "L{k}", "attn"|"mlp"
+            return int(lpart[1:]), sub
+        if isinstance(node, Embedding):
+            return None, "embed"
+        return None, None
+
+    nodes_meta: dict[str, dict] = {}
+    for cid, node in nodes_by_canonical_id(out).items():
+        cid_s = str(cid)
+        weight_params, weight_shapes = _baked_weights(node)
+        input_cids: list[str] = []
+        for inp in getattr(node, "inputs", None) or []:
+            icid = canon.get(inp.node_id)
+            if icid is not None:
+                input_cids.append(str(icid))
+        layer, sublayer = _layer_sublayer(cid_s, node)
+        nodes_meta[cid_s] = {
+            "op": type(node).__name__,
+            "annotation": node.annotation,
+            "width": len(node),
+            "weight_params": weight_params,
+            "weight_shapes": weight_shapes,
+            "inputs": input_cids,
+            "layer": layer,
+            "sublayer": sublayer,
+            "name": getattr(node, "name", None),
+        }
+    return nodes_meta
+
+
 def _write_debug_sidecar(
     onnx_path: str,
     *,
@@ -357,49 +503,12 @@ def _write_debug_sidecar(
     from torchwright.compiler.graph_identity import (
         canonical_ids,
         debug_fingerprint,
-        encode_cols,
-        nodes_by_canonical_id,
     )
 
     out = output_node
     canon = canonical_ids(out)
-    ra = compiled.residual_assignment
-    assert ra is not None
 
-    state_list: list[tuple] = [("input", compiled.layers[0].attn.in_state)]
-    for i, layer in enumerate(compiled.layers):
-        state_list.append((f"L{i}.attn", layer.attn.out_state))
-        state_list.append((f"L{i}.mlp", layer.mlp.out_state))
-
-    seen_tables: dict[int, str] = {}  # id(mapping dict) -> first state key
-    state_entries: list[dict] = []
-    # Earliest state in which each canonical id appears.  The state_list
-    # is ordered input → L0.attn → L0.mlp → L1.attn …, and a node sits in
-    # the residual stream from the sublayer that computes it until it is
-    # freed, so its FIRST appearance pins where it was computed.  Used as
-    # the layer/sublayer source for nodes the placement recorder doesn't
-    # log (literals, concatenations).
-    first_state: dict[str, str] = {}
-    for key, st in state_list:
-        table = ra.mapping.get(st)
-        if table is None:
-            state_entries.append({"key": key, "nodes": {}})
-            continue
-        prior = seen_tables.get(id(table))
-        if prior is not None:
-            state_entries.append({"key": key, "same_as": prior})
-            continue
-        seen_tables[id(table)] = key
-        nodes: dict[str, list] = {}
-        for node, cols in table.items():
-            cid = canon.get(node.node_id)
-            if cid is None:
-                # Not reachable from the output via inputs (e.g. the
-                # PosEncoding leaf) — cannot be keyed canonically.
-                continue
-            nodes.setdefault(str(cid), encode_cols(list(cols)))
-            first_state.setdefault(str(cid), key)
-        state_entries.append({"key": key, "nodes": nodes})
+    state_entries, first_state = _encode_state_entries(compiled, canon)
 
     assert_targets = sorted(
         {
@@ -415,74 +524,8 @@ def _write_debug_sidecar(
     # Per-node metadata keyed by canonical id — the same key space as
     # ``placements`` and the residual ``states``.  One entry per node
     # reachable from the output.
-    #
-    # layer/sublayer: the placement recorder logs the layer + matrix for
-    # every weight-bearing op (Linear/Attn/ReLU/Add), so it is the
-    # authoritative source where present; matrix_kind "attn.*"/"mlp.*"
-    # gives the sublayer.  Nodes it doesn't log (literals, concatenations)
-    # fall back to their first residual-state appearance, and pre-layer
-    # input nodes (Embedding) report sublayer "embed".
-    place_loc: dict[str, tuple] = {}
-    recorder = getattr(compiled, "placements", None)
-    if recorder is not None:
-        for e in recorder.entries:
-            if e.node is None:
-                continue
-            cid = canon.get(e.node.node_id)
-            if cid is None:
-                continue
-            cid_s = str(cid)
-            if cid_s in place_loc:
-                continue
-            sub = "attn" if e.matrix_kind.startswith("attn") else "mlp"
-            place_loc[cid_s] = (int(e.layer), sub)
-
-    def _layer_sublayer(cid_s: str, node: Node) -> tuple:
-        if cid_s in place_loc:
-            return place_loc[cid_s]
-        key = first_state.get(cid_s)
-        if key is not None and key != "input":
-            lpart, sub = key.split(".")  # "L{k}", "attn"|"mlp"
-            return int(lpart[1:]), sub
-        if isinstance(node, Embedding):
-            return None, "embed"
-        return None, None
-
-    # Baked weight tensors probed by attribute name, summed into a
-    # parameter count and per-tensor shape list.  0 / [] for pure ops.
-    baked_attrs = ("table", "output_matrix", "matrix", "weight", "value")
-    nodes_meta: dict[str, dict] = {}
-    for cid, node in nodes_by_canonical_id(out).items():
-        cid_s = str(cid)
-        weight_params = 0
-        weight_shapes: list[list] = []
-        for attr in baked_attrs:
-            t: Any = getattr(node, attr, None)
-            shape = getattr(t, "shape", None)
-            if shape is None:
-                continue
-            dims = [int(s) for s in shape]
-            if not dims:  # 0-d scalar — no parameters to attribute
-                continue
-            weight_params += int(t.numel()) if hasattr(t, "numel") else 1
-            weight_shapes.append([attr, dims])
-        input_cids: list[str] = []
-        for inp in getattr(node, "inputs", None) or []:
-            icid = canon.get(inp.node_id)
-            if icid is not None:
-                input_cids.append(str(icid))
-        layer, sublayer = _layer_sublayer(cid_s, node)
-        nodes_meta[cid_s] = {
-            "op": type(node).__name__,
-            "annotation": node.annotation,
-            "width": len(node),
-            "weight_params": weight_params,
-            "weight_shapes": weight_shapes,
-            "inputs": input_cids,
-            "layer": layer,
-            "sublayer": sublayer,
-            "name": getattr(node, "name", None),
-        }
+    place_loc = _placement_locations(compiled, canon)
+    nodes_meta = _nodes_metadata(out, canon, place_loc, first_state)
     payload = {
         "format": DEBUG_META_FORMAT,
         "kind": kind,  # always "token"
@@ -747,6 +790,7 @@ def _make_stream_layer_weights_cb(
     sparse_inits: list,
     per_layer_n_heads: list,
     per_layer_rotary: list | None = None,
+    *,
     trim_heads: bool = True,
     bias: bool = True,
 ) -> Callable[[int, object], None]:
@@ -959,14 +1003,123 @@ def _emit_rmsnorm(
     node("Mul", [f"{scratch}_normed", gain], [out])
 
 
+def _emit_rope_rotate(
+    node: Callable[..., None],
+    src: str,
+    dst: str,
+    cos: str,
+    sin: str,
+    *,
+    full_rotary: bool,
+) -> None:
+    """rotate_half RoPE over the rotary front ``d_rot``.
+
+    Rotates the first ``d_rot`` dims (``front*cos +
+    rotate_half(front)*sin``) and passes the last ``d_head - d_rot``
+    dims (the NoPE tail) through unchanged.  Matches graph/rope.py
+    (vanilla partial rotary, half-split over d_rot);
+    modeling_torchwright_custom.py mirrors this op sequence.
+
+    ``full_rotary`` (``d_rot == d_head``) emits the exact pre-partial 6-node
+    sequence — byte-for-byte the same graph, so the cancel-head denormal-ULP
+    note below still holds and existing exports are unchanged.
+
+    No ``src + (rot - src)`` reconstruction: cross-backend onnxruntime/torch
+    agreement is not algebraic — the cancel-head rows that cancel to denormal
+    magnitude differ by one denormal ULP regardless of the form (the
+    direct-HF parity bound tolerates it; no token or meaningful logit
+    moves), and the full suite is bit-exact with the direct form, so the
+    extra Sub/Add bought nothing.
+    """
+    if full_rotary:
+        # Full rotary: rotate_half over the whole head.
+        node("Split", [src, "rope_split"], [f"{dst}_h1", f"{dst}_h2"], axis=-1)
+        node("Neg", [f"{dst}_h2"], [f"{dst}_h2n"])
+        node("Concat", [f"{dst}_h2n", f"{dst}_h1"], [f"{dst}_rh"], axis=-1)
+        node("Mul", [src, cos], [f"{dst}_c"])
+        node("Mul", [f"{dst}_rh", sin], [f"{dst}_s"])
+        node("Add", [f"{dst}_c", f"{dst}_s"], [dst])
+        return
+    # Partial rotary: split off the rotary front (d_rot) and the NoPE tail,
+    # rotate_half the front, then re-concat the untouched tail.  cos/sin are
+    # width d_rot and broadcast over the front.
+    node(
+        "Split",
+        [src, "rope_partial_split"],
+        [f"{dst}_front", f"{dst}_tail"],
+        axis=-1,
+    )
+    node("Split", [f"{dst}_front", "rope_split"], [f"{dst}_h1", f"{dst}_h2"], axis=-1)
+    node("Neg", [f"{dst}_h2"], [f"{dst}_h2n"])
+    node("Concat", [f"{dst}_h2n", f"{dst}_h1"], [f"{dst}_rh"], axis=-1)
+    node("Mul", [f"{dst}_front", cos], [f"{dst}_c"])
+    node("Mul", [f"{dst}_rh", sin], [f"{dst}_s"])
+    node("Add", [f"{dst}_c", f"{dst}_s"], [f"{dst}_rotfront"])
+    node("Concat", [f"{dst}_rotfront", f"{dst}_tail"], [dst], axis=-1)
+
+
+def _emit_mlp_sublayer_nodes(
+    node: Callable[..., None],
+    p: str,
+    mlp_in: str,
+    *,
+    activation: str,
+    bias: bool,
+) -> None:
+    """Emit the MLP sublayer + skip, ending at ``{p}_res_next``.
+
+    Under bias=False the bias Adds do not exist — the writer folded every
+    bias into the matrices (docs/no_bias_plan.md) — so each projection is
+    its bare MatMul.  Residual tensor names ({p}_res_attn / {p}_res_next)
+    are identical in both modes, keeping the debug session's taps
+    mode-blind.
+    """
+    if activation == "swish":
+        # Gated (SwiGLU) sublayer: down(swish(gate(x)) * up(x)) + x.  Swish is
+        # emitted as Mul(z, Sigmoid(z)) — the exact op pair whose fp32
+        # saturation profile the A0 probes pinned (tests/docs/
+        # test_ort_cpu_saturation.py; ORT fuses it where profitable).
+        if bias:
+            node("MatMul", [mlp_in, f"{p}_Wgate"], [f"{p}_gate_m"])
+            node("Add", [f"{p}_gate_m", f"{p}_bgate"], [f"{p}_gate"])
+        else:
+            node("MatMul", [mlp_in, f"{p}_Wgate"], [f"{p}_gate"])
+        node("Sigmoid", [f"{p}_gate"], [f"{p}_gate_sig"])
+        node("Mul", [f"{p}_gate", f"{p}_gate_sig"], [f"{p}_gate_sw"])
+        if bias:
+            node("MatMul", [mlp_in, f"{p}_Wup"], [f"{p}_up_m"])
+            node("Add", [f"{p}_up_m", f"{p}_bup"], [f"{p}_up"])
+        else:
+            node("MatMul", [mlp_in, f"{p}_Wup"], [f"{p}_up"])
+        node("Mul", [f"{p}_gate_sw", f"{p}_up"], [f"{p}_hidden"])
+        node("MatMul", [f"{p}_hidden", f"{p}_Wdown"], [f"{p}_down_m"])
+        if bias:
+            node("Add", [f"{p}_down_m", f"{p}_bdown"], [f"{p}_down_b"])
+            node("Add", [f"{p}_res_attn", f"{p}_down_b"], [f"{p}_res_next"])
+        else:
+            node("Add", [f"{p}_res_attn", f"{p}_down_m"], [f"{p}_res_next"])
+    else:
+        node("MatMul", [mlp_in, f"{p}_W1"], [f"{p}_l1_m"])
+        if bias:
+            node("Add", [f"{p}_l1_m", f"{p}_b1"], [f"{p}_l1_b"])
+            node("Relu", [f"{p}_l1_b"], [f"{p}_l1_r"])
+        else:
+            node("Relu", [f"{p}_l1_m"], [f"{p}_l1_r"])
+        node("MatMul", [f"{p}_l1_r", f"{p}_W2"], [f"{p}_l2_m"])
+        if bias:
+            node("Add", [f"{p}_l2_m", f"{p}_b2"], [f"{p}_l2_b"])
+            node("Add", [f"{p}_res_attn", f"{p}_l2_b"], [f"{p}_res_next"])
+        else:
+            node("Add", [f"{p}_res_attn", f"{p}_l2_m"], [f"{p}_res_next"])
+
+
 def _emit_cached_layer_nodes(
     nodes: list,
     layer_idx: int,
     current_res: str,
-    d: int,
     d_head: int,
-    n_heads: int,
     d_rot: int,
+    *,
     scatter_idx_col: str = "_cache_pos_col",
     rms_norm: bool = False,
     rms_eps_name: str | None = None,
@@ -993,7 +1146,6 @@ def _emit_cached_layer_nodes(
     (``n_new=1``) is static, which is what makes the step CUDA-graph
     capturable.
 
-    ``n_heads`` is the (possibly trimmed) head count for this layer.
     Per-layer reshape constants ``l{i}_qkv_view_shape`` and
     ``l{i}_ctx_flat_shape`` are expected to have been emitted by the
     streaming weight callback.
@@ -1028,52 +1180,7 @@ def _emit_cached_layer_nodes(
         )
 
     def rope_rotate(src: str, dst: str, cos: str, sin: str) -> None:
-        """rotate_half RoPE over the rotary front ``d_rot``.
-
-        Rotates the first ``d_rot`` dims (``front*cos +
-        rotate_half(front)*sin``) and passes the last ``d_head - d_rot``
-        dims (the NoPE tail) through unchanged.  Matches graph/rope.py
-        (vanilla partial rotary, half-split over d_rot);
-        modeling_torchwright_custom.py mirrors this op sequence.
-
-        ``d_rot == d_head`` (full rotary) emits the exact pre-partial 6-node
-        sequence — byte-for-byte the same graph, so the cancel-head denormal-ULP
-        note below still holds and existing exports are unchanged.
-
-        No ``src + (rot - src)`` reconstruction: cross-backend onnxruntime/torch
-        agreement is not algebraic — the cancel-head rows that cancel to denormal
-        magnitude differ by one denormal ULP regardless of the form (the
-        direct-HF parity bound tolerates it; no token or meaningful logit
-        moves), and the full suite is bit-exact with the direct form, so the
-        extra Sub/Add bought nothing.
-        """
-        if d_rot == d_head:
-            # Full rotary: rotate_half over the whole head.
-            node("Split", [src, "rope_split"], [f"{dst}_h1", f"{dst}_h2"], axis=-1)
-            node("Neg", [f"{dst}_h2"], [f"{dst}_h2n"])
-            node("Concat", [f"{dst}_h2n", f"{dst}_h1"], [f"{dst}_rh"], axis=-1)
-            node("Mul", [src, cos], [f"{dst}_c"])
-            node("Mul", [f"{dst}_rh", sin], [f"{dst}_s"])
-            node("Add", [f"{dst}_c", f"{dst}_s"], [dst])
-            return
-        # Partial rotary: split off the rotary front (d_rot) and the NoPE tail,
-        # rotate_half the front, then re-concat the untouched tail.  cos/sin are
-        # width d_rot and broadcast over the front.
-        node(
-            "Split",
-            [src, "rope_partial_split"],
-            [f"{dst}_front", f"{dst}_tail"],
-            axis=-1,
-        )
-        node(
-            "Split", [f"{dst}_front", "rope_split"], [f"{dst}_h1", f"{dst}_h2"], axis=-1
-        )
-        node("Neg", [f"{dst}_h2"], [f"{dst}_h2n"])
-        node("Concat", [f"{dst}_h2n", f"{dst}_h1"], [f"{dst}_rh"], axis=-1)
-        node("Mul", [f"{dst}_front", cos], [f"{dst}_c"])
-        node("Mul", [f"{dst}_rh", sin], [f"{dst}_s"])
-        node("Add", [f"{dst}_c", f"{dst}_s"], [f"{dst}_rotfront"])
-        node("Concat", [f"{dst}_rotfront", f"{dst}_tail"], [dst], axis=-1)
+        _emit_rope_rotate(node, src, dst, cos, sin, full_rotary=d_rot == d_head)
 
     # Project Q, K_new, V_new from the new rows in sequence-major
     # (n_new, n_heads, d_head).  The deltas (new rows only) are the graph
@@ -1169,48 +1276,8 @@ def _emit_cached_layer_nodes(
             f"{p}_mlp_norm",
         )
 
-    # MLP sublayer + skip.  Under bias=False the bias Adds do not exist —
-    # the writer folded every bias into the matrices (docs/no_bias_plan.md)
-    # — so each projection is its bare MatMul.  Residual tensor names
-    # ({p}_res_attn / {p}_res_next) are identical in both modes, keeping
-    # the debug session's taps mode-blind.
-    if activation == "swish":
-        # Gated (SwiGLU) sublayer: down(swish(gate(x)) * up(x)) + x.  Swish is
-        # emitted as Mul(z, Sigmoid(z)) — the exact op pair whose fp32
-        # saturation profile the A0 probes pinned (tests/docs/
-        # test_ort_cpu_saturation.py; ORT fuses it where profitable).
-        if bias:
-            node("MatMul", [mlp_in, f"{p}_Wgate"], [f"{p}_gate_m"])
-            node("Add", [f"{p}_gate_m", f"{p}_bgate"], [f"{p}_gate"])
-        else:
-            node("MatMul", [mlp_in, f"{p}_Wgate"], [f"{p}_gate"])
-        node("Sigmoid", [f"{p}_gate"], [f"{p}_gate_sig"])
-        node("Mul", [f"{p}_gate", f"{p}_gate_sig"], [f"{p}_gate_sw"])
-        if bias:
-            node("MatMul", [mlp_in, f"{p}_Wup"], [f"{p}_up_m"])
-            node("Add", [f"{p}_up_m", f"{p}_bup"], [f"{p}_up"])
-        else:
-            node("MatMul", [mlp_in, f"{p}_Wup"], [f"{p}_up"])
-        node("Mul", [f"{p}_gate_sw", f"{p}_up"], [f"{p}_hidden"])
-        node("MatMul", [f"{p}_hidden", f"{p}_Wdown"], [f"{p}_down_m"])
-        if bias:
-            node("Add", [f"{p}_down_m", f"{p}_bdown"], [f"{p}_down_b"])
-            node("Add", [f"{p}_res_attn", f"{p}_down_b"], [f"{p}_res_next"])
-        else:
-            node("Add", [f"{p}_res_attn", f"{p}_down_m"], [f"{p}_res_next"])
-    else:
-        node("MatMul", [mlp_in, f"{p}_W1"], [f"{p}_l1_m"])
-        if bias:
-            node("Add", [f"{p}_l1_m", f"{p}_b1"], [f"{p}_l1_b"])
-            node("Relu", [f"{p}_l1_b"], [f"{p}_l1_r"])
-        else:
-            node("Relu", [f"{p}_l1_m"], [f"{p}_l1_r"])
-        node("MatMul", [f"{p}_l1_r", f"{p}_W2"], [f"{p}_l2_m"])
-        if bias:
-            node("Add", [f"{p}_l2_m", f"{p}_b2"], [f"{p}_l2_b"])
-            node("Add", [f"{p}_res_attn", f"{p}_l2_b"], [f"{p}_res_next"])
-        else:
-            node("Add", [f"{p}_res_attn", f"{p}_l2_m"], [f"{p}_res_next"])
+    # MLP sublayer + skip (see _emit_mlp_sublayer_nodes).
+    _emit_mlp_sublayer_nodes(node, p, mlp_in, activation=activation, bias=bias)
 
     return f"{p}_res_next"
 
@@ -1296,10 +1363,334 @@ def _resolve_cache_stride(
     return s
 
 
+def _print_head_pruning(n_heads: int, per_layer_n_heads: list) -> None:
+    """Verbose summary of ONNX-side head pruning."""
+    _max_heads = n_heads
+    _total = _max_heads * len(per_layer_n_heads)
+    _kept = sum(per_layer_n_heads)
+    print(
+        f"  Head pruning (ONNX): {_total - _kept}/{_total} heads pruned; "
+        f"per-layer heads range [{min(per_layer_n_heads)}, "
+        f"{max(per_layer_n_heads)}] of {_max_heads}"
+    )
+
+
+def _emit_token_graph_nodes(
+    n_layers: int,
+    d_head: int,
+    rope_d_rot_val: int,
+    rms_spec: "RmsNormSpec | None",
+    activation: str,
+    *,
+    bias: bool,
+) -> list:
+    """Emit the token graph's node list.
+
+    Preamble (mask + pos), token embed, residual stream, layers, and the
+    full-width tied unembed.
+    """
+    nodes: list = []
+
+    def add(op: str, ins: list[str], outs: list[str], **attrs: Any) -> None:
+        nodes.append(helper.make_node(op, ins, outs, **attrs))
+
+    _emit_cached_preamble(nodes)
+    # the residual seed (no projection).  Position is a rotation applied inside
+    # attention (RoPE), so there is no additive position table — the seed is
+    # the token embedding alone, whose rows carry the pinned RMSNorm constant
+    # and the const-1 self-match column (both folded above, token.v6).
+    add("Gather", ["embed_table", "token_ids"], ["res_0"], axis=0)
+
+    current_res = "res_0"
+    for i in range(n_layers):
+        current_res = _emit_cached_layer_nodes(
+            nodes,
+            i,
+            current_res,
+            d_head,
+            rope_d_rot_val,
+            scatter_idx_col="_cache_pos_col",
+            rms_norm=rms_spec is not None,
+            rms_eps_name="_rms_eps" if rms_spec is not None else None,
+            activation=activation,
+            bias=bias,
+        )
+
+    # Final norm before the unembed (Llama-style), the bit-exact identity.  It
+    # reads ALL d columns for mean(x^2), so the identity needs the total non-pinned
+    # energy bounded — which forward_compile's _certify_rms_norm_energy guarantees
+    # from the graph's value ranges (cancel-freed columns are zero, reassigned ones
+    # are owned by a snapshot node; either way the per-column bound holds).  Every
+    # column must also stay finite: the pinned constant is finite by construction.
+    if rms_spec is not None:
+        _emit_rmsnorm(
+            add, current_res, "final_norm", "_rms_eps", "_final_normed", "_final_norm"
+        )
+        current_res = "_final_normed"
+
+    # Physical tying: the same full-width table feeds token Gather and final
+    # MatMul.  The compiler placed the logical output in its learned bank and
+    # cleared the const-one seed; final_norm zeroed only the pinned RMS seeds.
+    add("Transpose", ["embed_table"], ["_embed_table_T"], perm=[1, 0])
+    add("MatMul", [current_res, "_embed_table_T"], ["logits"])
+    return nodes
+
+
+def _make_token_model(
+    nodes: list,
+    per_layer_n_heads: list,
+    d_head: int,
+    vocab_size: int,
+    dense_inits: list,
+    sparse_inits: list,
+) -> onnx.ModelProto:
+    """Wrap the emitted nodes and initializers into the ONNX ModelProto."""
+    token_ids_vi = helper.make_tensor_value_info(
+        "token_ids", TensorProto.INT64, ["n_new"]
+    )
+    cache_position_vi = helper.make_tensor_value_info(
+        "cache_position", TensorProto.INT64, ["n_new"]
+    )
+    past_vis, new_vis = _kv_io_value_info(per_layer_n_heads, d_head)
+    logits_vi = helper.make_tensor_value_info(
+        "logits", TensorProto.FLOAT, ["n_new", vocab_size]
+    )
+
+    graph = helper.make_graph(
+        nodes,
+        "token_transformer_cached",
+        inputs=[token_ids_vi, cache_position_vi, *past_vis],
+        outputs=[logits_vi, *new_vis],
+        initializer=dense_inits,
+        sparse_initializer=sparse_inits,
+    )
+    return helper.make_model(
+        graph,
+        opset_imports=[helper.make_opsetid("", 14)],
+        producer_name="torchwright",
+    )
+
+
+def _apply_export_profile(
+    profile: CompileProfile | str | None,
+    *,
+    bias: bool,
+    rms_norm: bool | None,
+) -> tuple[str | None, bool, bool | None]:
+    """Resolve a named compile profile into (machine, bias, rms_norm)."""
+    machine = None
+    if profile is not None:
+        resolved_profile = CompileProfile(profile)
+        machine = resolved_profile.machine
+        bias = resolved_profile.bias
+        rms_norm = resolved_profile.rms_norm
+    return machine, bias, rms_norm
+
+
+def _resolve_norm_policy(d: int, *, rms_norm: bool | None) -> bool:
+    """Resolve the norm policy.
+
+    RMSNorm is on by default (None -> True): every shipped artifact should
+    carry the real norm.  Refuse an unsupported width with the norm on —
+    fail fast and loudly here (before the long streaming compile) rather
+    than silently dropping it.  ``rms_norm=False`` is the explicit opt-out.
+    """
+    rms_norm_on = True if rms_norm is None else bool(rms_norm)
+    if rms_norm_on and not rms_norm_width_supported(d):
+        raise ValueError(
+            f"rms_norm is on (the default) but d={d} is not a supported "
+            f"width. Supported: any multiple of 1024 up to 16384, or any "
+            f"power of two (docs/rms_norm_dmodel.md has the full table). "
+            f"Use a supported d, or pass rms_norm=False to export without "
+            f"the norm."
+        )
+    return rms_norm_on
+
+
+def _tied_embed_table(
+    compiled: "HeadlessTransformer",
+    embedding: Embedding,
+    output_node: Node,
+    d: int,
+) -> tuple[np.ndarray, TokenModelWeights, int]:
+    """Resolve + validate the tied token layout and build the full table.
+
+    Returns (embed_table, token_weights, vocab_size).
+    """
+    assert compiled.residual_assignment is not None
+    in_state = compiled.layers[0].attn.in_state
+    out_state = compiled.layers[-1].mlp.out_state
+
+    embedding_indices = compiled.residual_assignment.get_node_indices(
+        in_state, embedding
+    )
+    literal_seeds = _collect_token_seeds(compiled, embedding)
+
+    d_embed = len(embedding_indices)
+
+    embed_table_compact = (
+        embedding.table.detach().cpu().numpy().astype(np.float32, copy=False)
+    )
+    vocab_size, d_embed_check = embed_table_compact.shape
+    assert d_embed_check == d_embed, (
+        f"Embedding table last dim {d_embed_check} disagrees with "
+        f"d_embed {d_embed} derived from feature assignment"
+    )
+
+    output_indices = compiled.residual_assignment.get_node_indices(
+        out_state, output_node
+    )
+    assert output_indices == embedding_indices, (
+        "tied output bank order differs from the embedding bank: "
+        f"embedding={embedding_indices}, output={output_indices}"
+    )
+
+    # Fold the residual column placement into one full-width tied table
+    # (see _fold_embed_table for the ZERO-INIT CONTRACT).
+    embed_table = _fold_embed_table(
+        embed_table_compact, embedding_indices, compiled.rms_norm_spec, literal_seeds, d
+    )
+
+    # The backend-neutral builder is the contract for these semantic folds.
+    # Keep the local variables used by the mature graph emitter, but replace
+    # them with the shared builder's results and assert equivalence while this
+    # exporter assembly is incrementally moved behind the sink boundary.
+    # v6: there is no ``lm_head`` initializer — the tied readout transposes
+    # ``embed_table`` itself (the builder still materializes the compact
+    # untied projection for the stock-architecture HF target).
+    token_weights = build_token_weights(compiled, output_node, embedding, d)
+    assert np.array_equal(embed_table, token_weights.embed_table)
+    return token_weights.embed_table, token_weights, int(vocab_size)
+
+
+def _collect_token_seeds(
+    compiled: "HeadlessTransformer",
+    embedding: Embedding,
+) -> list[tuple[int, float]]:
+    """Input-state literal seeds as (column, value) pairs.
+
+    These are folded into embed_table rows (token.v6) — there is no
+    separate constant_values initializer or post-Gather seed Add anymore.
+    """
+    assert compiled.residual_assignment is not None
+    in_state = compiled.layers[0].attn.in_state
+    literal_seeds: list[tuple[int, float]] = []
+    for node in compiled.residual_assignment.get_nodes(in_state):
+        indices = compiled.residual_assignment.get_node_indices(in_state, node)
+        if isinstance(node, Embedding):
+            assert node is embedding, (
+                "the token compiler contract permits exactly one reachable "
+                "Embedding, and it must be the explicit source"
+            )
+        elif isinstance(node, LiteralValue):
+            # The rotary Δ=0 self-match const-1 column: an input-state
+            # LiteralValue explicitly placed there by forward_compile, seeded
+            # to 1.0.  The graph's own constants are NOT here — they are
+            # JIT-materialized into the per-layer MLP near their consumer.
+            for k, idx in enumerate(indices):
+                literal_seeds.append((idx, float(node.value[k])))
+        elif isinstance(node, (Concatenate, InputNode)):
+            # Concatenate is structural; a raw InputNode is populated at
+            # forward-time by get_input_res_stream, not folded into embed_table.
+            # Both are intentionally not seeded here.
+            pass
+        else:
+            # Only Embedding / LiteralValue / Concatenate / InputNode are
+            # expected in the token seed; anything else would be silently
+            # dropped by the vanilla-embedding seed below — fail loud instead.
+            raise TypeError(
+                f"unexpected input-state node {type(node).__name__} in the "
+                f"token seed; only Embedding / LiteralValue / Concatenate / "
+                f"InputNode are expected"
+            )
+    return literal_seeds
+
+
+def _fold_embed_table(
+    embed_table_compact: np.ndarray,
+    embedding_indices: list[int],
+    rms_spec: "RmsNormSpec | None",
+    literal_seeds: list[tuple[int, float]],
+    d: int,
+) -> np.ndarray:
+    """Fold the residual column placement into one full-width tied table.
+
+    Its learned coordinates occupy the ordered held bank; folded seed
+    columns initialize the transformer but are exact zero by final readout.
+    ZERO-INIT CONTRACT.  The table starts as all-zeros and only the
+    embedding, pinned-RMSNorm, and literal-seed columns below are written;
+    every column allocated to a graph node stays zero.  A per-token
+    ``Gather("embed_table", ...)`` therefore hands the transformer a residual
+    stream that is exactly zero in every non-allocated column — which is the
+    zero-init the scheduler assumes when it skips BIRTH-layer dirty cancels
+    for fresh allocations (compile.py; the ``assume_zero_init`` flag was
+    retired in favour of this being universal).  This zeros-scatter IS that
+    contract; ``test_token_onnx_embed_table_zeroes_unallocated_columns`` pins
+    it.  Do not seed non-allocated columns here.
+    """
+    vocab_size = embed_table_compact.shape[0]
+    embed_table = np.zeros((vocab_size, d), dtype=np.float32)
+    embed_table[:, embedding_indices] = embed_table_compact
+
+    # Pinned-constant RMSNorm seeds: write each reserved column's constant for
+    # EVERY vocab row, so the per-token gather reproduces the constants at
+    # every position.  The reserved columns are allocated to no node, so every
+    # weight row that reads them is zero — the constants contribute nothing to
+    # any transformer matmul, yet their energy dominates mean(x^2) so the
+    # forced RMS is an exact power of two.  These are the only genuine new
+    # seed constants.
+    if rms_spec is not None:
+        for j, v in zip(rms_spec.reserved_cols, rms_spec.const_values, strict=False):
+            embed_table[:, j] = v
+
+    # Input-state literal seeds (the const-1 self-match column): folded into
+    # every vocab row exactly like the RMSNorm constant above, so the
+    # per-token gather reproduces the constant at every position.  The
+    # literal's columns are disjoint from the embedding's and the RMSNorm's
+    # (residual allocation is pairwise disjoint, I1), so these cells are zero
+    # before the fold and the gathered row is bit-identical to the pre-v6
+    # ``Gather -> Add(constant_values)`` pair this replaces.
+    for idx, val in literal_seeds:
+        embed_table[:, idx] = val
+    return embed_table
+
+
+def _add_rms_gain_inits(
+    rms_spec: "RmsNormSpec",
+    token_weights: TokenModelWeights,
+    n_layers: int,
+    dense_inits: list,
+    sparse_inits: list,
+) -> None:
+    """Pinned-constant RMSNorm gain weights (Llama3-named on the HF side).
+
+    One per pre-attention norm, one per pre-MLP norm, and a final norm.
+    Each is a uniform (d,) vector = 2^m, which cancels the forced
+    rms = 2^m exactly.  A single shared eps scalar feeds every norm.
+    """
+    gain_vec = token_weights.norm_gain
+    assert gain_vec is not None
+    for i in range(n_layers):
+        _add_float_init(f"l{i}_input_layernorm", gain_vec, dense_inits, sparse_inits)
+        _add_float_init(
+            f"l{i}_post_attention_layernorm", gain_vec, dense_inits, sparse_inits
+        )
+    final_gain_vec = gain_vec.copy()
+    final_gain_vec[list(rms_spec.reserved_cols)] = 0.0
+    _add_float_init("final_norm", final_gain_vec, dense_inits, sparse_inits)
+    _add_float_init(
+        "_rms_eps",
+        np.array([rms_spec.eps], dtype=np.float32),
+        dense_inits,
+        sparse_inits,
+    )
+
+
 def compile_to_onnx(
     output_node: Node,
     embedding: Embedding,
     output_path: str,
+    *,
     d: int = 1024,
     d_head: int = 16,
     max_seq_len: int = 512,
@@ -1424,27 +1815,10 @@ def compile_to_onnx(
     # (potentially very long) streaming compile would waste the whole run.
     cache_stride_resolved = _resolve_cache_stride(cache_stride, max_seq_len)
 
-    machine = None
-    if profile is not None:
-        resolved_profile = CompileProfile(profile)
-        machine = resolved_profile.machine
-        bias = resolved_profile.bias
-        rms_norm = resolved_profile.rms_norm
-
-    # Resolve the norm policy.  RMSNorm is on by default (None -> True): every
-    # shipped artifact should carry the real norm.  Refuse an unsupported
-    # width with the norm on — fail fast and loudly here (before the long
-    # streaming compile) rather than silently dropping it.  ``rms_norm=False``
-    # is the explicit opt-out.
-    rms_norm_on = True if rms_norm is None else bool(rms_norm)
-    if rms_norm_on and not rms_norm_width_supported(d):
-        raise ValueError(
-            f"rms_norm is on (the default) but d={d} is not a supported "
-            f"width. Supported: any multiple of 1024 up to 16384, or any "
-            f"power of two (docs/rms_norm_dmodel.md has the full table). "
-            f"Use a supported d, or pass rms_norm=False to export without "
-            f"the norm."
-        )
+    machine, bias, rms_norm = _apply_export_profile(
+        profile, bias=bias, rms_norm=rms_norm
+    )
+    rms_norm_on = _resolve_norm_policy(d, rms_norm=rms_norm)
     n_heads = resolve_n_heads(d, d_head, n_heads)
 
     # Attached-check coverage for the debug sidecar.  Collection order
@@ -1509,151 +1883,22 @@ def compile_to_onnx(
     rms_spec = compiled.rms_norm_spec
     t_compile = time.perf_counter() - t0
     if verbose and per_layer_n_heads:
-        _max_heads = n_heads
-        _total = _max_heads * len(per_layer_n_heads)
-        _kept = sum(per_layer_n_heads)
-        print(
-            f"  Head pruning (ONNX): {_total - _kept}/{_total} heads pruned; "
-            f"per-layer heads range [{min(per_layer_n_heads)}, "
-            f"{max(per_layer_n_heads)}] of {_max_heads}"
-        )
+        _print_head_pruning(n_heads, per_layer_n_heads)
 
     # --- Phase 2: metadata + graph assembly -------------------------------
     assert compiled.residual_assignment is not None
     n_layers = len(compiled.layers)
 
     t0 = time.perf_counter()
-    in_state = compiled.layers[0].attn.in_state
-    out_state = compiled.layers[-1].mlp.out_state
-
-    embedding_indices = compiled.residual_assignment.get_node_indices(
-        in_state, embedding
+    embed_table, token_weights, vocab_size = _tied_embed_table(
+        compiled, embedding, output_node, d
     )
-    # Input-state literal seeds as (column, value) pairs, folded into
-    # embed_table rows below (token.v6) — there is no separate
-    # constant_values initializer or post-Gather seed Add anymore.
-    literal_seeds: list[tuple[int, float]] = []
-
-    for node in compiled.residual_assignment.get_nodes(in_state):
-        indices = compiled.residual_assignment.get_node_indices(in_state, node)
-        if isinstance(node, Embedding):
-            assert node is embedding, (
-                "the token compiler contract permits exactly one reachable "
-                "Embedding, and it must be the explicit source"
-            )
-        elif isinstance(node, LiteralValue):
-            # The rotary Δ=0 self-match const-1 column: an input-state
-            # LiteralValue explicitly placed there by forward_compile, seeded
-            # to 1.0.  The graph's own constants are NOT here — they are
-            # JIT-materialized into the per-layer MLP near their consumer.
-            for k, idx in enumerate(indices):
-                literal_seeds.append((idx, float(node.value[k])))
-        elif isinstance(node, (Concatenate, InputNode)):
-            # Concatenate is structural; a raw InputNode is populated at
-            # forward-time by get_input_res_stream, not folded into embed_table.
-            # Both are intentionally not seeded here.
-            pass
-        else:
-            # Only Embedding / LiteralValue / Concatenate / InputNode are
-            # expected in the token seed; anything else would be silently
-            # dropped by the vanilla-embedding seed below — fail loud instead.
-            raise TypeError(
-                f"unexpected input-state node {type(node).__name__} in the "
-                f"token seed; only Embedding / LiteralValue / Concatenate / "
-                f"InputNode are expected"
-            )
-
-    d_embed = len(embedding_indices)
-
-    embed_table_compact = (
-        embedding.table.detach().cpu().numpy().astype(np.float32, copy=False)
-    )
-    vocab_size, d_embed_check = embed_table_compact.shape
-    assert d_embed_check == d_embed, (
-        f"Embedding table last dim {d_embed_check} disagrees with "
-        f"d_embed {d_embed} derived from feature assignment"
-    )
-
-    output_indices = compiled.residual_assignment.get_node_indices(
-        out_state, output_node
-    )
-    assert output_indices == embedding_indices, (
-        "tied output bank order differs from the embedding bank: "
-        f"embedding={embedding_indices}, output={output_indices}"
-    )
-
-    # Fold the residual column placement into one full-width tied table.  Its
-    # learned coordinates occupy the ordered held bank; folded seed columns
-    # initialize the transformer but are exact zero by final readout.
-    # ZERO-INIT CONTRACT.  The table starts as all-zeros and only the
-    # embedding, pinned-RMSNorm, and literal-seed columns below are written;
-    # every column allocated to a graph node stays zero.  A per-token
-    # ``Gather("embed_table", ...)`` therefore hands the transformer a residual
-    # stream that is exactly zero in every non-allocated column — which is the
-    # zero-init the scheduler assumes when it skips BIRTH-layer dirty cancels
-    # for fresh allocations (compile.py; the ``assume_zero_init`` flag was
-    # retired in favour of this being universal).  This zeros-scatter IS that
-    # contract; ``test_token_onnx_embed_table_zeroes_unallocated_columns`` pins
-    # it.  Do not seed non-allocated columns here.
-    embed_table = np.zeros((vocab_size, d), dtype=np.float32)
-    embed_table[:, embedding_indices] = embed_table_compact
-
-    # Pinned-constant RMSNorm seeds: write each reserved column's constant for
-    # EVERY vocab row, so the per-token gather reproduces the constants at
-    # every position.  The reserved columns are allocated to no node, so every
-    # weight row that reads them is zero — the constants contribute nothing to
-    # any transformer matmul, yet their energy dominates mean(x^2) so the
-    # forced RMS is an exact power of two.  These are the only genuine new
-    # seed constants.
-    if rms_spec is not None:
-        for j, v in zip(rms_spec.reserved_cols, rms_spec.const_values, strict=False):
-            embed_table[:, j] = v
-
-    # Input-state literal seeds (the const-1 self-match column): folded into
-    # every vocab row exactly like the RMSNorm constant above, so the
-    # per-token gather reproduces the constant at every position.  The
-    # literal's columns are disjoint from the embedding's and the RMSNorm's
-    # (residual allocation is pairwise disjoint, I1), so these cells are zero
-    # before the fold and the gathered row is bit-identical to the pre-v6
-    # ``Gather -> Add(constant_values)`` pair this replaces.
-    for idx, val in literal_seeds:
-        embed_table[:, idx] = val
-
-    # The backend-neutral builder is the contract for these semantic folds.
-    # Keep the local variables used by the mature graph emitter, but replace
-    # them with the shared builder's results and assert equivalence while this
-    # exporter assembly is incrementally moved behind the sink boundary.
-    # v6: there is no ``lm_head`` initializer — the tied readout transposes
-    # ``embed_table`` itself (the builder still materializes the compact
-    # untied projection for the stock-architecture HF target).
-    token_weights = build_token_weights(compiled, output_node, embedding, d)
-    assert np.array_equal(embed_table, token_weights.embed_table)
-    embed_table = token_weights.embed_table
 
     # Initializers
     _add_float_init("embed_table", embed_table, dense_inits, sparse_inits)
-    # Pinned-constant RMSNorm gain weights (Llama3-named on the HF side): one
-    # per pre-attention norm, one per pre-MLP norm, and a final norm.  Each is a
-    # uniform (d,) vector = 2^m, which cancels the forced rms = 2^m exactly.  A
-    # single shared eps scalar feeds every norm.
     if rms_spec is not None:
-        gain_vec = token_weights.norm_gain
-        assert gain_vec is not None
-        for i in range(n_layers):
-            _add_float_init(
-                f"l{i}_input_layernorm", gain_vec, dense_inits, sparse_inits
-            )
-            _add_float_init(
-                f"l{i}_post_attention_layernorm", gain_vec, dense_inits, sparse_inits
-            )
-        final_gain_vec = gain_vec.copy()
-        final_gain_vec[list(rms_spec.reserved_cols)] = 0.0
-        _add_float_init("final_norm", final_gain_vec, dense_inits, sparse_inits)
-        _add_float_init(
-            "_rms_eps",
-            np.array([rms_spec.eps], dtype=np.float32),
-            dense_inits,
-            sparse_inits,
+        _add_rms_gain_inits(
+            rms_spec, token_weights, n_layers, dense_inits, sparse_inits
         )
     # Baked slot indices [0..S), S = the FULL stride: the preamble slices
     # this GPU-resident constant to the bound prefix length S_eff and the
@@ -1667,13 +1912,6 @@ def compile_to_onnx(
     # Per-layer reshape constants (l{i}_qkv_view_shape, l{i}_ctx_flat_shape)
     # are emitted by the streaming weight callback.
     _add_scalar_inits(dense_inits)
-
-    # Nodes: preamble (mask + pos), token embed, residual stream, layers,
-    # full-width tied unembed.
-    nodes: list = []
-
-    def add(op: str, ins: list[str], outs: list[str], **attrs: Any) -> None:
-        nodes.append(helper.make_node(op, ins, outs, **attrs))
 
     # RoPE: bake the global rope inits when any layer is rotary; the preamble
     # emits cos/sin from cache_position when active (no-op otherwise).
@@ -1703,72 +1941,11 @@ def compile_to_onnx(
         ),
         token_weights,
     )
-    _emit_cached_preamble(nodes)
-    # the residual seed (no projection).  Position is a rotation applied inside
-    # attention (RoPE), so there is no additive position table — the seed is
-    # the token embedding alone, whose rows carry the pinned RMSNorm constant
-    # and the const-1 self-match column (both folded above, token.v6).
-    add("Gather", ["embed_table", "token_ids"], ["res_0"], axis=0)
-
-    current_res = "res_0"
-    for i in range(n_layers):
-        current_res = _emit_cached_layer_nodes(
-            nodes,
-            i,
-            current_res,
-            d,
-            d_head,
-            per_layer_n_heads[i],
-            rope_d_rot_val,
-            scatter_idx_col="_cache_pos_col",
-            rms_norm=rms_spec is not None,
-            rms_eps_name="_rms_eps" if rms_spec is not None else None,
-            activation=compiled.activation,
-            bias=bias,
-        )
-
-    # Final norm before the unembed (Llama-style), the bit-exact identity.  It
-    # reads ALL d columns for mean(x^2), so the identity needs the total non-pinned
-    # energy bounded — which forward_compile's _certify_rms_norm_energy guarantees
-    # from the graph's value ranges (cancel-freed columns are zero, reassigned ones
-    # are owned by a snapshot node; either way the per-column bound holds).  Every
-    # column must also stay finite: the pinned constant is finite by construction.
-    if rms_spec is not None:
-        _emit_rmsnorm(
-            add, current_res, "final_norm", "_rms_eps", "_final_normed", "_final_norm"
-        )
-        current_res = "_final_normed"
-
-    # Physical tying: the same full-width table feeds token Gather and final
-    # MatMul.  The compiler placed the logical output in its learned bank and
-    # cleared the const-one seed; final_norm zeroed only the pinned RMS seeds.
-    add("Transpose", ["embed_table"], ["_embed_table_T"], perm=[1, 0])
-    add("MatMul", [current_res, "_embed_table_T"], ["logits"])
-
-    # Graph I/O value infos
-    token_ids_vi = helper.make_tensor_value_info(
-        "token_ids", TensorProto.INT64, ["n_new"]
+    nodes = _emit_token_graph_nodes(
+        n_layers, d_head, rope_d_rot_val, rms_spec, compiled.activation, bias=bias
     )
-    cache_position_vi = helper.make_tensor_value_info(
-        "cache_position", TensorProto.INT64, ["n_new"]
-    )
-    past_vis, new_vis = _kv_io_value_info(per_layer_n_heads, d_head)
-    logits_vi = helper.make_tensor_value_info(
-        "logits", TensorProto.FLOAT, ["n_new", vocab_size]
-    )
-
-    graph = helper.make_graph(
-        nodes,
-        "token_transformer_cached",
-        inputs=[token_ids_vi, cache_position_vi, *past_vis],
-        outputs=[logits_vi, *new_vis],
-        initializer=dense_inits,
-        sparse_initializer=sparse_inits,
-    )
-    model = helper.make_model(
-        graph,
-        opset_imports=[helper.make_opsetid("", 14)],
-        producer_name="torchwright",
+    model = _make_token_model(
+        nodes, per_layer_n_heads, d_head, vocab_size, dense_inits, sparse_inits
     )
     t_build = time.perf_counter() - t0
 
@@ -1958,6 +2135,31 @@ class CompiledHeadless:
         """
         return self._n_layers
 
+    @property
+    def net(self) -> HeadlessTransformer:
+        """The underlying compiled transformer (read-only).
+
+        For probing/diagnostic code that needs the raw module — layer
+        list, device, activation, manual forwards.  Treat it as
+        immutable; mutating the compiled weights invalidates the
+        module's debug metadata.
+        """
+        return self._net
+
+    @property
+    def input_specs(self) -> list[tuple]:
+        """``(name, start_col, width)`` triples in input-tensor column order.
+
+        A snapshot copy — the packing contract for building full-width
+        input rows by hand (see also :meth:`input_slice`).
+        """
+        return list(self._input_specs)
+
+    @property
+    def output_indices(self) -> torch.Tensor:
+        """Residual-stream columns the outputs are read from (read-only)."""
+        return self._output_indices
+
     def _build_res_stream(self, inputs: torch.Tensor, past_len: int) -> torch.Tensor:
         n_new = inputs.shape[0]
         input_values = {
@@ -1971,6 +2173,7 @@ class CompiledHeadless:
     def __call__(
         self,
         inputs: torch.Tensor,
+        *,
         debug: bool = False,
         debug_atol: float = 1e-7,
     ) -> torch.Tensor:
@@ -2016,6 +2219,7 @@ class CompiledHeadless:
         inputs: torch.Tensor,
         past: tuple,
         past_len: int | None = None,
+        *,
         debug: bool = False,
         debug_atol: float = 1e-7,
     ) -> tuple:

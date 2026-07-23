@@ -415,7 +415,7 @@ def test_static_flex_class_capacity_boundary(bias, policy):
     One column wider and only attention transport remains, whatever
     ``local_in_attention`` says.
     """
-    usable = usable_hidden_slots(64, bias)
+    usable = usable_hidden_slots(64, bias=bias)
     assert usable == (64 if bias else 63)
 
     widest = usable // 2  # 32 under bias, 31 without (2*32 = 64 > 63)
@@ -451,7 +451,7 @@ def test_static_flex_class_add_capacity_boundary(bias, policy):
     One column wider and only ATTN_ADD remains, whatever
     ``add_in_attention`` says.
     """
-    usable = usable_hidden_slots(64, bias)
+    usable = usable_hidden_slots(64, bias=bias)
     widest = usable // 2
     fits = _add_of_width(widest)
     too_wide = _add_of_width(widest + 1)
@@ -498,13 +498,13 @@ def test_first_hidden_slot_is_the_only_bias_arithmetic():
 
     That fact: bias=False reserves slot 0 for the constant lane.
     """
-    assert first_hidden_slot(True) == 0
-    assert first_hidden_slot(False) == 1
+    assert first_hidden_slot(bias=True) == 0
+    assert first_hidden_slot(bias=False) == 1
     for d_hidden in (2, 7, 64):
         for bias in (True, False):
-            assert usable_hidden_slots(d_hidden, bias) == d_hidden - first_hidden_slot(
-                bias
-            )
+            assert usable_hidden_slots(
+                d_hidden, bias=bias
+            ) == d_hidden - first_hidden_slot(bias=bias)
 
 
 @pytest.mark.parametrize("bias", [True, False])
@@ -515,7 +515,7 @@ def test_resolve_static_routes_unplaceable_bypass_to_attention(bias):
     default policy asks for the bypass, while its narrow consumer still
     takes the bypass.
     """
-    usable = usable_hidden_slots(64, bias)
+    usable = usable_hidden_slots(64, bias=bias)
     out, _wide = _wide_graph(usable // 2 + 1)
 
     lowered = lower(out)
@@ -541,7 +541,7 @@ def test_cpsat_routing_agrees_with_resolve_static(bias):
     )
     from torchwright.compiler.realization import CLASS_SUBLAYER
 
-    usable = usable_hidden_slots(64, bias)
+    usable = usable_hidden_slots(64, bias=bias)
     out, _ = _wide_graph(usable // 2 + 1)
 
     lowered = lower(out)
@@ -590,7 +590,7 @@ def test_wide_bypass_linear_compiles_and_matches_compute(bias):
     from torchwright.debug.probe import probe_compiled
 
     d_hidden = 64
-    usable = usable_hidden_slots(d_hidden, bias)
+    usable = usable_hidden_slots(d_hidden, bias=bias)
     out, _ = _wide_graph(usable // 2 + 1)  # one column past the bypass boundary
 
     compiled = compile_headless(out, d=64, d_head=8, d_hidden=d_hidden, bias=bias)
@@ -613,7 +613,7 @@ def test_wide_bypass_linear_solves_under_pinned_cpsat_routing(bias):
     from torchwright.compiler.forward.compile import forward_compile
 
     d_hidden = 64
-    out, wide = _wide_graph(usable_hidden_slots(d_hidden, bias) // 2 + 1)
+    out, wide = _wide_graph(usable_hidden_slots(d_hidden, bias=bias) // 2 + 1)
 
     net = forward_compile(
         d=64,

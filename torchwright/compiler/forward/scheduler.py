@@ -174,6 +174,7 @@ class LayerScheduler:
         d: int,
         d_head: int,
         pos_encoding: Node | None = None,
+        *,
         d_hidden: int | None = None,
         clusters: SiblingClusters | None = None,
         admission_budget_fraction: float = 0.4,
@@ -194,7 +195,7 @@ class LayerScheduler:
         # usable_hidden_slots(d_hidden, bias)) or a solver-feasible layer is
         # unpackable on replay.
         self.bias = bias
-        self.usable_hidden_slots = usable_hidden_slots(self.d_hidden, bias)
+        self.usable_hidden_slots = usable_hidden_slots(self.d_hidden, bias=bias)
         self.n_heads = resolve_n_heads(d, d_head, n_heads, require_divisible=False)
         self.pos_encoding = pos_encoding
         self.policy = policy if policy is not None else SchedulingPolicy()
@@ -437,25 +438,10 @@ class LayerScheduler:
             return f"alternative {attn_cls} needs {demand}, over n_heads={self.n_heads}"
         return f"alternative {attn_cls} fits: {demand} within n_heads={self.n_heads}"
 
-    def _schedule_layer_inner(
-        self, residual_map: ResidualStreamMap, computed_nodes: set[Node]
-    ) -> tuple[list[_AttentionOp], list[_MlpOp], list[Node], bool]:
-        # Skip reasons for THIS pass only.  ``schedule_layer`` may call this
-        # twice (the admission-bypass retry), and it is the retry's skips that
-        # explain a deadlock — the first pass's were provisional.
-        self._skips = []
-        # Nodes already computed before this layer.  A node born THIS layer must
-        # not be MLP-cancelled this layer even if a same-layer MLP consumer
-        # makes it dead: the model requires every cancel at birth+1 or later
-        # (`cancel_layer >= layer + 1`), so freeing at birth would emit a hint
-        # the model cannot represent and a degenerate zero-length residual
-        # liveness window.  The directed replay is already protected by its
-        # `cancel_layer <= current` gate (the model never assigns cancel ==
-        # birth); this guards the eager heuristic's own choice.
-        computed_before_layer = set(computed_nodes)
-        # --- 1. Classify ready nodes ---
-        all_ready = self._get_ready_nodes(computed_nodes)
-
+    def _classify_ready_nodes(
+        self, all_ready: set[Node], computed_nodes: set[Node]
+    ) -> tuple[set[Node], list[Add], list[Add], list[Add]]:
+        """Split ready nodes into (ready, free_adds, deferred_adds, mlp_adds)."""
         ready: set[Node] = set()
         free_adds: list[Add] = []
         deferred_adds: list[Add] = []
@@ -487,6 +473,29 @@ class LayerScheduler:
             elif isinstance(node, (Attn, Linear, LiteralValue, FFN)):
                 ready.add(node)
             # else: skip unschedulable source nodes (InputNode, Embedding, etc.)
+        return ready, free_adds, deferred_adds, mlp_adds
+
+    def _schedule_layer_inner(
+        self, residual_map: ResidualStreamMap, computed_nodes: set[Node]
+    ) -> tuple[list[_AttentionOp], list[_MlpOp], list[Node], bool]:
+        # Skip reasons for THIS pass only.  ``schedule_layer`` may call this
+        # twice (the admission-bypass retry), and it is the retry's skips that
+        # explain a deadlock — the first pass's were provisional.
+        self._skips = []
+        # Nodes already computed before this layer.  A node born THIS layer must
+        # not be MLP-cancelled this layer even if a same-layer MLP consumer
+        # makes it dead: the model requires every cancel at birth+1 or later
+        # (`cancel_layer >= layer + 1`), so freeing at birth would emit a hint
+        # the model cannot represent and a degenerate zero-length residual
+        # liveness window.  The directed replay is already protected by its
+        # `cancel_layer <= current` gate (the model never assigns cancel ==
+        # birth); this guards the eager heuristic's own choice.
+        computed_before_layer = set(computed_nodes)
+        # --- 1. Classify ready nodes ---
+        all_ready = self._get_ready_nodes(computed_nodes)
+        ready, free_adds, deferred_adds, mlp_adds = self._classify_ready_nodes(
+            all_ready, computed_nodes
+        )
 
         # Layer-start deadness snapshot for the legacy attention-cancel paths
         # (placement-time promotion and the end-of-sublayer leftover loop).
@@ -1140,7 +1149,7 @@ class LayerScheduler:
         mlp_ops: list[_MlpOp] = []
         # Slot 0 is the constant lane under bias=False — see LayerScheduler
         # __init__ and weight_writer.BiasFold.
-        next_slot = first_hidden_slot(self.bias)
+        next_slot = first_hidden_slot(bias=self.bias)
 
         # MLP phase-start snapshot: the deadness reference for MLP-routed
         # Adds.  Everything from earlier layers plus this layer's attention
@@ -2216,6 +2225,7 @@ class DirectedLayerScheduler(LayerScheduler):
         d: int,
         d_head: int,
         pos_encoding: Node | None,
+        *,
         assignment: ScheduleAssignment,
         d_hidden: int | None = None,
         clusters: SiblingClusters | None = None,

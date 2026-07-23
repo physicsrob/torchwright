@@ -198,7 +198,9 @@ class Node:
     _affine_bound: "AffineBound"
     # Semantic affine override installed by an op via
     # ``affine_rules._apply_semantic_override`` (None for most nodes).
-    _semantic_affine_override: Optional["AffineBound"]
+    # Public: read and written by the optimizer folds and the graph
+    # cloner, not just the installing op.
+    semantic_affine_override: Optional["AffineBound"]
     # Weight-support cache attached lazily by
     # ``compiler.realization.live_weight_row_ranges`` (and injected directly
     # onto CP-SAT snapshot stand-in nodes); absent until first query.
@@ -207,7 +209,7 @@ class Node:
     def __init_subclass__(cls, **kwargs: object) -> None:
         super().__init_subclass__(**kwargs)
         original = cls.__dict__.get("compute")
-        if original is None or getattr(original, "_tw_verified", False):
+        if original is None or getattr(original, "tw_verified", False):
             return
 
         def wrapped(
@@ -234,7 +236,7 @@ class Node:
         wrapped.__name__ = original.__name__
         wrapped.__qualname__ = original.__qualname__
         wrapped.__doc__ = original.__doc__
-        cast("Any", wrapped)._tw_verified = True
+        cast("Any", wrapped).tw_verified = True
         type.__setattr__(cls, "compute", wrapped)
 
     def __init__(self, d_output: int, inputs: list["Node"], name: str = "") -> None:
@@ -256,7 +258,7 @@ class Node:
         # Stored persistently so ``refresh_node_caches`` can re-apply it
         # after recomputing the propagated bound — a recompute that dropped
         # it would silently loosen every downstream bound.
-        self._semantic_affine_override = None
+        self.semantic_affine_override = None
         # Check/claim metadata (see class docstring).  Empty at birth;
         # the asserts.py helpers attach after construction.
         self.checks = []

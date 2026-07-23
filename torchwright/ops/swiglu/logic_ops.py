@@ -241,6 +241,6 @@ def cond_gate(cond: Node, inp: Node) -> Node:
 
     _apply_semantic_override(
         result,
-        _cond_gate_semantic_bound(inp._affine_bound, inp, rel_tol=_GATE_C_TOL),
+        _cond_gate_semantic_bound(inp.affine_bound, inp, rel_tol=_GATE_C_TOL),
     )
     return result

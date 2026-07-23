@@ -32,6 +32,10 @@ if TYPE_CHECKING:
     from torchwright.compiler.components.linear import LinearLayerComponent
     from torchwright.compiler.forward.replay_plan import ReplayPlan
     from torchwright.compiler.groups.transformer_layer import TransformerLayer
+    from torchwright.compiler.residual_assignment import (
+        ResidualAssignment,
+        ResidualStreamState,
+    )
     from torchwright.compiler.transformer import HeadlessTransformer
 
 JSONScalar: TypeAlias = None | bool | int | float | str
@@ -269,15 +273,12 @@ def schedule_provenance(
     )
 
 
-def build_token_weights(
-    compiled: HeadlessTransformer, output_node: Node, embedding: Embedding, d: int
-) -> TokenModelWeights:
-    """Fold token placement, literals and RMS constants into full-width weights."""
-    assignment = compiled.residual_assignment
-    if assignment is None or not compiled.layers:
-        raise ValueError("compiled model has no residual assignment or layers")
-    in_state = compiled.layers[0].attn.in_state
-    out_state = compiled.layers[-1].mlp.out_state
+def _input_state_placement(
+    assignment: ResidualAssignment,
+    in_state: ResidualStreamState,
+    embedding: Embedding,
+) -> tuple[list[int], list[tuple[int, float]]]:
+    """The embedding's residual columns and literal seed values at the input state."""
     embedding_indices = None
     literal_seeds: list[tuple[int, float]] = []
     for node in assignment.get_nodes(in_state):
@@ -296,6 +297,21 @@ def build_token_weights(
             raise TypeError(f"unexpected input-state node {type(node).__name__}")
     if embedding_indices is None:
         raise ValueError("supplied embedding is absent from the residual assignment")
+    return embedding_indices, literal_seeds
+
+
+def build_token_weights(
+    compiled: HeadlessTransformer, output_node: Node, embedding: Embedding, d: int
+) -> TokenModelWeights:
+    """Fold token placement, literals and RMS constants into full-width weights."""
+    assignment = compiled.residual_assignment
+    if assignment is None or not compiled.layers:
+        raise ValueError("compiled model has no residual assignment or layers")
+    in_state = compiled.layers[0].attn.in_state
+    out_state = compiled.layers[-1].mlp.out_state
+    embedding_indices, literal_seeds = _input_state_placement(
+        assignment, in_state, embedding
+    )
     compact = embedding.table.detach().cpu().numpy().astype(np.float32, copy=False)
     vocab_size = compact.shape[0]
     if compact.shape[1] != len(embedding_indices):

@@ -62,7 +62,7 @@ _EXPORT_D = 1024
 _EXPRS = ["12*34\n", "999+1\n", "0-7\n", "999*999\n", "321*3\n"]
 
 
-def _compile(rms_norm: bool) -> str:
+def _compile(*, rms_norm: bool) -> str:
     from examples import calculator_simple
 
     out_node, emb = calculator_simple.create_network_parts()
@@ -134,7 +134,7 @@ def _compile_hf(rms_norm):
 
 
 def test_direct_model_model_has_llama3_norm_params(path_on):
-    model = _compile_hf(True)
+    model = _compile_hf(rms_norm=True)
     sd = model.state_dict()
     assert "model.norm.weight" in sd, "missing final norm"
     assert "model.layers.0.input_layernorm.weight" in sd
@@ -153,7 +153,7 @@ def test_direct_model_model_has_llama3_norm_params(path_on):
 
 def test_norm_off_model_has_no_norm_params(path_off):
     with pytest.raises(ValueError, match="requires rms_norm=True"):
-        _compile_hf(False)
+        _compile_hf(rms_norm=False)
 
 
 # ===========================================================================
@@ -168,7 +168,7 @@ _TINY_VOCAB = [*list("0123456789+"), "\n", _BOS, _EOS, "default"]
 _TINY_TOKENS = [_BOS, "1", "+", "2", "\n"]
 
 
-def _compile_tiny_5120(rms_norm: bool) -> str:
+def _compile_tiny_5120(*, rms_norm: bool) -> str:
     import torch
 
     from torchwright.graph import Linear

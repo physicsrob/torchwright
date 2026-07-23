@@ -32,7 +32,7 @@ class MLPSubLayer:
         self.linear2 = LinearLayerComponent(d_hidden, d, name="linear2")
 
     def forward(
-        self, inp: torch.Tensor, return_states: bool = False
+        self, inp: torch.Tensor, *, return_states: bool = False
     ) -> torch.Tensor | tuple[torch.Tensor, _StatesDict]:
         states: _StatesDict = {}
 
@@ -113,7 +113,7 @@ class GatedMLPSubLayer:
         self.down_proj = LinearLayerComponent(d_hidden, d, name="down_proj")
 
     def forward(
-        self, inp: torch.Tensor, return_states: bool = False
+        self, inp: torch.Tensor, *, return_states: bool = False
     ) -> torch.Tensor | tuple[torch.Tensor, _StatesDict]:
         states: _StatesDict = {}
 

@@ -302,7 +302,12 @@ def sweep(graphs: list[str], budget: float, n_points: int) -> dict[str, list[dic
             }
             rows.append(row)
 
-            def _drop(family: str) -> str:
+            def _drop(
+                family: str,
+                *,
+                fam: dict[str, dict] = fam,
+                sound_n: int | None = sound_n,
+            ) -> str:
                 fn = fam[family]["n"]
                 if fn is None or sound_n is None:
                     return "  -"

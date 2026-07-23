@@ -41,6 +41,8 @@ if TYPE_CHECKING:
     import torch
     from transformers import PreTrainedModel, PreTrainedTokenizerFast
 
+    from torchwright.compiler.forward.compile import RmsNormSpec
+
 HFArchitecture = CompileProfile | str
 
 # Default special-token spellings (not secrets — named to dodge bandit's
@@ -139,24 +141,9 @@ def _write_generation_config(
     ).save_pretrained(output_dir)
 
 
-def _validate_staged_bundle(
-    directory: str | os.PathLike, *, expect_tokenizer: bool
-) -> None:
-    """Validate bundle structure and tensor manifests without loading weights."""
+def _validate_staged_weights(directory: Path) -> None:
+    """Check the safetensors manifest (sharded or single-file) matches disk."""
     from safetensors import safe_open
-    from transformers import AutoConfig, AutoTokenizer
-
-    directory = Path(directory)
-    config_path = directory / "config.json"
-    if not config_path.is_file():
-        raise RuntimeError("staged HF bundle has no config.json")
-    config_data = json.loads(config_path.read_text(encoding="utf-8"))
-    if config_data.get("model_type") == "torchwright_custom":
-        from .configuration_torchwright_custom import TorchwrightCustomConfig
-
-        TorchwrightCustomConfig.from_pretrained(directory)
-    else:
-        AutoConfig.from_pretrained(directory)
 
     index_path = directory / "model.safetensors.index.json"
     if index_path.is_file():
@@ -185,6 +172,27 @@ def _validate_staged_bundle(
             if not list(handle.keys()):
                 raise RuntimeError("staged model.safetensors has no tensors")
 
+
+def _validate_staged_bundle(
+    directory: str | os.PathLike, *, expect_tokenizer: bool
+) -> None:
+    """Validate bundle structure and tensor manifests without loading weights."""
+    from transformers import AutoConfig, AutoTokenizer
+
+    directory = Path(directory)
+    config_path = directory / "config.json"
+    if not config_path.is_file():
+        raise RuntimeError("staged HF bundle has no config.json")
+    config_data = json.loads(config_path.read_text(encoding="utf-8"))
+    if config_data.get("model_type") == "torchwright_custom":
+        from .configuration_torchwright_custom import TorchwrightCustomConfig
+
+        TorchwrightCustomConfig.from_pretrained(directory)
+    else:
+        AutoConfig.from_pretrained(directory)
+
+    _validate_staged_weights(directory)
+
     if expect_tokenizer:
         if config_data.get("model_type") == "torchwright_custom":
             from .tokenization_torchwright_custom import TorchwrightCustomTokenizer
@@ -203,7 +211,7 @@ def _token_id(vocab: tuple[str, ...], token: str | None, kind: str) -> int | Non
 
 
 def _resolve_architecture(
-    architecture: HFArchitecture, bias: bool | None, rms_norm: bool | None
+    architecture: HFArchitecture, *, bias: bool | None, rms_norm: bool | None
 ) -> CompileProfile:
     try:
         profile = CompileProfile(architecture)
@@ -224,6 +232,7 @@ def _resolve_architecture(
 
 def _target(
     activation: str,
+    *,
     bias: bool,
     rms_norm: bool,
     architecture: HFArchitecture | None = None,
@@ -408,6 +417,163 @@ def compile_hf_bundle(
     return replace(report, output_dir=output_dir)
 
 
+class _DirectShardSink:
+    """Streams each compiled layer directly into its final HF shard."""
+
+    def __init__(
+        self, profile: CompileProfile, d_head: int, output_dir: str | os.PathLike
+    ) -> None:
+        self._profile = profile
+        self._d_head = d_head
+        self._output_dir = output_dir
+        self.meta: list[tuple[str, int, int, float | None, int | None]] = []
+        self.weight_map: dict[str, str] = {}
+        self.total_size = 0
+
+    def begin(self, header: CompileHeader) -> None:
+        self.header = header
+        if not header.layer_shapes:
+            raise RuntimeError("HF streaming requires announced layer shapes")
+        self.shard_count = len(header.layer_shapes) + 1
+        self.max_heads = max(shape.n_heads for shape in header.layer_shapes)
+        self.max_hidden = max(shape.d_hidden for shape in header.layer_shapes)
+
+    def write_layer(self, index: int, layer: CompiledLayerWeights) -> None:
+        import torch
+        from safetensors.torch import save_file
+
+        d_head = self._d_head
+        a = layer.attention
+        p = f"model.layers.{index}"
+        if self._profile is CompileProfile.CUSTOM:
+            assert isinstance(layer, ReluLayerWeights)
+            sd = {
+                f"{p}.self_attn.q_proj.weight": _torch(a.wq).T.contiguous(),
+                f"{p}.self_attn.k_proj.weight": _torch(a.wk).T.contiguous(),
+                f"{p}.self_attn.v_proj.weight": _torch(a.wv).T.contiguous(),
+                f"{p}.self_attn.o_proj.weight": _torch(a.wo).T.contiguous(),
+                f"{p}.mlp.fc1.weight": _torch(layer.w1).T.contiguous(),
+                f"{p}.mlp.fc1.bias": _torch(cast("np.ndarray", layer.b1)),
+                f"{p}.mlp.fc2.weight": _torch(layer.w2).T.contiguous(),
+                f"{p}.mlp.fc2.bias": _torch(cast("np.ndarray", layer.b2)),
+            }
+            kind = "relu"
+        else:
+            assert isinstance(layer, SwishLayerWeights)
+            rows, inter = self.max_heads * d_head, self.max_hidden
+            q = (_torch(a.wq).T.double() * math.sqrt(float(d_head))).float()
+
+            def tpad(value: torch.Tensor, target_size: int, axis: int) -> torch.Tensor:
+                shape = list(value.shape)
+                shape[axis] = target_size
+                out = torch.zeros(shape, dtype=torch.float32)
+                sl = [slice(None)] * value.ndim
+                sl[axis] = slice(0, value.shape[axis])
+                out[tuple(sl)] = value
+                return out
+
+            wk, wv, wo = _torch(a.wk), _torch(a.wv), _torch(a.wo)
+            wg, wu, wd = _torch(layer.wgate), _torch(layer.wup), _torch(layer.wdown)
+            sd = {
+                f"{p}.self_attn.qkv_proj.weight": torch.cat(
+                    [tpad(q, rows, 0), tpad(wk.T, rows, 0), tpad(wv.T, rows, 0)]
+                ),
+                f"{p}.self_attn.o_proj.weight": tpad(wo.T, rows, 1),
+                f"{p}.mlp.gate_up_proj.weight": torch.cat(
+                    [tpad(wg.T, inter, 0), tpad(wu.T, inter, 0)]
+                ),
+                f"{p}.mlp.down_proj.weight": tpad(wd.T, inter, 1),
+            }
+            kind = "swish"
+        filename = f"model-{index + 1:05d}-of-{self.shard_count:05d}.safetensors"
+        save_file(sd, str(Path(self._output_dir) / filename))
+        for name, value in sd.items():
+            self.weight_map[name] = filename
+            self.total_size += value.numel() * value.element_size()
+        self.meta.append((kind, a.n_heads, layer.d_hidden, a.rope_base, a.d_rot))
+
+    def finalize(self, spec: TokenModelSpec, weights: TokenModelWeights) -> None:
+        self.spec = spec
+        self.token_weights = weights
+
+
+def _rope_proxy_layers(
+    meta: list[tuple[str, int, int, float | None, int | None]],
+) -> list[Any]:
+    """Attribute proxies for ``resolve_rope`` (only RoPE metadata is read)."""
+    proxy_layers: list[Any] = []
+    for _kind, _nh, _dh, base, drot in meta:
+        # Only RoPE metadata is inspected by resolve_rope.
+        class A:
+            rope_base: Any
+            d_rot: Any
+
+        class L:
+            attention: Any
+
+        a, layer = A(), L()
+        a.rope_base, a.d_rot = base, drot
+        layer.attention = a
+        proxy_layers.append(layer)
+    return proxy_layers
+
+
+def _copy_custom_code(output_dir: str | os.PathLike) -> None:
+    """Ship the custom config/model/tokenizer modules alongside the bundle."""
+    here = Path(__file__).parent
+    for name in (
+        "configuration_torchwright_custom.py",
+        "modeling_torchwright_custom.py",
+        "tokenization_torchwright_custom.py",
+    ):
+        shutil.copy2(here / name, Path(output_dir) / name)
+
+
+def _write_final_shard(
+    output_dir: str | os.PathLike,
+    spec: TokenModelSpec,
+    token: TokenModelWeights,
+    rms_norm_spec: RmsNormSpec | None,
+    sink: _DirectShardSink,
+) -> None:
+    """Write the token-table/norm shard and the safetensors index.
+
+    token.v6 tied readout: lm_head aliases embed_tokens for both
+    targets (the custom model via _tied_weights_keys, stock Phi-3 via
+    tie_word_embeddings=True), so the state dict carries no separate
+    unembed.  The folded RMS constants in embed_table are cleared
+    before readout by the zeroed final-gain coordinates below, and
+    the literal seed by the compiled clear_literal_seed op.
+    """
+    from safetensors.torch import save_file
+
+    shard_count = spec.n_layers + 1
+    weight_map, total_size = sink.weight_map, sink.total_size
+    gain = token.norm_gain
+    final_sd = {
+        "model.embed_tokens.weight": _torch(token.embed_table),
+    }
+    if gain is not None:
+        # Final norm: exact zero on the pinned-constant coordinates so
+        # the tied readout never sees the folded RMS constants — the
+        # same fold the ONNX exporter's final_norm carries.
+        final_gain = gain.copy()
+        final_gain[list(cast("Any", rms_norm_spec).reserved_cols)] = 0.0
+        final_sd["model.norm.weight"] = _torch(final_gain)
+        for i in range(spec.n_layers):
+            p = f"model.layers.{i}"
+            final_sd[f"{p}.input_layernorm.weight"] = _torch(gain)
+            final_sd[f"{p}.post_attention_layernorm.weight"] = _torch(gain)
+    filename = f"model-{shard_count:05d}-of-{shard_count:05d}.safetensors"
+    save_file(final_sd, str(Path(output_dir) / filename))
+    for name, value in final_sd.items():
+        weight_map[name] = filename
+        total_size += value.numel() * value.element_size()
+    index_path = Path(output_dir) / "model.safetensors.index.json"
+    with index_path.open("w") as f:
+        json.dump({"metadata": {"total_size": total_size}, "weight_map": weight_map}, f)
+
+
 def _compile_hf_bundle_into(
     output_node: Node,
     embedding: Embedding,
@@ -448,87 +614,16 @@ def _compile_hf_bundle_into(
     falling back between architectures.
     """
     import torch
-    from safetensors.torch import save_file
 
-    profile = _resolve_architecture(architecture, bias, rms_norm)
+    profile = _resolve_architecture(architecture, bias=bias, rms_norm=rms_norm)
     machine, bias = profile.machine, profile.bias
     rms_on = profile.rms_norm if rms_norm is None else bool(rms_norm)
     if rms_on and not rms_norm_width_supported(d):
         raise ValueError(f"rms_norm is on but d={d} is unsupported")
     n_heads = resolve_n_heads(d, d_head, n_heads)
 
-    class DirectShardSink:
-        def __init__(self) -> None:
-            self.meta: list[tuple[str, int, int, float | None, int | None]] = []
-            self.weight_map: dict[str, str] = {}
-            self.total_size = 0
-
-        def begin(self, header: CompileHeader) -> None:
-            self.header = header
-            if not header.layer_shapes:
-                raise RuntimeError("HF streaming requires announced layer shapes")
-            self.shard_count = len(header.layer_shapes) + 1
-            self.max_heads = max(shape.n_heads for shape in header.layer_shapes)
-            self.max_hidden = max(shape.d_hidden for shape in header.layer_shapes)
-
-        def write_layer(self, index: int, layer: CompiledLayerWeights) -> None:
-            a = layer.attention
-            p = f"model.layers.{index}"
-            if profile is CompileProfile.CUSTOM:
-                assert isinstance(layer, ReluLayerWeights)
-                sd = {
-                    f"{p}.self_attn.q_proj.weight": _torch(a.wq).T.contiguous(),
-                    f"{p}.self_attn.k_proj.weight": _torch(a.wk).T.contiguous(),
-                    f"{p}.self_attn.v_proj.weight": _torch(a.wv).T.contiguous(),
-                    f"{p}.self_attn.o_proj.weight": _torch(a.wo).T.contiguous(),
-                    f"{p}.mlp.fc1.weight": _torch(layer.w1).T.contiguous(),
-                    f"{p}.mlp.fc1.bias": _torch(cast("np.ndarray", layer.b1)),
-                    f"{p}.mlp.fc2.weight": _torch(layer.w2).T.contiguous(),
-                    f"{p}.mlp.fc2.bias": _torch(cast("np.ndarray", layer.b2)),
-                }
-                kind = "relu"
-            else:
-                assert isinstance(layer, SwishLayerWeights)
-                rows, inter = self.max_heads * d_head, self.max_hidden
-                q = (_torch(a.wq).T.double() * math.sqrt(float(d_head))).float()
-
-                def tpad(
-                    value: torch.Tensor, target_size: int, axis: int
-                ) -> torch.Tensor:
-                    shape = list(value.shape)
-                    shape[axis] = target_size
-                    out = torch.zeros(shape, dtype=torch.float32)
-                    sl = [slice(None)] * value.ndim
-                    sl[axis] = slice(0, value.shape[axis])
-                    out[tuple(sl)] = value
-                    return out
-
-                wk, wv, wo = _torch(a.wk), _torch(a.wv), _torch(a.wo)
-                wg, wu, wd = _torch(layer.wgate), _torch(layer.wup), _torch(layer.wdown)
-                sd = {
-                    f"{p}.self_attn.qkv_proj.weight": torch.cat(
-                        [tpad(q, rows, 0), tpad(wk.T, rows, 0), tpad(wv.T, rows, 0)]
-                    ),
-                    f"{p}.self_attn.o_proj.weight": tpad(wo.T, rows, 1),
-                    f"{p}.mlp.gate_up_proj.weight": torch.cat(
-                        [tpad(wg.T, inter, 0), tpad(wu.T, inter, 0)]
-                    ),
-                    f"{p}.mlp.down_proj.weight": tpad(wd.T, inter, 1),
-                }
-                kind = "swish"
-            filename = f"model-{index + 1:05d}-of-{self.shard_count:05d}.safetensors"
-            save_file(sd, str(Path(output_dir) / filename))
-            for name, value in sd.items():
-                self.weight_map[name] = filename
-                self.total_size += value.numel() * value.element_size()
-            self.meta.append((kind, a.n_heads, layer.d_hidden, a.rope_base, a.d_rot))
-
-        def finalize(self, spec: TokenModelSpec, weights: TokenModelWeights) -> None:
-            self.spec = spec
-            self.token_weights = weights
-
     Path(output_dir).mkdir(parents=True, exist_ok=True)
-    sink = DirectShardSink()
+    sink = _DirectShardSink(profile, d_head, output_dir)
     with torch.no_grad():
         compiled = forward_compile(
             d=d,
@@ -565,21 +660,7 @@ def _compile_hf_bundle_into(
         token = build_token_weights(compiled, output_node, embedding, d)
         heads = [m[1] for m in sink.meta]
         hidden = [m[2] for m in sink.meta]
-        proxy_layers: list[Any] = []
-        for _kind, _nh, _dh, base, drot in sink.meta:
-            # Only RoPE metadata is inspected by resolve_rope.
-            class A:
-                rope_base: Any
-                d_rot: Any
-
-            class L:
-                attention: Any
-
-            a, layer = A(), L()
-            a.rope_base, a.d_rot = base, drot
-            layer.attention = a
-            proxy_layers.append(layer)
-        rope_base, d_rot = resolve_rope(proxy_layers, d_head)
+        rope_base, d_rot = resolve_rope(_rope_proxy_layers(sink.meta), d_head)
         vocab = tuple(embedding.tokenizer.vocab)
         spec = TokenModelSpec(
             d,
@@ -602,7 +683,10 @@ def _compile_hf_bundle_into(
         )
         sink.finalize(spec, token)
         target = _target(
-            spec.activation, spec.bias, spec.rms_norm, architecture=profile
+            spec.activation,
+            bias=spec.bias,
+            rms_norm=spec.rms_norm,
+            architecture=profile,
         )
         bos_id = _token_id(vocab, bos_token, "bos")
         eos_id = _token_id(vocab, eos_token, "eos")
@@ -673,48 +757,10 @@ def _compile_hf_bundle_into(
         config.save_pretrained(output_dir)
         _write_generation_config(output_dir, bos_id, eos_id)
 
-        shard_count = spec.n_layers + 1
-        weight_map, total_size = sink.weight_map, sink.total_size
-        gain = token.norm_gain
-        # token.v6 tied readout: lm_head aliases embed_tokens for both
-        # targets (the custom model via _tied_weights_keys, stock Phi-3 via
-        # tie_word_embeddings=True), so the state dict carries no separate
-        # unembed.  The folded RMS constants in embed_table are cleared
-        # before readout by the zeroed final-gain coordinates below, and
-        # the literal seed by the compiled clear_literal_seed op.
-        final_sd = {
-            "model.embed_tokens.weight": _torch(token.embed_table),
-        }
-        if gain is not None:
-            # Final norm: exact zero on the pinned-constant coordinates so
-            # the tied readout never sees the folded RMS constants — the
-            # same fold the ONNX exporter's final_norm carries.
-            final_gain = gain.copy()
-            final_gain[list(cast("Any", compiled.rms_norm_spec).reserved_cols)] = 0.0
-            final_sd["model.norm.weight"] = _torch(final_gain)
-            for i in range(spec.n_layers):
-                p = f"model.layers.{i}"
-                final_sd[f"{p}.input_layernorm.weight"] = _torch(gain)
-                final_sd[f"{p}.post_attention_layernorm.weight"] = _torch(gain)
-        filename = f"model-{shard_count:05d}-of-{shard_count:05d}.safetensors"
-        save_file(final_sd, str(Path(output_dir) / filename))
-        for name, value in final_sd.items():
-            weight_map[name] = filename
-            total_size += value.numel() * value.element_size()
-        index_path = Path(output_dir) / "model.safetensors.index.json"
-        with index_path.open("w") as f:
-            json.dump(
-                {"metadata": {"total_size": total_size}, "weight_map": weight_map}, f
-            )
+        _write_final_shard(output_dir, spec, token, compiled.rms_norm_spec, sink)
 
     if target == "custom":
-        here = Path(__file__).parent
-        for name in (
-            "configuration_torchwright_custom.py",
-            "modeling_torchwright_custom.py",
-            "tokenization_torchwright_custom.py",
-        ):
-            shutil.copy2(here / name, Path(output_dir) / name)
+        _copy_custom_code(output_dir)
     if write_tokenizer:
         if target == "phi3":
             build_fast_tokenizer(

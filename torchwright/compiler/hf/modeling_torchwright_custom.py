@@ -51,6 +51,77 @@ _SDPA_BACKEND = [SDPBackend.MATH]
 _KEY_PADDING_MASK_NDIM = 2
 
 
+def _require_fp32(hidden_states: torch.Tensor) -> None:
+    """Fail loud on reduced precision — it changes this model's outputs."""
+    if hidden_states.dtype != torch.float32:
+        raise RuntimeError(
+            "This model is fp32-only; got "
+            f"{hidden_states.dtype}. Load/keep the model in float32 (no "
+            "torch_dtype=fp16/bf16, no .half())."
+        )
+    device = hidden_states.device
+    try:
+        autocast_on = torch.is_autocast_enabled(device.type)
+    except TypeError:  # older torch: no device-type arg (CUDA only)
+        autocast_on = torch.is_autocast_enabled()
+    if autocast_on:
+        raise RuntimeError(
+            "This model is fp32-only; autocast is active, which runs "
+            "matmuls in reduced precision. Run outside autocast."
+        )
+
+
+def _resolve_cache_position(
+    position_ids: torch.LongTensor | None,
+    past_seen: int,
+    n_new: int,
+    device: torch.device,
+) -> torch.LongTensor:
+    """Absolute positions for the new rows when the caller supplied none."""
+    if position_ids is not None:
+        # Honor caller-supplied absolute positions (single sequence):
+        # the rotary rotation and the causal mask both key off
+        # cache_position, so map position_ids onto it rather than
+        # silently ignoring it.
+        return cast(
+            "torch.LongTensor",
+            position_ids[0].to(device=device, dtype=torch.long),
+        )
+    return cast(
+        "torch.LongTensor",
+        torch.arange(past_seen, past_seen + n_new, device=device),
+    )
+
+
+def _causal_mask(
+    cache_position: torch.LongTensor,
+    attention_mask: torch.Tensor | None,
+    total: int,
+    device: torch.device,
+) -> torch.Tensor:
+    """Causal mask over absolute positions: key j visible to query p iff j <= p."""
+    key_pos = torch.arange(total, device=device)
+    mask = (key_pos[None, :] <= cache_position[:, None])[None, None, :, :]
+    # Fold in a key-padding mask when one is supplied. The supported shape
+    # is a 2D (batch, total_keys) mask covering every key — what `generate`
+    # passes for a single unpadded sequence. Anything else is refused
+    # loudly rather than silently reduced to causal-only.
+    if attention_mask is not None:
+        if (
+            attention_mask.dim() == _KEY_PADDING_MASK_NDIM
+            and attention_mask.shape[-1] == total
+        ):
+            pad = attention_mask[:, None, None, :].to(torch.bool)
+            mask = mask & pad  # -> (B, 1, T, total)
+        else:
+            raise NotImplementedError(
+                "Unsupported attention_mask of shape "
+                f"{tuple(attention_mask.shape)}; pass a 2D (batch, {total}) "
+                "key-padding mask covering all keys, or None."
+            )
+    return mask
+
+
 class TorchwrightCustomAttention(nn.Module):
     """Causal multi-head attention, ``scale=1.0``, no bias.
 
@@ -271,6 +342,7 @@ class TorchwrightCustomModel(TorchwrightCustomPreTrainedModel):
         position_ids: torch.LongTensor | None = None,
         past_key_values: Cache | None = None,
         inputs_embeds: torch.FloatTensor | None = None,
+        *,
         use_cache: bool | None = None,
         cache_position: torch.LongTensor | None = None,
         **_kwargs: object,
@@ -291,21 +363,7 @@ class TorchwrightCustomModel(TorchwrightCustomPreTrainedModel):
 
         # fp32-only: reduced precision changes this model's outputs. Fail loud
         # rather than emit wrong tokens.
-        if hidden_states.dtype != torch.float32:
-            raise RuntimeError(
-                "This model is fp32-only; got "
-                f"{hidden_states.dtype}. Load/keep the model in float32 (no "
-                "torch_dtype=fp16/bf16, no .half())."
-            )
-        try:
-            autocast_on = torch.is_autocast_enabled(device.type)
-        except TypeError:  # older torch: no device-type arg (CUDA only)
-            autocast_on = torch.is_autocast_enabled()
-        if autocast_on:
-            raise RuntimeError(
-                "This model is fp32-only; autocast is active, which runs "
-                "matmuls in reduced precision. Run outside autocast."
-            )
+        _require_fp32(hidden_states)
 
         if use_cache and past_key_values is None:
             past_key_values = DynamicCache()
@@ -313,43 +371,9 @@ class TorchwrightCustomModel(TorchwrightCustomPreTrainedModel):
             past_key_values.get_seq_length() if past_key_values is not None else 0
         )
         if cache_position is None:
-            if position_ids is not None:
-                # Honor caller-supplied absolute positions (single sequence):
-                # the rotary rotation and the causal mask both key off
-                # cache_position, so map position_ids onto it rather than
-                # silently ignoring it.
-                cache_position = cast(
-                    "torch.LongTensor",
-                    position_ids[0].to(device=device, dtype=torch.long),
-                )
-            else:
-                cache_position = cast(
-                    "torch.LongTensor",
-                    torch.arange(past_seen, past_seen + T, device=device),
-                )
+            cache_position = _resolve_cache_position(position_ids, past_seen, T, device)
 
-        # Causal mask over absolute positions: key j is visible to query p iff
-        # j <= p.
-        total = past_seen + T
-        key_pos = torch.arange(total, device=device)
-        mask = (key_pos[None, :] <= cache_position[:, None])[None, None, :, :]
-        # Fold in a key-padding mask when one is supplied. The supported shape
-        # is a 2D (batch, total_keys) mask covering every key — what `generate`
-        # passes for a single unpadded sequence. Anything else is refused
-        # loudly rather than silently reduced to causal-only.
-        if attention_mask is not None:
-            if (
-                attention_mask.dim() == _KEY_PADDING_MASK_NDIM
-                and attention_mask.shape[-1] == total
-            ):
-                pad = attention_mask[:, None, None, :].to(torch.bool)
-                mask = mask & pad  # -> (B, 1, T, total)
-            else:
-                raise NotImplementedError(
-                    "Unsupported attention_mask of shape "
-                    f"{tuple(attention_mask.shape)}; pass a 2D (batch, {total}) "
-                    "key-padding mask covering all keys, or None."
-                )
+        mask = _causal_mask(cache_position, attention_mask, past_seen + T, device)
 
         for layer in self.layers:
             hidden_states = layer(hidden_states, mask, past_key_values, cache_position)
@@ -400,6 +424,7 @@ class TorchwrightCustomForCausalLM(TorchwrightCustomPreTrainedModel, GenerationM
         past_key_values: Cache | None = None,
         inputs_embeds: torch.FloatTensor | None = None,
         labels: torch.LongTensor | None = None,
+        *,
         use_cache: bool | None = None,
         output_attentions: bool | None = None,
         output_hidden_states: bool | None = None,

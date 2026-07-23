@@ -103,6 +103,41 @@ def _ratio_close(a: float, b: float, factor: float) -> bool:
     return hi / lo <= factor
 
 
+def _compare_op_dists(op_key: tuple, c_op: dict, r_op: dict) -> list[str]:
+    """Compare one op's committed vs regenerated distributions."""
+    op_name = "/".join(op_key)
+    failures: list[str] = []
+    c_dists = {d["name"]: d for d in c_op["distributions"]}
+    r_dists = {d["name"]: d for d in r_op["distributions"]}
+
+    d_missing = sorted(c_dists.keys() - r_dists.keys())
+    if d_missing:
+        failures.append(f"{op_name}: distributions removed: {d_missing}")
+    d_extra = sorted(r_dists.keys() - c_dists.keys())
+    if d_extra:
+        failures.append(f"{op_name}: distributions added: {d_extra}")
+
+    for dist_name in sorted(c_dists.keys() & r_dists.keys()):
+        cd = c_dists[dist_name]
+        rd = r_dists[dist_name]
+
+        if cd["n_samples"] != rd["n_samples"]:
+            failures.append(
+                f"{op_name}/{dist_name}: n_samples "
+                f"{cd['n_samples']} -> {rd['n_samples']}"
+            )
+
+        for key in _ERROR_METRIC_KEYS:
+            cv, rv = cd[key], rd[key]
+            if _is_staircase(op_key, dist_name):
+                ok = _ratio_close(cv, rv, _STAIRCASE_RATIO)
+            else:
+                ok = _close_enough(cv, rv)
+            if not ok:
+                failures.append(f"{op_name}/{dist_name}: {key} {cv} -> {rv}")
+    return failures
+
+
 def _compare_ops(committed: dict, regenerated: dict) -> list[str]:
     """Compare two stripped JSON dicts and return a list of failure messages.
 
@@ -124,35 +159,7 @@ def _compare_ops(committed: dict, regenerated: dict) -> list[str]:
         failures.append(f"Ops in fresh measurement but not in committed JSON: {extra}")
 
     for op_key in sorted(c_ops.keys() & r_ops.keys()):
-        op_name = "/".join(op_key)
-        c_dists = {d["name"]: d for d in c_ops[op_key]["distributions"]}
-        r_dists = {d["name"]: d for d in r_ops[op_key]["distributions"]}
-
-        d_missing = sorted(c_dists.keys() - r_dists.keys())
-        if d_missing:
-            failures.append(f"{op_name}: distributions removed: {d_missing}")
-        d_extra = sorted(r_dists.keys() - c_dists.keys())
-        if d_extra:
-            failures.append(f"{op_name}: distributions added: {d_extra}")
-
-        for dist_name in sorted(c_dists.keys() & r_dists.keys()):
-            cd = c_dists[dist_name]
-            rd = r_dists[dist_name]
-
-            if cd["n_samples"] != rd["n_samples"]:
-                failures.append(
-                    f"{op_name}/{dist_name}: n_samples "
-                    f"{cd['n_samples']} -> {rd['n_samples']}"
-                )
-
-            for key in _ERROR_METRIC_KEYS:
-                cv, rv = cd[key], rd[key]
-                if _is_staircase(op_key, dist_name):
-                    ok = _ratio_close(cv, rv, _STAIRCASE_RATIO)
-                else:
-                    ok = _close_enough(cv, rv)
-                if not ok:
-                    failures.append(f"{op_name}/{dist_name}: {key} {cv} -> {rv}")
+        failures.extend(_compare_op_dists(op_key, c_ops[op_key], r_ops[op_key]))
 
     return failures
 

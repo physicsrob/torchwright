@@ -145,6 +145,7 @@ def write_mlp_sublayer(
     layer: TransformerLayer,
     ops: Iterable[PlannedMlpOp],
     const_one_col: int,
+    *,
     biased_linears: set[Node] | None = None,
     recorder: PlacementRecorder | None = None,
     bias: bool = True,

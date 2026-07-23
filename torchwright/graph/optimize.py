@@ -267,23 +267,94 @@ def _fold_ffn_into_linear(
     # semantic affine override installed on b describes the pre-fold value
     # and must not be re-applied by the bounds refresh.  (The other two
     # folds preserve the survivor's value, so their overrides stay valid.)
-    b._semantic_affine_override = None
+    b.semantic_affine_override = None
     if b.name and lin.name:
         b.name = f"fused_{b.name}_{lin.name}"
     for consumer in list(consumers.get(lin, [])):
         consumer.replace_input(lin, b)
 
 
-def _fold_through_concatenate(
-    lin: Linear,
-    c: Concatenate,
-    output_nodes: set[Node],
-    consumers: dict[Node, list[Node]],
-    hint_targets: set[Node],
-    touched: set[Node],
-    mutated: set[Node],
-    fold_log: FoldLog,
-) -> int:
+@dataclass(frozen=True)
+class _FoldPassCtx:
+    """Shared state for one :func:`_fuse_one_pass` round.
+
+    ``output_nodes``, ``consumers``, and ``hint_targets`` are facts
+    computed fresh per pass; ``touched`` and ``mutated`` are
+    accumulators the folds write into; ``fold_log`` records value
+    survivorship across folds (see :class:`FoldLog`).
+    """
+
+    output_nodes: set[Node]
+    consumers: dict[Node, list[Node]]
+    hint_targets: set[Node]
+    touched: set[Node]
+    mutated: set[Node]
+    fold_log: FoldLog
+
+
+def _splice_nested_concat_leaves(
+    c: Concatenate, ctx: _FoldPassCtx
+) -> tuple[list[Node], int]:
+    """Splice single-consumer nested ``Concatenate`` leaves of *c* inline.
+
+    Returns the flattened leaf list and the number of splices applied.
+    A splice is value-identical but still orphans the nested concat, so
+    the hint gate applies (a waiter can name a Concatenate: the scheduler
+    marks one computed once its leaves are).
+    """
+    applied = 0
+    leaves: list[Node] = []
+    for leaf in c.inputs:
+        if (
+            isinstance(leaf, Concatenate)
+            and not _blocks_absorb(leaf)
+            and not _blocks_orphan(leaf, ctx.hint_targets)
+            and leaf not in ctx.touched
+            and leaf not in ctx.output_nodes
+            and len(ctx.consumers.get(leaf, [])) == 1
+        ):
+            leaves.extend(leaf.inputs)
+            ctx.touched.add(leaf)
+            applied += 1
+        else:
+            leaves.append(leaf)
+    return leaves, applied
+
+
+def _linear_leaf_shrinks(leaf: Linear, w: int, d_out: int) -> bool:
+    """Parameter gate for absorbing a Linear leaf's block: never grow."""
+    d_x = leaf.output_matrix.shape[0]
+    old = (d_x * w + w) + w * d_out
+    new = d_x * d_out
+    return new <= old
+
+
+def _coalesce_duplicate_leaves(
+    new_leaves: list[Node],
+    blocks: list[torch.Tensor],
+) -> tuple[list[Node], list[torch.Tensor], int]:
+    """Merge duplicate leaves' row blocks: ``x @ B1 + x @ B2 == x @ (B1 + B2)``.
+
+    Returns the deduplicated leaves, their merged blocks, and the number
+    of merges applied.
+    """
+    slot: dict[int, int] = {}
+    merged_leaves: list[Node] = []
+    merged_blocks: list[torch.Tensor] = []
+    merges = 0
+    for leaf, block in zip(new_leaves, blocks, strict=False):
+        j = slot.get(id(leaf))
+        if j is None:
+            slot[id(leaf)] = len(merged_leaves)
+            merged_leaves.append(leaf)
+            merged_blocks.append(block)
+        else:
+            merged_blocks[j] = merged_blocks[j] + block
+            merges += 1
+    return merged_leaves, merged_blocks, merges
+
+
+def _fold_through_concatenate(lin: Linear, c: Concatenate, ctx: _FoldPassCtx) -> int:
     """Fold foldable leaves of single-consumer ``c`` into ``lin``'s row blocks.
 
     ``Linear(Concatenate(..., leaf_i, ...))`` reads leaf ``i`` through the
@@ -325,28 +396,10 @@ def _fold_through_concatenate(
         return 0
 
     # Splice nested single-consumer concat leaves inline first, so the
-    # folds below see a flat leaf list.  A splice is value-identical but
-    # still orphans the nested concat, so the hint gate applies (a waiter
-    # can name a Concatenate: the scheduler marks one computed once its
-    # leaves are).
-    applied = 0
-    leaves: list[Node] = []
-    for leaf in c.inputs:
-        if (
-            isinstance(leaf, Concatenate)
-            and not _blocks_absorb(leaf)
-            and not _blocks_orphan(leaf, hint_targets)
-            and leaf not in touched
-            and leaf not in output_nodes
-            and len(consumers.get(leaf, [])) == 1
-        ):
-            leaves.extend(leaf.inputs)
-            touched.add(leaf)
-            applied += 1
-        else:
-            leaves.append(leaf)
+    # folds below see a flat leaf list.
+    leaves, applied = _splice_nested_concat_leaves(c, ctx)
 
-    allow_value_folds = c._semantic_affine_override is None
+    allow_value_folds = c.semantic_affine_override is None
     # Literal folds drop leaves; never drop them all.
     has_non_literal = any(not isinstance(x, LiteralValue) for x in leaves)
 
@@ -365,7 +418,7 @@ def _fold_through_concatenate(
             allow_value_folds
             and isinstance(leaf, LiteralValue)
             and not _blocks_absorb(leaf)
-            and not _blocks_orphan(leaf, hint_targets)
+            and not _blocks_orphan(leaf, ctx.hint_targets)
             and has_non_literal
         ):
             bias = bias + leaf.value @ m
@@ -377,22 +430,19 @@ def _fold_through_concatenate(
             allow_value_folds
             and isinstance(leaf, Linear)
             and not _blocks_absorb(leaf)
-            and not _blocks_orphan(leaf, hint_targets)
-            and leaf not in touched
-            and leaf not in output_nodes
-            and len(consumers.get(leaf, [])) == 1
+            and not _blocks_orphan(leaf, ctx.hint_targets)
+            and leaf not in ctx.touched
+            and leaf not in ctx.output_nodes
+            and len(ctx.consumers.get(leaf, [])) == 1
+            and _linear_leaf_shrinks(leaf, w, d_out)
         ):
-            d_x = leaf.output_matrix.shape[0]
-            old = (d_x * w + w) + w * d_out
-            new = d_x * d_out
-            if new <= old:
-                blocks.append(leaf.output_matrix @ m)
-                bias = bias + leaf.output_bias @ m
-                new_leaves.append(leaf.inputs[0])
-                touched.add(leaf)
-                applied += 1
-                value_folds += 1
-                continue
+            blocks.append(leaf.output_matrix @ m)
+            bias = bias + leaf.output_bias @ m
+            new_leaves.append(leaf.inputs[0])
+            ctx.touched.add(leaf)
+            applied += 1
+            value_folds += 1
+            continue
 
         blocks.append(m)
         new_leaves.append(leaf)
@@ -403,20 +453,9 @@ def _fold_through_concatenate(
     # merge exactly and the concat narrows — which also keeps duplicate
     # source columns out of the weight-writer scatters.
     if allow_value_folds and len({id(x) for x in new_leaves}) != len(new_leaves):
-        slot: dict[int, int] = {}
-        merged_leaves: list[Node] = []
-        merged_blocks: list[torch.Tensor] = []
-        for leaf, block in zip(new_leaves, blocks, strict=False):
-            j = slot.get(id(leaf))
-            if j is None:
-                slot[id(leaf)] = len(merged_leaves)
-                merged_leaves.append(leaf)
-                merged_blocks.append(block)
-            else:
-                merged_blocks[j] = merged_blocks[j] + block
-                applied += 1
-                value_folds += 1
-        new_leaves, blocks = merged_leaves, merged_blocks
+        new_leaves, blocks, merges = _coalesce_duplicate_leaves(new_leaves, blocks)
+        applied += merges
+        value_folds += merges
 
     if applied == 0:
         return 0
@@ -425,19 +464,19 @@ def _fold_through_concatenate(
     lin.output_bias = bias
     lin.d_input = lin.output_matrix.shape[0]
     _invalidate_support_cache(lin)
-    if len(new_leaves) == 1 and not _blocks_orphan(c, hint_targets):
+    if len(new_leaves) == 1 and not _blocks_orphan(c, ctx.hint_targets):
         # Bypass the concat entirely — unless the concat itself carries or is
         # named by a hint, in which case it stays interposed (one leaf wide).
         lin.inputs = [new_leaves[0]]
     else:
         c.inputs = new_leaves
         c.d_output = sum(len(x) for x in new_leaves)
-        mutated.add(c)
+        ctx.mutated.add(c)
         if value_folds:
-            fold_log.record_value_changed(c)
-    touched.add(c)
-    touched.add(lin)
-    mutated.add(lin)
+            ctx.fold_log.record_value_changed(c)
+    ctx.touched.add(c)
+    ctx.touched.add(lin)
+    ctx.mutated.add(lin)
     return applied
 
 
@@ -477,11 +516,10 @@ def _blocks_orphan(node: Node, hint_targets: set[Node]) -> bool:
     general (for the sibling merge, an intra-run hint would make the merged
     node wait on itself).
 
-    Consulted at every orphaning site in this module.  It cannot be checked
-    inside the fold functions themselves — they don't see ``hint_targets``
-    — so each call site in :func:`_fuse_one_pass` (and
-    :func:`_fold_through_concatenate`, which receives the set) gates before
-    folding.  The set must be computed fresh per pass by the orchestrator:
+    Consulted at every orphaning site in this module.  The fold functions
+    see ``hint_targets`` through the per-pass context
+    (:class:`_FoldPassCtx`) and gate before folding.  The set must be
+    computed fresh per pass by the orchestrator:
     a pass that deletes hint carriers would otherwise leave later passes
     reading an empty set and merging what the hints protected.
     """
@@ -507,7 +545,7 @@ def _blocks_merge(node: Node, hint_targets: set[Node]) -> bool:
         bool(node.checks)
         or node.claimed_type is not None
         or node.integer_claim
-        or node._semantic_affine_override is not None
+        or node.semantic_affine_override is not None
         or _blocks_orphan(node, hint_targets)
     )
 
@@ -549,15 +587,7 @@ def _merge_run(run: list[Linear], fold_log: FoldLog) -> Linear:
     return survivor
 
 
-def _merge_sibling_linear_leaves(
-    c: Concatenate,
-    output_nodes: set[Node],
-    consumers: dict[Node, list[Node]],
-    hint_targets: set[Node],
-    touched: set[Node],
-    mutated: set[Node],
-    fold_log: FoldLog,
-) -> int:
+def _merge_sibling_linear_leaves(c: Concatenate, ctx: _FoldPassCtx) -> int:
     """Merge maximal contiguous runs of same-input Linear leaves of ``c``.
 
     Consumer-agnostic: the concat's value and width are untouched, so no
@@ -597,11 +627,11 @@ def _merge_sibling_linear_leaves(
     def mergeable(leaf: Node) -> bool:
         return (
             isinstance(leaf, Linear)
-            and leaf not in touched
-            and leaf not in output_nodes
-            and not _blocks_merge(leaf, hint_targets)
+            and leaf not in ctx.touched
+            and leaf not in ctx.output_nodes
+            and not _blocks_merge(leaf, ctx.hint_targets)
             # Distinct consumers, not occurrences: see the docstring.
-            and {id(x) for x in consumers.get(leaf, [])} == {id(c)}
+            and {id(x) for x in ctx.consumers.get(leaf, [])} == {id(c)}
         )
 
     inputs = c.inputs
@@ -638,9 +668,9 @@ def _merge_sibling_linear_leaves(
             i = j
             continue
 
-        survivor = _merge_run(run, fold_log)
-        touched.update(run)
-        mutated.add(survivor)
+        survivor = _merge_run(run, ctx.fold_log)
+        ctx.touched.update(run)
+        ctx.mutated.add(survivor)
         new_inputs.append(survivor)
         applied += 1
         i = j
@@ -650,19 +680,12 @@ def _merge_sibling_linear_leaves(
 
     c.inputs = new_inputs
     c.d_output = sum(len(x) for x in new_inputs)
-    touched.add(c)
-    mutated.add(c)
+    ctx.touched.add(c)
+    ctx.mutated.add(c)
     return applied
 
 
-def _bypass_trivial_concatenate(
-    c: Concatenate,
-    output_nodes: set[Node],
-    consumers: dict[Node, list[Node]],
-    hint_targets: set[Node],
-    touched: set[Node],
-    mutated: set[Node],
-) -> int:
+def _bypass_trivial_concatenate(c: Concatenate, ctx: _FoldPassCtx) -> int:
     """A one-leaf ``Concatenate`` *is* its leaf: rewire consumers, orphan it.
 
     ``_fold_through_concatenate`` has this bypass too, but only reachable from
@@ -686,11 +709,15 @@ def _bypass_trivial_concatenate(
 
     Returns 1 if the concat was bypassed.
     """
-    if len(c.inputs) != 1 or c in output_nodes or _blocks_orphan(c, hint_targets):
+    if (
+        len(c.inputs) != 1
+        or c in ctx.output_nodes
+        or _blocks_orphan(c, ctx.hint_targets)
+    ):
         return 0
-    if _blocks_absorb(c) or c._semantic_affine_override is not None:
+    if _blocks_absorb(c) or c.semantic_affine_override is not None:
         return 0
-    reading = consumers.get(c, [])
+    reading = ctx.consumers.get(c, [])
     if not reading:
         return 0
     distinct = {id(x): x for x in reading}
@@ -702,13 +729,125 @@ def _bypass_trivial_concatenate(
         # replace_input rewrites every matching slot, so a consumer holding the
         # concat twice is fully repaired by one call.
         consumer.replace_input(c, leaf)
-        mutated.add(consumer)
-    touched.add(c)
+        ctx.mutated.add(consumer)
+    ctx.touched.add(c)
+    return 1
+
+
+def _param_delta_ok(new_params: int, old_params: int) -> bool:
+    # Skip folds that would grow the parameter count (bottleneck patterns).
+    return new_params <= old_params
+
+
+def _linear_linear_fold_ok(l1: Linear, l2: Linear, hint_targets: set[Node]) -> bool:
+    """Gates for absorbing ``l1`` into its sole consumer ``l2``."""
+    if _blocks_absorb(l1):  # l1's checked value would be erased
+        return False
+    if _blocks_orphan(l1, hint_targets):  # l1's hint edges would dangle
+        return False
+    d_in = l1.output_matrix.shape[0]
+    d_mid = l1.output_matrix.shape[1]
+    d_out = l2.output_matrix.shape[1]
+    old = d_in * d_mid + d_mid + d_mid * d_out + d_out
+    new = d_in * d_out + d_out
+    return _param_delta_ok(new, old)
+
+
+def _ffn_linear_fold_ok(
+    b: FFN, lin: Linear, output_nodes: set[Node], hint_targets: set[Node]
+) -> bool:
+    """Gates for folding FFN ``b``'s out_proj into its sole consumer ``lin``."""
+    if lin in output_nodes:
+        return False
+    if _blocks_absorb(b):  # b's checked pre-fold value would be erased
+        return False  # (lin's checks migrate — see the fold)
+    # lin is the orphan here even though its VALUE survives (it
+    # moves onto b): hint edges are keyed by node identity, so a
+    # waiter naming lin never sees it computed, and lin's own
+    # predecessors would stop constraining anything.
+    if _blocks_orphan(lin, hint_targets):
+        return False
+    n_lanes = b.n_lanes
+    d_b = b.d_output
+    d_z = lin.output_matrix.shape[1]
+    old = (n_lanes * d_b + d_b) + (d_b * d_z + d_z)
+    new = n_lanes * d_z + d_z
+    return _param_delta_ok(new, old)
+
+
+def _fold_into_downstream_linear(node: Linear, ctx: _FoldPassCtx) -> int:
+    """Folds keyed on a downstream ``Linear``.
+
+    Linear -> Linear, FFN -> Linear, and leaves through a
+    single-consumer ``Concatenate``.  Returns the number of folds
+    applied.
+    """
+    inp = node.inputs[0]
+    if inp in ctx.touched:
+        return 0
+    if isinstance(inp, Concatenate):
+        if len(ctx.consumers.get(inp, [])) == 1:
+            return _fold_through_concatenate(node, inp, ctx)
+        return 0
+    if len(ctx.consumers.get(inp, [])) != 1:
+        return 0
+
+    applied = 0
+    if isinstance(inp, Linear):
+        l1, l2 = inp, node
+        if _linear_linear_fold_ok(l1, l2, ctx.hint_targets):
+            _fuse_linear_into_linear(l1, l2)
+            ctx.touched.add(l1)
+            ctx.touched.add(l2)
+            ctx.mutated.add(l2)
+            applied = 1
+    elif isinstance(inp, FFN):
+        # Fold the FFN's out_proj into this downstream Linear.  The
+        # FFN becomes the survivor, so the Linear must not be a
+        # caller-held output node (its identity would be lost).
+        b, lin = inp, node
+        if _ffn_linear_fold_ok(b, lin, ctx.output_nodes, ctx.hint_targets):
+            _fold_ffn_into_linear(b, ctx.consumers, ctx.fold_log)
+            ctx.touched.add(b)
+            ctx.touched.add(lin)
+            ctx.mutated.add(b)
+            applied = 1
+    return applied
+
+
+def _fold_gate_linear_into_ffn(node: FFN, ctx: _FoldPassCtx) -> int:
+    """Linear -> FFN gate fold, keyed on the FFN.  Returns folds applied."""
+    inp = node.inputs[0]
+    if not isinstance(inp, Linear) or inp in ctx.touched:
+        return 0
+    if len(ctx.consumers.get(inp, [])) != 1:
+        return 0
+    u, b = inp, node
+    if _blocks_absorb(u):  # u's checked value would be erased
+        return 0
+    if _blocks_orphan(u, ctx.hint_targets):  # u's hint edges would dangle
+        return 0
+    d_x = u.output_matrix.shape[0]
+    d_u = u.output_matrix.shape[1]
+    n_lanes = b.n_lanes
+    gated = b.up_proj is not None
+    u_params = d_x * d_u + d_u
+    per_proj_old = n_lanes * d_u
+    per_proj_new = n_lanes * d_x
+    n_proj = 2 if gated else 1
+    old = u_params + n_proj * per_proj_old
+    new = n_proj * per_proj_new
+    if not _param_delta_ok(new, old):
+        return 0
+    _fold_linear_into_ffn_gate(u, b)
+    ctx.touched.add(u)
+    ctx.touched.add(b)
+    ctx.mutated.add(b)
     return 1
 
 
 def _fuse_one_pass(
-    output_nodes: set[Node], verbose: bool, mutated: set[Node], fold_log: FoldLog
+    output_nodes: set[Node], *, verbose: bool, mutated: set[Node], fold_log: FoldLog
 ) -> int:
     """One fusion round: apply a set of non-overlapping folds, return the count.
 
@@ -722,117 +861,27 @@ def _fuse_one_pass(
     from torchwright.compiler.utils import get_ancestor_nodes
 
     all_nodes = get_ancestor_nodes(output_nodes)
-    consumers = _consumer_map(all_nodes)
-    hint_targets = _scheduling_hint_targets(all_nodes)
-
-    touched: set[Node] = set()
+    ctx = _FoldPassCtx(
+        output_nodes=output_nodes,
+        consumers=_consumer_map(all_nodes),
+        hint_targets=_scheduling_hint_targets(all_nodes),
+        touched=set(),
+        mutated=mutated,
+        fold_log=fold_log,
+    )
     applied = 0
-
-    def param_delta_ok(new_params: int, old_params: int) -> bool:
-        # Skip folds that would grow the parameter count (bottleneck patterns).
-        return new_params <= old_params
 
     # Linear -> Linear, and FFN -> Linear (out-proj fold): keyed on the
     # downstream Linear.  Linear -> FFN (gate fold): keyed on the FFN.
     for node in sorted(all_nodes, key=lambda n: n.node_id):
-        if node in touched:
+        if node in ctx.touched:
             continue
 
         if isinstance(node, Linear):
-            inp = node.inputs[0]
-            if inp in touched:
-                continue
-            if isinstance(inp, Concatenate):
-                if len(consumers.get(inp, [])) == 1:
-                    applied += _fold_through_concatenate(
-                        node,
-                        inp,
-                        output_nodes,
-                        consumers,
-                        hint_targets,
-                        touched,
-                        mutated,
-                        fold_log,
-                    )
-                continue
-            if len(consumers.get(inp, [])) != 1:
-                continue
-
-            if isinstance(inp, Linear):
-                l1, l2 = inp, node
-                if _blocks_absorb(l1):  # l1's checked value would be erased
-                    continue
-                if _blocks_orphan(l1, hint_targets):  # l1's hint edges would dangle
-                    continue
-                d_in = l1.output_matrix.shape[0]
-                d_mid = l1.output_matrix.shape[1]
-                d_out = l2.output_matrix.shape[1]
-                old = d_in * d_mid + d_mid + d_mid * d_out + d_out
-                new = d_in * d_out + d_out
-                if not param_delta_ok(new, old):
-                    continue
-                _fuse_linear_into_linear(l1, l2)
-                touched.add(l1)
-                touched.add(l2)
-                mutated.add(l2)
-                applied += 1
-
-            elif isinstance(inp, FFN):
-                # Fold the FFN's out_proj into this downstream Linear.  The
-                # FFN becomes the survivor, so the Linear must not be a
-                # caller-held output node (its identity would be lost).
-                b, lin = inp, node
-                if lin in output_nodes:
-                    continue
-                if _blocks_absorb(b):  # b's checked pre-fold value would be erased
-                    continue  # (lin's checks migrate — see the fold)
-                # lin is the orphan here even though its VALUE survives (it
-                # moves onto b): hint edges are keyed by node identity, so a
-                # waiter naming lin never sees it computed, and lin's own
-                # predecessors would stop constraining anything.
-                if _blocks_orphan(lin, hint_targets):
-                    continue
-                n_lanes = b.n_lanes
-                d_b = b.d_output
-                d_z = lin.output_matrix.shape[1]
-                old = (n_lanes * d_b + d_b) + (d_b * d_z + d_z)
-                new = n_lanes * d_z + d_z
-                if not param_delta_ok(new, old):
-                    continue
-                _fold_ffn_into_linear(b, consumers, fold_log)
-                touched.add(b)
-                touched.add(lin)
-                mutated.add(b)
-                applied += 1
+            applied += _fold_into_downstream_linear(node, ctx)
 
         elif isinstance(node, FFN):
-            inp = node.inputs[0]
-            if not isinstance(inp, Linear) or inp in touched:
-                continue
-            if len(consumers.get(inp, [])) != 1:
-                continue
-            u, b = inp, node
-            if _blocks_absorb(u):  # u's checked value would be erased
-                continue
-            if _blocks_orphan(u, hint_targets):  # u's hint edges would dangle
-                continue
-            d_x = u.output_matrix.shape[0]
-            d_u = u.output_matrix.shape[1]
-            n_lanes = b.n_lanes
-            gated = b.up_proj is not None
-            u_params = d_x * d_u + d_u
-            per_proj_old = n_lanes * d_u
-            per_proj_new = n_lanes * d_x
-            n_proj = 2 if gated else 1
-            old = u_params + n_proj * per_proj_old
-            new = n_proj * per_proj_new
-            if not param_delta_ok(new, old):
-                continue
-            _fold_linear_into_ffn_gate(u, b)
-            touched.add(u)
-            touched.add(b)
-            mutated.add(b)
-            applied += 1
+            applied += _fold_gate_linear_into_ffn(node, ctx)
 
         elif isinstance(node, Concatenate):
             # Keyed on the concat, so it fires whatever the consumer is.  A
@@ -840,12 +889,8 @@ def _fuse_one_pass(
             # defers that consumer's own fold to the next pass — which then
             # sees the wide leaf, and whose parameter gate is strictly more
             # likely to admit it.
-            applied += _merge_sibling_linear_leaves(
-                node, output_nodes, consumers, hint_targets, touched, mutated, fold_log
-            )
-            applied += _bypass_trivial_concatenate(
-                node, output_nodes, consumers, hint_targets, touched, mutated
-            )
+            applied += _merge_sibling_linear_leaves(node, ctx)
+            applied += _bypass_trivial_concatenate(node, ctx)
 
     if verbose and applied:
         print(f"  fused {applied} pair(s) this pass")
@@ -854,6 +899,7 @@ def _fuse_one_pass(
 
 def fuse_consecutive_linears(
     output_nodes: set[Node],
+    *,
     verbose: bool = False,
     fold_log: FoldLog | None = None,
 ) -> int:
@@ -926,7 +972,9 @@ def fuse_consecutive_linears(
     if fold_log is None:
         fold_log = FoldLog()
     while True:
-        n = _fuse_one_pass(output_nodes, verbose, mutated, fold_log)
+        n = _fuse_one_pass(
+            output_nodes, verbose=verbose, mutated=mutated, fold_log=fold_log
+        )
         total += n
         if n == 0:
             break
@@ -965,6 +1013,7 @@ def _recompute_bounds_after_fusion(output_nodes: set[Node], mutated: set[Node]) 
 
 def optimize_graph(
     output_nodes: set[Node],
+    *,
     verbose: bool = False,
 ) -> None:
     """Apply all graph optimization passes.

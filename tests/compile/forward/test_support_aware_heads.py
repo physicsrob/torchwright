@@ -298,7 +298,7 @@ def test_fingerprint_sees_sparsity():
         "policy": None,
     }
 
-    def build(sparse: bool):
+    def build(*, sparse: bool):
         x = create_input("x", 40, value_range=(-1.0, 1.0))
         w = _sparse_w() if sparse else torch.ones(40, 2)
         return Concatenate([Linear(x, w, name="l")])

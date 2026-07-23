@@ -55,7 +55,7 @@ def compute_affine_bound(node: Node) -> AffineBound:
 
         result = AffineBound.constant(node.value.to(dtype=torch.float64))
     elif isinstance(node, ValueLogger):
-        result = node.inputs[0]._affine_bound
+        result = node.inputs[0].affine_bound
     elif isinstance(node, Linear):
         result = _linear_rule(node)
     elif isinstance(node, Add):
@@ -117,15 +117,15 @@ def _linear_affine(
 
 def _linear_rule(node: Linear) -> AffineBound:
     """Y = x @ W + c: sign-split GEMM."""
-    inp_ab = node.inputs[0]._affine_bound
+    inp_ab = node.inputs[0].affine_bound
     W = node.output_matrix.to(torch.float64)
     c = node.output_bias.to(torch.float64)
     return _linear_affine(inp_ab, W, c)
 
 
 def _add_rule(node: Add) -> AffineBound:
-    u = node.inputs[0]._affine_bound
-    v = node.inputs[1]._affine_bound
+    u = node.inputs[0].affine_bound
+    v = node.inputs[1].affine_bound
     if u.d_output != v.d_output:
         raise ValueError(
             f"Add node {node.node_id}: input affine bounds have mismatched "
@@ -147,7 +147,7 @@ def _concat_rule(node: Concatenate) -> AffineBound:
 
     from torchwright.graph.affine_bound import _merge_layouts, _scatter
 
-    bounds = [inp._affine_bound for inp in node.inputs]
+    bounds = [inp.affine_bound for inp in node.inputs]
 
     if len(bounds) == 1:
         return bounds[0]
@@ -232,7 +232,7 @@ def _relu_affine(inp_ab: AffineBound, warn_node: Node | None = None) -> AffineBo
 
 def _relu_rule(node: ReLU) -> AffineBound:
     """ReLU per-component case analysis using linear envelope."""
-    return _relu_affine(node.inputs[0]._affine_bound, warn_node=node.inputs[0])
+    return _relu_affine(node.inputs[0].affine_bound, warn_node=node.inputs[0])
 
 
 # Swish is sandwiched by ReLU globally: relu(z) - C <= swish(z) <= relu(z)
@@ -296,6 +296,7 @@ def _bilinear_comb(
     g: torch.Tensor,
     s_ab: AffineBound,
     u_ab: AffineBound,
+    *,
     lower: bool,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Per-lane affine under- or over-estimator of ``a_s*s + a_u*u + g``.
@@ -418,7 +419,7 @@ def _ffn_rule(node: FFN) -> AffineBound:
     concretized interval — not from concretizing the activation envelope,
     which is far looser at wide gate intervals.
     """
-    inp_ab = node.inputs[0]._affine_bound
+    inp_ab = node.inputs[0].affine_bound
     # Gate projection: y = x @ gate_proj.T + gate_bias.  gate_proj is
     # (n_lanes, d_input) in math orientation, so W = gate_proj.T.
     gate_W = node.gate_proj.to(torch.float64).T
@@ -452,7 +453,7 @@ def _ffn_rule(node: FFN) -> AffineBound:
 
 
 def _apply_claim_to_bound(node: Node) -> None:
-    """Fold ``node.claimed_type`` into ``node._affine_bound`` in place.
+    """Fold ``node.claimed_type`` into ``node.affine_bound`` in place.
 
     The two channels that used to live in the Assert wrapper's affine
     rule, applied to the claimed node itself:
@@ -476,7 +477,7 @@ def _apply_claim_to_bound(node: Node) -> None:
     from torchwright.graph.misc import InputNode
 
     claimed_range = node.claimed_type.value_range
-    ab = node._affine_bound
+    ab = node.affine_bound
 
     if isinstance(node, (InputNode, Embedding)) and node.node_id in ab.input_ranges:
         old_lo, old_hi = ab.input_ranges[node.node_id]
@@ -523,7 +524,7 @@ def _attn_rule(node: Attn) -> AffineBound:
     affine bounds on ``value @ V`` carry through unchanged.  O is
     then a standard linear step.
     """
-    value_ab = node.inputs[2]._affine_bound
+    value_ab = node.inputs[2].affine_bound
     V = node.value_matrix.to(torch.float64)
     O_mat = node.output_matrix.to(torch.float64)
 
@@ -583,7 +584,7 @@ def _apply_semantic_override(node: Node, semantic_ab: AffineBound | None) -> Non
     """Replace *node*'s affine bound with a semantic override.
 
     The override is also recorded on the node
-    (``_semantic_affine_override``) so :func:`refresh_node_caches` can
+    (``semantic_affine_override``) so :func:`refresh_node_caches` can
     re-apply it after recomputing the propagated bound — otherwise any
     post-construction recompute would silently drop the semantic
     tightening and loosen every downstream bound derived from it.
@@ -598,7 +599,7 @@ def _apply_semantic_override(node: Node, semantic_ab: AffineBound | None) -> Non
     """
     if semantic_ab is None:
         return
-    propagated = node._affine_bound.to_scalar_range()
+    propagated = node.affine_bound.to_scalar_range()
     semantic = semantic_ab.to_scalar_range()
     disjoint_msg = (
         f"Semantic override on node {node.node_id} is disjoint from "
@@ -606,7 +607,7 @@ def _apply_semantic_override(node: Node, semantic_ab: AffineBound | None) -> Non
     )
     assert semantic.lo <= propagated.hi, disjoint_msg
     assert semantic.hi >= propagated.lo, disjoint_msg
-    node._semantic_affine_override = semantic_ab
+    node.semantic_affine_override = semantic_ab
     node._affine_bound = semantic_ab
 
 
@@ -632,10 +633,10 @@ def refresh_node_caches(node: Node) -> None:
 
         node._structural_type = tightened_with(node._structural_type, node.claimed_type)
     node._affine_bound = compute_affine_bound(node)
-    if node._semantic_affine_override is not None:
+    if node.semantic_affine_override is not None:
         # Override wins on the affine channel (see _apply_semantic_override);
         # the claim reached _structural_type above, keeping value_type tight.
-        _apply_semantic_override(node, node._semantic_affine_override)
+        _apply_semantic_override(node, node.semantic_affine_override)
     else:
         _apply_claim_to_bound(node)
 
@@ -773,6 +774,7 @@ def _broadcast_select_semantic_bound(
     false_ab: AffineBound,
     n_slots: int,
     d_fill: int,
+    *,
     true_is_broadcast: bool,
     false_is_broadcast: bool,
     tolerance: float = 0.0,

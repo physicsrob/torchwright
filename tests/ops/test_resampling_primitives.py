@@ -67,7 +67,9 @@ def _table_lookup_2d_reference(
         r0, r1, rt = _axis_blend(float(i[p, 0]) * scale_i, rows)
         c0, c1, ct = _axis_blend(float(j[p, 0]) * scale_j, cols)
 
-        def _row_value(col: int) -> float:
+        def _row_value(
+            col: int, *, r0: int = r0, r1: int = r1, rt: float = rt
+        ) -> float:
             return (1.0 - rt) * float(table[r0, col]) + rt * float(table[r1, col])
 
         if cols == 1:

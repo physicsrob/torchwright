@@ -58,6 +58,7 @@ def main(
     module: str = "",
     script: str = "",
     args: str = "",
+    *,
     cpu_only: bool = False,
 ) -> None:
     if not module and not script:

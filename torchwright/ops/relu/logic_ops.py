@@ -199,7 +199,7 @@ def equals_vector(inp: Node, vector: torch.Tensor) -> Node:
     )
 
 
-def _cond_gate_output_type(cond: Node, inp: Node) -> NodeValueType:
+def _cond_gate_output_type(inp: Node) -> NodeValueType:
     vt = inp.value_type
     r = vt.value_range
     if not r.is_finite():
@@ -292,7 +292,7 @@ def cond_gate(cond: Node, inp: Node) -> Node:
         name="cond_gate",
     )
 
-    vt = _cond_gate_output_type(cond, inp)
+    vt = _cond_gate_output_type(inp)
     if vt != NodeValueType.unknown():
         gate_atol = M * _COND_GATE_C_TOL
         result = assert_matches_value_type(result, vt, atol=gate_atol)
@@ -303,6 +303,6 @@ def cond_gate(cond: Node, inp: Node) -> Node:
 
     _apply_semantic_override(
         result,
-        _cond_gate_semantic_bound(inp._affine_bound, inp, c_tol=_COND_GATE_C_TOL, M=M),
+        _cond_gate_semantic_bound(inp.affine_bound, inp, c_tol=_COND_GATE_C_TOL, M=M),
     )
     return result

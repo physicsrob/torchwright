@@ -101,7 +101,7 @@ def per_operation_layers() -> None:
     }
     for name, out in ops.items():
         compiled = compile_headless(out, d=D, d_head=D_HEAD)
-        print(f"  {name:10s}: {compiled._n_layers} layers")
+        print(f"  {name:10s}: {compiled.n_layers} layers")
 
 
 def addition_table_figure() -> None:

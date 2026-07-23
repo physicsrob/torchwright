@@ -38,7 +38,7 @@ D = 256
 D_HEAD = 16
 
 
-def _idchain(x, depth, name):
+def _idchain(x, depth):
     """Build a chain of ``depth`` self-Adds, forcing ``depth`` layers of dependency.
 
     Each layer doubles the value; identity Linears would be absorbed by
@@ -83,10 +83,10 @@ def test_literal_is_not_an_input_node():
 
 def test_deep_literal_not_prefilled_and_materialized_in_interior():
     x = create_input("x", 2, value_range=(-5.0, 5.0))
-    h = _idchain(x, 3, "pre")  # consumer lands several layers in
+    h = _idchain(x, 3)  # consumer lands several layers in
     lit = create_literal_value(torch.tensor([7.0, -3.0]))
     consumed = add(h, lit)  # the constant's only consumer — deep
-    out = _idchain(consumed, 3, "post")  # downstream work after the consumer
+    out = _idchain(consumed, 3)  # downstream work after the consumer
 
     net = forward_compile(d=D, d_head=D_HEAD, output_node=out, verbose=False)
     ra = net.residual_assignment
@@ -128,7 +128,7 @@ def test_deep_select_literal_matches_oracle(optimize):
     """
     cond = create_input("cond", 1, value_range=(-1.0, 1.0))
     base = create_input("t", 2, value_range=(-4.0, 4.0))
-    deep_true = _idchain(base, 3, "t")
+    deep_true = _idchain(base, 3)
     lit = create_literal_value(torch.tensor([2.0, -1.0]))
     out = select(cond, deep_true, lit)
 
@@ -178,7 +178,7 @@ def test_shared_literal_two_consumers_correct():
     x = create_input("x", 2, value_range=(-5.0, 5.0))
     lit = create_literal_value(torch.tensor([1.5, -2.5]))
     shallow = add(x, lit)  # needs the constant near layer 0
-    deep = add(_idchain(x, 3, "d"), lit)  # needs it deep
+    deep = add(_idchain(x, 3), lit)  # needs it deep
     # Wrap the join in an identity Linear so the output is a single
     # materialized node (a bare Concatenate isn't keyed in compute()'s result).
     out = Linear(concat([shallow, deep]), torch.eye(4), torch.zeros(4), name="out")
@@ -207,7 +207,7 @@ def test_deep_attention_fed_constant_matches_oracle():
     """
     rope = create_rope_config(d_head=D_HEAD, max_positions=512)
     x = create_input("x", 2, value_range=(-5.0, 5.0))
-    h = _idchain(x, 3, "d")
+    h = _idchain(x, 3)
     lit = create_literal_value(torch.tensor([4.0, -2.0]))
     v = concat([h, lit])  # the constant is part of the attention value
     out = attend_to_offset(rope, v, delta_pos=-1)
@@ -247,9 +247,9 @@ def test_literal_into_recycled_column_is_clean():
     x = create_input("x", 8, value_range=(-3.0, 3.0))
     # ``early`` is consumed immediately and then dies, freeing its (now
     # dirty) columns back into the pool.
-    early = _idchain(x, 1, "early")
+    early = _idchain(x, 1)
     sink = add(x, early)  # consumes ``early``; it dies here
-    deep = _idchain(sink, 4, "deep")  # push the constant's consumer late
+    deep = _idchain(sink, 4)  # push the constant's consumer late
     lit = create_literal_value(torch.full((8,), 5.0))
     out = add(deep, lit)
 
@@ -272,7 +272,7 @@ def _consumer_layer(other_kind):
     the Add's layer reveals whether the JIT gate delayed it.
     """
     x = create_input("x", 2, value_range=(-5.0, 5.0))
-    deep = _idchain(x, 3, "d")
+    deep = _idchain(x, 3)
     if other_kind == "literal":
         other = create_literal_value(torch.tensor([1.0, 2.0]))
     else:
@@ -314,7 +314,7 @@ def test_jit_graph_passes_end_of_layer_liveness(monkeypatch):
     """
     monkeypatch.setenv("TW_COMPILER_VERIFY", "1")
     x = create_input("x", 2, value_range=(-5.0, 5.0))
-    deep = _idchain(x, 3, "d")
+    deep = _idchain(x, 3)
     lit = create_literal_value(torch.tensor([7.0, -3.0]))
     out = add(deep, lit)
 
@@ -345,7 +345,7 @@ def test_cpsat_treats_constant_as_schedulable_not_prefilled():
     real, residual-bound graph (the DOOM graph), not here.
     """
     x = create_input("x", 2, value_range=(-5.0, 5.0))
-    deep = _idchain(x, 4, "d")
+    deep = _idchain(x, 4)
     lit = create_literal_value(torch.tensor([1.0, 2.0]))
     out = add(deep, lit)
 

@@ -274,7 +274,7 @@ def test_a2_trips_on_mlp_add_source_with_same_layer_attention_cancel():
         n_layers=4,
         node_to_cancel_mech={u.node_id: "attn", v.node_id: "attn"},
     )
-    sched = DirectedLayerScheduler(graph, D, D_HEAD, None, assignment)
+    sched = DirectedLayerScheduler(graph, D, D_HEAD, None, assignment=assignment)
     sched.set_current_layer(0)
     sched.schedule_layer(rmap, computed)
     sched.set_current_layer(1)

@@ -120,7 +120,7 @@ def compare(
     _apply_semantic_override(
         result,
         _compare_semantic_bound(
-            inp._affine_bound, thresh, true_level, false_level, slack=slack
+            inp.affine_bound, thresh, true_level, false_level, slack=slack
         ),
     )
     return result
@@ -305,10 +305,53 @@ def square(inp: Node) -> Node:
     )
 
 
+def _slope_change_hinges(
+    breakpoints: list[float],
+    values: list[list[float]],
+    d_out: int,
+    *,
+    clamp: bool,
+) -> list[tuple[float, float, list[float]]]:
+    """Hinge list ``(input_weight, threshold, [output_weights_per_dim])``.
+
+    One entry per breakpoint where the slope changes; a final entry
+    cancels the last slope when *clamp* is true, and two extrapolation
+    entries extend the end segments when it is false.
+    """
+    n = len(breakpoints)
+
+    slopes = []
+    for i in range(n - 1):
+        dx = breakpoints[i + 1] - breakpoints[i]
+        slopes.append([(values[i + 1][j] - values[i][j]) / dx for j in range(d_out)])
+
+    relus: list[tuple[float, float, list[float]]] = []
+    prev_slopes = [0.0] * d_out
+
+    for i in range(n - 1):
+        deltas = [slopes[i][j] - prev_slopes[j] for j in range(d_out)]
+        if any(builtins.abs(d) > _SLOPE_EPS for d in deltas):
+            relus.append((1.0, breakpoints[i], deltas))
+        prev_slopes = list(slopes[i])
+
+    # Cancel final slope (clamp)
+    if any(builtins.abs(s) > _SLOPE_EPS for s in prev_slopes):
+        relus.append((1.0, breakpoints[-1], [-s for s in prev_slopes]))
+
+    if not clamp:
+        if any(builtins.abs(s) > _SLOPE_EPS for s in slopes[0]):
+            relus.append((-1.0, breakpoints[0], [-s for s in slopes[0]]))
+        if any(builtins.abs(s) > _SLOPE_EPS for s in slopes[-1]):
+            relus.append((1.0, breakpoints[-1], list(slopes[-1])))
+
+    return relus
+
+
 def piecewise_linear(
     inp: Node,
     breakpoints: list[float],
     fn: Callable[[float], float | list[float]],
+    *,
     clamp: bool = True,
     d_max: int = min_d_hidden,
     input_scale: float = 1.0,
@@ -388,30 +431,7 @@ def piecewise_linear(
     d_out = len(values[0])
     assert all(len(v) == d_out for v in values)
 
-    slopes = []
-    for i in range(n - 1):
-        dx = breakpoints[i + 1] - breakpoints[i]
-        slopes.append([(values[i + 1][j] - values[i][j]) / dx for j in range(d_out)])
-
-    # Hinge list: (input_weight, threshold, [output_weights_per_dim])
-    relus: list = []
-    prev_slopes = [0.0] * d_out
-
-    for i in range(n - 1):
-        deltas = [slopes[i][j] - prev_slopes[j] for j in range(d_out)]
-        if any(builtins.abs(d) > _SLOPE_EPS for d in deltas):
-            relus.append((1.0, breakpoints[i], deltas))
-        prev_slopes = list(slopes[i])
-
-    # Cancel final slope (clamp)
-    if any(builtins.abs(s) > _SLOPE_EPS for s in prev_slopes):
-        relus.append((1.0, breakpoints[-1], [-s for s in prev_slopes]))
-
-    if not clamp:
-        if any(builtins.abs(s) > _SLOPE_EPS for s in slopes[0]):
-            relus.append((-1.0, breakpoints[0], [-s for s in slopes[0]]))
-        if any(builtins.abs(s) > _SLOPE_EPS for s in slopes[-1]):
-            relus.append((1.0, breakpoints[-1], list(slopes[-1])))
+    relus = _slope_change_hinges(breakpoints, values, d_out, clamp=clamp)
 
     if len(relus) == 0:
         from torchwright.ops.inout_nodes import create_literal_value

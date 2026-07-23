@@ -105,7 +105,7 @@ class HeadlessTransformer:
             layer.to(device)
         return self
 
-    def add_layer(self, append: bool = False) -> TransformerLayer:
+    def add_layer(self, *, append: bool = False) -> TransformerLayer:
         layer = TransformerLayer(
             self.d,
             self.d_head,
@@ -162,7 +162,7 @@ class HeadlessTransformer:
         return res_stream
 
     def forward(
-        self, inp: torch.Tensor, return_states: bool = False
+        self, inp: torch.Tensor, *, return_states: bool = False
     ) -> torch.Tensor | _SublayerForwardStatesResult:
         res = inp
         all_states: _SublayerStates = {}

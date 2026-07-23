@@ -119,7 +119,7 @@ def flex_route_classes(node: Node) -> tuple[str, str]:
     return attn[0], mlp[0]
 
 
-def first_hidden_slot(bias: bool) -> int:
+def first_hidden_slot(*, bias: bool) -> int:
     """The lowest hidden slot a scheduled node may pack into.
 
     ``bias=False`` reserves hidden slot 0 for the weight-writer's constant
@@ -128,7 +128,7 @@ def first_hidden_slot(bias: bool) -> int:
     return 0 if bias else 1
 
 
-def usable_hidden_slots(d_hidden: int, bias: bool) -> int:
+def usable_hidden_slots(d_hidden: int, *, bias: bool) -> int:
     """Hidden slots one layer's MLP can hand out to scheduled nodes.
 
     The eager scheduler's slot packing, the CP-SAT hidden-slot cumulative,
@@ -136,7 +136,7 @@ def usable_hidden_slots(d_hidden: int, bias: bool) -> int:
     routing rule decides whether a node *can* live in the MLP, and the two
     schedulers then have to be able to place what it decided.
     """
-    return d_hidden - first_hidden_slot(bias)
+    return d_hidden - first_hidden_slot(bias=bias)
 
 
 def fits_mlp(node: Node, usable_slots: int) -> bool:

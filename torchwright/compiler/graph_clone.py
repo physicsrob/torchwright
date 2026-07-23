@@ -106,7 +106,7 @@ _REBUILT_FIELDS = frozenset(
         "checks",
         "_structural_type",
         "_affine_bound",
-        "_semantic_affine_override",
+        "semantic_affine_override",
         # Weight-support cache (realization.live_weight_row_ranges).  Must
         # NOT ride the generic copy: lowering's folds mutate the clone's
         # output_matrix, and a stale copied cache would make the head charge
@@ -192,8 +192,8 @@ def _clone_default(
     # reached yet.
     clone.scheduling_predecessors = set()
 
-    override = src._semantic_affine_override
-    clone._semantic_affine_override = (
+    override = src.semantic_affine_override
+    clone.semantic_affine_override = (
         None if override is None else _remap_bound_basis(override, id_map)
     )
     refresh_node_caches(clone)

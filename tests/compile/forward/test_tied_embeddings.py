@@ -256,7 +256,7 @@ def _held_warm_start_hints(output, embedding, *, d, d_head, d_hidden, max_layers
         source=embedding, target=output, bank=tuple(rmap.get_indices(embedding))
     )
     table = RealizationTable.build(nodes).resolve_static(
-        nodes, SchedulingPolicy(), usable_hidden_slots(d_hidden, True)
+        nodes, SchedulingPolicy(), usable_hidden_slots(d_hidden, bias=True)
     )
     trace = _build_heuristic_schedule_trace(
         graph=graph,
@@ -385,7 +385,7 @@ def test_held_handoff_declines_same_layer_live_addend():
     table = RealizationTable.build(nodes).resolve_static(
         nodes,
         SchedulingPolicy(),
-        usable_hidden_slots(16, True),
+        usable_hidden_slots(16, bias=True),
         forced_classes={output.node_id: ATTN_TRANSPORT},
     )
     sched = LayerScheduler(
@@ -932,7 +932,7 @@ def test_unheld_bank_skip_names_the_held_output_bank():
     table = RealizationTable.build(all_nodes).resolve_static(
         all_nodes,
         SchedulingPolicy(),
-        usable_hidden_slots(d, True),
+        usable_hidden_slots(d, bias=True),
         forced_classes={out.node_id: ATTN_TRANSPORT},
     )
     # d_head == d leaves a single attention head: the dying-source escape

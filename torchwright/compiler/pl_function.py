@@ -497,7 +497,7 @@ def _merge_intervals(iv: torch.Tensor) -> torch.Tensor:
 
 
 def _in_intervals(
-    iv: torch.Tensor, xs: torch.Tensor, strict: bool = False
+    iv: torch.Tensor, xs: torch.Tensor, *, strict: bool = False
 ) -> torch.Tensor:
     """Boolean mask: which ``xs`` lie inside the merged intervals.
 
@@ -575,6 +575,329 @@ class _OracleCache:
         return torch.cat(self._vals[node])[rows].to(_F64)
 
 
+@dataclass
+class _WalkState:
+    """Mutable per-walk state threaded through the certify helpers."""
+
+    source: Node
+    lo: float
+    hi: float
+    plmap: dict[Node, PLFunction]
+    kinks: dict[Node, torch.Tensor]
+    bands: dict[Node, torch.Tensor]
+    consts: dict[Node, PLFunction]
+    edge_bends: dict[Node, tuple[bool, bool]]
+
+
+def _input_pl(u: Node, st: _WalkState) -> PLFunction:
+    if u is st.source:
+        return PLFunction.line(
+            torch.ones(1, dtype=_F64), torch.zeros(1, dtype=_F64), st.lo, st.hi
+        )
+    if isinstance(u, LiteralValue):
+        return PLFunction.constant(u.value, st.lo, st.hi)
+    pl = st.plmap.get(u)
+    if pl is not None:
+        return pl
+    # Neither the source nor a member: the finder attributes it to
+    # no subgraph, so its ancestry is literal-only — a constant
+    # subexpression.  Evaluate it once.
+    pl = st.consts.get(u)
+    if pl is None:
+        from torchwright.debug.probe import reference_eval
+        from torchwright.graph.node import suppress_checks
+
+        with suppress_checks():
+            val = reference_eval(u, {}, 1)[u][0]
+        pl = PLFunction.constant(val, st.lo, st.hi)
+        st.consts[u] = pl
+    return pl
+
+
+def _input_kinks(u: Node, st: _WalkState) -> torch.Tensor:
+    if u is st.source or u not in st.kinks:
+        return torch.zeros(0, dtype=_F64)
+    return st.kinks[u]
+
+
+def _input_bands(u: Node, st: _WalkState) -> torch.Tensor:
+    if u is st.source or u not in st.bands:
+        return torch.zeros(0, 2, dtype=_F64)
+    return st.bands[u]
+
+
+def _ffn_hinge_features(
+    phi: PLFunction, lo: float, hi: float, hinge_exact: float
+) -> tuple[torch.Tensor, list[torch.Tensor], list[torch.Tensor]]:
+    """An FFN crossing's kink candidates and analytic hinge bands.
+
+    Returns (crossings, extra_kink_sets, extra_band_rows).
+    """
+    ks: list[torch.Tensor] = []
+    bnd: list[torch.Tensor] = []
+    cross = _snap_f32(phi.zero_crossings())
+    ks.append(cross[(cross > lo) & (cross < hi)])
+    if hinge_exact > 0.0 and phi.n_knots >= _MIN_KNOTS_FOR_SEGMENT:
+        # Analytic hinge bands (see _HINGE_EXACT_Z): the
+        # interval where each crossing's pre-activation is
+        # within ±hinge_exact along its local slope.  The
+        # interval ends become knots (clean chord anchors);
+        # the intervals themselves become fillet zones and
+        # propagate downstream with the kink union.
+        y0, y1 = phi.y[:-1], phi.y[1:]
+        strad = (y0 * y1) < 0
+        if bool(strad.any()):
+            dxs = (phi.x[1:] - phi.x[:-1]).unsqueeze(1)
+            m_phi = ((y1 - y0) / dxs).abs().clamp(min=1e-30)
+            pos = phi.x[:-1].unsqueeze(1) + (y0 / (y0 - y1)) * dxs
+            half = hinge_exact / m_phi
+            # A band is excusable only when it is LOCAL — a
+            # shallow-slope crossing's ±hinge_exact region can
+            # span the whole domain, and excusing it would
+            # certify anything (a domain-wide fillet zone ate a
+            # step function whole before this bound existed).
+            # Domain-scale curvature is exactly what the chord
+            # certificate must MEASURE; only narrow transition
+            # machinery inherits the in-band clause.
+            local = strad & (half <= (hi - lo) / 16.0)
+            if bool(local.any()):
+                edge_lo = _snap_f32((pos - half)[local])
+                edge_hi = _snap_f32((pos + half)[local])
+                edges = torch.cat([edge_lo, edge_hi])
+                ks.append(edges[(edges > lo) & (edges < hi)])
+                bnd.append(torch.stack([edge_lo, edge_hi], dim=1))
+    return cross, ks, bnd
+
+
+def _max_child_devs(
+    child: list[MemberCertificate],
+) -> tuple[float, float, float, float, float, float]:
+    """Worst (deviation, banded, fillet) with locations over child certs."""
+    dev, dev_at = 0.0, 0.0
+    bdev, bdev_at = 0.0, 0.0
+    fdev, fdev_at = 0.0, 0.0
+    for c in child:
+        if c.deviation >= dev:
+            dev, dev_at = c.deviation, c.deviation_at
+        if c.banded_deviation >= bdev:
+            bdev, bdev_at = c.banded_deviation, c.banded_deviation_at
+        if c.fillet_deviation >= fdev:
+            fdev, fdev_at = c.fillet_deviation, c.fillet_deviation_at
+    return dev, dev_at, bdev, bdev_at, fdev, fdev_at
+
+
+def _narrow_band_zone(
+    fn: PLFunction,
+    is_plateau: torch.Tensor,
+    runs: list[tuple[int, int]],
+    seg: torch.Tensor,
+) -> torch.Tensor:
+    """Banded policy (see _BAND_PLATEAU_RATIO).
+
+    Samples strictly inside a transition run that is narrow relative to
+    both neighboring plateau runs.  Plateau runs narrower than a few
+    fp32 spacings do not separate (or anchor) runs — a sub-resolution
+    flat between two transitions is part of one band.
+    """
+    n_seg = int(is_plateau.shape[0])
+
+    def _plateau_is_separator(a: int, b: int) -> bool:
+        width = float(fn.x[b] - fn.x[a])
+        mag = max(1.0, float(fn.x[a].abs()), float(fn.x[b].abs()))
+        import math as _math
+
+        return width > 64.0 * 2.0 ** (_math.floor(_math.log2(mag)) - 23)
+
+    # Coalesced transition runs: (start_knot, end_knot) spans.
+    coalesced: list[tuple[int, int]] = []
+    for i, j in runs:
+        if coalesced and not _plateau_is_separator(coalesced[-1][1], i):
+            coalesced[-1] = (coalesced[-1][0], j)
+        else:
+            coalesced.append((i, j))
+    seg_in_narrow_run = torch.zeros(n_seg, dtype=torch.bool)
+    for i, j in coalesced:
+        width = float(fn.x[j] - fn.x[i])
+        left = 0.0
+        k = i
+        while k > 0 and bool(is_plateau[k - 1]):
+            k -= 1
+        if k < i:
+            left = float(fn.x[i] - fn.x[k])
+        right = 0.0
+        k = j
+        while k < n_seg and bool(is_plateau[k]):
+            k += 1
+        if k > j:
+            right = float(fn.x[k] - fn.x[j])
+        if (
+            left > 0.0
+            and right > 0.0
+            and width <= _BAND_PLATEAU_RATIO * min(left, right)
+        ):
+            seg_in_narrow_run[i:j] = True
+    return seg_in_narrow_run[seg]
+
+
+@dataclass
+class _CertCtx:
+    """Loop-invariant measurement context for :func:`_measure_member`."""
+
+    cache: _OracleCache
+    lo: float
+    hi: float
+    ladder: torch.Tensor
+    keep_raw: bool
+
+
+def _fillet_zone_mask(
+    fn: PLFunction,
+    samples: torch.Tensor,
+    err: torch.Tensor,
+    seg: torch.Tensor,
+    is_plateau: torch.Tensor,
+    edge_bend: tuple[bool, bool],
+) -> torch.Tensor:
+    """Classify samples: which ride the chain's own transition machinery.
+
+    A near-knot rung beside an interior knot (a candidate kink — a hinge
+    bend of the chain's own machinery) sits in the chain's transition
+    band — the fillet zone (see _MID_FRACTION).  Rungs beside a domain
+    endpoint are chargeable unless a bend coincides with that endpoint.
+    """
+    n = fn.n_knots
+    frac = (samples - fn.x[seg]) / (fn.x[seg + 1] - fn.x[seg])
+    interior = torch.ones(n, dtype=torch.bool)
+    interior[0], interior[-1] = edge_bend
+    near_left = frac <= _MID_FRACTION
+    near_right = frac >= 1.0 - _MID_FRACTION
+    fillet_zone = (near_left & interior[seg]) | (near_right & interior[seg + 1])
+    # Quantization-limited transitions: a ramp narrower than a few
+    # fp32 spacings at its own magnitude has no resolvable interior
+    # — any construction (the original chain included) quantizes it
+    # the same way, so its interior samples are reproduction-class,
+    # not chord-certificate evidence.
+    seg_w = fn.x[seg + 1] - fn.x[seg]
+    eps32 = 2.0 ** (torch.floor(torch.log2(samples.abs().clamp(min=1.0))) - 23)
+    fillet_zone |= (~is_plateau[seg]) & (seg_w <= 16.0 * eps32)
+    # Resolution floor (see _RES_FLOOR_K): deviation under
+    # slope·eps32(|x|) is the machine's own position quantization.
+    # The neighboring segments' slopes count too: a knot whose
+    # value is position-quantized (sampled mid-ramp because the
+    # true corner is within one fp32 spacing) tilts the chord of
+    # the segment NEXT to the ramp by up to ramp-slope·eps32.
+    seg_slopes = fn.segment_slopes().abs().amax(dim=1)
+    n_seg = int(seg_slopes.shape[0])
+    prev_s = seg_slopes[(seg - 1).clamp(0, n_seg - 1)]
+    next_s = seg_slopes[(seg + 1).clamp(0, n_seg - 1)]
+    local_slope = torch.maximum(seg_slopes[seg], torch.maximum(prev_s, next_s))
+    fillet_zone |= err <= _RES_FLOOR_K * local_slope * eps32
+    return fillet_zone
+
+
+def _measure_member(
+    m: Node,
+    kset: torch.Tensor,
+    edge_bend: tuple[bool, bool],
+    band: torch.Tensor,
+    ctx: _CertCtx,
+) -> tuple[PLFunction, MemberCertificate]:
+    """Sample one member against its chord function and certify it.
+
+    Returns the (simplified) propagated function and the certificate.
+    """
+    lo, hi = ctx.lo, ctx.hi
+    # Bracket every candidate with its fp32 neighbors: a transition
+    # sharper than fp32 resolution collapses both ramp-edge
+    # candidates onto one representable position whose oracle value
+    # is mid-step — without the ±1-ulp knots that mid-step value
+    # poisons the chords of both adjacent (wide) segments.
+    k32 = kset.to(torch.float32)
+    inf32 = torch.full_like(k32, float("inf"))
+    expanded = torch.cat(
+        [
+            kset,
+            torch.nextafter(k32, inf32).to(_F64),
+            torch.nextafter(k32, -inf32).to(_F64),
+        ]
+    )
+    expanded = expanded[(expanded > lo) & (expanded < hi)]
+    knots = torch.unique(torch.cat([torch.tensor([lo, hi], dtype=_F64), expanded]))
+    # Ladder samples inside every segment, snapped; drop any that
+    # land on a knot (adjacent-fp32 knots leave no interior).
+    x0 = knots[:-1].unsqueeze(1)
+    x1 = knots[1:].unsqueeze(1)
+    raw = _snap_f32(x0 + ctx.ladder.unsqueeze(0) * (x1 - x0)).reshape(-1)
+    knot_set = {float(v) for v in knots.tolist()}
+    samples = torch.unique(
+        torch.tensor(
+            [v for v in raw.tolist() if v not in knot_set] or [lo],
+            dtype=_F64,
+        )
+    )
+    ctx.cache.ensure(knots)
+    ctx.cache.ensure(samples)
+    # ``fn`` keeps every candidate (and bracket) as a knot — the
+    # measurement/classification frame: a candidate marks a band
+    # even where the composed value is flat (a canceling pair, a
+    # min whose fillet is the only feature).  The certificate's
+    # *reported* function sheds chord-consistent knots (below) so
+    # the shape models see real bends and mid-step anchors only.
+    fn = PLFunction(
+        knots,
+        ctx.cache.get(m, knots),
+        torch.zeros(m.d_output, dtype=_F64),
+        torch.zeros(m.d_output, dtype=_F64),
+    )
+    actual = ctx.cache.get(m, samples)
+    err = (actual - fn.eval(samples)).abs().amax(dim=1)
+
+    n = fn.n_knots
+    is_plateau, _runs = transition_runs(fn)
+    seg = (torch.searchsorted(fn.x, samples, right=True) - 1).clamp(0, n - 2)
+    fillet_zone = _fillet_zone_mask(fn, samples, err, seg, is_plateau, edge_bend)
+    # Analytic hinge bands (see _HINGE_EXACT_Z): a sample inside
+    # any ancestor hinge's ±hinge_exact interval rides the
+    # machine's own dip/tail — the documented in-band class,
+    # independent of how wide the surrounding knot spacing is.
+    fillet_zone |= _in_intervals(band, samples)
+
+    band_zone = _narrow_band_zone(fn, is_plateau, _runs, seg)
+
+    def _worst(mask: torch.Tensor) -> tuple[float, float]:
+        if not bool(mask.any()):
+            return 0.0, 0.0
+        e = torch.where(mask, err, torch.zeros_like(err))
+        i = int(e.argmax())
+        return float(e[i]), float(samples[i])
+
+    dev, dev_at = _worst(~fillet_zone)
+    bdev, bdev_at = _worst(~fillet_zone & ~band_zone)
+    fdev, fdev_at = _worst(fillet_zone | band_zone)
+    # The reported/propagated function: chord-consistent knots (the
+    # ±1-ulp brackets on straight stretches, oracle-noise wiggles)
+    # shed, real bends and mid-step anchors kept.  The sleeve
+    # tolerance is charged by the analysis layer (SIMPLIFY_TOL).
+    fn_raw = fn
+    fn = fn.simplified(SIMPLIFY_TOL)
+    cert = MemberCertificate(
+        node=m,
+        fn=fn,
+        n_kinks=int(kset.numel()),
+        deviation=dev,
+        deviation_at=dev_at,
+        banded_deviation=bdev,
+        banded_deviation_at=bdev_at,
+        fillet_deviation=fdev,
+        fillet_deviation_at=fdev_at,
+        n_samples=int(samples.numel()),
+        bands=band,
+        kinks_raw=kset if ctx.keep_raw else None,
+        fn_raw=fn_raw if ctx.keep_raw else None,
+    )
+    return fn, cert
+
+
 def certify_subgraph(
     source: Node,
     members: Sequence[Node],
@@ -641,95 +964,42 @@ def certify_subgraph(
             return _seeded_oracle(members, source, grid)
 
     cache = _OracleCache(oracle)
-    plmap: dict[Node, PLFunction] = {}
-    kinks: dict[Node, torch.Tensor] = {}
-    # Per-member analytic hinge-band intervals (merged (k, 2) rows),
-    # unioned through inputs like the kink sets — see _HINGE_EXACT_Z.
-    bands: dict[Node, torch.Tensor] = {}
     certs: dict[Node, MemberCertificate] = {}
-    # Whether a hinge bend coincides with a domain endpoint — the
-    # endpoint knot is then band-bearing for the fillet-zone split.
-    edge_bends: dict[Node, tuple[bool, bool]] = {}
-
-    consts: dict[Node, PLFunction] = {}
-
-    def input_pl(u: Node) -> PLFunction:
-        if u is source:
-            return PLFunction.line(
-                torch.ones(1, dtype=_F64), torch.zeros(1, dtype=_F64), lo, hi
-            )
-        if isinstance(u, LiteralValue):
-            return PLFunction.constant(u.value, lo, hi)
-        pl = plmap.get(u)
-        if pl is not None:
-            return pl
-        # Neither the source nor a member: the finder attributes it to
-        # no subgraph, so its ancestry is literal-only — a constant
-        # subexpression.  Evaluate it once.
-        pl = consts.get(u)
-        if pl is None:
-            from torchwright.debug.probe import reference_eval
-            from torchwright.graph.node import suppress_checks
-
-            with suppress_checks():
-                val = reference_eval(u, {}, 1)[u][0]
-            pl = PLFunction.constant(val, lo, hi)
-            consts[u] = pl
-        return pl
-
-    def input_kinks(u: Node) -> torch.Tensor:
-        if u is source or u not in kinks:
-            return torch.zeros(0, dtype=_F64)
-        return kinks[u]
-
-    def input_bands(u: Node) -> torch.Tensor:
-        if u is source or u not in bands:
-            return torch.zeros(0, 2, dtype=_F64)
-        return bands[u]
-
-    ladder = torch.tensor(_LADDER, dtype=_F64)
+    st = _WalkState(
+        source=source,
+        lo=lo,
+        hi=hi,
+        plmap={},
+        # Per-member analytic hinge-band intervals (merged (k, 2) rows),
+        # unioned through inputs like the kink sets — see _HINGE_EXACT_Z.
+        kinks={},
+        bands={},
+        consts={},
+        # Whether a hinge bend coincides with a domain endpoint — the
+        # endpoint knot is then band-bearing for the fillet-zone split.
+        edge_bends={},
+    )
+    ctx = _CertCtx(
+        cache=cache,
+        lo=lo,
+        hi=hi,
+        ladder=torch.tensor(_LADDER, dtype=_F64),
+        keep_raw=keep_raw,
+    )
     declined: str | None = None
 
     for m in members:
-        ks = [input_kinks(u) for u in m.inputs]
-        bnd = [input_bands(u) for u in m.inputs]
-        bend_lo = any(edge_bends.get(u, (False, False))[0] for u in m.inputs)
-        bend_hi = any(edge_bends.get(u, (False, False))[1] for u in m.inputs)
+        ks = [_input_kinks(u, st) for u in m.inputs]
+        bnd = [_input_bands(u, st) for u in m.inputs]
+        bend_lo = any(st.edge_bends.get(u, (False, False))[0] for u in m.inputs)
+        bend_hi = any(st.edge_bends.get(u, (False, False))[1] for u in m.inputs)
         if isinstance(m, FFN):
-            phi = input_pl(m.inputs[0]).map_affine(
+            phi = _input_pl(m.inputs[0], st).map_affine(
                 m.gate_proj.t().to(_F64), m.gate_bias.to(_F64)
             )
-            cross = _snap_f32(phi.zero_crossings())
-            ks.append(cross[(cross > lo) & (cross < hi)])
-            if hinge_exact > 0.0 and phi.n_knots >= _MIN_KNOTS_FOR_SEGMENT:
-                # Analytic hinge bands (see _HINGE_EXACT_Z): the
-                # interval where each crossing's pre-activation is
-                # within ±hinge_exact along its local slope.  The
-                # interval ends become knots (clean chord anchors);
-                # the intervals themselves become fillet zones and
-                # propagate downstream with the kink union.
-                y0, y1 = phi.y[:-1], phi.y[1:]
-                strad = (y0 * y1) < 0
-                if bool(strad.any()):
-                    dxs = (phi.x[1:] - phi.x[:-1]).unsqueeze(1)
-                    m_phi = ((y1 - y0) / dxs).abs().clamp(min=1e-30)
-                    pos = phi.x[:-1].unsqueeze(1) + (y0 / (y0 - y1)) * dxs
-                    half = hinge_exact / m_phi
-                    # A band is excusable only when it is LOCAL — a
-                    # shallow-slope crossing's ±hinge_exact region can
-                    # span the whole domain, and excusing it would
-                    # certify anything (a domain-wide fillet zone ate a
-                    # step function whole before this bound existed).
-                    # Domain-scale curvature is exactly what the chord
-                    # certificate must MEASURE; only narrow transition
-                    # machinery inherits the in-band clause.
-                    local = strad & (half <= (hi - lo) / 16.0)
-                    if bool(local.any()):
-                        edge_lo = _snap_f32((pos - half)[local])
-                        edge_hi = _snap_f32((pos + half)[local])
-                        edges = torch.cat([edge_lo, edge_hi])
-                        ks.append(edges[(edges > lo) & (edges < hi)])
-                        bnd.append(torch.stack([edge_lo, edge_hi], dim=1))
+            cross, ks_extra, bnd_extra = _ffn_hinge_features(phi, lo, hi, hinge_exact)
+            ks.extend(ks_extra)
+            bnd.extend(bnd_extra)
             # A bend can coincide with a domain endpoint: a crossing
             # snapped onto it, or a gate argument exactly zero there
             # (zero_crossings records only strict straddles).
@@ -739,10 +1009,10 @@ def certify_subgraph(
             bend_hi = (
                 bend_hi or bool((cross == hi).any()) or bool((phi.y[-1] == 0).any())
             )
-        bands[m] = (
+        st.bands[m] = (
             _merge_intervals(torch.cat(bnd)) if bnd else torch.zeros(0, 2, dtype=_F64)
         )
-        edge_bends[m] = (bend_lo, bend_hi)
+        st.edge_bends[m] = (bend_lo, bend_hi)
         kset = torch.unique(torch.cat(ks)) if ks else torch.zeros(0, dtype=_F64)
         m_name = m.name or type(m).__name__
         if kset.numel() > max_kinks:
@@ -751,24 +1021,15 @@ def certify_subgraph(
                 f"{kset.numel()} candidates > cap {max_kinks}"
             )
             break
-        kinks[m] = kset
+        st.kinks[m] = kset
 
         if isinstance(m, Concatenate):
-            plmap[m] = PLFunction.concat([input_pl(u) for u in m.inputs])
+            st.plmap[m] = PLFunction.concat([_input_pl(u, st) for u in m.inputs])
             child = [certs[u] for u in m.inputs if u in certs]
-            dev, dev_at = 0.0, 0.0
-            bdev, bdev_at = 0.0, 0.0
-            fdev, fdev_at = 0.0, 0.0
-            for c in child:
-                if c.deviation >= dev:
-                    dev, dev_at = c.deviation, c.deviation_at
-                if c.banded_deviation >= bdev:
-                    bdev, bdev_at = c.banded_deviation, c.banded_deviation_at
-                if c.fillet_deviation >= fdev:
-                    fdev, fdev_at = c.fillet_deviation, c.fillet_deviation_at
+            dev, dev_at, bdev, bdev_at, fdev, fdev_at = _max_child_devs(child)
             certs[m] = MemberCertificate(
                 node=m,
-                fn=plmap[m],
+                fn=st.plmap[m],
                 n_kinks=int(kset.numel()),
                 deviation=dev,
                 deviation_at=dev_at,
@@ -777,174 +1038,15 @@ def certify_subgraph(
                 fillet_deviation=fdev,
                 fillet_deviation_at=fdev_at,
                 n_samples=0,
-                bands=bands[m],
+                bands=st.bands[m],
                 kinks_raw=kset if keep_raw else None,
-                fn_raw=plmap[m] if keep_raw else None,
+                fn_raw=st.plmap[m] if keep_raw else None,
             )
             continue
 
-        # Bracket every candidate with its fp32 neighbors: a transition
-        # sharper than fp32 resolution collapses both ramp-edge
-        # candidates onto one representable position whose oracle value
-        # is mid-step — without the ±1-ulp knots that mid-step value
-        # poisons the chords of both adjacent (wide) segments.
-        k32 = kset.to(torch.float32)
-        inf32 = torch.full_like(k32, float("inf"))
-        expanded = torch.cat(
-            [
-                kset,
-                torch.nextafter(k32, inf32).to(_F64),
-                torch.nextafter(k32, -inf32).to(_F64),
-            ]
-        )
-        expanded = expanded[(expanded > lo) & (expanded < hi)]
-        knots = torch.unique(torch.cat([torch.tensor([lo, hi], dtype=_F64), expanded]))
-        # Ladder samples inside every segment, snapped; drop any that
-        # land on a knot (adjacent-fp32 knots leave no interior).
-        x0 = knots[:-1].unsqueeze(1)
-        x1 = knots[1:].unsqueeze(1)
-        raw = _snap_f32(x0 + ladder.unsqueeze(0) * (x1 - x0)).reshape(-1)
-        knot_set = {float(v) for v in knots.tolist()}
-        samples = torch.unique(
-            torch.tensor(
-                [v for v in raw.tolist() if v not in knot_set] or [lo],
-                dtype=_F64,
-            )
-        )
-        cache.ensure(knots)
-        cache.ensure(samples)
-        # ``fn`` keeps every candidate (and bracket) as a knot — the
-        # measurement/classification frame: a candidate marks a band
-        # even where the composed value is flat (a canceling pair, a
-        # min whose fillet is the only feature).  The certificate's
-        # *reported* function sheds chord-consistent knots (below) so
-        # the shape models see real bends and mid-step anchors only.
-        fn = PLFunction(
-            knots,
-            cache.get(m, knots),
-            torch.zeros(m.d_output, dtype=_F64),
-            torch.zeros(m.d_output, dtype=_F64),
-        )
-        actual = cache.get(m, samples)
-        err = (actual - fn.eval(samples)).abs().amax(dim=1)
-
-        # Classify samples: a near-knot rung beside an interior knot
-        # (a candidate kink — a hinge bend of the chain's own
-        # machinery) sits in the chain's transition band — the fillet
-        # zone (see _MID_FRACTION).  Rungs beside a domain endpoint are
-        # chargeable unless a bend coincides with that endpoint.
-        n = fn.n_knots
-        is_plateau, _runs = transition_runs(fn)
-        seg = (torch.searchsorted(fn.x, samples, right=True) - 1).clamp(0, n - 2)
-        frac = (samples - fn.x[seg]) / (fn.x[seg + 1] - fn.x[seg])
-        interior = torch.ones(n, dtype=torch.bool)
-        interior[0], interior[-1] = edge_bends[m]
-        near_left = frac <= _MID_FRACTION
-        near_right = frac >= 1.0 - _MID_FRACTION
-        fillet_zone = (near_left & interior[seg]) | (near_right & interior[seg + 1])
-        # Quantization-limited transitions: a ramp narrower than a few
-        # fp32 spacings at its own magnitude has no resolvable interior
-        # — any construction (the original chain included) quantizes it
-        # the same way, so its interior samples are reproduction-class,
-        # not chord-certificate evidence.
-        seg_w = fn.x[seg + 1] - fn.x[seg]
-        eps32 = 2.0 ** (torch.floor(torch.log2(samples.abs().clamp(min=1.0))) - 23)
-        fillet_zone |= (~is_plateau[seg]) & (seg_w <= 16.0 * eps32)
-        # Resolution floor (see _RES_FLOOR_K): deviation under
-        # slope·eps32(|x|) is the machine's own position quantization.
-        # The neighboring segments' slopes count too: a knot whose
-        # value is position-quantized (sampled mid-ramp because the
-        # true corner is within one fp32 spacing) tilts the chord of
-        # the segment NEXT to the ramp by up to ramp-slope·eps32.
-        seg_slopes = fn.segment_slopes().abs().amax(dim=1)
-        n_seg = int(seg_slopes.shape[0])
-        prev_s = seg_slopes[(seg - 1).clamp(0, n_seg - 1)]
-        next_s = seg_slopes[(seg + 1).clamp(0, n_seg - 1)]
-        local_slope = torch.maximum(seg_slopes[seg], torch.maximum(prev_s, next_s))
-        fillet_zone |= err <= _RES_FLOOR_K * local_slope * eps32
-        # Analytic hinge bands (see _HINGE_EXACT_Z): a sample inside
-        # any ancestor hinge's ±hinge_exact interval rides the
-        # machine's own dip/tail — the documented in-band class,
-        # independent of how wide the surrounding knot spacing is.
-        fillet_zone |= _in_intervals(bands[m], samples)
-
-        # Banded policy (see _BAND_PLATEAU_RATIO): samples strictly
-        # inside a transition run that is narrow relative to both
-        # neighboring plateau runs.  Plateau runs narrower than a few
-        # fp32 spacings do not separate (or anchor) runs — a
-        # sub-resolution flat between two transitions is part of one
-        # band.
-        n_seg = int(is_plateau.shape[0])
-
-        def _plateau_is_separator(a: int, b: int) -> bool:
-            width = float(fn.x[b] - fn.x[a])
-            mag = max(1.0, float(fn.x[a].abs()), float(fn.x[b].abs()))
-            import math as _math
-
-            return width > 64.0 * 2.0 ** (_math.floor(_math.log2(mag)) - 23)
-
-        # Coalesced transition runs: (start_knot, end_knot) spans.
-        coalesced: list[tuple[int, int]] = []
-        for i, j in _runs:
-            if coalesced and not _plateau_is_separator(coalesced[-1][1], i):
-                coalesced[-1] = (coalesced[-1][0], j)
-            else:
-                coalesced.append((i, j))
-        seg_in_narrow_run = torch.zeros(n_seg, dtype=torch.bool)
-        for i, j in coalesced:
-            width = float(fn.x[j] - fn.x[i])
-            left = 0.0
-            k = i
-            while k > 0 and bool(is_plateau[k - 1]):
-                k -= 1
-            if k < i:
-                left = float(fn.x[i] - fn.x[k])
-            right = 0.0
-            k = j
-            while k < n_seg and bool(is_plateau[k]):
-                k += 1
-            if k > j:
-                right = float(fn.x[k] - fn.x[j])
-            if (
-                left > 0.0
-                and right > 0.0
-                and width <= _BAND_PLATEAU_RATIO * min(left, right)
-            ):
-                seg_in_narrow_run[i:j] = True
-        band_zone = seg_in_narrow_run[seg]
-
-        def _worst(mask: torch.Tensor) -> tuple[float, float]:
-            if not bool(mask.any()):
-                return 0.0, 0.0
-            e = torch.where(mask, err, torch.zeros_like(err))
-            i = int(e.argmax())
-            return float(e[i]), float(samples[i])
-
-        dev, dev_at = _worst(~fillet_zone)
-        bdev, bdev_at = _worst(~fillet_zone & ~band_zone)
-        fdev, fdev_at = _worst(fillet_zone | band_zone)
-        # The reported/propagated function: chord-consistent knots (the
-        # ±1-ulp brackets on straight stretches, oracle-noise wiggles)
-        # shed, real bends and mid-step anchors kept.  The sleeve
-        # tolerance is charged by the analysis layer (SIMPLIFY_TOL).
-        fn_raw = fn
-        fn = fn.simplified(SIMPLIFY_TOL)
-        plmap[m] = fn
-        certs[m] = MemberCertificate(
-            node=m,
-            fn=fn,
-            n_kinks=int(kset.numel()),
-            deviation=dev,
-            deviation_at=dev_at,
-            banded_deviation=bdev,
-            banded_deviation_at=bdev_at,
-            fillet_deviation=fdev,
-            fillet_deviation_at=fdev_at,
-            n_samples=int(samples.numel()),
-            bands=bands[m],
-            kinks_raw=kset if keep_raw else None,
-            fn_raw=fn_raw if keep_raw else None,
-        )
+        fn, cert = _measure_member(m, kset, st.edge_bends[m], st.bands[m], ctx)
+        st.plmap[m] = fn
+        certs[m] = cert
 
     return SubgraphCertificate(
         source=source,

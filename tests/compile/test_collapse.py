@@ -33,7 +33,7 @@ def _ops(machine):
     return ops
 
 
-def _staircase_chain(machine, lo=0.0, hi=9.0, integer=True):
+def _staircase_chain(machine, lo=0.0, hi=9.0, *, integer=True):
     """A depth->=2 univariate chain of x: min(cmp(x,2.5), cmp(x,5.5)).
 
     Composed function: -1 for x <= 5, +1 for x >= 6 — a one-step

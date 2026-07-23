@@ -76,6 +76,16 @@ def _current_node_id() -> int:
     return _node_mod.global_node_id
 
 
+def _is_entry_node(cur: Node, lo: int) -> bool:
+    """True when all of *cur*'s flattened inputs are strictly pre-iteration."""
+    for inp in cur.inputs:
+        flat = flatten_concat_nodes([inp]) if isinstance(inp, Concatenate) else [inp]
+        for leaf in flat:
+            if leaf.node_id >= lo:
+                return False
+    return True
+
+
 def _find_entry_nodes(terminal: Node, lo: int, hi: int) -> list[Node]:
     """Find this iteration's entry nodes.
 
@@ -106,18 +116,7 @@ def _find_entry_nodes(terminal: Node, lo: int, hi: int) -> list[Node]:
             continue
         # Non-Concatenate in-range node.  Check if it's an entry:
         # all of its flattened inputs must be strictly pre-iteration.
-        is_entry = True
-        for inp in cur.inputs:
-            flat = (
-                flatten_concat_nodes([inp]) if isinstance(inp, Concatenate) else [inp]
-            )
-            for leaf in flat:
-                if leaf.node_id >= lo:
-                    is_entry = False
-                    break
-            if not is_entry:
-                break
-        if is_entry:
+        if _is_entry_node(cur, lo):
             entries.append(cur)
         # Keep walking backward through all inputs to find deeper entries.
         stack.extend(cur.inputs)

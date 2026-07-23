@@ -264,7 +264,7 @@ def _reserve_rms_norm_columns(
         )
 
     n_const = len(col_exps)
-    free_sorted = sorted(residual_map._free)
+    free_sorted = residual_map.free_columns()
     if len(free_sorted) < n_const:
         raise RuntimeError(
             f"rms_norm needs {n_const} free residual column(s) to pin the RMS at "
@@ -395,10 +395,10 @@ class _TrackingResidualStreamMap(ResidualStreamMap):
         super().__init__(base.d)
         # Copy state from the cloned base map.  We can't reuse base
         # directly because the tracking subclass is a different type.
-        self._free = set(base._free)
-        self._node_to_indices = dict(base._node_to_indices)
-        self._held = set(base._held)
-        self._reserved = set(base._reserved)
+        self._free = set(base.free_columns())
+        self._node_to_indices = base.assignments()
+        self._held = set(base.held_columns())
+        self._reserved = set(base.reserved_columns())
         self.current_layer: int = 0
         self.cancel_layer: dict[int, int] = {}
         # Which sublayer each free ran in ("attn"/"mlp"), captured alongside
@@ -454,6 +454,48 @@ class HeuristicScheduleTrace:
     @property
     def is_complete(self) -> bool:
         return self.n_layers > 0 and bool(self.node_to_layer)
+
+
+def _absorb_completed_concats(graph: GraphAnalyzer, computed: set[Node]) -> None:
+    """Mark every Concatenate whose leaves are all computed as computed."""
+    for node in graph.get_all_nodes():
+        if (
+            isinstance(node, Concatenate)
+            and node not in computed
+            and all(leaf in computed for leaf in flatten_concat_nodes([node]))
+        ):
+            computed.add(node)
+
+
+def _record_layer_ops(
+    attn_ops: list,
+    mlp_ops: list,
+    hint_routing: dict,
+    hint_add_placement: dict[int, tuple[bool, int | None]],
+) -> None:
+    """Record one layer's routing contract and Add placement observations.
+
+    CP-SAT formerly needed hints only for flexible Linears, but
+    deterministic replay needs every schedulable node's chosen sublayer.
+    Every Add additionally records its physical placement observation —
+    the emitted op says whether the walk reused a target occurrence or
+    placed fresh.
+    """
+    op: Any  # heterogeneous loops: _AttentionOp records, then _MlpOp
+    for op in attn_ops:
+        if op.node is not None and op.op_type != "cancel":
+            hint_routing[op.node.node_id] = "attn"
+        if op.op_type == "add_into":
+            hint_add_placement[op.node.node_id] = (True, op.reuse_input_index)
+        elif op.op_type == "compute_add":
+            hint_add_placement[op.node.node_id] = (False, None)
+    for op in mlp_ops:
+        if op.node is not None and not op.op_type.startswith("cancel"):
+            hint_routing[op.node.node_id] = "mlp"
+        if op.op_type == "add_into_bypass":
+            hint_add_placement[op.node.node_id] = (True, op.reuse_input_index)
+        elif op.op_type == "compute_add_bypass":
+            hint_add_placement[op.node.node_id] = (False, None)
 
 
 def _build_heuristic_schedule_trace(
@@ -517,33 +559,8 @@ def _build_heuristic_schedule_trace(
         # an optional solver hint. Preserve LayerScheduler's detailed
         # geometry/deadlock diagnostic if it cannot construct one.
         attn_ops, mlp_ops, _ = hint_scheduler.schedule_layer(hint_rmap, hint_computed)
-        # Record the complete routing contract. CP-SAT formerly needed hints
-        # only for flexible Linears, but deterministic replay needs every
-        # schedulable node's chosen sublayer.  Every Add additionally records
-        # its physical placement observation — the emitted op says whether
-        # the walk reused a target occurrence or placed fresh.
-        op: Any  # heterogeneous loops: _AttentionOp records, then _MlpOp
-        for op in attn_ops:
-            if op.node is not None and op.op_type != "cancel":
-                hint_routing[op.node.node_id] = "attn"
-            if op.op_type == "add_into":
-                hint_add_placement[op.node.node_id] = (True, op.reuse_input_index)
-            elif op.op_type == "compute_add":
-                hint_add_placement[op.node.node_id] = (False, None)
-        for op in mlp_ops:
-            if op.node is not None and not op.op_type.startswith("cancel"):
-                hint_routing[op.node.node_id] = "mlp"
-            if op.op_type == "add_into_bypass":
-                hint_add_placement[op.node.node_id] = (True, op.reuse_input_index)
-            elif op.op_type == "compute_add_bypass":
-                hint_add_placement[op.node.node_id] = (False, None)
-        for node in graph.get_all_nodes():
-            if (
-                isinstance(node, Concatenate)
-                and node not in hint_computed
-                and all(leaf in hint_computed for leaf in flatten_concat_nodes([node]))
-            ):
-                hint_computed.add(node)
+        _record_layer_ops(attn_ops, mlp_ops, hint_routing, hint_add_placement)
+        _absorb_completed_concats(graph, hint_computed)
         for n in hint_computed - prev_hint:
             hint_layers[n.node_id] = hi
         if not attn_ops and not mlp_ops:
@@ -681,6 +698,24 @@ def _check_replay_depth(
         )
 
 
+def _written_nodes(attn_ops: list, mlp_ops: list) -> set[Node]:
+    """Nodes some op in this layer writes a value for (cancels excluded)."""
+    written_nodes: set[Node] = set()
+    for op in attn_ops:
+        if op.op_type == "cancel":
+            continue
+        if op.node is not None:
+            written_nodes.add(op.node)
+    for op in mlp_ops:
+        if op.op_type == "cancel_bypass":
+            # Zeroes an already-freed node's columns (node=None); not a fresh
+            # write, exactly like the attention "cancel" carve-out above.
+            continue
+        if op.node is not None:
+            written_nodes.add(op.node)
+    return written_nodes
+
+
 def _verify_end_of_layer_writes(
     attn_ops: list,
     mlp_ops: list,
@@ -705,19 +740,7 @@ def _verify_end_of_layer_writes(
     :func:`_verify_end_of_layer_liveness` — the walk is cheap but
     the assertion machinery is debug-mode only.
     """
-    written_nodes: set[Node] = set()
-    for op in attn_ops:
-        if op.op_type == "cancel":
-            continue
-        if op.node is not None:
-            written_nodes.add(op.node)
-    for op in mlp_ops:
-        if op.op_type == "cancel_bypass":
-            # Zeroes an already-freed node's columns (node=None); not a fresh
-            # write, exactly like the attention "cancel" carve-out above.
-            continue
-        if op.node is not None:
-            written_nodes.add(op.node)
+    written_nodes = _written_nodes(attn_ops, mlp_ops)
 
     newly_computed = computed - prev_computed
     for node in newly_computed:
@@ -830,11 +853,34 @@ def _snapshot_residual_map(
         sorted(
             (
                 (node.node_id, tuple(cols))
-                for node, cols in residual_map._node_to_indices.items()
+                for node, cols in residual_map.assignments().items()
             ),
             key=lambda item: item[0],
         )
     )
+
+
+def _verify_held_output_layout(
+    layout: HeldOutputLayout,
+    planned_rmap: ResidualStreamMap,
+    output_node: Node,
+    const_one: Node,
+) -> None:
+    """Tied output-layout validation on the planner's final allocator state."""
+    if planned_rmap.has_held():
+        raise AssertionError(
+            f"held output bank was never claimed: {planned_rmap.held_columns()[:8]}"
+        )
+    if planned_rmap.is_allocated(layout.source):
+        raise AssertionError("held source still owns residual columns at completion")
+    actual_output_bank = tuple(planned_rmap.get_indices(output_node))
+    if actual_output_bank != layout.bank:
+        raise AssertionError(
+            f"held output bank order changed: expected "
+            f"{layout.bank}, got {actual_output_bank}"
+        )
+    if planned_rmap.is_allocated(const_one):
+        raise AssertionError("final literal seed was not retired")
 
 
 def _build_replay_plan(
@@ -887,15 +933,7 @@ def _build_replay_plan(
         attn_ops, mlp_ops, biased_linears = scheduler.schedule_layer(
             planned_rmap, planned_computed
         )
-        for node in graph.get_all_nodes():
-            if (
-                isinstance(node, Concatenate)
-                and node not in planned_computed
-                and all(
-                    leaf in planned_computed for leaf in flatten_concat_nodes([node])
-                )
-            ):
-                planned_computed.add(node)
+        _absorb_completed_concats(graph, planned_computed)
 
         newly_computed = tuple(
             sorted(planned_computed - previous, key=lambda node: node.node_id)
@@ -965,23 +1003,9 @@ def _build_replay_plan(
         # Tied output-layout validation on the planner's final allocator
         # state (the emission loop below is a pure consumer of this plan
         # and never advances an allocator).
-        layout = scheduler.held_output_layout
-        if planned_rmap.has_held():
-            raise AssertionError(
-                f"held output bank was never claimed: {planned_rmap.held_columns()[:8]}"
-            )
-        if planned_rmap.is_allocated(layout.source):
-            raise AssertionError(
-                "held source still owns residual columns at completion"
-            )
-        actual_output_bank = tuple(planned_rmap.get_indices(output_node))
-        if actual_output_bank != layout.bank:
-            raise AssertionError(
-                f"held output bank order changed: expected "
-                f"{layout.bank}, got {actual_output_bank}"
-            )
-        if planned_rmap.is_allocated(const_one):
-            raise AssertionError("final literal seed was not retired")
+        _verify_held_output_layout(
+            scheduler.held_output_layout, planned_rmap, output_node, const_one
+        )
     if not layers:
         # Runtime models require one layer to expose input/output residual
         # states.  Make that physical placeholder part of the plan so sinks
@@ -1025,7 +1049,7 @@ def _build_replay_plan(
     )
 
 
-def _params_per_slot(d: int, activation: str, bias: bool = True) -> int:
+def _params_per_slot(d: int, activation: str, *, bias: bool = True) -> int:
     """Parameters one occupied hidden slot costs, by machine.
 
     ReLU machine: a linear1 column + bias and a linear2 row + bias
@@ -1045,6 +1069,7 @@ def _count_layer_params(
     d: int,
     d_head: int,
     activation: str = "relu",
+    *,
     bias: bool = True,
 ) -> int:
     """Count transformer parameters used by one layer's ops.
@@ -1070,7 +1095,7 @@ def _count_layer_params(
         ):
             bias_entries += len(mlp_op.target_cols)
 
-    params_per_slot = _params_per_slot(d, activation, bias)
+    params_per_slot = _params_per_slot(d, activation, bias=bias)
     return heads_used * params_per_head + slots_used * params_per_slot + bias_entries
 
 
@@ -1078,6 +1103,7 @@ def forward_compile(
     d: int,
     d_head: int,
     output_node: Node,
+    *,
     verbose: bool = True,
     max_layers: int = 100,
     device: str | None = "auto",
@@ -1605,7 +1631,7 @@ def forward_compile(
     # standalone Linear has an MLP-bypass realization at all, so both
     # resolvers read it: `resolve_static` below, and `routing()` inside the
     # CP-SAT model (which receives it as its `d_hidden`).
-    solver_d_hidden = usable_hidden_slots(d_hidden, bias)
+    solver_d_hidden = usable_hidden_slots(d_hidden, bias=bias)
     static_realization_table = lowered.realization_table.resolve_static(
         graph.get_all_nodes(),
         policy,
@@ -2369,7 +2395,7 @@ def forward_compile(
         total_layer_time += layer_time
 
         layer_params = _count_layer_params(
-            attn_ops, mlp_ops, d, d_head, activation, bias
+            attn_ops, mlp_ops, d, d_head, activation, bias=bias
         )
         per_layer_head_counts.append(_count_heads_by_type(attn_ops, d_head))
         total_params += layer_params
@@ -2577,7 +2603,9 @@ def forward_compile(
         if verbose:
             mlp_before = d_hidden * len(net.layers)
             mlp_after = sum(layer.mlp.d_hidden for layer in net.layers)
-            mlp_saved = (mlp_before - mlp_after) * _params_per_slot(d, activation, bias)
+            mlp_saved = (mlp_before - mlp_after) * _params_per_slot(
+                d, activation, bias=bias
+            )
             print(
                 f"\n  MLP trimming: {mlp_before - mlp_after}/{mlp_before} "
                 f"slots trimmed ({mlp_saved:,} params saved)"

@@ -141,7 +141,7 @@ def _node_field_matches(key, sval, cval, node_map):
     elif key == "_affine_bound":
         sr, cr = sval.to_scalar_range(), cval.to_scalar_range()
         result = (sr.lo, sr.hi) == (cr.lo, cr.hi)
-    elif key == "_semantic_affine_override":
+    elif key == "semantic_affine_override":
         if sval is None or cval is None:
             result = sval is None and cval is None
         else:
@@ -300,7 +300,7 @@ def test_clone_remaps_semantic_override_basis():
     x = create_input("x", 1, value_range=(-10.0, 10.0))
     cmp = compare(x, 0.0, true_level=1.0, false_level=-1.0)
     overridden = [
-        n for n in get_ancestor_nodes({cmp}) if n._semantic_affine_override is not None
+        n for n in get_ancestor_nodes({cmp}) if n.semantic_affine_override is not None
     ]
     assert overridden, "compare() should install a semantic override"
 
@@ -308,13 +308,13 @@ def test_clone_remaps_semantic_override_basis():
     source_ids = {n.node_id for n in copy.node_map}
     for src in overridden:
         clone = copy.node_map[src]
-        ov = clone._semantic_affine_override
+        ov = clone.semantic_affine_override
         assert ov is not None
         for nid in list(ov.columns) + list(ov.input_ranges):
             assert nid not in source_ids, (
                 f"clone override basis still keyed by source node id {nid}"
             )
-        sr = src._semantic_affine_override.to_scalar_range()
+        sr = src.semantic_affine_override.to_scalar_range()
         cr = ov.to_scalar_range()
         assert (sr.lo, sr.hi) == (cr.lo, cr.hi)
         # And the override is live: the clone's bound IS the override.

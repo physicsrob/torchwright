@@ -103,7 +103,7 @@ def test_compiled_zero_support_floor_head_is_compacted():
     other = Linear(y, torch.randn(D_HEAD, 2) * 0.2, name="other")
     out = Concatenate([lin, other])
 
-    def compile_(trim):
+    def compile_(*, trim):
         return forward_compile(
             d=64,
             d_head=D_HEAD,
@@ -114,7 +114,7 @@ def test_compiled_zero_support_floor_head_is_compacted():
             trim_heads=trim,
         )
 
-    untrimmed = compile_(False)
+    untrimmed = compile_(trim=False)
 
     def dead_allocated_heads(net):
         return sum(
@@ -127,7 +127,7 @@ def test_compiled_zero_support_floor_head_is_compacted():
     # is allocated and dead.
     assert dead_allocated_heads(untrimmed) >= 1
 
-    trimmed = compile_(True)
+    trimmed = compile_(trim=True)
 
     def heads(net):
         return sum(layer.attn.attn.n_heads for layer in net.layers)

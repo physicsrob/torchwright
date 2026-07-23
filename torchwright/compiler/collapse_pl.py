@@ -44,6 +44,7 @@ schedule-cache key.
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
 import torch
@@ -53,17 +54,19 @@ from torchwright.compiler.collapse import (
     _SYNTH_CLAIM_ATOL,
     CollapseReport,
     SubgraphOutcome,
+    _index_subgraphs,
     _machine,
     _member_depths,
+    _node_label,
     _piecewise_linear_fn,
     _seeded_oracle,
-    scalar_sources,
 )
 from torchwright.compiler.graph_clone import topological_order
 from torchwright.compiler.pl_function import (
     _HINGE_EXACT_Z,
     SIMPLIFY_TOL,
     PLFunction,
+    SubgraphCertificate,
     _in_intervals,
     band_skeleton,
     certify_subgraph,
@@ -102,14 +105,7 @@ _FLAT_SLOPE_ATOL = 1e-12
 _KINK_PRESCREEN_FACTOR = 4
 
 
-def _emit_s1(
-    source: Node,
-    skel: PLFunction,
-    machine: str | None,
-    lane_cap: int,
-    budget: float,
-    name: str,
-) -> Node:
+def _emit_s1(source: Node, skel: PLFunction, ctx: _PLPassCtx, *, name: str) -> Node:
     """One interpolating ``piecewise_linear`` (or constant) from the source.
 
     Computes the certified skeleton's values from the source.
@@ -125,24 +121,24 @@ def _emit_s1(
     }
 
     input_scale = 1.0
-    if machine == "swish":
+    if ctx.machine == "swish":
         from torchwright.ops.const import scale, swish_dip
 
         max_dm = float(deltas.max())
         # Dip at or below half the claim budget; the emission-time
         # verification measures the realized value.
         input_scale = min(
-            max(1.0, 2.0 * swish_dip * max_dm / (scale * budget)),
+            max(1.0, 2.0 * swish_dip * max_dm / (scale * ctx.budget)),
             _MAX_INPUT_SCALE,
         )
 
-    piecewise_linear = _piecewise_linear_fn(machine)
+    piecewise_linear = _piecewise_linear_fn(ctx.machine)
     return piecewise_linear(
         source,
         breakpoints,
         lambda x: rows[x],
         clamp=True,
-        d_max=lane_cap,
+        d_max=ctx.lane_cap,
         input_scale=input_scale,
         name=name,
     )
@@ -179,6 +175,163 @@ def _verify_emission(
     return worst <= budget, worst, float(xs[i])
 
 
+@dataclass(frozen=True)
+class _PLPassCtx:
+    """Loop-invariant context shared by the per-subgraph S1 steps."""
+
+    consumers: dict[Node, list[Node]]
+    topo_index: dict[Node, int]
+    machine: str | None
+    lane_cap: int
+    budget: float
+
+
+@dataclass
+class _PLSubgraph:
+    """One univariate subgraph's derived structure (pre-gating)."""
+
+    source: Node
+    src_name: str
+    members: list[Node]
+    member_set: set[Node]
+    boundary: list[Node]
+    depth: dict[Node, int]
+    chain_depth: int
+    synthesized: list[Node]
+
+
+def _pl_subgraph(
+    source: Node, members: list[Node], output_node: Node, ctx: _PLPassCtx
+) -> _PLSubgraph:
+    """Derive one subgraph's boundary/synthesized structure."""
+    member_set = set(members)
+    depth = _member_depths(source, members)
+    boundary = [
+        m
+        for m in members
+        if m is output_node or any(c not in member_set for c in ctx.consumers[m])
+    ]
+    return _PLSubgraph(
+        source=source,
+        src_name=_node_label(source, ctx.topo_index),
+        members=members,
+        member_set=member_set,
+        boundary=boundary,
+        depth=depth,
+        chain_depth=max(depth[m] for m in members),
+        synthesized=[m for m in boundary if depth[m] >= _MIN_SYNTH_DEPTH],
+    )
+
+
+def _declined_pl(sub: _PLSubgraph, reason: str) -> SubgraphOutcome:
+    return SubgraphOutcome(
+        source=sub.src_name,
+        n_members=len(sub.members),
+        chain_depth=sub.chain_depth,
+        collapsed=False,
+        reason=reason,
+    )
+
+
+def _s1_gate(
+    sub: _PLSubgraph, cert: SubgraphCertificate, ctx: _PLPassCtx
+) -> tuple[dict[Node, PLFunction], str | None]:
+    """Strict chord certificate + S1 admissibility, all synthesized members.
+
+    The emitted shape is the band skeleton.  Returns (skeletons, fail).
+    """
+    skels: dict[Node, PLFunction] = {}
+    for m in sub.synthesized:
+        c: Any = cert.members[m]
+        m_name = _node_label(m, ctx.topo_index)
+        if not c.linear(ctx.budget):
+            return skels, (
+                f"not PL within budget (member {m_name} deviates "
+                f"{c.deviation:.2e} at x={c.deviation_at:.6g})"
+            )
+        skel = band_skeleton(c.fn, c.bands)
+        s1 = model_s1(skel, c.deviation + SIMPLIFY_TOL)
+        if not s1.admissible(ctx.lane_cap, ctx.budget):
+            return skels, (
+                f"S1 inadmissible for member {m_name} "
+                f"({s1.lanes} lanes, bound {s1.total_bound:.2e}; "
+                f"cap {ctx.lane_cap}, budget {ctx.budget:g})"
+            )
+        skels[m] = skel
+    return skels, None
+
+
+def _emit_gate(
+    sub: _PLSubgraph,
+    cert: SubgraphCertificate,
+    skels: dict[Node, PLFunction],
+    ctx: _PLPassCtx,
+) -> tuple[dict[Node, Node], str | None]:
+    """Emit + verify every synthesized member BEFORE any rewiring.
+
+    A verification failure must leave the graph untouched.  Returns
+    (emitted, fail).
+    """
+    emitted: dict[Node, Node] = {}
+    for m in sub.synthesized:
+        m_name = m.name or f"m{ctx.topo_index[m]}"
+        new = _emit_s1(
+            sub.source, skels[m], ctx, name=f"collapse_pl_{sub.src_name}_{m_name}"
+        )
+        ok, worst, at = _verify_emission(
+            new, m, sub.members, sub.source, skels[m], cert.members[m].bands, ctx.budget
+        )
+        if not ok:
+            return emitted, (
+                f"emission verification failed for member {m_name} "
+                f"(|emitted - original| = {worst:.2e} at x={at:.6g}, "
+                f"budget {ctx.budget:g})"
+            )
+        emitted[m] = new
+    return emitted, None
+
+
+def _apply_pl_collapse(
+    sub: _PLSubgraph,
+    emitted: dict[Node, Node],
+    ctx: _PLPassCtx,
+    output_node: Node,
+    fold_log: FoldLog,
+) -> tuple[Node, SubgraphOutcome]:
+    """Rewire and orphan (v1's skeleton verbatim)."""
+    kept = {m for m in sub.boundary if sub.depth[m] < _MIN_SYNTH_DEPTH}
+    freed = sum(
+        m.gate_proj.shape[0]
+        for m in sub.members
+        if isinstance(m, FFN) and m not in kept
+    )
+    n_orphaned = sum(len(m.checks) for m in sub.members if m not in kept)
+    emitted_lanes = 0
+    for m in sub.synthesized:
+        new = emitted[m]
+        if isinstance(new, FFN):
+            emitted_lanes += new.gate_proj.shape[0]
+        for c in list(ctx.consumers[m]):
+            if c not in sub.member_set:
+                c.replace_input(m, new)
+        if m is output_node:
+            output_node = new
+        fold_log.record_move(orphan=m, survivor=new)
+
+    outcome = SubgraphOutcome(
+        source=sub.src_name,
+        n_members=len(sub.members),
+        chain_depth=sub.chain_depth,
+        collapsed=True,
+        n_synthesized=len(sub.synthesized),
+        n_kept=len(sub.boundary) - len(sub.synthesized),
+        emitted_lanes=emitted_lanes,
+        freed_lanes=freed,
+        n_checks_orphaned=n_orphaned,
+    )
+    return output_node, outcome
+
+
 def collapse_pl_subgraphs(
     output_node: Node,
     *,
@@ -211,58 +364,31 @@ def collapse_pl_subgraphs(
         the per-subgraph log.
     """
     order = topological_order(output_node)
-    src = scalar_sources(order)
     machine = _machine(order)
-
-    by_src: dict[Node, list[Node]] = {}
-    for n in order:  # topological, so member lists stay topological
-        s = src[n]
-        if s is not None and s is not n:
-            by_src.setdefault(s, []).append(n)
-
-    consumers: dict[Node, list[Node]] = {n: [] for n in order}
-    for n in order:
-        for u in n.inputs:
-            if u in consumers:
-                consumers[u].append(n)
-
-    topo_index = {n: i for i, n in enumerate(order)}
+    by_src, consumers, topo_index = _index_subgraphs(order)
+    ctx = _PLPassCtx(
+        consumers=consumers,
+        topo_index=topo_index,
+        machine=machine,
+        lane_cap=lane_cap,
+        budget=budget,
+    )
     outcomes: list[SubgraphOutcome] = []
 
     for source in sorted(by_src, key=topo_index.__getitem__):
-        members = by_src[source]
-        member_set = set(members)
-        depth = _member_depths(source, members)
-        chain_depth = max(depth[m] for m in members)
-        src_name = source.name or f"{type(source).__name__}#{topo_index[source]}"
-
-        def declined(reason: str) -> SubgraphOutcome:
-            return SubgraphOutcome(
-                source=src_name,
-                n_members=len(members),
-                chain_depth=chain_depth,
-                collapsed=False,
-                reason=reason,
-            )
-
-        boundary = [
-            m
-            for m in members
-            if m is output_node or any(c not in member_set for c in consumers[m])
-        ]
-        synthesized = [m for m in boundary if depth[m] >= _MIN_SYNTH_DEPTH]
-        if not synthesized:
+        sub = _pl_subgraph(source, by_src[source], output_node, ctx)
+        if not sub.synthesized:
             outcomes.append(
-                declined("no depth gain (no boundary member at depth >= 2)")
+                _declined_pl(sub, "no depth gain (no boundary member at depth >= 2)")
             )
             continue
         if machine == "mixed":
-            outcomes.append(declined("graph mixes relu and swish FFNs"))
+            outcomes.append(_declined_pl(sub, "graph mixes relu and swish FFNs"))
             continue
 
         cert = certify_subgraph(
             source,
-            members,
+            sub.members,
             # The pre-screen: the lane-cap-derived candidate ceiling
             # (see _KINK_PRESCREEN_FACTOR); max_kinks stays the
             # absolute backstop.
@@ -270,97 +396,23 @@ def collapse_pl_subgraphs(
             hinge_exact=_HINGE_EXACT_Z if machine == "swish" else 0.0,
         )
         if cert.declined is not None:
-            outcomes.append(declined(cert.declined))
+            outcomes.append(_declined_pl(sub, cert.declined))
             continue
 
-        # Strict chord certificate + S1 admissibility, all synthesized
-        # members (the emitted shape is the band skeleton).
-        skels: dict[Node, PLFunction] = {}
-        fail = None
-        for m in synthesized:
-            c: Any = cert.members[m]
-            m_name = m.name or f"{type(m).__name__}#{topo_index[m]}"
-            if not c.linear(budget):
-                fail = (
-                    f"not PL within budget (member {m_name} deviates "
-                    f"{c.deviation:.2e} at x={c.deviation_at:.6g})"
-                )
-                break
-            skel = band_skeleton(c.fn, c.bands)
-            s1 = model_s1(skel, c.deviation + SIMPLIFY_TOL)
-            if not s1.admissible(lane_cap, budget):
-                fail = (
-                    f"S1 inadmissible for member {m_name} "
-                    f"({s1.lanes} lanes, bound {s1.total_bound:.2e}; "
-                    f"cap {lane_cap}, budget {budget:g})"
-                )
-                break
-            skels[m] = skel
+        skels, fail = _s1_gate(sub, cert, ctx)
         if fail is not None:
-            outcomes.append(declined(fail))
+            outcomes.append(_declined_pl(sub, fail))
             continue
 
-        # Emit + verify every synthesized member BEFORE any rewiring —
-        # a verification failure must leave the graph untouched.
-        emitted: dict[Node, Node] = {}
-        for m in synthesized:
-            m_name = m.name or f"m{topo_index[m]}"
-            new = _emit_s1(
-                source,
-                skels[m],
-                machine,
-                lane_cap,
-                budget,
-                name=f"collapse_pl_{src_name}_{m_name}",
-            )
-            ok, worst, at = _verify_emission(
-                new, m, members, source, skels[m], cert.members[m].bands, budget
-            )
-            if not ok:
-                fail = (
-                    f"emission verification failed for member {m_name} "
-                    f"(|emitted - original| = {worst:.2e} at x={at:.6g}, "
-                    f"budget {budget:g})"
-                )
-                break
-            emitted[m] = new
+        emitted, fail = _emit_gate(sub, cert, skels, ctx)
         if fail is not None:
-            outcomes.append(declined(fail))
+            outcomes.append(_declined_pl(sub, fail))
             continue
 
-        # --- Rewire and orphan (v1's skeleton verbatim). ---------------
-        kept = {m for m in boundary if depth[m] < _MIN_SYNTH_DEPTH}
-        freed = sum(
-            m.gate_proj.shape[0]
-            for m in members
-            if isinstance(m, FFN) and m not in kept
+        output_node, outcome = _apply_pl_collapse(
+            sub, emitted, ctx, output_node, fold_log
         )
-        n_orphaned = sum(len(m.checks) for m in members if m not in kept)
-        emitted_lanes = 0
-        for m in synthesized:
-            new = emitted[m]
-            if isinstance(new, FFN):
-                emitted_lanes += new.gate_proj.shape[0]
-            for c in list(consumers[m]):
-                if c not in member_set:
-                    c.replace_input(m, new)
-            if m is output_node:
-                output_node = new
-            fold_log.record_move(orphan=m, survivor=new)
-
-        outcomes.append(
-            SubgraphOutcome(
-                source=src_name,
-                n_members=len(members),
-                chain_depth=chain_depth,
-                collapsed=True,
-                n_synthesized=len(synthesized),
-                n_kept=len(boundary) - len(synthesized),
-                emitted_lanes=emitted_lanes,
-                freed_lanes=freed,
-                n_checks_orphaned=n_orphaned,
-            )
-        )
+        outcomes.append(outcome)
 
     report = CollapseReport(outcomes)
     if verbose and outcomes:

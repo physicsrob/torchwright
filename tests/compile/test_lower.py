@@ -187,7 +187,7 @@ def test_lower_preserves_semantic_overrides_on_copy():
     overridden = [
         n
         for n in get_ancestor_nodes({consumer})
-        if n._semantic_affine_override is not None
+        if n.semantic_affine_override is not None
     ]
     assert overridden, "compare() should install a semantic override"
     r_src = consumer._affine_bound.to_scalar_range()
@@ -201,7 +201,7 @@ def test_lower_preserves_semantic_overrides_on_copy():
         f"source={r_src} copy={r_copy}"
     )
     for n in overridden:
-        assert lowered.copy_of(n)._semantic_affine_override is not None
+        assert lowered.copy_of(n).semantic_affine_override is not None
 
 
 def test_lower_twice_is_bit_identical_and_source_untouched():

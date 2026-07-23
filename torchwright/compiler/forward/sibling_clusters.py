@@ -265,6 +265,32 @@ class SiblingClusterAnalyzer:
             out.append(u)
         return out
 
+    def _downstream_valid(
+        self,
+        node: Node,
+        within: set[Node],
+        join: Node,
+        cache: dict[Node, bool],
+    ) -> bool:
+        """True when *node* keeps ``within`` exclusive (see the prune loop)."""
+        if node is join:
+            return True
+        if node in within:
+            return True
+        if not isinstance(node, Concatenate):
+            return False
+        if node in cache:
+            return cache[node]
+        # Tentatively mark True to break cycles (DAG: won't happen,
+        # but defensive).  We'll finalize after checking.
+        cache[node] = True
+        ok = all(
+            self._downstream_valid(c, within, join, cache)
+            for c in self.graph.get_consumers(node)
+        )
+        cache[node] = ok
+        return ok
+
     def _prune_external_consumers(self, exclusive: set[Node], join: Node) -> set[Node]:
         """Iteratively drop nodes with consumers outside ``exclusive U {join}``.
 
@@ -275,29 +301,15 @@ class SiblingClusterAnalyzer:
         """
         valid_downstream_cache: dict[Node, bool] = {}
 
-        def is_valid(node: Node, within: set[Node]) -> bool:
-            if node is join:
-                return True
-            if node in within:
-                return True
-            if not isinstance(node, Concatenate):
-                return False
-            if node in valid_downstream_cache:
-                return valid_downstream_cache[node]
-            # Tentatively mark True to break cycles (DAG: won't happen,
-            # but defensive).  We'll finalize after checking.
-            valid_downstream_cache[node] = True
-            ok = all(is_valid(c, within) for c in self.graph.get_consumers(node))
-            valid_downstream_cache[node] = ok
-            return ok
-
         # Pruning can invalidate the cache, so clear it each iteration.
         while True:
             valid_downstream_cache.clear()
             to_remove: set[Node] = set()
             for n in exclusive:
                 for c in self.graph.get_consumers(n):
-                    if not is_valid(c, exclusive):
+                    if not self._downstream_valid(
+                        c, exclusive, join, valid_downstream_cache
+                    ):
                         to_remove.add(n)
                         break
             if not to_remove:

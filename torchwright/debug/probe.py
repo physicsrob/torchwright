@@ -431,6 +431,7 @@ def probe_graph(
     output_node: Node,
     input_values: dict[str, torch.Tensor],
     n_pos: int,
+    *,
     d: int = 1024,
     d_head: int = 16,
     d_hidden: int | None = None,

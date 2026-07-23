@@ -17,7 +17,7 @@ def set_device(device: torch.device | None) -> None:
     _state.displayed = False
 
 
-def get_device(verbose: bool = True) -> torch.device:
+def get_device(*, verbose: bool = True) -> torch.device:
     """Auto-detect the best available torch device.
 
     Prints a one-line summary on first call (unless verbose=False).

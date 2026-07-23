@@ -1417,7 +1417,7 @@ def test_mlp_linear_bypass_concatenated_input():
 # ---------------------------------------------------------------------------
 
 
-def _swish_ffn(x, n_lanes=6, d_out=3, gated=True, seed=0):
+def _swish_ffn(x, n_lanes=6, d_out=3, *, gated=True, seed=0):
     """A directly-authored swish FFN fixture.
 
     The spec's constructions are op-level; writer tests need only the

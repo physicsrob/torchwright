@@ -100,7 +100,7 @@ def test_layer_bounds_sound_against_solved_schedule():
     assert assignment is not None
     gm = build_graph_model(out)
     es, ls = _compute_layer_bounds(
-        gm, SchedulingPolicy(), True, _SOLVE_KW["max_layers"]
+        gm, SchedulingPolicy(), flex_routing=True, max_layers=_SOLVE_KW["max_layers"]
     )
     for nid, layer in assignment.node_to_layer.items():
         assert es[nid] <= layer <= ls[nid], (

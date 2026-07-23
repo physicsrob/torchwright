@@ -251,13 +251,13 @@ def test_pinned_optimum_no_shallower_than_unpinned(name, d):
     """
     build, _, d_head = _example_specs()[name]
 
-    def _solve(pin):
+    def _solve(*, pin):
         torch.manual_seed(0)
         low = _lower(build(), d)
         return solve_schedule(low, _pin_cancels=pin, **_solve_cfg(d, d_head))
 
-    off_asg, off_stats = _solve(False)
-    on_asg, on_stats = _solve(True)
+    off_asg, off_stats = _solve(pin=False)
+    on_asg, on_stats = _solve(pin=True)
     assert off_asg is not None, f"{name} d={d}: unpinned solve found nothing"
     assert off_stats.is_optimal, (
         f"{name} d={d}: unpinned not optimal in budget ({off_stats.status_name})"

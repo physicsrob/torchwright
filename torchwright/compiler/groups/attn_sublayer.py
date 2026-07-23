@@ -24,7 +24,7 @@ class AttnSubLayer:
         self.attn = AttnLayerComponent(d, d_head, name="attn", n_heads=n_heads)
 
     def forward(
-        self, inp: torch.Tensor, return_states: bool = False
+        self, inp: torch.Tensor, *, return_states: bool = False
     ) -> torch.Tensor | tuple[torch.Tensor, _StatesDict]:
         states: _StatesDict = {}
 

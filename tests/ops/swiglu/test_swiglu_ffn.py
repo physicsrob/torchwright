@@ -18,7 +18,7 @@ D = 64
 D_HEAD = 8
 
 
-def _build(gated_second=True):
+def _build(*, gated_second=True):
     """A two-FFN swish graph (gated feeding degenerate-or-gated).
 
     Returns new node ids each call.

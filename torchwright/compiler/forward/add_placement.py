@@ -90,7 +90,7 @@ def derive_add_placement(
         # The held target claims the whole held bank via allocate_at with
         # fresh placement, unconditionally (its is_free is pinned 0 without
         # the deadness biconditional).
-        return AddPlacement(False, False, None)
+        return AddPlacement(reusable_0=False, reusable_1=False, reuse_input_index=None)
     layer_a = node_to_layer.get(add.node_id)
     route_a = node_to_routing.get(add.node_id)
     if layer_a is None or route_a is None:
@@ -133,4 +133,6 @@ def derive_add_placement(
         index = 1
     else:
         index = None
-    return AddPlacement(reusable_0, reusable_1, index)
+    return AddPlacement(
+        reusable_0=reusable_0, reusable_1=reusable_1, reuse_input_index=index
+    )

@@ -53,6 +53,7 @@ def _broadcast_select_per_column_offsets(
     false_value: Node,
     n_slots: int,
     d_fill: int,
+    *,
     true_bc: bool,
     false_bc: bool,
     scalar_M: float,
@@ -458,7 +459,6 @@ def switch(conditions: list[Node], values: list[Node]) -> Node:
 
 
 def _select_output_type(
-    cond: Node,
     true_node: Node,
     false_node: Node,
 ) -> NodeValueType:
@@ -552,7 +552,7 @@ def select(cond: Node, true_node: Node, false_node: Node) -> Node:
         name="select",
     )
 
-    vt = _select_output_type(cond, true_node, false_node)
+    vt = _select_output_type(true_node, false_node)
     if vt != NodeValueType.unknown():
         gate_atol = M * _GATE_C_TOL
         result = assert_matches_value_type(result, vt, atol=gate_atol)
@@ -565,7 +565,7 @@ def select(cond: Node, true_node: Node, false_node: Node) -> Node:
     _apply_semantic_override(
         result,
         _select_semantic_bound(
-            true_node._affine_bound, false_node._affine_bound, tolerance=tolerance
+            true_node.affine_bound, false_node.affine_bound, tolerance=tolerance
         ),
     )
     return result
@@ -796,110 +796,141 @@ def broadcast_select(
     assert true_is_broadcast or len(true_value) == n_slots * d_fill
     assert false_is_broadcast or len(false_value) == n_slots * d_fill
 
+    if approximate:
+        return _broadcast_select_approximate(
+            masks, true_value, false_value, n_slots, d_fill
+        )
+    return _broadcast_select_exact(masks, true_value, false_value, n_slots, d_fill)
+
+
+def _broadcast_select_approximate(
+    masks: Node,
+    true_value: Node,
+    false_value: Node,
+    n_slots: int,
+    d_fill: int,
+) -> Node:
+    """Single-sublayer branch of :func:`broadcast_select` (``approximate=True``)."""
+    true_is_broadcast = len(true_value) == d_fill
+    false_is_broadcast = len(false_value) == d_fill
+
     M = _select_offset(true_value, false_value, "broadcast_select")
 
-    if approximate:
-        # Per-output-column offsets (see per_column_offsets) so a narrow column
-        # is not forced to a wide sibling's M in the `(M + v) - M` cancellation.
-        M_cols = _broadcast_select_per_column_offsets(
-            true_value,
-            false_value,
+    # Per-output-column offsets (see per_column_offsets) so a narrow column
+    # is not forced to a wide sibling's M in the `(M + v) - M` cancellation.
+    M_cols = _broadcast_select_per_column_offsets(
+        true_value,
+        false_value,
+        n_slots,
+        d_fill,
+        true_bc=true_is_broadcast,
+        false_bc=false_is_broadcast,
+        scalar_M=M,
+    )
+
+    d_hidden = 4 * n_slots * d_fill
+    inp = Concatenate([masks, true_value, false_value])
+    d_input = len(inp)
+
+    # Offsets into the concatenated input
+    mask_offset = 0
+    true_offset = n_slots
+    false_offset = n_slots + len(true_value)
+
+    input_proj = torch.zeros(d_hidden, d_input)
+    input_bias = torch.zeros(d_hidden)
+    output_proj = torch.zeros(d_hidden, n_slots * d_fill)
+    # Output bias is zero — every M offset is cancelled locally by
+    # the matching ``_b`` carrier unit.
+    output_bias = torch.zeros(n_slots * d_fill)
+
+    for i in range(n_slots):
+        for j in range(d_fill):
+            out_idx = i * d_fill + j
+            M_o = M_cols[out_idx]
+            unit_pos_t = 4 * out_idx
+            unit_pos_b = 4 * out_idx + 1
+            unit_neg_t = 4 * out_idx + 2
+            unit_neg_b = 4 * out_idx + 3
+
+            # unit_pos_t rectifies (M times mask_i) plus true_ij.
+            input_proj[unit_pos_t, mask_offset + i] = M_o
+            if true_is_broadcast:
+                input_proj[unit_pos_t, true_offset + j] = 1.0
+            else:
+                input_proj[unit_pos_t, true_offset + i * d_fill + j] = 1.0
+
+            # unit_pos_b rectifies (M times mask_i) alone, as the
+            # carrier that cancels the M offset on the true side.
+            input_proj[unit_pos_b, mask_offset + i] = M_o
+
+            # unit_neg_t rectifies (-M times mask_i) plus false_ij.
+            input_proj[unit_neg_t, mask_offset + i] = -M_o
+            if false_is_broadcast:
+                input_proj[unit_neg_t, false_offset + j] = 1.0
+            else:
+                input_proj[unit_neg_t, false_offset + i * d_fill + j] = 1.0
+
+            # unit_neg_b rectifies (-M times mask_i) alone, as the
+            # carrier that cancels the M offset on the false side.
+            input_proj[unit_neg_b, mask_offset + i] = -M_o
+
+            # The output sums the true-side pair (pos_t minus its
+            # carrier pos_b) with the false-side pair (neg_t minus its
+            # carrier neg_b).
+            output_proj[unit_pos_t, out_idx] = 1.0
+            output_proj[unit_pos_b, out_idx] = -1.0
+            output_proj[unit_neg_t, out_idx] = 1.0
+            output_proj[unit_neg_b, out_idx] = -1.0
+
+    result = linear_relu_linear(
+        input_node=inp,
+        input_proj=input_proj,
+        input_bias=input_bias,
+        output_proj=output_proj,
+        output_bias=output_bias,
+        name="broadcast_select",
+    )
+    tv = true_value.value_type
+    fv = false_value.value_type
+    r = tv.value_range.union(fv.value_range)
+    if r.is_finite():
+        gate_atol = M * _GATE_C_TOL
+        result = assert_matches_value_type(
+            result, NodeValueType(value_range=r), atol=gate_atol
+        )
+    from torchwright.graph.affine_rules import (
+        _apply_semantic_override,
+        _broadcast_select_semantic_bound,
+    )
+
+    _apply_semantic_override(
+        result,
+        _broadcast_select_semantic_bound(
+            true_value.affine_bound,
+            false_value.affine_bound,
             n_slots,
             d_fill,
-            true_is_broadcast,
-            false_is_broadcast,
-            M,
-        )
+            true_is_broadcast=true_is_broadcast,
+            false_is_broadcast=false_is_broadcast,
+            tolerance=_GATE_C_TOL * M,
+        ),
+    )
+    return result
 
-        d_hidden = 4 * n_slots * d_fill
-        inp = Concatenate([masks, true_value, false_value])
-        d_input = len(inp)
 
-        # Offsets into the concatenated input
-        mask_offset = 0
-        true_offset = n_slots
-        false_offset = n_slots + len(true_value)
+def _broadcast_select_exact(
+    masks: Node,
+    true_value: Node,
+    false_value: Node,
+    n_slots: int,
+    d_fill: int,
+) -> Node:
+    """Two-sublayer branch of :func:`broadcast_select` (``approximate=False``)."""
+    true_is_broadcast = len(true_value) == d_fill
+    false_is_broadcast = len(false_value) == d_fill
 
-        input_proj = torch.zeros(d_hidden, d_input)
-        input_bias = torch.zeros(d_hidden)
-        output_proj = torch.zeros(d_hidden, n_slots * d_fill)
-        # Output bias is zero — every M offset is cancelled locally by
-        # the matching ``_b`` carrier unit.
-        output_bias = torch.zeros(n_slots * d_fill)
-
-        for i in range(n_slots):
-            for j in range(d_fill):
-                out_idx = i * d_fill + j
-                M_o = M_cols[out_idx]
-                unit_pos_t = 4 * out_idx
-                unit_pos_b = 4 * out_idx + 1
-                unit_neg_t = 4 * out_idx + 2
-                unit_neg_b = 4 * out_idx + 3
-
-                # unit_pos_t rectifies (M times mask_i) plus true_ij.
-                input_proj[unit_pos_t, mask_offset + i] = M_o
-                if true_is_broadcast:
-                    input_proj[unit_pos_t, true_offset + j] = 1.0
-                else:
-                    input_proj[unit_pos_t, true_offset + i * d_fill + j] = 1.0
-
-                # unit_pos_b rectifies (M times mask_i) alone, as the
-                # carrier that cancels the M offset on the true side.
-                input_proj[unit_pos_b, mask_offset + i] = M_o
-
-                # unit_neg_t rectifies (-M times mask_i) plus false_ij.
-                input_proj[unit_neg_t, mask_offset + i] = -M_o
-                if false_is_broadcast:
-                    input_proj[unit_neg_t, false_offset + j] = 1.0
-                else:
-                    input_proj[unit_neg_t, false_offset + i * d_fill + j] = 1.0
-
-                # unit_neg_b rectifies (-M times mask_i) alone, as the
-                # carrier that cancels the M offset on the false side.
-                input_proj[unit_neg_b, mask_offset + i] = -M_o
-
-                # The output sums the true-side pair (pos_t minus its
-                # carrier pos_b) with the false-side pair (neg_t minus its
-                # carrier neg_b).
-                output_proj[unit_pos_t, out_idx] = 1.0
-                output_proj[unit_pos_b, out_idx] = -1.0
-                output_proj[unit_neg_t, out_idx] = 1.0
-                output_proj[unit_neg_b, out_idx] = -1.0
-
-        result = linear_relu_linear(
-            input_node=inp,
-            input_proj=input_proj,
-            input_bias=input_bias,
-            output_proj=output_proj,
-            output_bias=output_bias,
-            name="broadcast_select",
-        )
-        tv = true_value.value_type
-        fv = false_value.value_type
-        r = tv.value_range.union(fv.value_range)
-        if r.is_finite():
-            gate_atol = M * _GATE_C_TOL
-            result = assert_matches_value_type(
-                result, NodeValueType(value_range=r), atol=gate_atol
-            )
-        from torchwright.graph.affine_rules import (
-            _apply_semantic_override,
-            _broadcast_select_semantic_bound,
-        )
-
-        _apply_semantic_override(
-            result,
-            _broadcast_select_semantic_bound(
-                true_value._affine_bound,
-                false_value._affine_bound,
-                n_slots,
-                d_fill,
-                true_is_broadcast,
-                false_is_broadcast,
-                tolerance=_GATE_C_TOL * M,
-            ),
-        )
-        return result
+    M = _select_offset(true_value, false_value, "broadcast_select")
 
     # approximate=False: two sublayers, cancellation-free.
     # Sublayer 1: c_off[i] = ReLU(-masks[i]), c_on[i] = ReLU(masks[i]).

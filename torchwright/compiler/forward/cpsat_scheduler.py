@@ -187,6 +187,17 @@ def objective_blocks(
     return int(primary), int(secondary)
 
 
+def _check_trace_coverage(covered: set[int], sched_ids: set[int], kind: str) -> None:
+    """Raise unless a heuristic-trace map covers exactly the schedulable ids."""
+    if covered != sched_ids:
+        missing = sorted(sched_ids - covered)
+        extra = sorted(covered - sched_ids)
+        raise ValueError(
+            f"heuristic trace {kind} coverage mismatch: "
+            f"missing={missing}, extra={extra}"
+        )
+
+
 @dataclass(frozen=True)
 class ScheduleAssignment:
     """Per-node placement, cancellation, and routing decisions.
@@ -269,20 +280,8 @@ class ScheduleAssignment:
         layer_map = {
             nid: layer for nid, layer in node_to_layer.items() if nid in sched_ids
         }
-        if set(layer_map) != sched_ids:
-            missing = sorted(sched_ids - set(layer_map))
-            extra = sorted(set(layer_map) - sched_ids)
-            raise ValueError(
-                f"heuristic trace layer coverage mismatch: "
-                f"missing={missing}, extra={extra}"
-            )
-        if set(node_to_routing) != sched_ids:
-            missing = sorted(sched_ids - set(node_to_routing))
-            extra = sorted(set(node_to_routing) - sched_ids)
-            raise ValueError(
-                f"heuristic trace routing coverage mismatch: "
-                f"missing={missing}, extra={extra}"
-            )
+        _check_trace_coverage(set(layer_map), sched_ids, "layer")
+        _check_trace_coverage(set(node_to_routing), sched_ids, "routing")
 
         # Physical-versus-derived Add placement tripwire + reused-target
         # canonicalization (docs/plan_additional_mlp_routing.md).
@@ -314,7 +313,7 @@ class ScheduleAssignment:
                 or derived.reuse_input_index != observed_index
             ):
 
-                def _consumer_summary(occ: Node) -> str:
+                def _consumer_summary(occ: Node, *, node: Node = node) -> str:
                     parts = [
                         f"{c!r}@L{layer_map.get(c.node_id)}"
                         f"/{node_to_routing.get(c.node_id)}"
@@ -906,12 +905,51 @@ def uses_residual(_node: Node, _gm: GraphModel) -> bool:
 # ---------------------------------------------------------------------------
 
 
+def _mode_gap(a: str, b: str) -> int:
+    """Minimum layer gap for edge modes: 0 only for (attn -> mlp)."""
+    return 0 if (a == ATTN and b == MLP) else 1
+
+
+def _sweep_earliest(
+    edges: list[tuple[int, int]],
+    node_modes: dict[int, tuple[str, ...]],
+    es: dict[int, dict[str, int]],
+) -> bool:
+    """One forward propagation sweep; returns whether anything tightened."""
+    changed = False
+    for u, v in edges:
+        for b in node_modes[v]:
+            # u commits to ONE mode; the relaxation lets it pick the
+            # best one per edge (sound: real schedules are no earlier).
+            lo = min(es[u][a] + _mode_gap(a, b) for a in node_modes[u])
+            if lo > es[v][b]:
+                es[v][b] = lo
+                changed = True
+    return changed
+
+
+def _sweep_latest(
+    edges: list[tuple[int, int]],
+    node_modes: dict[int, tuple[str, ...]],
+    ls: dict[int, dict[str, int]],
+) -> bool:
+    """One backward propagation sweep; returns whether anything tightened."""
+    changed = False
+    for u, v in reversed(edges):
+        for a in node_modes[u]:
+            hi = max(ls[v][b] - _mode_gap(a, b) for b in node_modes[v])
+            if hi < ls[u][a]:
+                ls[u][a] = hi
+                changed = True
+    return changed
+
+
 def _compute_layer_bounds(
     gm: GraphModel,
     policy: SchedulingPolicy,
+    *,
     flex_routing: bool,
     max_layers: int,
-    *,
     usable_slots: int | None = None,
 ) -> tuple[dict[int, int], dict[int, int]]:
     """Per-node [earliest, latest] layer bounds from the dependency DAG.
@@ -941,9 +979,6 @@ def _compute_layer_bounds(
             return (ATTN, MLP)
         return (routing(n, gm, policy, usable_slots),)
 
-    def gap(a: str, b: str) -> int:
-        return 0 if (a == ATTN and b == MLP) else 1
-
     input_ids = {n.node_id for n in gm.input_nodes}
     node_modes = {n.node_id: modes(n) for n in gm.schedulable}
     edges: list[tuple[int, int]] = []
@@ -959,21 +994,8 @@ def _compute_layer_bounds(
     # sweep when edges are in topological order (gm.schedulable is
     # build-ordered), but loop defensively in case they are not.
     for _ in range(200):
-        changed = False
-        for u, v in edges:
-            for b in node_modes[v]:
-                # u commits to ONE mode; the relaxation lets it pick the
-                # best one per edge (sound: real schedules are no earlier).
-                lo = min(es[u][a] + gap(a, b) for a in node_modes[u])
-                if lo > es[v][b]:
-                    es[v][b] = lo
-                    changed = True
-        for u, v in reversed(edges):
-            for a in node_modes[u]:
-                hi = max(ls[v][b] - gap(a, b) for b in node_modes[v])
-                if hi < ls[u][a]:
-                    ls[u][a] = hi
-                    changed = True
+        changed = _sweep_earliest(edges, node_modes, es)
+        changed = _sweep_latest(edges, node_modes, ls) or changed
         if not changed:
             break
     else:
@@ -1012,7 +1034,11 @@ def critical_path_layers(
         policy = LEGACY_POLICY
     gm = build_graph_model(output_node, pos_encoding)
     es, _ = _compute_layer_bounds(
-        gm, policy, flex_routing, max_layers=1 << 20, usable_slots=usable_slots
+        gm,
+        policy,
+        flex_routing=flex_routing,
+        max_layers=1 << 20,
+        usable_slots=usable_slots,
     )
     return max(es.values()) + 1
 
@@ -1252,7 +1278,11 @@ def build_cpsat_model_from_gm(
     # derive the same bounds itself, this just hands them over up front.
     bounds = (
         _compute_layer_bounds(
-            gm, policy, flex_routing, max_layers, usable_slots=d_hidden
+            gm,
+            policy,
+            flex_routing=flex_routing,
+            max_layers=max_layers,
+            usable_slots=d_hidden,
         )
         if tighten_domains
         else None
@@ -2742,6 +2772,344 @@ class _IncumbentTrace(cp_model.CpSolverSolutionCallback):
         )
 
 
+def _hint_desc(nid: int, all_nodes: dict[int, Node]) -> str:
+    n = all_nodes.get(nid)
+    if n is None:
+        return f"id={nid} <not in graph>"
+    return f"id={nid} {type(n).__name__} name={getattr(n, 'name', None)!r}"
+
+
+def _expected_hint_drop(nid: int, all_nodes: dict[int, Node]) -> bool:
+    n = all_nodes.get(nid)
+    return isinstance(n, Concatenate)
+
+
+def _check_layer_hints(
+    built: BuiltModel,
+    hint_layers: Mapping[int, int] | None,
+    all_nodes: dict[int, Node],
+    input_ids: set[int],
+    max_layers: int,
+) -> list[str]:
+    """Layer hints inside the model's (tightened) domains, or guard-dropped."""
+    violations: list[str] = []
+    for nid, L in (hint_layers or {}).items():
+        if nid in built.layer_var:
+            if not (0 <= L < max_layers):
+                violations.append(
+                    f"layer hint out of range (guard-dropped): "
+                    f"{_hint_desc(nid, all_nodes)} hint={L}"
+                )
+            elif built.layer_bounds is not None:
+                lo, hi = built.layer_bounds[nid]
+                if not (lo <= L <= hi):
+                    violations.append(
+                        f"layer hint outside tightened domain [{lo},{hi}]: "
+                        f"{_hint_desc(nid, all_nodes)} hint={L}"
+                    )
+        elif not _expected_hint_drop(nid, all_nodes) and nid not in input_ids:
+            violations.append(
+                f"layer hint for node with no layer var (guard-dropped): "
+                f"{_hint_desc(nid, all_nodes)} hint={L}"
+            )
+    return violations
+
+
+def _check_routing_hints(
+    built: BuiltModel,
+    hint_routing: Mapping[int, str] | None,
+    all_nodes: dict[int, Node],
+) -> list[str]:
+    """Routing hints name a known route and a node with a routing var."""
+    violations: list[str] = []
+    route: str | None
+    for nid, route in (hint_routing or {}).items():
+        if route not in (ATTN, MLP):
+            violations.append(
+                f"routing hint with unknown route {route!r}: "
+                f"{_hint_desc(nid, all_nodes)}"
+            )
+        if nid not in built.is_attn and not _expected_hint_drop(nid, all_nodes):
+            violations.append(
+                f"routing hint for node with no routing var (guard-dropped): "
+                f"{_hint_desc(nid, all_nodes)} hint={route}"
+            )
+    return violations
+
+
+def _hinted_add_placement(
+    A: Add, hint: DiagnosticHint, built: BuiltModel
+) -> AddPlacement | None:
+    """Derive A's placement from the LAYER/ROUTING hints.
+
+    Goes through the one assignment-level definition
+    (`add_placement.derive_add_placement` — the same rule the model's
+    per-occurrence literals reify; keep them in sync).  Returns None
+    (check leniently) when a needed hint is missing.  The held target
+    short-circuits inside the derivation (is_free pinned 0, never
+    derived).
+    """
+    gm = built.gm
+    hint_layers = hint.layers
+    if hint_layers is None or A.node_id not in hint_layers:
+        return None
+    routing_map = dict(hint.routing or {})
+    if routing_map.get(A.node_id) is None:
+        # Layers-only diagnostic hints: assume the attention-route
+        # (strict-prior) predicate — exact for attention-routed Adds
+        # and conservative (never over-reuses) otherwise.  Consumers
+        # with missing route hints block same-layer completion inside
+        # the derivation for the same reason.
+        routing_map[A.node_id] = ATTN
+    try:
+        return derive_add_placement(
+            A,
+            effective_consumers=lambda x: gm.consumers_eff.get(x, ()),
+            node_to_layer=hint_layers,
+            node_to_routing=routing_map,
+            held_source_id=built.held_source_id,
+            held_target_id=built.held_target_id,
+        )
+    except ValueError:
+        return None
+
+
+def _hinted_add_placement_complete(
+    A: Add, hint: DiagnosticHint, built: BuiltModel
+) -> bool:
+    """True when every hint the derivation read actually existed.
+
+    A missing consumer layer/route makes the derivation conservative
+    (not reusable), which must not be mistaken for a derived fresh.
+    """
+    gm = built.gm
+    hint_layers = hint.layers
+    hint_routing = hint.routing
+    if hint_layers is None or A.node_id not in hint_layers:
+        return False
+    if (hint_routing or {}).get(A.node_id) is None:
+        return False
+    for E in A.inputs:
+        for c in gm.consumers_eff.get(E, set()):
+            if c is A or isinstance(c, Concatenate):
+                continue
+            if c.node_id not in built.layer_var:
+                continue
+            if (hint_layers or {}).get(c.node_id) is None:
+                return False
+            if (hint_routing or {}).get(c.node_id) is None:
+                return False
+    return True
+
+
+def _hinted_reuse_targets(
+    built: BuiltModel, hint: DiagnosticHint
+) -> dict[int, tuple[Add, AddPlacement]]:
+    """The selected reuse target per the hints: target nid -> (add, placement)."""
+    hinted_target_of: dict[int, tuple[Add, AddPlacement]] = {}
+    for _A in built.gm.schedulable:
+        if not isinstance(_A, Add):
+            continue
+        _p = _hinted_add_placement(_A, hint, built)
+        if (
+            _p is not None
+            and _p.reuse_input_index is not None
+            and _hinted_add_placement_complete(_A, hint, built)
+        ):
+            hinted_target_of[_A.inputs[_p.reuse_input_index].node_id] = (_A, _p)
+    return hinted_target_of
+
+
+@dataclass(frozen=True)
+class _HintCheckCtx:
+    """Shared state for the per-node cancel-hint checks."""
+
+    built: BuiltModel
+    hint: DiagnosticHint
+    all_nodes: dict[int, Node]
+    max_layers: int
+    hinted_target_of: dict[int, tuple[Add, AddPlacement]]
+
+
+def _check_selected_reuse_target(
+    nid: int,
+    L: int,
+    selected: tuple[Add, AddPlacement],
+    hint: DiagnosticHint,
+    all_nodes: dict[int, Node],
+) -> list[str]:
+    """Cancel-hint checks for a selected reuse target.
+
+    A selected reuse target's lifetime ends through the reassign
+    handoff: its canonical virtual cancel is layer[A] + 1 with a
+    non-MLP mechanism (bookkeeping only — the physical cancel is
+    gated absent).  A different hint contradicts the model's
+    selector constraints and would sink the incumbent.
+    """
+    violations: list[str] = []
+    sel_add, _sel_p = selected
+    sel_layer = (hint.layers or {}).get(sel_add.node_id)
+    if sel_layer is not None and sel_layer + 1 != L:
+        violations.append(
+            f"selected reuse target's cancel hint is not the "
+            f"virtual handoff layer[A]+1={sel_layer + 1}: "
+            f"{_hint_desc(nid, all_nodes)} cancel={L} "
+            f"(Add {_hint_desc(sel_add.node_id, all_nodes)})"
+        )
+    if (hint.cancel_mech or {}).get(nid) == MLP:
+        violations.append(
+            f"selected reuse target hinted an MLP cancel mechanism "
+            f"(a reassigned target has no physical cancel; its "
+            f"canonical mechanism is attention): {_hint_desc(nid, all_nodes)}"
+        )
+    return violations
+
+
+def _consumer_cancel_gap(
+    c: Node, nid: int, mech: str, ctx: _HintCheckCtx, *, in_input: bool
+) -> int:
+    """Mirror the mechanism-conditional cancel bound for one consumer.
+
+    An MLP cancel fires after both sublayers' reads, so it permits gap 0
+    for every non-Add consumer (attn or mlp).  An attention cancel keeps
+    the routing-aware gap: an attention-routed consumer permits a
+    same-layer cancel (gap 0); an MLP-routed consumer keeps the
+    layer-after bound (gap 1).  Routing comes from the hint when
+    present, else the model's pinned routing; flex consumers without
+    a routing hint are checked leniently (gap 0).  An Add consumer's
+    bound mirrors the mechanism-specific model terms: the attention
+    term is `layer + (is_free OR MLP-routed)` (reuse conservatism —
+    gap #2 — or the MLP-routed Add's post-cancel read), the MLP term
+    is `layer + is_free`.  Placement derives from the layer/route
+    hints (`_hinted_add_placement`), lenient (gap 0) when a needed
+    hint is missing.  Freeable non-held inputs keep the model's
+    uniform gap-1 bound for every consumer.
+    """
+    built = ctx.built
+    hint_routing = ctx.hint.routing
+    if in_input and nid != built.held_source_id:
+        return 1
+    if isinstance(c, Add):
+        placement = _hinted_add_placement(c, ctx.hint, built)
+        add_free = placement.is_free if placement is not None else False
+        if mech == MLP:
+            return 1 if add_free else 0
+        c_route = (hint_routing or {}).get(c.node_id)
+        return 1 if (add_free or c_route == MLP) else 0
+    if mech == MLP:
+        return 0
+    route = (hint_routing or {}).get(c.node_id)
+    if route is None and built.static_routing is not None:
+        route = built.static_routing.get(c.node_id)
+    return 1 if route == MLP else 0
+
+
+def _check_consumer_gaps_and_window(
+    nid: int, L: int, mech: str, ctx: _HintCheckCtx
+) -> list[str]:
+    """Consumer-gap bounds plus the (widened) cancel-window bound."""
+    built = ctx.built
+    hint_layers = ctx.hint.layers
+    in_sched = nid in built.cancel_layer
+    in_input = nid in built.input_cancel_layer
+    birth = (hint_layers or {}).get(nid) if in_sched else 0
+    node = ctx.all_nodes.get(nid)
+    K = built.eff_cancel_slack
+    deltas = built.cancel_window_delta or {}
+    violations: list[str] = []
+    hinted_cons: list[int] = []
+    all_cons_hinted = True
+    for c in built.gm.consumers_eff.get(cast("Node", node), set()):
+        if c.node_id not in built.layer_var:
+            continue
+        c_hint = (hint_layers or {}).get(c.node_id)
+        if c_hint is None:
+            all_cons_hinted = False
+            continue
+        hinted_cons.append(c_hint)
+        gap = _consumer_cancel_gap(c, nid, mech, ctx, in_input=in_input)
+        if c_hint + gap > L:
+            violations.append(
+                f"cancel hint before consumer's layer+{gap}: "
+                f"{_hint_desc(nid, ctx.all_nodes)} "
+                f"cancel={L}, consumer {_hint_desc(c.node_id, ctx.all_nodes)} "
+                f"layer={c_hint}"
+            )
+    if K is not None and all_cons_hinted:
+        base = max(hinted_cons) if hinted_cons else birth
+        if base is not None:
+            ub = base + 1 + K + deltas.get(nid, 0)
+            if ub < L:
+                violations.append(
+                    f"cancel hint outside the (widened) window: "
+                    f"{_hint_desc(nid, ctx.all_nodes)} cancel={L} > ub={ub} "
+                    f"(base={base}, "
+                    f"K={K}, delta={deltas.get(nid, 0)}) — post-widening "
+                    f"this should be impossible; a new class of hint "
+                    f"infeasibility has appeared"
+                )
+    return violations
+
+
+def _check_one_cancel_hint(nid: int, L: int, ctx: _HintCheckCtx) -> list[str]:
+    """All cancel-hint checks for one hinted node."""
+    built = ctx.built
+    all_nodes = ctx.all_nodes
+    violations: list[str] = []
+    in_sched = nid in built.cancel_layer
+    in_input = nid in built.input_cancel_layer
+    if not in_sched and not in_input:
+        if not _expected_hint_drop(nid, all_nodes):
+            violations.append(
+                f"cancel hint for node with no cancel var (guard-dropped): "
+                f"{_hint_desc(nid, all_nodes)} hint={L}"
+            )
+        return violations
+    if not (0 <= L <= ctx.max_layers):
+        violations.append(
+            f"cancel hint out of range (guard-dropped): "
+            f"{_hint_desc(nid, all_nodes)} hint={L}"
+        )
+        return violations
+    keep = nid in (built.keep_forever_ids if in_sched else built.input_keep_ids)
+    if keep:
+        if ctx.max_layers != L:
+            violations.append(
+                f"cancel hint below max_layers={ctx.max_layers} for "
+                f"keep-forever node: {_hint_desc(nid, all_nodes)} hint={L}"
+            )
+        return violations
+    birth = (ctx.hint.layers or {}).get(nid) if in_sched else 0
+    min_lifetime = 0 if nid == built.held_source_id else 1
+    if birth is not None and birth + min_lifetime > L:
+        violations.append(
+            f"cancel hint before birth+{min_lifetime}: "
+            f"{_hint_desc(nid, all_nodes)} "
+            f"cancel={L} birth={birth}"
+        )
+    mech = (ctx.hint.cancel_mech or {}).get(nid, ATTN)
+    selected = ctx.hinted_target_of.get(nid)
+    if selected is not None:
+        violations.extend(
+            _check_selected_reuse_target(nid, L, selected, ctx.hint, all_nodes)
+        )
+        return violations
+    if in_input and mech == MLP:
+        # Inputs have no MLP cancel mechanism in the model (no
+        # `cancel_in_mlp` var is created for freeable inputs), so an
+        # MLP-mech hint on an input can only come from a heuristic
+        # emitting a schedule the model cannot represent.  Flag it, then
+        # check the gaps as the attention mechanism the model assumes.
+        violations.append(
+            f"MLP cancel mechanism hinted for an input (inputs are "
+            f"always attention-cancelled in the model): "
+            f"{_hint_desc(nid, all_nodes)}"
+        )
+        mech = ATTN
+    violations.extend(_check_consumer_gaps_and_window(nid, L, mech, ctx))
+    return violations
+
+
 def _validate_hint(
     built: BuiltModel,
     hint: DiagnosticHint,
@@ -2775,250 +3143,25 @@ def _validate_hint(
     naming the first violations; the default emits one ``RuntimeWarning``
     (production keeps its fall-back-don't-fail contract).
     """
-    hint_layers = hint.layers
-    hint_routing = hint.routing
-    hint_cancel = hint.cancel
-    hint_cancel_mech = hint.cancel_mech
-    violations: list[str] = []
     gm = built.gm
     all_nodes: dict[int, Node] = {n.node_id: n for n in gm.graph.get_all_nodes()}
     input_ids = {n.node_id for n in gm.input_nodes}
 
-    def _desc(nid: int) -> str:
-        n = all_nodes.get(nid)
-        if n is None:
-            return f"id={nid} <not in graph>"
-        return f"id={nid} {type(n).__name__} name={getattr(n, 'name', None)!r}"
+    violations: list[str] = []
+    violations.extend(
+        _check_layer_hints(built, hint.layers, all_nodes, input_ids, max_layers)
+    )
+    violations.extend(_check_routing_hints(built, hint.routing, all_nodes))
 
-    def _expected_drop(nid: int) -> bool:
-        n = all_nodes.get(nid)
-        return isinstance(n, Concatenate)
-
-    K = built.eff_cancel_slack
-    deltas = built.cancel_window_delta or {}
-
-    for nid, L in (hint_layers or {}).items():
-        if nid in built.layer_var:
-            if not (0 <= L < max_layers):
-                violations.append(
-                    f"layer hint out of range (guard-dropped): {_desc(nid)} hint={L}"
-                )
-            elif built.layer_bounds is not None:
-                lo, hi = built.layer_bounds[nid]
-                if not (lo <= L <= hi):
-                    violations.append(
-                        f"layer hint outside tightened domain [{lo},{hi}]: "
-                        f"{_desc(nid)} hint={L}"
-                    )
-        elif not _expected_drop(nid) and nid not in input_ids:
-            violations.append(
-                f"layer hint for node with no layer var (guard-dropped): "
-                f"{_desc(nid)} hint={L}"
-            )
-
-    route: str | None
-    for nid, route in (hint_routing or {}).items():
-        if route not in (ATTN, MLP):
-            violations.append(
-                f"routing hint with unknown route {route!r}: {_desc(nid)}"
-            )
-        if nid not in built.is_attn and not _expected_drop(nid):
-            violations.append(
-                f"routing hint for node with no routing var (guard-dropped): "
-                f"{_desc(nid)} hint={route}"
-            )
-
-    def _hinted_add_placement(A: Add) -> AddPlacement | None:
-        """Derive A's placement from the LAYER/ROUTING hints.
-
-        Goes through the one assignment-level definition
-        (`add_placement.derive_add_placement` — the same rule the model's
-        per-occurrence literals reify; keep them in sync).  Returns None
-        (check leniently) when a needed hint is missing.  The held target
-        short-circuits inside the derivation (is_free pinned 0, never
-        derived).
-        """
-        if hint_layers is None or A.node_id not in hint_layers:
-            return None
-        routing_map = dict(hint_routing or {})
-        if routing_map.get(A.node_id) is None:
-            # Layers-only diagnostic hints: assume the attention-route
-            # (strict-prior) predicate — exact for attention-routed Adds
-            # and conservative (never over-reuses) otherwise.  Consumers
-            # with missing route hints block same-layer completion inside
-            # the derivation for the same reason.
-            routing_map[A.node_id] = ATTN
-        try:
-            return derive_add_placement(
-                A,
-                effective_consumers=lambda x: gm.consumers_eff.get(x, ()),
-                node_to_layer=hint_layers,
-                node_to_routing=routing_map,
-                held_source_id=built.held_source_id,
-                held_target_id=built.held_target_id,
-            )
-        except ValueError:
-            return None
-
-    def _hinted_add_placement_complete(A: Add) -> bool:
-        """True when every hint the derivation read actually existed.
-
-        A missing consumer layer/route makes the derivation conservative
-        (not reusable), which must not be mistaken for a derived fresh.
-        """
-        if hint_layers is None or A.node_id not in hint_layers:
-            return False
-        if (hint_routing or {}).get(A.node_id) is None:
-            return False
-        for E in A.inputs:
-            for c in gm.consumers_eff.get(E, set()):
-                if c is A or isinstance(c, Concatenate):
-                    continue
-                if c.node_id not in built.layer_var:
-                    continue
-                if (hint_layers or {}).get(c.node_id) is None:
-                    return False
-                if (hint_routing or {}).get(c.node_id) is None:
-                    return False
-        return True
-
-    # The selected reuse target per the hints: target nid -> (add, placement).
-    hinted_target_of: dict[int, tuple[Add, object]] = {}
-    for _A in gm.schedulable:
-        if not isinstance(_A, Add):
-            continue
-        _p = _hinted_add_placement(_A)
-        if (
-            _p is not None
-            and _p.reuse_input_index is not None
-            and _hinted_add_placement_complete(_A)
-        ):
-            hinted_target_of[_A.inputs[_p.reuse_input_index].node_id] = (_A, _p)
-
-    for nid, L in (hint_cancel or {}).items():
-        in_sched = nid in built.cancel_layer
-        in_input = nid in built.input_cancel_layer
-        if not in_sched and not in_input:
-            if not _expected_drop(nid):
-                violations.append(
-                    f"cancel hint for node with no cancel var (guard-dropped): "
-                    f"{_desc(nid)} hint={L}"
-                )
-            continue
-        if not (0 <= L <= max_layers):
-            violations.append(
-                f"cancel hint out of range (guard-dropped): {_desc(nid)} hint={L}"
-            )
-            continue
-        keep = nid in (built.keep_forever_ids if in_sched else built.input_keep_ids)
-        if keep:
-            if max_layers != L:
-                violations.append(
-                    f"cancel hint below max_layers={max_layers} for "
-                    f"keep-forever node: {_desc(nid)} hint={L}"
-                )
-            continue
-        birth = (hint_layers or {}).get(nid) if in_sched else 0
-        min_lifetime = 0 if nid == built.held_source_id else 1
-        if birth is not None and birth + min_lifetime > L:
-            violations.append(
-                f"cancel hint before birth+{min_lifetime}: {_desc(nid)} "
-                f"cancel={L} birth={birth}"
-            )
-        node = all_nodes.get(nid)
-        mech = (hint_cancel_mech or {}).get(nid, ATTN)
-        selected = hinted_target_of.get(nid)
-        if selected is not None:
-            # A selected reuse target's lifetime ends through the reassign
-            # handoff: its canonical virtual cancel is layer[A] + 1 with a
-            # non-MLP mechanism (bookkeeping only — the physical cancel is
-            # gated absent).  A different hint contradicts the model's
-            # selector constraints and would sink the incumbent.
-            sel_add, _sel_p = selected
-            sel_layer = (hint_layers or {}).get(sel_add.node_id)
-            if sel_layer is not None and sel_layer + 1 != L:
-                violations.append(
-                    f"selected reuse target's cancel hint is not the "
-                    f"virtual handoff layer[A]+1={sel_layer + 1}: "
-                    f"{_desc(nid)} cancel={L} (Add {_desc(sel_add.node_id)})"
-                )
-            if (hint_cancel_mech or {}).get(nid) == MLP:
-                violations.append(
-                    f"selected reuse target hinted an MLP cancel mechanism "
-                    f"(a reassigned target has no physical cancel; its "
-                    f"canonical mechanism is attention): {_desc(nid)}"
-                )
-            continue
-        if in_input and mech == MLP:
-            # Inputs have no MLP cancel mechanism in the model (no
-            # `cancel_in_mlp` var is created for freeable inputs), so an
-            # MLP-mech hint on an input can only come from a heuristic
-            # emitting a schedule the model cannot represent.  Flag it, then
-            # check the gaps as the attention mechanism the model assumes.
-            violations.append(
-                f"MLP cancel mechanism hinted for an input (inputs are "
-                f"always attention-cancelled in the model): {_desc(nid)}"
-            )
-            mech = ATTN
-        hinted_cons: list[int] = []
-        all_cons_hinted = True
-        for c in gm.consumers_eff.get(cast("Node", node), set()):
-            if c.node_id not in built.layer_var:
-                continue
-            c_hint = (hint_layers or {}).get(c.node_id)
-            if c_hint is None:
-                all_cons_hinted = False
-                continue
-            hinted_cons.append(c_hint)
-            # Mirror the mechanism-conditional cancel bound.  An MLP cancel
-            # fires after both sublayers' reads, so it permits gap 0 for every
-            # non-Add consumer (attn or mlp).  An attention cancel keeps the
-            # routing-aware gap: an attention-routed consumer permits a
-            # same-layer cancel (gap 0); an MLP-routed consumer keeps the
-            # layer-after bound (gap 1).  Routing comes from the hint when
-            # present, else the model's pinned routing; flex consumers without
-            # a routing hint are checked leniently (gap 0).  An Add consumer's
-            # bound mirrors the mechanism-specific model terms: the attention
-            # term is `layer + (is_free OR MLP-routed)` (reuse conservatism —
-            # gap #2 — or the MLP-routed Add's post-cancel read), the MLP term
-            # is `layer + is_free`.  Placement derives from the layer/route
-            # hints (`_hinted_add_placement`), lenient (gap 0) when a needed
-            # hint is missing.  Freeable non-held inputs keep the model's
-            # uniform gap-1 bound for every consumer.
-            if in_input and nid != built.held_source_id:
-                gap = 1
-            elif isinstance(c, Add):
-                placement = _hinted_add_placement(c)
-                add_free = placement.is_free if placement is not None else False
-                if mech == MLP:
-                    gap = 1 if add_free else 0
-                else:
-                    c_route = (hint_routing or {}).get(c.node_id)
-                    gap = 1 if (add_free or c_route == MLP) else 0
-            elif mech == MLP:
-                gap = 0
-            else:
-                route = (hint_routing or {}).get(c.node_id)
-                if route is None and built.static_routing is not None:
-                    route = built.static_routing.get(c.node_id)
-                gap = 1 if route == MLP else 0
-            if c_hint + gap > L:
-                violations.append(
-                    f"cancel hint before consumer's layer+{gap}: {_desc(nid)} "
-                    f"cancel={L}, consumer {_desc(c.node_id)} layer={c_hint}"
-                )
-        if K is not None and all_cons_hinted:
-            base = max(hinted_cons) if hinted_cons else birth
-            if base is not None:
-                ub = base + 1 + K + deltas.get(nid, 0)
-                if ub < L:
-                    violations.append(
-                        f"cancel hint outside the (widened) window: "
-                        f"{_desc(nid)} cancel={L} > ub={ub} (base={base}, "
-                        f"K={K}, delta={deltas.get(nid, 0)}) — post-widening "
-                        f"this should be impossible; a new class of hint "
-                        f"infeasibility has appeared"
-                    )
+    ctx = _HintCheckCtx(
+        built=built,
+        hint=hint,
+        all_nodes=all_nodes,
+        max_layers=max_layers,
+        hinted_target_of=_hinted_reuse_targets(built, hint),
+    )
+    for nid, L in (hint.cancel or {}).items():
+        violations.extend(_check_one_cancel_hint(nid, L, ctx))
 
     if violations:
         max_shown = 5

@@ -289,7 +289,7 @@ def equivalence_report(
             d_head=d_head,
             d_hidden=d_hidden,
         )
-        n_in = sum(w for _, _, w in c_chain._input_specs)
+        n_in = sum(w for _, _, w in c_chain.input_specs)
         if input_tensor is None:
             input_tensor = torch.randn(n_pos, n_in)
         oc = c_chain(input_tensor)

@@ -35,7 +35,7 @@ def _eval(node, inputs, n_pos=1):
     return values[node]
 
 
-def _build_graph(with_watch=False, with_assert=False):
+def _build_graph(*, with_watch=False, with_assert=False):
     x = create_input("x", 1)
     y = clamp(x, -1.0, 1.0)
     if with_watch:

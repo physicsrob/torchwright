@@ -335,7 +335,9 @@ def test_trivial_graph_uses_placeholder_layer_without_planned_operations():
         output_node=x,
         optimize=0,
         verbose=False,
-        on_layer_compiled=make_layer_callback(CompileHeader(16, 16, True, True), sink),
+        on_layer_compiled=make_layer_callback(
+            CompileHeader(16, 16, trim_heads=True, bias=True), sink
+        ),
     )
 
     assert net.schedule_result.assignment.n_layers == 0

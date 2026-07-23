@@ -109,6 +109,194 @@ def _sidecar_or_raise(onnx_path: str) -> dict:
     return sidecar
 
 
+def _check_fingerprint(onnx_path: str, sidecar: dict, out: Node, d: int) -> None:
+    """Raise unless the rebuilt graph is the compiled graph (topology)."""
+    fp = debug_fingerprint(out, d=d, d_head=int(sidecar["d_head"]))
+    if fp != sidecar["fingerprint"]:
+        raise ValueError(
+            f"{debug_meta_path_for(onnx_path)}: graph fingerprint mismatch — "
+            f"the rebuilt graph's topology differs from the graph this "
+            f"artifact was compiled from (sidecar "
+            f"{sidecar['fingerprint'][:12]}..., rebuilt {fp[:12]}...).  "
+            f"Rebuild with the same construction code/parameters as the "
+            f"compile.  (Attached checks do NOT affect the "
+            f"fingerprint; anything else does.)"
+        )
+
+
+def _warn_if_fewer_asserts(checked_nodes: list[Node], sidecar: dict) -> None:
+    """Warn when the rebuild carries fewer assert checks than the compile."""
+    n_asserts = sum(1 for n in checked_nodes for c in n.checks if c.kind == "assert")
+    cov = sidecar.get("assert_coverage") or {}
+    if n_asserts < int(cov.get("n_asserts", 0)):
+        print(
+            f"OnnxDebugSession WARNING: rebuilt graph carries "
+            f"{n_asserts} assert check(s) but the compiled graph "
+            f"had {cov['n_asserts']} — debug=True is checking fewer "
+            f"invariants than the original compile would have."
+        )
+
+
+def _check_machine_kind(onnx_path: str, sidecar: dict, by_canon: dict) -> None:
+    """Raise on a relu-vs-swish rebuild of the same shapes.
+
+    The topology fingerprint predates the swish machine and cannot see
+    FFN activation (its encoding is frozen), so cross-check explicitly
+    against the sidecar's recorded machine (pre-swish sidecars lack the
+    key: they are all ReLU artifacts).
+    """
+    from torchwright.graph.ffn import FFN as _FFN
+
+    rebuilt_acts = {n.activation for n in by_canon.values() if isinstance(n, _FFN)}
+    rebuilt_act = (
+        next(iter(rebuilt_acts))
+        if len(rebuilt_acts) == 1
+        else ("relu" if not rebuilt_acts else "mixed")
+    )
+    sidecar_act = sidecar.get("activation", "relu")
+    if rebuilt_act != sidecar_act:
+        raise ValueError(
+            f"{debug_meta_path_for(onnx_path)}: machine mismatch — the "
+            f"artifact was compiled as the {sidecar_act!r} machine but the "
+            f"rebuilt graph's FFNs give {rebuilt_act!r}.  Rebuild with the "
+            f"same op package the compile used."
+        )
+
+
+def _build_residual_assignment(
+    sidecar: dict, by_canon: dict
+) -> tuple[ResidualAssignment, dict[str, ResidualStreamState]]:
+    """Remap the sidecar's canonical-id residual assignment onto live nodes."""
+    states: list[ResidualStreamState] = []
+    key_to_state: dict[str, ResidualStreamState] = {}
+    for entry in sidecar["states"]:
+        st = ResidualStreamState(name=entry["key"])
+        key_to_state[entry["key"]] = st
+        states.append(st)
+    ra = ResidualAssignment(set(states))
+    for entry in sidecar["states"]:
+        st = key_to_state[entry["key"]]
+        same_as = entry.get("same_as")
+        if same_as is not None:
+            ra.duplicate_state(key_to_state[same_as], st)
+            continue
+        for cid_str, runs in entry["nodes"].items():
+            node = by_canon.get(int(cid_str))
+            if node is None:
+                continue
+            ra.assign(st, node, decode_cols(runs))
+    return ra, key_to_state
+
+
+def _annotation_paths(sidecar: dict, by_canon: dict) -> dict[int, str]:
+    """Annotation paths keyed by live node id (from the sidecar node table)."""
+    annotation_by_node_id: dict[int, str] = {}
+    for cid_str, meta in (sidecar.get("nodes") or {}).items():
+        label = meta.get("annotation")
+        if label is None:
+            continue
+        node = by_canon.get(int(cid_str))
+        if node is not None:
+            annotation_by_node_id[node.node_id] = label
+    return annotation_by_node_id
+
+
+def _find_token_embedding(out: Node) -> Embedding | None:
+    """The graph's Embedding node (token-string translation), if any."""
+    stack = [out]
+    seen: set = set()
+    while stack:
+        n = stack.pop()
+        if n.node_id in seen:
+            continue
+        seen.add(n.node_id)
+        if isinstance(n, Embedding):
+            return n
+        stack.extend(getattr(n, "inputs", None) or [])
+    return None
+
+
+def _state_fetch_plan(
+    key_to_state: dict[str, ResidualStreamState], n_layers: int
+) -> list[tuple[ResidualStreamState, str, str]]:
+    """Map each capturable state to its ONNX tensor name and label."""
+    state_fetch: list[tuple[ResidualStreamState, str, str]] = []
+    if "input" in key_to_state:
+        state_fetch.append((key_to_state["input"], "res_0", "input_res_0"))
+    for i in range(n_layers):
+        state_fetch.append(
+            (
+                key_to_state[f"L{i}.attn"],
+                f"l{i}_res_attn",
+                f"layer_{i}_attn_skip_out_state",
+            )
+        )
+        state_fetch.append(
+            (
+                key_to_state[f"L{i}.mlp"],
+                f"l{i}_res_next",
+                f"layer_{i}_mlp_out_state",
+            )
+        )
+    return state_fetch
+
+
+def _promote_debug_outputs(
+    model: onnx.ModelProto,
+    state_fetch: list[tuple[ResidualStreamState, str, str]],
+    per_layer_n_heads: list[int],
+    d: int,
+) -> None:
+    """Promote the per-layer residual and attention tensors to graph outputs."""
+    from onnx import TensorProto, helper
+
+    existing_outputs = {vo.name for vo in model.graph.output}
+    for _state, tensor_name, _label in state_fetch:
+        if tensor_name not in existing_outputs:
+            model.graph.output.append(
+                helper.make_tensor_value_info(
+                    tensor_name, TensorProto.FLOAT, ["n_new", d]
+                )
+            )
+    for i in range(len(per_layer_n_heads)):
+        for suffix in ("weights", "logits_masked"):
+            name = f"l{i}_{suffix}"
+            if name not in existing_outputs:
+                model.graph.output.append(
+                    helper.make_tensor_value_info(
+                        name,
+                        TensorProto.FLOAT,
+                        [per_layer_n_heads[i], "n_new", "n_keys"],
+                    )
+                )
+
+
+def _check_emission_bias(onnx_path: str, sidecar: dict, model: onnx.ModelProto) -> None:
+    """Raise when the sidecar's bias flag disagrees with the artifact.
+
+    The bias flag is a compile option — the rebuilt graph cannot reveal
+    it, so unlike the machine check this compares sidecar against the
+    artifact's own initializer set.  Pre-feature sidecars lack the key:
+    they are all biased artifacts.
+    """
+    sidecar_bias = bool(sidecar.get("bias", True))
+    init_names = {t.name for t in model.graph.initializer} | {
+        s.values.name for s in model.graph.sparse_initializer
+    }
+    artifact_bias = any(
+        name in init_names
+        for name in ("l0_b1", "l0_b2", "l0_bgate", "l0_bup", "l0_bdown")
+    )
+    if sidecar_bias != artifact_bias:
+        raise ValueError(
+            f"{debug_meta_path_for(onnx_path)}: emission-mode mismatch — "
+            f"the sidecar records bias={sidecar_bias} but the artifact "
+            f"{'carries' if artifact_bias else 'carries no'} bias "
+            f"initializers.  The sidecar does not belong to this model; "
+            f"re-export the pair together."
+        )
+
+
 #: onnxruntime's embedded-initializer ceiling (bytes).  ORT >= 1.26 refuses
 #: to load ANY initializer whose dense size exceeds this unless the data is
 #: external — and a *sparse* initializer (ONNX has no external form for
@@ -128,8 +316,8 @@ _DENSIFY_BLOCK_ELEMS = 64 * 1024 * 1024
 
 
 def _make_session(
-    model: onnx.ModelProto, providers: list[str] | None, owner: OnnxDebugSession
-) -> ort.InferenceSession:
+    model: onnx.ModelProto, providers: list[str] | None
+) -> tuple[ort.InferenceSession, tempfile.TemporaryDirectory[str] | None]:
     """Build the onnxruntime session for the (output-promoted) debug model.
 
     Small models load from in-memory bytes, as before.  When any sparse
@@ -139,6 +327,11 @@ def _make_session(
     the only load form ORT accepts for >2 GiB tensors.  Debug-session-only
     cost (one dense materialization + disk copy); the production runtime
     never takes this path.
+
+    Returns ``(session, external_data_dir)``; the second element is the
+    temp directory holding the externalized tensor data (``None`` when no
+    conversion ran).  The caller must keep it alive for the session's
+    lifetime — ORT reads the external file lazily.
     """
     import numpy as np
     import onnx
@@ -161,7 +354,10 @@ def _make_session(
         if _declared_bytes(sp) > _ORT_EMBEDDED_INITIALIZER_LIMIT
     ]
     if not oversized:
-        return ort.InferenceSession(model.SerializeToString(), providers=providers)
+        return (
+            ort.InferenceSession(model.SerializeToString(), providers=providers),
+            None,
+        )
 
     import tempfile
 
@@ -169,9 +365,9 @@ def _make_session(
 
     # The temp dir must outlive the session (ORT reads the external file at
     # init; keeping it for the session's lifetime is the safe contract).
-    owner._external_data_dir = tempfile.TemporaryDirectory(prefix="tw_onnx_debug_")
+    external_data_dir = tempfile.TemporaryDirectory(prefix="tw_onnx_debug_")
     data_name = "debug_dense.bin"
-    data_path = Path(owner._external_data_dir.name) / data_name
+    data_path = Path(external_data_dir.name) / data_name
 
     # The dense bytes go straight into a side file, never into a
     # TensorProto: a protobuf message caps at 2 GiB, so a >2 GiB dense
@@ -231,9 +427,9 @@ def _make_session(
     # Everything still embedded fits comfortably (the artifact held it all
     # in one file), so a plain save alongside the side file suffices; ORT
     # resolves external_data locations relative to the model's directory.
-    tmp_model = str(Path(owner._external_data_dir.name) / "debug_model.onnx")
+    tmp_model = str(Path(external_data_dir.name) / "debug_model.onnx")
     onnx.save(model, tmp_model)
-    return ort.InferenceSession(tmp_model, providers=providers)
+    return ort.InferenceSession(tmp_model, providers=providers), external_data_dir
 
 
 class OnnxDebugSession:
@@ -274,77 +470,22 @@ class OnnxDebugSession:
 
         # --- Fingerprint: the rebuilt graph must be the compiled graph.
         out = output_node
-        fp = debug_fingerprint(out, d=self._d, d_head=int(sidecar["d_head"]))
-        if fp != sidecar["fingerprint"]:
-            raise ValueError(
-                f"{debug_meta_path_for(onnx_path)}: graph fingerprint mismatch — "
-                f"the rebuilt graph's topology differs from the graph this "
-                f"artifact was compiled from (sidecar "
-                f"{sidecar['fingerprint'][:12]}..., rebuilt {fp[:12]}...).  "
-                f"Rebuild with the same construction code/parameters as the "
-                f"compile.  (Attached checks do NOT affect the "
-                f"fingerprint; anything else does.)"
-            )
+        _check_fingerprint(onnx_path, sidecar, out, self._d)
 
         # --- Check predicates come from the rebuilt graph.
         from torchwright.graph.asserts import collect_debug_nodes
 
         self._checked_nodes = collect_debug_nodes(output_node)
-        n_asserts = sum(
-            1 for n in self._checked_nodes for c in n.checks if c.kind == "assert"
-        )
-        cov = sidecar.get("assert_coverage") or {}
-        if n_asserts < int(cov.get("n_asserts", 0)):
-            print(
-                f"OnnxDebugSession WARNING: rebuilt graph carries "
-                f"{n_asserts} assert check(s) but the compiled graph "
-                f"had {cov['n_asserts']} — debug=True is checking fewer "
-                f"invariants than the original compile would have."
-            )
+        _warn_if_fewer_asserts(self._checked_nodes, sidecar)
 
         # --- Remap the sidecar's canonical-id residual assignment onto
         # the rebuilt graph's live nodes.
         by_canon = nodes_by_canonical_id(out)
 
-        # --- Machine kind: the topology fingerprint predates the swish
-        # machine and cannot see FFN activation (its encoding is frozen), so
-        # a relu-vs-swish rebuild of the same shapes would slip through it.
-        # Cross-check explicitly against the sidecar's recorded machine
-        # (pre-swish sidecars lack the key: they are all ReLU artifacts).
-        from torchwright.graph.ffn import FFN as _FFN
+        # --- Machine kind cross-check (see _check_machine_kind).
+        _check_machine_kind(onnx_path, sidecar, by_canon)
 
-        rebuilt_acts = {n.activation for n in by_canon.values() if isinstance(n, _FFN)}
-        rebuilt_act = (
-            next(iter(rebuilt_acts))
-            if len(rebuilt_acts) == 1
-            else ("relu" if not rebuilt_acts else "mixed")
-        )
-        sidecar_act = sidecar.get("activation", "relu")
-        if rebuilt_act != sidecar_act:
-            raise ValueError(
-                f"{debug_meta_path_for(onnx_path)}: machine mismatch — the "
-                f"artifact was compiled as the {sidecar_act!r} machine but the "
-                f"rebuilt graph's FFNs give {rebuilt_act!r}.  Rebuild with the "
-                f"same op package the compile used."
-            )
-        states: list[ResidualStreamState] = []
-        key_to_state: dict[str, ResidualStreamState] = {}
-        for entry in sidecar["states"]:
-            st = ResidualStreamState(name=entry["key"])
-            key_to_state[entry["key"]] = st
-            states.append(st)
-        ra = ResidualAssignment(set(states))
-        for entry in sidecar["states"]:
-            st = key_to_state[entry["key"]]
-            same_as = entry.get("same_as")
-            if same_as is not None:
-                ra.duplicate_state(key_to_state[same_as], st)
-                continue
-            for cid_str, runs in entry["nodes"].items():
-                node = by_canon.get(int(cid_str))
-                if node is None:
-                    continue
-                ra.assign(st, node, decode_cols(runs))
+        ra, key_to_state = _build_residual_assignment(sidecar, by_canon)
         self._ra = ra
         self._key_to_state = key_to_state
 
@@ -353,53 +494,23 @@ class OnnxDebugSession:
         # objects so callers can look one up by node (mirroring
         # node.annotation on the in-process backend).  Nodes that carried
         # no annotation are simply absent.
-        self._annotation_by_node_id: dict[int, str] = {}
-        for cid_str, meta in (sidecar.get("nodes") or {}).items():
-            label = meta.get("annotation")
-            if label is None:
-                continue
-            node = by_canon.get(int(cid_str))
-            if node is not None:
-                self._annotation_by_node_id[node.node_id] = label
+        self._annotation_by_node_id: dict[int, str] = _annotation_paths(
+            sidecar, by_canon
+        )
         # Post-MLP triples — the ordered states every check/probe scans,
         # mirroring the in-process backend.
         self._ordered: list[tuple] = [
             (i, f"L{i}.mlp", key_to_state[f"L{i}.mlp"]) for i in range(self._n_layers)
         ]
         # state -> ONNX tensor name, every capturable state.
-        self._state_fetch: list[tuple[ResidualStreamState, str, str]] = []
-        if "input" in key_to_state:
-            self._state_fetch.append((key_to_state["input"], "res_0", "input_res_0"))
-        for i in range(self._n_layers):
-            self._state_fetch.append(
-                (
-                    key_to_state[f"L{i}.attn"],
-                    f"l{i}_res_attn",
-                    f"layer_{i}_attn_skip_out_state",
-                )
-            )
-            self._state_fetch.append(
-                (
-                    key_to_state[f"L{i}.mlp"],
-                    f"l{i}_res_next",
-                    f"layer_{i}_mlp_out_state",
-                )
-            )
+        self._state_fetch: list[tuple[ResidualStreamState, str, str]] = (
+            _state_fetch_plan(key_to_state, self._n_layers)
+        )
 
         # --- Token graphs: the Embedding node translates token strings.
         self._embedding: Embedding | None = None
         if self._kind == "token":
-            stack = [out]
-            seen: set = set()
-            while stack:
-                n = stack.pop()
-                if n.node_id in seen:
-                    continue
-                seen.add(n.node_id)
-                if isinstance(n, Embedding):
-                    self._embedding = n
-                    break
-                stack.extend(getattr(n, "inputs", None) or [])
+            self._embedding = _find_token_embedding(out)
 
         # --- Production meta sidecar (vocab etc.) — optional but normal.
         self.metadata: dict = {}
@@ -420,27 +531,8 @@ class OnnxDebugSession:
                 f"{onnx_path}: no past_K_0 input — not a cached-protocol model"
             )
 
-        # Emission-mode cross-check: the sidecar's recorded bias flag (a
-        # compile option — the rebuilt graph cannot reveal it, so unlike
-        # the machine check this compares sidecar against the artifact's
-        # own initializer set).  Pre-feature sidecars lack the key: they
-        # are all biased artifacts.
-        sidecar_bias = bool(sidecar.get("bias", True))
-        init_names = {t.name for t in model.graph.initializer} | {
-            s.values.name for s in model.graph.sparse_initializer
-        }
-        artifact_bias = any(
-            name in init_names
-            for name in ("l0_b1", "l0_b2", "l0_bgate", "l0_bup", "l0_bdown")
-        )
-        if sidecar_bias != artifact_bias:
-            raise ValueError(
-                f"{debug_meta_path_for(onnx_path)}: emission-mode mismatch — "
-                f"the sidecar records bias={sidecar_bias} but the artifact "
-                f"{'carries' if artifact_bias else 'carries no'} bias "
-                f"initializers.  The sidecar does not belong to this model; "
-                f"re-export the pair together."
-            )
+        # Emission-mode cross-check (see _check_emission_bias).
+        _check_emission_bias(onnx_path, sidecar, model)
 
         def _dim(vi: onnx.ValueInfoProto, k: int) -> int | None:
             d = vi.type.tensor_type.shape.dim[k]
@@ -456,32 +548,15 @@ class OnnxDebugSession:
         self._static_slot_dim: int | None = _dim(graph_inputs["past_K_0"], 0)
         self._cache_stride: int = int(self._static_slot_dim or sidecar["cache_stride"])
 
-        from onnx import TensorProto, helper
+        _promote_debug_outputs(
+            model, self._state_fetch, self._per_layer_n_heads, self._d
+        )
 
-        existing_outputs = {vo.name for vo in model.graph.output}
-        for _state, tensor_name, _label in self._state_fetch:
-            if tensor_name not in existing_outputs:
-                model.graph.output.append(
-                    helper.make_tensor_value_info(
-                        tensor_name, TensorProto.FLOAT, ["n_new", self._d]
-                    )
-                )
-        for i in range(self._n_layers):
-            for suffix in ("weights", "logits_masked"):
-                name = f"l{i}_{suffix}"
-                if name not in existing_outputs:
-                    model.graph.output.append(
-                        helper.make_tensor_value_info(
-                            name,
-                            TensorProto.FLOAT,
-                            [self._per_layer_n_heads[i], "n_new", "n_keys"],
-                        )
-                    )
-
-        # Session-lifetime home of externalized initializer data; set by
-        # _make_session only when an oversized sparse tensor was converted.
-        self._external_data_dir: tempfile.TemporaryDirectory[str] | None = None
-        self._session = _make_session(model, providers, self)
+        # Session-lifetime home of externalized initializer data; non-None
+        # only when _make_session converted an oversized sparse tensor.
+        # Held here so the temp dir outlives the session that reads it.
+        self._external_data_dir: tempfile.TemporaryDirectory[str] | None
+        self._session, self._external_data_dir = _make_session(model, providers)
         self._primary_output = "logits" if self._kind == "token" else "outputs"
         self._debug_state: _DebugState | None = None
 
@@ -556,6 +631,7 @@ class OnnxDebugSession:
         inputs: torch.Tensor,
         past: tuple,
         past_len: int | None = None,
+        *,
         debug: bool = False,
         debug_atol: float = 1e-7,
     ) -> tuple:
@@ -605,6 +681,7 @@ class OnnxDebugSession:
     def __call__(
         self,
         inputs: torch.Tensor,
+        *,
         debug: bool = False,
         debug_atol: float = 1e-7,
     ) -> torch.Tensor:

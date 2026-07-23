@@ -751,40 +751,17 @@ def _mul_op(
 # ---------------------------------------------------------------------------
 
 
-def _sub_op(
-    rope: RopeConfig,
-    embedding: Embedding,
-    A: list[Node],
-    B: list[Node],
-    n: int,
-    steps_since: Node,
-) -> tuple[list[Node], list[Node]]:
-    """Streamed subtraction.
+def _cmp_verdict_stream(
+    embedding: Embedding, A: list[Node], B: list[Node], n: int
+) -> list[Node]:
+    """Streamed comparison phase: MSB-first 3-state verdict fold.
 
-    Three streamed thinking phases precede the answer:
-
-    1. **comparison** (MSB-first) — a 3-state less/equal/greater verdict folded
-       one column at a time, each column reading the prior verdict from the
-       previous emitted token; the last (LSB) verdict is the overall ``A ≥ B``.
-    2. **borrow sweep** (LSB-first) — ``|A - B|`` by a borrow fold over
-       ``bigger_k = (a_k if A≥B else b_k)`` / ``smaller_k``.
-    3. **normalization** (MSB-first) — the leading-zero count of the magnitude.
-
-    The answer is ``n+1`` MSB-first slots: a leading sign slot (``-`` if
-    ``A < B``) then the trimmed magnitude.  Verdict, borrow, and count state are
-    all read back from the emitted prefix at statically-known offsets.
+    The serial form the graph calculators retired when compare_digit_seqs
+    went constant-depth; here the recurrence rides the decode axis, where
+    serial is the point.  Each column reads the prior verdict from the
+    previous emitted token; the last (LSB) verdict is the overall ``A ≥ B``.
     """
     embed = embedding.get_embedding
-    n_state = _n_thinking(n)
-    W = 20  # shifted column total (bigger - smaller - borrow_in + 10) ∈ 0..19
-
-    a_scalar = [_digit_scalar(embedding, d) for d in A]  # MSB-first
-    b_scalar = [_digit_scalar(embedding, d) for d in B]
-
-    # --- comparison phase: MSB-first 3-state verdict fold — the serial form
-    # the graph calculators retired when compare_digit_seqs went
-    # constant-depth; here the recurrence rides the decode axis, where
-    # serial is the point. ---
     combine_table: dict[torch.Tensor, torch.Tensor] = {}
     nxt: int | Node
     for v in range(_CMP_W):
@@ -817,6 +794,41 @@ def _sub_op(
         verdict_tok.append(
             onehot_lookup(nxt, verdict_to_token, embed(_thinking_text(_EQUAL)))
         )
+    return verdict_tok
+
+
+def _sub_op(
+    rope: RopeConfig,
+    embedding: Embedding,
+    A: list[Node],
+    B: list[Node],
+    n: int,
+    steps_since: Node,
+) -> tuple[list[Node], list[Node]]:
+    """Streamed subtraction.
+
+    Three streamed thinking phases precede the answer:
+
+    1. **comparison** (MSB-first) — a 3-state less/equal/greater verdict folded
+       one column at a time, each column reading the prior verdict from the
+       previous emitted token; the last (LSB) verdict is the overall ``A ≥ B``.
+    2. **borrow sweep** (LSB-first) — ``|A - B|`` by a borrow fold over
+       ``bigger_k = (a_k if A≥B else b_k)`` / ``smaller_k``.
+    3. **normalization** (MSB-first) — the leading-zero count of the magnitude.
+
+    The answer is ``n+1`` MSB-first slots: a leading sign slot (``-`` if
+    ``A < B``) then the trimmed magnitude.  Verdict, borrow, and count state are
+    all read back from the emitted prefix at statically-known offsets.
+    """
+    embed = embedding.get_embedding
+    n_state = _n_thinking(n)
+    W = 20  # shifted column total (bigger - smaller - borrow_in + 10) ∈ 0..19
+
+    a_scalar = [_digit_scalar(embedding, d) for d in A]  # MSB-first
+    b_scalar = [_digit_scalar(embedding, d) for d in B]
+
+    # --- comparison phase (see _cmp_verdict_stream). ---
+    verdict_tok = _cmp_verdict_stream(embedding, A, B, n)
 
     # The thinking region is verdict (n) ++ borrow (n) ++ scratch (n) ++ norm
     # (n); the answer is the sign slot ++ n magnitude slots.  Name the boundaries

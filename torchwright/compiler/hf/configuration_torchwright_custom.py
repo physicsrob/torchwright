@@ -52,6 +52,7 @@ class TorchwrightCustomConfig(PretrainedConfig):
         max_position_embeddings: int = 0,
         rope_base: float = 500000.0,
         d_rot: int | None = None,
+        *,
         rms_norm: bool = False,
         rms_norm_eps: float = 1e-5,
         **kwargs: object,

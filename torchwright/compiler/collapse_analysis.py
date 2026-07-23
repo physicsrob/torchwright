@@ -37,9 +37,10 @@ import torch
 from torchwright.compiler.collapse import (
     _MIN_SYNTH_DEPTH,
     _SYNTH_CLAIM_ATOL,
+    _index_subgraphs,
     _machine,
     _member_depths,
-    scalar_sources,
+    _node_label,
 )
 from torchwright.compiler.graph_clone import topological_order
 from torchwright.compiler.pl_function import (
@@ -225,7 +226,6 @@ class V2Report:
 
 
 def _stage1_col_union(
-    members: list[MemberAnalysis],
     certs: list[MemberCertificate],
     plateau_tol: float,
 ) -> int:
@@ -242,6 +242,111 @@ def _stage1_col_union(
     if not mids:
         return 0
     return int(torch.unique(_snap_f32(torch.tensor(mids))).numel())
+
+
+def _analyze_member(
+    m: Node,
+    c: MemberCertificate,
+    *,
+    name: str,
+    depth_m: int,
+    machine: str | None,
+    budget: float,
+    lane_cap: int,
+) -> MemberAnalysis:
+    """Shape-model one synthesized member from its certificate.
+
+    Strict-policy models (the sleeve tolerance of the reported function
+    rides the bound); banded rebudgets the same fp/drift terms with the
+    smaller banded deviation.  The shape models see the
+    plateau-to-plateau skeleton — in-band knots trace the machine's own
+    dip/tail, which the emission recreates with its own hinges; counting
+    them as steps/lanes double-charges the band.
+    """
+    skel = band_skeleton(c.fn, c.bands)
+    s1 = model_s1(skel, c.deviation + SIMPLIFY_TOL)
+    s2 = model_s2(skel, c.deviation + SIMPLIFY_TOL, machine=machine, plateau_tol=budget)
+    s1_banded = s1.total_bound - c.deviation + c.banded_deviation
+    s2_banded = s2.total_bound - c.deviation + c.banded_deviation
+    return MemberAnalysis(
+        name=name,
+        d_output=m.d_output,
+        depth=depth_m,
+        n_kinks=c.n_kinks,
+        deviation=c.deviation,
+        deviation_at=c.deviation_at,
+        banded_deviation=c.banded_deviation,
+        banded_deviation_at=c.banded_deviation_at,
+        fillet_deviation=c.fillet_deviation,
+        s1=s1,
+        s2=s2,
+        linear_ok=c.linear(budget),
+        s1_ok=c.linear(budget) and s1.admissible(lane_cap, budget),
+        s2_ok=c.linear(budget) and s2.admissible(lane_cap, budget),
+        linear_banded=c.linear_banded(budget),
+        s1_banded_ok=c.linear_banded(budget)
+        and s1.lanes <= lane_cap
+        and s1_banded <= budget,
+        s2_banded_ok=c.linear_banded(budget)
+        and s2.n_steps > 0
+        and s2.stage1_lanes <= lane_cap
+        and s2.stage2_lanes <= lane_cap
+        and s2_banded <= budget,
+    )
+
+
+def _policy_verdict(
+    analyses: list[MemberAnalysis],
+    chain_depth: int,
+    *,
+    banded: bool,
+    s1_only: bool,
+    lane_cap: int,
+    budget: float,
+) -> tuple[str, int | None]:
+    """Subgraph verdict under one deviation policy (strict or banded)."""
+    lin = [a.linear_banded if banded else a.linear_ok for a in analyses]
+    s1s = [a.s1_banded_ok if banded else a.s1_ok for a in analyses]
+    s2s = [
+        False if s1_only else (a.s2_banded_ok if banded else a.s2_ok) for a in analyses
+    ]
+    if not all(lin):
+        worst_i = max(
+            (i for i in range(len(analyses)) if not lin[i]),
+            key=lambda i: (
+                analyses[i].banded_deviation if banded else analyses[i].deviation
+            ),
+        )
+        a = analyses[worst_i]
+        d = a.banded_deviation if banded else a.deviation
+        at = a.banded_deviation_at if banded else a.deviation_at
+        return (
+            f"declined: not PL within budget (member {a.name} "
+            f"deviates {d:.2e} at x={at:.6g})",
+            None,
+        )
+    if all(s1s):
+        verdict, depth_after = "S1", 1
+    elif all(a or b for a, b in zip(s1s, s2s, strict=False)):
+        verdict, depth_after = "S2", 2
+    else:
+        bad_i = next(i for i in range(len(analyses)) if not (s1s[i] or s2s[i]))
+        bad = analyses[bad_i]
+        return (
+            f"declined: member {bad.name} fits neither shape "
+            f"(S1: {bad.s1.lanes} lanes, bound {bad.s1.total_bound:.2e}; "
+            f"S2: {bad.s2.stage1_lanes} stage-1 lanes, "
+            f"bound {bad.s2.total_bound:.2e}; cap {lane_cap}, "
+            f"budget {budget:g})",
+            None,
+        )
+    if depth_after >= chain_depth:
+        return (
+            f"no depth gain ({verdict} shape needs {depth_after} "
+            f"sublayers, chain is {chain_depth})",
+            None,
+        )
+    return verdict, depth_after
 
 
 def analyze_collapse_v2(
@@ -273,22 +378,8 @@ def analyze_collapse_v2(
         verbose: print one line per subgraph as verdicts land.
     """
     order = topological_order(output_node)
-    src = scalar_sources(order)
     machine = _machine(order)
-
-    by_src: dict[Node, list[Node]] = {}
-    for n in order:
-        s = src[n]
-        if s is not None and s is not n:
-            by_src.setdefault(s, []).append(n)
-
-    consumers: dict[Node, list[Node]] = {n: [] for n in order}
-    for n in order:
-        for u in n.inputs:
-            if u in consumers:
-                consumers[u].append(n)
-
-    topo_index = {n: i for i, n in enumerate(order)}
+    by_src, consumers, topo_index = _index_subgraphs(order)
     subgraphs: list[SubgraphAnalysis] = []
     # (source, synthesized member, shape) for the floor model's
     # rewiring passes — subgraphs taken under strict, and the extra
@@ -303,15 +394,12 @@ def analyze_collapse_v2(
         member_set = set(members)
         depth = _member_depths(source, members)
         chain_depth = max(depth[m] for m in members)
-        src_name = source.name or f"{type(source).__name__}#{topo_index[source]}"
+        src_name = _node_label(source, topo_index)
         ann = source.annotation or "-"
 
-        boundary = [
-            m
-            for m in members
-            if m is output_node or any(c not in member_set for c in consumers[m])
-        ]
-        synthesized = [m for m in boundary if depth[m] >= _MIN_SYNTH_DEPTH]
+        boundary, synthesized = _boundary_members(
+            members, member_set, output_node, consumers, depth
+        )
 
         def outcome(
             verdict: str,
@@ -324,6 +412,15 @@ def analyze_collapse_v2(
             stage1_cols: int = 0,
             stage1_cols_banded: int = 0,
             n_oracle_points: int = 0,
+            # Explicit bindings of the enclosing loop's per-iteration
+            # values (B023) — behavior unchanged, the closure is only
+            # called within its own iteration.
+            src_name: str = src_name,
+            ann: str = ann,
+            source: Node = source,
+            chain_depth: int = chain_depth,
+            boundary: list[Node] = boundary,
+            synthesized: list[Node] = synthesized,
         ) -> SubgraphAnalysis:
             return SubgraphAnalysis(
                 source=src_name,
@@ -362,110 +459,39 @@ def analyze_collapse_v2(
             subgraphs.append(outcome(f"declined: {cert.declined}", domain=cert.domain))
             continue
 
-        analyses: list[MemberAnalysis] = []
-        for m in synthesized:
-            c: MemberCertificate = cert.members[m]
-            # Strict-policy models (the sleeve tolerance of the
-            # reported function rides the bound); banded rebudgets the
-            # same fp/drift terms with the smaller banded deviation.
-            # The shape models see the plateau-to-plateau skeleton —
-            # in-band knots trace the machine's own dip/tail, which
-            # the emission recreates with its own hinges; counting
-            # them as steps/lanes double-charges the band.
-            skel = band_skeleton(c.fn, c.bands)
-            s1 = model_s1(skel, c.deviation + SIMPLIFY_TOL)
-            s2 = model_s2(
-                skel, c.deviation + SIMPLIFY_TOL, machine=machine, plateau_tol=budget
+        analyses = [
+            _analyze_member(
+                m,
+                cert.members[m],
+                name=_node_label(m, topo_index),
+                depth_m=depth[m],
+                machine=machine,
+                budget=budget,
+                lane_cap=lane_cap,
             )
-            s1_banded = s1.total_bound - c.deviation + c.banded_deviation
-            s2_banded = s2.total_bound - c.deviation + c.banded_deviation
-            analyses.append(
-                MemberAnalysis(
-                    name=m.name or f"{type(m).__name__}#{topo_index[m]}",
-                    d_output=m.d_output,
-                    depth=depth[m],
-                    n_kinks=c.n_kinks,
-                    deviation=c.deviation,
-                    deviation_at=c.deviation_at,
-                    banded_deviation=c.banded_deviation,
-                    banded_deviation_at=c.banded_deviation_at,
-                    fillet_deviation=c.fillet_deviation,
-                    s1=s1,
-                    s2=s2,
-                    linear_ok=c.linear(budget),
-                    s1_ok=c.linear(budget) and s1.admissible(lane_cap, budget),
-                    s2_ok=c.linear(budget) and s2.admissible(lane_cap, budget),
-                    linear_banded=c.linear_banded(budget),
-                    s1_banded_ok=c.linear_banded(budget)
-                    and s1.lanes <= lane_cap
-                    and s1_banded <= budget,
-                    s2_banded_ok=c.linear_banded(budget)
-                    and s2.n_steps > 0
-                    and s2.stage1_lanes <= lane_cap
-                    and s2.stage2_lanes <= lane_cap
-                    and s2_banded <= budget,
-                )
-            )
+            for m in synthesized
+        ]
 
-        def policy_verdict(banded: bool) -> tuple[str, int | None]:
-            lin = [a.linear_banded if banded else a.linear_ok for a in analyses]
-            s1s = [a.s1_banded_ok if banded else a.s1_ok for a in analyses]
-            s2s = [
-                False if s1_only else (a.s2_banded_ok if banded else a.s2_ok)
-                for a in analyses
-            ]
-            if not all(lin):
-                worst_i = max(
-                    (i for i in range(len(analyses)) if not lin[i]),
-                    key=lambda i: (
-                        analyses[i].banded_deviation
-                        if banded
-                        else analyses[i].deviation
-                    ),
-                )
-                a = analyses[worst_i]
-                d = a.banded_deviation if banded else a.deviation
-                at = a.banded_deviation_at if banded else a.deviation_at
-                return (
-                    f"declined: not PL within budget (member {a.name} "
-                    f"deviates {d:.2e} at x={at:.6g})",
-                    None,
-                )
-            if all(s1s):
-                verdict, depth_after = "S1", 1
-            elif all(a or b for a, b in zip(s1s, s2s, strict=False)):
-                verdict, depth_after = "S2", 2
-            else:
-                bad_i = next(i for i in range(len(analyses)) if not (s1s[i] or s2s[i]))
-                bad = analyses[bad_i]
-                return (
-                    f"declined: member {bad.name} fits neither shape "
-                    f"(S1: {bad.s1.lanes} lanes, bound {bad.s1.total_bound:.2e}; "
-                    f"S2: {bad.s2.stage1_lanes} stage-1 lanes, "
-                    f"bound {bad.s2.total_bound:.2e}; cap {lane_cap}, "
-                    f"budget {budget:g})",
-                    None,
-                )
-            if depth_after >= chain_depth:
-                return (
-                    f"no depth gain ({verdict} shape needs {depth_after} "
-                    f"sublayers, chain is {chain_depth})",
-                    None,
-                )
-            return verdict, depth_after
-
-        verdict, depth_after = policy_verdict(banded=False)
-        verdict_banded, depth_after_banded = policy_verdict(banded=True)
+        verdict, depth_after = _policy_verdict(
+            analyses,
+            chain_depth,
+            banded=False,
+            s1_only=s1_only,
+            lane_cap=lane_cap,
+            budget=budget,
+        )
+        verdict_banded, depth_after_banded = _policy_verdict(
+            analyses,
+            chain_depth,
+            banded=True,
+            s1_only=s1_only,
+            lane_cap=lane_cap,
+            budget=budget,
+        )
 
         member_certs = [cert.members[m] for m in synthesized]
-        stage1_cols = (
-            _stage1_col_union(analyses, member_certs, budget) if verdict == "S2" else 0
-        )
-        stage1_cols_banded = (
-            _stage1_col_union(analyses, member_certs, budget)
-            if verdict_banded == "S2"
-            else 0
-        )
+        stage1_cols = _stage1_cols_if_s2(verdict, member_certs, budget)
+        stage1_cols_banded = _stage1_cols_if_s2(verdict_banded, member_certs, budget)
         sg = outcome(
             verdict,
             verdict_banded=verdict_banded,
@@ -478,28 +504,69 @@ def analyze_collapse_v2(
             n_oracle_points=cert.n_oracle_points,
         )
         subgraphs.append(sg)
-        if sg.taken:
-            rewiring.extend((source, m, verdict) for m in synthesized)
-        elif sg.taken_banded:
-            rewiring_banded.extend((source, m, verdict_banded) for m in synthesized)
+        if sg.taken or sg.taken_banded:
+            # Strict takes go on the strict list; the extras only the
+            # banded policy admits go on the banded list.
+            target, shape = (
+                (rewiring, verdict) if sg.taken else (rewiring_banded, verdict_banded)
+            )
+            target.extend((source, m, shape) for m in synthesized)
         if verbose:
             print(f"  {sg.format_line()}")
 
     report = V2Report(subgraphs=subgraphs, machine=machine)
 
     if model_floor:
-        from torchwright.compiler.forward.cpsat_scheduler import critical_path_layers
-
-        report.floor_off = critical_path_layers(output_node)
-        output_node = _graft_standins(output_node, rewiring, consumers, by_src)
-        report.floor_strict = critical_path_layers(output_node)
-        output_node = _graft_standins(output_node, rewiring_banded, consumers, by_src)
-        report.floor_banded = critical_path_layers(output_node)
-        report.witness_banded = _witness_chain(output_node)
+        _apply_floor_model(
+            report, output_node, rewiring, rewiring_banded, consumers, by_src
+        )
 
     if verbose:
         print(report.format())
     return report
+
+
+def _boundary_members(
+    members: list[Node],
+    member_set: set[Node],
+    output_node: Node,
+    consumers: dict[Node, list[Node]],
+    depth: dict[Node, int],
+) -> tuple[list[Node], list[Node]]:
+    """Externally-consumed members and the depth->=2 subset to synthesize."""
+    boundary = [
+        m
+        for m in members
+        if m is output_node or any(c not in member_set for c in consumers[m])
+    ]
+    synthesized = [m for m in boundary if depth[m] >= _MIN_SYNTH_DEPTH]
+    return boundary, synthesized
+
+
+def _stage1_cols_if_s2(
+    verdict: str, member_certs: list[MemberCertificate], budget: float
+) -> int:
+    """Stage-1 column union for an S2 verdict; 0 otherwise."""
+    return _stage1_col_union(member_certs, budget) if verdict == "S2" else 0
+
+
+def _apply_floor_model(
+    report: V2Report,
+    output_node: Node,
+    rewiring: list[tuple[Node, Node, str]],
+    rewiring_banded: list[tuple[Node, Node, str]],
+    consumers: dict[Node, list[Node]],
+    by_src: dict[Node, list[Node]],
+) -> None:
+    """Model the layer floor off/on via stand-in nodes (mutates *report*)."""
+    from torchwright.compiler.forward.cpsat_scheduler import critical_path_layers
+
+    report.floor_off = critical_path_layers(output_node)
+    output_node = _graft_standins(output_node, rewiring, consumers, by_src)
+    report.floor_strict = critical_path_layers(output_node)
+    output_node = _graft_standins(output_node, rewiring_banded, consumers, by_src)
+    report.floor_banded = critical_path_layers(output_node)
+    report.witness_banded = _witness_chain(output_node)
 
 
 def _witness_chain(output_node: Node) -> list[str]:
@@ -514,7 +581,9 @@ def _witness_chain(output_node: Node) -> list[str]:
     )
 
     gm = build_graph_model(output_node, None)
-    es, _ = _compute_layer_bounds(gm, LEGACY_POLICY, True, max_layers=1 << 20)
+    es, _ = _compute_layer_bounds(
+        gm, LEGACY_POLICY, flex_routing=True, max_layers=1 << 20
+    )
     preds: dict[int, list[int]] = {}
     for u, v in gm.edges:
         preds.setdefault(v.node_id, []).append(u.node_id)

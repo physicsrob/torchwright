@@ -82,7 +82,7 @@ class AffineBound:
         d = input_node.d_output
         A = torch.eye(d, dtype=torch.float64)
         b = torch.zeros(d, dtype=torch.float64)
-        lo_val, hi_val = input_node._declared_value_range
+        lo_val, hi_val = input_node.declared_value_range
         lo = torch.full((d,), float(lo_val), dtype=torch.float64)
         hi = torch.full((d,), float(hi_val), dtype=torch.float64)
         return cls(

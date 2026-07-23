@@ -193,29 +193,24 @@ def eval_swish_pwl(w_query: float, hinges: list, y0: float, K: float) -> float:
 # ---------------------------------------------------------------------------
 
 
-def main(machine: str = "relu") -> None:
-    theta = theta_slow(D_HEAD, BASE)
-    print(f"Production parameters: MAX_LEN={MAX_LEN}, D_HEAD={D_HEAD}, BASE={BASE:.0e}")
-    print(f"θ_slow = {theta:.5e}")
-    if machine == "swiglu":
-        print("Machine: swiglu (sharpened-hinge PL inversion)")
-    print()
-
-    # 1. Monotonicity and minimum adjacent gap
+def _check_monotonicity(theta: float, fp32_floor: float) -> float:
+    """Section 1: monotonicity and minimum adjacent gap.  Returns min_gap."""
     print("=== 1. Monotonicity and adjacent gap ===")
     ws = [w_of_m(m, MAX_LEN, theta) for m in range(MAX_LEN + 1)]
     diffs = [ws[m] - ws[m + 1] for m in range(MAX_LEN)]
     min_gap = min(diffs)
     min_gap_pos = diffs.index(min_gap)
-    fp32_floor = 6e-8
     assert min_gap > 0, f"w(m) is NOT monotone! Inversion at m={min_gap_pos}"
     print("w(m) strictly monotone: ✓")
     print(f"Min adjacent-m gap = {min_gap:.3e}  (at m={min_gap_pos})")
     print(f"fp32 weight floor   = {fp32_floor:.1e}")
     print(f"Safety margin       = {min_gap / fp32_floor:.1f}x  (need >> 1)")
     print()
+    return min_gap
 
-    # 2. PWL inverse accuracy
+
+def _measure_pwl_error(machine: str, theta: float) -> float:
+    """Section 2: PWL inverse accuracy.  Returns the worst position error."""
     print(f"=== 2. PWL inverse accuracy ({N_BREAKPOINTS} log-uniform breakpoints) ===")
     w_bps, m_bps = build_pwl_table(MAX_LEN, theta, N_BREAKPOINTS)
     print(f"w range: [{w_bps[0]:.6f}, {w_bps[-1]:.6f}]")
@@ -275,10 +270,14 @@ def main(machine: str = "relu") -> None:
     print("Rounding threshold: 0.5 positions")
     print(f"Rounding margin: {0.5 / max_err:.1f}x below threshold  (need >> 1)")
     print()
+    return max_err
 
-    # 3. fp32 softmax noise contribution
+
+def _measure_fp32_error(theta: float) -> float:
+    """Section 3: fp32 softmax noise contribution.  Returns the worst error."""
     print("=== 3. fp32 softmax noise → error in m ===")
     # At each m, |δm| ≈ |dm/dw| · |δw| where |δw| ≈ w · FP32_EPS / 2
+    step = 10
     max_fp32_err = 0.0
     worst_fp32_m = 0
     eps = FP32_EPS / 2.0
@@ -297,14 +296,11 @@ def main(machine: str = "relu") -> None:
         f"Worst-case fp32 contribution: {max_fp32_err:.4f} positions "
         f"(at m={worst_fp32_m})"
     )
+    return max_fp32_err
 
-    combined = max_err + max_fp32_err
-    print(f"Combined (PWL + fp32):        {combined:.4f} positions")
-    print("Rounding threshold:           0.5")
-    print(f"Rounding margin:              {0.5 / combined:.1f}x")
-    print()
 
-    # 4. cosine attenuation magnitude at max_len
+def _check_cosine_attenuation(theta: float) -> None:
+    """Section 4: cosine attenuation magnitude at max_len."""
     print("=== 4. Cosine attenuation sanity check ===")
     cos_at_max = math.cos(MAX_LEN * theta)
     print(f"cos(MAX_LEN · θ_slow) = {cos_at_max:.6f}  (1% would be 0.990)")
@@ -314,6 +310,28 @@ def main(machine: str = "relu") -> None:
         f"  (absorbed by the PWL fit)"
     )
     print()
+
+
+def main(machine: str = "relu") -> None:
+    theta = theta_slow(D_HEAD, BASE)
+    print(f"Production parameters: MAX_LEN={MAX_LEN}, D_HEAD={D_HEAD}, BASE={BASE:.0e}")
+    print(f"θ_slow = {theta:.5e}")
+    if machine == "swiglu":
+        print("Machine: swiglu (sharpened-hinge PL inversion)")
+    print()
+
+    fp32_floor = 6e-8
+    min_gap = _check_monotonicity(theta, fp32_floor)
+    max_err = _measure_pwl_error(machine, theta)
+    max_fp32_err = _measure_fp32_error(theta)
+
+    combined = max_err + max_fp32_err
+    print(f"Combined (PWL + fp32):        {combined:.4f} positions")
+    print("Rounding threshold:           0.5")
+    print(f"Rounding margin:              {0.5 / combined:.1f}x")
+    print()
+
+    _check_cosine_attenuation(theta)
 
     print("=== Summary ===")
     if machine == "swiglu":

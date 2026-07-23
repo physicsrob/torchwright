@@ -308,6 +308,45 @@ def _check_vocabulary(all_nodes: set[Node]) -> None:
     )
 
 
+def _rebuild_node_map(
+    clone_map: dict[Node, Node],
+    fold_log: FoldLog,
+    copy_nodes: set[Node],
+) -> tuple[dict[Node, Node], dict[Node, tuple]]:
+    """Source→copy map tracking VALUES across fusion/collapse rewrites.
+
+    Fusion orphans copy nodes and changes what some survivors compute, so
+    the map must track values, not object identity: a source node maps to
+    the copy node that computes its value, or to nothing if that value no
+    longer exists in the copy.  A value that survives as a column slice of
+    a widened sibling-merge survivor goes to ``slice_map`` instead —
+    ``node_map`` has no way to say "columns [off, off+w) of that node".
+    """
+    node_map: dict[Node, Node] = {}
+    slice_map: dict[Node, tuple] = {}
+    for src, clone in clone_map.items():
+        # Slice records take precedence over moves: a merge-widened
+        # survivor that a later fold moves onto an FFN has both, and the
+        # slice is the precise one — the source's original value is the
+        # front columns of what moved, not the whole moved value (the
+        # move retargets the slice's holder, so the record already
+        # points at the FFN).
+        slice_rec = fold_log.slices.get(clone)
+        if slice_rec is not None and slice_rec[0] in copy_nodes:
+            # Holder still live in the copy; a dangling record (holder
+            # itself orphaned by a later fold) means the value is gone.
+            slice_map[src] = slice_rec
+            continue
+        survivor = fold_log.moves.get(clone)
+        if survivor is not None:
+            node_map[src] = survivor
+            continue
+        if clone in fold_log.value_changed or clone not in copy_nodes:
+            continue  # value gone (changed in place, or orphaned)
+        node_map[src] = clone
+    return node_map, slice_map
+
+
 def lower(
     output_node: Node,
     *,
@@ -422,34 +461,7 @@ def lower(
     if not n_fused and not n_collapsed:
         node_map = dict(copy.node_map)
     else:
-        # Fusion orphans copy nodes and changes what some survivors
-        # compute, so the map must track VALUES, not object identity: a
-        # source node maps to the copy node that computes its value, or
-        # to nothing if that value no longer exists in the copy.  A value
-        # that survives as a column slice of a widened sibling-merge
-        # survivor goes to slice_map instead — node_map has no way to say
-        # "columns [off, off+w) of that node".
-        node_map = {}
-        for src, clone in copy.node_map.items():
-            # Slice records take precedence over moves: a merge-widened
-            # survivor that a later fold moves onto an FFN has both, and the
-            # slice is the precise one — the source's original value is the
-            # front columns of what moved, not the whole moved value (the
-            # move retargets the slice's holder, so the record already
-            # points at the FFN).
-            slice_rec = fold_log.slices.get(clone)
-            if slice_rec is not None and slice_rec[0] in copy_nodes:
-                # Holder still live in the copy; a dangling record (holder
-                # itself orphaned by a later fold) means the value is gone.
-                slice_map[src] = slice_rec
-                continue
-            survivor = fold_log.moves.get(clone)
-            if survivor is not None:
-                node_map[src] = survivor
-                continue
-            if clone in fold_log.value_changed or clone not in copy_nodes:
-                continue  # value gone (changed in place, or orphaned)
-            node_map[src] = clone
+        node_map, slice_map = _rebuild_node_map(copy.node_map, fold_log, copy_nodes)
 
     table = RealizationTable.build(copy_nodes)
     if verbose:

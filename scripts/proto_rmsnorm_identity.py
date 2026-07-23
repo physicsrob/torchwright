@@ -107,8 +107,8 @@ def run_case(d: int, max_digits: int, prompt: list[str]) -> None:
     gain = 2.0**m
     output_node, embedding = create_network_parts(max_digits=max_digits)
     compiled = compile_headless(output_node, d=d, d_head=D_HEAD)
-    net = compiled._net
-    out_idx = compiled._output_indices
+    net = compiled.net
+    out_idx = compiled.output_indices
     res0 = net.get_input_res_stream(len(prompt), {"embedding_input": prompt})
 
     with torch.no_grad():

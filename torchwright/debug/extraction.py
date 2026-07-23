@@ -94,6 +94,50 @@ def first_state_with(
     return None
 
 
+def _format_violation_entry(i: int, violation: tuple) -> str:
+    """One numbered entry of the self-consistency failure message."""
+    node, first_label, later_label, cols, first_val, val, max_diff = violation
+    diff = (first_val - val).abs()
+    per_col_max = diff.max(dim=0).values if diff.ndim >= _DIFF_MATRIX_NDIM else diff
+    worst_col_idx = int(per_col_max.argmax().item())
+    worst_col = cols[worst_col_idx] if worst_col_idx < len(cols) else None
+    node_name = node.annotation or node.name or f"node_{node.node_id}"
+    # Summarise value tensors at the worst col if they span many
+    # positions: show min/max across positions rather than dumping
+    # the whole list so the error stays readable when the prefill
+    # is long.
+    cols_fmt = (
+        cols
+        if len(cols) <= _INLINE_COLS_LIMIT
+        else str(cols[:_INLINE_COLS_LIMIT]) + "..."
+    )
+    a_slice = first_val[..., worst_col_idx]
+    b_slice = val[..., worst_col_idx]
+    if a_slice.ndim == 0 or a_slice.numel() <= _INLINE_VALUE_LIMIT:
+        a_fmt = a_slice.tolist()
+        b_fmt = b_slice.tolist()
+    else:
+        a_fmt = (
+            f"n={a_slice.numel()} min={float(a_slice.min()):g} "
+            f"max={float(a_slice.max()):g}"
+        )
+        b_fmt = (
+            f"n={b_slice.numel()} min={float(b_slice.min()):g} "
+            f"max={float(b_slice.max()):g}"
+        )
+    return (
+        f"\n  [{i}] {node_name} (id={node.node_id}, "
+        f"type={type(node).__name__}, width={len(cols)})\n"
+        f"      first:     {first_label}\n"
+        f"      later:     {later_label}\n"
+        f"      cols:      {cols_fmt}\n"
+        f"      worst col: residual[{worst_col}] (node index {worst_col_idx})\n"
+        f"      first val: {a_fmt}\n"
+        f"      later val: {b_fmt}\n"
+        f"      max_abs_diff: {max_diff:.6g}"
+    )
+
+
 def run_consistency_check(
     ordered_states: list[ResidualStreamState],
     state_tensor: StateTensors,
@@ -171,54 +215,8 @@ def run_consistency_check(
         f"Residual-stream self-consistency failure (atol={atol:g}) — "
         f"{len(violations)} node(s):{extra_cause}"
     ]
-    for i, (
-        node,
-        first_label,
-        later_label,
-        cols,
-        first_val,
-        val,
-        max_diff,
-    ) in enumerate(violations, 1):
-        diff = (first_val - val).abs()
-        per_col_max = diff.max(dim=0).values if diff.ndim >= _DIFF_MATRIX_NDIM else diff
-        worst_col_idx = int(per_col_max.argmax().item())
-        worst_col = cols[worst_col_idx] if worst_col_idx < len(cols) else None
-        node_name = node.annotation or node.name or f"node_{node.node_id}"
-        # Summarise value tensors at the worst col if they span many
-        # positions: show min/max across positions rather than dumping
-        # the whole list so the error stays readable when the prefill
-        # is long.
-        cols_fmt = (
-            cols
-            if len(cols) <= _INLINE_COLS_LIMIT
-            else str(cols[:_INLINE_COLS_LIMIT]) + "..."
-        )
-        a_slice = first_val[..., worst_col_idx]
-        b_slice = val[..., worst_col_idx]
-        if a_slice.ndim == 0 or a_slice.numel() <= _INLINE_VALUE_LIMIT:
-            a_fmt = a_slice.tolist()
-            b_fmt = b_slice.tolist()
-        else:
-            a_fmt = (
-                f"n={a_slice.numel()} min={float(a_slice.min()):g} "
-                f"max={float(a_slice.max()):g}"
-            )
-            b_fmt = (
-                f"n={b_slice.numel()} min={float(b_slice.min()):g} "
-                f"max={float(b_slice.max()):g}"
-            )
-        msg_lines.append(
-            f"\n  [{i}] {node_name} (id={node.node_id}, "
-            f"type={type(node).__name__}, width={len(cols)})\n"
-            f"      first:     {first_label}\n"
-            f"      later:     {later_label}\n"
-            f"      cols:      {cols_fmt}\n"
-            f"      worst col: residual[{worst_col}] (node index {worst_col_idx})\n"
-            f"      first val: {a_fmt}\n"
-            f"      later val: {b_fmt}\n"
-            f"      max_abs_diff: {max_diff:.6g}"
-        )
+    for i, violation in enumerate(violations, 1):
+        msg_lines.append(_format_violation_entry(i, violation))
     raise RuntimeError("".join(msg_lines))
 
 

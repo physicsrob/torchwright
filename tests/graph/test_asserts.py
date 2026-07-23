@@ -256,7 +256,7 @@ def test_collect_asserts_returns_empty_for_no_asserts():
 # ---------------------------------------------------------------------------
 
 
-def _build_simple_graph(with_assert: bool):
+def _build_simple_graph(*, with_assert: bool):
     """Simple compilable graph: ``y = clamp(x, -1, 1)`` optionally asserted."""
     from torchwright.ops.relu.arithmetic_ops import clamp
 

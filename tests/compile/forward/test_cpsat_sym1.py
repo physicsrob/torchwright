@@ -228,7 +228,7 @@ def test_canonical_form_on_solved_model(name, d):
 def test_depth_invariance_on_vs_off(name, d):
     build, _, d_head = _example_specs()[name]
 
-    def _solve(canonical):
+    def _solve(*, canonical):
         torch.manual_seed(0)
         low = _lower(build(), d)
         return solve_schedule(
@@ -244,8 +244,8 @@ def test_depth_invariance_on_vs_off(name, d):
             _pin_cancels=False,
         )
 
-    off_asg, off_stats = _solve(False)
-    on_asg, on_stats = _solve(True)
+    off_asg, off_stats = _solve(canonical=False)
+    on_asg, on_stats = _solve(canonical=True)
     assert off_asg is not None, f"{name} d={d}: off solve found nothing"
     assert off_stats.is_optimal, f"{name} d={d}: off not optimal"
     assert on_asg is not None, f"{name} d={d}: on solve found nothing"
@@ -267,7 +267,7 @@ def test_depth_invariance_on_vs_off(name, d):
 def test_knob_on_compile_replays_clean():
     build, d, d_head = _example_specs()["caesar"]
 
-    def _compile(canonical):
+    def _compile(*, canonical):
         torch.manual_seed(0)
         net = forward_compile(
             d=d,
@@ -284,8 +284,8 @@ def test_knob_on_compile_replays_clean():
 
     # A raise here would be the replay-depth tripwire firing (or any compile
     # error); a clean return is the tripwire staying silent.
-    off_layers = _compile(False)
-    on_layers = _compile(True)
+    off_layers = _compile(canonical=False)
+    on_layers = _compile(canonical=True)
     assert on_layers == off_layers, (
         f"caesar: knob-on compile depth {on_layers} != knob-off {off_layers}"
     )

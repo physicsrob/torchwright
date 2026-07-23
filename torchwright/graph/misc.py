@@ -98,6 +98,11 @@ class InputNode(Node):
 
         current_session().register_input(self)
 
+    @property
+    def declared_value_range(self) -> tuple[float, float]:
+        """The ``value_range`` this input was declared with (read-only)."""
+        return self._declared_value_range
+
     def compute_value_type(self) -> NodeValueType:
         return NodeValueType()
 
