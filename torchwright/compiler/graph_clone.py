@@ -36,8 +36,8 @@ whose exact type has no entry fails loudly at clone time.
 
 from __future__ import annotations
 
-from collections.abc import Callable
 from dataclasses import dataclass
+from typing import TYPE_CHECKING
 
 from torchwright.graph import Node
 from torchwright.graph.affine_bound import AffineBound
@@ -54,6 +54,9 @@ from torchwright.graph.misc import (
     Placeholder,
     ValueLogger,
 )
+
+if TYPE_CHECKING:
+    from collections.abc import Callable
 
 
 class GraphCloneError(RuntimeError):

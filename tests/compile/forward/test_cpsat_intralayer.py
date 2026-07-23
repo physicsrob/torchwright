@@ -104,7 +104,7 @@ def test_solver_same_layer_handoff_replays_correctly():
     handoff semantics are pinned deterministically by the hard-fixed
     fixtures below (atomic-attention-replay plan §§5.1–5.2).
     """
-    x, out = _width_starved_graph()
+    _x, out = _width_starved_graph()
     net = forward_compile(
         d=48, d_head=8, output_node=out, device="cpu", verbose=False, optimize=1
     )
@@ -135,7 +135,7 @@ def test_optimize1_compiles_where_eager_heuristic_cannot():
     """
     import pytest
 
-    x, out = _width_starved_graph()
+    _x, out = _width_starved_graph()
     opt = forward_compile(
         d=48, d_head=8, output_node=out, device="cpu", verbose=False, optimize=1
     )
@@ -166,7 +166,7 @@ def test_same_layer_attn_handoff_feasible_mlp_infeasible():
     the solver could flip A to MLP-cancel and satisfy the gap-0 bound even with
     an MLP-routed B (that case is the next test).
     """
-    x, a, b = _chain_ab()
+    _x, a, b = _chain_ab()
     hint_layers = {a.node_id: 0, b.node_id: 1}
     hint_cancel = {a.node_id: 1}  # A cancelled at B's own layer
     attn_mech = {a.node_id: ATTN}
@@ -199,7 +199,7 @@ def test_mlp_cancel_same_layer_feasible_with_mlp_consumer():
     bound cancel >= layer[B]).  This is the mirror of the routing test above and
     pins that `cancel_in_mlp` actually relaxes the bound.
     """
-    x, a, b = _chain_ab()
+    _x, a, b = _chain_ab()
     hint_layers = {a.node_id: 0, b.node_id: 1}
     hint_cancel = {a.node_id: 1}
     mlp_route = {b.node_id: MLP}
@@ -558,7 +558,7 @@ def test_parked_escape_leaves_node_unfreed_and_charges_no_head():
     its earliest legal layer), so this pins the ``_pin_cancels=False``
     escape hatch.
     """
-    x, a, b = _chain_ab()
+    _x, a, b = _chain_ab()
     max_layers = 20
     built = build_cpsat_model(
         b,
@@ -660,7 +660,7 @@ def test_collective_readers_replay_atomically(monkeypatch):
     from torchwright.compiler.forward import compile as compile_mod
     from torchwright.compiler.forward.graph_analysis import GraphAnalyzer
 
-    x, blocker, s, a, b, out = _collective_readers_graph()
+    _x, _blocker, _s, _a, _b, out = _collective_readers_graph()
 
     solve_calls = []
 
@@ -845,7 +845,7 @@ def test_dual_release_assignment_is_cpsat_feasible():
     one free column and the combined release of both sources fits C and the
     MLP out exactly.
     """
-    x, y, blocker, sx, sy, c, out = _dual_release_graph()
+    _x, _y, _blocker, sx, sy, c, out = _dual_release_graph()
     built = build_cpsat_model(out, d=24, d_head=4, d_hidden=24, max_layers=8)
     built.model.Add(built.n_layers_var == 2)
     status = _hard_fix_and_solve(
@@ -875,7 +875,8 @@ def test_dual_release_replays_atomically():
 
     sched.set_current_layer(0)
     sched.schedule_layer(rmap, computed)
-    assert sx in computed and sy in computed
+    assert sx in computed
+    assert sy in computed
 
     # Layer-1 entry: const(1) + x(4) + y(4) + blocker(6) + Sx(4) + Sy(4)
     # occupy 23 of 24 columns.
@@ -1154,7 +1155,7 @@ def test_entry_dead_assignment_is_cpsat_feasible():
     legal at layer 1 because its MLP consumer P ran at layer 0; S's is legal
     gap-0 under its two attention readers).
     """
-    x, blocker, w, p, s, a, b, out = _entry_dead_graph()
+    _x, _blocker, w, p, s, a, b, out = _entry_dead_graph()
     built = build_cpsat_model(out, d=24, d_head=4, d_hidden=24, max_layers=8)
     built.model.Add(built.n_layers_var == 2)
     status = _hard_fix_and_solve(
@@ -1195,7 +1196,9 @@ def test_entry_dead_and_mid_batch_releases_share_one_batch():
 
     sched.set_current_layer(0)
     sched.schedule_layer(rmap, computed)
-    assert w in computed and p in computed and s in computed
+    assert w in computed
+    assert p in computed
+    assert s in computed
 
     # Layer-1 entry: const(1) + x(4) + blocker(10) + W(2) + P(2) + S(4)
     # occupy 23 of 24 columns.

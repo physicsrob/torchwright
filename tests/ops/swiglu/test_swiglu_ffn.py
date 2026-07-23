@@ -64,11 +64,13 @@ def test_returns_swish_ffn():
 def test_degenerate_vs_gated_by_up_proj_presence():
     _, gated = _build(gated_second=True)
     assert not gated.is_degenerate
-    assert gated.up_proj is not None and gated.up_bias is not None
+    assert gated.up_proj is not None
+    assert gated.up_bias is not None
 
     _, degen = _build(gated_second=False)
     assert degen.is_degenerate
-    assert degen.up_proj is None and degen.up_bias is None
+    assert degen.up_proj is None
+    assert degen.up_bias is None
 
 
 def test_up_proj_requires_up_bias():

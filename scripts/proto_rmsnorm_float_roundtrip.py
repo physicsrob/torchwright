@@ -105,7 +105,7 @@ def run(d, eps=0.0, energy_scale=1.0, n_iter=200):
     return err.max().item(), rms_spread, drift
 
 
-def main():
+def main() -> None:
     print("Reserve-inside power-of-two-RMS identity, DOOM-like floats:\n")
     print("d=1024 (even b -> ONE constant column):")
     run(1024, eps=0.0)

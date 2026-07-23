@@ -72,7 +72,7 @@ def sum_digit_seqs(
     """
     carry = create_literal_value(torch.tensor([-1.0]))
     out = []
-    for digit1, digit2 in reversed(list(zip(seq1, seq2))):
+    for digit1, digit2 in reversed(list(zip(seq1, seq2, strict=False))):
         sum, carry = sum_digits(embedding, digit1, digit2, carry)
         out.append(sum)
 

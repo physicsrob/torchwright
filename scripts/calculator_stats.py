@@ -179,7 +179,7 @@ def times_table_figure() -> None:
     print("      " + "  ".join(str(y) for y in range(10)))
     for x in range(10):
         cells = "  ".join(
-            f"{int(round(out[x * 10 + y, 0].item())) * 10 + int(round(out[x * 10 + y, 1].item())):2d}"
+            f"{round(out[x * 10 + y, 0].item()) * 10 + round(out[x * 10 + y, 1].item()):2d}"
             for y in range(10)
         )
         print(f"  {x}: {cells}")

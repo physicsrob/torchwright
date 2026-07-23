@@ -49,7 +49,7 @@ def _inputs(n_pos, marker_pos):
 
 def test_oracle_recovers_gap_to_bound():
     """Oracle: gap[n] == n - marker_pos out to the ~350 bound."""
-    _, marker_node, valid_node, gap = _build()
+    _, _marker_node, _valid_node, gap = _build()
     n_pos = MAX_GAP + 1  # positions 0..350, marker at 0 -> gaps 0..350
     marker, valid = _inputs(n_pos, marker_pos=0)
     cache = reference_eval(
@@ -68,7 +68,7 @@ def test_oracle_recovers_gap_to_bound():
 
 def test_oracle_marker_not_at_zero():
     """Oracle: gap measured from a mid-stream marker."""
-    _, marker_node, valid_node, gap = _build()
+    _, _marker_node, _valid_node, gap = _build()
     n_pos = 200
     marker_pos = 37
     marker, valid = _inputs(n_pos, marker_pos)

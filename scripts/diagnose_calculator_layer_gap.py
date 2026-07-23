@@ -24,8 +24,7 @@ Pure CPU, seconds per config::
 import argparse
 import importlib
 from collections import Counter
-from collections.abc import Callable
-from typing import Any, cast
+from typing import TYPE_CHECKING, Any, cast
 
 from torchwright.compiler.forward.cpsat_scheduler import (
     _compute_layer_bounds,
@@ -34,6 +33,9 @@ from torchwright.compiler.forward.cpsat_scheduler import (
 )
 from torchwright.compiler.forward.scheduling_policy import LEGACY_POLICY
 from torchwright.compiler.lower import lower
+
+if TYPE_CHECKING:
+    from collections.abc import Callable
 
 
 def _describe(node) -> str:
@@ -137,7 +139,7 @@ def forensic_carry_sweep(output_node, lane_cap: int) -> None:
         grid = xs.to(torch.float32).reshape(-1, 1)
         vals = _seeded_oracle(list(members), source, grid)[m]
         chord = worst.fn.eval(xs)
-        for xi, v, cval in zip(xs.tolist(), vals, chord):
+        for xi, v, cval in zip(xs.tolist(), vals, chord, strict=False):
             e = (v.to(torch.float64) - cval).abs().max()
             print(
                 f"  x={xi:12.8f} max|oracle-chord|={e:.3e}  "

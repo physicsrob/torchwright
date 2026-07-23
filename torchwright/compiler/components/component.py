@@ -16,7 +16,7 @@ class Component(ABC):
     out_state: ResidualStreamState
     name: str
 
-    def __init__(self, d: int, name: str = ""):
+    def __init__(self, d: int, name: str = "") -> None:
         self.d = d
         self.name = name
         self.in_state = ResidualStreamState(name=f"{self} in_state")
@@ -28,7 +28,7 @@ class Component(ABC):
     @abstractmethod
     def num_params(self) -> int: ...
 
-    def resize(self, new_d):
+    def resize(self, new_d) -> None:
         self.d = new_d
 
     def to(self, device):

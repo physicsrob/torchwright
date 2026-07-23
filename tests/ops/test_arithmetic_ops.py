@@ -58,7 +58,7 @@ def test_relu_add():
     input_val1 = create_input("val1", 3)
     input_val2 = create_input("val2", 3)
     x = relu_add(input_val1, input_val2)
-    for i in range(10):
+    for _i in range(10):
         val1 = 100.0 * (torch.rand(3) - 0.5)
         val2 = 100.0 * (torch.rand(3) - 0.5)
         output = x.compute(
@@ -520,7 +520,7 @@ def test_piecewise_linear_vector():
             .squeeze(0)
             .tolist()
         )
-        for j, (r, e) in enumerate(zip(result, expected)):
+        for j, (r, e) in enumerate(zip(result, expected, strict=False)):
             assert abs(r - e) < 0.01, (
                 f"piecewise_linear({x_val})[{j}]: expected {e}, got {r:.4f}"
             )

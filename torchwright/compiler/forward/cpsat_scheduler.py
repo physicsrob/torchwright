@@ -33,17 +33,13 @@ from __future__ import annotations
 import os
 import time
 import warnings
-from collections.abc import Mapping
 from dataclasses import dataclass, field
 from types import MappingProxyType
-from typing import Any, cast
+from typing import TYPE_CHECKING, Any, cast
 
 from ortools.sat.python import cp_model
 
 from torchwright.compiler.forward.add_placement import derive_add_placement
-from torchwright.compiler.forward.cpsat_snapshot import (
-    SchedulingProblem,
-)
 from torchwright.compiler.forward.graph_analysis import GraphAnalyzer
 from torchwright.compiler.forward.scheduling_policy import (
     LEGACY_POLICY,
@@ -69,6 +65,13 @@ from torchwright.graph import (
 )
 from torchwright.graph.ffn import FFN
 from torchwright.graph.misc import LiteralValue
+
+if TYPE_CHECKING:
+    from collections.abc import Mapping
+
+    from torchwright.compiler.forward.cpsat_snapshot import (
+        SchedulingProblem,
+    )
 
 # ---------------------------------------------------------------------------
 # Public dataclasses
@@ -1581,7 +1584,7 @@ def build_cpsat_model_from_gm(
         tuple[int, cp_model.IntVar, cp_model.IntVar, list[int], list[int]]
     ] = []
 
-    def _canonicalize_cancel_reps(cl, parked, cim, rat=None):
+    def _canonicalize_cancel_reps(cl, parked, cim, rat=None) -> None:
         # sym1 (MEASUREMENT-ONLY, gated by `_canonical_cancel_reps`; default OFF
         # posts nothing, keeping the proto byte-identical).  Removes two
         # encoding degeneracies where one physical schedule has multiple model
@@ -2405,7 +2408,7 @@ class _StandInGraph:
     ``gm.consumers_eff``, not ``gm.graph``); they raise loudly if ever read.
     """
 
-    def __init__(self, all_nodes, critical_path: dict[int, int]):
+    def __init__(self, all_nodes, critical_path: dict[int, int]) -> None:
         self._all_nodes = set(all_nodes)
         self._critical_path = critical_path
 
@@ -2436,7 +2439,7 @@ class _ShapeCarrier:
 
     __slots__ = ("shape",)
 
-    def __init__(self, n_lanes: int):
+    def __init__(self, n_lanes: int) -> None:
         self.shape = (n_lanes,)
 
 
@@ -2680,7 +2683,9 @@ class _IncumbentTrace(cp_model.CpSolverSolutionCallback):
     incumbent costs microseconds each and only runs in capture mode.
     """
 
-    def __init__(self, layer_var, cancel_layer, input_cancel_layer, n_layers_var, out):
+    def __init__(
+        self, layer_var, cancel_layer, input_cancel_layer, n_layers_var, out
+    ) -> None:
         super().__init__()
         self._layer_var = layer_var
         self._cancel_layer = cancel_layer
@@ -2688,7 +2693,7 @@ class _IncumbentTrace(cp_model.CpSolverSolutionCallback):
         self._n_layers_var = n_layers_var
         self._out = out
 
-    def on_solution_callback(self):
+    def on_solution_callback(self) -> None:
         self._out.append(
             {
                 "t": self.WallTime(),

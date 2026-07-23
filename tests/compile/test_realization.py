@@ -68,7 +68,7 @@ def _test_graph():
 
 
 def test_candidate_classes_declaration():
-    out, a, b, add, blk, lit = _test_graph()
+    out, a, _b, add, blk, lit = _test_graph()
     assert candidate_classes(a) == (ATTN_TRANSPORT, MLP_BYPASS)
     assert candidate_classes(add) == (ATTN_ADD, MLP_ADD)
     assert candidate_classes(blk) == (MLP_COMPOSITE,)
@@ -77,7 +77,8 @@ def test_candidate_classes_declaration():
     with pytest.raises(TypeError):
         candidate_classes(out)  # Concatenate is not schedulable
 
-    assert has_flex_choice(a) and has_flex_choice(add)
+    assert has_flex_choice(a)
+    assert has_flex_choice(add)
     assert not has_flex_choice(blk)
     assert flex_route_classes(a) == (ATTN_TRANSPORT, MLP_BYPASS)
     assert flex_route_classes(add) == (ATTN_ADD, MLP_ADD)
@@ -100,10 +101,12 @@ def test_attn_candidate_class():
 def test_lower_builds_unresolved_table():
     # The lowered table is keyed by the compiler-private copy's node ids
     # (the scheduler consumes it); translate source nodes via copy_of.
-    out, a, b, add, blk, lit = _test_graph()
+    out, a, _b, add, blk, lit = _test_graph()
     lowered = lower(out)
     table = lowered.realization_table
-    cid = lambda n: lowered.copy_of(n).node_id
+
+    def cid(n):
+        return lowered.copy_of(n).node_id
 
     ea = table.entries[cid(a)]
     assert ea.resolved is None
@@ -120,7 +123,7 @@ def test_lower_builds_unresolved_table():
 
 
 def test_resolve_static_both_policies():
-    out, a, b, add, blk, lit = _test_graph()
+    out, a, b, add, blk, _lit = _test_graph()
     lowered = lower(out)
     table = lowered.realization_table
     nodes = get_ancestor_nodes({lowered.output_node})
@@ -160,7 +163,9 @@ def test_resolve_from_assignment():
     out, a, b, add, blk, lit = _test_graph()
     lowered = lower(out)
     table = lowered.realization_table
-    cid = lambda n: lowered.copy_of(n).node_id
+
+    def cid(n):
+        return lowered.copy_of(n).node_id
 
     routing = {
         cid(a): "attn",
@@ -183,7 +188,7 @@ def test_resolve_from_assignment():
 
 
 def test_resolve_from_assignment_rejects_contradiction():
-    out, a, b, add, blk, lit = _test_graph()
+    out, _a, _b, _add, blk, _lit = _test_graph()
     lowered = lower(out)
     # The solve routing an FFN to attention contradicts its only class.
     with pytest.raises(UnresolvedRealizationError, match="only realization"):
@@ -193,7 +198,7 @@ def test_resolve_from_assignment_rejects_contradiction():
 
 
 def test_check_complete_and_unresolved_read():
-    out, a, b, add, blk, lit = _test_graph()
+    out, a, _b, _add, _blk, _lit = _test_graph()
     lowered = lower(out)
     nodes = get_ancestor_nodes({lowered.output_node})
     table = lowered.realization_table
@@ -212,7 +217,7 @@ def test_resolve_static_rejects_nodes_missing_the_flex_entry():
     node set not covering the table's unresolved entries gets a named error,
     not a KeyError.
     """
-    out, a, b, add, blk, lit = _test_graph()
+    out, _a, _b, _add, _blk, _lit = _test_graph()
     lowered = lower(out)
     with pytest.raises(UnresolvedRealizationError, match="absent from the nodes"):
         lowered.realization_table.resolve_static([], SchedulingPolicy(), 64)
@@ -252,7 +257,7 @@ def test_cost_summary_static_hand_computed():
     lanes; add width 3: MLP_ADD 2*3=6 slots, or ATTN_ADD reuse ceil(3/8)=1 /
     fresh 2; literal: no slots.
     """
-    out, a, b, add, blk, lit = _test_graph()
+    out, _a, _b, _add, _blk, _lit = _test_graph()
     lowered = lower(out)
 
     # Default policy splits by node type: Linears to MLP, the Add to
@@ -287,7 +292,7 @@ def test_cost_summary_bypass_demand_beyond_capacity_routes_to_attention():
     ``2 * d_output`` exceeds the layer's usable pool has no MLP realization,
     so the summary must charge it heads even under the MLP policy.
     """
-    out, a, b, add, blk, lit = _test_graph()
+    out, _a, _b, _add, _blk, _lit = _test_graph()
     lowered = lower(out)
 
     # a, b, and the add each want 6 MLP slots.  At usable_slots=5 none fit,
@@ -300,14 +305,14 @@ def test_cost_summary_bypass_demand_beyond_capacity_routes_to_attention():
 
 
 def test_cost_summary_requires_usable_slots_to_resolve():
-    out, a, b, add, blk, lit = _test_graph()
+    out, _a, _b, _add, _blk, _lit = _test_graph()
     lowered = lower(out)
     with pytest.raises(ValueError, match="usable_slots"):
         lowered.cost_summary(d_head=8)
 
 
 def test_cost_summary_requires_resolved_table():
-    out, a, b, add, blk, lit = _test_graph()
+    out, _a, _b, _add, _blk, _lit = _test_graph()
     lowered = lower(out)
     with pytest.raises(UnresolvedRealizationError, match="incomplete"):
         lowered.cost_summary(d_head=8, realization_table=lowered.realization_table)
@@ -319,7 +324,7 @@ def test_cost_summary_reconciles_with_solver_totals():
     """
     from torchwright.compiler.forward.compile import forward_compile
 
-    out, a, b, add, blk, lit = _test_graph()
+    out, _a, _b, _add, _blk, _lit = _test_graph()
     lowered = lower(out)
     cs = lowered.cost_summary(d_head=8, usable_slots=64)
 
@@ -456,7 +461,7 @@ def test_resolve_static_forced_held_target_add():
     under an MLP-preferring Add policy (the shipping default already keeps
     Adds on attention, which would make the force vacuous here).
     """
-    out, a, b, add, blk, lit = _test_graph()
+    out, a, _b, add, _blk, _lit = _test_graph()
     lowered = lower(out)
     nodes = get_ancestor_nodes({lowered.output_node})
     cadd = lowered.copy_of(add)
@@ -497,7 +502,7 @@ def test_resolve_static_routes_unplaceable_bypass_to_attention(bias):
     its narrow consumer still takes the bypass.
     """
     usable = usable_hidden_slots(64, bias)
-    out, wide = _wide_graph(usable // 2 + 1)
+    out, _wide = _wide_graph(usable // 2 + 1)
 
     lowered = lower(out)
     nodes = get_ancestor_nodes({lowered.output_node})
@@ -543,7 +548,7 @@ def test_routing_without_capacity_raises_rather_than_guessing():
         routing,
     )
 
-    out, a, b, add, blk, lit = _test_graph()
+    out, a, _b, _add, blk, _lit = _test_graph()
     lowered = lower(out)
     gm = build_graph_model(lowered.output_node)
     ca = lowered.copy_of(a)

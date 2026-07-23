@@ -368,10 +368,7 @@ def piecewise_linear(
     raw_values = [fn(x) for x in breakpoints]
 
     scalar = not isinstance(raw_values[0], (list, tuple))
-    if scalar:
-        values = [[v] for v in raw_values]
-    else:
-        values = [list(v) for v in raw_values]
+    values = [[v] for v in raw_values] if scalar else [list(v) for v in raw_values]
     d_out = len(values[0])
     assert all(len(v) == d_out for v in values)
 
@@ -432,10 +429,7 @@ def piecewise_linear(
             )
         )
 
-    if len(chunks) == 1:
-        result = chunks[0]
-    else:
-        result = sum_nodes(chunks)
+    result = chunks[0] if len(chunks) == 1 else sum_nodes(chunks)
 
     # With clamp=True the exact PL output is bounded by the min/max of fn
     # at the breakpoints (per-channel); the swish fillets can dip past
@@ -458,7 +452,7 @@ def piecewise_linear(
             for j in range(d_out):
                 s = sum(
                     swish_dip * builtins.abs(r[2][j]) / K
-                    for r, x in zip(relus, xs)
+                    for r, x in zip(relus, xs, strict=False)
                     if builtins.abs(x - xs[i]) <= window
                 )
                 slack = builtins.max(slack, s)
@@ -761,7 +755,7 @@ def floor_int(
 
     # δ_k = g(k) − g(k−1) per boundary; the identity g leaves every δ_k = 1
     # and g(max) = min + n, reproducing the plain-floor weights exactly.
-    g = (lambda k: float(k)) if output_map is None else output_map
+    g = (float) if output_map is None else output_map
 
     def _delta(k: int) -> float:
         return float(g(k)) - float(g(k - 1))
@@ -849,7 +843,7 @@ def floor_int(
         # magnitude.  Default δ_k = 1 recovers [−c(1+dip)−1, c·dip+1].
         lo_sum = sum(builtins.min(d * dip, -d * (1.0 + dip)) for d in dlist)
         hi_sum = sum(builtins.max(d * dip, -d * (1.0 + dip)) for d in dlist)
-        pad = builtins.max(1.0, builtins.max(builtins.abs(d) for d in dlist))
+        pad = builtins.max(1.0, *(builtins.abs(d) for d in dlist))
         neg_partials.append(
             assert_matches_value_type(
                 neg_partial,
@@ -916,7 +910,7 @@ def radix_floor_int(
     sharpness: float | None = None,
     hi_sharpness: float | None = None,
 ) -> Node:
-    """Compute floor(x) as a radix split of three small :func:`floor_int`\\ s.
+    r"""Compute floor(x) as a radix split of three small :func:`floor_int`\\ s.
 
     A flat ``floor_int`` over ``N = max_value − min_value`` boundaries
     costs ``3N`` hidden lanes in 2 sublayers and holds an up-to-512-wide

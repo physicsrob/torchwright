@@ -12,7 +12,9 @@ default_special_tokens = [unk_token]
 class Tokenizer:
     vocab: list[str]
 
-    def __init__(self, vocab: list[str], special_tokens: list[str] | None = None):
+    def __init__(
+        self, vocab: list[str], special_tokens: list[str] | None = None
+    ) -> None:
         if special_tokens is None:
             special_tokens = default_special_tokens
         self.vocab = list(special_tokens) + list(vocab)
@@ -27,7 +29,7 @@ class Tokenizer:
             return self.vocab[token_id]
         return unk_token
 
-    def __len__(self):
+    def __len__(self) -> int:
         return len(self.vocab)
 
 
@@ -45,7 +47,7 @@ class Embedding(Node):
         table: torch.Tensor | None = None,
         input_name: str = "embedding_input",
         special_tokens: list[str] | None = None,
-    ):
+    ) -> None:
         """Embedding lookup node.
 
         Default behaviour (``table=None``, ``d_embed=8``): loads the E8
@@ -127,7 +129,7 @@ class Embedding(Node):
 
 
 class Unembedding:
-    def __init__(self, inp: Node, embedding: Embedding):
+    def __init__(self, inp: Node, embedding: Embedding) -> None:
         self.embedding = embedding
         self.inp = inp
         assert len(self.inp) == self.embedding.d_embed

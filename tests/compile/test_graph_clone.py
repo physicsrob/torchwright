@@ -122,9 +122,9 @@ def _node_field_matches(key, sval, cval, node_map):
     if key == "node_id":
         return cval != sval
     if key == "inputs":
-        return all(c is node_map[s] for s, c in zip(sval, cval)) and len(sval) == len(
-            cval
-        )
+        return all(c is node_map[s] for s, c in zip(sval, cval, strict=False)) and len(
+            sval
+        ) == len(cval)
     if key == "scheduling_predecessors":
         return cval == {node_map[s] for s in sval} and all(
             c is not s for s in sval for c in cval
@@ -133,7 +133,7 @@ def _node_field_matches(key, sval, cval, node_map):
         # Fresh list object per clone; Check entries shared by reference.
         return (
             (cval is not sval or not sval)
-            and all(c is s for c, s in zip(cval, sval))
+            and all(c is s for c, s in zip(cval, sval, strict=False))
             and len(cval) == len(sval)
         )
     if key == "_structural_type":
@@ -224,7 +224,7 @@ def test_clone_shares_weight_tensors_by_reference():
                 checked += 1
         if isinstance(src, Embedding):
             assert clone.tokenizer is src.tokenizer
-        for c_check, s_check in zip(clone.checks, src.checks):
+        for c_check, s_check in zip(clone.checks, src.checks, strict=False):
             assert c_check is s_check  # Check entries shared by reference
     assert checked > 10
 
@@ -345,7 +345,7 @@ def test_dispatch_generation_rejects_uncovered_vocabulary():
         pass
 
     with pytest.raises(GraphCloneError, match="FutureType"):
-        build_clone_dispatch(VOCABULARY + (FutureType,))
+        build_clone_dispatch((*VOCABULARY, FutureType))
 
 
 def test_clone_catches_stray_node_reference_field():

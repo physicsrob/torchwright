@@ -440,7 +440,7 @@ class RealizationTable:
     cannot alias.
     """
 
-    def __init__(self, entries: dict[int, Entry]):
+    def __init__(self, entries: dict[int, Entry]) -> None:
         self.entries = entries
 
     @classmethod

@@ -58,24 +58,24 @@ BASES = [10_000.0, 500_000.0]  # Phi-3 default; torchwright ROPE_BASE
 
 
 def _phi3_config(base: float, **overrides) -> Phi3Config:
-    kwargs: dict[str, Any] = dict(
-        vocab_size=64,
-        hidden_size=D_HEAD * 4,
-        intermediate_size=64,
-        num_hidden_layers=1,
-        num_attention_heads=4,
-        head_dim=D_HEAD,
-        rope_parameters={
+    kwargs: dict[str, Any] = {
+        "vocab_size": 64,
+        "hidden_size": D_HEAD * 4,
+        "intermediate_size": 64,
+        "num_hidden_layers": 1,
+        "num_attention_heads": 4,
+        "head_dim": D_HEAD,
+        "rope_parameters": {
             "rope_type": "default",
             "rope_theta": base,
             "partial_rotary_factor": FACTOR,
         },
-        max_position_embeddings=65536,
-        tie_word_embeddings=True,
-        bos_token_id=None,
-        eos_token_id=None,
-        pad_token_id=None,
-    )
+        "max_position_embeddings": 65536,
+        "tie_word_embeddings": True,
+        "bos_token_id": None,
+        "eos_token_id": None,
+        "pad_token_id": None,
+    }
     kwargs.update(overrides)
     return Phi3Config(**kwargs)
 

@@ -157,7 +157,7 @@ def test_picks_most_recent_within_window():
     n = 130
     stride = 10
     matches = set(range(0, n, stride))
-    out = _global_selection(n, matches, value_fn=lambda p: float(p))
+    out = _global_selection(n, matches, value_fn=float)
 
     for p in range(1, n):
         # m <= p: the query at p can see itself if it's a match (causal, inclusive).
@@ -180,7 +180,7 @@ def test_fixes_phase6_breakdown():
     """
     n = 600
     recent, older = 500, 10
-    out = _global_selection(n, {older, recent}, value_fn=lambda p: float(p))
+    out = _global_selection(n, {older, recent}, value_fn=float)
 
     for p in range(recent + 1, n):
         # The most recent match is at position 500; value_fn(500) = 500.0.
@@ -200,7 +200,7 @@ def test_content_dominates_recency():
     """
     n = 80
     match_pos = 5
-    out = _global_selection(n, {match_pos}, value_fn=lambda p: float(p))
+    out = _global_selection(n, {match_pos}, value_fn=float)
 
     for p in range(match_pos + 1, n):
         assert abs(out[p].item() - float(match_pos)) < 0.5, (
@@ -217,7 +217,7 @@ def test_very_far_gap_still_correct():
     """
     n = 700
     recent, older = 602, 2
-    out = _global_selection(n, {older, recent}, value_fn=lambda p: float(p))
+    out = _global_selection(n, {older, recent}, value_fn=float)
 
     for p in range(recent + 1, n):
         assert abs(out[p].item() - float(recent)) < 0.5, (
@@ -240,7 +240,7 @@ def test_exclude_self_does_not_pick_self():
     n = 50
     stride = 10
     matches = set(range(0, n, stride))  # {0, 10, 20, 30, 40}
-    out = _global_selection(n, matches, value_fn=lambda p: float(p), exclude_self=True)
+    out = _global_selection(n, matches, value_fn=float, exclude_self=True)
     # At a match position p, self-key is shifted out; most-recent visible match
     # carries value p-stride.
     for p in [20, 30, 40]:

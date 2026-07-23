@@ -69,7 +69,7 @@ def first_state_with(
     if isinstance(node, Concatenate):
         # Concatenate is resolved transparently — pick the earliest
         # state where *all* of its leaves are present.
-        children = [i for i in node.inputs]
+        children = list(node.inputs)
         best: ResidualStreamState | None = None
         for st in ordered_states:
             if all(first_state_with(c, ra, [st]) is not None for c in children):
@@ -125,7 +125,7 @@ def run_consistency_check(
                 continue
             cols = list(ra.get_node_indices(state, node))
             if node in node_first_value:
-                first_val, first_label, first_cols = node_first_value[node]
+                first_val, first_label, _first_cols = node_first_value[node]
                 if first_val.shape == val.shape:
                     diff = (first_val - val).abs()
                     max_diff = diff.max().item()
@@ -169,10 +169,7 @@ def run_consistency_check(
         max_diff,
     ) in enumerate(violations, 1):
         diff = (first_val - val).abs()
-        if diff.ndim >= 2:
-            per_col_max = diff.max(dim=0).values
-        else:
-            per_col_max = diff
+        per_col_max = diff.max(dim=0).values if diff.ndim >= 2 else diff
         worst_col_idx = int(per_col_max.argmax().item())
         worst_col = cols[worst_col_idx] if worst_col_idx < len(cols) else None
         node_name = node.annotation or node.name or f"node_{node.node_id}"

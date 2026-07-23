@@ -1,4 +1,4 @@
-"""Calculator compiled into a transformer: ``+``, ``-``, ``*`` on integers up
+r"""Calculator compiled into a transformer: ``+``, ``-``, ``*`` on integers up
 to ``max_digits`` digits, parsed from ``"A op B\\n"`` and emitted digit by
 digit.  This is the *legible* variant, built to be read line by line.
 
@@ -103,7 +103,7 @@ def digitwise_fold(
     default_state = init_state
     state = create_literal_value(init_state)
     out: list[Node] = []
-    for a, b in reversed(list(zip(seq1, seq2))):
+    for a, b in reversed(list(zip(seq1, seq2, strict=False))):
         key = concat([a, b, state])
         out.append(onehot_lookup(key, digit_table, default_digit))
         state = onehot_lookup(key, state_table, default_state)

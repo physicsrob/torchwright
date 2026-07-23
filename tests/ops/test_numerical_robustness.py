@@ -285,7 +285,7 @@ def test_sum_digits_on_map_to_table_output():
 
     zero = create_literal_value(embedding.get_embedding("0"))
     no_carry = create_literal_value(torch.tensor([-1.0]))
-    digit_sum, carry_out = sum_digits(embedding, ones, zero, no_carry)
+    digit_sum, _carry_out = sum_digits(embedding, ones, zero, no_carry)
 
     result = digit_sum.compute(n_pos=1, input_values={}).squeeze()
     expected = embedding.get_embedding("2")
@@ -394,7 +394,7 @@ def _assert_trimmed_relu(seq_tokens, max_removals, expected_tokens):
     seq = [create_literal_value(embedding.get_embedding(t)) for t in seq_tokens]
     result = remove_leading_0s(embedding, seq, max_removals)
     assert len(result) == len(expected_tokens)
-    for i, (node, tok) in enumerate(zip(result, expected_tokens)):
+    for i, (node, tok) in enumerate(zip(result, expected_tokens, strict=False)):
         out = node.compute(n_pos=1, input_values={}).squeeze()
         dist = (out - embedding.get_embedding(tok)).norm().item()
         assert dist < 0.5, f"slot {i}: dist from '{tok}' = {dist:.4f}"

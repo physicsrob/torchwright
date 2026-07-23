@@ -339,7 +339,7 @@ def _expected_output(
         dist_scale,
         wall_bias,
     )
-    n_walls = len(walls)
+    len(walls)
     out = np.zeros(D_OUTPUT, dtype=np.float64)
     for i, w in enumerate(walls):
         out[_OUT_WALL_ID] += weights[i] * w["wall_id"]
@@ -456,7 +456,7 @@ def test_n_walls_each_midpoint(n_walls):
 
 
 @pytest.mark.parametrize(
-    "n_walls,logit_scale,min_correct_weight",
+    ("n_walls", "logit_scale", "min_correct_weight"),
     [
         # Small scenes at a moderate scale are easy: the adjacent logit gap
         # widens with angular separation, so the softmax saturates fast.

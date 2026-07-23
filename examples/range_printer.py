@@ -156,7 +156,7 @@ def build_range_printer_graph(
     next_col_output = select(inner_continues, next_col_val, zero_col)
 
     # --- Output --------------------------------------------------------
-    output = Concatenate(
+    return Concatenate(
         [
             active_col,  # 0:   the column value emitted this step
             done_flag,  # 1:   +1 when all items exhausted
@@ -165,7 +165,6 @@ def build_range_printer_graph(
             next_is_new_item,  # 3+N: next is_new_item flag
         ]
     )
-    return output
 
 
 # --- Output index helpers (for host-side parsing) ----------------------

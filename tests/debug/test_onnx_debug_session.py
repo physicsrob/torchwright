@@ -139,7 +139,7 @@ def _build_annotated_graph():
     from torchwright.ops.relu.logic_ops import equals_vector
     from torchwright.ops.relu.map_select import select
 
-    vocab = list("0123456789+") + ["\n", "<bos>", "<eos>", "default"]
+    vocab = [*list("0123456789+"), "\n", "<bos>", "<eos>", "default"]
     embedding = create_embedding(vocab=vocab)
     with annotate("scene"):
         cond = equals_vector(inp=embedding, vector=embedding.get_embedding("+"))
@@ -156,7 +156,7 @@ def test_sidecar_carries_annotations(tmp_path):
     """The ``annotate()`` label path round-trips through the debug sidecar
     and onto OnnxDebugSession.annotation() against a fresh rebuild.
     """
-    out, embedding, prod, top = _build_annotated_graph()
+    out, embedding, _prod, _top = _build_annotated_graph()
     onnx_path = str(tmp_path / "annotated.onnx")
     compile_to_onnx(
         out,
@@ -191,7 +191,7 @@ def test_sidecar_nodes_table_schema(tmp_path):
     """The per-node table keys by canonical id (same space as placements /
     states) and carries op/width/weights/inputs/layer/sublayer per node.
     """
-    out, embedding, prod, top = _build_annotated_graph()
+    out, embedding, _prod, _top = _build_annotated_graph()
     onnx_path = str(tmp_path / "nodes.onnx")
     compile_to_onnx(
         out,
@@ -224,7 +224,7 @@ def test_sidecar_nodes_table_schema(tmp_path):
             assert key in nodes, f"state node {key} missing from nodes"
 
     # Required per-entry shape.
-    for cid, m in nodes.items():
+    for m in nodes.values():
         assert isinstance(m["op"], str)
         assert isinstance(m["width"], int)
         assert isinstance(m["weight_params"], int)
@@ -280,7 +280,8 @@ def test_probe_and_debug_value_parity_with_headless(token_artifact):
     headless(headless.build_prefill(iv, len(TOKENS)), debug=True)
     v_onnx = session.debug_value(out_onnx)
     v_h = headless.debug_value(out_h)
-    assert v_onnx is not None and v_h is not None
+    assert v_onnx is not None
+    assert v_h is not None
     # v_onnx carries the onnxruntime fp32 execution floor (the same one this
     # test budgets _ONNX_PROBE_ATOL=2.5e-3 against above), while v_h is
     # oracle-tight; so their cross-backend difference must allow that floor, not
@@ -389,7 +390,7 @@ def test_corrupted_initializer_is_detected(token_artifact, tmp_path):
     """D6 reproducer: an artifact whose weights differ from what the
     compiler computed must show up as oracle divergence on the ONNX
     backend.  (The in-process backend never reads the artifact, so it
-    is structurally blind to this class.)
+    is structurally blind to this class.).
     """
     import numpy as np
     import onnx
@@ -564,7 +565,7 @@ def test_oversized_conversion_external_metadata_and_bytes(token_artifact, monkey
     when several tensors convert.  (The true >2 GiB representation cannot run
     in a unit test; it is exercised for real by the W6 landing gate, which
     opens a production e1m1_lowres artifact whose embed_table declares
-    3.3 GB.  This pins the metadata arithmetic that gate relies on.)
+    3.3 GB.  This pins the metadata arithmetic that gate relies on.).
     """
     import numpy as np
     import onnx

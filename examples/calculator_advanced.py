@@ -172,7 +172,7 @@ def _carry_lookahead_op(
                 key = torch.cat([ab, _state(carry, _CARRY_W)])
                 digit_table[key] = embedding.get_embedding(str(digit_of(a, b, carry)))
 
-    pairs = list(reversed(list(zip(seq1, seq2))))  # LSB-first
+    pairs = list(reversed(list(zip(seq1, seq2, strict=False))))  # LSB-first
     segments = [
         onehot_lookup(concat([a, b]), status_table, _state(_KILL, _SEG_W))
         for a, b in pairs
@@ -180,7 +180,7 @@ def _carry_lookahead_op(
     carries = carry_lookahead(segments)
     out_lsb = [
         onehot_lookup(concat([a, b, carry]), digit_table, embedding.get_embedding("0"))
-        for (a, b), carry in zip(pairs, carries)
+        for (a, b), carry in zip(pairs, carries, strict=False)
     ]
     return list(reversed(out_lsb))
 

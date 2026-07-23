@@ -89,7 +89,7 @@ class FoldLog:
         """
         survivor = run[0]
         offset = 0
-        for member, width in zip(run, widths):
+        for member, width in zip(run, widths, strict=False):
             if member is survivor:
                 # The survivor's pre-merge columns stay at offset 0, so
                 # records pointing at it need no retarget — and a duplicate
@@ -403,7 +403,7 @@ def _fold_through_concatenate(
         slot: dict[int, int] = {}
         merged_leaves: list[Node] = []
         merged_blocks: list[torch.Tensor] = []
-        for leaf, block in zip(new_leaves, blocks):
+        for leaf, block in zip(new_leaves, blocks, strict=False):
             j = slot.get(id(leaf))
             if j is None:
                 slot[id(leaf)] = len(merged_leaves)

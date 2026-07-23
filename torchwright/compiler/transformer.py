@@ -2,8 +2,6 @@ from typing import TYPE_CHECKING, Any, Optional
 
 import torch
 
-from torchwright.compiler.groups.attn_sublayer import AttnSubLayer
-from torchwright.compiler.groups.mlp_sublayer import GatedMLPSubLayer, MLPSubLayer
 from torchwright.compiler.groups.transformer_layer import TransformerLayer
 from torchwright.compiler.residual_assignment import ResidualAssignment
 from torchwright.graph import (
@@ -21,6 +19,8 @@ if TYPE_CHECKING:
         ScheduleResult,
         SolveStats,
     )
+    from torchwright.compiler.groups.attn_sublayer import AttnSubLayer
+    from torchwright.compiler.groups.mlp_sublayer import GatedMLPSubLayer, MLPSubLayer
     from torchwright.compiler.realization import RealizationTable
 
 
@@ -65,7 +65,7 @@ class HeadlessTransformer:
         d_hidden: int | None = None,
         activation: str = "relu",
         n_heads: int | None = None,
-    ):
+    ) -> None:
         if activation not in ("relu", "swish"):
             raise ValueError(
                 f"HeadlessTransformer activation must be 'relu' or 'swish', "
@@ -108,7 +108,7 @@ class HeadlessTransformer:
         if append:
             self.layers.append(layer)
         else:
-            self.layers = [layer] + self.layers
+            self.layers = [layer, *self.layers]
         return layer
 
     def get_input_res_stream(
@@ -150,7 +150,7 @@ class HeadlessTransformer:
                 for i, idx in enumerate(indices):
                     res_stream[:, idx] = embedding_output[:, i]
             else:
-                assert False, "Unsupported node type"
+                raise AssertionError("Unsupported node type")
         return res_stream
 
     def forward(self, inp: torch.Tensor, return_states=False):

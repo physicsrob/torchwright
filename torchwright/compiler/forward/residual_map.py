@@ -31,7 +31,7 @@ class ResidualStreamMap:
     is never needed.
     """
 
-    def __init__(self, d: int):
+    def __init__(self, d: int) -> None:
         self.d = d
         self._free: set[int] = set(range(d))
         self._node_to_indices: dict[Node, list[int]] = {}
@@ -77,7 +77,7 @@ class ResidualStreamMap:
         self._check_invariants(f"allocate({node!r}, {n} cols)")
         return indices
 
-    def free(self, node: Node, mech: str = "attn"):
+    def free(self, node: Node, mech: str = "attn") -> None:
         # ``mech`` ("attn"/"mlp") records which sublayer the freeing cancel ran
         # in; the base map ignores it (the free is identical either way).  The
         # warm-start tracking subclass records it so the CP-SAT mechanism hint
@@ -152,7 +152,7 @@ class ResidualStreamMap:
         self._check_invariants(f"allocate_at({node!r}, {cols[:4]}...)")
         return list(cols)
 
-    def reassign(self, old_node: Node, new_node: Node):
+    def reassign(self, old_node: Node, new_node: Node) -> None:
         if old_node not in self._node_to_indices:
             raise KeyError(f"Node {old_node} is not allocated")
         indices = self._node_to_indices.pop(old_node)
@@ -207,7 +207,7 @@ class ResidualStreamMap:
         cols = set(cols)
         unowned = cols - self._free
         if unowned:
-            owners = {
+            {
                 c: owner
                 for owner, indices in self._node_to_indices.items()
                 for c in indices

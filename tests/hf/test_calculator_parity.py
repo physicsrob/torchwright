@@ -111,7 +111,7 @@ def tok2id(oracle):
 
 
 def _prefill_logits(model, oracle, tok2id, text):
-    ids = [tok2id[t] for t in ([_BOS] + list(text))]
+    ids = [tok2id[t] for t in ([_BOS, *list(text)])]
     o = oracle(torch.tensor(ids, dtype=torch.int64))
     with torch.no_grad():
         h = model(input_ids=torch.tensor([ids], dtype=torch.int64), use_cache=True)
@@ -125,7 +125,7 @@ def _oracle_gen(oracle, text):
 
 
 def _hf_gen(model, tok2id, vocab, text):
-    ids = torch.tensor([[tok2id[t] for t in ([_BOS] + list(text))]], dtype=torch.int64)
+    ids = torch.tensor([[tok2id[t] for t in ([_BOS, *list(text)])]], dtype=torch.int64)
     with torch.no_grad():
         g = model.generate(
             ids,

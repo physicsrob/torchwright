@@ -7,10 +7,10 @@ by every artifact sink.
 
 from __future__ import annotations
 
-from collections.abc import Callable, Mapping
 from dataclasses import asdict, dataclass, field, replace
 from enum import Enum
 from typing import (
+    TYPE_CHECKING,
     Any,
     Literal,
     Protocol,
@@ -24,6 +24,9 @@ import numpy as np
 from torchwright.graph import Concatenate, Embedding, LiteralValue, Node
 from torchwright.graph.misc import InputNode
 from torchwright.graph.rope import ROPE_BASE
+
+if TYPE_CHECKING:
+    from collections.abc import Callable, Mapping
 
 JSONScalar: TypeAlias = None | bool | int | float | str
 JSONValue: TypeAlias = JSONScalar | list["JSONValue"] | dict[str, "JSONValue"]
@@ -167,7 +170,7 @@ def make_layer_callback(header: CompileHeader, sink: TokenModelSink) -> Callable
         sink.begin(header)
         begun = True
 
-    def callback(index, layer):
+    def callback(index, layer) -> None:
         nonlocal begun
         if not begun:
             sink.begin(header)
@@ -210,6 +213,7 @@ def make_layer_callback(header: CompileHeader, sink: TokenModelSink) -> Callable
             lin.output_matrix = lin.output_bias = None
             return matrix, bias_value
 
+        record: SwishLayerWeights | ReluLayerWeights
         if getattr(mlp, "activation", "relu") == "swish":
             wg, bg = linear(mlp.gate_proj)
             wu, bu = linear(mlp.up_proj)
@@ -274,7 +278,7 @@ def build_token_weights(compiled, output_node: Node, embedding: Embedding, d: in
                     "the supplied embedding"
                 )
         elif isinstance(node, LiteralValue):
-            literal_seeds.extend(zip(indices, map(float, node.value)))
+            literal_seeds.extend(zip(indices, map(float, node.value), strict=False))
         elif not isinstance(node, (Concatenate, InputNode)):
             raise AssertionError(f"unexpected input-state node {type(node).__name__}")
     if embedding_indices is None:
@@ -289,7 +293,7 @@ def build_token_weights(compiled, output_node: Node, embedding: Embedding, d: in
     embed[:, embedding_indices] = compact
     rms = compiled.rms_norm_spec
     if rms is not None:
-        for col, value in zip(rms.reserved_cols, rms.const_values):
+        for col, value in zip(rms.reserved_cols, rms.const_values, strict=False):
             embed[:, col] = value
     for col, value in literal_seeds:
         embed[:, col] = value

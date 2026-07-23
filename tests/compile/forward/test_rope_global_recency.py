@@ -49,8 +49,7 @@ def _global_recency_graph(d_head=D_HEAD, d_rot=None):
     kv = create_input("kv", 8)
     val = create_input("val", 1)
     gpos = global_position_from_bos(rope, bos_ind)
-    sel = attend_most_recent_globally(rope, qv, kv, gpos, val)
-    return sel
+    return attend_most_recent_globally(rope, qv, kv, gpos, val)
 
 
 def _e8_inputs(n, match_positions):

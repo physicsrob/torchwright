@@ -44,10 +44,10 @@ def _table_lookup_2d_reference(
     offset = max_abs + row_slack + 1.0
 
     def _axis_blend(x: float, n: int) -> tuple[int, int, float]:
-        idx = max(0, min(n - 1, int(math.floor(x + 0.5))))
+        idx = max(0, min(n - 1, math.floor(x + 0.5)))
         if n <= 1:
             return idx, idx, 0.0
-        k = int(math.floor(x))
+        k = math.floor(x)
         boundary = float(k) + 0.5
         lo = boundary - eps / 2.0
         hi = boundary + eps / 2.0
@@ -234,7 +234,7 @@ def _dynamic_extract_reference(
     n_pos = table.shape[0]
     out = torch.empty(n_pos, d_fill, dtype=table.dtype)
     for p in range(n_pos):
-        k = int(round(idx[p, 0].item()))
+        k = round(idx[p, 0].item())
         k = max(0, min(n_entries - 1, k))
         out[p] = table[p, k * d_fill : (k + 1) * d_fill]
     return out
@@ -247,12 +247,11 @@ def _build_dynamic_extract_graph(n_entries: int, d_fill: int):
         value_range=(0.0, 1.0),
     )
     idx_node = create_input("idx", 1, value_range=(0.0, float(n_entries)))
-    out_node = dynamic_extract(table_node, idx_node, n_entries, d_fill)
-    return out_node
+    return dynamic_extract(table_node, idx_node, n_entries, d_fill)
 
 
 @pytest.mark.parametrize(
-    "n_entries,d_fill",
+    ("n_entries", "d_fill"),
     [
         (2, 1),
         (4, 3),

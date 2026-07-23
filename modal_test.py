@@ -135,7 +135,7 @@ def run_pytest(pytest_args: str, shard_id: int = 0, extra_args: str = "") -> int
 
 
 @app.local_entrypoint()
-def main(file: str = "tests", args: str = ""):
+def main(file: str = "tests", args: str = "") -> None:
     if file != "tests":
         rc = run_pytest.remote(pytest_args=file, shard_id=0, extra_args=args)
         sys.exit(rc)

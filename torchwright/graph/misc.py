@@ -71,7 +71,7 @@ class InputNode(Node):
         name: str = "",
         *,
         value_range: tuple[float, float],
-    ):
+    ) -> None:
         # Support both old and new constructor patterns:
         # - InputNode(d_output) - new anonymous pattern
         # - InputNode(d_output, name=name) - new named pattern
@@ -116,12 +116,12 @@ class InputNode(Node):
         ), "Input must be of shape (n_pos, d_output)"
         return val
 
-    def __len__(self):
+    def __len__(self) -> int:
         return self.d_output
 
 
 class Concatenate(Node):
-    def __init__(self, inputs: list[Node]):
+    def __init__(self, inputs: list[Node]) -> None:
         super().__init__(sum(len(x) for x in inputs), inputs)
 
     def compute(self, n_pos: int, input_values: dict) -> torch.Tensor:
@@ -142,7 +142,7 @@ class Concatenate(Node):
 
 
 class Add(Node):
-    def __init__(self, input1: Node, input2: Node, name: str = ""):
+    def __init__(self, input1: Node, input2: Node, name: str = "") -> None:
         super().__init__(len(input1), [input1, input2], name)
 
     def compute(self, n_pos: int, input_values: dict) -> torch.Tensor:
@@ -161,7 +161,7 @@ class Add(Node):
 
 
 class LiteralValue(Node):
-    def __init__(self, value: torch.Tensor, name: str = ""):
+    def __init__(self, value: torch.Tensor, name: str = "") -> None:
         assert len(value.shape) == 1
         self.value = value
         super().__init__(len(value), [], name)
@@ -184,7 +184,7 @@ class LiteralValue(Node):
     def is_zero(self):
         return self.value.eq(0).all()
 
-    def node_type(self):
+    def node_type(self) -> str:
         if self.is_zero():
             return "Zero"
         return "LiteralValue"
@@ -193,7 +193,7 @@ class LiteralValue(Node):
 class Placeholder(Node):
     """Zero-width sentinel used as a stand-in when a real node is not yet available."""
 
-    def __init__(self, d: int = 0):
+    def __init__(self, d: int = 0) -> None:
         super().__init__(d, [])
 
     def compute(self, n_pos: int, input_values: dict) -> torch.Tensor:
@@ -201,7 +201,7 @@ class Placeholder(Node):
 
 
 class ValueLogger(Node):
-    def __init__(self, inp: Node, name: str):
+    def __init__(self, inp: Node, name: str) -> None:
         self.name = name
         super().__init__(len(inp), [inp])
 

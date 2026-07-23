@@ -27,7 +27,7 @@ from torchwright.debug.onnx_debug import OnnxDebugSession  # noqa: E402
 
 D = 256
 D_HEAD = 16
-VOCAB = list("0123456789+") + ["\n", "<bos>", "<eos>", "default"]
+VOCAB = [*list("0123456789+"), "\n", "<bos>", "<eos>", "default"]
 TOKENS = ["<bos>", "1", "+", "2"]
 _ONNX_PROBE_ATOL = 2.5e-3
 

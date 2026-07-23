@@ -53,7 +53,7 @@ class TorchwrightCustomConfig(PretrainedConfig):
         rms_norm: bool = False,
         rms_norm_eps: float = 1e-5,
         **kwargs,
-    ):
+    ) -> None:
         self.d = int(d)
         self.d_head = int(d_head)
         self.vocab_size = int(vocab_size)

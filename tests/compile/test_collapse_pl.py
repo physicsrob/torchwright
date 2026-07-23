@@ -42,7 +42,7 @@ def _chain(machine, sharpness=50.0):
 
 def test_s1_take_matches_source_both_machines():
     for machine in ("relu", "swish"):
-        x, out = _chain(machine)
+        _x, out = _chain(machine)
         lowered = lower(out, collapse_pl=True, collapse_lane_cap=64)
         rep = lowered.collapse_pl_report
         assert rep is not None and rep.n_collapsed == 1, (machine, rep.format())
@@ -62,7 +62,7 @@ def test_pl_takes_what_v1_leaves():
     """v1 (staircase, integer-gated) declines the continuous chain;
     the pl pass takes it in the same lower() run.
     """
-    x, out = _chain("swish")
+    _x, out = _chain("swish")
     lowered = lower(
         out, collapse_univariate=True, collapse_pl=True, collapse_lane_cap=64
     )
@@ -126,7 +126,7 @@ def test_no_depth_gain_declines():
 
 
 def test_orphaned_checks_are_counted():
-    x, out = _chain("relu")
+    _x, out = _chain("relu")
     # A watch on the interior compare member: the rewiring orphans it.
     interior = out.inputs[0]
     debug_watch(interior, lambda v: (True, ""), "interior watch")
@@ -152,14 +152,14 @@ def test_vector_valued_boundary_member():
 
 
 def test_node_map_follows_synthesized_value():
-    x, out = _chain("relu")
+    _x, out = _chain("relu")
     lowered = lower(out, collapse_pl=True, collapse_lane_cap=64)
     survivor = lowered.copy_of(out)
     assert (survivor.name or "").startswith("collapse_pl_"), survivor.name
 
 
 def test_flag_off_is_inert():
-    x, out = _chain("relu")
+    _x, out = _chain("relu")
     lowered = lower(out)
     assert lowered.collapse_pl_report is None
 
@@ -174,7 +174,7 @@ def test_emitted_step_survives_shallow_crossing_bands():
     (collapse_pl) each independently prevent it; the value sweep pins
     the end-to-end behavior.
     """
-    x, out = _chain("swish", sharpness=50.0)
+    _x, out = _chain("swish", sharpness=50.0)
     lowered = lower(out, collapse_pl=True, collapse_lane_cap=64)
     xs = torch.linspace(0.0, 10.0, 4001, dtype=torch.float64)
     err = (_eval(lowered.output_node, xs) - _eval(out, xs)).abs().amax(dim=1)

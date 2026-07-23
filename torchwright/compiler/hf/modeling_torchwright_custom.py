@@ -53,7 +53,7 @@ class TorchwrightCustomAttention(nn.Module):
     ``d_head`` is shared across all layers.
     """
 
-    def __init__(self, config: TorchwrightCustomConfig, layer_idx: int):
+    def __init__(self, config: TorchwrightCustomConfig, layer_idx: int) -> None:
         super().__init__()
         self.layer_idx = layer_idx
         self.d = config.d
@@ -140,7 +140,7 @@ class TorchwrightCustomAttention(nn.Module):
 class TorchwrightCustomMLP(nn.Module):
     """``fc2(relu(fc1(x)))`` — both linears biased."""
 
-    def __init__(self, config: TorchwrightCustomConfig, layer_idx: int):
+    def __init__(self, config: TorchwrightCustomConfig, layer_idx: int) -> None:
         super().__init__()
         d_hidden = config.d_hidden_per_layer[layer_idx]
         self.fc1 = nn.Linear(config.d, d_hidden, bias=True)
@@ -155,7 +155,7 @@ class TorchwrightCustomRMSNorm(nn.Module):
     the same form as Llama's.
     """
 
-    def __init__(self, d: int, eps: float):
+    def __init__(self, d: int, eps: float) -> None:
         super().__init__()
         self.weight = nn.Parameter(torch.ones(d))
         self.eps = float(eps)
@@ -170,7 +170,7 @@ class TorchwrightCustomDecoderLayer(nn.Module):
     The norms are ``nn.Identity`` when ``config.rms_norm`` is off.
     """
 
-    def __init__(self, config: TorchwrightCustomConfig, layer_idx: int):
+    def __init__(self, config: TorchwrightCustomConfig, layer_idx: int) -> None:
         super().__init__()
         self.self_attn = TorchwrightCustomAttention(config, layer_idx)
         self.mlp = TorchwrightCustomMLP(config, layer_idx)
@@ -200,10 +200,7 @@ class TorchwrightCustomDecoderLayer(nn.Module):
             past_key_values,
             cache_position,
         )
-        hidden_states = hidden_states + self.mlp(
-            self.post_attention_layernorm(hidden_states)
-        )
-        return hidden_states
+        return hidden_states + self.mlp(self.post_attention_layernorm(hidden_states))
 
 
 class TorchwrightCustomPreTrainedModel(PreTrainedModel):
@@ -213,7 +210,7 @@ class TorchwrightCustomPreTrainedModel(PreTrainedModel):
     _no_split_modules = ["TorchwrightCustomDecoderLayer"]
     _supports_sdpa = True
 
-    def _init_weights(self, module):
+    def _init_weights(self, module) -> None:
         # Real weights come from the checkpoint; a fresh construction only has
         # to be finite and shape-correct. Use ``nn.init.*`` on the parameter
         # (not ``.data.normal_()``): under ``from_pretrained``, transformers
@@ -231,7 +228,7 @@ class TorchwrightCustomPreTrainedModel(PreTrainedModel):
 class TorchwrightCustomModel(TorchwrightCustomPreTrainedModel):
     """Decoder trunk: token embedding, ``n_layers`` decoder blocks, final norm."""
 
-    def __init__(self, config: TorchwrightCustomConfig):
+    def __init__(self, config: TorchwrightCustomConfig) -> None:
         super().__init__(config)
         self.embed_tokens = nn.Embedding(config.vocab_size, config.d)
         self.layers = nn.ModuleList(
@@ -248,7 +245,7 @@ class TorchwrightCustomModel(TorchwrightCustomPreTrainedModel):
     def get_input_embeddings(self):
         return self.embed_tokens
 
-    def set_input_embeddings(self, value):
+    def set_input_embeddings(self, value) -> None:
         self.embed_tokens = value
 
     def forward(
@@ -273,7 +270,7 @@ class TorchwrightCustomModel(TorchwrightCustomPreTrainedModel):
             use_cache = getattr(self.config, "use_cache", True)
 
         hidden_states = self.embed_tokens(input_ids)  # (B, T, d)
-        B, T = hidden_states.shape[0], hidden_states.shape[1]
+        _B, T = hidden_states.shape[0], hidden_states.shape[1]
         device = hidden_states.device
 
         # fp32-only: reduced precision changes this model's outputs. Fail loud
@@ -354,7 +351,7 @@ class TorchwrightCustomForCausalLM(TorchwrightCustomPreTrainedModel, GenerationM
 
     _tied_weights_keys = {"lm_head.weight": "model.embed_tokens.weight"}
 
-    def __init__(self, config: TorchwrightCustomConfig):
+    def __init__(self, config: TorchwrightCustomConfig) -> None:
         super().__init__(config)
         self.model = TorchwrightCustomModel(config)
         self.lm_head = nn.Linear(config.d, config.vocab_size, bias=False)
@@ -363,13 +360,13 @@ class TorchwrightCustomForCausalLM(TorchwrightCustomPreTrainedModel, GenerationM
     def get_input_embeddings(self):
         return self.model.embed_tokens
 
-    def set_input_embeddings(self, value):
+    def set_input_embeddings(self, value) -> None:
         self.model.embed_tokens = value
 
     def get_output_embeddings(self):
         return self.lm_head
 
-    def set_output_embeddings(self, value):
+    def set_output_embeddings(self, value) -> None:
         self.lm_head = value
 
     def get_decoder(self):

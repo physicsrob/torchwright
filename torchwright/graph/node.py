@@ -229,7 +229,7 @@ class Node:
         wrapped._tw_verified = True
         cls.compute = wrapped
 
-    def __init__(self, d_output: int, inputs: list["Node"], name: str = ""):
+    def __init__(self, d_output: int, inputs: list["Node"], name: str = "") -> None:
         global global_node_id
         self.d_output = d_output
         self.inputs = inputs
@@ -310,10 +310,10 @@ class Node:
     def compute(self, n_pos: int, input_values: dict) -> torch.Tensor:
         raise NotImplementedError
 
-    def __len__(self):
+    def __len__(self) -> int:
         return self.d_output
 
-    def replace_input(self, old_input: "Node", new_input: "Node"):
+    def replace_input(self, old_input: "Node", new_input: "Node") -> None:
         for i, _ in enumerate(self.inputs):
             if self.inputs[i] == old_input:
                 self.inputs[i] = new_input
@@ -321,7 +321,7 @@ class Node:
     def node_type(self):
         return type(self).__name__
 
-    def __repr__(self):
+    def __repr__(self) -> str:
         type_name = self.node_type()
         if len(self.inputs) == 0:
             return f"{type_name}(id={self.node_id}, name='{self.name}', d={len(self)})"
@@ -338,7 +338,7 @@ class Node:
         inp_str = ", ".join(inp_strings)
         return f"{type_name}(id={self.node_id}, name='{self.name}', {inp_str}, d={len(self)})"
 
-    def num_params(self):
+    def num_params(self) -> int:
         return 0
 
     def __eq__(self, other):

@@ -95,7 +95,7 @@ def test_index_past_length_reads_default(setup):
 
 
 def test_length_at_latches_and_holds(setup):
-    embedding, _, region, is_plus = setup
+    _embedding, _, region, is_plus = setup
     length = region.length_at(is_plus)
     for tokens, expected in [
         ([bos_token, "1", "+", "2", "3", "\n"], 1.0),

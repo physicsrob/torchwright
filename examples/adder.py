@@ -1,4 +1,4 @@
-"""3-digit adder using embedding-space arithmetic.
+r"""3-digit adder using embedding-space arithmetic.
 
 Parses "A+B\\n" where A and B are up to 3-digit numbers, and outputs their
 sum autoregressively. All arithmetic is done digit-by-digit in embedding
@@ -35,9 +35,15 @@ MAX_POSITIONS = 512
 
 def create_network_parts() -> tuple[Node, Embedding]:
     """Build the 3-digit adder graph and return (output_node, embedding)."""
-    vocab = list(
-        " 0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ!@#$%^&*()-+="
-    ) + ["\n", "<bos>", "<eos>", "default"]
+    vocab = [
+        *list(
+            " 0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ!@#$%^&*()-+="
+        ),
+        "\n",
+        "<bos>",
+        "<eos>",
+        "default",
+    ]
     embedding = create_embedding(vocab=vocab)
     rope = create_rope_config(d_head=D_HEAD, max_positions=MAX_POSITIONS)
 
@@ -58,8 +64,9 @@ def create_network_parts() -> tuple[Node, Embedding]:
     second_num_digits = num_seq.get_digits_at_event(is_end_of_second_num)
 
     # --- Phase 2: Add digit-by-digit with carry propagation ---
-    sum_digits = sum_digit_seqs(embedding, first_num_digits, second_num_digits) + [
-        create_literal_value(embedding.get_embedding("<eos>"))
+    sum_digits = [
+        *sum_digit_seqs(embedding, first_num_digits, second_num_digits),
+        create_literal_value(embedding.get_embedding("<eos>")),
     ]
     sum_digits = remove_leading_0s(embedding, sum_digits, max_removals=max_digits - 1)
 

@@ -54,7 +54,8 @@ def test_reference_eval_matches_direct_compute_tiny():
     direct = output.compute(n_pos, input_values)
     assert torch.allclose(direct, expected, atol=1e-6)
     # Every intermediate is also cached.
-    assert x in cache and y in cache
+    assert x in cache
+    assert y in cache
     assert torch.allclose(cache[x], input_values["x"])
     assert torch.allclose(cache[y], input_values["y"])
 

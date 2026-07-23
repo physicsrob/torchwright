@@ -21,8 +21,7 @@ D_HEAD = 16
 def _build_sample_graph():
     a = create_input("a", 1)
     b = create_input("b", 1)
-    out = multiply_2d(a, b, max_abs1=10, max_abs2=10)
-    return out
+    return multiply_2d(a, b, max_abs1=10, max_abs2=10)
 
 
 def test_compiled_headless_step_matches_call():

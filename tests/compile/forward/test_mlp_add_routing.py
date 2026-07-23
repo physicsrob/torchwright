@@ -76,11 +76,12 @@ MLP_ADD_POLICY = SchedulingPolicy(add_in_attention="never")
 
 
 def test_mlp_add_policy_routes_adds_to_mlp_with_zero_add_heads():
-    out, x, add_reuse, add_fresh = _mixed_add_graph()
-    net, plan = _capture_plan(output_node=out, policy=MLP_ADD_POLICY)
+    out, _x, _add_reuse, _add_fresh = _mixed_add_graph()
+    _net, plan = _capture_plan(output_node=out, policy=MLP_ADD_POLICY)
 
     attn_types, mlp_types = _op_types(plan)
-    assert "add_into" not in attn_types and "compute_add" not in attn_types
+    assert "add_into" not in attn_types
+    assert "compute_add" not in attn_types
     assert "add_into_bypass" in mlp_types
     assert "compute_add_bypass" in mlp_types
 
@@ -116,7 +117,7 @@ def test_default_and_legacy_policies_retain_attention_add_ops(policy):
     """
     out, *_ = _mixed_add_graph()
     kwargs = {} if policy is None else {"policy": policy}
-    net, plan = _capture_plan(output_node=out, **kwargs)
+    _net, plan = _capture_plan(output_node=out, **kwargs)
 
     attn_types, mlp_types = _op_types(plan)
     assert "add_into" in attn_types
@@ -129,7 +130,7 @@ def test_mlp_routed_adds_match_compute():
     """Value parity through compile_headless: the compiled transformer with
     MLP-routed Adds matches the recursive oracle.  (Per-machine ReLU/Swish
     coverage of the writers lives in test_weight_writer.py; the machine
-    here is whatever the default compile selects.)
+    here is whatever the default compile selects.).
     """
     out, *_ = _mixed_add_graph()
     compiled = compile_headless(

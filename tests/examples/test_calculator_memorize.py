@@ -42,14 +42,14 @@ def _check_expr(out_node, embedding, expr: str, expected: str) -> None:
     """Teacher-forced check: the model's argmax at the newline and every
     answer position predicts the expected next token.
     """
-    tokens = [bos_token] + list(expr) + ["\n"] + list(expected) + ["<eos>"]
+    tokens = [bos_token, *list(expr), "\n", *list(expected), "<eos>"]
     cache = reference_eval(
         out_node, cast("dict", {"embedding_input": tokens}), len(tokens)
     )
     logits = cache[out_node]
     vocab = embedding.tokenizer.vocab
     start = 1 + len(expr)  # the newline's position predicts the first digit
-    for k, want in enumerate(list(expected) + ["<eos>"]):
+    for k, want in enumerate([*list(expected), "<eos>"]):
         got = vocab[int(logits[start + k].argmax())]
         assert got == want, (expr, k, got, want)
 

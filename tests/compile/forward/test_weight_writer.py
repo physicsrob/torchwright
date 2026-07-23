@@ -177,8 +177,8 @@ def test_attn_compute():
     )
 
     rmap = ResidualStreamMap(D)
-    pos_cols = rmap.allocate(pos)
-    v_cols = rmap.allocate(value_in)
+    rmap.allocate(pos)
+    rmap.allocate(value_in)
     out_cols = rmap.allocate(attn_node)
 
     layer = TransformerLayer(D, D_HEAD)
@@ -204,7 +204,7 @@ def test_attn_compute_small_d_v():
     """Attn node whose value width d_v is smaller than the layer d_head — the
     V/O projection is padded up to d_head.  (Q/K are full-width d_head: every
     head is rotary on the one global grid, so partial-width Q/K no longer
-    exists.)
+    exists.).
     """
     pos = _make_reserved_block()
     value_in = InputNode("v", 4, value_range=(-100.0, 100.0))
@@ -221,8 +221,8 @@ def test_attn_compute_small_d_v():
     )
 
     rmap = ResidualStreamMap(D)
-    pos_cols = rmap.allocate(pos)
-    v_cols = rmap.allocate(value_in)
+    rmap.allocate(pos)
+    rmap.allocate(value_in)
     out_cols = rmap.allocate(attn_node)
 
     layer = TransformerLayer(D, D_HEAD)
@@ -825,7 +825,7 @@ def test_mlp_block():
     )
 
     rmap = ResidualStreamMap(D)
-    x_cols = rmap.allocate(x)
+    rmap.allocate(x)
     out_cols = rmap.allocate(ffn)
 
     mlp_slots = list(range(8))  # 8 hidden slots for the 8-lane FFN
@@ -1048,7 +1048,7 @@ def test_non_contiguous_columns():
     rmap.allocate(pos)  # takes first 16 cols
     dummy1 = InputNode("d1", 2, value_range=(-100.0, 100.0))
     rmap.allocate(x)  # takes next 4
-    d1_cols = rmap.allocate(dummy1)  # takes next 2
+    rmap.allocate(dummy1)  # takes next 2
     out_cols = rmap.allocate(linear_node)  # takes next 3
     rmap.free(dummy1)  # frees 2 cols in the middle
 
@@ -2006,7 +2006,7 @@ def test_mlp_linear_bypass_duplicate_concat_leaf():
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.parametrize("activation,atol", [("relu", 1e-5), ("swish", 1e-4)])
+@pytest.mark.parametrize(("activation", "atol"), [("relu", 1e-5), ("swish", 1e-4)])
 def test_mlp_add_into_bypass(activation, atol):
     """Add(dead, live): the pair reads the live addend and adds it into the
     dead addend's reused columns — the residual leaves as dead + live.
@@ -2073,7 +2073,7 @@ def test_mlp_add_into_bypass_dead_at_inputs1():
     assert torch.allclose(out[:, dead_cols].cpu(), expected, atol=1e-4)
 
 
-@pytest.mark.parametrize("activation,atol", [("relu", 1e-5), ("swish", 1e-4)])
+@pytest.mark.parametrize(("activation", "atol"), [("relu", 1e-5), ("swish", 1e-4)])
 def test_mlp_compute_add_bypass(activation, atol):
     """Fresh MLP Add: W = [I; I] over the concatenated sources into zeroed
     fresh columns.
@@ -2244,7 +2244,7 @@ def test_mlp_compute_add_bypass_folds_biased_source():
     W·x + b even though the residual holds only W·x.
     """
     rmap = ResidualStreamMap(D)
-    x, lin = _biased_linear_missing_its_bias(rmap, "lin")
+    _x, lin = _biased_linear_missing_its_bias(rmap, "lin")
     other = InputNode("other", 3, value_range=(-100.0, 100.0))
     rmap.allocate(other)
     add_node = Add(lin, other)
@@ -2277,7 +2277,7 @@ def test_mlp_add_into_bypass_folds_biased_live_source():
     bias into the Add delta.
     """
     rmap = ResidualStreamMap(D)
-    x, lin = _biased_linear_missing_its_bias(rmap, "lin")
+    _x, lin = _biased_linear_missing_its_bias(rmap, "lin")
     dead = InputNode("dead", 3, value_range=(-100.0, 100.0))
     dead_cols = rmap.allocate(dead)
     add_node = Add(dead, lin)
@@ -2312,7 +2312,7 @@ def test_mlp_add_into_bypass_biased_reused_target_applies_bias_once():
     occurrence-based, not node-based.
     """
     rmap = ResidualStreamMap(D)
-    x, lin = _biased_linear_missing_its_bias(rmap, "lin")
+    _x, lin = _biased_linear_missing_its_bias(rmap, "lin")
     live = InputNode("live", 3, value_range=(-100.0, 100.0))
     rmap.allocate(live)
     add_node = Add(lin, live)
@@ -2354,7 +2354,7 @@ def test_mlp_add_into_bypass_biased_self_add():
     though both occurrences name the same node.
     """
     rmap = ResidualStreamMap(D)
-    x, lin = _biased_linear_missing_its_bias(rmap, "lin")
+    _x, lin = _biased_linear_missing_its_bias(rmap, "lin")
     add_node = Add(lin, lin)
 
     lin_cols = list(rmap.get_indices(lin))
@@ -2391,8 +2391,8 @@ def test_mlp_compute_add_bypass_two_biased_sources():
     occurrence's bias folds exactly once.
     """
     rmap = ResidualStreamMap(D)
-    xa, lin_a = _biased_linear_missing_its_bias(rmap, "lin_a")
-    xb, lin_b = _biased_linear_missing_its_bias(rmap, "lin_b")
+    _xa, lin_a = _biased_linear_missing_its_bias(rmap, "lin_a")
+    _xb, lin_b = _biased_linear_missing_its_bias(rmap, "lin_b")
     add_node = Add(lin_a, lin_b)
     out_cols = rmap.allocate(add_node)
 

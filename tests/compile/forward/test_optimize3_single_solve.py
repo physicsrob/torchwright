@@ -133,7 +133,7 @@ def test_optimize3_is_one_solve_with_the_full_budget_and_the_mech_hint(
     5x600 s on the d=8192 production fixture (cpsat_pinned_cancel_plan.md
     step 2, batch 1) — the solver, not the compile, is where the
     cancel-LAYER values get dropped.  (``_solve_only`` returns before the
-    replay, so the fake schedule is never executed.)
+    replay, so the fake schedule is never executed.).
     """
     calls = []
 

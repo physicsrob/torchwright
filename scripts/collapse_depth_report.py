@@ -39,11 +39,14 @@ import argparse
 import importlib
 import json
 import time
+from typing import TYPE_CHECKING
 
 from scripts.measure_fusion_opportunities import _EXAMPLES
 from torchwright.compiler.export import compile_headless
 from torchwright.compiler.lower import lower
-from torchwright.graph import Node
+
+if TYPE_CHECKING:
+    from torchwright.graph import Node
 
 
 def _build_example(mod_name: str) -> tuple[Node, int, int]:

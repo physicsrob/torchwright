@@ -140,7 +140,7 @@ def test_default_build_is_pinned(name):
     really posted.
     """
     node, d, d_head = _build(name)
-    cfg = dict(d=d, d_head=d_head, d_hidden=d, max_layers=_MAX_LAYERS)
+    cfg = {"d": d, "d_head": d_head, "d_hidden": d, "max_layers": _MAX_LAYERS}
     default = _proto_text(build_cpsat_model(node, **cfg))
     on = _proto_text(build_cpsat_model(node, _pin_cancels=True, **cfg))
     assert default == on, f"{name}: default proto differs from pinned build"
@@ -159,7 +159,7 @@ def test_knob_off_reproduces_legacy_model(name):
     build gets its ``parked`` var + upper window back and loses the pins.
     """
     node, d, d_head = _build(name)
-    cfg = dict(d=d, d_head=d_head, d_hidden=d, max_layers=_MAX_LAYERS)
+    cfg = {"d": d, "d_head": d_head, "d_hidden": d, "max_layers": _MAX_LAYERS}
     default = _proto_text(build_cpsat_model(node, **cfg))
     off = _proto_text(build_cpsat_model(node, _pin_cancels=False, **cfg))
     assert off != default, f"{name}: knob-off proto identical to default"
@@ -184,18 +184,18 @@ _SOLVE_CELLS = [
 
 
 def _solve_cfg(d, d_head):
-    return dict(
-        d=d,
-        d_head=d_head,
-        d_hidden=d,
-        max_layers=100,
-        time_budget_s=60.0,
-        policy=SchedulingPolicy(),
-        tighten_domains=True,
-    )
+    return {
+        "d": d,
+        "d_head": d_head,
+        "d_hidden": d,
+        "max_layers": 100,
+        "time_budget_s": 60.0,
+        "policy": SchedulingPolicy(),
+        "tighten_domains": True,
+    }
 
 
-@pytest.mark.parametrize("name,d", _SOLVE_CELLS)
+@pytest.mark.parametrize(("name", "d"), _SOLVE_CELLS)
 def test_pinned_solution_valid_in_unpinned_model(name, d):
     """Solve the pinned model, then hard-fix its full decision assignment into
     the UNPINNED legacy model and re-solve: feasibility there proves the pin
@@ -242,7 +242,7 @@ def test_pinned_solution_valid_in_unpinned_model(name, d):
     assert solver.Value(built.n_layers_var) == asg.n_layers
 
 
-@pytest.mark.parametrize("name,d", _SOLVE_CELLS)
+@pytest.mark.parametrize(("name", "d"), _SOLVE_CELLS)
 def test_pinned_optimum_no_shallower_than_unpinned(name, d):
     """A restriction can never beat the model it restricts: when both solves
     prove optimality, pinned depth >= unpinned depth.
@@ -289,7 +289,7 @@ def test_pin_reaches_snapshot_path():
 
     node, d, d_head = _build("fibonacci")
     problem = snapshot_from_graph_model(build_graph_model(node))
-    cfg = dict(d=d, d_head=d_head, d_hidden=d, max_layers=_MAX_LAYERS)
+    cfg = {"d": d, "d_head": d_head, "d_hidden": d, "max_layers": _MAX_LAYERS}
     snap_default = _proto_text(build_model_from_snapshot(problem, **cfg))
     snap_off = _proto_text(
         build_model_from_snapshot(problem, _pin_cancels=False, **cfg)

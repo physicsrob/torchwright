@@ -1,4 +1,4 @@
-"""Autoregressive Fibonacci generator.
+r"""Autoregressive Fibonacci generator.
 
 After a trigger token, generates Fibonacci numbers autoregressively.
 Each number is emitted as a fixed-width block of W digit tokens (zero-padded),
@@ -62,11 +62,7 @@ def create_network_parts(
             Determines the maximum representable value (10^digit_width - 1).
         n_terms: Number of Fibonacci terms to generate (including the two seeds).
     """
-    vocab = list("0123456789 abcdefghijklmnopqrstuvwxyz") + [
-        "\n",
-        "<bos>",
-        "<eos>",
-    ]
+    vocab = [*list("0123456789 abcdefghijklmnopqrstuvwxyz"), "\n", "<bos>", "<eos>"]
     embedding = create_embedding(vocab=vocab)
     rope = create_rope_config(d_head=D_HEAD, max_positions=MAX_POSITIONS)
     embed = embedding.get_embedding

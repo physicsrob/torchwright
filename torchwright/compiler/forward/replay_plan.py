@@ -53,7 +53,9 @@ def _freeze_node_indices(value, field_name: str, *, sort: bool) -> "NodeIndices"
     return tuple(frozen)
 
 
-def _check_reuse_input_index(op_type: str, index, reuse_op_types: tuple[str, ...]):
+def _check_reuse_input_index(
+    op_type: str, index, reuse_op_types: tuple[str, ...]
+) -> None:
     """A reuse operation carries exactly one valid target-occurrence index
     (0 or 1); every fresh or unrelated operation carries None.  The index is
     occurrence-level, not node-level — for ``add(x, x)`` both addends name

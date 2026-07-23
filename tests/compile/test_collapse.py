@@ -137,8 +137,10 @@ def test_kept_depth1_boundary_member():
     m1_copy = lowered.copy_of(m1)
     m2_copy = lowered.copy_of(m2)
     live = get_ancestor_nodes({lowered.output_node})
-    assert m1_copy in live and not m1_copy.name.startswith("collapse_")
-    assert m2_copy in live and m2_copy.name.startswith("collapse_")
+    assert m1_copy in live
+    assert not m1_copy.name.startswith("collapse_")
+    assert m2_copy in live
+    assert m2_copy.name.startswith("collapse_")
 
 
 def test_interior_member_value_ceases_to_exist():

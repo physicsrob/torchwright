@@ -41,7 +41,7 @@ def _eval(node, v: float) -> float:
 
 
 def test_exact_on_integers_and_flat_zones():
-    x, f = _native()
+    _x, f = _native()
     for v in (-1023.0, -1022.0, -513.0, -1.0, 0.0, 1.0, 512.0, 1023.0):
         assert abs(_eval(f, v) - v) < 1e-3, f"floor({v}) drifted: {_eval(f, v)}"
     for v in (-1022.6, -1000.4, -0.5, 0.7, 127.9, 500.25, 1022.4):
@@ -54,7 +54,7 @@ def test_divisor_boundary_sliver_reconstructs_exactly():
     too — a fractional hi would be amplified x64 by the recombine, so
     this pins the snap + extended-lo compensation.
     """
-    x, f = _native()
+    _x, f = _native()
     for m in (-512, -64, 64, 512, 896):
         for delta in (1e-4 + 1e-6, 5e-4, 1e-3, 5e-3):
             v = float(m) - delta
@@ -70,7 +70,7 @@ def test_lo_ramp_stays_within_one_step():
     fractional — the same tolerated window as flat floor_int.  The pin:
     it stays inside (true, true+1), never D-amplified.
     """
-    x, f = _native()
+    _x, f = _native()
     for k in (-512, -100, 0, 64, 1000):
         for frac in (0.2, 0.5, 0.9):
             v = float(k) - frac / NATIVE_S
@@ -106,7 +106,7 @@ def test_lane_cost_is_sqrtn_class():
     from torchwright.compiler.utils import get_ancestor_nodes
     from torchwright.graph import FFN
 
-    x, f = _native()
+    _x, f = _native()
     n = NATIVE_HI - NATIVE_LO
     ffns = [nd for nd in get_ancestor_nodes({f}) if isinstance(nd, FFN)]
     lanes = sum(nd.n_lanes for nd in ffns)

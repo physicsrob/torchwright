@@ -451,7 +451,7 @@ def rotary_recency_head(
     # rotate_half partner (p + half) left zero so the planes do not mix.
     q_rec = torch.zeros((1, d_head))
     k_rec = torch.zeros((1, d_head))
-    for p, a in zip(planes, amps):
+    for p, a in zip(planes, amps, strict=False):
         q_rec[0, p] = recency_gain * float(a)
         k_rec[0, p] = 1.0
 

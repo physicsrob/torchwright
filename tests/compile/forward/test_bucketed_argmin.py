@@ -53,10 +53,9 @@ def _build(nb, nt, value_width, *, prefix, d_head):
     qb = InputNode(f"{prefix}_qb", nb, value_range=(-2.0, 2.0))
     th = InputNode(f"{prefix}_th", nt, value_range=(-2.0, 2.0))
     value = InputNode(f"{prefix}_value", value_width, value_range=(-100.0, 100.0))
-    out = attend_argmin_above_in_bucket(
+    return attend_argmin_above_in_bucket(
         _rope(d_head), score, validity, kb, above, qb, th, value
     )
-    return out
 
 
 def test_baib_adjacent_score_recovered_compiled():
@@ -73,15 +72,15 @@ def test_baib_adjacent_score_recovered_compiled():
     n_pos = 2
     scores = [6, 5]  # adjacent; row 1 is the lower score
     thresholds = [0, 1, 2, 3, 4]
-    inputs = dict(
-        adj_score=torch.tensor([[float(s)] for s in scores]),
-        adj_validity=torch.tensor([[1.0], [1.0]]),
-        adj_kb=_onehot_rows([1, 1], nb),
-        adj_above=_above_table(scores, thresholds),
-        adj_qb=_onehot_rows([1, 1], nb),
-        adj_th=_onehot_rows([2, 2], nt),  # threshold > 2; both 5 and 6 above
-        adj_value=torch.eye(n_pos, vw),
-    )
+    inputs = {
+        "adj_score": torch.tensor([[float(s)] for s in scores]),
+        "adj_validity": torch.tensor([[1.0], [1.0]]),
+        "adj_kb": _onehot_rows([1, 1], nb),
+        "adj_above": _above_table(scores, thresholds),
+        "adj_qb": _onehot_rows([1, 1], nb),
+        "adj_th": _onehot_rows([2, 2], nt),  # threshold > 2; both 5 and 6 above
+        "adj_value": torch.eye(n_pos, vw),
+    }
     # Oracle: at q1 both rows match; smallest score is row 1 (5).
     oracle = reference_eval(out, inputs, n_pos)[out]
     assert torch.allclose(oracle[1], inputs["adj_value"][1], atol=1e-2), oracle[1]
@@ -110,15 +109,15 @@ def test_baib_wide_value_splits_over_heads_compiled():
     value_in[0, 7] = 9.0  # winner payload in head 0 (cols 0..15)
     value_in[0, 18] = 7.0  # winner ALSO carries a payload in a head-1 column
     value_in[1, 18] = 4.0  # loser's head-1 payload must be suppressed
-    inputs = dict(
-        wide_score=torch.tensor([[float(s)] for s in scores]),
-        wide_validity=torch.tensor([[1.0], [1.0]]),
-        wide_kb=_onehot_rows([1, 1], nb),
-        wide_above=_above_table(scores, thresholds),
-        wide_qb=_onehot_rows([1, 1], nb),
-        wide_th=_onehot_rows([0, 0], nt),  # threshold > 0
-        wide_value=value_in,
-    )
+    inputs = {
+        "wide_score": torch.tensor([[float(s)] for s in scores]),
+        "wide_validity": torch.tensor([[1.0], [1.0]]),
+        "wide_kb": _onehot_rows([1, 1], nb),
+        "wide_above": _above_table(scores, thresholds),
+        "wide_qb": _onehot_rows([1, 1], nb),
+        "wide_th": _onehot_rows([0, 0], nt),  # threshold > 0
+        "wide_value": value_in,
+    }
     # q1: smallest score is row 0 (5) -> its payload (9.0 at col 7 in head 0,
     # 7.0 at col 18 in head 1); head 1 must pass 7.0 through AND suppress the
     # loser's 4.0 at the same col 18.
@@ -144,15 +143,15 @@ def test_baib_all_invalid_compiled_is_finite():
     n_pos = 3
     scores = [2, 3, 4]
     thresholds = [0, 1, 2]
-    inputs = dict(
-        inv_score=torch.tensor([[float(s)] for s in scores]),
-        inv_validity=torch.tensor([[-1.0], [-1.0], [-1.0]]),
-        inv_kb=_onehot_rows([1, 1, 1], nb),
-        inv_above=_above_table(scores, thresholds),
-        inv_qb=_onehot_rows([1, 1, 1], nb),
-        inv_th=_onehot_rows([0, 0, 0], nt),
-        inv_value=torch.eye(n_pos, vw),
-    )
+    inputs = {
+        "inv_score": torch.tensor([[float(s)] for s in scores]),
+        "inv_validity": torch.tensor([[-1.0], [-1.0], [-1.0]]),
+        "inv_kb": _onehot_rows([1, 1, 1], nb),
+        "inv_above": _above_table(scores, thresholds),
+        "inv_qb": _onehot_rows([1, 1, 1], nb),
+        "inv_th": _onehot_rows([0, 0, 0], nt),
+        "inv_value": torch.eye(n_pos, vw),
+    }
     oracle = reference_eval(out, inputs, n_pos)[out]
     assert torch.isfinite(oracle).all(), oracle
     report = probe_graph(
@@ -175,15 +174,15 @@ def test_baib_self_row_only_compiled_is_finite():
     n_pos = 1
     scores = [3]
     thresholds = [0, 1, 2]
-    inputs = dict(
-        self_score=torch.tensor([[3.0]]),
-        self_validity=torch.tensor([[1.0]]),
-        self_kb=_onehot_rows([1], nb),
-        self_above=_above_table(scores, thresholds),
-        self_qb=_onehot_rows([1], nb),
-        self_th=_onehot_rows([0], nt),
-        self_value=torch.eye(n_pos, vw),
-    )
+    inputs = {
+        "self_score": torch.tensor([[3.0]]),
+        "self_validity": torch.tensor([[1.0]]),
+        "self_kb": _onehot_rows([1], nb),
+        "self_above": _above_table(scores, thresholds),
+        "self_qb": _onehot_rows([1], nb),
+        "self_th": _onehot_rows([0], nt),
+        "self_value": torch.eye(n_pos, vw),
+    }
     oracle = reference_eval(out, inputs, n_pos)[out]
     assert torch.isfinite(oracle).all(), oracle
     report = probe_graph(

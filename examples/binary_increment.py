@@ -1,4 +1,4 @@
-"""Binary increment.
+r"""Binary increment.
 
 Parses a binary string like "1011\\n" and outputs the incremented value
 "1100". Handles carry propagation through consecutive trailing 1s
@@ -48,7 +48,7 @@ def create_network_parts(
         max_bits: Maximum number of input bits (handles up to max_bits-bit
             binary numbers). Output may be max_bits+1 bits on overflow.
     """
-    vocab = list("01 ") + ["\n", "<bos>", "<eos>"]
+    vocab = [*list("01 "), "\n", "<bos>", "<eos>"]
     embedding = create_embedding(vocab=vocab)
     rope = create_rope_config(d_head=D_HEAD, max_positions=MAX_POSITIONS)
     embed = embedding.get_embedding
@@ -92,7 +92,7 @@ def create_network_parts(
     overflow_bit = select(carry[max_bits], one_embed, zero_embed)
 
     # --- Build output (MSB first) ---
-    output_seq = [overflow_bit] + list(reversed(new_bits)) + [eos_embed]
+    output_seq = [overflow_bit, *list(reversed(new_bits)), eos_embed]
     output_seq = remove_leading_0s(embedding, output_seq, max_removals=max_bits)
 
     output_node = output_sequence(

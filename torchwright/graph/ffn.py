@@ -71,7 +71,7 @@ class FFN(Node):
         up_bias: torch.Tensor | None = None,
         activation: str = "relu",
         name: str = "",
-    ):
+    ) -> None:
         if activation not in ("relu", "swish"):
             raise ValueError(
                 f"FFN activation must be 'relu' or 'swish', got {activation!r}"

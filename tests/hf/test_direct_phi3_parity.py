@@ -64,7 +64,7 @@ def direct_model(artifact_path):
 
 def _prefill_ids(oracle):
     tok2id = {t: i for i, t in enumerate(oracle.vocab)}
-    return [tok2id[t] for t in ([_BOS] + list(_PREFILL_TEXT))]
+    return [tok2id[t] for t in ([_BOS, *list(_PREFILL_TEXT)])]
 
 
 def test_custom_config_rejects_explicit_untied():
@@ -73,7 +73,7 @@ def test_custom_config_rejects_explicit_untied():
     silently overridden — HF's tie_weights() would otherwise clone the
     embedding over a checkpoint's real lm_head and return wrong logits with
     no error.  (The stock Phi3 target ties through its ordinary
-    tie_word_embeddings flag instead — no custom guard needed there.)
+    tie_word_embeddings flag instead — no custom guard needed there.).
     """
     from torchwright.compiler.hf.configuration_torchwright_custom import (
         TorchwrightCustomConfig,
@@ -147,7 +147,7 @@ def test_prefill_and_decode_bit_exact(direct_model):
     prefill = _prefill_ids(oracle)
     o_ids, o_logits = oracle_decode(oracle, prefill, _N_STEPS)
     h_logits = hf_teacher_forced(model, prefill, o_ids)
-    for i, (o, h) in enumerate(zip(o_logits, h_logits)):
+    for i, (o, h) in enumerate(zip(o_logits, h_logits, strict=False)):
         normal = o.abs() >= 1e-30  # exclude the denormal cancel-head noise floor
         assert torch.equal(o[normal], h[normal]), f"row {i}: normal logits diverged"
         # Where the row carries real signal, both backends decode the same token.
@@ -170,7 +170,8 @@ def test_bare_forward_without_use_cache(direct_model):
     prefill = _prefill_ids(oracle)
     with torch.no_grad():
         out = model(input_ids=torch.tensor([prefill]))
-    assert out.logits.shape[0] == 1 and out.logits.shape[1] == len(prefill)
+    assert out.logits.shape[0] == 1
+    assert out.logits.shape[1] == len(prefill)
     assert torch.isfinite(out.logits).all()
 
 
@@ -180,7 +181,8 @@ def test_labels_loss_path(direct_model):
     ids = torch.tensor([_prefill_ids(oracle)])
     with torch.no_grad():
         out = model(input_ids=ids, labels=ids)
-    assert out.loss is not None and out.loss.ndim == 0
+    assert out.loss is not None
+    assert out.loss.ndim == 0
     assert torch.isfinite(out.loss)
 
 
@@ -195,7 +197,7 @@ def test_inputs_embeds_supported(direct_model):
 
 
 def test_compiler_returns_fp32(direct_model):
-    model, oracle = direct_model
+    model, _oracle = direct_model
     assert {p.dtype for p in model.parameters()} == {torch.float32}
 
 

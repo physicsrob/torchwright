@@ -5,7 +5,7 @@ from torchwright.graph.value_type import NodeValueType
 
 
 class ReLU(Node):
-    def __init__(self, input_node: Node, name: str = ""):
+    def __init__(self, input_node: Node, name: str = "") -> None:
         super().__init__(len(input_node), [input_node], name=name)
 
     def compute(self, n_pos: int, input_values: dict) -> torch.Tensor:

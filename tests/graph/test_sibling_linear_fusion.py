@@ -87,7 +87,7 @@ def _lanes(x, w: torch.Tensor, tag: str = "lane") -> list:
 def _consumer(node, n: int):
     """An ``FFN`` consumer.  (DOOM's real consumer is an ``Attn`` — see
     ``_build_split_attn``, which isolates the sibling merge without the FFN's
-    confounding ``Linear -> FFN`` gate fold.)
+    confounding ``Linear -> FFN`` gate fold.).
 
     It must not be a ``Linear``: then ``_fold_through_concatenate`` also fires
     and there is nothing to attribute to the sibling merge.  A hand-built

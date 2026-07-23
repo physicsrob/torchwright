@@ -13,7 +13,7 @@ class TransformerLayer:
         d_hidden: int | None = None,
         activation: str = "relu",
         n_heads: int | None = None,
-    ):
+    ) -> None:
         # The machine kind is uniform per network (all-ReLU or all-swish);
         # the compiler selects it from the graph's FFN nodes and threads it
         # here via HeadlessTransformer.add_layer.

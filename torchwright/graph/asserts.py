@@ -426,7 +426,7 @@ def assert_unique_values(
     def predicate(x: torch.Tensor) -> tuple:
         if x.ndim != 2:
             return False, f"expected 2D (n_pos, d); got shape {tuple(x.shape)}"
-        n_pos, d = x.shape
+        _n_pos, d = x.shape
         if d < 2:
             return True, ""
         # Pairwise absolute differences within each row.
@@ -555,10 +555,7 @@ def assert_score_gap_at_least(
     def predicate(x: torch.Tensor) -> tuple:
         val = x[:, :d_value]
         valid = x[:, d_value : d_value + d_where]
-        if d_where == 1:
-            mask = valid.squeeze(-1) > 0.5
-        else:
-            mask = (valid > 0.5).any(dim=-1)
+        mask = valid.squeeze(-1) > 0.5 if d_where == 1 else (valid > 0.5).any(dim=-1)
         rows = val[mask]
         if rows.shape[0] < 2:
             return True, ""
@@ -638,10 +635,7 @@ def assert_picked_from(
         res = x[:, :d_r]
         vals = x[:, d_r : d_r + d_v]
         keys_t = x[:, d_r + d_v : d_r + d_v + d_k]
-        if d_k == 1:
-            mask = keys_t.squeeze(-1) > 0.5
-        else:
-            mask = (keys_t > 0.5).any(dim=-1)
+        mask = keys_t.squeeze(-1) > 0.5 if d_k == 1 else (keys_t > 0.5).any(dim=-1)
         n_pos = res.shape[0]
         valid_idxs = mask.nonzero(as_tuple=False).squeeze(-1)
         if valid_idxs.numel() == 0:

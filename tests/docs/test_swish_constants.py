@@ -241,7 +241,7 @@ def test_gated_select_winning_branch_bit_exact():
     factors are powers of two, so neither product rounds.  (At scale=100
     this carried up to 1 fp32 ulp relative rounding, the recorded
     regression versus the approximate=False path; the power-of-two scale
-    erases it.)
+    erases it.).
     """
     t = torch.linspace(-5000, 5000, 100_001, dtype=torch.float32)
     gate = _swish(torch.tensor(SCALE, dtype=torch.float32))  # Swish(128) = 128.0
@@ -362,12 +362,12 @@ def test_onehot_lookup_counting_margin():
 
     def lookup(x):
         out = default.clone()
-        for k, v in zip(keys, vals):
+        for k, v in zip(keys, vals, strict=False):
             lane = _swish(SCALE * (x @ k - 1.5))  # bias -(n_blocks - 0.5)
             out = out + lane * (2.0 * (v - default) / SCALE)
         return out
 
-    for k, v in zip(keys, vals):
+    for k, v in zip(keys, vals, strict=False):
         assert (lookup(k) - v).abs().max().item() <= 1e-3  # ~ulp(1000)
     miss = torch.zeros(8)
     miss[3] = 1.0
@@ -409,7 +409,8 @@ def test_scalar_to_embedding_staircase():
     assert (s2e(0.55, dtype=torch.float64) - want).abs().max().item() <= 1e-9
     # spacing: pair hinges 1/S apart, fillet radius 17/(scale*S) --
     # fillets never overlap iff 34/(scale*S) < 1/S, i.e. scale > 34
-    assert 34.0 / (SCALE * S) < 1.0 / S and SCALE > 34.0
+    assert 34.0 / (SCALE * S) < 1.0 / S
+    assert SCALE > 34.0
 
 
 def test_hinge_fillet_width():

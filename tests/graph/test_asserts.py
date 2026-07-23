@@ -52,7 +52,7 @@ def _eval(node, inputs: dict, n_pos: int = 1) -> torch.Tensor:
 
 
 @pytest.mark.parametrize(
-    "values,should_raise",
+    ("values", "should_raise"),
     [
         ([-0.5, 0.0, 0.9], False),
         ([-0.5, 0.0, 2.5], True),
@@ -77,7 +77,7 @@ def test_assert_in_range(values, should_raise):
 
 
 @pytest.mark.parametrize(
-    "values,should_raise",
+    ("values", "should_raise"),
     [
         ([1.0, -1.0, 1.0, -1.0], False),
         ([1.0, 0.0, -1.0], True),
@@ -101,7 +101,7 @@ def test_assert_bool(values, should_raise):
 
 
 @pytest.mark.parametrize(
-    "values,should_raise",
+    ("values", "should_raise"),
     [
         ([0.0, 1.0, 0.0, 1.0], False),
         ([0.0, 0.5, 1.0], True),
@@ -125,7 +125,7 @@ def test_assert_01(values, should_raise):
 
 
 @pytest.mark.parametrize(
-    "values,should_raise,match",
+    ("values", "should_raise", "match"),
     [
         ([0.0, 1.0, 0.0, 0.0], False, None),
         ([1.0, 1.0, 0.0, 0.0], True, r"not one-hot"),
@@ -200,7 +200,7 @@ def test_assert_strictly_less_rejects_equal_at_zero_margin():
 
 
 @pytest.mark.parametrize(
-    "values,should_raise",
+    ("values", "should_raise"),
     [
         ([0.0, 1.0, 2.0, 3.0], False),
         ([0.0, 1.0, 1.2], True),  # 1.0 ≈ 1.2 at margin 0.5
@@ -726,7 +726,7 @@ def test_format_bad_multidim_reports_true_positions():
     tensor and pair with the actual offending values. (Regression: a
     multi-dim nonzero returns coordinate rows; flattening those produced
     coordinates misread as flat indices, pairing wrong values with wrong
-    positions.)
+    positions.).
     """
     from torchwright.graph.asserts import _format_bad
 

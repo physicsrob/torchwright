@@ -289,7 +289,7 @@ class OnnxTokenModule:
         (RoPE recency is now the intrinsic local rotary lobe — there is no
         injected ``<ref>`` reference token; ``docs/rope_port_plan.md`` Phase 6.)
         """
-        tokens = [bos_token] + list(input_text)
+        tokens = [bos_token, *list(input_text)]
         ids = torch.tensor([self.token_to_id(t) for t in tokens], dtype=torch.int64)
 
         logits, past = self.step(ids, self.empty_past())

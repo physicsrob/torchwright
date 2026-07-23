@@ -106,7 +106,7 @@ def path_off():
 
 def _last_logits(oracle, vocab, text):
     t2i = {t: i for i, t in enumerate(vocab)}
-    ids = torch.tensor([t2i[t] for t in ([_BOS] + list(text))], dtype=torch.int64)
+    ids = torch.tensor([t2i[t] for t in ([_BOS, *list(text)])], dtype=torch.int64)
     return oracle(ids)[-1]
 
 
@@ -164,7 +164,7 @@ def test_norm_off_model_has_no_norm_params(path_off):
 # logits through real onnxruntime execution.
 # ===========================================================================
 
-_TINY_VOCAB = list("0123456789+") + ["\n", _BOS, _EOS, "default"]
+_TINY_VOCAB = [*list("0123456789+"), "\n", _BOS, _EOS, "default"]
 _TINY_TOKENS = [_BOS, "1", "+", "2", "\n"]
 
 

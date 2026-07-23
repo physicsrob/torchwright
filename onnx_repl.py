@@ -9,7 +9,7 @@ import argparse
 from torchwright.compiler.repl import run_repl
 
 
-def main():
+def main() -> None:
     parser = argparse.ArgumentParser(
         description="Interactive REPL for a compiled ONNX model"
     )

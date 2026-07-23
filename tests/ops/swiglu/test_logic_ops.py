@@ -181,10 +181,10 @@ def test_bool_not_truth_table():
 
 
 @pytest.mark.parametrize(
-    "op,ref",
+    ("op", "ref"),
     [
-        (bool_any_true, lambda a, b, c: max(a, b, c)),
-        (bool_all_true, lambda a, b, c: min(a, b, c)),
+        (bool_any_true, max),
+        (bool_all_true, min),
     ],
 )
 def test_bool_any_all_truth_tables(op, ref):

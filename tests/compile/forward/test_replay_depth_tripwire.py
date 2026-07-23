@@ -54,8 +54,7 @@ def _build_width_graph():
         li = Linear(x, torch.randn(4, 12), torch.zeros(12), name=f"L{i}")
         mids.append(Linear(li, torch.randn(12, 2), torch.zeros(2), name=f"Ma{i}"))
         mids.append(Linear(li, torch.randn(12, 2), torch.zeros(2), name=f"Mb{i}"))
-    out = Linear(Concatenate(mids), torch.randn(24, 4), torch.zeros(4), name="out")
-    return out
+    return Linear(Concatenate(mids), torch.randn(24, 4), torch.zeros(4), name="out")
 
 
 def test_tripwire_silent_on_faithful_replay():

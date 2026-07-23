@@ -223,7 +223,7 @@ def test_zero_support_flex_linear_solves_and_matches():
 # Snapshot: geometry-free support runs roundtrip; legacy records fall back
 # ---------------------------------------------------------------------------
 
-_CFG = dict(d=192, d_head=D_HEAD, d_hidden=192, max_layers=12)
+_CFG = {"d": 192, "d_head": D_HEAD, "d_hidden": 192, "max_layers": 12}
 
 
 def _sparse_graph():
@@ -275,14 +275,14 @@ def test_fingerprint_sees_sparsity():
     under-book heads in one direction.  The fingerprint must separate them
     — and must stay stable across rebuilds of the same graph.
     """
-    kw = dict(
-        d=192,
-        d_head=D_HEAD,
-        d_hidden=192,
-        flex_routing=True,
-        cancel_slack=2,
-        policy=None,
-    )
+    kw = {
+        "d": 192,
+        "d_head": D_HEAD,
+        "d_hidden": 192,
+        "flex_routing": True,
+        "cancel_slack": 2,
+        "policy": None,
+    }
 
     def build(sparse: bool):
         x = create_input("x", 40, value_range=(-1.0, 1.0))

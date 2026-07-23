@@ -186,7 +186,7 @@ def test_autoregressive(items):
     )
 
     expected_cols = _expected_sequence(items)
-    N = len(items)
+    len(items)
 
     past = compiled.empty_past()
     step_idx = 0
@@ -216,7 +216,7 @@ def test_autoregressive(items):
     idx_done = out_done_flag()
 
     max_steps = len(expected_cols) + 5  # generous upper bound
-    for k in range(max_steps):
+    for _k in range(max_steps):
         row = _build_step_row(
             compiled,
             E8_PRINT,

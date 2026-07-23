@@ -93,8 +93,10 @@ def test_pl_vector_fn_and_range_slack():
     # Range claim: knot hull ± windowed stacked dip. Breakpoints 1.0
     # apart >> 34/K, so the slack is the single worst windowed sum.
     r = out.value_type.value_range
-    assert r.lo < -4.0 and r.lo > -4.1  # -4 minus small slack
-    assert r.hi > 2.0 and r.hi < 2.1
+    assert r.lo < -4.0
+    assert r.lo > -4.1
+    assert r.hi > 2.0
+    assert r.hi < 2.1
 
 
 def test_pl_chunking_matches_single_ffn():

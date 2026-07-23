@@ -102,7 +102,7 @@ def test_schedule_attn_node():
     computed = {pos, v}
 
     scheduler = LayerScheduler(graph, D, D_HEAD, pos)
-    attn_ops, mlp_ops, _biased = scheduler.schedule_layer(rmap, computed)
+    attn_ops, _mlp_ops, _biased = scheduler.schedule_layer(rmap, computed)
 
     compute_attn = [op for op in attn_ops if op.op_type == "compute_attn"]
     assert len(compute_attn) == 1
@@ -123,7 +123,7 @@ def test_schedule_block():
     computed = {pos, x}
 
     scheduler = LayerScheduler(graph, D, D_HEAD, pos)
-    attn_ops, mlp_ops, _biased = scheduler.schedule_layer(rmap, computed)
+    _attn_ops, mlp_ops, _biased = scheduler.schedule_layer(rmap, computed)
 
     ffn_ops = [op for op in mlp_ops if op.op_type == "compute_ffn"]
     assert len(ffn_ops) == 1
@@ -148,7 +148,7 @@ def test_schedule_constant():
     computed = {pos}
 
     scheduler = LayerScheduler(graph, D, D_HEAD, pos)
-    attn_ops, mlp_ops, _biased = scheduler.schedule_layer(rmap, computed)
+    _attn_ops, mlp_ops, _biased = scheduler.schedule_layer(rmap, computed)
 
     const_ops = [op for op in mlp_ops if op.op_type == "compute_literal_value"]
     assert len(const_ops) == 1
@@ -170,7 +170,7 @@ def test_schedule_zero_bias_linear():
     computed = {pos, x}
 
     scheduler = LayerScheduler(graph, D, D_HEAD, pos, policy=LEGACY_POLICY)
-    attn_ops, mlp_ops, _biased = scheduler.schedule_layer(rmap, computed)
+    attn_ops, _mlp_ops, _biased = scheduler.schedule_layer(rmap, computed)
 
     linear_ops = [op for op in attn_ops if op.op_type == "compute_linear"]
     assert len(linear_ops) == 1
@@ -267,7 +267,7 @@ def test_schedule_large_input_linear():
     computed = {pos} | set(inputs)
 
     scheduler = LayerScheduler(graph, D, D_HEAD, pos, policy=LEGACY_POLICY)
-    attn_ops, mlp_ops, _biased = scheduler.schedule_layer(rmap, computed)
+    attn_ops, _mlp_ops, _biased = scheduler.schedule_layer(rmap, computed)
 
     linear_ops = [op for op in attn_ops if op.op_type == "compute_linear"]
     assert any(op.node is linear for op in linear_ops)
@@ -310,7 +310,7 @@ def test_schedule_biased_linear_bypass():
     computed = {pos, x}
 
     scheduler = LayerScheduler(graph, D, D_HEAD, pos)
-    attn_ops, mlp_ops, _biased = scheduler.schedule_layer(rmap, computed)
+    _attn_ops, mlp_ops, _biased = scheduler.schedule_layer(rmap, computed)
 
     bypass_ops = [op for op in mlp_ops if op.op_type == "compute_linear_bypass"]
     assert len(bypass_ops) == 1
@@ -338,7 +338,7 @@ def test_schedule_cancellation():
     x_cols = set(rmap.get_indices(x))
 
     scheduler = LayerScheduler(graph, D, D_HEAD, pos)
-    attn_ops, mlp_ops, _biased = scheduler.schedule_layer(rmap, computed)
+    attn_ops, _mlp_ops, _biased = scheduler.schedule_layer(rmap, computed)
 
     cancel_ops = [op for op in attn_ops if op.op_type == "cancel"]
     # Cancels are coalesced into a single operation whose target_cols
@@ -378,7 +378,7 @@ def test_schedule_free_add():
     computed = {pos, dead_node, live_node}
 
     scheduler = LayerScheduler(graph, D, D_HEAD, pos)
-    attn_ops, mlp_ops, _biased = scheduler.schedule_layer(rmap, computed)
+    attn_ops, _mlp_ops, _biased = scheduler.schedule_layer(rmap, computed)
 
     add_ops = [op for op in attn_ops if op.op_type == "add_into"]
     assert len(add_ops) == 1
@@ -416,7 +416,7 @@ def test_schedule_deferred_add_via_compute():
     computed = {pos, a, b}
 
     scheduler = LayerScheduler(graph, d_test, D_HEAD, pos)
-    attn_ops, mlp_ops, _biased = scheduler.schedule_layer(rmap, computed)
+    attn_ops, _mlp_ops, _biased = scheduler.schedule_layer(rmap, computed)
 
     add_ops = [op for op in attn_ops if op.node is add_node and op.op_type != "cancel"]
     assert len(add_ops) == 1
@@ -446,7 +446,7 @@ def test_schedule_add_into_preferred_over_compute_add():
     computed = {pos, a, b}
 
     scheduler = LayerScheduler(graph, D, D_HEAD, pos)
-    attn_ops, mlp_ops, _biased = scheduler.schedule_layer(rmap, computed)
+    attn_ops, _mlp_ops, _biased = scheduler.schedule_layer(rmap, computed)
 
     add_ops = [op for op in attn_ops if op.node is add_node]
     assert len(add_ops) == 1
@@ -471,7 +471,7 @@ def test_schedule_add_both_addends_dead():
     computed = {pos, a, b}
 
     scheduler = LayerScheduler(graph, D, D_HEAD, pos)
-    attn_ops, mlp_ops, _biased = scheduler.schedule_layer(rmap, computed)
+    attn_ops, _mlp_ops, _biased = scheduler.schedule_layer(rmap, computed)
 
     add_ops = [op for op in attn_ops if op.op_type == "add_into"]
     assert len(add_ops) == 1
@@ -500,7 +500,7 @@ def test_head_budget_exhaustion():
     computed = {pos, x}
 
     scheduler = LayerScheduler(graph, D, D_HEAD, pos, policy=LEGACY_POLICY)
-    attn_ops, mlp_ops, _biased = scheduler.schedule_layer(rmap, computed)
+    attn_ops, _mlp_ops, _biased = scheduler.schedule_layer(rmap, computed)
 
     # Should not exceed head budget
     assert len(attn_ops) <= N_HEADS
@@ -527,7 +527,7 @@ def test_mlp_slot_exhaustion():
     computed = {pos, x}
 
     scheduler = LayerScheduler(graph, D, D_HEAD, pos)
-    attn_ops, mlp_ops, _biased = scheduler.schedule_layer(rmap, computed)
+    _attn_ops, mlp_ops, _biased = scheduler.schedule_layer(rmap, computed)
 
     total_slots = sum(
         len(op.mlp_slots) for op in mlp_ops if op.op_type == "compute_ffn"
@@ -790,7 +790,7 @@ def test_add_into_shared_addend_not_reassigned():
     computed = {pos, shared} | set(dead_nodes)
 
     scheduler = LayerScheduler(graph, D, D_HEAD, pos)
-    attn_ops, mlp_ops, _biased = scheduler.schedule_layer(rmap, computed)
+    attn_ops, _mlp_ops, _biased = scheduler.schedule_layer(rmap, computed)
 
     add_into_ops = [op for op in attn_ops if op.op_type == "add_into"]
     assert len(add_into_ops) == 3, f"Expected 3 add_into ops, got {len(add_into_ops)}"
@@ -827,7 +827,7 @@ def test_output_already_computed():
 
     scheduler = LayerScheduler(graph, D, D_HEAD, pos)
     # Should not raise — nothing to do
-    attn_ops, mlp_ops, _biased = scheduler.schedule_layer(rmap, computed)
+    _attn_ops, _mlp_ops, _biased = scheduler.schedule_layer(rmap, computed)
 
 
 def test_within_layer_freeing_surfaces_freshly_dead_intermediate():
@@ -890,7 +890,8 @@ def test_mlp_add_reuses_dead_addend():
     assert op.node is add_node
     assert op.reuse_input_index == 0
     assert op.target_cols == a_cols
-    assert op.mlp_slots and len(op.mlp_slots) == 2 * 4
+    assert op.mlp_slots
+    assert len(op.mlp_slots) == 2 * 4
     # The dead addend's columns now belong to the Add.
     assert rmap.get_indices(add_node) == a_cols
     assert not rmap.is_allocated(a)
@@ -916,15 +917,17 @@ def test_mlp_add_fresh_allocates_columns():
     computed = {pos, a, b}
 
     scheduler = LayerScheduler(graph, D, D_HEAD, pos, policy=MLP_ADD_POLICY)
-    attn_ops, mlp_ops, _biased = scheduler.schedule_layer(rmap, computed)
+    _attn_ops, mlp_ops, _biased = scheduler.schedule_layer(rmap, computed)
 
     add_ops = [op for op in mlp_ops if op.op_type == "compute_add_bypass"]
     assert len(add_ops) == 1
     op = add_ops[0]
     assert op.reuse_input_index is None
-    assert op.source_cols == a_cols and op.source_cols_b == b_cols
+    assert op.source_cols == a_cols
+    assert op.source_cols_b == b_cols
     assert set(op.target_cols).isdisjoint(set(a_cols) | set(b_cols))
-    assert rmap.is_allocated(a) and rmap.is_allocated(b)
+    assert rmap.is_allocated(a)
+    assert rmap.is_allocated(b)
 
 
 def test_mlp_add_both_dead_selects_input0():
@@ -944,7 +947,7 @@ def test_mlp_add_both_dead_selects_input0():
     computed = {pos, a, b}
 
     scheduler = LayerScheduler(graph, D, D_HEAD, pos, policy=MLP_ADD_POLICY)
-    attn_ops, mlp_ops, _biased = scheduler.schedule_layer(rmap, computed)
+    _attn_ops, mlp_ops, _biased = scheduler.schedule_layer(rmap, computed)
 
     add_ops = [op for op in mlp_ops if op.op_type == "add_into_bypass"]
     assert len(add_ops) == 1
@@ -1007,13 +1010,13 @@ def test_mlp_producer_defers_mlp_add_to_next_layer():
     computed = {pos, x, other}
 
     scheduler = LayerScheduler(graph, D, D_HEAD, pos, policy=MLP_ADD_POLICY)
-    attn_ops0, mlp_ops0, _ = scheduler.schedule_layer(rmap, computed)
+    _attn_ops0, mlp_ops0, _ = scheduler.schedule_layer(rmap, computed)
     assert [op for op in mlp_ops0 if op.op_type == "compute_ffn"]
     assert not [
         op for op in mlp_ops0 if op.op_type in ("add_into_bypass", "compute_add_bypass")
     ]
 
-    attn_ops1, mlp_ops1, _ = scheduler.schedule_layer(rmap, computed)
+    _attn_ops1, mlp_ops1, _ = scheduler.schedule_layer(rmap, computed)
     assert [
         op for op in mlp_ops1 if op.op_type in ("add_into_bypass", "compute_add_bypass")
     ]
@@ -1040,9 +1043,10 @@ def test_same_layer_consumer_reusability_is_sublayer_aware():
     rmap.allocate(b)
     computed = {pos, a, b}
     scheduler = LayerScheduler(graph, D, D_HEAD, pos, policy=MLP_ADD_POLICY)
-    attn_ops, mlp_ops, _ = scheduler.schedule_layer(rmap, computed)
+    _attn_ops, mlp_ops, _ = scheduler.schedule_layer(rmap, computed)
     add_ops = [op for op in mlp_ops if op.op_type == "add_into_bypass"]
-    assert len(add_ops) == 1 and add_ops[0].reuse_input_index == 0
+    assert len(add_ops) == 1
+    assert add_ops[0].reuse_input_index == 0
     assert add_ops[0].target_cols == a_cols
 
     # MLP peer: a is NOT reusable (and b is kept live), so the Add is fresh.
@@ -1061,13 +1065,14 @@ def test_same_layer_consumer_reusability_is_sublayer_aware():
     rmap2.allocate(b2)
     computed2 = {pos2, a2, b2}
     scheduler2 = LayerScheduler(graph2, D, D_HEAD, pos2, policy=MLP_ADD_POLICY)
-    attn_ops2, mlp_ops2, _ = scheduler2.schedule_layer(rmap2, computed2)
+    _attn_ops2, mlp_ops2, _ = scheduler2.schedule_layer(rmap2, computed2)
     add_ops2 = [
         op for op in mlp_ops2 if op.op_type in ("add_into_bypass", "compute_add_bypass")
     ]
     assert len(add_ops2) == 1
     assert add_ops2[0].op_type == "compute_add_bypass"
-    assert rmap2.is_allocated(a2) and rmap2.is_allocated(b2)
+    assert rmap2.is_allocated(a2)
+    assert rmap2.is_allocated(b2)
 
 
 def test_mlp_add_slot_exhaustion_defers_without_spilling():
@@ -1124,13 +1129,15 @@ def test_mlp_add_live_source_not_cancelled_same_layer():
     scheduler = LayerScheduler(graph, D, D_HEAD, pos, policy=MLP_ADD_POLICY)
     # Layer 0: lin places (MLP bypass under the default policy).
     scheduler.schedule_layer(rmap, computed)
-    assert lin in computed and rmap.is_allocated(lin)
+    assert lin in computed
+    assert rmap.is_allocated(lin)
     lin_cols = set(rmap.get_indices(lin))
 
     # Layer 1: the Add reuses a's columns and reads lin as the live source.
-    attn_ops, mlp_ops, _ = scheduler.schedule_layer(rmap, computed)
+    _attn_ops, mlp_ops, _ = scheduler.schedule_layer(rmap, computed)
     add_ops = [op for op in mlp_ops if op.op_type == "add_into_bypass"]
-    assert len(add_ops) == 1 and add_ops[0].reuse_input_index == 0
+    assert len(add_ops) == 1
+    assert add_ops[0].reuse_input_index == 0
     cancel_cols = {
         c for op in mlp_ops if op.op_type == "cancel_bypass" for c in op.target_cols
     }

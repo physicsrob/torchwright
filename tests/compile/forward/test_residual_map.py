@@ -87,7 +87,7 @@ def test_hold_bank_is_not_free_and_only_full_ordered_claim_succeeds():
     other = InputNode("other", free_before, value_range=(-10.0, 10.0))
     assert set(rmap.allocate(other)).isdisjoint(bank)
     with pytest.raises(AssertionError, match="complete held bank"):
-        rmap.allocate_at(target, bank[:-1] + [rmap.get_indices(other)[0]])
+        rmap.allocate_at(target, [*bank[:-1], rmap.get_indices(other)[0]])
 
     assert rmap.allocate_at(target, bank) == bank
     assert rmap.get_indices(target) == bank

@@ -47,6 +47,7 @@ import argparse
 import os
 import tempfile
 import time
+from typing import Any
 
 # Cold solves: isolate the schedule cache before torchwright imports read it.
 os.environ["TW_SCHEDULE_CACHE_DIR"] = tempfile.mkdtemp(prefix="tw-add-flip-")
@@ -105,7 +106,7 @@ def _example_specs():
 def _run_config(out, d, d_head, *, optimize, policy, flex):
     captured = {}
 
-    def on_layer(_i, _layer):
+    def on_layer(_i, _layer) -> None:
         pass
 
     on_layer.on_replay_plan = lambda plan: captured.__setitem__("plan", plan)
@@ -123,9 +124,10 @@ def _run_config(out, d, d_head, *, optimize, policy, flex):
             on_layer_compiled=on_layer,
         )
     except Exception as exc:  # noqa: BLE001 - record the failure, keep sweeping
-        return dict(
-            status=f"FAIL:{type(exc).__name__}", wall_s=time.perf_counter() - t0
-        )
+        return {
+            "status": f"FAIL:{type(exc).__name__}",
+            "wall_s": time.perf_counter() - t0,
+        }
     wall = time.perf_counter() - t0
     if optimize == 0:
         origin = "heuristic"
@@ -149,34 +151,34 @@ def _run_config(out, d, d_head, *, optimize, policy, flex):
         add_mlp = sum(types.count(t) for t in _ADD_MLP_OPS)
         heads = plan.total_attention_heads
         slots = plan.total_mlp_bypass_slots
-    return dict(
-        status=origin,
-        wall_s=wall,
-        n_layers=len(net.layers),
-        add_attn_ops=add_attn,
-        add_mlp_ops=add_mlp,
-        emitted_heads=heads,
-        bypass_slots=slots,
-    )
+    return {
+        "status": origin,
+        "wall_s": wall,
+        "n_layers": len(net.layers),
+        "add_attn_ops": add_attn,
+        "add_mlp_ops": add_mlp,
+        "emitted_heads": heads,
+        "bypass_slots": slots,
+    }
 
 
-_CONFIGS = [
-    ("opt0-legacy", dict(optimize=0, policy=LEGACY_POLICY, flex=True)),
-    ("opt0-default", dict(optimize=0, policy=None, flex=True)),
+_CONFIGS: list[tuple[str, dict[str, Any]]] = [
+    ("opt0-legacy", {"optimize": 0, "policy": LEGACY_POLICY, "flex": True}),
+    ("opt0-default", {"optimize": 0, "policy": None, "flex": True}),
     (
         "opt0-addmlp",
-        dict(
-            optimize=0,
-            policy=SchedulingPolicy(add_in_attention="never"),
-            flex=True,
-        ),
+        {
+            "optimize": 0,
+            "policy": SchedulingPolicy(add_in_attention="never"),
+            "flex": True,
+        },
     ),
-    ("opt1-legacy", dict(optimize=1, policy=LEGACY_POLICY, flex=False)),
-    ("opt1-default", dict(optimize=1, policy=None, flex=True)),
+    ("opt1-legacy", {"optimize": 1, "policy": LEGACY_POLICY, "flex": False}),
+    ("opt1-default", {"optimize": 1, "policy": None, "flex": True}),
 ]
 
 
-def main():
+def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--graphs", nargs="*", default=None)
     args = parser.parse_args()

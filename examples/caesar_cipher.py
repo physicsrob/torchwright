@@ -1,4 +1,4 @@
-"""Caesar cipher with runtime shift parameter.
+r"""Caesar cipher with runtime shift parameter.
 
 Parses "<shift> <letters>\\n" where <shift> is a single digit (0-9) and
 <letters> is a sequence of lowercase letters (fixed length). Outputs each

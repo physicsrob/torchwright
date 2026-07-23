@@ -170,7 +170,7 @@ def sum_nodes(inp_list: list[Node], *, max_fanout: int | None = None) -> Node:
     chunk = max_fanout - 1
     for start in range(max_fanout, len(inp_list), chunk):
         group = inp_list[start : start + chunk]
-        running = _flat([running] + list(group))
+        running = _flat([running, *list(group)])
     return running
 
 

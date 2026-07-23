@@ -55,7 +55,7 @@ def test_mlp_sublayer_rectangular_shapes():
 
 
 def test_compile_with_small_d_hidden():
-    out_node, inp = _build_relu_chain_graph(d_input=4, d_hidden_chain=4, d_output=2)
+    out_node, _inp = _build_relu_chain_graph(d_input=4, d_hidden_chain=4, d_output=2)
 
     module = compile_headless(
         out_node,
@@ -100,7 +100,7 @@ def test_compile_with_d_hidden_larger_than_d():
     the scheduler would reject the chain because ``next_slot + d_hidden
     > self.d`` (the per-layer pool was the residual stream itself).
     """
-    out_node, inp = _build_relu_chain_graph(d_input=4, d_hidden_chain=48, d_output=2)
+    out_node, _inp = _build_relu_chain_graph(d_input=4, d_hidden_chain=48, d_output=2)
 
     # d=32 is smaller than the chain's hidden width (48) — impossible
     # before the decoupling (the scheduler's pool was ``self.d``).
@@ -166,7 +166,7 @@ def test_compile_default_d_hidden_equals_d():
     assert net_explicit.d_hidden == net_explicit.d == 32
     assert len(net_default.layers) == len(net_explicit.layers)
 
-    for la, lb in zip(net_default.layers, net_explicit.layers):
+    for la, lb in zip(net_default.layers, net_explicit.layers, strict=False):
         for attr in ("output_matrix", "output_bias"):
             assert torch.equal(
                 getattr(la.mlp.linear1, attr), getattr(lb.mlp.linear1, attr)

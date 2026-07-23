@@ -1,4 +1,4 @@
-"""End-to-end ONNX test for the sort_digits example.
+r"""End-to-end ONNX test for the sort_digits example.
 
 The variant exports its ``create_network_parts`` through
 :func:`compile_to_onnx`, runs argmax autoregressive decode on a battery of

@@ -23,7 +23,8 @@ def test_range_rejects_inverted_bounds():
 
 def test_range_point():
     r = Range.point(3.0)
-    assert r.lo == 3.0 and r.hi == 3.0
+    assert r.lo == 3.0
+    assert r.hi == 3.0
 
 
 def test_range_add():

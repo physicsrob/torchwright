@@ -151,4 +151,4 @@ def hf_teacher_forced(
 
 def max_logit_diff(a: list[torch.Tensor], b: list[torch.Tensor]) -> float:
     """Max abs logit difference across all compared (prefill + per-step) rows."""
-    return max((x - y).abs().max().item() for x, y in zip(a, b))
+    return max((x - y).abs().max().item() for x, y in zip(a, b, strict=False))

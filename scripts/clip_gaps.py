@@ -10,6 +10,7 @@ The written column is the most-recent SET_CURSOR_X column
 
 from __future__ import annotations
 
+import itertools
 import statistics
 from collections import defaultdict
 
@@ -33,7 +34,7 @@ def build_scene():
     return py_scene, py_state
 
 
-def main():
+def main() -> None:
     py_scene, py_state = build_scene()
     tokens = expected_ar_tokens(py_scene, py_state)
     print(
@@ -66,7 +67,7 @@ def main():
     print(f"CLIP_UPDATE tokens: {n_clip_update}")
     print(f"SCREEN_RANGE tokens total: {n_screen_range_total}")
     print(f"SCREEN_RANGE after CLIP_UPDATE (clip writes): {n_screen_range_after_clip}")
-    print(f"distinct columns written: {len(set(c for _, c in writes))}")
+    print(f"distinct columns written: {len({c for _, c in writes})}")
 
     # (a) gaps in token positions between CONSECUTIVE writes to the SAME column
     by_col: dict[int, list[int]] = defaultdict(list)
@@ -78,7 +79,7 @@ def main():
     for col, positions in by_col.items():
         positions.sort()
         writes_per_col.append(len(positions))
-        for a, b in zip(positions, positions[1:]):
+        for a, b in itertools.pairwise(positions):
             same_col_gaps.append(b - a)
 
     # The same set, reinterpreted for RoPE recency resolvability (R13).
@@ -93,13 +94,16 @@ def main():
     # than this. The MIN (not the median) is what matters.
     winner_runnerup_gaps = same_col_gaps
 
-    def summ(name, xs):
+    def summ(name, xs) -> None:
         if not xs:
             print(f"  {name}: (none)")
             return
         xs = sorted(xs)
         n = len(xs)
-        p = lambda q: xs[min(n - 1, int(q * n))]
+
+        def p(q):
+            return xs[min(n - 1, int(q * n))]
+
         print(
             f"  {name}: n={n} min={xs[0]} median={statistics.median(xs):.0f} "
             f"mean={statistics.mean(xs):.0f} p90={p(0.90)} p95={p(0.95)} "

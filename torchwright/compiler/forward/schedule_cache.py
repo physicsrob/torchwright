@@ -26,7 +26,7 @@ from __future__ import annotations
 import json
 import os
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from torchwright.compiler.graph_identity import (
     canonical_ids as _canonical_ids,
@@ -34,9 +34,11 @@ from torchwright.compiler.graph_identity import (
 from torchwright.compiler.graph_identity import (
     graph_fingerprint,
 )
-from torchwright.graph import Node
 
 from .cpsat_scheduler import ScheduleAssignment
+
+if TYPE_CHECKING:
+    from torchwright.graph import Node
 
 __all__ = [
     "cache_dir",

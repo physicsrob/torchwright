@@ -28,9 +28,8 @@ compared under the same scheduler mode by construction here.
 
 from __future__ import annotations
 
-from collections.abc import Callable
 from dataclasses import dataclass, field
-from typing import Any, cast
+from typing import TYPE_CHECKING, Any, cast
 
 import torch
 
@@ -43,6 +42,9 @@ from torchwright.compiler.residual_assignment import flatten_concat_nodes
 from torchwright.graph import Concatenate, Node
 from torchwright.graph.misc import LiteralValue
 from torchwright.graph.node import reserve_node_id_above
+
+if TYPE_CHECKING:
+    from collections.abc import Callable
 
 
 @dataclass

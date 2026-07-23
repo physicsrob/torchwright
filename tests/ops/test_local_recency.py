@@ -100,7 +100,8 @@ def test_lobe_breaks_down_past_window():
             break
     assert inversion is not None, "no recency inversion found past W"
     d1, d2 = inversion
-    assert d2 > d1 and float(lobe(torch.tensor([d2]))) > float(lobe(torch.tensor([d1])))
+    assert d2 > d1
+    assert float(lobe(torch.tensor([d2]))) > float(lobe(torch.tensor([d1])))
 
 
 def _rope():

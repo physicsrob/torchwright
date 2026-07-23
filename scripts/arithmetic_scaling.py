@@ -376,9 +376,9 @@ def write_json(payload, path) -> None:
 
 def write_plot(results, model_results, path) -> None:
     try:
-        import matplotlib
+        import matplotlib as mpl
 
-        matplotlib.use("Agg")
+        mpl.use("Agg")
         import matplotlib.pyplot as plt
     except ImportError:
         log("matplotlib not installed; skipping PNG (JSON is still written)")
@@ -448,7 +448,7 @@ def main() -> None:
     parser.add_argument(
         "--digits",
         default=None,
-        help="comma-separated digit sweep (default: %s)" % DEFAULT_DIGIT_SWEEP,
+        help=f"comma-separated digit sweep (default: {DEFAULT_DIGIT_SWEEP})",
     )
     parser.add_argument(
         "--multiply-cap",
@@ -459,8 +459,7 @@ def main() -> None:
     parser.add_argument(
         "--model-digits",
         default=None,
-        help="comma-separated end-to-end model sweep (default: %s)"
-        % DEFAULT_MODEL_DIGIT_SWEEP,
+        help=f"comma-separated end-to-end model sweep (default: {DEFAULT_MODEL_DIGIT_SWEEP})",
     )
     args = parser.parse_args()
 

@@ -120,7 +120,7 @@ class SiblingClusterAnalyzer:
         graph: GraphAnalyzer,
         min_chains: int = 4,
         min_peak_width: int = 32,
-    ):
+    ) -> None:
         self.graph = graph
         self.min_chains = min_chains
         self.min_peak_width = min_peak_width

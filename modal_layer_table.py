@@ -44,14 +44,14 @@ def main(
     ns: str = "2,3,4,5,6,7,8,9,10",
     out: str = "docs/calculator_layer_table.json",
     impls: str = "",
-):
+) -> None:
     from scripts.calculator_layer_table import IMPLS, render, table_config
 
     ns_list = [int(x) for x in ns.split(",")]
     impl_list = [x for x in impls.split(",") if x] or IMPLS
     cells = [(impl, n) for impl in impl_list for n in ns_list]
     results: dict = {impl: [] for impl in impl_list}
-    for (impl, _n), row in zip(cells, collect_cell_remote.map(cells)):
+    for (impl, _n), row in zip(cells, collect_cell_remote.map(cells), strict=False):
         results[impl].append(row)
     payload = {"config": table_config(ns_list), "results": results}
     if len(impl_list) == len(IMPLS):

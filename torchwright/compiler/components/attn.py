@@ -30,7 +30,9 @@ class AttnLayerComponent(Component):
         output_matrix: (n_heads, d_head, d)
     """
 
-    def __init__(self, d: int, d_head: int, name: str = "", n_heads: int | None = None):
+    def __init__(
+        self, d: int, d_head: int, name: str = "", n_heads: int | None = None
+    ) -> None:
         super().__init__(d, name)
         from torchwright.compiler.utils import resolve_n_heads
 
@@ -55,7 +57,7 @@ class AttnLayerComponent(Component):
         self.rope_base = ROPE_BASE
         self.rope_d_rot: int | None = None
 
-    def __repr__(self):
+    def __repr__(self) -> str:
         return f"AttnLayerComponent(name='{self.name}')"
 
     def _apply_rope(
@@ -102,8 +104,7 @@ class AttnLayerComponent(Component):
                 scale=1.0,
             ).squeeze(0)  # (n_heads, n_pos, d_head)
 
-        output = torch.einsum("hpk,hkd->pd", weighted, self.output_matrix)
-        return output
+        return torch.einsum("hpk,hkd->pd", weighted, self.output_matrix)
 
     def forward_cached(
         self,
@@ -183,7 +184,7 @@ class AttnLayerComponent(Component):
 
         return output, (K, V)
 
-    def trim_unused_heads(self):
+    def trim_unused_heads(self) -> None:
         """Drop every head that cannot contribute, compacting the survivors.
 
         Two kinds of dead head: everything past ``used_heads`` (never

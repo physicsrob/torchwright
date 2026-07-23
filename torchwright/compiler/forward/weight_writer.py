@@ -77,7 +77,7 @@ class PlacementRecorder:
     write; subsequent ``add`` calls attribute to that layer.
     """
 
-    def __init__(self):
+    def __init__(self) -> None:
         self.entries: list[PlacementEntry] = []
         self._layer = -1
 
@@ -105,7 +105,7 @@ def write_attn_sublayer(
     ops: Iterable[PlannedAttentionOp],
     const_one_col: int,
     recorder: PlacementRecorder | None = None,
-):
+) -> None:
     """Write attention head operations into a layer's AttnLayerComponent.
 
     The four arithmetic-transport ops (``compute_linear``/``compute_add``/
@@ -145,7 +145,7 @@ def write_mlp_sublayer(
     biased_linears: set[Node] | None = None,
     recorder: PlacementRecorder | None = None,
     bias: bool = True,
-):
+) -> None:
     """Write MLP operations into a layer's MLPSubLayer components.
 
     Under ``bias=False`` (docs/no_bias_plan.md) every bias write folds into
@@ -245,7 +245,7 @@ def _scatter_attn_head(
     recorder: PlacementRecorder | None = None,
     node: Node | None = None,
     op_type: str | None = None,
-):
+) -> None:
     """Scatter strategy matrices into one attention head's weight tensors."""
     if recorder is not None:
         # Every attention write fills the head's full d_head columns for the
@@ -294,7 +294,7 @@ def _write_compute_attn(
     attn,
     op: PlannedAttentionOp,
     recorder: PlacementRecorder | None = None,
-):
+) -> None:
     """Copy an Attn node's Q/K/V/O matrices into attention heads.
 
     When the node's d_v exceeds the layer's d_head, V/O are split across
@@ -421,7 +421,7 @@ def _write_compute_linear(
     op: PlannedAttentionOp,
     const_one_col: int,
     recorder: PlacementRecorder | None = None,
-):
+) -> None:
     """Compile a zero-bias Linear via current-position attention.
 
     Q/K attend to the current position (Δ=0 self-match) — over the trig grid
@@ -492,7 +492,7 @@ def _write_compute_add(
     op: PlannedAttentionOp,
     const_one_col: int,
     recorder: PlacementRecorder | None = None,
-):
+) -> None:
     """Compute Add(a, b) by copying both inputs to fresh columns via attention.
 
     Used when neither input is dead (so add_into can't reuse columns).
@@ -613,7 +613,7 @@ def _write_cancel(
     op: PlannedAttentionOp,
     const_one_col: int,
     recorder: PlacementRecorder | None = None,
-):
+) -> None:
     """Cancel target_cols: V=identity, O=-identity. Skip adds x + (-x) = 0.
 
     Splits across multiple heads when wider than d_head.  Used both to
@@ -661,7 +661,7 @@ def _write_add_into(
     op: PlannedAttentionOp,
     const_one_col: int,
     recorder: PlacementRecorder | None = None,
-):
+) -> None:
     """Add(dead, live): copy live's values to dead's columns via attention.
 
     target_cols are the dead addend's columns (now owned by the Add node
@@ -743,7 +743,7 @@ class BiasFold:
         mlp,
         const_col: int,
         recorder: PlacementRecorder | None = None,
-    ):
+    ) -> None:
         self.mlp = mlp
         self.const_col = const_col
         self.recorder = recorder
@@ -850,7 +850,7 @@ def _write_compute_ffn(
     biased_linears: set[Node] | None = None,
     recorder: PlacementRecorder | None = None,
     bias_fold: BiasFold | None = None,
-):
+) -> None:
     """Compile an :class:`FFN` through the MLP sublayer (either machine).
 
     The FFN is the only MLP composite: it maps its input through the gate
@@ -1024,7 +1024,7 @@ def _write_compute_ffn(
 
 def _write_compute_literal_value(
     mlp, op: PlannedMlpOp, bias_fold: BiasFold | None = None
-):
+) -> None:
     """Write a constant value via MLP output bias (or the constant lane).
 
     Under ``bias=False`` the value rides the constant lane's down-projection
@@ -1050,7 +1050,9 @@ def _write_compute_literal_value(
     out_lin.output_bias[cols_t] = node.value.to(target_dtype)
 
 
-def _write_compute_bias(mlp, op: PlannedMlpOp, bias_fold: BiasFold | None = None):
+def _write_compute_bias(
+    mlp, op: PlannedMlpOp, bias_fold: BiasFold | None = None
+) -> None:
     """Add bias to MLP output bias (for biased Linear split).
 
     Under ``bias=False`` the deferred bias rides the constant lane's
@@ -1080,7 +1082,9 @@ def _write_compute_bias(mlp, op: PlannedMlpOp, bias_fold: BiasFold | None = None
     out_lin.output_bias[cols_t] += node.output_bias.to(target_dtype)
 
 
-def _write_clear_literal_seed(mlp, op: PlannedMlpOp, bias_fold: BiasFold | None = None):
+def _write_clear_literal_seed(
+    mlp, op: PlannedMlpOp, bias_fold: BiasFold | None = None
+) -> None:
     """Cancel a compiler-internal literal in the final MLP residual update.
 
     The literal remains live through final attention (self-match heads read
@@ -1118,7 +1122,7 @@ def _write_bypass_lane_pair(
     op_type: str,
     bias_fold: BiasFold | None = None,
     recorder: PlacementRecorder | None = None,
-):
+) -> None:
     """Emit the activation bypass lane-pair computing ``W.T @ x`` from
     ``in_idx`` into ``out_idx`` over ``mlp_slots`` (== ``2 * len(out_idx)``).
 
@@ -1200,7 +1204,7 @@ def _fold_deferred_source_bias(
     *,
     node: Node | None,
     op_type: str,
-):
+) -> None:
     """Fold same-layer deferred attention-Linear biases into a bypass pair's
     hidden-slot biases.
 
@@ -1271,7 +1275,7 @@ def _write_cancel_bypass(
     op: PlannedMlpOp,
     recorder: PlacementRecorder | None = None,
     bias_fold: BiasFold | None = None,
-):
+) -> None:
     """Zero a dying node's columns from the MLP sublayer via the bypass pair
     with ``W = -I``: the lane-pair emits ``-x`` and the skip connection turns
     the column's ``x`` into ``x + (-x) = 0`` (up to the swish two-lane fp32
@@ -1306,7 +1310,7 @@ def _write_compute_linear_bypass(
     biased_linears: set[Node] | None = None,
     recorder: PlacementRecorder | None = None,
     bias_fold: BiasFold | None = None,
-):
+) -> None:
     """Compile a standalone Linear via MLP using the activation bypass pair.
 
     ReLU machine: ``ReLU(z) - ReLU(-z) = z``.  Swish machine:
@@ -1400,7 +1404,7 @@ def _write_add_into_bypass(
     biased_linears: set[Node] | None = None,
     recorder: PlacementRecorder | None = None,
     bias_fold: BiasFold | None = None,
-):
+) -> None:
     """Add the live addend into a reused dead addend's columns from the MLP
     sublayer via the bypass pair with ``W = I``.
 
@@ -1459,7 +1463,7 @@ def _write_compute_add_bypass(
     biased_linears: set[Node] | None = None,
     recorder: PlacementRecorder | None = None,
     bias_fold: BiasFold | None = None,
-):
+) -> None:
     """Compute both addends into fresh, zeroed columns from the MLP sublayer
     via the bypass pair over the concatenated source rows with
     ``W = [I; I]``.

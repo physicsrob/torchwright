@@ -59,7 +59,7 @@ def main(
     script: str = "",
     args: str = "",
     cpu_only: bool = False,
-):
+) -> None:
     if not module and not script:
         print(
             "error: pass --module <dotted.name> or --script <path>",

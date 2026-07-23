@@ -66,7 +66,7 @@ def test_multiply_dead_lane_exact_zero_bit_exact_fp32():
     contributes nothing and the live lane is a·b in one rounding —
     bit-identical to the reference.  (At merely-saturated |a| ≈ 17-88
     the dead lane's σ is a representable ~e^{-|a|}, leaving ulp-class
-    relative error — covered by the allclose tests above.)
+    relative error — covered by the allclose tests above.).
     """
     at = torch.tensor([100.0, -100.0, 150.0, -200.0]).unsqueeze(1)
     bt = torch.tensor([3.25, -0.5, -123.456, 0.875]).unsqueeze(1)

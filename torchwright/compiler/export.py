@@ -763,12 +763,14 @@ def _make_stream_layer_weights_cb(
     """
 
     class OnnxLayerSink:
-        def begin(self, header):
-            assert header.d == d and header.d_head == d_head
+        def begin(self, header) -> None:
+            assert header.d == d
+            assert header.d_head == d_head
             assert header.n_heads == n_heads
-            assert header.trim_heads == trim_heads and header.bias == bias
+            assert header.trim_heads == trim_heads
+            assert header.bias == bias
 
-        def write_layer(self, i, weights):
+        def write_layer(self, i, weights) -> None:
             attn = weights.attention
             nh, hd = attn.n_heads, attn.n_heads * d_head
             per_layer_n_heads.append(nh)
@@ -794,7 +796,7 @@ def _make_stream_layer_weights_cb(
                 dense_inits,
             )
 
-            def emit_bias(name, value):
+            def emit_bias(name, value) -> None:
                 if value is not None:
                     emit(name, value)
 
@@ -812,7 +814,7 @@ def _make_stream_layer_weights_cb(
                 emit(f"l{i}_W2", weights.w2)
                 emit_bias(f"l{i}_b2", weights.b2)
 
-        def finalize(self, spec, weights):
+        def finalize(self, spec, weights) -> None:
             # Graph assembly below consumes the finalized semantic values.
             self.spec = spec
             self.token_weights = weights
@@ -884,7 +886,7 @@ def _emit_cached_preamble(nodes: list) -> None:
         comparison and by every layer's ``ScatterND`` indices.
     """
 
-    def add(op, ins, outs, **attrs):
+    def add(op, ins, outs, **attrs) -> None:
         nodes.append(helper.make_node(op, ins, outs, **attrs))
 
     # S_eff = bound first dim of the cache; slots = arange_S[:S_eff].
@@ -988,7 +990,7 @@ def _emit_cached_layer_nodes(
     """
     p = f"l{layer_idx}"
 
-    def node(op, ins, outs, **attrs):
+    def node(op, ins, outs, **attrs) -> None:
         nodes.append(helper.make_node(op, ins, outs, **attrs))
 
     # Pre-norm: the attention sublayer reads norm(current_res); the residual
@@ -1586,7 +1588,7 @@ def compile_to_onnx(
     # forced RMS is an exact power of two.  These are the only genuine new
     # seed constants.
     if rms_spec is not None:
-        for j, v in zip(rms_spec.reserved_cols, rms_spec.const_values):
+        for j, v in zip(rms_spec.reserved_cols, rms_spec.const_values, strict=False):
             embed_table[:, j] = v
 
     # Input-state literal seeds (the const-1 self-match column): folded into
@@ -1652,7 +1654,7 @@ def compile_to_onnx(
     # full-width tied unembed.
     nodes: list = []
 
-    def add(op, ins, outs, **attrs):
+    def add(op, ins, outs, **attrs) -> None:
         nodes.append(helper.make_node(op, ins, outs, **attrs))
 
     # RoPE: bake the global rope inits when any layer is rotary; the preamble

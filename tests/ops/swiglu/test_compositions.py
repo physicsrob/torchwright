@@ -30,7 +30,7 @@ D_HEAD = 8
 
 @pytest.fixture
 def embedding():
-    vocab = list("0123456789+-=") + ["<eos>", "default"]
+    vocab = [*list("0123456789+-="), "<eos>", "default"]
     return create_embedding(vocab=vocab)
 
 
@@ -118,7 +118,7 @@ def _assert_trimmed(embedding, seq_tokens, max_removals, expected_tokens):
         embedding, _literal_seq(embedding, seq_tokens), max_removals
     )
     assert len(out) == len(expected_tokens)
-    for i, (node, tok) in enumerate(zip(out, expected_tokens)):
+    for i, (node, tok) in enumerate(zip(out, expected_tokens, strict=False)):
         v = node.compute(1, {"embedding_input": ["0"]})
         assert torch.allclose(v[0], embedding.get_embedding(tok), atol=1e-3), (
             i,
@@ -168,7 +168,7 @@ def _assert_signed_trim(embedding, seq_tokens, max_removals, negate, expected_to
         sign_token=embedding.get_embedding("-"),
     )
     assert len(out) == len(expected_tokens)
-    for i, (node, tok) in enumerate(zip(out, expected_tokens)):
+    for i, (node, tok) in enumerate(zip(out, expected_tokens, strict=False)):
         v = node.compute(1, {"embedding_input": ["0"]})
         assert torch.allclose(v[0], embedding.get_embedding(tok), atol=1e-3), (i, tok)
 

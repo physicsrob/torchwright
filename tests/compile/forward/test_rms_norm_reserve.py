@@ -65,7 +65,7 @@ def _spec(q=_RMS_NORM_CONST_EXP, reserved=(1023,)):
 
 
 @pytest.mark.parametrize(
-    "d, n_const_expected",
+    ("d", "n_const_expected"),
     [
         (256, 1),  # 2^8, even exponent  -> one column
         (1024, 1),  # 2^10, even          -> one column (calculator)
@@ -237,7 +237,7 @@ def test_identity_holds_at_non_power_of_two_widths(d):
     certified budget comes back bit-for-bit; far over it, the mean drifts
     off the power of two and the identity breaks.  (The certified budget
     2^(2q-24) is deliberately conservative — sound in every fp32 summation
-    order — so the observable break point sits above it, never below.)
+    order — so the observable break point sits above it, never below.).
     """
     q = _RMS_NORM_CONST_EXP
     spec = _reserve_rms_norm_columns(ResidualStreamMap(d), d, 1e-5, q)
@@ -312,7 +312,7 @@ def test_energy_bound_identity_holds_below_and_breaks_above():
     deepest-layer energy of the *shipping* graph, not just calculator_simple.
     """
     d, n_const, q = 1024, 1, 30  # the original (too-small) calculator setting
-    bound = 2.0 ** (2 * q - 24)  # ~6.9e10
+    2.0 ** (2 * q - 24)  # ~6.9e10
     # calculator_simple-scale energy: well under the bound -> identity holds
     assert _rmsnorm_identity_holds(d, n_const, q, data_energy=1e8)
     # calculator_simple squaring-path energy: over the bound -> identity breaks
@@ -349,7 +349,7 @@ def _tiny_graph():
     )
 
 
-_CPSAT_KW = dict(d=64, d_head=8, d_hidden=128)
+_CPSAT_KW = {"d": 64, "d_head": 8, "d_hidden": 128}
 
 
 def test_cpsat_available_residual_excludes_reserved():
@@ -393,14 +393,14 @@ def test_schedule_fingerprint_keys_on_reserved_residual():
     so existing cache entries still hit (the conditional payload field).
     """
     out = _tiny_graph()
-    fp_kw = dict(
-        d=64,
-        d_head=8,
-        d_hidden=64,
-        flex_routing=True,
-        cancel_slack=2,
-        policy=None,
-    )
+    fp_kw = {
+        "d": 64,
+        "d_head": 8,
+        "d_hidden": 64,
+        "flex_routing": True,
+        "cancel_slack": 2,
+        "policy": None,
+    }
     fp_none = graph_fingerprint(out, **fp_kw)
     fp_zero = graph_fingerprint(out, reserve_residual=0, **fp_kw)
     fp_one = graph_fingerprint(out, reserve_residual=1, **fp_kw)

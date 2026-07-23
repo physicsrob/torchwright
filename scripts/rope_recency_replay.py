@@ -48,7 +48,7 @@ def load(path: str):
     rows = []
     n = len(buf)
     while off < n:
-        qp, npos, sel, dec, nc = struct.unpack_from("<5i", buf, off)
+        qp, _npos, sel, dec, nc = struct.unpack_from("<5i", buf, off)
         off += 20
         pos = np.empty(nc, dtype=np.int64)
         clog = np.empty(nc, dtype=np.float64)
@@ -155,7 +155,7 @@ def margin_diagnostic(rows, R):
     worst = math.inf
     worst_at = None
     n_neg = 0  # selections where R is already non-monotone (margin <= 0)
-    for qp, sel, dec, pos, clog in rows:
+    for qp, sel, _dec, pos, clog in rows:
         csel = clog[pos == sel]
         if len(csel) == 0:
             continue
@@ -174,7 +174,7 @@ def margin_diagnostic(rows, R):
     return worst, worst_at, n_neg
 
 
-def main():
+def main() -> None:
     path = sys.argv[1] if len(sys.argv) > 1 else "scratchpad/recency_compact.bin"
     rows = load(path)
     max_pos = max(qp for qp, *_ in rows)

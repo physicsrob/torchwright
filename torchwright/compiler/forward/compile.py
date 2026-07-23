@@ -204,7 +204,7 @@ def _reserve_rms_norm_columns(
     # by the representability check below.  The boundary is inclusive: the
     # DOOM production config (d=8192, q=63) lands exactly on a 2^127 top bit
     # and must be accepted.
-    import numpy as _np
+    import numpy as np
 
     e_exp_top = d.bit_length() - 1 + 2 * m  # exponent of E's top set bit
     if e_exp_top > 127:
@@ -220,10 +220,10 @@ def _reserve_rms_norm_columns(
     # reciprocal 1/d — must land exactly on 2^(2m).  (ReduceMean's internal
     # strategy is not contractual across ONNX execution providers.)
     energy_exact = float(d) * 2.0 ** (2 * m)  # exact in float64 for any sane q
-    energy32 = _np.float32(energy_exact)
-    target_ms = _np.float32(2.0 ** (2 * m))
-    ms_div = energy32 / _np.float32(d)
-    ms_recip = energy32 * (_np.float32(1.0) / _np.float32(d))
+    energy32 = np.float32(energy_exact)
+    target_ms = np.float32(2.0 ** (2 * m))
+    ms_div = energy32 / np.float32(d)
+    ms_recip = energy32 * (np.float32(1.0) / np.float32(d))
     if float(energy32) != energy_exact or ms_div != target_ms or ms_recip != target_ms:
         raise ValueError(
             f"rms_norm has no bit-exact pinned layout at d={d}: the forced "
@@ -234,8 +234,8 @@ def _reserve_rms_norm_columns(
         )
     # The forced mean-of-squares is exactly 2^(2m); eps must sit below its fp32
     # LSB or it shifts ms+eps off the power of two and breaks the identity.
-    forced_ms = _np.float32(2.0 ** (2 * m))
-    if _np.float32(forced_ms + _np.float32(eps)) != forced_ms:
+    forced_ms = np.float32(2.0 ** (2 * m))
+    if np.float32(forced_ms + np.float32(eps)) != forced_ms:
         raise ValueError(
             f"rms_norm_eps={eps} is too large for the forced RMS (mean-square "
             f"2^{2 * m}): it perturbs ms+eps and breaks the identity. Use a "
@@ -305,7 +305,7 @@ def _certify_rms_norm_energy(ra, spec: RmsNormSpec) -> None:
     budget = const_min * const_min * 2.0**-24  # min(const)²·2⁻²⁴
 
     col_max: dict = {}
-    for state, mapping in ra.mapping.items():
+    for mapping in ra.mapping.values():
         for node, indices in mapping.items():
             data_cols = [c for c in indices if c not in reserved]
             if not data_cols:
@@ -900,7 +900,8 @@ def _build_replay_plan(
             # above) retains the column, so every runtime surface still seeds
             # the pre-layer value to one.
             const_col = planned_rmap.get_indices(const_one)[0]
-            planned_mlp_ops = planned_mlp_ops + (
+            planned_mlp_ops = (
+                *planned_mlp_ops,
                 PlannedMlpOp("clear_literal_seed", const_one, (const_col,)),
             )
             planned_rmap.free(const_one)
@@ -2499,7 +2500,7 @@ def forward_compile(
             layer.mlp.trim_unused_slots()
         if trim_heads:
             for index, (layer, planned_layer) in enumerate(
-                zip(net.layers, replay_plan.layers)
+                zip(net.layers, replay_plan.layers, strict=False)
             ):
                 actual = LayerShape(
                     layer.attn.attn.n_heads,

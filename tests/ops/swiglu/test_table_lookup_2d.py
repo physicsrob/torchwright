@@ -129,7 +129,7 @@ def test_chunked_axes_match_table():
 
 
 def test_compiles_clean():
-    out, table = _build()
+    out, _table = _build()
     compiled = compile_headless(out, d=D, d_head=D_HEAD)
     assert compiled._net.activation == "swish"
     inputs = {
@@ -159,7 +159,7 @@ def test_clamp_skip_matches_clamped_form():
     on a dense grid — clamping an in-bounds index is the identity.
     """
     # _TABLE is 3x4 -> top_i=2, top_j=3.
-    skip, table = _build_ranged((0.0, 2.0), (0.0, 3.0))
+    skip, _table = _build_ranged((0.0, 2.0), (0.0, 3.0))
     keep, _ = _build_ranged((-1e4, 1e4), (-1e4, 1e4))
     ii = torch.linspace(0.0, 2.0, 37)
     jj = torch.linspace(0.0, 3.0, 41)

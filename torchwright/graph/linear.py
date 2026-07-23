@@ -24,7 +24,7 @@ class Linear(Node):
         output_matrix: torch.Tensor,
         output_bias: torch.Tensor | None = None,
         name: str = "",
-    ):
+    ) -> None:
         # output_matrix shape (d_input, d_output)
         self.d_input = output_matrix.shape[0]
         self.d_output = output_matrix.shape[1]

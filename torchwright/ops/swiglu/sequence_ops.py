@@ -78,7 +78,7 @@ class NumericSequence:
         rope: RopeConfig,
         embedding: Embedding,
         digits: int,
-    ):
+    ) -> None:
         self.rope = rope
         zero_constant = create_literal_value(embedding.get_embedding("0"))
         is_digit = check_is_digit(embedding)
@@ -92,7 +92,7 @@ class NumericSequence:
         # Sliding window; at number boundaries, reset earlier positions
         # to "0".
         current_digits: list[Node] = [embedding]
-        for i in range(digits - 1):
+        for _i in range(digits - 1):
             current_digits.append(
                 select(
                     cond=is_num_start,
@@ -246,7 +246,7 @@ class IndexedRegion:
         max_len: int,
         max_read_distance: int,
         default: torch.Tensor,
-    ):
+    ) -> None:
         assert len(marker) == 1, "marker must be a 1-D boolean"
         assert len(in_region) == 1, "in_region must be a 1-D boolean"
         assert max_len >= 1, "max_len must be >= 1"

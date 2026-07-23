@@ -130,7 +130,9 @@ def switch(conditions: list[Node], values: list[Node]) -> Node:
     Returns:
         Node: The value whose corresponding condition is true.
     """
-    return sum_nodes([cond_gate(c, v) for c, v in zip(conditions, values)])
+    return sum_nodes(
+        [cond_gate(c, v) for c, v in zip(conditions, values, strict=False)]
+    )
 
 
 _MASK_TOL = 4.0 * swish_dip / scale

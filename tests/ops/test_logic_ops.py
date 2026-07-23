@@ -40,10 +40,7 @@ def test_cond_gate():
                     "x": torch.tensor([[x_value]]),
                 },
             )
-            if cond_value > 0.0:
-                expected_value = x_value
-            else:
-                expected_value = 0.0
+            expected_value = x_value if cond_value > 0.0 else 0.0
             assert output.item() == expected_value
 
 

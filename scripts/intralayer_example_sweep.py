@@ -35,7 +35,7 @@ from __future__ import annotations
 
 import argparse
 import time
-from collections.abc import Callable
+from typing import TYPE_CHECKING
 
 import torch
 
@@ -46,6 +46,9 @@ from torchwright.compiler.forward.cpsat_scheduler import (
 )
 from torchwright.compiler.forward.scheduling_policy import SchedulingPolicy
 from torchwright.compiler.lower import lower
+
+if TYPE_CHECKING:
+    from collections.abc import Callable
 
 _RELAX = frozenset({"mlp_cancel_occupancy"})
 
@@ -223,7 +226,7 @@ def _width_grid(d_natural: int, d_head: int, n_points: int) -> list[int]:
         return sorted({d_natural, lo}, reverse=True)
     step = (d_natural - lo) / (n_points - 1)
     grid = {
-        int(round((d_natural - i * step) / d_head)) * d_head for i in range(n_points)
+        round((d_natural - i * step) / d_head) * d_head for i in range(n_points)
     } | {d_natural, lo}
     return sorted((d for d in grid if d >= d_head), reverse=True)
 
@@ -264,27 +267,29 @@ def sweep(graphs: list[str], budget: float, n_points: int):
                     fn, fopt, fbound = _solve_layers(
                         low_out, d, d_head, budget, frozenset({family})
                     )
-                    fam[family] = dict(n=fn, opt=fopt, bound=fbound)
+                    fam[family] = {"n": fn, "opt": fopt, "bound": fbound}
             else:
                 sound_n, sound_opt, sound_bound = None, False, None
-                fam = {f: dict(n=None, opt=False, bound=None) for f in _FAMILY_SWEEP}
+                fam = {
+                    f: {"n": None, "opt": False, "bound": None} for f in _FAMILY_SWEEP
+                }
             dt = time.perf_counter() - t0
-            row = dict(
-                d=d,
-                floor=cp_lb,
-                opt0=n0,
-                opt0_status=s0,
-                opt1=n1,
-                opt1_status=s1,
-                sound=sound_n,
-                sound_opt=sound_opt,
-                sound_bound=sound_bound,
-                families=fam,
+            row = {
+                "d": d,
+                "floor": cp_lb,
+                "opt0": n0,
+                "opt0_status": s0,
+                "opt1": n1,
+                "opt1_status": s1,
+                "sound": sound_n,
+                "sound_opt": sound_opt,
+                "sound_bound": sound_bound,
+                "families": fam,
                 # ``relaxed`` kept for the legacy phase-gate verdict (gap #1).
-                relaxed=fam["mlp_cancel_occupancy"]["n"],
-                relaxed_opt=fam["mlp_cancel_occupancy"]["opt"],
-                secs=round(dt, 1),
-            )
+                "relaxed": fam["mlp_cancel_occupancy"]["n"],
+                "relaxed_opt": fam["mlp_cancel_occupancy"]["opt"],
+                "secs": round(dt, 1),
+            }
             rows.append(row)
 
             def _drop(family: str) -> str:
@@ -315,7 +320,7 @@ def _fmt(v) -> str:
     return "  -" if v is None else f"{v:>3}"
 
 
-def _verdict(results: dict[str, list[dict]]):
+def _verdict(results: dict[str, list[dict]]) -> None:
     print("\n" + "=" * 72)
     print("PHASE-GATE VERDICT")
     print("=" * 72)
@@ -363,7 +368,7 @@ def _verdict(results: dict[str, list[dict]]):
     )
 
 
-def main():
+def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--graphs", nargs="*", default=None)
     ap.add_argument("--budget", type=float, default=15.0)

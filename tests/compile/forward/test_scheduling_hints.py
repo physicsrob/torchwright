@@ -94,8 +94,7 @@ def test_sequential_scope_finds_deep_entry_nodes():
     def build_row(i):
         a = _linear(x, 8, name=f"a_{i}")
         b = _linear(a, 8, name=f"b_{i}")
-        c = _linear(b, 2, name=f"c_{i}")
-        return c
+        return _linear(b, 2, name=f"c_{i}")
 
     terminals = sequential_scope(
         [lambda i=i: build_row(i) for i in range(3)],

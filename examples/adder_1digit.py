@@ -1,4 +1,4 @@
-"""1-digit adder: the simplest example of programming a transformer.
+r"""1-digit adder: the simplest example of programming a transformer.
 
 Parses "A+B\\n" where A and B are single digits, and outputs their sum.
 All arithmetic is done via a single 100-entry lookup table that maps
@@ -67,9 +67,15 @@ def sum_numbers(embedding: Embedding, num1: Node, num2: Node) -> tuple[Node, Nod
 
 def create_network() -> Unembedding:
     # --- Phase 1: Vocabulary and parsing ---
-    vocab = list(
-        "0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ!@#$%^&*()-+="
-    ) + ["\n", "<bos>", "<eos>", "default"]
+    vocab = [
+        *list(
+            "0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ!@#$%^&*()-+="
+        ),
+        "\n",
+        "<bos>",
+        "<eos>",
+        "default",
+    ]
     embedding = create_embedding(vocab=vocab)
     rope = create_rope_config(d_head=D_HEAD, max_positions=MAX_POSITIONS)
 
@@ -90,7 +96,7 @@ def create_network() -> Unembedding:
     # Latch: remember the digit at "=".
     second_num = get_prev_value(rope, just_completed_num, is_second_num)
 
-    summed, carry = sum_numbers(embedding, first_num, second_num)
+    summed, _carry = sum_numbers(embedding, first_num, second_num)
 
     # --- Phase 3: Output ---
     return create_unembedding(summed, embedding)

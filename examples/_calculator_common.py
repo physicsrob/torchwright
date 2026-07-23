@@ -1,4 +1,4 @@
-"""Shared scaffolding for the three calculator examples.
+r"""Shared scaffolding for the three calculator examples.
 
 ``calculator_simple`` and ``calculator_advanced`` are two *independent*
 implementations of the same calculator: they differ only in their arithmetic —
@@ -185,7 +185,7 @@ def compare_digit_seqs(
 
     flags = [
         onehot_lookup(concat([a, b]), pair_table, default_flag)
-        for a, b in zip(seq1, seq2)  # MSB-first
+        for a, b in zip(seq1, seq2, strict=False)  # MSB-first
     ]
     # Sharpen each flag to an exact three-level value: gt = 1 iff flag > 0.5,
     # lt = 1 iff flag < -0.5 (both bit-exact in saturation; the flag sits
@@ -215,7 +215,7 @@ def parse_expression(
     embedding: Embedding,
     max_digits: int,
 ) -> tuple[list[Node], list[Node], Node, Node, Node, Node]:
-    """Parse ``"A op B\\n"`` from the token stream, at constant depth.
+    r"""Parse ``"A op B\\n"`` from the token stream, at constant depth.
 
     Returns ``(first, second, is_plus, is_minus, is_times, saw_newline)``:
     the two operand digit windows (MSB-first, zero-padded to ``max_digits``),
@@ -383,13 +383,13 @@ def build_calculator(
 
     # --- Addition: pad each operand by one digit so the top carry has a home. ---
     add_seq = _pad_result(
-        embedding, add_digit_seqs(embedding, [zero] + first, [zero] + second), seq_len
+        embedding, add_digit_seqs(embedding, [zero, *first], [zero, *second]), seq_len
     )
 
     # --- Subtraction: |A - B| by a borrow fold, sign from the comparison. ---
     a_ge_b = compare_digit_seqs(embedding, first, second)
-    bigger = [select(a_ge_b, a, b) for a, b in zip(first, second)]
-    smaller = [select(a_ge_b, b, a) for a, b in zip(first, second)]
+    bigger = [select(a_ge_b, a, b) for a, b in zip(first, second, strict=False)]
+    smaller = [select(a_ge_b, b, a) for a, b in zip(first, second, strict=False)]
     sub_seq = _pad_result(
         embedding, subtract_digit_seqs(embedding, bigger, smaller), seq_len
     )

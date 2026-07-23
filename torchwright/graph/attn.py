@@ -95,7 +95,7 @@ class Attn(Node):
         output_matrix: torch.Tensor,
         rope_base: float = ROPE_BASE,
         rope_d_rot: int | None = None,
-    ):
+    ) -> None:
         self.d_qk = query_matrix.shape[1]
         self.d_v = value_matrix.shape[1]
         self.d_query_in = query_matrix.shape[0]
@@ -182,9 +182,8 @@ class Attn(Node):
         values = attn.matmul(value_values)
         # values shape is now (query pos, d_v)
 
-        values_output = values.matmul(self.output_matrix)
+        return values.matmul(self.output_matrix)
         # values shape is now (query pos, d_output)
-        return values_output
 
     def num_params(self):
         return (

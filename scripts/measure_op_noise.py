@@ -27,10 +27,9 @@ import datetime as _dt
 import json
 import subprocess
 import sys
-from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import TypedDict
+from typing import TYPE_CHECKING, TypedDict
 
 import torch
 
@@ -40,7 +39,6 @@ from torchwright.debug.noise import (
     measure_op_isolated,
     update_docstring_footer,
 )
-from torchwright.graph import Node
 from torchwright.ops import swiglu as swiglu_ops
 from torchwright.ops.const import step_sharpness
 from torchwright.ops.relu.arithmetic_ops import (
@@ -69,6 +67,11 @@ from torchwright.ops.relu.logic_ops import (
     cond_gate,
     equals_vector,
 )
+
+if TYPE_CHECKING:
+    from collections.abc import Callable, Sequence
+
+    from torchwright.graph import Node
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 DOCS_JSON = REPO_ROOT / "docs" / "op_noise_data.json"
@@ -1061,7 +1064,7 @@ def _map_to_table_ref(x: torch.Tensor) -> torch.Tensor:
     values = torch.tensor([[10.0, -1.0], [20.0, -2.0], [30.0, -3.0]])
     default = torch.tensor([5.0, 0.5])
     out = default.unsqueeze(0).repeat(x.shape[0], 1)
-    for k, v in zip(keys, values):
+    for k, v in zip(keys, values, strict=False):
         hit = (x == k).all(dim=-1)
         out[hit] = v
     return out
@@ -2075,7 +2078,7 @@ def _round_float(x: float, sig: int = 6) -> float | None:
         return 0.0
     import math
 
-    digits = sig - int(math.floor(math.log10(abs(x)))) - 1
+    digits = sig - math.floor(math.log10(abs(x))) - 1
     return round(x, digits)
 
 

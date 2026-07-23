@@ -51,7 +51,7 @@ def _graph():
 
 
 def test_both_addends_dead_earlier_selects_occurrence_0():
-    x, a, b, add = _graph()
+    _x, a, b, add = _graph()
     pairs = {a.node_id: [add], b.node_id: [add]}
     layers = {add.node_id: 3, a.node_id: 1, b.node_id: 1}
     routes = {add.node_id: "attn", a.node_id: "attn", b.node_id: "attn"}
@@ -61,7 +61,7 @@ def test_both_addends_dead_earlier_selects_occurrence_0():
 
 
 def test_only_occurrence_1_reusable():
-    x, a, b, add = _graph()
+    _x, a, b, add = _graph()
     later = _linear(a, 2, "later")  # a has a later reader; b does not
     pairs = {a.node_id: [add, later], b.node_id: [add]}
     layers = {add.node_id: 3, later.node_id: 5}
@@ -70,7 +70,7 @@ def test_only_occurrence_1_reusable():
 
 
 def test_same_layer_attention_consumer_counts_for_mlp_add_only():
-    x, a, b, add = _graph()
+    _x, a, b, add = _graph()
     peer = _linear(a, 2, "peer")  # reads a in the same layer as the add
     pairs = {a.node_id: [add, peer], b.node_id: [add, peer]}
     layers = {add.node_id: 3, peer.node_id: 3}
@@ -87,7 +87,7 @@ def test_same_layer_attention_consumer_counts_for_mlp_add_only():
 
 
 def test_same_layer_mlp_consumer_never_counts():
-    x, a, b, add = _graph()
+    _x, a, b, add = _graph()
     peer = _linear(a, 2, "peer")
     pairs = {a.node_id: [add, peer], b.node_id: [add]}
     layers = {add.node_id: 3, peer.node_id: 3}
@@ -97,7 +97,7 @@ def test_same_layer_mlp_consumer_never_counts():
 
 
 def test_unordered_consumer_blocks_reuse():
-    x, a, b, add = _graph()
+    _x, a, b, add = _graph()
     terminal = Concatenate([a])  # output retention: no layer entry
     pairs = {a.node_id: [add, terminal], b.node_id: [add]}
     layers = {add.node_id: 3}
@@ -106,7 +106,7 @@ def test_unordered_consumer_blocks_reuse():
 
 
 def test_concatenate_occurrence_is_not_reusable():
-    x, a, b, add0 = _graph()
+    _x, a, b, _add0 = _graph()
     cat = Concatenate([a, b])
     tail = create_input("tail", 6, value_range=(-1.0, 1.0))
     add = Add(cat, tail, name="cat_add")
@@ -119,7 +119,7 @@ def test_concatenate_occurrence_is_not_reusable():
 
 
 def test_graph_input_target_needs_no_own_layer():
-    x, a, b, add0 = _graph()
+    _x, a, _b, _add0 = _graph()
     y = create_input("y", 3, value_range=(-1.0, 1.0))
     add = Add(y, a, name="input_add")
     reader = _linear(y, 2, "reader")
@@ -141,7 +141,7 @@ def test_self_add_selects_occurrence_0():
 
 
 def test_held_target_short_circuits_fresh():
-    x, a, b, add = _graph()
+    _x, a, b, add = _graph()
     pairs = {a.node_id: [add], b.node_id: [add]}
     layers = {add.node_id: 3}
     routes = {add.node_id: "attn"}
@@ -151,7 +151,7 @@ def test_held_target_short_circuits_fresh():
 
 
 def test_held_source_occurrence_never_reusable():
-    x, a, b, add0 = _graph()
+    _x, a, _b, _add0 = _graph()
     emb = create_input("emb", 3, value_range=(-1.0, 1.0))
     add = Add(emb, a, name="handoff")
     pairs = {emb.node_id: [add], a.node_id: [add]}
@@ -164,7 +164,7 @@ def test_held_source_occurrence_never_reusable():
 
 
 def test_missing_add_layer_or_route_raises():
-    x, a, b, add = _graph()
+    _x, a, b, add = _graph()
     pairs = {a.node_id: [add], b.node_id: [add]}
     with pytest.raises(ValueError, match="layer and route"):
         _derive(add, pairs, {}, {add.node_id: "attn"})

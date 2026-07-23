@@ -11,7 +11,7 @@ import sys
 from scripts.measure_op_noise import _measure_all, render_json
 
 
-def main():
+def main() -> None:
     measurements = _measure_all()
     # Get commit SHA from env or fallback
     import subprocess

@@ -283,7 +283,8 @@ def test_jit_constant_adds_no_latency_to_consumer():
     """
     with_literal = _consumer_layer("literal")
     with_input = _consumer_layer("input")
-    assert with_literal is not None and with_input is not None
+    assert with_literal is not None
+    assert with_input is not None
     assert with_literal <= with_input, (
         f"JIT gate delayed the consumer: Add at layer {with_literal} with a "
         f"constant vs {with_input} with a pre-seeded input"

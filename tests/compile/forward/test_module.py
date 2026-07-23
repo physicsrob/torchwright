@@ -77,7 +77,7 @@ def _feeds(token_ids: np.ndarray, past_k, past_v, base: int) -> dict:
         "token_ids": token_ids,
         "cache_position": np.arange(base, base + n_new, dtype=np.int64),
     }
-    for i, (k, v) in enumerate(zip(past_k, past_v)):
+    for i, (k, v) in enumerate(zip(past_k, past_v, strict=False)):
         feeds[f"past_K_{i}"] = k
         feeds[f"past_V_{i}"] = v
     return feeds
@@ -127,7 +127,7 @@ def test_token_onnx_prefill_matches_compute():
         ref_logits = _reference_logits(output_node, embedding, tokens)
 
         session = onnxruntime.InferenceSession(onnx_path)
-        n_layers, per_layer_n_heads, d_head, S = _discover_meta(session, onnx_path)
+        _n_layers, per_layer_n_heads, d_head, S = _discover_meta(session, onnx_path)
         token_ids = np.array(
             [embedding.tokenizer.get_token_id(t) for t in tokens],
             dtype=np.int64,
@@ -495,7 +495,7 @@ def test_token_onnx_chunked_decode_matches_full_prefill(adder_artifact):
 def test_token_onnx_static_tail_is_inert(adder_artifact):
     """Finite garbage in masked tail slots (positions > cache_position) must
     not change the decode output — the in-graph mask zeroes those weights
-    exactly.  (Slot n itself is overwritten by the ScatterND diagonal.)
+    exactly.  (Slot n itself is overwritten by the ScatterND diagonal.).
     """
     onnx_path, embedding = adder_artifact
     token_ids = _ids(embedding, _PROTO_TOKENS)
@@ -562,7 +562,7 @@ def test_token_onnx_prefix_window_binding(adder_artifact):
     ref = decode_window(S)
     for s_eff in (n + 1, n + 3, S - 1):
         got = decode_window(s_eff)
-        for r, g, name in zip(ref, got, out_names):
+        for r, g, name in zip(ref, got, out_names, strict=False):
             assert np.array_equal(r, g), (
                 f"S_eff={s_eff}: {name} differs from the full-S binding "
                 f"(max diff {np.abs(r - g).max():.6e})"

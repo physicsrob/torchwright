@@ -75,14 +75,21 @@ def test_diagnostic_hint_defensively_freezes_parallel_mappings():
         hint.layers[2] = 3
 
 
-_SOLVE_KW = dict(d=64, d_head=8, d_hidden=128, time_budget_s=10.0, max_layers=20)
+_SOLVE_KW = {
+    "d": 64,
+    "d_head": 8,
+    "d_hidden": 128,
+    "time_budget_s": 10.0,
+    "max_layers": 20,
+}
 
 
 def test_tighten_domains_preserves_optimum():
     out = _repro_graph()
     plain, _ = solve_schedule(out, **_SOLVE_KW)
     tight, tight_stats = solve_schedule(out, tighten_domains=True, **_SOLVE_KW)
-    assert plain is not None and tight is not None
+    assert plain is not None
+    assert tight is not None
     assert tight_stats.status_name == "OPTIMAL"
     assert tight.n_layers == plain.n_layers
 
@@ -125,8 +132,10 @@ def test_drop_decision_strategy_solves_same_depth():
     out = _repro_graph()
     with_strategy, s0 = solve_schedule(out, **_SOLVE_KW)
     without, s1 = solve_schedule(out, drop_decision_strategy=True, **_SOLVE_KW)
-    assert with_strategy is not None and without is not None
-    assert s0.status_name == "OPTIMAL" and s1.status_name == "OPTIMAL"
+    assert with_strategy is not None
+    assert without is not None
+    assert s0.status_name == "OPTIMAL"
+    assert s1.status_name == "OPTIMAL"
     assert without.n_layers == with_strategy.n_layers
 
 
@@ -161,7 +170,8 @@ def test_secondary_objectives_are_lexicographic(costs):
     out = _repro_graph()
     plain, _ = solve_schedule(out, **_SOLVE_KW)
     sec, stats = solve_schedule(out, costs=costs, **_SOLVE_KW)
-    assert plain is not None and sec is not None
+    assert plain is not None
+    assert sec is not None
     assert sec.n_layers == plain.n_layers
     assert stats.objective_scale > 1
     assert stats.objective_value // stats.objective_scale == plain.n_layers
@@ -216,13 +226,13 @@ def test_schedule_cache_round_trip(tmp_path, monkeypatch):
     from torchwright.compiler.forward.compile import forward_compile
 
     monkeypatch.setenv("TW_SCHEDULE_CACHE_DIR", str(tmp_path))
-    kw = dict(
-        d=64,
-        d_head=8,
-        device="cpu",
-        verbose=False,
-        optimize=2,
-    )
+    kw = {
+        "d": 64,
+        "d_head": 8,
+        "device": "cpu",
+        "verbose": False,
+        "optimize": 2,
+    }
     out1 = _repro_graph()
     net1 = forward_compile(output_node=out1, **kw)
     assert net1.cpsat_solve_stats.status_name in ("OPTIMAL", "FEASIBLE")
@@ -289,14 +299,14 @@ def test_schedule_cache_keys_on_compiler_code(monkeypatch):
     from torchwright.compiler import graph_identity
 
     out = _repro_graph()
-    kw = dict(
-        d=64,
-        d_head=8,
-        d_hidden=64,
-        flex_routing=True,
-        cancel_slack=2,
-        policy=None,
-    )
+    kw = {
+        "d": 64,
+        "d_head": 8,
+        "d_hidden": 64,
+        "flex_routing": True,
+        "cancel_slack": 2,
+        "policy": None,
+    }
     fp_before = graph_identity.graph_fingerprint(out, **kw)
     assert fp_before == graph_identity.graph_fingerprint(out, **kw)
     monkeypatch.setattr(
@@ -352,7 +362,7 @@ def test_schedule_cache_optimize_gate_end_to_end(tmp_path, monkeypatch):
     from torchwright.compiler.forward.compile import forward_compile
 
     monkeypatch.setenv("TW_SCHEDULE_CACHE_DIR", str(tmp_path))
-    kw = dict(d=64, d_head=8, device="cpu", verbose=False)
+    kw = {"d": 64, "d_head": 8, "device": "cpu", "verbose": False}
 
     net1 = forward_compile(output_node=_repro_graph(), optimize=1, **kw)
     assert net1.cpsat_solve_stats.status_name in ("OPTIMAL", "FEASIBLE")
@@ -384,7 +394,8 @@ def _deferred_cancel_hint(max_layers, cancel_slack=2):
 
     out = _repro_graph()
     assignment, stats = solve_schedule(out, _pin_cancels=False, **_SOLVE_KW)
-    assert assignment is not None and stats.status_name == "OPTIMAL"
+    assert assignment is not None
+    assert stats.status_name == "OPTIMAL"
 
     gm = build_graph_model(out)
     pinned_ids = {n.node_id for n in gm.pinned_nodes}
@@ -451,12 +462,12 @@ def test_deferred_cancel_hint_rejected_without_widening():
     out, (hint_layers, hint_routing, hint_cancel), target_id = _deferred_cancel_hint(
         max_layers
     )
-    build_kw = dict(
-        d=_SOLVE_KW["d"],
-        d_head=_SOLVE_KW["d_head"],
-        d_hidden=_SOLVE_KW["d_hidden"],
-        max_layers=max_layers,
-    )
+    build_kw = {
+        "d": _SOLVE_KW["d"],
+        "d_head": _SOLVE_KW["d_head"],
+        "d_hidden": _SOLVE_KW["d_hidden"],
+        "max_layers": max_layers,
+    }
 
     blind = build_cpsat_model(out, _pin_cancels=False, **build_kw)
     assert blind.cancel_window_delta is None
@@ -683,7 +694,7 @@ def test_schedule_cache_stores_once_after_replay_and_not_on_hit(tmp_path, monkey
         return real_store(*args, **kwargs)
 
     monkeypatch.setattr(compile_mod, "store_assignment", counting_store)
-    kw = dict(d=64, d_head=8, device="cpu", verbose=False, optimize=1)
+    kw = {"d": 64, "d_head": 8, "device": "cpu", "verbose": False, "optimize": 1}
 
     net1 = forward_compile(output_node=_repro_graph(), **kw)
     assert net1.cpsat_solve_stats.status_name in ("OPTIMAL", "FEASIBLE")

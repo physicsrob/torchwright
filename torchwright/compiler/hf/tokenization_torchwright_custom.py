@@ -36,11 +36,11 @@ class TorchwrightCustomTokenizer(PreTrainedTokenizer):
         vocab_file: str | None = None,
         *,
         unk_token: str = "<unk>",
-        bos_token: str = "<bos>",
-        eos_token: str = "<eos>",
+        bos_token: str | None = "<bos>",
+        eos_token: str | None = "<eos>",
         add_bos_token: bool = True,
         **kwargs,
-    ):
+    ) -> None:
         if vocab_file is None:
             raise ValueError(
                 "TorchwrightCustomTokenizer needs vocab_file (vocab.json); load via "

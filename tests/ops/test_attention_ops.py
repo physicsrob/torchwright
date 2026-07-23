@@ -958,17 +958,17 @@ def test_baib_near_one_hot_inputs_do_not_change_selection():
     nb, nt = 3, 5
     out = _baib_nodes(nb, nt)
     n_pos = 5
-    kwargs = dict(
-        scores=[6, 4, 8, 3, 5],
-        buckets=[1, 1, 1, 0, 1],
-        valid=[1, 1, 1, 1, 1],
-        thresholds=[0, 1, 2, 3, 4],
-        q_bucket=[1] * n_pos,
-        q_thresh=[2] * n_pos,
-        value_in=torch.eye(n_pos, 4),
-        nb=nb,
-        nt=nt,
-    )
+    kwargs = {
+        "scores": [6, 4, 8, 3, 5],
+        "buckets": [1, 1, 1, 0, 1],
+        "valid": [1, 1, 1, 1, 1],
+        "thresholds": [0, 1, 2, 3, 4],
+        "q_bucket": [1] * n_pos,
+        "q_thresh": [2] * n_pos,
+        "value_in": torch.eye(n_pos, 4),
+        "nb": nb,
+        "nt": nt,
+    }
     clean = _run_baib(out, n_pos, **kwargs)
     noisy = _run_baib(out, n_pos, perturb=0.97, **kwargs)
     for q in range(n_pos):

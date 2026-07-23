@@ -42,7 +42,7 @@ _SHIPPED = [
 ]
 
 
-@pytest.mark.parametrize("filename,allowed_extra,allowed_rel", _SHIPPED)
+@pytest.mark.parametrize(("filename", "allowed_extra", "allowed_rel"), _SHIPPED)
 def test_shipped_file_imports_are_clean(filename, allowed_extra, allowed_rel):
     from transformers.dynamic_module_utils import get_imports, get_relative_imports
 

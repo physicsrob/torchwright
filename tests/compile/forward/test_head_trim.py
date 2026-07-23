@@ -128,7 +128,10 @@ def test_compiled_zero_support_floor_head_is_compacted():
     assert dead_allocated_heads(untrimmed) >= 1
 
     trimmed = compile_(True)
-    heads = lambda net: sum(layer.attn.attn.n_heads for layer in net.layers)
+
+    def heads(net):
+        return sum(layer.attn.attn.n_heads for layer in net.layers)
+
     assert heads(trimmed) < heads(untrimmed)
 
     vals = {

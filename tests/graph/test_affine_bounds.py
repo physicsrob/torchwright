@@ -95,7 +95,7 @@ class TestAlign:
             x = InputNode(2, name="x", value_range=(-1.0, 1.0))
             a = AffineBound.identity(x)
             b = AffineBound.identity(x)
-            a2, b2 = AffineBound.align(a, b)
+            a2, _b2 = AffineBound.align(a, b)
             assert a2.columns == a.columns
             assert torch.equal(a2.A_lo, a.A_lo)
 
@@ -114,7 +114,7 @@ class TestAlign:
             assert ax2.A_lo[0, 2].item() == 0.0
             # y's identity is in last 3 cols, zeros in first 2
             assert ay2.A_lo[0, 0].item() == 0.0
-            x_id, y_id = x.node_id, y.node_id
+            _x_id, y_id = x.node_id, y.node_id
             y_start = ay2.columns[y_id][0]
             assert ay2.A_lo[0, y_start].item() == 1.0
 
@@ -162,7 +162,7 @@ class TestAlign:
 class TestSession:
     def test_fresh_session_isolates_inputs(self):
         with fresh_graph_session() as s1:
-            x = InputNode(2, name="x", value_range=(-100.0, 100.0))
+            InputNode(2, name="x", value_range=(-100.0, 100.0))
             assert len(s1.input_nodes) == 1
         with fresh_graph_session() as s2:
             y = InputNode(3, name="y", value_range=(-100.0, 100.0))
@@ -501,7 +501,8 @@ class TestClaimChannels:
 
             a1 = assert_in_range(x, -2.0, 3.0)
             a2 = assert_in_range(x, -5.0, 5.0)
-            assert a1 is x and a2 is x
+            assert a1 is x
+            assert a2 is x
             lin1 = Linear(a1, torch.tensor([[1.0]]))
             lin2 = Linear(a2, torch.tensor([[1.0]]))
             for lin in (lin1, lin2):
@@ -933,7 +934,8 @@ class TestToIntervalFpCrossing:
         assert intervals[0].lo == intervals[0].hi == 0.5
         # to_scalar_range goes through the same path.
         r = ab.to_scalar_range()
-        assert r.lo == pytest.approx(0.5) and r.hi == pytest.approx(0.5)
+        assert r.lo == pytest.approx(0.5)
+        assert r.hi == pytest.approx(0.5)
 
     def test_gross_crossing_still_raises(self):
         ab = self._point_bound(1.0, 0.5)
@@ -1011,7 +1013,8 @@ class TestSwishSandwich:
         assert hi == pytest.approx(-10.0 / (1.0 + math.exp(10.0)))
         # Infinite endpoints stay sound and NaN-free.
         lo, hi = _swish_interval(float("-inf"), float("inf"))
-        assert lo == pytest.approx(-0.278465, abs=1e-6) and math.isinf(hi)
+        assert lo == pytest.approx(-0.278465, abs=1e-6)
+        assert math.isinf(hi)
 
 
 class TestGatedFFNRule:
@@ -1074,7 +1077,8 @@ class TestGatedFFNRule:
                 out_proj=torch.randn(8, 3, generator=g),
             )
             r = blk.value_type.value_range
-            assert math.isfinite(r.lo) and math.isfinite(r.hi)
+            assert math.isfinite(r.lo)
+            assert math.isfinite(r.hi)
 
     def test_unbounded_input_degenerates_without_crash(self):
         """An unbounded gated lane must fall back to an unbounded row —
@@ -1113,7 +1117,8 @@ class TestGatedFFNTightness:
             )
             r = blk.affine_bound.to_interval()[0]
             assert r.lo <= -100.0 <= 100.0 <= r.hi  # contains the true range
-            assert r.lo >= -110.0 and r.hi <= 110.0  # within 1.10x
+            assert r.lo >= -110.0
+            assert r.hi <= 110.0
             assert _pointwise_slack(blk, -10.0, 10.0) >= -1e-9
 
     def test_select_construction(self):
@@ -1133,8 +1138,10 @@ class TestGatedFFNTightness:
                 out_proj=torch.tensor([[1.0 / s], [1.0 / s]]),
             )
             r = blk.affine_bound.to_interval()[0]
-            assert r.lo <= -9.9 and r.hi >= 9.9
-            assert r.lo >= -11.5 and r.hi <= 11.5
+            assert r.lo <= -9.9
+            assert r.hi >= 9.9
+            assert r.lo >= -11.5
+            assert r.hi <= 11.5
 
     def test_cond_gate_construction(self):
         # cond_gate(cond, inp) = swish(s*cond)/s * inp: single gated lane.
@@ -1152,5 +1159,7 @@ class TestGatedFFNTightness:
                 out_proj=torch.tensor([[1.0 / s]]),
             )
             r = blk.affine_bound.to_interval()[0]
-            assert r.lo <= -9.9 and r.hi >= 9.9
-            assert r.lo >= -11.0 and r.hi <= 11.0
+            assert r.lo <= -9.9
+            assert r.hi >= 9.9
+            assert r.lo >= -11.0
+            assert r.hi <= 11.0

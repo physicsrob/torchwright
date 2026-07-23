@@ -81,7 +81,7 @@ def normed_forward(net, res0, free_cols, n_const, gain, eps):
     return cur, (rms_all.max() - rms_all.min()).item()
 
 
-def run_case(d, max_digits, prompt):
+def run_case(d, max_digits, prompt) -> None:
     n_const, m = pow2_layout(d)
     gain = 2.0**m
     output_node, embedding = create_network_parts(max_digits=max_digits)
@@ -119,7 +119,7 @@ def run_case(d, max_digits, prompt):
     )
 
 
-def main():
+def main() -> None:
     cases = [
         (1, ["<bos>", "2", "*", "3", "\n"]),
         (3, ["<bos>", "1", "2", "*", "3", "4", "\n"]),

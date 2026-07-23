@@ -6,6 +6,7 @@ CPU only. Production resolution (set env before running):
 
 from __future__ import annotations
 
+import itertools
 import statistics
 from collections import defaultdict
 
@@ -46,7 +47,7 @@ def gaps(writes):
     g = []
     for col, ps in by.items():
         ps.sort()
-        g += [b - a for a, b in zip(ps, ps[1:])]
+        g += [b - a for a, b in itertools.pairwise(ps)]
     return g
 
 
@@ -60,7 +61,7 @@ for angle in range(0, 256, 16):
     ntok, writes = writes_for(angle)
     g = sorted(gaps(writes))
     all_gaps += g
-    ncol = len(set(c for _, c in writes))
+    ncol = len({c for _, c in writes})
     if g:
         med = int(statistics.median(g))
         p95 = g[min(len(g) - 1, int(0.95 * len(g)))]

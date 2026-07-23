@@ -267,7 +267,7 @@ def save_hf_bundle(
 
 def _save_hf_bundle_into(
     model, vocab, output_dir, *, add_bos_token=True, write_tokenizer=True
-):
+) -> None:
     os.makedirs(output_dir, exist_ok=True)
     model.save_pretrained(output_dir)
     _write_generation_config(
@@ -418,12 +418,12 @@ def _compile_hf_bundle_into(
     n_heads = resolve_n_heads(d, d_head, n_heads)
 
     class DirectShardSink:
-        def __init__(self):
-            self.meta = []
-            self.weight_map = {}
+        def __init__(self) -> None:
+            self.meta: list[tuple[str, int, int, float, int]] = []
+            self.weight_map: dict[str, str] = {}
             self.total_size = 0
 
-        def begin(self, header):
+        def begin(self, header) -> None:
             self.header = header
             if not header.layer_shapes:
                 raise RuntimeError("HF streaming requires announced layer shapes")
@@ -431,7 +431,7 @@ def _compile_hf_bundle_into(
             self.max_heads = max(shape.n_heads for shape in header.layer_shapes)
             self.max_hidden = max(shape.d_hidden for shape in header.layer_shapes)
 
-        def write_layer(self, index, layer):
+        def write_layer(self, index, layer) -> None:
             a = layer.attention
             p = f"model.layers.{index}"
             if profile is CompileProfile.CUSTOM:
@@ -481,7 +481,7 @@ def _compile_hf_bundle_into(
                 self.total_size += value.numel() * value.element_size()
             self.meta.append((kind, a.n_heads, layer.d_hidden, a.rope_base, a.d_rot))
 
-        def finalize(self, spec, weights):
+        def finalize(self, spec, weights) -> None:
             self.spec = spec
             self.token_weights = weights
 
@@ -523,7 +523,7 @@ def _compile_hf_bundle_into(
         heads = [m[1] for m in sink.meta]
         hidden = [m[2] for m in sink.meta]
         proxy_layers: list[Any] = []
-        for kind, nh, dh, base, drot in sink.meta:
+        for _kind, _nh, _dh, base, drot in sink.meta:
             # Only RoPE metadata is inspected by resolve_rope.
             class A:
                 rope_base: Any

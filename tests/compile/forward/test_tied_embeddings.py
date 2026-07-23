@@ -449,15 +449,15 @@ def test_no_bias_clear_uses_reserved_constant_lane():
 def test_cpsat_charges_direct_compute_and_cancel_in_same_layer():
     embedding = _embedding()
     output = _identity(embedding, "output")
-    common = dict(
-        output_node=output,
-        d_head=2,
-        d_hidden=16,
-        max_layers=4,
-        time_budget_s=5.0,
-        held_source_id=embedding.node_id,
-        held_target_id=output.node_id,
-    )
+    common = {
+        "output_node": output,
+        "d_head": 2,
+        "d_hidden": 16,
+        "max_layers": 4,
+        "time_budget_s": 5.0,
+        "held_source_id": embedding.node_id,
+        "held_target_id": output.node_id,
+    }
 
     impossible, _ = solve_schedule(d=5, **common)
     assert impossible is None
@@ -501,7 +501,7 @@ def test_held_live_and_snapshot_models_are_identical():
 
     embedding = _embedding()
     output = _identity(embedding, "output")
-    geometry = dict(d=9, d_head=2, d_hidden=16, max_layers=4)
+    geometry = {"d": 9, "d_head": 2, "d_hidden": 16, "max_layers": 4}
     live = build_cpsat_model(
         output,
         **geometry,
@@ -543,7 +543,7 @@ def test_snapshot_held_contract_validation():
     embedding = _embedding()
     output = _identity(embedding, "output")
     gm = build_graph_model(output)
-    geometry = dict(d=9, d_head=2, d_hidden=16, max_layers=4)
+    geometry = {"d": 9, "d_head": 2, "d_hidden": 16, "max_layers": 4}
 
     with pytest.raises(ValueError, match="supplied together"):
         snapshot_from_graph_model(gm, held_source_id=embedding.node_id)
@@ -590,7 +590,7 @@ def test_canonicalized_snapshot_remaps_and_rebuilds_held_ids():
 
     embedding = _embedding()
     output = _identity(embedding, "output")
-    geometry = dict(d=9, d_head=2, d_hidden=16, max_layers=4)
+    geometry = {"d": 9, "d_head": 2, "d_hidden": 16, "max_layers": 4}
     problem = snapshot_from_graph_model(
         build_graph_model(output),
         held_source_id=embedding.node_id,
@@ -621,14 +621,14 @@ def test_snapshot_identity_matches_production_cache_key_for_tied_graph(tmp_path)
     """
     embedding = _embedding()
     output = _identity(embedding, "output")
-    fp_cfg = dict(
-        d=16,
-        d_head=4,
-        d_hidden=16,
-        flex_routing=True,
-        cancel_slack=2,
-        policy=None,
-    )
+    fp_cfg = {
+        "d": 16,
+        "d_head": 4,
+        "d_hidden": 16,
+        "flex_routing": True,
+        "cancel_slack": 2,
+        "policy": None,
+    }
     production_fp = graph_fingerprint(
         output,
         **fp_cfg,
@@ -670,14 +670,14 @@ def test_snapshot_identity_matches_production_cache_key_for_tied_graph(tmp_path)
 def test_held_contract_participates_in_schedule_cache_identity():
     embedding = _embedding()
     output = _identity(embedding, "output")
-    cfg = dict(
-        d=16,
-        d_head=4,
-        d_hidden=16,
-        flex_routing=True,
-        cancel_slack=2,
-        policy=None,
-    )
+    cfg = {
+        "d": 16,
+        "d_head": 4,
+        "d_hidden": 16,
+        "flex_routing": True,
+        "cancel_slack": 2,
+        "policy": None,
+    }
     generic = graph_fingerprint(output, **cfg)
     held = graph_fingerprint(
         output,
@@ -728,17 +728,17 @@ def test_held_schedule_cache_replay_keeps_bank(monkeypatch, tmp_path):
     monkeypatch.setenv("TW_SCHEDULE_CACHE_DIR", str(tmp_path))
     embedding = _embedding()
     output = _identity(embedding, "output")
-    kwargs = dict(
-        d=16,
-        d_head=4,
-        d_hidden=16,
-        output_node=output,
-        output_layout_source=embedding,
-        rms_norm=False,
-        optimize=1,
-        require_solver=True,
-        verbose=False,
-    )
+    kwargs = {
+        "d": 16,
+        "d_head": 4,
+        "d_hidden": 16,
+        "output_node": output,
+        "output_layout_source": embedding,
+        "rms_norm": False,
+        "optimize": 1,
+        "require_solver": True,
+        "verbose": False,
+    }
 
     first = forward_compile(**kwargs)
     assert first.cpsat_solve_stats.status_name != "CACHED"

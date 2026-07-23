@@ -101,7 +101,7 @@ def test_no_bias_probe_clean(build, xt):
     """probe_compiled agrees with the oracle everywhere under bias=False,
     on both machines, and no physical bias vector is written.
     """
-    _, lit, out = build()
+    _, _lit, out = build()
     compiled = compile_headless(out, d=D, d_head=D_HEAD, bias=False)
     _assert_no_physical_bias(compiled)
     report = probe_compiled(compiled, out, {"x": xt}, N_POS, atol=1e-3)
@@ -193,14 +193,14 @@ def test_schedule_fingerprint_keys_on_bias():
     cache entries keep hitting).
     """
     _, _, out = _relu_graph()
-    common = dict(
-        d=D,
-        d_head=D_HEAD,
-        d_hidden=D,
-        flex_routing=True,
-        cancel_slack=2,
-        policy=None,
-    )
+    common = {
+        "d": D,
+        "d_head": D_HEAD,
+        "d_hidden": D,
+        "flex_routing": True,
+        "cancel_slack": 2,
+        "policy": None,
+    }
     fp_default = graph_fingerprint(out, **common)
     fp_true = graph_fingerprint(out, bias=True, **common)
     fp_false = graph_fingerprint(out, bias=False, **common)

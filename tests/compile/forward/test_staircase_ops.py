@@ -64,7 +64,7 @@ def _run_module_on_integer_range(module, max_value: int) -> torch.Tensor:
         return module(inputs).squeeze(-1)
 
 
-@pytest.mark.parametrize("divisor,max_value", SCALE_CASES)
+@pytest.mark.parametrize(("divisor", "max_value"), SCALE_CASES)
 def test_thermometer_floor_div_exhaustive(divisor, max_value):
     """For every integer v in [0, max_value], floor_div(v, divisor) == v // divisor."""
     module = _compile_unary(
@@ -85,7 +85,7 @@ def test_thermometer_floor_div_exhaustive(divisor, max_value):
     )
 
 
-@pytest.mark.parametrize("divisor,max_value", SCALE_CASES)
+@pytest.mark.parametrize(("divisor", "max_value"), SCALE_CASES)
 def test_mod_const_exhaustive(divisor, max_value):
     """For every integer v in [0, max_value], mod_const(v, divisor) == v % divisor."""
     module = _compile_unary(
@@ -106,7 +106,7 @@ def test_mod_const_exhaustive(divisor, max_value):
     )
 
 
-@pytest.mark.parametrize("divisor,max_value", SCALE_CASES)
+@pytest.mark.parametrize(("divisor", "max_value"), SCALE_CASES)
 def test_mod_const_crosses_every_wraparound(divisor, max_value):
     """Stricter check: every ``v`` that sits immediately on either side of a
     multiple of ``divisor`` is within 0.25 of the ground truth.  This

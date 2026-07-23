@@ -1,4 +1,4 @@
-"""Fibonacci generator: export to ONNX and verify correctness.
+r"""Fibonacci generator: export to ONNX and verify correctness.
 
 Tests that the autoregressive recurrence produces correct Fibonacci numbers.
 The input prompt must have enough tokens before \\n to avoid out-of-bounds

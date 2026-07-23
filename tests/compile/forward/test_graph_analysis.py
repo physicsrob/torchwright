@@ -97,7 +97,7 @@ def test_adder_graph():
     """
     from torchwright.compiler.lower import lower
 
-    source_output, embedding = create_network_parts()
+    source_output, _embedding = create_network_parts()
     output_node = lower(source_output).output_node
     graph = GraphAnalyzer(output_node)
 

@@ -14,13 +14,17 @@ See ``docs/numerical_noise.md`` for the methodology this module implements.
 from __future__ import annotations
 
 import ast
-from collections.abc import Callable
 from dataclasses import dataclass
+from typing import TYPE_CHECKING
 
 import torch
 
-from torchwright.graph import Node
 from torchwright.ops.inout_nodes import create_input
+
+if TYPE_CHECKING:
+    from collections.abc import Callable
+
+    from torchwright.graph import Node
 
 NOISE_FOOTER_MARKER = ".. noise-footer::"
 
@@ -283,7 +287,7 @@ def update_docstring_footer(
         trim = marker_idx
         while trim > 0 and doc_lines[trim - 1].strip() == "":
             trim -= 1
-        doc_lines = doc_lines[:trim] + [closing]
+        doc_lines = [*doc_lines[:trim], closing]
 
     footer = render_footer_block(
         max_abs_error=max_abs_error,

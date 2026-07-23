@@ -40,7 +40,7 @@ _MACHINES = {
 def _build(machine):
     """output_sequence emitting the digit embeddings 0..5 after "=" fires."""
     output_sequence, equals_vector = _MACHINES[machine]
-    embedding = create_embedding(vocab=list("012345") + ["="])
+    embedding = create_embedding(vocab=[*list("012345"), "="])
     rope = create_rope_config(d_head=D_HEAD, max_positions=512)
     trigger = equals_vector(embedding, embedding.get_embedding("="))
     seq = [

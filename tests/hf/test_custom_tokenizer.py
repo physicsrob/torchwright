@@ -18,7 +18,7 @@ from torchwright.compiler.hf.tokenization_torchwright_custom import (
     TorchwrightCustomTokenizer,
 )
 
-_VOCAB = ["<unk>", "<bos>", "<eos>"] + list("0123456789+-*\n")
+_VOCAB = ["<unk>", "<bos>", "<eos>", *list("0123456789+-*\n")]
 
 
 @pytest.fixture

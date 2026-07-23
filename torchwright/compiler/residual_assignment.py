@@ -8,13 +8,13 @@ class ResidualStreamState:
     state_id: int
     name: str  # For debugging
 
-    def __init__(self, name: str = ""):
+    def __init__(self, name: str = "") -> None:
         global global_state_id
         self.state_id = global_state_id
         self.name = name
         global_state_id += 1
 
-    def __repr__(self):
+    def __repr__(self) -> str:
         return f"ResidualStreamState({self.state_id}, name='{self.name}')"
 
 
@@ -28,13 +28,17 @@ class ResidualAssignment:
 
     mapping: dict[ResidualStreamState, dict[Node, list[int]]]
 
-    def __init__(self, states: set[ResidualStreamState]):
+    def __init__(self, states: set[ResidualStreamState]) -> None:
         self.mapping = {state: {} for state in states}
 
-    def assign(self, state: ResidualStreamState, node: Node, indices: list[int]):
+    def assign(
+        self, state: ResidualStreamState, node: Node, indices: list[int]
+    ) -> None:
         self.mapping[state][node] = indices
 
-    def duplicate_state(self, src: ResidualStreamState, dst: ResidualStreamState):
+    def duplicate_state(
+        self, src: ResidualStreamState, dst: ResidualStreamState
+    ) -> None:
         self.mapping[dst] = self.mapping[src]
 
     def has_node(self, state: ResidualStreamState, node: Node) -> bool:

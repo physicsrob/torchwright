@@ -33,7 +33,9 @@ def _select_per_column_offsets(true_node, false_node, scalar_M):
     fi = _intersect_intervals(false_node)
     if ti is None or fi is None or len(ti) != len(fi):
         return torch.full((len(true_node),), scalar_M)
-    union = [Range(min(t.lo, f.lo), max(t.hi, f.hi)) for t, f in zip(ti, fi)]
+    union = [
+        Range(min(t.lo, f.lo), max(t.hi, f.hi)) for t, f in zip(ti, fi, strict=False)
+    ]
     return per_column_offsets(union, scalar_M)
 
 
@@ -261,7 +263,7 @@ def _table_lookup_row_vector(
     d_max: int,
     name: str,
 ) -> Node:
-    rows, cols = table.shape
+    rows, _cols = table.shape
     if rows == 1:
         return _constant_vector(table[0], name=f"{name}_constant_row")
 
@@ -437,7 +439,9 @@ def switch(conditions: list[Node], values: list[Node]) -> Node:
     Returns:
         Node: The value whose corresponding condition is true.
     """
-    return sum_nodes([cond_gate(c, v) for c, v in zip(conditions, values)])
+    return sum_nodes(
+        [cond_gate(c, v) for c, v in zip(conditions, values, strict=False)]
+    )
 
 
 def _select_output_type(

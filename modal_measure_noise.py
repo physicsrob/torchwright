@@ -53,7 +53,7 @@ def measure() -> dict:
 
 
 @app.local_entrypoint()
-def main():
+def main() -> None:
     files = measure.remote()
     root = pathlib.Path(__file__).resolve().parent
     for rel, content in sorted(files.items()):

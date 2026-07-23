@@ -25,10 +25,12 @@ import json
 from dataclasses import asdict
 from functools import lru_cache
 from pathlib import Path
-from typing import cast
+from typing import TYPE_CHECKING, cast
 
 from torchwright.compiler.utils import resolve_n_heads
-from torchwright.graph import Node
+
+if TYPE_CHECKING:
+    from torchwright.graph import Node
 
 
 @lru_cache(maxsize=1)

@@ -134,13 +134,13 @@ def _lower(out, d):
 def test_knob_off_is_byte_identical(name):
     """With the knob off the proto equals the plain legacy build."""
     node, d, d_head = _build(name)
-    cfg = dict(
-        d=d,
-        d_head=d_head,
-        d_hidden=d,
-        max_layers=_MAX_LAYERS,
-        _pin_cancels=False,
-    )
+    cfg = {
+        "d": d,
+        "d_head": d_head,
+        "d_hidden": d,
+        "max_layers": _MAX_LAYERS,
+        "_pin_cancels": False,
+    }
     default = _proto_text(build_cpsat_model(node, **cfg))
     off = _proto_text(build_cpsat_model(node, _canonical_cancel_reps=False, **cfg))
     assert off == default, f"{name}: knob-off proto differs from legacy build"
@@ -156,13 +156,13 @@ def test_knob_on_changes_proto(name):
     D-2 converse ``cancel_layer <= max_layers - 1`` under ``parked.Not()``.
     """
     node, d, d_head = _build(name)
-    cfg = dict(
-        d=d,
-        d_head=d_head,
-        d_hidden=d,
-        max_layers=_MAX_LAYERS,
-        _pin_cancels=False,
-    )
+    cfg = {
+        "d": d,
+        "d_head": d_head,
+        "d_hidden": d,
+        "max_layers": _MAX_LAYERS,
+        "_pin_cancels": False,
+    }
     off = _proto_text(build_cpsat_model(node, _canonical_cancel_reps=False, **cfg))
     on = _proto_text(build_cpsat_model(node, _canonical_cancel_reps=True, **cfg))
     assert on != off, f"{name}: knob-on proto identical to off (knob is dead)"
@@ -182,7 +182,7 @@ _SOLVE_CELLS = [
 ]
 
 
-@pytest.mark.parametrize("name,d", _SOLVE_CELLS)
+@pytest.mark.parametrize(("name", "d"), _SOLVE_CELLS)
 def test_canonical_form_on_solved_model(name, d):
     build, _, d_head = _example_specs()[name]
     torch.manual_seed(0)
@@ -224,7 +224,7 @@ def test_canonical_form_on_solved_model(name, d):
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.parametrize("name,d", _SOLVE_CELLS)
+@pytest.mark.parametrize(("name", "d"), _SOLVE_CELLS)
 def test_depth_invariance_on_vs_off(name, d):
     build, _, d_head = _example_specs()[name]
 

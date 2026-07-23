@@ -31,7 +31,7 @@ _DEFAULT = torch.tensor([5.0, 0.5])
 
 
 def _table():
-    return dict(zip(_KEYS, _VALUES))
+    return dict(zip(_KEYS, _VALUES, strict=False))
 
 
 def _unwrap(node):
@@ -58,7 +58,7 @@ def test_map_to_table_structure():
 def test_map_to_table_match_and_default():
     x = create_input("x", 3, value_range=(-5.0, 5.0))
     out = map_to_table(x, _table(), _DEFAULT)
-    xs = torch.stack(_KEYS + [torch.zeros(3)])
+    xs = torch.stack([*_KEYS, torch.zeros(3)])
     val = out.compute(4, {"x": xs})
     # Matches: value_i to ~1 ulp (×scale/÷scale round trip); other
     # entries' leakage underflows.

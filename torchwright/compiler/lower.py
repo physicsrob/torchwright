@@ -201,7 +201,7 @@ class _ChainMiner:
     ``Concatenate``.
     """
 
-    def __init__(self, all_nodes: set[Node]):
+    def __init__(self, all_nodes: set[Node]) -> None:
         self._direct_consumers: dict[Node, list[Node]] = {n: [] for n in all_nodes}
         for node in all_nodes:
             for inp in node.inputs:

@@ -30,7 +30,7 @@ Phase A instrument; synthesis is Phase B, gated on Rob's GO.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import cast
+from typing import TYPE_CHECKING, cast
 
 import torch
 
@@ -54,8 +54,10 @@ from torchwright.compiler.pl_function import (
     model_s2,
     transition_runs,
 )
-from torchwright.graph import Node
 from torchwright.graph.ffn import FFN
+
+if TYPE_CHECKING:
+    from torchwright.graph import Node
 
 
 @dataclass(frozen=True)
@@ -408,7 +410,7 @@ def analyze_collapse_v2(
                 )
             if all(s1s):
                 verdict, depth_after = "S1", 1
-            elif all(a or b for a, b in zip(s1s, s2s)):
+            elif all(a or b for a, b in zip(s1s, s2s, strict=False)):
                 verdict, depth_after = "S2", 2
             else:
                 bad_i = next(i for i in range(len(analyses)) if not (s1s[i] or s2s[i]))

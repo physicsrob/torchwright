@@ -45,7 +45,7 @@ from __future__ import annotations
 
 import json
 import os
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import numpy as np
 import torch
@@ -65,8 +65,10 @@ from torchwright.compiler.residual_assignment import (
     ResidualAssignment,
     ResidualStreamState,
 )
-from torchwright.graph import Node
 from torchwright.graph.embedding import Embedding
+
+if TYPE_CHECKING:
+    from torchwright.graph import Node
 
 #: Appended to the self-consistency failure preamble on this backend —
 #: unlike the in-process backend, a violation here has three candidate
@@ -561,7 +563,7 @@ class OnnxDebugSession:
         if inputs.ndim == 1:
             inputs = inputs.reshape(-1, 1) if self._kind == "token" else inputs
         base = self._resolve_base(past, past_len)
-        n_new = int(inputs.shape[0])
+        int(inputs.shape[0])
         feeds = self._feeds(inputs, base, past)
 
         fetch = [self._primary_output]

@@ -13,14 +13,14 @@ class LinearLayerComponent(Component):
     Forward: out = inp @ output_matrix + output_bias
     """
 
-    def __init__(self, d_in: int, d_out: int, name: str = ""):
+    def __init__(self, d_in: int, d_out: int, name: str = "") -> None:
         super().__init__(d_out, name)
         self.d_in = d_in
         self.d_out = d_out
         self.output_matrix = torch.zeros(d_in, d_out)
         self.output_bias = torch.zeros(d_out)
 
-    def __repr__(self):
+    def __repr__(self) -> str:
         return f"LinearLayerComponent(name='{self.name}')"
 
     def forward(self, inp: torch.Tensor):

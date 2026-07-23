@@ -521,7 +521,7 @@ def attend_argmin_above_in_bucket(
     assert n_thresholds >= 1, "n_thresholds must be >= 1"
 
     d_qk = 2 + n_buckets + n_thresholds
-    d_v = len(value)
+    len(value)
 
     # d_qk column layout:
     #   col 0:                         score logit  (Q = _QUERY_GAIN, K = -score)

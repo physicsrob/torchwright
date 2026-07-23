@@ -1,4 +1,4 @@
-"""Flat-depth, scratchpad ("thinking tokens") calculator.
+r"""Flat-depth, scratchpad ("thinking tokens") calculator.
 
 ``calculator_simple`` and ``calculator_advanced`` compute ``A op B`` (``+ - *``,
 one-hot digits) with the serial carry/borrow/comparison work folded *inside the
@@ -338,7 +338,7 @@ class _SeqLayout:
         n_norm: int,
         n_answer: int,
         n_state: int,
-    ):
+    ) -> None:
         self.carry_start = 1  # first carry/verdict glyph (THINKING_START at 0)
         self.scratch_start = 1 + n_carry  # first scratch digit
         self.norm_start = self.scratch_start + n_scratch  # first normalization glyph
@@ -907,13 +907,13 @@ def _assemble(
     encodes, so every read offset lines up by construction.
     """
     embed = embedding.get_embedding
-    return (
-        [create_literal_value(embed(THINKING_START))]
-        + thinking
-        + [create_literal_value(embed(RESULT))]
-        + answer
-        + [create_literal_value(embed("<eos>"))]
-    )
+    return [
+        create_literal_value(embed(THINKING_START)),
+        *thinking,
+        create_literal_value(embed(RESULT)),
+        *answer,
+        create_literal_value(embed("<eos>")),
+    ]
 
 
 def _emit_by_slot_index(

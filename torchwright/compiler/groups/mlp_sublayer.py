@@ -18,7 +18,7 @@ class MLPSubLayer:
     #: Machine kind (uniform per compiled network; see GatedMLPSubLayer).
     activation = "relu"
 
-    def __init__(self, d: int, d_hidden: int | None = None):
+    def __init__(self, d: int, d_hidden: int | None = None) -> None:
         if d_hidden is None:
             d_hidden = d
         self.d = d
@@ -44,7 +44,7 @@ class MLPSubLayer:
             return x, states
         return x
 
-    def trim_unused_slots(self):
+    def trim_unused_slots(self) -> None:
         """Remove trailing unused (all-zero) hidden slots after compilation.
 
         Slots are allocated contiguously from index 0, so slicing
@@ -56,10 +56,7 @@ class MLPSubLayer:
         l1_used = (self.linear1.output_matrix != 0).any(dim=0)  # (d_hidden,)
         l2_used = (self.linear2.output_matrix != 0).any(dim=1)  # (d_hidden,)
         used = l1_used | l2_used
-        if used.any():
-            last_used = used.nonzero()[-1].item() + 1
-        else:
-            last_used = 1
+        last_used = int(used.nonzero()[-1].item()) + 1 if used.any() else 1
         n = max(last_used, 1)
         if n < self.d_hidden:
             self.linear1.output_matrix = self.linear1.output_matrix[:, :n].contiguous()
@@ -100,7 +97,7 @@ class GatedMLPSubLayer:
     #: Machine kind (uniform per compiled network; see MLPSubLayer).
     activation = "swish"
 
-    def __init__(self, d: int, d_hidden: int | None = None):
+    def __init__(self, d: int, d_hidden: int | None = None) -> None:
         if d_hidden is None:
             d_hidden = d
         self.d = d
@@ -127,7 +124,7 @@ class GatedMLPSubLayer:
             return x, states
         return x
 
-    def trim_unused_slots(self):
+    def trim_unused_slots(self) -> None:
         """Remove trailing unused (all-zero) hidden slots after compilation.
 
         Slots are allocated contiguously from index 0, so slicing
@@ -148,10 +145,7 @@ class GatedMLPSubLayer:
         )
         d_used = (self.down_proj.output_matrix != 0).any(dim=1)
         used = g_used | u_used | d_used
-        if used.any():
-            last_used = used.nonzero()[-1].item() + 1
-        else:
-            last_used = 1
+        last_used = int(used.nonzero()[-1].item()) + 1 if used.any() else 1
         n = max(last_used, 1)
         if n < self.d_hidden:
             self.gate_proj.output_matrix = self.gate_proj.output_matrix[

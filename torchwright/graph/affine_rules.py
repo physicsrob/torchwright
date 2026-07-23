@@ -212,7 +212,8 @@ def _relu_affine(inp_ab: AffineBound, warn_node: Node | None = None) -> AffineBo
                         f"Node {warn_node.node_id}: ReLU input affine interval is "
                         f"infinite ({l}, {h}) but value_type is finite "
                         f"{vt_range}. Upstream affine rule may be missing or "
-                        f"degenerate."
+                        f"degenerate.",
+                        stacklevel=2,
                     )
             b_hi[i] = float(h)
         else:
@@ -386,8 +387,12 @@ def _gated_lane_affine(
     # dtype=torch.bool: an empty comparison list would otherwise default to
     # float32, which torch.where rejects as a condition (a zero-lane FFN's
     # bound is legitimately empty and must flow through well-typed).
-    lo2 = torch.tensor([r2.lo > r1.lo for r1, r2 in zip(iv1, iv2)], dtype=torch.bool)
-    hi2 = torch.tensor([r2.hi < r1.hi for r1, r2 in zip(iv1, iv2)], dtype=torch.bool)
+    lo2 = torch.tensor(
+        [r2.lo > r1.lo for r1, r2 in zip(iv1, iv2, strict=False)], dtype=torch.bool
+    )
+    hi2 = torch.tensor(
+        [r2.hi < r1.hi for r1, r2 in zip(iv1, iv2, strict=False)], dtype=torch.bool
+    )
     return bound(
         torch.where(lo2.unsqueeze(1), A_L2, A_L1),
         torch.where(lo2, b_L2, b_L1),
@@ -676,7 +681,8 @@ def _cond_gate_semantic_bound(
                         f"Node {inp_node.node_id}: cond_gate input affine "
                         f"interval is infinite ({l}, {h}) but value_type is "
                         f"finite {vt_range}. Upstream affine rule may be "
-                        f"missing or degenerate."
+                        f"missing or degenerate.",
+                        stacklevel=2,
                     )
             b_lo[i] = float(min(0, l))
             b_hi[i] = float(max(0, h))

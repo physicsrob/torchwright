@@ -70,7 +70,7 @@ def test_flex_solve_replays_and_matches_oracle():
     picks, the assignment replays through the directed scheduler and the
     compiled values match the recursive oracle.
     """
-    out, x, add_reuse, add_fresh = _mixed_add_graph()
+    out, _x, _add_reuse, _add_fresh = _mixed_add_graph()
     compiled = compile_headless(out, d=D, d_head=D_HEAD, d_hidden=64, optimize=1)
     torch.manual_seed(1)
     values = {
@@ -87,7 +87,7 @@ def test_legacy_policy_with_flex_off_pins_cpsat_adds_to_attention():
     cpsat_flex_routing=False keeps every Add on the attention writers.
     """
     out, *_ = _mixed_add_graph()
-    net, plan = _capture_plan(
+    _net, plan = _capture_plan(
         output_node=out,
         optimize=1,
         policy=LEGACY_POLICY,
@@ -135,7 +135,7 @@ def test_low_head_geometry_feasible_via_mlp_adds():
     turns the silent heuristic fallback into a raise) and exact.
     """
     out = _head_starved_graph()
-    net, plan = _capture_plan(
+    _net, plan = _capture_plan(
         output_node=out,
         optimize=1,
         n_heads=1,
@@ -143,7 +143,8 @@ def test_low_head_geometry_feasible_via_mlp_adds():
         require_solver=True,
     )
     attn_types, mlp_types = _op_types(plan)
-    assert "add_into" not in attn_types and "compute_add" not in attn_types
+    assert "add_into" not in attn_types
+    assert "compute_add" not in attn_types
     assert "compute_add_bypass" in mlp_types
 
     compiled = compile_headless(
@@ -160,7 +161,7 @@ def test_low_head_geometry_feasible_via_mlp_adds_heuristic_path():
     Add to MLP and the heuristic + directed replay compile it.  (The
     shipping default keeps Adds on attention statically — at optimize=0
     this geometry needs the explicit knob; at optimize>0 the solver's flex
-    routing rescues it regardless, per the test above.)
+    routing rescues it regardless, per the test above.).
     """
     out = _head_starved_graph()
     compiled = compile_headless(
@@ -181,8 +182,8 @@ def test_reused_input_target_gets_virtual_handoff_in_assignment():
     """A CP-SAT solve that reuses a graph-input target records the canonical
     virtual cancel `layer[A] + 1` for it, with no mechanism entry.
     """
-    out, x, add_reuse, add_fresh = _mixed_add_graph()
-    net, plan = _capture_plan(output_node=out, optimize=1, require_solver=True)
+    out, _x, _add_reuse, _add_fresh = _mixed_add_graph()
+    _net, plan = _capture_plan(output_node=out, optimize=1, require_solver=True)
     assignment = plan.assignment
     reused_ops = [
         op

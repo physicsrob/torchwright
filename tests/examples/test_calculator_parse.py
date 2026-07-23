@@ -56,11 +56,11 @@ def _run(parse, tokens):
 
 
 def _prompt(text):
-    return [bos_token] + list(text)
+    return [bos_token, *list(text)]
 
 
 @pytest.mark.parametrize(
-    "prompt,a,b,op",
+    ("prompt", "a", "b", "op"),
     [
         ("12+7\n", "012", "007", "+"),  # mixed widths
         ("123+456\n", "123", "456", "+"),  # full width
@@ -78,14 +78,14 @@ def test_operands_and_operator(parse, prompt, a, b, op):
 def test_emitted_minus_does_not_retrigger_latch(parse):
     # After the newline the model emits "-4" (a negative difference); the
     # latched flags and operand windows must not move.
-    tokens = _prompt("1-5\n") + ["-", "4"]
+    tokens = [*_prompt("1-5\n"), "-", "4"]
     assert _run(parse, tokens) == ("001", "005", "-")
 
 
 def test_emitted_digits_do_not_pollute_operands(parse):
     # Emitted answer digits are stream digits too; the region gates must keep
     # them out of the operand windows for the rest of the rollout.
-    tokens = _prompt("12+7\n") + ["1", "9"]
+    tokens = [*_prompt("12+7\n"), "1", "9"]
     assert _run(parse, tokens) == ("012", "007", "+")
 
 

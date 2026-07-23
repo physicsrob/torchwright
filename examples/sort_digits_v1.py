@@ -1,4 +1,4 @@
-"""Attention-based digit sort (V1): indicator-basis next-above-threshold.
+r"""Attention-based digit sort (V1): indicator-basis next-above-threshold.
 
 Input: string of single-digit integers terminated by ``"\\n"``.
 Output: the digits sorted ascending, one per autoregressive step,
@@ -96,7 +96,7 @@ def _build_indicators_above(digit_scalar: Node, is_input_digit: Node) -> Node:
     """
     # is_input_digit is {+1, -1}; we need {0, 1} to multiply through
     # the per-threshold step.
-    is_input_digit_01 = select(
+    select(
         is_input_digit,
         create_literal_value(torch.tensor([1.0])),
         create_literal_value(torch.tensor([0.0])),
@@ -144,7 +144,7 @@ def create_network_parts(
     max_out: int = MAX_OUT,
 ) -> tuple[Node, Embedding]:
     """Build the V1 distinct-digit selection-sort graph."""
-    vocab = list("0123456789") + [" ", "\n", "<bos>", "<eos>"]
+    vocab = [*list("0123456789"), " ", "\n", "<bos>", "<eos>"]
     embedding = create_embedding(vocab=vocab)
     rope = create_rope_config(d_head=D_HEAD, max_positions=MAX_POSITIONS)
 

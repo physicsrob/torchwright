@@ -53,7 +53,7 @@ def _build_graph(with_watch=False, with_assert=False):
 
 
 def _compile(output, **kwargs):
-    defaults = dict(d=256, d_head=16, max_layers=40, verbose=False)
+    defaults = {"d": 256, "d_head": 16, "max_layers": 40, "verbose": False}
     defaults.update(kwargs)
     return compile_headless(output, **defaults)
 
@@ -71,7 +71,7 @@ def _make_input(mod, x_val):
 
 
 def test_debug_watch_compute_prints(capsys):
-    x, y = _build_graph(with_watch=True)
+    _x, y = _build_graph(with_watch=True)
     inputs = {"x": torch.tensor([[0.8]])}
     out = _eval(y, inputs)
     captured = capsys.readouterr()
@@ -81,7 +81,7 @@ def test_debug_watch_compute_prints(capsys):
 
 
 def test_debug_watch_compute_silent(capsys):
-    x, y = _build_graph(with_watch=True)
+    _x, y = _build_graph(with_watch=True)
     inputs = {"x": torch.tensor([[0.3]])}
     out = _eval(y, inputs)
     captured = capsys.readouterr()
@@ -90,7 +90,7 @@ def test_debug_watch_compute_silent(capsys):
 
 
 def test_debug_watch_does_not_raise():
-    x, y = _build_graph(with_watch=True)
+    _x, y = _build_graph(with_watch=True)
     inputs = {"x": torch.tensor([[0.99]])}
     _eval(y, inputs)
 
@@ -101,7 +101,7 @@ def test_debug_watch_does_not_raise():
 
 
 def test_collect_watches_finds_reachable():
-    x, y = _build_graph(with_watch=True)
+    _x, y = _build_graph(with_watch=True)
     watches = collect_watches(y)
     assert len(watches) == 1
     assert watches[0] is y  # the watch lives on the node itself
@@ -113,7 +113,7 @@ def test_collect_watches_returns_empty():
 
 
 def test_collect_debug_nodes_finds_both_kinds():
-    x, y = _build_graph(with_watch=True, with_assert=True)
+    _x, y = _build_graph(with_watch=True, with_assert=True)
     checked = collect_debug_nodes(y)
     kinds = {c.kind for n in checked for c in n.checks}
     assert kinds == {"assert", "watch"}
@@ -287,8 +287,7 @@ def test_debug_watch_fires_on_correct_threshold():
                 return False, f"val={t.abs().max().item():.4f}"
             return True, ""
 
-        y = debug_watch(y, threshold_pred, message="threshold")
-        return y
+        return debug_watch(y, threshold_pred, message="threshold")
 
     y = build_with_recording_watch()
     mod = _compile(y)

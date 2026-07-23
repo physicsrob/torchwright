@@ -44,7 +44,7 @@ def recency_score(deltas, theta, amp):
     return c @ amp
 
 
-def analyze(label, theta, amp):
+def analyze(label, theta, amp) -> None:
     deltas = np.arange(0, R + 1)
     s = recency_score(deltas, theta, amp)
     s0 = s[0]  # == sum(amp), the global max (all cos=1)
@@ -54,9 +54,9 @@ def analyze(label, theta, amp):
     inv = np.where(gap <= 0)[0]
     first_inv = int(inv[0]) if inv.size else None
     # Normalized gap (dimensionless: gap relative to max score).
-    ng = gap / s0
+    gap / s0
     # fp32 relative floor for a logit dot-product accumulation of ~d_head terms.
-    fp32_floor = (d_head_for[label]) ** 0.5 * 2.0**-23
+    (d_head_for[label]) ** 0.5 * 2.0**-23
 
     # Main-lobe vs sidelobe: the REAL recency question is whether a recent
     # match (small Delta) outranks ALL older matches. The most-recent write at

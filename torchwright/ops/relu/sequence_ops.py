@@ -78,7 +78,7 @@ class NumericSequence:
         rope: RopeConfig,
         embedding: Embedding,
         digits: int,
-    ):
+    ) -> None:
         self.rope = rope
         zero_constant = create_literal_value(embedding.get_embedding("0"))
         is_digit = check_is_digit(embedding)
@@ -93,7 +93,7 @@ class NumericSequence:
         # current_digits[1] = token one position back, etc.
         # At number boundaries, reset earlier positions to "0".
         current_digits: list[Node] = [embedding]
-        for i in range(digits - 1):
+        for _i in range(digits - 1):
             current_digits.append(
                 select(
                     cond=is_num_start,
@@ -130,7 +130,7 @@ def output_sequence(
     seq: list[Node],
     default_output: torch.Tensor,
 ):
-    """Gate a sequence of values for left-to-right autoregressive emission.
+    r"""Gate a sequence of values for left-to-right autoregressive emission.
 
     Before the trigger fires, outputs default_output. Once the trigger fires
     (at some position P), outputs seq[0] at position P, seq[1] at P+1, etc.

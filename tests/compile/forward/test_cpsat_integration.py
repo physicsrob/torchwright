@@ -127,7 +127,7 @@ def test_cpsat_layer_count_no_worse_than_heuristic():
     minimizes layer count.  The heuristic — being a feasible schedule —
     gives an upper bound the solver always matches or beats.
     """
-    out, inputs = _build_branchy()
+    out, _inputs = _build_branchy()
     net_heur = forward_compile(
         d=D,
         d_head=D_HEAD,
@@ -155,7 +155,7 @@ def test_cpsat_with_admission_control_raises():
     the sibling-cluster admission constraint, so a solver-feasible
     schedule may not be replayable.
     """
-    out, inputs = _build_relu_chain()
+    out, _inputs = _build_relu_chain()
     with pytest.raises(RuntimeError, match="admission_control"):
         forward_compile(
             d=D,
@@ -257,7 +257,7 @@ def test_cpsat_warm_start_layer_count_no_worse():
     Because the warm start is feasible, CP-SAT can always match it; with
     ``cpsat_costs.alpha=1`` (the default) it tries to beat it.
     """
-    out, inputs = _build_branchy()
+    out, _inputs = _build_branchy()
     net_heur = forward_compile(
         d=D,
         d_head=D_HEAD,

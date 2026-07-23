@@ -118,7 +118,13 @@ def _proto_text(built):
 @pytest.mark.parametrize("tighten", [False, True])
 def test_proto_identical_live_vs_roundtripped_snapshot(name, tighten):
     node, d, d_head = _build(name)
-    cfg = dict(d=d, d_head=d_head, d_hidden=d, max_layers=60, tighten_domains=tighten)
+    cfg = {
+        "d": d,
+        "d_head": d_head,
+        "d_hidden": d,
+        "max_layers": 60,
+        "tighten_domains": tighten,
+    }
 
     live = _proto_text(build_cpsat_model(node, **cfg))
 
@@ -142,7 +148,7 @@ def test_canonicalized_snapshot_rebuilds_a_valid_model():
     re-solves; its ids differ from live, so its proto is its own — but stable.
     """
     node, d, d_head = _build("caesar")
-    cfg = dict(d=d, d_head=d_head, d_hidden=d, max_layers=40)
+    cfg = {"d": d, "d_head": d_head, "d_hidden": d, "max_layers": 40}
     problem = snapshot_from_graph_model(build_graph_model(node)).canonicalized(node)
     a = _proto_text(
         build_model_from_snapshot(SchedulingProblem.loads(problem.dumps()), **cfg)
@@ -163,14 +169,14 @@ def test_hinted_build_proto_identical():
     # the pinned production default skips window sizing entirely, which
     # would make this proto comparison vacuous on the widening path.
     node, d, d_head = _build("caesar")
-    cfg = dict(
-        d=d,
-        d_head=d_head,
-        d_hidden=d,
-        max_layers=40,
-        tighten_domains=True,
-        _pin_cancels=False,
-    )
+    cfg = {
+        "d": d,
+        "d_head": d_head,
+        "d_hidden": d,
+        "max_layers": 40,
+        "tighten_domains": True,
+        "_pin_cancels": False,
+    }
     # A feasible schedule -> hint dicts that exercise the cancel-window widening.
     asg, _ = solve_schedule(node, time_budget_s=20.0, **cfg)
     assert asg is not None
@@ -207,22 +213,23 @@ def test_frozen_hint_roundtrips():
 
 def test_solve_from_snapshot_matches_live_solve():
     node, d, d_head = _build("caesar")
-    kw = dict(
-        d=d,
-        d_head=d_head,
-        d_hidden=d,
-        max_layers=40,
-        time_budget_s=30.0,
-        tighten_domains=True,
-        policy=SchedulingPolicy(),
-        solver_params={"random_seed": 1},
-    )
+    kw = {
+        "d": d,
+        "d_head": d_head,
+        "d_hidden": d,
+        "max_layers": 40,
+        "time_budget_s": 30.0,
+        "tighten_domains": True,
+        "policy": SchedulingPolicy(),
+        "solver_params": {"random_seed": 1},
+    }
     live_asg, live_stats = solve_schedule(node, **kw)
     problem = SchedulingProblem.loads(
         snapshot_from_graph_model(build_graph_model(node)).canonicalized(node).dumps()
     )
     snap_asg, snap_stats = solve_schedule_from_snapshot(problem, **kw)
-    assert live_asg is not None and snap_asg is not None
+    assert live_asg is not None
+    assert snap_asg is not None
     assert live_stats.status_name == snap_stats.status_name == "OPTIMAL"
     assert live_asg.n_layers == snap_asg.n_layers
 
@@ -234,15 +241,15 @@ def test_solve_from_snapshot_matches_live_solve():
 
 def test_save_load_with_fingerprint_gate(tmp_path):
     node, d, d_head = _build("binary_increment")
-    geom = dict(
-        d=d,
-        d_head=d_head,
-        d_hidden=d,
-        flex_routing=True,
-        cancel_slack=2,
-        policy=SchedulingPolicy(),
-        max_layers=60,
-    )
+    geom = {
+        "d": d,
+        "d_head": d_head,
+        "d_hidden": d,
+        "flex_routing": True,
+        "cancel_slack": 2,
+        "policy": SchedulingPolicy(),
+        "max_layers": 60,
+    }
     cp = 5  # arbitrary stand-in for the lowered critical path in this unit test
     problem = (
         snapshot_from_graph_model(build_graph_model(node))
@@ -284,11 +291,18 @@ def test_format_version_mismatch_raises():
 
 def test_proto_dump_and_resolve(tmp_path):
     node, d, d_head = _build("caesar")
-    cfg = dict(d=d, d_head=d_head, d_hidden=d, max_layers=40, tighten_domains=True)
+    cfg = {
+        "d": d,
+        "d_head": d_head,
+        "d_hidden": d,
+        "max_layers": 40,
+        "tighten_domains": True,
+    }
     built = build_cpsat_model(node, **cfg)
     path = tmp_path / "model.cpproto"
     dump_model_proto(built, path)
-    assert path.exists() and path.with_suffix(".cpproto.meta.json").exists()
+    assert path.exists()
+    assert path.with_suffix(".cpproto.meta.json").exists()
 
     result = resolve_model_proto(path, time_budget_s=30.0, workers=4)
     assert result["status_name"] == "OPTIMAL"

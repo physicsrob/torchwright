@@ -692,7 +692,7 @@ class AttentionProbe:
         k_eff = min(k, n_keys)
         topk = torch.topk(w, k=k_eff)
         out: list[tuple[int, float, str]] = []
-        for val, idx in zip(topk.values.tolist(), topk.indices.tolist()):
+        for val, idx in zip(topk.values.tolist(), topk.indices.tolist(), strict=False):
             label = self.position_labels[idx] if idx < len(self.position_labels) else ""
             out.append((int(idx), float(val), label))
         return out

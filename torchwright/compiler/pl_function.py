@@ -62,15 +62,19 @@ is called by ``lower()``; see ``torchwright/compiler/collapse_analysis.py``.
 
 from __future__ import annotations
 
-from collections.abc import Callable, Sequence
 from dataclasses import dataclass
+from typing import TYPE_CHECKING
 
 import torch
 
 from torchwright.compiler.collapse import _SYNTH_CLAIM_ATOL, _seeded_oracle, _ulp32
-from torchwright.graph import Node
 from torchwright.graph.ffn import FFN
 from torchwright.graph.misc import Concatenate, LiteralValue
+
+if TYPE_CHECKING:
+    from collections.abc import Callable, Sequence
+
+    from torchwright.graph import Node
 
 _F64 = torch.float64
 
@@ -128,7 +132,8 @@ class PLFunction:
         n = self.x.shape[0]
         assert n >= 1, "need at least one knot"
         assert self.y.shape == (n, d)
-        assert self.slope_lo.shape == (d,) and self.slope_hi.shape == (d,)
+        assert self.slope_lo.shape == (d,)
+        assert self.slope_hi.shape == (d,)
         if n > 1:
             assert bool((self.x[1:] > self.x[:-1]).all()), (
                 "knots must be strictly ascending"
@@ -532,7 +537,9 @@ class _OracleCache:
     introduces new positions, not per point.
     """
 
-    def __init__(self, oracle: Callable[[torch.Tensor], dict[Node, torch.Tensor]]):
+    def __init__(
+        self, oracle: Callable[[torch.Tensor], dict[Node, torch.Tensor]]
+    ) -> None:
         self._oracle = oracle
         self._index: dict[float, int] = {}
         self._vals: dict[Node, list[torch.Tensor]] = {}

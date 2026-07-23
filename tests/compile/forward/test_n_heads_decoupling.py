@@ -101,14 +101,14 @@ def test_cpsat_capacity_uses_explicit_n_heads():
 
 
 def test_schedule_fingerprint_includes_decoupled_head_capacity():
-    common = dict(
-        d=32,
-        d_head=8,
-        d_hidden=32,
-        flex_routing=True,
-        cancel_slack=2,
-        policy=LEGACY_POLICY,
-    )
+    common = {
+        "d": 32,
+        "d_head": 8,
+        "d_hidden": 32,
+        "flex_routing": True,
+        "cancel_slack": 2,
+        "policy": LEGACY_POLICY,
+    }
     out = _graph()
     default = graph_fingerprint(out, **common)
     assert default == graph_fingerprint(out, n_heads=4, **common)

@@ -179,7 +179,7 @@ class LayerScheduler:
         bias: bool = True,
         held_output_layout: HeldOutputLayout | None = None,
         n_heads: int | None = None,
-    ):
+    ) -> None:
         self.graph = graph
         self.d = d
         self.d_hidden = d if d_hidden is None else d_hidden
@@ -654,7 +654,7 @@ class LayerScheduler:
                 return None
             return additions, delta
 
-        def commit_cancel(additions, delta):
+        def commit_cancel(additions, delta) -> None:
             nonlocal heads_used, cancel_heads
             if additions:
                 cancel_cols.extend(additions)
@@ -672,7 +672,7 @@ class LayerScheduler:
         for add_node in sorted(free_adds, key=self._critical_path_key):
             a0, a1 = add_node.inputs
             d0 = self._is_dead_for_add(a0, add_node, computed_snapshot)
-            d1 = self._is_dead_for_add(a1, add_node, computed_snapshot)
+            self._is_dead_for_add(a1, add_node, computed_snapshot)
             dead_addend = a0 if d0 else a1
             live_addend = a1 if d0 else a0
             n_heads = (len(live_addend) + self.d_head - 1) // self.d_head
@@ -1164,7 +1164,7 @@ class LayerScheduler:
             computed_before_layer if computed_before_layer is not None else set()
         )
 
-        def _surface_mlp_freshly_dead(placed_node):
+        def _surface_mlp_freshly_dead(placed_node) -> None:
             # After placing an MLP compute op, its operands may be freshly dead.
             # Offer the MLP-eligible ones to the cancel_bypass batch (their
             # values were captured on the op above, so freeing them is safe).
@@ -1644,10 +1644,7 @@ class LayerScheduler:
                     continue
                 if leaf not in computed_nodes:
                     return False
-        for pred in node.scheduling_predecessors:
-            if pred not in computed_nodes:
-                return False
-        return True
+        return all(pred in computed_nodes for pred in node.scheduling_predecessors)
 
     def _is_dead(self, node: Node, computed_nodes: set[Node]) -> bool:
         if node is self.pos_encoding:
@@ -1706,12 +1703,10 @@ class LayerScheduler:
         """
         if self.policy.cancel_in_attention == "always":
             return False
-        if (
+        return not (
             self.held_output_layout is not None
             and node is self.held_output_layout.source
-        ):
-            return False
-        return True
+        )
 
     def _mlp_cancel_defers_live_addends(self) -> bool:
         """Should a node used as an ``add_into`` live addend THIS layer be left
@@ -2212,7 +2207,7 @@ class DirectedLayerScheduler(LayerScheduler):
         bias: bool = True,
         held_output_layout: HeldOutputLayout | None = None,
         n_heads: int | None = None,
-    ):
+    ) -> None:
         # The CP-SAT model does not represent the sibling-cluster admission
         # constraint (docs/cpsat_scheduler.md §3 Model preconditions), so a
         # replay under admission gating could defer a batch member AFTER the

@@ -16,7 +16,7 @@ class GraphAnalyzer:
     Pure analysis — nothing here mutates the graph.
     """
 
-    def __init__(self, output_node: Node):
+    def __init__(self, output_node: Node) -> None:
         self._output_node = output_node
         self._all_nodes = get_ancestor_nodes({output_node})
 
@@ -68,7 +68,7 @@ class GraphAnalyzer:
                     queue.append(consumer)
         return order
 
-    def _compute_critical_paths(self):
+    def _compute_critical_paths(self) -> None:
         """Longest chain from each node to the output, computed bottom-up."""
         # Process in reverse topo order (output first)
         self._critical_path[self._output_node] = 0
@@ -115,10 +115,7 @@ class GraphAnalyzer:
                         return False
             elif inp not in available:
                 return False
-        for pred in node.scheduling_predecessors:
-            if pred not in available:
-                return False
-        return True
+        return all(pred in available for pred in node.scheduling_predecessors)
 
     def get_ready_nodes(self, available: set[Node]) -> set[Node]:
         """Return all nodes whose inputs are all in the available set.

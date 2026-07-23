@@ -95,7 +95,7 @@ def compare(
     false_level: float = -1.0,
     sharpness: float | None = None,
 ) -> Node:
-    """Compare input with threshold and return boolean valued node (1.0 for true, -1.0 for false)
+    """Compare input with threshold and return boolean valued node (1.0 for true, -1.0 for false).
 
     Args:
         inp: Node to compare. Must be length 1.
@@ -258,10 +258,7 @@ def piecewise_linear(
 
     # Normalise to vector form: values[i] is always a list of length d_out.
     scalar = not isinstance(raw_values[0], (list, tuple))
-    if scalar:
-        values = [[v] for v in raw_values]
-    else:
-        values = [list(v) for v in raw_values]
+    values = [[v] for v in raw_values] if scalar else [list(v) for v in raw_values]
     d_out = len(values[0])
     assert all(len(v) == d_out for v in values)
 
@@ -323,10 +320,7 @@ def piecewise_linear(
             )
         )
 
-    if len(chunks) == 1:
-        result = chunks[0]
-    else:
-        result = sum_nodes(chunks)
+    result = chunks[0] if len(chunks) == 1 else sum_nodes(chunks)
 
     # With clamp=True the output is bounded by the min/max of fn evaluated
     # on the breakpoints (per-channel). Declare that range so downstream
@@ -526,12 +520,12 @@ def multiply_2d(
     # --- Build breakpoints ---
     if breakpoints1 is None:
         lo1 = -max_abs1
-        n1 = builtins.max(int(round((max_abs1 - lo1) / step1)) + 1, 2)
+        n1 = builtins.max(round((max_abs1 - lo1) / step1) + 1, 2)
         breakpoints1 = [lo1 + i * step1 for i in range(n1)]
         breakpoints1[-1] = max_abs1  # pin endpoint
     if breakpoints2 is None:
         lo2 = -max_abs2
-        n2 = builtins.max(int(round((max_abs2 - lo2) / step2)) + 1, 2)
+        n2 = builtins.max(round((max_abs2 - lo2) / step2) + 1, 2)
         breakpoints2 = [lo2 + i * step2 for i in range(n2)]
         breakpoints2[-1] = max_abs2  # pin endpoint
 

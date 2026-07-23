@@ -44,16 +44,22 @@ MAX_POSITIONS = 512
 
 
 def create_network(max_digits: int = 3) -> Unembedding:
-    """Create a v2 adder: parses "A+B\\n", outputs result digits autoregressively.
+    r"""Create a v2 adder: parses "A+B\\n", outputs result digits autoregressively.
 
     Three phases:
       1. Parse: extract digit embeddings for A and B from the token stream
       2. Compute: embeddings → scalars → add → scalars → embeddings
       3. Output: emit result digits left-to-right, then <eos>
     """
-    vocab = list(
-        " 0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ!@#$%^&*()-+="
-    ) + ["\n", "<bos>", "<eos>", "default"]
+    vocab = [
+        *list(
+            " 0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ!@#$%^&*()-+="
+        ),
+        "\n",
+        "<bos>",
+        "<eos>",
+        "default",
+    ]
     embedding = create_embedding(vocab=vocab)
     rope = create_rope_config(d_head=D_HEAD, max_positions=MAX_POSITIONS)
 
@@ -83,8 +89,9 @@ def create_network(max_digits: int = 3) -> Unembedding:
     result_digits = [scalar_to_embedding(d, embedding) for d in digit_scalars]
 
     # --- Phase 3: Format and output ---
-    result_digits = result_digits + [
-        create_literal_value(embedding.get_embedding("<eos>"))
+    result_digits = [
+        *result_digits,
+        create_literal_value(embedding.get_embedding("<eos>")),
     ]
     result_digits = remove_leading_0s(embedding, result_digits, max_removals=max_digits)
 

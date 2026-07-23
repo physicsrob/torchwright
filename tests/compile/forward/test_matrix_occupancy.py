@@ -42,8 +42,7 @@ def _build_graph():
     b = create_input("b", 1)
     c = create_input("c", 1)
     prod = multiply_2d(a, b, max_abs1=10, max_abs2=10)
-    out = add(prod, c)
-    return out
+    return add(prod, c)
 
 
 def _compile():
@@ -115,7 +114,7 @@ def test_diag_rects_break_when_only_one_axis_advances():
 
 def test_matrices_table_shapes_and_axes():
     net, canon, _ = _compile()
-    matrices, placements, n_heads, d_hidden = _build_matrix_occupancy(
+    matrices, _placements, n_heads, d_hidden = _build_matrix_occupancy(
         net, canon, D, D_HEAD
     )
 

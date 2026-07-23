@@ -44,7 +44,7 @@ schedule-cache key.
 
 from __future__ import annotations
 
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import torch
 
@@ -68,10 +68,12 @@ from torchwright.compiler.pl_function import (
     certify_subgraph,
     model_s1,
 )
-from torchwright.graph import Node
 from torchwright.graph.ffn import FFN
 from torchwright.graph.misc import LiteralValue
-from torchwright.graph.optimize import FoldLog
+
+if TYPE_CHECKING:
+    from torchwright.graph import Node
+    from torchwright.graph.optimize import FoldLog
 
 _F64 = torch.float64
 
@@ -111,7 +113,10 @@ def _emit_s1(
         return LiteralValue(skel.y[0].to(torch.float32).clone().reshape(-1), name=name)
 
     breakpoints = [float(v) for v in skel.x.tolist()]
-    rows = {b: [float(v) for v in row] for b, row in zip(breakpoints, skel.y.tolist())}
+    rows = {
+        b: [float(v) for v in row]
+        for b, row in zip(breakpoints, skel.y.tolist(), strict=False)
+    }
 
     input_scale = 1.0
     if machine == "swish":

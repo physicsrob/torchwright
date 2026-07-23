@@ -15,7 +15,7 @@ class AttnSubLayer:
         d: int,
         d_head: int,
         n_heads: int | None = None,
-    ):
+    ) -> None:
         self.d = d
         self.in_state = ResidualStreamState(name="AttnSubLayer In State")
         self.out_state = ResidualStreamState(name="AttnSubLayer Out State")
@@ -44,6 +44,6 @@ class AttnSubLayer:
         self.attn.to(device)
         return self
 
-    def resize(self, new_d):
+    def resize(self, new_d) -> None:
         self.d = new_d
         self.attn.resize(new_d)

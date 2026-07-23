@@ -142,7 +142,9 @@ def test_sawtooth_graph_kink_pin():
     ops = _ops("relu")
     knots, vals = _sawtooth_knots()
     x = create_input("x", 1, value_range=(0.0, 12.0))
-    saw = ops.piecewise_linear(x, knots, dict(zip(knots, vals)).__getitem__)
+    saw = ops.piecewise_linear(
+        x, knots, dict(zip(knots, vals, strict=False)).__getitem__
+    )
     c = ops.compare(saw, 2.0)
     cert = _certify(c, x)
     assert cert.members[saw].n_kinks == 5
@@ -243,7 +245,9 @@ def test_kink_pin_floor_int():
     assert s1.lanes == 16  # 2 per boundary — the plan's pin
     s2 = model_s2(m.fn, m.deviation, machine="swish")
     assert s2.n_steps == 8
-    assert s2.stage1_lanes == 16 and s2.stage1_cols == 8 and s2.stage2_lanes == 8
+    assert s2.stage1_lanes == 16
+    assert s2.stage1_cols == 8
+    assert s2.stage2_lanes == 8
 
 
 def test_kink_pin_table_lookup_2d():
@@ -442,10 +446,13 @@ def test_kink_explosion_declines():
     ops = _ops("relu")
     knots, vals = _sawtooth_knots()
     x = create_input("x", 1, value_range=(0.0, 12.0))
-    saw = ops.piecewise_linear(x, knots, dict(zip(knots, vals)).__getitem__)
+    saw = ops.piecewise_linear(
+        x, knots, dict(zip(knots, vals, strict=False)).__getitem__
+    )
     c = ops.compare(saw, 2.0)
     cert = _certify(c, x, max_kinks=3)
-    assert cert.declined is not None and "kink explosion" in cert.declined
+    assert cert.declined is not None
+    assert "kink explosion" in cert.declined
 
 
 def test_unbounded_source_declines():
@@ -490,7 +497,7 @@ def test_s1_infeasible_s2_feasible_on_doom_scale_staircase():
     assert s2.total_bound <= 1e-3
     assert s2.admissible(lane_cap=8192)
     assert not s2.admissible(lane_cap=1024)  # stage-1 lanes past the cap
-    is_plateau, runs = transition_runs(fn)
+    _is_plateau, runs = transition_runs(fn)
     assert len(runs) == 2046
 
 
@@ -533,7 +540,8 @@ def test_analysis_picks_s2_for_sharp_wide_staircase_chain():
     (sg,) = [s for s in report.subgraphs if s.n_synthesized]
     assert sg.verdict == "S2", sg.format_line()
     m = sg.members[0]
-    assert not m.s1_ok and m.s2_ok  # fp32 kills S1; S2 fits
+    assert not m.s1_ok
+    assert m.s2_ok
     assert sg.stage1_cols == 1  # one composed value transition
     assert report.floor_strict == 2
     assert report.floor_strict < report.floor_off
