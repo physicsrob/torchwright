@@ -11,7 +11,8 @@ compile: $(HF_BUNDLES)
 
 .PHONY: lint
 lint:
-	uv run black --check .
+	uv run ruff format --check .
+	uv run ruff check .
 	uv run mypy .
 
 # Guard the standalone lock the Modal --frozen build installs from.  It cannot

@@ -31,7 +31,9 @@ hf = [
 
 [dependency-groups]
 dev = [
-    "black",
+    # Pinned exactly: select = ["ALL"] picks up new rules on upgrade, so a
+    # ruff bump is a deliberate act (bump pin + fix new violations together).
+    "ruff==0.15.22",
     "modal",
     "mypy",
     "pytest",
@@ -77,3 +79,45 @@ show_missing = true
 
 [tool.mypy]
 ignore_missing_imports = true
+
+[tool.ruff]
+# target-version is inferred from requires-python (>=3.10).
+line-length = 88
+
+[tool.ruff.lint]
+select = ["ALL"]
+# Every entry here defends a deliberate torchwright decision, not a backlog.
+# Do not add entries to make a check pass — fix the code instead.
+ignore = [
+    # Formatter conflicts (ruff's own recommendation when using its formatter)
+    "COM812",  # missing-trailing-comma
+    "ISC001",  # single-line-implicit-string-concatenation
+    # Docstring presence — deferred as a separate task; shape rules (D2xx) stay on
+    "D100", "D101", "D102", "D103", "D104", "D105", "D106", "D107",
+    # Exception-message style rules that fight the long, diagnostic messages
+    # this codebase deliberately writes
+    "TRY003",  # long messages in exception constructors
+    "EM101", "EM102",  # string literals / f-strings in exceptions
+    # Compiler invariants I1-I4 are runtime asserts by doctrine (CLAUDE.md,
+    # "Compiler Invariants"): AssertionError shape is pinned by negative tests
+    "S101",    # use of assert
+    # The probe/watch debug tooling prints by contract ("prints, does not raise")
+    "T201",    # print
+    # Math naming: Q/K/V/W matrices in a transformer compiler
+    "N802", "N803", "N806",
+    # Lazy imports of heavy deps (torch/onnx/modal) are deliberate
+    "PLC0415", # import-outside-top-level
+]
+
+[tool.ruff.lint.pydocstyle]
+convention = "google"
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**" = [
+    "PLR2004",  # magic values allowed in tests
+    "ANN",      # type annotations optional in tests
+    "SLF001",   # private-member access allowed in tests
+]
+
+[tool.ruff.format]
+docstring-code-format = true
