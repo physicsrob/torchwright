@@ -62,6 +62,28 @@ flexibility, flag it. Minimizing complexity in the explanation doesn't
 reduce the complexity of the mechanism — it just hides it, and the
 user will find it later in a more frustrating way.
 
+# Linting and formatting
+
+Format: `uv run ruff format .`  Lint: `uv run ruff check .`  Types:
+`uv run mypy .`  All three (via `make lint`) must pass before
+considering any task complete.
+
+- Never add `# noqa` or `# type: ignore` comments, and never edit the
+  ruff/mypy configuration to weaken rules.  Fix the code instead.  If
+  a rule seems genuinely wrong for this codebase, stop and ask — the
+  ignore list in `pyproject.toml` is a set of deliberate decisions,
+  each with a recorded reason, not a backlog.
+- Use modern typing syntax: `X | None` not `Optional[X]`, `X | Y` not
+  `Union[X, Y]`, `dict/list/tuple` not `Dict/List/Tuple` (enforced via
+  UP006/UP007/UP045).
+- ruff is pinned exactly in the dev group because `select = ["ALL"]`
+  picks up new rules on upgrade; bumping the pin and fixing the new
+  findings is one deliberate act.
+- The generated noise footers in `torchwright/ops/` docstrings (below
+  each `.. noise-footer::` marker) are exempt from manual edits of any
+  kind — including lint fixes.  Fix the generator instead (see
+  *Numerical noise*).
+
 # Testing
 
 ## Running Tests
