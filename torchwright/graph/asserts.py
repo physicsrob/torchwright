@@ -43,9 +43,8 @@ after broadcast) take a tolerance large enough to absorb that fuzz.
 
 import torch
 
-from torchwright.graph import Concatenate, Node
-from torchwright.graph.misc import Check, Predicate
-from torchwright.graph.node import _current_annotation
+from torchwright.graph.misc import Check, Concatenate, Predicate
+from torchwright.graph.node import Node, _current_annotation
 from torchwright.graph.value_type import NodeValueType, Range, tightened_with
 
 

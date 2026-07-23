@@ -1,6 +1,6 @@
 import torch
 
-from torchwright.graph import Node
+from torchwright.graph.node import Node
 from torchwright.graph.rope import ROPE_BASE, apply_rope, rope_cos_sin
 
 # Causal mask sentinel: future positions are filled with this value before

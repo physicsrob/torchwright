@@ -3,7 +3,7 @@ from dataclasses import dataclass
 
 import torch
 
-from torchwright.graph import Node
+from torchwright.graph.node import Node
 from torchwright.graph.value_type import NodeValueType
 
 # A predicate maps a value tensor to ``(ok, detail)`` where ``detail`` is a

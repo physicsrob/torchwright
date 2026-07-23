@@ -1,6 +1,6 @@
 import torch
 
-from torchwright.graph import Node
+from torchwright.graph.node import Node
 from torchwright.graph.value_type import NodeValueType
 
 

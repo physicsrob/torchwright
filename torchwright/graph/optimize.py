@@ -9,9 +9,10 @@ from typing import cast
 
 import torch
 
-from torchwright.graph import Concatenate, LiteralValue, Node
 from torchwright.graph.ffn import FFN
 from torchwright.graph.linear import Linear
+from torchwright.graph.misc import Concatenate, LiteralValue
+from torchwright.graph.node import Node
 
 
 @dataclass
