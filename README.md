@@ -1,11 +1,13 @@
 # torchwright
 
 torchwright is a compiler that transforms computation graphs into the weights of a
-transformer. The output is a standard decoder-only transformer — causal softmax
-attention, rotary position embeddings, RMSNorm, a KV cache — and its weights are
-emitted by the compiler, not trained. Compiled models are packaged, by default,
-as ordinary `transformers` checkpoints in the Phi-3 architecture:
-`AutoModelForCausalLM` loads them with no custom code and no `trust_remote_code`.
+transformer. It treats a transformer as a fixed computational substrate that can
+be programmed: the compiler sets the weights directly, without any training, so
+that a standard decoder-only transformer — causal softmax attention, rotary
+position embeddings, RMSNorm, a KV cache — executes the source graph. Compiled
+models are packaged, by default, as ordinary `transformers` checkpoints in the
+Phi-3 architecture: `AutoModelForCausalLM` loads them with no custom code and no
+`trust_remote_code`.
 
 ## Example
 
@@ -54,6 +56,16 @@ constructs every nonlinear op from ReLU sublayers; `torchwright.ops.swiglu`
 constructs the same ops from gated SwiGLU sublayers, and is what the Phi-3
 output uses. A graph imports from exactly one — the compiler rejects a graph
 that mixes them.
+
+The compiled computation lives in the residual stream — the fixed-width vector a
+transformer carries between layers. Every value the graph computes owns a set of
+columns there for as long as anything downstream still needs it; columns need not
+be contiguous, and concatenation is logical rather than physical. A sublayer can
+only *add* to the stream, and that one fact drives the compilation scheme: a new
+value lands in zeroed columns (0 + new = new), a value nothing needs anymore is
+cancelled by writing its negation (v + (−v) = 0), which frees its columns for
+reuse, and the graph's additions are implemented on the skip connection itself,
+costing no extra columns.
 
 Every op compiles down to concrete weights — attention heads, rows of MLP
 sublayers. A scheduler assigns every node to a layer: `optimize=0`, the default,
