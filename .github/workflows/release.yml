@@ -1,0 +1,30 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    # Trusted Publishing (OIDC): PyPI is configured to accept publishes
+    # from this repo + workflow + environment; no token is stored anywhere.
+    environment: pypi
+    permissions:
+      id-token: write
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+      - name: Check tag matches project version
+        run: |
+          V=$(python3 -c "import tomllib; print(tomllib.load(open('pyproject.toml','rb'))['project']['version'])")
+          if [ "v$V" != "$GITHUB_REF_NAME" ]; then
+            echo "pyproject.toml version $V does not match tag $GITHUB_REF_NAME" >&2
+            exit 1
+          fi
+      - name: Build
+        run: uv build
+      - name: Publish to PyPI
+        run: uv publish --trusted-publishing always
