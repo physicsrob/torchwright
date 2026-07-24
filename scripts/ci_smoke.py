@@ -16,7 +16,7 @@ from pathlib import Path
 
 def main() -> int:
     from examples.binary_increment import D_HEAD, D_MODEL, create_network_parts
-    from torchwright import compile_hf_bundle
+    from torchwright.compiler.hf import compile_hf_bundle
 
     output_node, embedding = create_network_parts()
     with tempfile.TemporaryDirectory() as tmp:
