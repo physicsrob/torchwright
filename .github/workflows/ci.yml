@@ -30,13 +30,19 @@ jobs:
       - name: Lint
         run: make lint
 
-  test:
+  # Fast end-to-end signal on every push: compile an example on CPU,
+  # generate, assert the output.  The full suite is far too slow for
+  # per-push CI (~1h on a 2-core runner) — it runs on Modal during
+  # development (make test) and weekly via full-tests.yml.
+  smoke:
     runs-on: ubuntu-latest
-    timeout-minutes: 60
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
       - uses: astral-sh/setup-uv@v6
         with:
           enable-cache: true
-      - name: Test (CPU)
-        run: make test-ci
+      - name: Sync dev environment
+        run: uv sync
+      - name: Compile-and-generate smoke
+        run: uv run --no-sync python -m scripts.ci_smoke

@@ -60,7 +60,7 @@ test: check-modal-lock
 test-logs:
 	@tail -f /tmp/torchwright-test.log
 
-# CI entry point (.github/workflows/ci.yml): full suite on the runner's CPU,
+# CI entry point (.github/workflows/full-tests.yml): full suite on the runner's CPU,
 # synced from the standalone lock like the Modal image.  Guarded to CI because
 # inside the umbrella workspace `uv sync` operates on the shared venv instead
 # (dropping opt-in packages like torchwright_doom's onnxruntime-gpu), and a
