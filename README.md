@@ -79,7 +79,13 @@ ONNX artifact runnable outside `transformers`.
 
 ## Install
 
-Not yet on PyPI — install from source. Python 3.10 or later.
+Python 3.10 or later.
+
+```
+pip install "torchwright[hf]"
+```
+
+Or from source:
 
 ```
 git clone https://github.com/physicsrob/torchwright

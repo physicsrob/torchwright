@@ -1,5 +1,9 @@
 # Unreleased
 
+# 0.1.0 — 2026-07-23
+
+First public release.
+
 ## Bundles ship a generation config
 
 - `compile_hf_bundle` and `save_hf_bundle` now write
