@@ -60,6 +60,21 @@ test: check-modal-lock
 test-logs:
 	@tail -f /tmp/torchwright-test.log
 
+# CI entry point (.github/workflows/ci.yml): full suite on the runner's CPU,
+# synced from the standalone lock like the Modal image.  Guarded to CI because
+# inside the umbrella workspace `uv sync` operates on the shared venv instead
+# (dropping opt-in packages like torchwright_doom's onnxruntime-gpu), and a
+# full local suite run belongs on Modal anyway (see test-local's guard).
+.PHONY: test-ci
+test-ci:
+	@if [ -z "$$CI" ]; then \
+		echo "Error: test-ci is the CI entry point (runs the full suite locally)." >&2 ; \
+		echo "       Use 'make test' (Modal) or 'make test-local FILE=...' instead." >&2 ; \
+		exit 2 ; \
+	fi
+	uv sync --group test-onnx
+	uv run --no-sync pytest tests --device cpu
+
 .PHONY: test-local
 test-local:
 	@if [ -z "$(FILE)" ]; then \
