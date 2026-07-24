@@ -35,7 +35,7 @@ print(generate("1011\n", return_full_text=False)[0]["generated_text"])
 # 1100
 ```
 
-The compiler scheduled this graph into a 22-layer decoder at hidden size 256 (the
+The compiler scheduled this graph into a 20-layer decoder at hidden size 512 (the
 `d=D_MODEL` argument). Every weight was computed from the source graph; nothing
 was trained. Compiling this example took under ten seconds on a laptop CPU.
 
@@ -168,11 +168,16 @@ Examples that define `create_network_parts()` compile to a bundle with
 ## Development
 
 `torchwright/` holds the package (`graph`, `ops`, `compiler`, `debug`);
-`examples/`, `tests/`, and `docs/` are what they say. `make lint` (black + mypy)
+`examples/`, `tests/`, and `docs/` are what they say. `make lint` (ruff + mypy)
 and `make test-local FILE=tests/...` (single-file pytest) run anywhere. The full
 suite, `make test`, shards across GPU containers on Modal and needs a Modal
 account. `make measure-noise` regenerates the committed per-op noise data; two
 tests pin it to the code.
+
+CI runs on every push and pull request: `make lint`, plus a smoke that compiles
+an example on CPU and checks its generated output. The full suite additionally
+runs on CPU weekly. Releases are tagged (`v*`) and published to PyPI from CI;
+`docs/releasing.md` has the procedure.
 
 ## License
 

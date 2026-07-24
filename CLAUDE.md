@@ -181,6 +181,32 @@ tolerance-boundary flake (see *FP nondeterminism at tolerance boundaries*
 under *Debugging compiled graphs*). Investigate the ops on the failing
 codepath, not the test.
 
+# CI and releasing
+
+GitHub Actions (`.github/workflows/`) runs two required checks on every
+push and PR: `lint` (make lint) and `smoke` (`scripts/ci_smoke.py` —
+compile binary_increment on CPU, generate through a transformers
+pipeline, assert the output).  **Per-push CI stays fast; never add the
+full suite or any slow job to it** (decided 2026-07-23 — the full suite
+takes ~an hour on a 2-core runner).  The full CPU suite runs weekly via
+`full-tests.yml` and on demand via workflow_dispatch; its entry point,
+`make test-ci`, is guarded to refuse local runs — use `make test`
+(Modal) or `make test-local FILE=...` instead.
+
+Branch rules on `main`: force-pushes and deletion are blocked for
+everyone; the two checks are required with a repo-admin bypass, so a
+direct push prints `remote: Bypassed rule violations` — that notice is
+the ruleset working, not an error.
+
+Releases: `docs/releasing.md` is the procedure.  The version in
+`pyproject.toml` is the single source of truth; bumping it requires
+`make modal-lock` (the standalone lock records torchwright's version)
+plus `uv lock` at the umbrella.  Pushing a `v*` tag publishes to PyPI
+via Trusted Publishing; the workflow refuses a tag that doesn't match
+the pyproject version.  Keep `RELEASE_NOTES.md`'s `# Unreleased`
+section current as user-facing changes land — release time only
+retitles it.
+
 # Numerical noise
 
 Every approximate op in `torchwright/ops/` is measured against its exact-math
