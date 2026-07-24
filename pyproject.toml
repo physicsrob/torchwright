@@ -1,8 +1,37 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
 [project]
 name = "torchwright"
 version = "0.1.0"
 description = "A compiler that transforms computation graphs into transformer neural network weights"
+readme = "README.md"
 license = "Apache-2.0"
+license-files = ["LICENSE"]
+authors = [
+    { name = "Rob Porter", email = "physicsrob@gmail.com" },
+]
+keywords = [
+    "transformer",
+    "compiler",
+    "weights",
+    "interpretability",
+    "onnx",
+    "huggingface",
+]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "Intended Audience :: Science/Research",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+    "Typing :: Typed",
+]
 requires-python = ">=3.10"
 dependencies = [
     "torch",
@@ -10,6 +39,11 @@ dependencies = [
     "ortools>=9.10",
     "pydantic>=2.0",
 ]
+
+[project.urls]
+Homepage = "https://github.com/physicsrob/torchwright"
+Repository = "https://github.com/physicsrob/torchwright"
+Changelog = "https://github.com/physicsrob/torchwright/blob/main/RELEASE_NOTES.md"
 
 [project.optional-dependencies]
 # Pinned: the CUDA-graph capture path (torchwright_doom render runtime)
@@ -58,6 +92,14 @@ test-onnx = [
     "onnxruntime==1.26.0; python_version >= '3.11'",
     "onnxruntime; python_version < '3.11'",
 ]
+
+# Only the library ships: tests/, scripts/, examples/, docs/, and the
+# modal_*.py launchers are repo infrastructure, not distribution content.
+[tool.hatch.build.targets.wheel]
+packages = ["torchwright"]
+
+[tool.hatch.build.targets.sdist]
+include = ["torchwright"]
 
 [[tool.uv.index]]
 name = "pytorch-cu128"
