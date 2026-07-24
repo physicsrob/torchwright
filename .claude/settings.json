@@ -9,7 +9,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "F=$(jq -r '.tool_input.file_path // empty'); case \"$F\" in *.py) /home/rob/workspace/torchwright/.venv/bin/black --quiet --fast \"$F\" 2>/dev/null ;; esac; true"
+            "command": "F=$(jq -r '.tool_input.file_path // empty'); case \"$F\" in *.py) /home/rob/workspace/torchdoom/.venv/bin/ruff format --quiet \"$F\" 2>/dev/null ;; esac; true"
           }
         ]
       }

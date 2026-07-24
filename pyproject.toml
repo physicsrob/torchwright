@@ -78,11 +78,10 @@ dev = [
 ]
 # CPU onnxruntime for the ONNX-runtime and HF-parity tests (the OnnxTokenModule
 # oracle in onnx_load.py, and everything that compares against it).  This is a
-# DEDICATED non-default group, deliberately NOT in `dev`: the umbrella's
-# `uv sync --all-packages` installs every member's dev group alongside
-# torchwright_doom's `onnxruntime-gpu` main dependency, and the CPU and GPU
-# builds collide on the same `onnxruntime` import path.  Keeping it out of `dev`
-# lets the local workspace use the GPU build while the Modal test image
+# DEDICATED non-default group, deliberately NOT in `dev`: torchwright_doom
+# carries `onnxruntime-gpu` (in its own opt-in `test-onnx` group), and the CPU
+# and GPU builds collide on the same `onnxruntime` import path.  Keeping it out
+# of `dev` lets the local workspace use the GPU build while the Modal test image
 # (modal_image.py) opts in explicitly via `--group test-onnx`.  Pinned in
 # lockstep with the gpu extra so the CPU
 # oracle the parity tests compare against matches the 1.26.0 runtime contract;
