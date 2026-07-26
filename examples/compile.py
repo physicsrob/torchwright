@@ -44,6 +44,8 @@ from typing import cast
 
 from torchwright.compiler.hf import compile_hf_bundle
 
+_TWO_DIGIT_EXAMPLE_MIN_WIDTH = 2
+
 _CARD_HEADER = """\
 ---
 license: apache-2.0
@@ -55,39 +57,87 @@ tags:
 pipeline_tag: text-generation
 ---
 
-# Compiled `{name}` (torchwright)
+# `{name}`{title_config} (torchwright)
 
-This is a **compiled** transformer: {task} compiled by torchwright into
-transformer weights, shipped as a stock Phi-3 `transformers` causal LM. The
-weights are not trained — they are *emitted* by a compiler from the source
-graph.
+A **compiled** transformer: the
+[torchwright](https://github.com/physicsrob/torchwright) compiler emitted
+these weights directly from a computation graph — nothing was trained.  This
+bundle is the `{name}` example{built_with}: {task}.
 
-* **Precision**: **fp32 only**. The compiled attention relies on exact
-  algebraic cancellation; a fp16/bf16 downcast breaks correctness.
-* **Decoding**: greedy (`do_sample=False`) only.
-* **Hardware**: CPU is fine.
+The bundle uses the stock Phi-3 architecture and loads through `transformers`
+without custom model code or `trust_remote_code`.
 
-## Normalization: a genuine RMSNorm that computes the identity
+Run it in **fp32** with **greedy decoding** (`do_sample=False`).  Other
+precisions and decoding modes are outside the supported contract.
+"""
 
-Like a stock Llama-style decoder, every block applies an `RMSNorm` before
-attention and before the MLP, with a final `RMSNorm` before the unembedding —
-the standard `input_layernorm` / `post_attention_layernorm` / `model.norm`
-weights. They are real ops and run on any standard engine.
+_CARD_IO = """\
 
-Because the weights are **compiled, not trained**, the norm does not need to
-*do* anything. Training needs normalization to keep activations in range; this
-model emits exact values and must preserve them. So the residual stream is
-arranged so the norm is the **identity**: one residual column is pinned to a
-large constant whose energy fixes the per-position RMS to an exact power of two,
-and the gain is set to cancel that RMS exactly — `x / rms * gain == x`, bit for
-bit. The norm runs for real; it just returns its input.
+## Input and output
 
-The one honest tell that this was compiled rather than trained: every gain is
-the same large constant ({gain} in this model), where a trained
-RMSNorm's gains cluster near 1. We keep the real norm — rather than dropping it
-and claiming "no normalization" — so the architecture is a faithful standard
-transformer; the atypical gain magnitude is the price of making the norm an
-exact identity, and we name it rather than hide it.
+Prompts are `A op B` terminated by a newline: two non-negative decimal
+operands of up to {max_digits} digits, with `op` one of `+`, `-`, `*`.
+Subtraction may produce a negative result.  Wider operands, or any character
+outside the model's small vocabulary, are outside the contract — the output
+is undefined.
+
+| prompt | output |
+|---|---|
+{rows}{output_note}"""
+
+_CARD_SIZE = """\
+
+## Size
+
+The checkpoint stores {size_gb} GB of dense fp32 weights ({total} entries) at
+the example family's shared compile width.  {zero_pct}% of those entries are
+exactly zero: the vast majority of the model is unused canvas, so size reflects
+the compile geometry rather than stored knowledge.
+
+The zero entries are not compressed, and dense `transformers` execution still
+pays their memory and compute cost.  CPU execution is supported; allow
+additional RAM beyond the checkpoint size.
+"""
+
+_CARD_LIMITS = """\
+
+## Intended use and limitations
+
+This model is a demonstration of a computation graph compiled into transformer
+weights.  It is not a general language model or a general-purpose calculator;
+only the input contract above is supported.
+"""
+
+_CARD_VERIFICATION = """\
+
+## Verification
+
+The examples above are exact reference outputs.  The Modal publishing path
+reloads the emitted checkpoint through stock `transformers`, checks those
+examples plus additional width-limit cases against Python integer arithmetic,
+and refuses to upload on a mismatch.  This is a functional smoke test, not
+exhaustive verification of every allowed expression.
+"""
+
+_CARD_FAMILY = """\
+
+## Family
+
+One example of many compiled with torchwright.  Calculator siblings —
+`calculator-simple` (serial arithmetic, depth grows with the digit count),
+`calculator-advanced` (carry-lookahead, near-flat depth), and
+`calculator-scratchpad` (flat depth; the serial work streams out as visible
+thinking tokens) — are published at several digit widths.  Browse the
+[torchwright calculator models](https://huggingface.co/models?search=physicsrob%2Ftorchwright-calculator)
+on Hugging Face.
+"""
+
+_CARD_FAMILY_GENERIC = """\
+
+## Family
+
+One example of many compiled with torchwright; the compiler and the full
+example set live at [physicsrob/torchwright](https://github.com/physicsrob/torchwright).
 """
 
 _CARD_USAGE = """\
@@ -97,8 +147,9 @@ _CARD_USAGE = """\
 ```python
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
-model = AutoModelForCausalLM.from_pretrained(REPO).eval()
-tok = AutoTokenizer.from_pretrained(REPO)
+repo_id = {repo_id!r}
+model = AutoModelForCausalLM.from_pretrained(repo_id).eval()
+tok = AutoTokenizer.from_pretrained(repo_id)
 
 enc = tok({prompt!r}, return_tensors="pt")
 out = model.generate(enc["input_ids"], max_new_tokens={max_new_tokens}, do_sample=False,
@@ -108,35 +159,100 @@ print(tok.decode(out[0, enc["input_ids"].shape[1]:], skip_special_tokens=True))
 """
 
 
-def _norm_gain(out_dir: str) -> str:
-    """The bundle's actual RMSNorm gain, formatted for the model card."""
-    import math
-
+def _weight_stats(out_dir: str) -> tuple[int, int, int]:
+    """Return ``(nonzero entries, total entries, serialized bytes)``."""
     from safetensors import safe_open
 
     with Path(out_dir, "model.safetensors.index.json").open() as f:
-        weight_map = json.load(f)["weight_map"]
-    key = "model.layers.0.input_layernorm.weight"
-    with safe_open(str(Path(out_dir, weight_map[key])), framework="pt") as f:
-        gain = float(f.get_tensor(key).max())
-    exp = round(math.log2(gain))
-    approx = f"{gain:.1e}".replace("e+", "e")
-    if 2.0**exp == gain:
-        return f"`2^{exp} ≈ {approx}`"
-    return f"`{approx}`"
+        index = json.load(f)
+    weight_map = index["weight_map"]
+    size_bytes = int(index["metadata"]["total_size"])
+    nonzero = total = 0
+    for filename in sorted(set(weight_map.values())):
+        with safe_open(str(Path(out_dir, filename)), framework="pt") as f:
+            for key in list(f.keys()):
+                tensor = f.get_tensor(key)
+                nonzero += int((tensor != 0).sum())
+                total += tensor.numel()
+    return nonzero, total, size_bytes
 
 
-def model_card(
+def _exact_answer(expr: str) -> str:
+    """Exact integer answer for an ``A op B`` expression."""
+    for op in ("*", "+", "-"):
+        a, found, b = expr.partition(op)
+        if found:
+            f = {"*": int.__mul__, "+": int.__add__, "-": int.__sub__}[op]
+            return str(f(int(a), int(b)))
+    raise ValueError(f"not an 'A op B' expression: {expr!r}")
+
+
+def _io_section(module: object, max_digits: int) -> str:
+    """The input-contract section with exact example rows."""
+    exprs = _card_expressions(max_digits)
+    output_note = getattr(module, "CARD_OUTPUT_NOTE", None)
+    rows = ""
+    for expr in exprs:
+        answer = _exact_answer(expr)
+        shown = f"<THINKING>…</THINKING>{answer}" if output_note else answer
+        rows += f"| `{expr}` | `{shown}` |\n"
+    note = (
+        "\n"
+        + output_note.format(
+            nines="9" * max_digits,
+            power_of_ten="1" + "0" * max_digits,
+        )
+        if output_note
+        else ""
+    )
+    return _CARD_IO.format(max_digits=max_digits, rows=rows, output_note=note)
+
+
+def write_card(
     name: str,
-    task: str | None,
-    gain: str,
-    prompts: list[str] | None,
-    max_new_tokens: int = 32,
-) -> str:
-    card = _CARD_HEADER.format(name=name, task=task or "a computation graph", gain=gain)
+    out_dir: str,
+    max_digits: int | None,
+    *,
+    repo_id: str | None = None,
+) -> None:
+    """Generate the bundle's README from the module and the written shards.
+
+    Standalone on purpose: it reads everything it needs from the bundle
+    directory, so a card can be regenerated (locally or on a Modal
+    worker holding the volume) without recompiling.  ``repo_id`` replaces
+    the local bundle path in the usage example when the card is about to
+    be uploaded.
+    """
+    module = importlib.import_module(f"examples.{name}")
+    prompts = getattr(module, "DEMO_PROMPTS", None)
+    max_new_tokens = getattr(module, "DEMO_MAX_NEW_TOKENS", 32)
+    config = f", max_digits={max_digits}" if max_digits is not None else ""
+    built = f" built with `max_digits={max_digits}`" if max_digits is not None else ""
+    card = _CARD_HEADER.format(
+        name=name,
+        title_config=config,
+        built_with=built,
+        task=getattr(module, "CARD_TASK", None) or "a computation graph",
+    )
     if prompts:
-        card += _CARD_USAGE.format(prompt=prompts[0], max_new_tokens=max_new_tokens)
-    return card
+        card += _CARD_USAGE.format(
+            repo_id=repo_id or out_dir,
+            prompt=prompts[0],
+            max_new_tokens=max_new_tokens,
+        )
+    if max_digits is not None and name.startswith("calculator"):
+        card += _io_section(module, max_digits)
+        card += _CARD_LIMITS
+        card += _CARD_VERIFICATION
+    nonzero, total, size_bytes = _weight_stats(out_dir)
+    card += _CARD_SIZE.format(
+        zero_pct=f"{100.0 * (1.0 - nonzero / total):.2f}",
+        total=f"{total:,}",
+        size_gb=f"{size_bytes / 1e9:.2f}",
+    )
+    card += _CARD_FAMILY if name.startswith("calculator") else _CARD_FAMILY_GENERIC
+    with Path(out_dir, "README.md").open("w") as f:
+        f.write(card)
 
 
 def run_prompts(
@@ -188,7 +304,23 @@ def _full_width_prompts(max_digits: int) -> list[str]:
     """
     nines = "9" * max_digits
     dense = "".join(str(i % 9 + 1) for i in range(max_digits))
-    return [f"{nines}*{nines}\n", f"{nines}+1\n", f"{nines}-{dense}\n", f"{dense}*2\n"]
+    return [
+        f"{nines}*{nines}\n",
+        f"{nines}+1\n",
+        f"{nines}-{dense}\n",
+        f"{dense}*2\n",
+        f"{dense}-{nines}\n",
+    ]
+
+
+def _card_expressions(max_digits: int) -> list[str]:
+    """Representative in-contract expressions for a sized calculator card."""
+    exprs = ["7+8"]
+    if max_digits >= _TWO_DIGIT_EXAMPLE_MIN_WIDTH:
+        exprs.insert(0, "12*34")
+    full_width = _full_width_prompts(max_digits)
+    exprs.extend(p.strip() for p in [*full_width[:3], full_width[-1]])
+    return list(dict.fromkeys(exprs))
 
 
 def bundle_dirname(name: str, max_digits: int | None) -> str:
@@ -239,17 +371,11 @@ def build_bundle(
         d_hidden=getattr(module, "D_HIDDEN", None),
         optimize=optimize,
     )
+    write_card(name, out_dir, max_digits)
     prompts = getattr(module, "DEMO_PROMPTS", None)
     if prompts is not None and max_digits is not None:
         prompts = [*prompts, *_full_width_prompts(max_digits)]
-    max_new_tokens = getattr(module, "DEMO_MAX_NEW_TOKENS", 32)
-    task = getattr(module, "CARD_TASK", None)
-    if task is not None and max_digits is not None:
-        task = f"{task}, sized for operands up to {max_digits} digits"
-    card = model_card(name, task, _norm_gain(out_dir), prompts, max_new_tokens)
-    with Path(out_dir, "README.md").open("w") as f:
-        f.write(card)
-    return out_dir, prompts, max_new_tokens
+    return out_dir, prompts, getattr(module, "DEMO_MAX_NEW_TOKENS", 32)
 
 
 def main() -> None:
@@ -288,6 +414,12 @@ def main() -> None:
     if args.push:
         from huggingface_hub import HfApi
 
+        write_card(
+            args.name,
+            out_dir,
+            args.max_digits,
+            repo_id=args.push,
+        )
         api = HfApi()
         api.create_repo(args.push, exist_ok=True)
         api.upload_folder(folder_path=out_dir, repo_id=args.push)

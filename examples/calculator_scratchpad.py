@@ -169,6 +169,14 @@ CARD_TASK = (
 )
 DEMO_PROMPTS = ["12*34\n", "7+8\n", "100-99\n", "123*4\n"]
 DEMO_MAX_NEW_TOKENS = 96
+CARD_OUTPUT_NOTE = """\
+The answer is preceded by a visible scratchpad between `<THINKING>` and
+`</THINKING>`: superscript glyphs (`⁰¹²`) stream the per-column carry /
+borrow / comparison state, plain digits are the unnormalized scratch answer,
+and subscript glyphs (`₀₁₂`) stream the leading-zero cleanup count.  The
+final answer follows the closing tag — e.g. `{nines}+1` ends
+`…</THINKING>{power_of_ten}`.
+"""
 
 
 def decode_steps(max_digits: int) -> int:

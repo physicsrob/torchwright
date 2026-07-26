@@ -136,6 +136,28 @@ def verify_remote(dirname: str, exprs: str, max_new_tokens: int = 32) -> list[st
     return lines
 
 
+@app.function(cpu=4, memory=8192, timeout=7200, volumes={BUNDLE_ROOT: bundles})
+def card_remote(dirname: str) -> str:
+    """Regenerate a volume bundle's README without recompiling.
+
+    ``write_card`` reads everything it needs from the bundle directory
+    (density from the shards, geometry from config.json), so card
+    iterations don't cost a compile.
+    """
+    from examples.compile import write_card
+
+    m = re.fullmatch(r"(.+?)(?:_n(\d+))?_hf_bundle", dirname)
+    if m is None:
+        raise ValueError(f"not a bundle dirname: {dirname!r}")
+    write_card(
+        m.group(1),
+        str(Path(BUNDLE_ROOT) / dirname),
+        int(m.group(2)) if m.group(2) else None,
+    )
+    bundles.commit()
+    return dirname
+
+
 @app.function(
     cpu=4,
     memory=8192,
@@ -145,6 +167,19 @@ def verify_remote(dirname: str, exprs: str, max_new_tokens: int = 32) -> list[st
 )
 def push_remote(dirname: str, repo_id: str) -> str:
     from huggingface_hub import HfApi
+
+    from examples.compile import write_card
+
+    m = re.fullmatch(r"(.+?)(?:_n(\d+))?_hf_bundle", dirname)
+    if m is None:
+        raise ValueError(f"not a bundle dirname: {dirname!r}")
+    write_card(
+        m.group(1),
+        str(Path(BUNDLE_ROOT) / dirname),
+        int(m.group(2)) if m.group(2) else None,
+        repo_id=repo_id,
+    )
+    bundles.commit()
 
     api = HfApi()
     api.create_repo(repo_id, exist_ok=True)
