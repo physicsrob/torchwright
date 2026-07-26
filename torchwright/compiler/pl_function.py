@@ -481,19 +481,58 @@ class SubgraphCertificate:
     n_oracle_points: int = 0
 
 
-def _merge_intervals(iv: torch.Tensor) -> torch.Tensor:
-    """Merge overlapping ``(k, 2)`` intervals; returns sorted disjoint rows."""
+def _excusable_bands(iv: torch.Tensor) -> torch.Tensor:
+    """Filter raw hinge-band rows down to the excusable, disjoint set.
+
+    The in-band excusal (the inherited-ramp clause consumed by
+    :func:`band_skeleton` and the emission verifier) models a band's
+    interior as ONE hinge's fillet.  That premise fails when a dense
+    grid packs adjacent hinges closer than their fillet width — the
+    steep end of a reciprocal — and blindly merging the overlapping
+    rows produced one wide band whose interior held several real slope
+    changes; the skeleton then dropped those knots and the emission
+    replaced the curve there with a single chord, unverified (the
+    2026-07-26 calculator wide-operand truncation).
+
+    Two-step rule, all from the ``(k, 2)`` rows (a raw band is
+    ``crossing ± half``, so its center IS the crossing):
+
+    1. Rows whose centers coincide within the smaller fillet radius
+       describe the SAME corner (a hinge pair, an inherited duplicate)
+       and union into one candidate band.
+    2. Candidates from DISTINCT corners that still overlap void each
+       other's excusal entirely: the region keeps its knots in the
+       skeleton, the chord certificate measures it, and the emission
+       verifier samples it.
+    """
     if iv.numel() == 0:
         return iv.reshape(0, 2)
-    iv = iv[torch.argsort(iv[:, 0])]
-    merged = [iv[0].clone()]
-    for row in iv[1:]:
-        if float(row[0]) <= float(merged[-1][1]):
-            if float(row[1]) > float(merged[-1][1]):
-                merged[-1][1] = row[1]
+    mids = (iv[:, 0] + iv[:, 1]) / 2.0
+    halfs = (iv[:, 1] - iv[:, 0]) / 2.0
+    order = torch.argsort(mids)
+    iv, mids, halfs = iv[order], mids[order], halfs[order]
+
+    clusters: list[list[int]] = [[0]]
+    for i in range(1, int(iv.shape[0])):
+        j = clusters[-1][-1]
+        same_corner = float((mids[i] - mids[j]).abs()) <= float(
+            torch.minimum(halfs[i], halfs[j])
+        )
+        if same_corner:
+            clusters[-1].append(i)
         else:
-            merged.append(row.clone())
-    return torch.stack(merged)
+            clusters.append([i])
+    cand = torch.stack(
+        [
+            torch.stack([iv[c, 0].min(), iv[c, 1].max()])
+            for c in [torch.tensor(c) for c in clusters]
+        ]
+    )
+    keep = torch.ones(cand.shape[0], dtype=torch.bool)
+    for i in range(int(cand.shape[0]) - 1):
+        if float(cand[i, 1]) > float(cand[i + 1, 0]):
+            keep[i] = keep[i + 1] = False
+    return cand[keep]
 
 
 def _in_intervals(
@@ -1010,7 +1049,7 @@ def certify_subgraph(
                 bend_hi or bool((cross == hi).any()) or bool((phi.y[-1] == 0).any())
             )
         st.bands[m] = (
-            _merge_intervals(torch.cat(bnd)) if bnd else torch.zeros(0, 2, dtype=_F64)
+            _excusable_bands(torch.cat(bnd)) if bnd else torch.zeros(0, 2, dtype=_F64)
         )
         st.edge_bends[m] = (bend_lo, bend_hi)
         kset = torch.unique(torch.cat(ks)) if ks else torch.zeros(0, dtype=_F64)

@@ -115,14 +115,26 @@ def test_fact_and_param_formulas_match_built_graph(n, model_n1, model_n2):
     assert counted == cm.n_params(n)
 
 
-def test_layer_floor_is_constant_in_n(model_n1, model_n2):
+def test_lowered_layer_floors(model_n1, model_n2):
+    """Pin the lowered floors at both buildable sizes: 13 (n=1), 15 (n=2).
+
+    The floor was constant in n until 2026-07-26, when the band-chaining
+    fix in collapse_pl (``_excusable_bands``) started measuring regions
+    the pass had silently excused: at n=2 two chains genuinely deviate
+    2.18e-3 from a clean piecewise-linear — over the strict 1e-3 budget
+    — so they now decline collapse and honestly cost two layers.  The
+    old constancy rode on the verification hole (accepted per Rob's
+    option-1 call, 2026-07-26); a floor DROP here would mean those
+    chains collapse again — verify the take is certified before
+    re-pinning.
+    """
     floors = []
     for out, _embedding in (model_n1, model_n2):
         lowered = lower(
             out, collapse_univariate=True, collapse_pl=True, collapse_lane_cap=2048
         )
         floors.append(critical_path_layers(lowered.output_node))
-    assert floors[0] == floors[1], floors
+    assert floors == [13, 15], floors
 
 
 def test_n3_is_stated_as_unbuildable():

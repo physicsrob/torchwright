@@ -218,3 +218,78 @@ def test_output_concat_with_literal_field_compiles():
     with suppress_checks():
         want = reference_eval(out, {"x": inp}, 2)[out]
     assert float((res.cpu() - want).abs().max()) < 1e-3
+
+
+def _steep_count_chain():
+    """The mean -> count chain behind the 2026-07 calculator truncation.
+
+    ``count_since_marker``'s reciprocal uses a geometric grid whose
+    hinges at the steep end sit closer together than their fillet
+    width.  Pre-fix, the per-hinge analytic bands chained into one
+    interval spanning four real slope changes, ``band_skeleton``
+    dropped those knots, and the S1 emission replaced the curve there
+    with a single chord — 0.62 off, certified at the 1e-3 budget
+    because the verifier never samples inside bands.
+    """
+    import math
+
+    from torchwright.ops._math import _RECIP_REL_SAFETY
+    from torchwright.ops.swiglu.arithmetic_ops import add_const, reciprocal
+
+    max_gap = 13
+    lo_v, hi_v = 1.0 / (max_gap + 1.5), 1.5
+    target_rel = 0.5 / (max_gap + 1.0) / _RECIP_REL_SAFETY
+    r_max = 1.0 + math.sqrt(8.0 * target_rel)
+    n_bp = max(32, int(math.log(hi_v / lo_v) / math.log(r_max)) + 2)
+    step = (hi_v - lo_v) / (n_bp - 1)
+    x = create_input("x", 1, value_range=(lo_v, 1.0))
+    return x, add_const(reciprocal(x, min_value=lo_v, max_value=hi_v, step=step), -1.0)
+
+
+def test_steep_dense_grid_keeps_count_contract():
+    """Collapsing a dense steep grid must not lose real corners.
+
+    Whether the pass emits (with the corners kept) or declines (the
+    chain keeps its original layers), the lowered graph must track the
+    original reference at the count's operating points and across the
+    steep end.  Thresholds sit far under the pre-fix 0.44/0.62 errors
+    but leave room for legitimate in-band rounding differences.
+    """
+    _x, out = _steep_count_chain()
+    lowered = lower(out, collapse_pl=True, collapse_lane_cap=512)
+    gaps = torch.tensor([1.0 / (g + 1.0) for g in range(14)], dtype=torch.float64)
+    err = (_eval(lowered.output_node, gaps) - _eval(out, gaps)).abs()
+    assert float(err.max()) < 5e-2, float(err.max())
+    fine = torch.linspace(1.0 / 14.5, 0.13, 1001, dtype=torch.float64)
+    err_fine = (_eval(lowered.output_node, fine) - _eval(out, fine)).abs()
+    assert float(err_fine.max()) < 5e-2, float(err_fine.max())
+
+
+def test_overlapping_hinge_bands_void_excusal():
+    """Unit set for ``_excusable_bands`` (the band-chaining fix)."""
+    from torchwright.compiler.pl_function import _excusable_bands
+
+    def rows(*pairs):
+        return torch.tensor(pairs, dtype=torch.float64)
+
+    # An isolated band survives untouched.
+    assert _excusable_bands(rows([0.0, 1.0])).tolist() == [[0.0, 1.0]]
+    # Rows whose centers coincide within the fillet radius (a hinge
+    # pair, an inherited duplicate) union into ONE band.
+    assert _excusable_bands(rows([0.0, 1.0], [0.001, 1.001])).shape[0] == 1
+    # Distinct corners whose bands overlap void each other's excusal.
+    assert _excusable_bands(rows([0.0, 1.0], [0.8, 1.8])).shape[0] == 0
+    # The calculator steep end: a chain of five overlapping bands all
+    # void; the first non-overlapping neighbors survive.
+    chain = rows(
+        [0.0637, 0.0743],
+        [0.0709, 0.0815],
+        [0.0788, 0.0894],
+        [0.0876, 0.0982],
+        [0.0973, 0.1079],
+        [0.1080, 0.1186],
+        [0.1199, 0.1305],
+    )
+    kept = _excusable_bands(chain)
+    assert kept.shape[0] == 2, kept.tolist()
+    assert float(kept[0, 0]) == 0.1080
