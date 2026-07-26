@@ -47,6 +47,9 @@ _MEDIUM_FILE_GROUPS: list[list[str]] = [
     # Calculator family (d=1024-3072, ~90 layers each).
     [
         "tests/compile/forward/test_forward_calculator.py",
+        # Full-width (9-digit) arithmetic + lowered-parse coverage — ~40s
+        # of graph builds and reference evals, no compiles.
+        "tests/examples/test_calculator_full_width.py",
     ],
     [
         "tests/compile/forward/test_kv_cache.py",
