@@ -23,205 +23,205 @@
     "calculator_simple": [
       {
         "n": 2,
-        "layers": 23,
-        "steps": 5,
-        "params": 531909,
-        "floor": 23
-      },
-      {
-        "n": 3,
         "layers": 25,
-        "steps": 7,
-        "params": 1329165,
+        "steps": 5,
+        "params": 531911,
         "floor": 25
       },
       {
-        "n": 4,
+        "n": 3,
         "layers": 27,
-        "steps": 9,
-        "params": 2720147,
+        "steps": 7,
+        "params": 1329181,
         "floor": 27
       },
       {
-        "n": 5,
+        "n": 4,
         "layers": 29,
-        "steps": 11,
-        "params": 4877783,
+        "steps": 9,
+        "params": 2720165,
         "floor": 29
       },
       {
-        "n": 6,
+        "n": 5,
         "layers": 31,
-        "steps": 13,
-        "params": 7975145,
+        "steps": 11,
+        "params": 4877865,
         "floor": 31
       },
       {
-        "n": 7,
-        "layers": 34,
-        "steps": 15,
-        "params": 12185267,
+        "n": 6,
+        "layers": 33,
+        "steps": 13,
+        "params": 7975297,
         "floor": 33
       },
       {
-        "n": 8,
+        "n": 7,
         "layers": 36,
-        "steps": 17,
-        "params": 17681145,
+        "steps": 15,
+        "params": 12185477,
         "floor": 35
       },
       {
-        "n": 9,
-        "layers": 39,
-        "steps": 19,
-        "params": 24635299,
+        "n": 8,
+        "layers": 38,
+        "steps": 17,
+        "params": 17681427,
         "floor": 37
       },
       {
-        "n": 10,
+        "n": 9,
         "layers": 41,
-        "steps": 21,
-        "params": 33221670,
+        "steps": 19,
+        "params": 24635815,
         "floor": 39
+      },
+      {
+        "n": 10,
+        "layers": 43,
+        "steps": 21,
+        "params": 33222306,
+        "floor": 41
       }
     ],
     "calculator_advanced": [
       {
         "n": 2,
-        "layers": 25,
+        "layers": 27,
         "steps": 5,
-        "params": 656428,
-        "floor": 25
+        "params": 656430,
+        "floor": 27
       },
       {
         "n": 3,
-        "layers": 27,
+        "layers": 29,
         "steps": 7,
-        "params": 1500858,
-        "floor": 27
+        "params": 1500874,
+        "floor": 29
       },
       {
         "n": 4,
-        "layers": 27,
+        "layers": 29,
         "steps": 9,
-        "params": 2942400,
-        "floor": 27
+        "params": 2942418,
+        "floor": 29
       },
       {
         "n": 5,
-        "layers": 28,
+        "layers": 30,
         "steps": 11,
-        "params": 5136237,
-        "floor": 28
+        "params": 5200430,
+        "floor": 30
       },
       {
         "n": 6,
-        "layers": 28,
+        "layers": 30,
         "steps": 13,
-        "params": 8447774,
-        "floor": 28
+        "params": 8447926,
+        "floor": 30
       },
       {
         "n": 7,
-        "layers": 32,
+        "layers": 34,
         "steps": 15,
-        "params": 12966644,
-        "floor": 31
+        "params": 12966854,
+        "floor": 33
       },
       {
         "n": 8,
-        "layers": 32,
+        "layers": 34,
         "steps": 17,
-        "params": 19316762,
-        "floor": 31
+        "params": 19317044,
+        "floor": 33
       },
       {
         "n": 9,
-        "layers": 34,
+        "layers": 36,
         "steps": 19,
-        "params": 26465128,
-        "floor": 32
+        "params": 26465644,
+        "floor": 34
       },
       {
         "n": 10,
-        "layers": 34,
+        "layers": 36,
         "steps": 21,
-        "params": 35295159,
-        "floor": 32
+        "params": 35295795,
+        "floor": 34
       }
     ],
     "calculator_scratchpad": [
       {
         "n": 2,
-        "layers": 16,
+        "layers": 18,
         "steps": 19,
-        "params": 570152,
-        "floor": 16
+        "params": 570154,
+        "floor": 18
       },
       {
         "n": 3,
-        "layers": 16,
+        "layers": 18,
         "steps": 27,
-        "params": 1050035,
-        "floor": 16
+        "params": 1050051,
+        "floor": 18
       },
       {
         "n": 4,
-        "layers": 16,
+        "layers": 18,
         "steps": 35,
-        "params": 1714580,
-        "floor": 16
+        "params": 1714598,
+        "floor": 18
       },
       {
         "n": 5,
-        "layers": 16,
+        "layers": 18,
         "steps": 43,
-        "params": 2592130,
-        "floor": 16
+        "params": 2592212,
+        "floor": 18
       },
       {
         "n": 6,
-        "layers": 16,
+        "layers": 18,
         "steps": 51,
-        "params": 3710651,
-        "floor": 16
+        "params": 3710803,
+        "floor": 18
       },
       {
         "n": 7,
-        "layers": 16,
+        "layers": 18,
         "steps": 59,
-        "params": 5098865,
-        "floor": 16
+        "params": 5099075,
+        "floor": 18
       },
       {
         "n": 8,
         "layers": 19,
         "steps": 67,
-        "params": 6784549,
-        "floor": 16
+        "params": 6784831,
+        "floor": 18
       },
       {
         "n": 9,
         "steps": 75,
-        "params": 8794724,
-        "floor": 16,
-        "compile_error": "No progress: 664 nodes remaining, 6 free columns."
+        "params": 8795240,
+        "floor": 18,
+        "compile_error": "No progress: 677 nodes remaining, 0 free columns."
       },
       {
         "n": 10,
         "steps": 83,
-        "params": 11159946,
-        "floor": 16,
-        "compile_error": "No progress: 896 nodes remaining, 0 free columns."
+        "params": 11160582,
+        "floor": 18,
+        "compile_error": "No progress: 862 nodes remaining, 0 free columns."
       }
     ],
     "calculator_memorize": [
       {
         "n": 2,
-        "layers": 14,
+        "layers": 16,
         "steps": 5,
-        "params": 5574209,
-        "floor": 13
+        "params": 5574211,
+        "floor": 15
       },
       {
         "n": 3,
