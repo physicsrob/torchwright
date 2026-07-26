@@ -136,6 +136,30 @@ def verify_remote(dirname: str, exprs: str, max_new_tokens: int = 32) -> list[st
     return lines
 
 
+@app.function(
+    gpu="B200", cpu=8, memory=262144, timeout=7200, volumes={BUNDLE_ROOT: bundles}
+)
+def accuracy_remote(
+    dirname: str, n: int = 500, seed: int = 0, batch_size: int = 250
+) -> dict:
+    """Randomized accuracy sweep of a volume bundle on one B200.
+
+    A single B200's 192GB holds even the n=12 bundles in full fp32 —
+    no sharding, no downcast (TF32 disabled in the script; the compiled
+    attention's exact cancellation does not survive it).  Operand digit
+    lengths are drawn independently in [1, max_digits] per side.
+    """
+    from scripts.verify_bundle_accuracy import make_examples, report, run
+
+    m = re.fullmatch(r"(.+?)_n(\d+)_hf_bundle", dirname)
+    if m is None:
+        raise ValueError(f"not a sized bundle dirname: {dirname!r}")
+    examples = make_examples(n, int(m.group(2)), seed)
+    results = run(str(Path(BUNDLE_ROOT) / dirname), examples, batch_size=batch_size)
+    n_bad = report(results)
+    return {"bundle": dirname, "n": n, "seed": seed, "mismatches": n_bad}
+
+
 @app.function(cpu=4, memory=8192, timeout=7200, volumes={BUNDLE_ROOT: bundles})
 def card_remote(dirname: str) -> str:
     """Regenerate a volume bundle's README without recompiling.
