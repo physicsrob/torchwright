@@ -157,6 +157,19 @@ __all__ = [
     "scratch_vocab",
 ]
 
+# Model-card fields consumed by ``examples.compile`` when publishing this
+# example as a Hugging Face bundle.  The generation budget must cover the
+# *variant's* worst-case transcript — decode_steps(max_digits) tokens even
+# for narrow operands, since the streamed sweeps walk the padded window —
+# so it is sized for the family ceiling (decode_steps(10) == 83).
+CARD_TASK = (
+    "a computation graph for integer arithmetic (`A op B` with `op` in `+ - *`) "
+    "that streams its serial carry/borrow work as visible thinking tokens "
+    "before emitting the answer"
+)
+DEMO_PROMPTS = ["12*34\n", "7+8\n", "100-99\n", "123*4\n"]
+DEMO_MAX_NEW_TOKENS = 96
+
 
 def decode_steps(max_digits: int) -> int:
     """**Worst-case** decode steps for ``max_digits``-wide operands.

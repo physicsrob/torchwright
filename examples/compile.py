@@ -11,6 +11,13 @@ Usage:
     uv run python -m examples.compile <name> --out DIR
     uv run python -m examples.compile <name> --push USER/REPO
     uv run python -m examples.compile <name> --no-demo
+    uv run python -m examples.compile <name> --max-digits 5   # sized variants
+    uv run python -m examples.compile <name> --optimize 2
+
+``--max-digits`` threads through to ``create_network_parts(max_digits=...)``
+for the examples that take it (the calculator family); the default bundle
+directory then becomes ``<name>_n<max_digits>_hf_bundle`` so differently
+sized variants don't overwrite each other.
 
 Optional attributes on the example module:
 
@@ -30,8 +37,10 @@ from __future__ import annotations
 
 import argparse
 import importlib
+import inspect
 import json
 from pathlib import Path
+from typing import cast
 
 from torchwright.compiler.hf import compile_hf_bundle
 
@@ -92,7 +101,7 @@ model = AutoModelForCausalLM.from_pretrained(REPO).eval()
 tok = AutoTokenizer.from_pretrained(REPO)
 
 enc = tok({prompt!r}, return_tensors="pt")
-out = model.generate(enc["input_ids"], max_new_tokens=32, do_sample=False,
+out = model.generate(enc["input_ids"], max_new_tokens={max_new_tokens}, do_sample=False,
                      eos_token_id=tok.eos_token_id, pad_token_id=tok.eos_token_id)
 print(tok.decode(out[0, enc["input_ids"].shape[1]:], skip_special_tokens=True))
 ```
@@ -118,15 +127,21 @@ def _norm_gain(out_dir: str) -> str:
 
 
 def model_card(
-    name: str, task: str | None, gain: str, prompts: list[str] | None
+    name: str,
+    task: str | None,
+    gain: str,
+    prompts: list[str] | None,
+    max_new_tokens: int = 32,
 ) -> str:
     card = _CARD_HEADER.format(name=name, task=task or "a computation graph", gain=gain)
     if prompts:
-        card += _CARD_USAGE.format(prompt=prompts[0])
+        card += _CARD_USAGE.format(prompt=prompts[0], max_new_tokens=max_new_tokens)
     return card
 
 
-def demo(out_dir: str, prompts: list[str]) -> None:
+def run_prompts(
+    out_dir: str, prompts: list[str], max_new_tokens: int = 32
+) -> list[str]:
     """Clean-room reload + greedy generation, as a user would consume it."""
     import torch
     from transformers import AutoModelForCausalLM, AutoTokenizer
@@ -134,36 +149,86 @@ def demo(out_dir: str, prompts: list[str]) -> None:
     model = AutoModelForCausalLM.from_pretrained(out_dir).eval()
     tok = AutoTokenizer.from_pretrained(out_dir)
 
-    print("\n=== clean-room stock Phi-3 demo ===")
+    outputs: list[str] = []
     for expr in prompts:
         enc = tok(expr, return_tensors="pt")
         with torch.no_grad():
             g = model.generate(
                 enc["input_ids"],
-                max_new_tokens=32,
+                max_new_tokens=max_new_tokens,
                 do_sample=False,
                 use_cache=True,
                 eos_token_id=tok.eos_token_id,
                 pad_token_id=tok.eos_token_id,
             )
-        out = tok.decode(g[0, enc["input_ids"].shape[1] :], skip_special_tokens=True)
+        outputs.append(
+            cast(
+                "str",
+                tok.decode(g[0, enc["input_ids"].shape[1] :], skip_special_tokens=True),
+            )
+        )
+    return outputs
+
+
+def demo(out_dir: str, prompts: list[str], max_new_tokens: int = 32) -> None:
+    print("\n=== clean-room stock Phi-3 demo ===")
+    for expr, out in zip(
+        prompts, run_prompts(out_dir, prompts, max_new_tokens), strict=True
+    ):
         print(f"  {expr.strip():10s} -> {out}")
 
 
-def main() -> None:
-    ap = argparse.ArgumentParser(description=__doc__)
-    ap.add_argument("name", help="example module name under examples/")
-    ap.add_argument("--out", default=None, help="output dir (default <name>_hf_bundle)")
-    ap.add_argument("--push", default=None, help="Hub repo id to push the bundle to")
-    ap.add_argument("--no-demo", action="store_true")
-    args = ap.parse_args()
+def _full_width_prompts(max_digits: int) -> list[str]:
+    """Demo prompts that exercise the full operand width.
 
-    module = importlib.import_module(f"examples.{args.name}")
+    The 2026-07 truncation shipped because every variant's demo used
+    3-digit operands — the one region where all widths agree.  A sized
+    bundle's demo (and the pre-push verification built on it) must
+    prove arithmetic at its own width limit, carries included.
+    """
+    nines = "9" * max_digits
+    dense = "".join(str(i % 9 + 1) for i in range(max_digits))
+    return [f"{nines}*{nines}\n", f"{nines}+1\n", f"{nines}-{dense}\n", f"{dense}*2\n"]
+
+
+def bundle_dirname(name: str, max_digits: int | None) -> str:
+    """Default bundle directory name for an example (sized or not)."""
+    suffix = f"_n{max_digits}" if max_digits is not None else ""
+    return f"{name}{suffix}_hf_bundle"
+
+
+def build_bundle(
+    name: str,
+    out_dir: str | None = None,
+    *,
+    max_digits: int | None = None,
+    optimize: int = 0,
+) -> tuple[str, list[str] | None, int]:
+    """Compile ``examples.<name>`` into an HF bundle with its model card.
+
+    ``max_digits`` threads through to ``create_network_parts`` for the
+    examples that take it (the calculator family); passing it for one
+    that doesn't raises.  Returns ``(out_dir, demo prompts or None,
+    generation budget)`` — the demo itself is the caller's decision,
+    not part of the build.
+    """
+    module = importlib.import_module(f"examples.{name}")
     if not hasattr(module, "create_network_parts"):
-        raise SystemExit(f"examples.{args.name} has no create_network_parts()")
+        raise ValueError(f"examples.{name} has no create_network_parts()")
 
-    out_dir = args.out or f"{args.name}_hf_bundle"
-    output_node, embedding = module.create_network_parts()
+    build_kwargs = {}
+    if max_digits is not None:
+        if (
+            "max_digits"
+            not in inspect.signature(module.create_network_parts).parameters
+        ):
+            raise ValueError(
+                f"examples.{name}.create_network_parts takes no max_digits"
+            )
+        build_kwargs["max_digits"] = max_digits
+
+    out_dir = out_dir or bundle_dirname(name, max_digits)
+    output_node, embedding = module.create_network_parts(**build_kwargs)
     compile_hf_bundle(
         output_node,
         embedding,
@@ -172,18 +237,53 @@ def main() -> None:
         d_head=getattr(module, "D_HEAD", 16),
         n_heads=getattr(module, "N_HEADS", None),
         d_hidden=getattr(module, "D_HIDDEN", None),
+        optimize=optimize,
     )
     prompts = getattr(module, "DEMO_PROMPTS", None)
-    card = model_card(
-        args.name, getattr(module, "CARD_TASK", None), _norm_gain(out_dir), prompts
-    )
+    if prompts is not None and max_digits is not None:
+        prompts = [*prompts, *_full_width_prompts(max_digits)]
+    max_new_tokens = getattr(module, "DEMO_MAX_NEW_TOKENS", 32)
+    task = getattr(module, "CARD_TASK", None)
+    if task is not None and max_digits is not None:
+        task = f"{task}, sized for operands up to {max_digits} digits"
+    card = model_card(name, task, _norm_gain(out_dir), prompts, max_new_tokens)
     with Path(out_dir, "README.md").open("w") as f:
         f.write(card)
+    return out_dir, prompts, max_new_tokens
+
+
+def main() -> None:
+    ap = argparse.ArgumentParser(description=__doc__)
+    ap.add_argument("name", help="example module name under examples/")
+    ap.add_argument("--out", default=None, help="output dir (default <name>_hf_bundle)")
+    ap.add_argument("--push", default=None, help="Hub repo id to push the bundle to")
+    ap.add_argument("--no-demo", action="store_true")
+    ap.add_argument(
+        "--max-digits",
+        type=int,
+        default=None,
+        help="operand digit width, for examples whose create_network_parts "
+        "takes max_digits (default: the example's own default)",
+    )
+    ap.add_argument(
+        "--optimize",
+        type=int,
+        default=0,
+        help="compiler optimization level passed to compile_hf_bundle",
+    )
+    args = ap.parse_args()
+
+    try:
+        out_dir, prompts, max_new_tokens = build_bundle(
+            args.name, args.out, max_digits=args.max_digits, optimize=args.optimize
+        )
+    except ValueError as exc:
+        raise SystemExit(str(exc)) from None
     bundle_files = sorted(p.name for p in Path(out_dir).iterdir())
     print(f"Wrote bundle to {out_dir}: {bundle_files}")
 
     if prompts and not args.no_demo:
-        demo(out_dir, prompts)
+        demo(out_dir, prompts, max_new_tokens)
 
     if args.push:
         from huggingface_hub import HfApi

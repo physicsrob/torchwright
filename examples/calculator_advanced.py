@@ -76,6 +76,14 @@ __all__ = [
     "subtract_digit_seqs",
 ]
 
+# Model-card fields consumed by ``examples.compile`` when publishing this
+# example as a Hugging Face bundle.
+CARD_TASK = (
+    "a computation graph for integer arithmetic (`A op B` with `op` in `+ - *`), "
+    "computed at logarithmic depth via carry-lookahead / carry-save arithmetic"
+)
+DEMO_PROMPTS = ["12*34\n", "7+8\n", "100-99\n", "123*4\n"]
+
 
 # ---------------------------------------------------------------------------
 # Carry-lookahead addition / subtraction
