@@ -66,7 +66,7 @@ def repo_name(name: str, max_digits: int | None) -> str:
 def compile_remote(spec: tuple) -> dict:
     from examples.compile import build_bundle, bundle_dirname, run_prompts
 
-    name, max_digits, optimize = spec
+    name, max_digits, optimize, d, d_hidden = (*spec, None, None)[:5]
     dirname = bundle_dirname(name, max_digits)
     t0 = time.time()
     try:
@@ -75,6 +75,8 @@ def compile_remote(spec: tuple) -> dict:
             str(Path(BUNDLE_ROOT) / dirname),
             max_digits=max_digits,
             optimize=optimize,
+            d=d,
+            d_hidden=d_hidden,
         )
     except (ValueError, RuntimeError) as exc:
         # A cell can refuse to build (calculator_memorize past n=2) or to
@@ -263,7 +265,14 @@ def push_remote(dirname: str, repo_id: str) -> str:
 
     api = HfApi()
     api.create_repo(repo_id, exist_ok=True)
-    api.upload_folder(folder_path=str(Path(BUNDLE_ROOT) / dirname), repo_id=repo_id)
+    api.upload_folder(
+        folder_path=str(Path(BUNDLE_ROOT) / dirname),
+        repo_id=repo_id,
+        # A replacement bundle may have fewer shards than its
+        # predecessor; stale remote shards would linger (the index
+        # ignores them, but they bloat and confuse the repo).
+        delete_patterns=["model-*.safetensors"],
+    )
     return f"https://huggingface.co/{repo_id}"
 
 
@@ -271,11 +280,24 @@ def push_remote(dirname: str, repo_id: str) -> str:
 def main(specs: str, optimize: int = 0, push_prefix: str = "") -> None:
     cells = []
     for cell_spec in specs.split(","):
-        cell_name, _, digits = cell_spec.partition(":")
-        cells.append((cell_name.strip(), int(digits) if digits else None, optimize))
+        # name[:max_digits[:d[:d_hidden]]] — trailing fields optional.
+        fields = [f or None for f in cell_spec.strip().split(":")]
+        fields += [None] * (4 - len(fields))
+        name_part, digits, d, d_hidden = fields[:4]
+        if not name_part:
+            raise ValueError(f"bad spec: {cell_spec!r}")
+        cells.append(
+            (
+                name_part,
+                int(digits) if digits else None,
+                optimize,
+                int(d) if d else None,
+                int(d_hidden) if d_hidden else None,
+            )
+        )
 
     to_push = []
-    for (name, n, _), row in zip(cells, compile_remote.map(cells), strict=True):
+    for (name, n, *_rest), row in zip(cells, compile_remote.map(cells), strict=True):
         print(row, flush=True)
         if push_prefix and "error" not in row:
             to_push.append((row["bundle"], f"{push_prefix}{repo_name(name, n)}"))

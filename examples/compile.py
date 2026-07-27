@@ -89,8 +89,8 @@ _CARD_SIZE = """\
 
 ## Size
 
-The checkpoint stores {size_gb} GB of dense fp32 weights ({total} entries) at
-the example family's shared compile width.  {zero_pct}% of those entries are
+The checkpoint stores {size_gb} GB of dense fp32 weights ({total} entries){width}.
+{zero_pct}% of those entries are
 exactly zero: the vast majority of the model is unused canvas, so size reflects
 the compile geometry rather than stored knowledge.
 
@@ -245,7 +245,15 @@ def write_card(
         card += _CARD_LIMITS
         card += _CARD_VERIFICATION
     nonzero, total, size_bytes = _weight_stats(out_dir)
+    config_path = Path(out_dir, "config.json")
+    width = ""
+    if config_path.is_file():
+        with config_path.open() as f:
+            hidden = json.load(f).get("hidden_size")
+        if hidden:
+            width = f" at compile width d={hidden}"
     card += _CARD_SIZE.format(
+        width=width,
         zero_pct=f"{100.0 * (1.0 - nonzero / total):.2f}",
         total=f"{total:,}",
         size_gb=f"{size_bytes / 1e9:.2f}",
@@ -335,14 +343,20 @@ def build_bundle(
     *,
     max_digits: int | None = None,
     optimize: int = 0,
+    d: int | None = None,
+    d_hidden: int | None = None,
 ) -> tuple[str, list[str] | None, int]:
     """Compile ``examples.<name>`` into an HF bundle with its model card.
 
     ``max_digits`` threads through to ``create_network_parts`` for the
     examples that take it (the calculator family); passing it for one
-    that doesn't raises.  Returns ``(out_dir, demo prompts or None,
-    generation budget)`` — the demo itself is the caller's decision,
-    not part of the build.
+    that doesn't raises.  ``d`` / ``d_hidden`` override the module's
+    family geometry — for right-sized small-n bundles whose free-shrink
+    region is measured (scripts/measure_calculator_compiled_layers);
+    ``d_head`` is never overridable (it is baked into the graph at
+    build time).  Returns ``(out_dir, demo prompts or None, generation
+    budget)`` — the demo itself is the caller's decision, not part of
+    the build.
     """
     module = importlib.import_module(f"examples.{name}")
     if not hasattr(module, "create_network_parts"):
@@ -365,10 +379,12 @@ def build_bundle(
         output_node,
         embedding,
         out_dir,
-        d=getattr(module, "D_MODEL", 1024),
+        d=d if d is not None else int(getattr(module, "D_MODEL", 1024)),
         d_head=getattr(module, "D_HEAD", 16),
         n_heads=getattr(module, "N_HEADS", None),
-        d_hidden=getattr(module, "D_HIDDEN", None),
+        d_hidden=d_hidden
+        if d_hidden is not None
+        else getattr(module, "D_HIDDEN", None),
         optimize=optimize,
     )
     write_card(name, out_dir, max_digits)
@@ -392,6 +408,18 @@ def main() -> None:
         "takes max_digits (default: the example's own default)",
     )
     ap.add_argument(
+        "--d",
+        type=int,
+        default=None,
+        help="override the module's D_MODEL (right-sized small-n bundles)",
+    )
+    ap.add_argument(
+        "--d-hidden",
+        type=int,
+        default=None,
+        help="override the module's D_HIDDEN",
+    )
+    ap.add_argument(
         "--optimize",
         type=int,
         default=0,
@@ -401,7 +429,12 @@ def main() -> None:
 
     try:
         out_dir, prompts, max_new_tokens = build_bundle(
-            args.name, args.out, max_digits=args.max_digits, optimize=args.optimize
+            args.name,
+            args.out,
+            max_digits=args.max_digits,
+            optimize=args.optimize,
+            d=args.d,
+            d_hidden=args.d_hidden,
         )
     except ValueError as exc:
         raise SystemExit(str(exc)) from None
