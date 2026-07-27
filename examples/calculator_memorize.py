@@ -94,6 +94,15 @@ __all__ = [
 # parameters, ~12 GB fp32) — expressible only through the formulas above.
 MAX_SUPPORTED_DIGITS = 2
 
+# Model-card fields consumed by ``examples.compile`` when publishing this
+# example as a Hugging Face bundle.  Prompts stay within the 2-digit width.
+CARD_TASK = (
+    "a computation graph for integer arithmetic (`A op B` with `op` in `+ - *`) "
+    "that computes nothing: every answer is a memorized fact, looked up from "
+    "the operand pair"
+)
+DEMO_PROMPTS = ["12*34\n", "7+8\n", "10-99\n", "99*99\n"]
+
 
 def n_facts(max_digits: int) -> int:
     """One lane per possible expression: ``3 * 10^(2n)``."""
