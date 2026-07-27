@@ -22,8 +22,13 @@ or locally against any bundle directory::
 
 import argparse
 from collections import Counter
+from typing import TYPE_CHECKING, Any, cast
 
 import numpy as np
+
+if TYPE_CHECKING:
+    from transformers import PreTrainedModel
+    from transformers.tokenization_utils_base import PreTrainedTokenizerBase
 
 Example = tuple[int, str, int]
 
@@ -49,15 +54,28 @@ def expected(a: int, op: str, b: int) -> str:
     return str(f(a, b))
 
 
-def run(
-    path: str,
-    examples: list[Example],
-    *,
-    batch_size: int = 250,
-    device: str = "cuda",
-    max_new_tokens: int = 32,
-) -> list[tuple[int, str, int, str]]:
-    """Batched greedy decode; returns ``(a, op, b, model_answer)`` rows."""
+def exhaustive_examples(
+    start: int, stop: int, max_value: int = 999, ops: str = "+-*"
+) -> list[Example]:
+    """Examples ``[start, stop)`` of the exhaustive ``(op, a, b)`` grid.
+
+    The grid is op-major then row-major: index
+    ``i = (op_idx * (max_value+1) + a) * (max_value+1) + b`` — computed
+    arithmetically so a shard materializes only its own slice.
+    """
+    m = max_value + 1
+    out: list[Example] = []
+    for i in range(start, stop):
+        op_idx, rem = divmod(i, m * m)
+        a, b = divmod(rem, m)
+        out.append((a, ops[op_idx], b))
+    return out
+
+
+def load(
+    path: str, device: str = "cuda"
+) -> tuple["PreTrainedModel", "PreTrainedTokenizerBase"]:
+    """Load a bundle (local dir or Hub repo id) in strict fp32."""
     import torch
     from transformers import AutoModelForCausalLM, AutoTokenizer
 
@@ -68,15 +86,28 @@ def run(
     tok.pad_token = tok.eos_token
     tok.padding_side = "left"
     model = AutoModelForCausalLM.from_pretrained(path, torch_dtype=torch.float32)
-    model = model.eval().to(device)
+    return cast("PreTrainedModel", model.eval().to(device)), tok
 
+
+def generate_answers(
+    model: "PreTrainedModel",
+    tok: "PreTrainedTokenizerBase",
+    examples: list[Example],
+    *,
+    batch_size: int = 250,
+    max_new_tokens: int = 32,
+) -> list[tuple[int, str, int, str]]:
+    """Batched greedy decode; returns ``(a, op, b, model_answer)`` rows."""
+    import torch
+
+    device = model.device
     results: list[tuple[int, str, int, str]] = []
     with torch.no_grad():
         for start in range(0, len(examples), batch_size):
             chunk = examples[start : start + batch_size]
             prompts = [f"{a}{op}{b}\n" for a, op, b in chunk]
             enc = tok(prompts, return_tensors="pt", padding=True).to(device)
-            g = model.generate(
+            g = cast("Any", model).generate(
                 **enc,
                 max_new_tokens=max_new_tokens,
                 do_sample=False,
@@ -91,6 +122,21 @@ def run(
                 results.append((a, op, b, out.strip()))
             print(f"  {len(results)}/{len(examples)} generated", flush=True)
     return results
+
+
+def run(
+    path: str,
+    examples: list[Example],
+    *,
+    batch_size: int = 250,
+    device: str = "cuda",
+    max_new_tokens: int = 32,
+) -> list[tuple[int, str, int, str]]:
+    """Load-and-generate convenience over :func:`load` / :func:`generate_answers`."""
+    model, tok = load(path, device)
+    return generate_answers(
+        model, tok, examples, batch_size=batch_size, max_new_tokens=max_new_tokens
+    )
 
 
 def report(results: list[tuple[int, str, int, str]]) -> int:

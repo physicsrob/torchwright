@@ -160,6 +160,62 @@ def accuracy_remote(
     return {"bundle": dirname, "n": n, "seed": seed, "mismatches": n_bad}
 
 
+@app.function(gpu="B200", cpu=8, memory=65536, timeout=7200)
+def exhaustive_remote(
+    repo_id: str,
+    shard: int,
+    n_shards: int,
+    max_value: int = 999,
+    batch_size: int = 8192,
+) -> dict:
+    """One shard of the exhaustive grid, straight from the published Hub repo.
+
+    Every ``A op B`` with both operands in ``[0, max_value]`` and each
+    op, split op-major across ``n_shards`` workers.  A mismatch is
+    immediately re-run unbatched to separate a model error from a
+    batching/padding artifact before it lands in the report.
+    """
+    from scripts.verify_bundle_accuracy import (
+        exhaustive_examples,
+        expected,
+        generate_answers,
+        load,
+    )
+
+    total = 3 * (max_value + 1) ** 2
+    start = shard * total // n_shards
+    stop = (shard + 1) * total // n_shards
+    model, tok = load(repo_id)
+    results = generate_answers(
+        model,
+        tok,
+        exhaustive_examples(start, stop, max_value=max_value),
+        batch_size=batch_size,
+        max_new_tokens=10,
+    )
+    mismatches = []
+    for a, op, b, out in results:
+        want = expected(a, op, b)
+        if out != want:
+            single = generate_answers(
+                model, tok, [(a, op, b)], batch_size=1, max_new_tokens=10
+            )[0][3]
+            mismatches.append(
+                {"expr": f"{a}{op}{b}", "batched": out, "single": single, "want": want}
+            )
+            print(
+                f"[shard {shard}] MISMATCH {a}{op}{b}: batched={out!r} "
+                f"single={single!r} expected={want}",
+                flush=True,
+            )
+    print(
+        f"[shard {shard}] SUMMARY {len(results) - len(mismatches)}/{len(results)} "
+        f"correct ({start}..{stop})",
+        flush=True,
+    )
+    return {"shard": shard, "n": len(results), "mismatches": mismatches}
+
+
 @app.function(cpu=4, memory=8192, timeout=7200, volumes={BUNDLE_ROOT: bundles})
 def card_remote(dirname: str) -> str:
     """Regenerate a volume bundle's README without recompiling.
