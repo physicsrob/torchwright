@@ -125,9 +125,11 @@ _CARD_FAMILY = """\
 
 One example of many compiled with torchwright.  Calculator siblings —
 `calculator-simple` (serial arithmetic, depth grows with the digit count),
-`calculator-advanced` (carry-lookahead, near-flat depth), and
+`calculator-advanced` (carry-lookahead, near-flat depth),
 `calculator-scratchpad` (flat depth; the serial work streams out as visible
-thinking tokens) — are published at several digit widths.  Browse the
+thinking tokens), and `calculator-memorize` (no arithmetic at all: a fact
+table, exponential in the digit count) — are published at several digit
+widths.  Browse the
 [torchwright calculator models](https://huggingface.co/models?search=physicsrob%2Ftorchwright-calculator)
 on Hugging Face.
 """
