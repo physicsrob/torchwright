@@ -248,8 +248,9 @@ def multiply_digit_seqs(
     default_product = torch.tensor([0.0, 0.0])
 
     # Steps 1-2: drop each product's digits into their place-value columns and
-    # collect the (free) per-column number contributions.  Column p is the
-    # 10^p place; columns run 0 (least significant) .. 2n-1.
+    # collect the (free) per-column number contributions.  Like the operands
+    # and result, columns are MSB-first: column 0 is the most significant
+    # product digit and column 2n-1 is the units digit.
     columns: list[list[Node]] = [[] for _ in range(2 * n)]
     for i in range(n):
         for j in range(n):
@@ -258,9 +259,8 @@ def multiply_digit_seqs(
             )
             tens = _slice(product, 0, 1, name="product_tens")
             ones = _slice(product, 1, 1, name="product_ones")
-            place = (n - 1 - i) + (n - 1 - j)  # place value of the ones digit
-            columns[place].append(ones)
-            columns[place + 1].append(tens)
+            columns[i + j].append(tens)
+            columns[i + j + 1].append(ones)
 
     # Step 3: one carry sweep, least-significant column first.  Turn each
     # column total (a number 0..20n) into a one-hot index and read off its
@@ -292,8 +292,8 @@ def multiply_digit_seqs(
 
     carry: Node = zero_scalar
     out_lsb_first: list[Node] = []
-    for place in range(2 * n):
-        contributions = columns[place] or [zero_scalar]
+    for column in reversed(columns):
+        contributions = column or [zero_scalar]
         total = add(sum_nodes(contributions), carry)  # free number addition
         total_onehot = bool_to_01(in_range(total, add_const(total, 1.0), max_total + 1))
         out_lsb_first.append(

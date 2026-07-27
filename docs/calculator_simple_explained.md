@@ -38,8 +38,8 @@ columns, and makes one carry pass across the column totals.
 
 ### 1. Build the Times Table
 
-The code starts by constructing the 100 entries in the `0–9` times table. Each
-product is stored as separate tens and ones:
+The code starts by constructing a 100-entry Python mapping for the `0–9` times
+table. Each product is stored as separate tens and ones:
 
 ```python
 for a in range(10):
@@ -53,8 +53,9 @@ for a in range(10):
 ```
 
 For example, `7 × 8` is stored as `(5, 6)`. This Python loop runs once while
-building the calculator; the resulting table becomes a fixed part of the
-finished model.
+building the graph. Every later call to `onehot_lookup` materializes the
+mapping as an independent 100-lane FFN node; the finished transformer does not
+contain one shared table queried by every digit pair.
 
 ### 2. Place the Products into Columns
 
@@ -67,22 +68,25 @@ product = onehot_lookup(
 tens = _slice(product, 0, 1, name="product_tens")
 ones = _slice(product, 1, 1, name="product_ones")
 
-place = (n - 1 - i) + (n - 1 - j)
-columns[place].append(ones)
-columns[place + 1].append(tens)
+columns[i + j].append(tens)
+columns[i + j + 1].append(ones)
 ```
 
 Each pair gets its own lookup, so all the digit products can be found together.
-For the default three-digit calculator, there are `3 × 3 = 9` of these lookups.
-The ones and tens are then sent to the columns representing their place values.
+For the default three-digit calculator, there are `3 × 3 = 9` independent
+lookup circuits, comprising 900 FFN lanes. The operands, columns, and result
+are all stored most-significant digit first. For operands at positions `i` and
+`j`, the product's tens go into column `i + j` and its ones go into the next
+column, `i + j + 1`.
 
-For `12 × 34`, the work looks like this:
+For `12 × 34`, the nonzero columns look like this from most significant to
+least significant:
 
 | Column | Contributions | Result |
 | --- | --- | --- |
-| Ones | `2 × 4` contributes `8` | Write `8` |
-| Tens | `2 × 3` contributes `6`; `1 × 4` contributes `4` | Write `0`, carry `1` |
 | Hundreds | `1 × 3` contributes `3`, plus the carry | Write `4` |
+| Tens | `2 × 3` contributes `6`; `1 × 4` contributes `4` | Write `0`, carry `1` |
+| Ones | `2 × 4` contributes `8` | Write `8` |
 
 ### 3. Make One Carry Pass
 
@@ -90,26 +94,31 @@ The last multiplication step moves from the least-significant column to the
 most-significant one. The essential part of the code is:
 
 ```python
-total = add(sum_nodes(contributions), carry)
-total_onehot = bool_to_01(
-    in_range(total, add_const(total, 1.0), max_total + 1)
-)
-out_lsb_first.append(
-    onehot_lookup(total_onehot, digit_table, embedding.get_embedding("0"))
-)
-carry = piecewise_linear(
-    total,
-    sorted(carry_knots),
-    carry_knots.__getitem__,
-    input_scale=step_sharpness,
-    name="carry_staircase",
-)
+for column in reversed(columns):
+    contributions = column or [zero_scalar]
+    total = add(sum_nodes(contributions), carry)
+    total_onehot = bool_to_01(
+        in_range(total, add_const(total, 1.0), max_total + 1)
+    )
+    out_lsb_first.append(
+        onehot_lookup(total_onehot, digit_table, embedding.get_embedding("0"))
+    )
+    carry = piecewise_linear(
+        total,
+        sorted(carry_knots),
+        carry_knots.__getitem__,
+        input_scale=step_sharpness,
+        name="carry_staircase",
+    )
 ```
 
-For each column, `total` combines its contributions with the incoming carry.
-The lookup selects the final decimal digit, while `carry_staircase` calculates
-how many tens move into the next column. This stage is sequential because each
-column needs the carry produced by the column to its right.
+Although `columns` is stored most-significant first, carrying must proceed from
+right to left, so the loop traverses `reversed(columns)`. For each column,
+`total` combines its contributions with the incoming carry. The lookup selects
+the final decimal digit, while `carry_staircase` calculates how many tens move
+into the next column. This stage is sequential because each column needs the
+carry produced by the column to its right. The loop accumulates the output
+least-significant digit first, then reverses it before returning the result.
 
 The result is held at a fixed width, so `12 × 34` may initially appear as
 `000408`. The leading zeros are removed later.
