@@ -34,15 +34,19 @@ Example = tuple[int, str, int]
 
 
 def make_examples(
-    n: int, max_digits: int, seed: int, ops: str = "+-*"
+    n: int, max_digits: int, seed: int, ops: str = "+-*", min_digits: int = 1
 ) -> list[Example]:
-    """``n`` random examples; digit lengths independent-uniform in [1, max]."""
+    """``n`` random examples with independent-uniform digit lengths.
+
+    Lengths draw from ``[min_digits, max_digits]``; equal bounds pin an
+    exact width.
+    """
     rng = np.random.default_rng(seed)
     out: list[Example] = []
     for _ in range(n):
         operands = []
         for _side in range(2):
-            length = int(rng.integers(1, max_digits + 1))
+            length = int(rng.integers(min_digits, max_digits + 1))
             lo = 0 if length == 1 else 10 ** (length - 1)
             operands.append(int(rng.integers(lo, 10**length)))
         out.append((operands[0], ops[int(rng.integers(len(ops)))], operands[1]))

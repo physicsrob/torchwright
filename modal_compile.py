@@ -162,6 +162,53 @@ def accuracy_remote(
     return {"bundle": dirname, "n": n, "seed": seed, "mismatches": n_bad}
 
 
+@app.function(
+    gpu="B200", cpu=8, memory=262144, timeout=7200, volumes={BUNDLE_ROOT: bundles}
+)
+def eval_widths_remote(
+    dirname: str,
+    widths: str = "3,4,5,6,7",
+    n_per: int = 500,
+    ops: str = "*",
+    batch_size: int = 2048,
+) -> dict:
+    """Per-width accuracy buckets for a volume bundle on one B200.
+
+    Each width w draws ``n_per`` seeded examples with BOTH operands
+    exactly w digits; the model loads once and every bucket batches
+    through it.  Mismatches print immediately.
+    """
+    from scripts.verify_bundle_accuracy import (
+        expected,
+        generate_answers,
+        load,
+        make_examples,
+    )
+
+    model, tok = load(str(Path(BUNDLE_ROOT) / dirname))
+    buckets = {}
+    for w in (int(x) for x in widths.split(",")):
+        examples = make_examples(n_per, max_digits=w, seed=w, ops=ops, min_digits=w)
+        results = generate_answers(
+            model, tok, examples, batch_size=batch_size, max_new_tokens=32
+        )
+        bad = [
+            (a, op, b, out) for a, op, b, out in results if out != expected(a, op, b)
+        ]
+        for a, op, b, out in bad:
+            print(
+                f"[{dirname}] MISMATCH {a}{op}{b} -> {out!r} != {expected(a, op, b)}",
+                flush=True,
+            )
+        buckets[w] = {"n": len(results), "mismatches": len(bad)}
+        print(
+            f"[{dirname}] width {w}x{w}: "
+            f"{len(results) - len(bad)}/{len(results)} correct",
+            flush=True,
+        )
+    return {"bundle": dirname, "ops": ops, "buckets": buckets}
+
+
 @app.function(gpu="B200", cpu=8, memory=65536, timeout=7200)
 def exhaustive_remote(
     repo_id: str,
