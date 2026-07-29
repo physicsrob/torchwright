@@ -7,7 +7,7 @@ carry-save versions.  Everything else is identical, so it lives here rather than
 being duplicated or having one calculator import the other:
 
 * the vocabulary and residual width (``CALC_VOCAB`` / ``D_MODEL``);
-* the one-hot helpers both arithmetics build on (``_state`` / ``_slice`` and the
+* the one-hot helpers both arithmetics build on (``_state`` and the
   carry/borrow state constants);
 * **comparison** — lexicographic, computed positionally at constant depth
   (the verdict is the greater-flag at the first differing digit).
@@ -124,14 +124,6 @@ def _state(index: int, width: int) -> torch.Tensor:
     v = torch.zeros(width)
     v[index] = 1.0
     return v
-
-
-def _slice(node: Node, start: int, width: int, name: str = "slice") -> Node:
-    """Take a ``width``-wide consecutive slice via a free ``Linear`` (no layer)."""
-    proj = torch.zeros(len(node), width)
-    for i in range(width):
-        proj[start + i, i] = 1.0
-    return Linear(node, proj, name=name)
 
 
 # ---------------------------------------------------------------------------

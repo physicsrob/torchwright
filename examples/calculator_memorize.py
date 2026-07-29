@@ -68,13 +68,12 @@ from examples._calculator_common import (
     D_HIDDEN,
     D_MODEL,
     MAX_POSITIONS,
-    _slice,
     emit_result,
     parse_expression,
 )
 from torchwright.graph import Embedding, Node
 from torchwright.ops.inout_nodes import create_onehot_embedding, create_rope_config
-from torchwright.ops.linear import bool_to_01, concat, sum_nodes
+from torchwright.ops.linear import bool_to_01, concat, slice_columns, sum_nodes
 from torchwright.ops.swiglu.onehot_table import onehot_lookup
 
 __all__ = [
@@ -204,7 +203,7 @@ def create_network_parts(max_digits: int = 2) -> tuple[Node, Embedding]:
     answer = sum_nodes(partitions)
 
     result_digits = [
-        _slice(answer, i * 17, 17, name="memorized_slot") for i in range(seq_len)
+        slice_columns(answer, i * 17, 17, name="memorized_slot") for i in range(seq_len)
     ]
     output_node = emit_result(rope, embedding, saw_newline, result_digits)
     return output_node, embedding

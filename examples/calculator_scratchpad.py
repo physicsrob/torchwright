@@ -85,7 +85,6 @@ from examples._calculator_common import (
     D_HIDDEN,
     D_MODEL,
     MAX_POSITIONS,
-    _slice,
     _state,
     parse_expression,
 )
@@ -107,6 +106,7 @@ from torchwright.ops.linear import (
     bool_to_01,
     concat,
     negate,
+    slice_columns,
     subtract,
     sum_nodes,
 )
@@ -759,8 +759,8 @@ def _mul_op(
                 concat([A[i], B[j]]), product_table, default_product
             )
             place = (n - 1 - i) + (n - 1 - j)  # place value of the ones digit
-            columns[place].append(_slice(product, 1, 1, name="product_ones"))
-            columns[place + 1].append(_slice(product, 0, 1, name="product_tens"))
+            columns[place].append(slice_columns(product, 1, 1, name="product_ones"))
+            columns[place + 1].append(slice_columns(product, 0, 1, name="product_tens"))
 
     T = [sum_nodes(col) if col else _scalar(0.0) for col in columns]
     W = 20 * n + 1

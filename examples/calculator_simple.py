@@ -35,7 +35,6 @@ from examples._calculator_common import (
     D_HIDDEN,
     D_MODEL,
     MAX_POSITIONS,
-    _slice,
     _state,
     build_calculator,
     compare_digit_seqs,  # shared verbatim — re-exported as part of this variant
@@ -43,7 +42,14 @@ from examples._calculator_common import (
 from torchwright.graph import Embedding, Node
 from torchwright.ops.const import step_sharpness
 from torchwright.ops.inout_nodes import create_literal_value
-from torchwright.ops.linear import add, add_const, bool_to_01, concat, sum_nodes
+from torchwright.ops.linear import (
+    add,
+    add_const,
+    bool_to_01,
+    concat,
+    slice_columns,
+    sum_nodes,
+)
 from torchwright.ops.swiglu.arithmetic_ops import piecewise_linear
 from torchwright.ops.swiglu.map_select import in_range
 from torchwright.ops.swiglu.onehot_table import onehot_lookup
@@ -257,8 +263,8 @@ def multiply_digit_seqs(
             product = onehot_lookup(
                 concat([seq1[i], seq2[j]]), product_table, default_product
             )
-            tens = _slice(product, 0, 1, name="product_tens")
-            ones = _slice(product, 1, 1, name="product_ones")
+            tens = slice_columns(product, 0, 1, name="product_tens")
+            ones = slice_columns(product, 1, 1, name="product_ones")
             columns[i + j].append(tens)
             columns[i + j + 1].append(ones)
 

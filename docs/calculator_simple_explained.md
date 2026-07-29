@@ -65,8 +65,8 @@ The next loop creates one lookup for every pair of digit positions:
 product = onehot_lookup(
     concat([seq1[i], seq2[j]]), product_table, default_product
 )
-tens = _slice(product, 0, 1, name="product_tens")
-ones = _slice(product, 1, 1, name="product_ones")
+tens = slice_columns(product, 0, 1, name="product_tens")
+ones = slice_columns(product, 1, 1, name="product_ones")
 
 columns[i + j].append(tens)
 columns[i + j + 1].append(ones)

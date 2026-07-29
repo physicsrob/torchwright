@@ -53,14 +53,19 @@ from examples._calculator_common import (
     D_HEAD,
     D_HIDDEN,
     D_MODEL,
-    _slice,
     _state,
     build_calculator,
     compare_digit_seqs,  # shared verbatim — re-exported as part of this variant
 )
 from torchwright.graph import Embedding, Linear, Node
 from torchwright.ops.inout_nodes import create_literal_value
-from torchwright.ops.linear import add_const, bool_to_01, concat, sum_nodes
+from torchwright.ops.linear import (
+    add_const,
+    bool_to_01,
+    concat,
+    slice_columns,
+    sum_nodes,
+)
 from torchwright.ops.swiglu.map_select import in_range
 from torchwright.ops.swiglu.onehot_table import onehot_lookup
 
@@ -363,8 +368,8 @@ def multiply_digit_seqs(
             product = onehot_lookup(
                 concat([seq1[i], seq2[j]]), times_table, default_pair
             )
-            tens = _slice(product, 0, d_embed, name="pp_tens")
-            ones = _slice(product, d_embed, d_embed, name="pp_ones")
+            tens = slice_columns(product, 0, d_embed, name="pp_tens")
+            ones = slice_columns(product, d_embed, d_embed, name="pp_ones")
             place = (n - 1 - i) + (n - 1 - j)  # place value of the ones digit
             columns[place].append(ones)
             columns[place + 1].append(tens)  # place+1 <= 2n-1 = width-1

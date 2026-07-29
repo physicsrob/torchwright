@@ -1,3 +1,4 @@
+import pytest
 import torch
 
 from torchwright.ops.inout_nodes import create_input
@@ -6,6 +7,7 @@ from torchwright.ops.linear import (
     bool_to_01,
     multiply_const,
     negate,
+    slice_columns,
     subtract,
 )
 from torchwright.ops.relu.arithmetic_ops import (
@@ -44,6 +46,33 @@ def test_bool_to_01_wide():
         input_values={"x": torch.tensor([[1.0, -1.0, 1.0]])},
     )
     assert result.tolist() == [[1.0, 0.0, 1.0]]
+
+
+def test_slice_columns():
+    x = create_input("x", 4)
+    out = slice_columns(x, 1, 2)
+    result = out.compute(
+        n_pos=1,
+        input_values={"x": torch.tensor([[10.0, 20.0, 30.0, 40.0]])},
+    )
+    assert result.tolist() == [[20.0, 30.0]]
+
+
+def test_slice_columns_full_width():
+    x = create_input("x", 3)
+    out = slice_columns(x, 0, 3)
+    result = out.compute(
+        n_pos=2,
+        input_values={"x": torch.tensor([[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]])},
+    )
+    assert result.tolist() == [[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]]
+
+
+def test_slice_columns_out_of_range():
+    x = create_input("x", 4)
+    for start, width in [(3, 2), (-1, 2), (0, 0), (4, 1)]:
+        with pytest.raises(ValueError, match="out of range"):
+            slice_columns(x, start, width)
 
 
 def test_add_const():

@@ -186,3 +186,32 @@ def concat(inp_list: list[Node]) -> Node:
         Node: Node resulting from concatenation
     """
     return Concatenate(inp_list)
+
+
+def slice_columns(inp: Node, start: int, width: int, name: str = "slice") -> Node:
+    """Take ``width`` consecutive components of ``inp`` starting at ``start``.
+
+    The narrowing dual of :func:`concat`.  Realized as a ``Linear`` whose
+    matrix is a shifted identity — purely linear, so it normally folds
+    into a neighboring op's weights and costs nothing.  That fold is
+    declined when the sliced value must stay materialized (e.g. it
+    carries an attached check), in which case the slice occupies
+    residual-stream wiring like any other ``Linear``.
+
+    Args:
+        inp (Node): Node to slice.
+        start (int): Index of the first component to keep.
+        width (int): Number of consecutive components to keep.
+        name (str): Name for the resulting node.
+
+    Returns:
+        Node: ``width``-wide node holding components
+        ``[start, start + width)`` of ``inp``.
+    """
+    if width < 1 or start < 0 or start + width > len(inp):
+        raise ValueError(
+            f"slice [{start}, {start + width}) out of range for width-{len(inp)} node"
+        )
+    proj = torch.zeros(len(inp), width)
+    proj[start : start + width] = torch.eye(width)
+    return Linear(inp, proj, name=name)
