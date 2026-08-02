@@ -42,6 +42,10 @@ from modal_image import IMAGE
 
 BUNDLE_ROOT = "/bundles"
 
+# The Modal workspace allows 10 concurrent GPUs; verification fan-outs
+# self-cap below that to leave headroom for other work.
+GPU_SHARD_CAP = 8
+
 app = modal.App("torchwright-compile", image=IMAGE)
 bundles = modal.Volume.from_name("torchwright-hf-bundles", create_if_missing=True)
 
@@ -180,6 +184,7 @@ def eval_widths_remote(
     """
     from scripts.verify_bundle_accuracy import (
         expected,
+        extract_answer,
         generate_answers,
         load,
         make_examples,
@@ -193,7 +198,9 @@ def eval_widths_remote(
             model, tok, examples, batch_size=batch_size, max_new_tokens=32
         )
         bad = [
-            (a, op, b, out) for a, op, b, out in results if out != expected(a, op, b)
+            (a, op, b, out)
+            for a, op, b, out in results
+            if extract_answer(out) != expected(a, op, b)
         ]
         for a, op, b, out in bad:
             print(
@@ -216,6 +223,7 @@ def exhaustive_remote(
     n_shards: int,
     max_value: int = 999,
     batch_size: int = 8192,
+    max_new_tokens: int = 10,
 ) -> dict:
     """One shard of the exhaustive grid, straight from the published Hub repo.
 
@@ -223,10 +231,17 @@ def exhaustive_remote(
     op, split op-major across ``n_shards`` workers.  A mismatch is
     immediately re-run unbatched to separate a model error from a
     batching/padding artifact before it lands in the report.
+
+    ``max_new_tokens`` must cover the variant's whole transcript: 10
+    suffices for the direct-answer calculators, but the scratchpad
+    streams its thinking glyphs first (``decode_steps(3) == 27``).
+    Verdicts compare :func:`extract_answer` output, so the glyphs never
+    count against the answer.
     """
     from scripts.verify_bundle_accuracy import (
         exhaustive_examples,
         expected,
+        extract_answer,
         generate_answers,
         load,
     )
@@ -240,14 +255,14 @@ def exhaustive_remote(
         tok,
         exhaustive_examples(start, stop, max_value=max_value),
         batch_size=batch_size,
-        max_new_tokens=10,
+        max_new_tokens=max_new_tokens,
     )
     mismatches = []
     for a, op, b, out in results:
         want = expected(a, op, b)
-        if out != want:
+        if extract_answer(out) != want:
             single = generate_answers(
-                model, tok, [(a, op, b)], batch_size=1, max_new_tokens=10
+                model, tok, [(a, op, b)], batch_size=1, max_new_tokens=max_new_tokens
             )[0][3]
             mismatches.append(
                 {"expr": f"{a}{op}{b}", "batched": out, "single": single, "want": want}
@@ -321,6 +336,37 @@ def push_remote(dirname: str, repo_id: str) -> str:
         delete_patterns=["model-*.safetensors"],
     )
     return f"https://huggingface.co/{repo_id}"
+
+
+@app.local_entrypoint()
+def exhaustive(
+    repo_id: str,
+    n_shards: int = 8,
+    max_value: int = 999,
+    batch_size: int = 8192,
+    max_new_tokens: int = 10,
+) -> None:
+    """Fan the exhaustive grid over ``n_shards`` B200 workers; total the verdicts.
+
+    Hard-capped at :data:`GPU_SHARD_CAP` concurrent shards.  The cap is
+    per-invocation, not workspace-global, so verify bundles one
+    ``modal run`` at a time::
+
+        uv run modal run modal_compile.py::exhaustive --repo-id PHYSICSROB/REPO
+    """
+    if not 1 <= n_shards <= GPU_SHARD_CAP:
+        raise ValueError(
+            f"n_shards must be in [1, {GPU_SHARD_CAP}] (GPU budget), got {n_shards}"
+        )
+    n_total = n_bad = 0
+    for row in exhaustive_remote.starmap(
+        (repo_id, shard, n_shards, max_value, batch_size, max_new_tokens)
+        for shard in range(n_shards)
+    ):
+        n_total += row["n"]
+        n_bad += len(row["mismatches"])
+        print(row, flush=True)
+    print(f"TOTAL {n_total - n_bad}/{n_total} correct for {repo_id}", flush=True)
 
 
 @app.local_entrypoint()

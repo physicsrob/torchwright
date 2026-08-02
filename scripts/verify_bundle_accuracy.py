@@ -58,6 +58,19 @@ def expected(a: int, op: str, b: int) -> str:
     return str(f(a, b))
 
 
+def extract_answer(out: str) -> str:
+    """The answer portion of a decoded completion.
+
+    The scratchpad calculator streams thinking glyphs and closes them
+    with ``</THINKING>`` before the answer digits; everything after the
+    last close tag is the answer.  The other calculators emit the answer
+    directly, so the whole (stripped) completion passes through.
+    """
+    from examples.calculator_scratchpad import RESULT
+
+    return out.rsplit(RESULT, 1)[-1].strip()
+
+
 def exhaustive_examples(
     start: int, stop: int, max_value: int = 999, ops: str = "+-*"
 ) -> list[Example]:
@@ -154,7 +167,7 @@ def report(results: list[tuple[int, str, int, str]]) -> int:
         width = max(len(str(abs(a))), len(str(abs(b))))
         by_op[op] += 1
         by_width[width] += 1
-        if out != expected(a, op, b):
+        if extract_answer(out) != expected(a, op, b):
             bad_by_op[op] += 1
             bad_by_width[width] += 1
             mismatches.append((a, op, b, out))
