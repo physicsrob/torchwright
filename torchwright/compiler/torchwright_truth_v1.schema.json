@@ -1,0 +1,95 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/physicsrob/torchwright/blob/main/torchwright/compiler/torchwright_truth_v1.schema.json",
+  "title": "torchwright compiled artifact truth manifest v1",
+  "type": "object",
+  "required": [
+    "format",
+    "artifact",
+    "build",
+    "model",
+    "token_io",
+    "graphs",
+    "schedule",
+    "residual_stream",
+    "physical_layout",
+    "parameter_support",
+    "observability",
+    "runtime_contract",
+    "intervention_contract",
+    "reference_fixtures"
+  ],
+  "properties": {
+    "format": {"const": "torchwright.truth.v1"},
+    "$schema": {"type": "string"},
+    "artifact": {
+      "type": "object",
+      "required": ["kind", "architecture", "files"],
+      "properties": {
+        "kind": {"const": "huggingface_causal_lm_bundle"},
+        "architecture": {"enum": ["phi3", "custom"]},
+        "files": {
+          "type": "object",
+          "additionalProperties": {
+            "type": "object",
+            "required": ["sha256", "bytes"],
+            "properties": {
+              "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+              "bytes": {"type": "integer", "minimum": 0}
+            }
+          }
+        }
+      }
+    },
+    "build": {"type": "object"},
+    "model": {"type": "object"},
+    "token_io": {"type": "object"},
+    "graphs": {
+      "type": "object",
+      "required": ["source", "lowered", "realization_map"],
+      "properties": {
+        "source": {"$ref": "#/$defs/graph"},
+        "lowered": {"$ref": "#/$defs/graph"},
+        "realization_map": {"type": "array"}
+      }
+    },
+    "schedule": {
+      "type": "object",
+      "required": ["assignment", "realizations", "layers"]
+    },
+    "residual_stream": {
+      "type": "object",
+      "required": ["width", "states"]
+    },
+    "physical_layout": {
+      "type": "object",
+      "required": ["matrices", "placements", "checkpoint_parameter_map"]
+    },
+    "parameter_support": {
+      "type": "object",
+      "required": ["file", "format", "tensors"]
+    },
+    "observability": {"type": "object"},
+    "runtime_contract": {"type": "object"},
+    "intervention_contract": {"type": "object"},
+    "reference_fixtures": {"type": "object"},
+    "metadata": {"type": "object"}
+  },
+  "$defs": {
+    "graph": {
+      "type": "object",
+      "required": ["root", "nodes", "sha256"],
+      "properties": {
+        "root": {"type": "string"},
+        "nodes": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": ["id", "op", "width", "inputs", "value_contract"]
+          }
+        },
+        "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"}
+      }
+    }
+  }
+}

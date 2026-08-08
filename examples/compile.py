@@ -388,6 +388,13 @@ def build_bundle(
         if d_hidden is not None
         else getattr(module, "D_HIDDEN", None),
         optimize=optimize,
+        truth_metadata={
+            "source": {
+                "entrypoint": f"examples.{name}:create_network_parts",
+                "arguments": build_kwargs,
+            },
+            "task": {"example": name, "max_digits": max_digits},
+        },
     )
     write_card(name, out_dir, max_digits)
     prompts = getattr(module, "DEMO_PROMPTS", None)
