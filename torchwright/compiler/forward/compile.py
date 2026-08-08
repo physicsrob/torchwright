@@ -1528,6 +1528,8 @@ def forward_compile(
     # None for the heuristic path so callers can always query it.
     net.cpsat_solve_stats = None
     net.schedule_result = None
+    net.cpsat_assignment = None
+    net.schedule_fingerprint = None
     residual_map = ResidualStreamMap(d)
     # Reserve one constant-1 residual column for the Δ=0 self-match heads behind
     # every Linear/Add/Cancel/add_into.  It is a LiteralValue input node, so all
@@ -1743,6 +1745,7 @@ def forward_compile(
             schedule_fp = hashlib.sha256(
                 f"{schedule_fp}:costs={weighted_cost_key}".encode("ascii")
             ).hexdigest()
+        net.schedule_fingerprint = schedule_fp
         if verbose:
             # Print the schedule fingerprint unconditionally (not only on a
             # cache hit/store) so a solve-only measurement emits the graph's

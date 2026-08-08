@@ -140,6 +140,8 @@ def test_solve_only_returns_sound_depth_without_replaying():
     solve_only = _compile(_width_graph(), _solve_only=True, _force_resolve=True)
     assert len(solve_only.layers) == 0  # replay skipped
     assert solve_only.cpsat_assignment is not None
+    assert solve_only.schedule_fingerprint is not None
+    assert len(solve_only.schedule_fingerprint) == 64
     assert solve_only.cpsat_assignment.n_layers == len(full.layers)
 
 

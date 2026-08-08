@@ -57,6 +57,9 @@ class HeadlessTransformer:
     schedule_result: Optional["ScheduleResult"]
     # Solve-only measurement output (None when no feasible incumbent).
     cpsat_assignment: Optional["ScheduleAssignment"]
+    # Stable schedule-cache key for the lowered graph. Exposed so a sound
+    # solve-only measurement can preserve the exact assignment it selected.
+    schedule_fingerprint: str | None
     # Diagnostics from the dominating-replay-plan choice.
     replay_candidate_diagnostics: dict[str, object]
     # Pinned-constant RMSNorm layout; None when the norm is off.
