@@ -41,6 +41,7 @@ from torchwright.compiler.forward.residual_map import (
     ResidualStreamMap,
 )
 from torchwright.compiler.forward.schedule_cache import (
+    assignment_payload,
     graph_fingerprint,
     load_assignment,
     store_assignment,
@@ -1529,6 +1530,7 @@ def forward_compile(
     net.cpsat_solve_stats = None
     net.schedule_result = None
     net.cpsat_assignment = None
+    net.cpsat_assignment_payload = None
     net.schedule_fingerprint = None
     residual_map = ResidualStreamMap(d)
     # Reserve one constant-1 residual column for the Δ=0 self-match heads behind
@@ -1980,6 +1982,11 @@ def forward_compile(
         # optimality; ``cpsat_assignment`` carries n_layers.
         if _disabled_families or _solve_only:
             net.cpsat_assignment = assignment
+            net.cpsat_assignment_payload = (
+                None
+                if assignment is None
+                else assignment_payload(assignment, output_node)
+            )
             if verbose:
                 claim = (
                     "no feasible incumbent"

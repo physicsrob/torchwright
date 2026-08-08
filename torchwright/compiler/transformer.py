@@ -57,6 +57,9 @@ class HeadlessTransformer:
     schedule_result: Optional["ScheduleResult"]
     # Solve-only measurement output (None when no feasible incumbent).
     cpsat_assignment: Optional["ScheduleAssignment"]
+    # Canonical cache payload for the solve-only assignment, serialized while
+    # the compiler still owns the exact lowered graph.
+    cpsat_assignment_payload: dict[str, Any] | None
     # Stable schedule-cache key for the lowered graph. Exposed so a sound
     # solve-only measurement can preserve the exact assignment it selected.
     schedule_fingerprint: str | None
@@ -96,6 +99,7 @@ class HeadlessTransformer:
         self.layers = []
         self.residual_assignment = None
         self.placements = None
+        self.cpsat_assignment_payload = None
 
     @property
     def device(self) -> torch.device:

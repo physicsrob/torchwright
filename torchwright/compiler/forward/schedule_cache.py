@@ -41,6 +41,7 @@ if TYPE_CHECKING:
     from torchwright.graph import Node
 
 __all__ = [
+    "assignment_payload",
     "cache_dir",
     "graph_fingerprint",
     "load_assignment",
@@ -52,6 +53,36 @@ _ENV_DIR = "TW_SCHEDULE_CACHE_DIR"
 # ``realized_objective_blocks`` is a (primary, secondary) lexicographic
 # objective pair (see ``_replay_plan_objective_blocks`` in compile.py).
 _OBJECTIVE_BLOCKS_LEN = 2
+
+
+def assignment_payload(
+    assignment: ScheduleAssignment,
+    output_node: Node,
+) -> dict[str, Any] | None:
+    """Serialize ``assignment`` against the exact lowered graph identity.
+
+    Returns ``None`` when a scheduled node is not reachable from
+    ``output_node`` and therefore cannot be represented by a stable canonical
+    id.  Keeping this conversion beside cache loading/storing ensures
+    solve-only callers can preserve an assignment without reconstructing the
+    compiler-private lowered graph afterward.
+    """
+    canon = _canonical_ids(output_node)
+    if not set(assignment.node_to_layer) <= set(canon):
+        return None
+    return {
+        "node_to_layer": {canon[k]: v for k, v in assignment.node_to_layer.items()},
+        "node_to_cancel_layer": {
+            canon[k]: v
+            for k, v in assignment.node_to_cancel_layer.items()
+            if k in canon
+        },
+        "node_to_routing": {canon[k]: v for k, v in assignment.node_to_routing.items()},
+        "node_to_cancel_mech": {
+            canon[k]: v for k, v in assignment.node_to_cancel_mech.items() if k in canon
+        },
+        "n_layers": assignment.n_layers,
+    }
 
 
 def cache_dir() -> Path | None:
@@ -189,26 +220,13 @@ def store_assignment(
                 tmp.replace(prior_path)
             return False
     base.mkdir(parents=True, exist_ok=True)
-    canon = _canonical_ids(output_node)
-    if not set(assignment.node_to_layer) <= set(canon):
+    payload = assignment_payload(assignment, output_node)
+    if payload is None:
         # A scheduled node is unreachable from the output via inputs — it
         # cannot be keyed canonically; skip caching rather than store a
         # partial schedule.
         return False
-    payload = {
-        "node_to_layer": {canon[k]: v for k, v in assignment.node_to_layer.items()},
-        "node_to_cancel_layer": {
-            canon[k]: v
-            for k, v in assignment.node_to_cancel_layer.items()
-            if k in canon
-        },
-        "node_to_routing": {canon[k]: v for k, v in assignment.node_to_routing.items()},
-        "node_to_cancel_mech": {
-            canon[k]: v for k, v in assignment.node_to_cancel_mech.items() if k in canon
-        },
-        "n_layers": assignment.n_layers,
-        "meta": meta,
-    }
+    payload["meta"] = meta
     path = base / f"{fingerprint}.json"
     tmp = path.with_suffix(".json.tmp")
     tmp.write_text(json.dumps(payload), encoding="utf-8")
