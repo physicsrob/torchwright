@@ -28,7 +28,7 @@ if TYPE_CHECKING:
     from torchwright.compiler.forward.replay_plan import NodeIndices, ReplayPlan
     from torchwright.compiler.lower import LoweredGraph
     from torchwright.compiler.transformer import HeadlessTransformer
-    from torchwright.graph import Node
+    from torchwright.graph import Node, OpScopeRecord
     from torchwright.graph.value_type import Range
 
 TRUTH_FORMAT = "torchwright.truth.v1"
@@ -205,6 +205,63 @@ def _graph_record(
     if stamp_hash:
         graph["sha256"] = sha256_json(graph)
     return graph, refs
+
+
+def _stamp_semantic_regions(
+    source: Node,
+    node_records: list[dict[str, Any]],
+    refs: dict[int, str],
+) -> list[dict[str, Any]]:
+    """Stamp per-node region membership and build the region table.
+
+    Walks the canonical order (the order ``node_records`` was built in)
+    and assigns ``"r:0"``, ``"r:1"``, ... to op-scope records as they are
+    first reached.  Each stamped node's ancestor chain is registered
+    outermost-first, so a parent always gets a lower id than its children
+    and ids are deterministic across rebuilds of the same graph.
+    Collecting ancestors is load-bearing, not an optimization:
+    composition ops (``linear.subtract`` = add∘negate) stamp zero nodes
+    directly, so their records are reachable only as parents of child
+    records.  Operand/result node ids that never reached the compiled
+    output are dropped rather than emitted as dangling references.
+    """
+    region_ids: dict[OpScopeRecord, str] = {}
+    table: list[dict[str, Any]] = []
+
+    def register(record: OpScopeRecord) -> str:
+        chain: list[OpScopeRecord] = []
+        cursor: OpScopeRecord | None = record
+        while cursor is not None and cursor not in region_ids:
+            chain.append(cursor)
+            cursor = cursor.parent
+        for entry in reversed(chain):
+            region_id = f"r:{len(table)}"
+            region_ids[entry] = region_id
+            table.append(
+                {
+                    "id": region_id,
+                    "op": entry.op,
+                    "parent": (
+                        None if entry.parent is None else region_ids[entry.parent]
+                    ),
+                    "params": entry.params,
+                    "operands": [
+                        refs[node_id]
+                        for node_id in entry.operand_ids
+                        if node_id in refs
+                    ],
+                    "results": [
+                        refs[node_id] for node_id in entry.result_ids if node_id in refs
+                    ],
+                    "annotation": entry.annotation,
+                }
+            )
+        return region_ids[record]
+
+    for node, record in zip(canonical_walk(source), node_records, strict=True):
+        region = node.op_region
+        record["region"] = None if region is None else register(region)
+    return table
 
 
 def _dense_rects(matrix: str, rows: list[int], cols: list[int]) -> list[dict]:
@@ -541,7 +598,15 @@ def capture_compile_truth(
     if source is None:
         raise RuntimeError("truth capture requires a source graph")
     tensor_hashes: dict[int, str] = {}
-    source_graph, _source_refs = _graph_record(source, "s", tensor_hashes)
+    # The source record is hashed only after the region stamp so the
+    # source content hash covers semantic regions and per-node membership.
+    source_graph, source_refs = _graph_record(
+        source, "s", tensor_hashes, stamp_hash=False
+    )
+    source_graph["semantic_regions"] = _stamp_semantic_regions(
+        source, source_graph["nodes"], source_refs
+    )
+    source_graph["sha256"] = sha256_json(source_graph)
     # The lowered record is mutated (source_nodes) and hashed by
     # _lowering_records below; hashing it here too would be discarded work.
     lowered_graph, lowered_refs = _graph_record(

@@ -11,7 +11,7 @@ from .misc import (
     Predicate,
     ValueLogger,
 )
-from .node import Node, annotate, annotated
+from .node import Node, OpScopeRecord, annotate, annotated, op_scope
 from .relu import ReLU
 from .rope import ROPE_BASE, RopeConfig
 from .session import fresh_graph_session
@@ -30,6 +30,7 @@ __all__ = [
     "LiteralValue",
     "Node",
     "NodeValueType",
+    "OpScopeRecord",
     "Predicate",
     "Range",
     "ReLU",
@@ -38,4 +39,5 @@ __all__ = [
     "annotate",
     "annotated",
     "fresh_graph_session",
+    "op_scope",
 ]

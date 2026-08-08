@@ -94,7 +94,26 @@
           "type": "array",
           "items": {
             "type": "object",
-            "required": ["id", "op", "width", "inputs", "value_contract"]
+            "required": ["id", "op", "width", "inputs", "value_contract"],
+            "properties": {
+              "region": {"type": ["string", "null"]}
+            }
+          }
+        },
+        "semantic_regions": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": ["id", "op", "operands", "results"],
+            "properties": {
+              "id": {"type": "string"},
+              "op": {"type": "string"},
+              "parent": {"type": ["string", "null"]},
+              "params": {"type": "object"},
+              "operands": {"type": "array", "items": {"type": "string"}},
+              "results": {"type": "array", "items": {"type": "string"}},
+              "annotation": {"type": ["string", "null"]}
+            }
           }
         },
         "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"}

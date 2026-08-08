@@ -16,6 +16,7 @@ from torchwright.compiler.hf import compile_hf_bundle, compile_to_hf, save_hf_bu
 from torchwright.compiler.hf.build import _validate_staged_bundle
 from torchwright.compiler.truth import TRUTH_FORMAT, sha256_json
 from torchwright.graph import Add, Embedding, Linear
+from torchwright.ops.linear import add, subtract
 
 
 def _compile_small_bundle(path):
@@ -134,6 +135,66 @@ def test_truth_manifest_binds_graph_schedule_layout_and_support(tmp_path):
             }
             assert _support_coordinates(record, arrays) == expected
             assert record["nnz"] == len(expected)
+
+
+def test_truth_manifest_semantic_regions(tmp_path):
+    """Regions built through decorated ops land in the source record.
+
+    ``subtract`` is the composition proof: it creates no node directly
+    (add ∘ negate), so its record is reachable only through the parent
+    chain — and it must still appear in the table with resolving
+    operand/result references.
+    """
+    embedding = Embedding(
+        ["a"],
+        d_embed=2,
+        table=torch.tensor([[1.0, 0.0], [0.0, 1.0]]),
+    )
+    total = add(embedding, embedding)
+    output = subtract(total, embedding)
+    compile_hf_bundle(
+        output,
+        embedding,
+        tmp_path,
+        d=32,
+        d_head=16,
+        d_hidden=16,
+        bos_token=None,
+        eos_token=None,
+        write_tokenizer=False,
+    )
+    manifest = json.loads((tmp_path / "torchwright_truth.json").read_text())
+    source = manifest["graphs"]["source"]
+    regions = source["semantic_regions"]
+    # Canonical walk: outer Add (subtract's), inner Add, embedding, negate.
+    assert [record["op"] for record in regions] == [
+        "linear.subtract",
+        "linear.add",
+        "linear.add",
+        "linear.negate",
+    ]
+    assert [record["parent"] for record in regions] == [None, "r:0", None, "r:0"]
+    node_ids = {node["id"] for node in source["nodes"]}
+    by_op = {node["op"]: node for node in source["nodes"]}
+    for record in regions:
+        assert record["params"] == {}
+        for field in ("operands", "results"):
+            assert record[field], record
+            assert set(record[field]) <= node_ids
+    # Membership: every node names its innermost creating op call.
+    memberships = {node["id"]: node["region"] for node in source["nodes"]}
+    assert memberships[source["root"]] == "r:1"  # subtract's internal add
+    assert memberships[by_op["Embedding"]["id"]] is None
+    # The stamped source hash covers the regions table: an edit that also
+    # recomputes the whole-manifest integrity hash still trips it.
+    truth_path = tmp_path / "torchwright_truth.json"
+    manifest["graphs"]["source"]["semantic_regions"][0]["params"] = {"x": 1}
+    manifest["integrity"]["sha256"] = sha256_json(
+        {key: value for key, value in manifest.items() if key != "integrity"}
+    )
+    truth_path.write_text(json.dumps(manifest))
+    with pytest.raises(RuntimeError, match="source graph hash mismatch"):
+        _validate_staged_bundle(tmp_path, expect_tokenizer=False, expect_truth=True)
 
 
 def test_truth_validation_rejects_a_tampered_bound_file(tmp_path):

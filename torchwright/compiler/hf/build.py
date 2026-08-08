@@ -1274,6 +1274,31 @@ def _validate_graph_record(graph: dict[str, Any], prefix: str) -> dict[str, int]
     return widths
 
 
+def _validate_semantic_regions(
+    graph: dict[str, Any], source_widths: dict[str, int]
+) -> None:
+    regions = graph.get("semantic_regions")
+    if not isinstance(regions, list):
+        raise TypeError("source graph semantic regions must be a list")
+    region_ids = {region.get("id") for region in regions}
+    if len(region_ids) != len(regions) or any(
+        not isinstance(region_id, str) or not region_id.startswith("r:")
+        for region_id in region_ids
+    ):
+        raise RuntimeError("source graph has duplicate or invalid region IDs")
+    for region in regions:
+        parent = region.get("parent")
+        if parent is not None and parent not in region_ids:
+            raise RuntimeError("semantic region parent does not resolve")
+        for field in ("operands", "results"):
+            if any(ref not in source_widths for ref in region.get(field, [])):
+                raise RuntimeError(f"semantic region has an unresolved {field} node")
+    for node in graph["nodes"]:
+        region = node.get("region")
+        if region is not None and region not in region_ids:
+            raise RuntimeError("source node names an unknown semantic region")
+
+
 def _validate_lowering_map(
     records: object, source_widths: dict[str, int], lowered_widths: dict[str, int]
 ) -> None:
@@ -1399,6 +1424,7 @@ def _validate_physical_layout(payload: dict[str, Any]) -> None:
 def _validate_truth_internals(payload: dict[str, Any]) -> None:
     graphs = payload["graphs"]
     source_widths = _validate_graph_record(graphs["source"], "s")
+    _validate_semantic_regions(graphs["source"], source_widths)
     lowered_widths = _validate_graph_record(graphs["lowered"], "l")
     _validate_lowering_map(graphs.get("realization_map"), source_widths, lowered_widths)
     internal = graphs.get("internal_nodes", [])

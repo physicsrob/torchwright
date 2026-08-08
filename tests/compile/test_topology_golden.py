@@ -99,3 +99,20 @@ def test_lowered_topology_encoding_is_pinned():
     out = _build_asserted_graph()
     lowered = lower(out)
     assert _entries_hash(topology_entries(lowered.output_node)) == LOWERED_GOLDEN
+
+
+def test_encodings_unchanged_inside_an_op_scope():
+    """``op_scope`` records are metadata-neutral, like ``node.checks``.
+
+    Building the same graph with an op scope active stamps ``op_region``
+    on every node; both fingerprint encodings (debug sidecar and schedule
+    cache) must not move.
+    """
+    from torchwright.compiler.graph_clone import topological_order
+    from torchwright.graph import op_scope
+
+    out = op_scope(_build_asserted_graph)()
+    assert all(node.op_region is not None for node in topological_order(out))
+    assert _entries_hash(topology_entries(out)) == SOURCE_GOLDEN
+    lowered = lower(out)
+    assert _entries_hash(topology_entries(lowered.output_node)) == LOWERED_GOLDEN

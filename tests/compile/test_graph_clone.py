@@ -232,6 +232,24 @@ def test_clone_shares_weight_tensors_by_reference():
     assert checked > 10
 
 
+def test_clone_carries_op_region_by_reference():
+    """``op_region`` rides the generic copy, shared with the source.
+
+    Semantic regions are a source-level manifest concept — truth capture
+    reads only source nodes — so the shared record on the compiler-private
+    clone is inert creator-provenance, not something to remap.
+    """
+    from torchwright.ops.linear import subtract
+
+    a = create_input("a", 2, value_range=(-1.0, 1.0))
+    b = create_input("b", 2, value_range=(-1.0, 1.0))
+    out = subtract(a, b)
+    copy = clone_graph(out, DISPATCH)
+    assert out.op_region is not None
+    for src, clone in copy.node_map.items():
+        assert clone.op_region is src.op_region
+
+
 def test_clone_leaves_source_untouched():
     out, _ = _variant_graph()
     nodes_before = get_ancestor_nodes({out})

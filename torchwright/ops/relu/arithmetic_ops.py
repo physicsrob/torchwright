@@ -4,7 +4,7 @@ from typing import cast
 
 import torch
 
-from torchwright.graph import Add, Concatenate, Linear, Node
+from torchwright.graph import Add, Concatenate, Linear, Node, op_scope
 from torchwright.graph.asserts import assert_matches_value_type
 from torchwright.graph.value_type import NodeValueType, Range
 from torchwright.ops.const import step_sharpness
@@ -98,6 +98,7 @@ def _compare_output_type(true_level: float, false_level: float) -> NodeValueType
     return NodeValueType(value_range=Range(lo, hi))
 
 
+@op_scope
 def compare(
     inp: Node,
     thresh: float,

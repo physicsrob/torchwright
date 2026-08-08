@@ -11,7 +11,7 @@ import math
 
 import torch
 
-from torchwright.graph import Concatenate, Linear, Node
+from torchwright.graph import Concatenate, Linear, Node, op_scope
 from torchwright.graph.asserts import assert_matches_value_type
 from torchwright.graph.misc import LiteralValue
 from torchwright.graph.value_type import NodeValueType, Range
@@ -35,6 +35,7 @@ def _select_output_type(true_node: Node, false_node: Node) -> NodeValueType:
     return NodeValueType(value_range=r)
 
 
+@op_scope
 def select(cond: Node, true_node: Node, false_node: Node) -> Node:
     """Output one of two nodes based on a boolean condition.
 

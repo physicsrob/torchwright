@@ -1,4 +1,7 @@
+import dataclasses
 import functools
+import inspect
+import math
 import os
 from contextlib import contextmanager
 from contextvars import ContextVar
@@ -156,6 +159,198 @@ def annotated(label: str) -> "Callable[[Callable[_P, _R]], Callable[_P, _R]]":
     return deco
 
 
+@dataclasses.dataclass(eq=False)
+class OpScopeRecord:
+    """Construction-time provenance for one op-library call.
+
+    Created by :func:`op_scope` on every decorated call — there is no
+    dedup (unlike :func:`annotate`): two identical calls produce two
+    records, because each call is a distinct op instance.  ``eq=False``
+    keeps identity hashing, so records can key the capture dicts the
+    truth manifest builds from them.
+
+    Records hold ``node_id`` integers only, never ``Node`` references:
+    the clone pass's stray-reference guard
+    (``graph_clone._iter_stray_node_refs``) cannot see inside dataclass
+    fields, so a ``Node``-typed field here would silently leak source
+    references into compiler-private clones.
+
+    Attribution rules: a node's membership (``Node.op_region``) is the
+    innermost record active at its construction, stamped once in
+    ``Node.__init__`` and never overwritten — a node returned unchanged
+    through an outer decorated call appears in that outer record's
+    ``result_ids`` but keeps its creator's membership.  Consumers read
+    ``operand_ids``/``result_ids`` for dataflow, not membership.
+    """
+
+    #: Derived op name: module path under ``torchwright.ops`` plus the
+    #: function qualname (``linear.add``, ``relu.arithmetic_ops.compare``).
+    op: str
+    #: JSON-safe non-Node arguments by parameter name (defaults included).
+    params: dict[str, Any]
+    #: Enclosing decorated call at entry, or None at top level.
+    parent: "OpScopeRecord | None"
+    #: Ambient :func:`annotate` path at call entry.
+    annotation: str | None
+    #: ``node_id`` of every Node-typed argument, in signature order.
+    operand_ids: tuple[int, ...]
+    #: ``node_id`` of every Node-typed return value (set after the call).
+    result_ids: tuple[int, ...] = ()
+
+
+_current_op_scope: ContextVar[OpScopeRecord | None] = ContextVar(
+    "current_op_scope",
+    default=None,
+)
+
+# Bounds for _sanitize_op_params: container elements beyond the cap (and
+# nesting beyond the depth cap) collapse to a summary string, so DOOM-scale
+# arguments (vocab lists, breakpoint grids) cannot bloat the record.  The
+# element cap follows truth._INLINE_LITERAL_LIMIT's "small enough to keep
+# inline" stance.
+_PARAM_ELEMENT_CAP = 64
+_PARAM_DEPTH_CAP = 3
+
+
+def _scalar_param(value: object) -> object:
+    """Encode a scalar; non-finite floats become strings.
+
+    The string encoding is mandatory, not cosmetic: the truth manifest is
+    dumped with ``allow_nan=False``, so a raw ``inf`` param would crash
+    manifest emission far from the op call that captured it.
+    """
+    if isinstance(value, float) and not math.isfinite(value):
+        if math.isnan(value):
+            return "nan"
+        return "+inf" if value > 0 else "-inf"
+    return value
+
+
+def _frozen_dataclass_fields(value: object) -> dict[str, object] | None:
+    """Shallow field dict for a frozen dataclass instance, else None.
+
+    Deliberately not ``dataclasses.asdict`` — that deep-copies tensor
+    fields, and records live as long as the graph.
+    """
+    if not dataclasses.is_dataclass(value) or isinstance(value, type):
+        return None
+    params = getattr(type(value), "__dataclass_params__", None)
+    if params is None or not params.frozen:
+        return None
+    return {
+        field.name: getattr(value, field.name) for field in dataclasses.fields(value)
+    }
+
+
+def _sanitize_op_params(value: object, depth: int = 0) -> object:
+    """Encode one op argument as JSON-safe data — total, recursive, capped.
+
+    Every branch returns something ``json.dumps(..., allow_nan=False)``
+    accepts.  Tensors are summarized by shape/dtype and never retained.
+    Containers recurse up to the element and depth caps; oversized,
+    non-string-keyed, or unrecognized values collapse to a summary
+    string.
+    """
+    if value is None or isinstance(value, (bool, int, float, str)):
+        return _scalar_param(value)
+    if isinstance(value, torch.Tensor):
+        return {
+            "tensor": {
+                "shape": list(value.shape),
+                "dtype": str(value.dtype).removeprefix("torch."),
+            }
+        }
+    if depth < _PARAM_DEPTH_CAP:
+        if isinstance(value, (list, tuple)) and len(value) <= _PARAM_ELEMENT_CAP:
+            return [_sanitize_op_params(item, depth + 1) for item in value]
+        if (
+            isinstance(value, dict)
+            and len(value) <= _PARAM_ELEMENT_CAP
+            and all(isinstance(key, str) for key in value)
+        ):
+            return {
+                key: _sanitize_op_params(item, depth + 1) for key, item in value.items()
+            }
+        fields = _frozen_dataclass_fields(value)
+        if fields is not None:
+            return {
+                name: _sanitize_op_params(item, depth + 1)
+                for name, item in fields.items()
+            }
+    size = f"[{len(value)}]" if isinstance(value, (list, tuple, dict)) else ""
+    return f"<{type(value).__name__}{size}>"
+
+
+def _node_ids_in(value: object) -> list[int] | None:
+    """Node ids in ``value`` (one container level deep), or None if none.
+
+    The one-level depth matches the clone pass's stray-reference walk
+    (``graph_clone._iter_stray_node_refs``): an op argument that buries
+    nodes deeper than one list/tuple level is invisible to both.
+    """
+    if isinstance(value, Node):
+        return [value.node_id]
+    if isinstance(value, (list, tuple)):
+        ids = [item.node_id for item in value if isinstance(item, Node)]
+        if ids:
+            return ids
+    return None
+
+
+def op_scope(fn: "Callable[_P, _R]") -> "Callable[_P, _R]":
+    """Stamp every node created inside ``fn`` with op-call provenance.
+
+    Bare decorator for op-library constructors.  The op name is derived
+    from the function's module and qualname (``linear.add``,
+    ``swiglu.map_select.select``), so twin-machine names never collide
+    and there is no hand-written label to drift.  Each call captures a
+    fresh :class:`OpScopeRecord`: ``Node``-typed arguments (scanned one
+    container level deep) become ``operand_ids``, every other argument is
+    sanitized into ``params`` (defaults included; a parameter named
+    ``self`` is skipped, so methods decorate cleanly), and ``Node``-typed
+    returns are recorded as ``result_ids`` after the call.  Nested
+    decorated calls chain through ``parent``.
+
+    The record is pure metadata: it does not participate in canonical
+    ids, fingerprints, or the schedule cache (the same neutrality
+    contract ``node.checks`` has).
+    """
+    signature = inspect.signature(fn)
+    module = fn.__module__.removeprefix("torchwright.ops.")
+    op_name = f"{module}.{fn.__qualname__}"
+
+    @functools.wraps(fn)
+    def wrapper(*args: _P.args, **kwargs: _P.kwargs) -> _R:
+        bound = signature.bind(*args, **kwargs)
+        bound.apply_defaults()
+        operand_ids: list[int] = []
+        params: dict[str, Any] = {}
+        for name, value in bound.arguments.items():
+            if name == "self":
+                continue
+            node_ids = _node_ids_in(value)
+            if node_ids is not None:
+                operand_ids.extend(node_ids)
+            else:
+                params[name] = _sanitize_op_params(value)
+        record = OpScopeRecord(
+            op=op_name,
+            params=params,
+            parent=_current_op_scope.get(),
+            annotation=_current_annotation.get(),
+            operand_ids=tuple(operand_ids),
+        )
+        token = _current_op_scope.set(record)
+        try:
+            result = fn(*args, **kwargs)
+        finally:
+            _current_op_scope.reset(token)
+        record.result_ids = tuple(_node_ids_in(result) or ())
+        return result
+
+    return wrapper
+
+
 class Node:
     """Base class for all computation graph nodes.
 
@@ -169,6 +364,12 @@ class Node:
         node_id: Auto-incremented unique identifier.
         name: Optional human-readable label (for debugging / repr).
         annotation: Hierarchical label set by the ``annotate`` context manager.
+        op_region: Innermost :func:`op_scope` record active at construction
+            (None outside any decorated op call).  Stamped once here and
+            never overwritten — a node returned through an outer decorated
+            call keeps its creator's membership.  Pure metadata, like
+            ``checks``: invisible to canonical ids, fingerprints, and the
+            schedule cache.
         checks: Runtime predicates attached to this node's value
             (``torchwright.graph.misc.Check``); run during ``compute``
             and against compiled values on ``debug=True`` forwards.
@@ -188,6 +389,7 @@ class Node:
     node_id: int
     name: str
     annotation: str | None
+    op_region: OpScopeRecord | None
     scheduling_predecessors: set["Node"]
     checks: list
     claimed_type: NodeValueType | None
@@ -246,6 +448,7 @@ class Node:
         self.node_id = global_node_id
         self.name = name
         self.annotation = _current_annotation.get()
+        self.op_region = _current_op_scope.get()
         # Scheduling-only predecessors (not data inputs).  Populated by
         # ``torchwright.graph.scheduling_hints.sequential_scope`` and
         # similar helpers; honored by ``GraphAnalyzer.is_ready`` so the

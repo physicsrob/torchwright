@@ -9,9 +9,10 @@ machine library, not in this module.
 
 import torch
 
-from torchwright.graph import Add, Concatenate, Linear, Node
+from torchwright.graph import Add, Concatenate, Linear, Node, op_scope
 
 
+@op_scope
 def add(inp1: Node, inp2: Node) -> Node:
     """Performs element-wise addition of two input nodes.
 
@@ -25,6 +26,7 @@ def add(inp1: Node, inp2: Node) -> Node:
     return Add(inp1, inp2)
 
 
+@op_scope
 def subtract(inp1: Node, inp2: Node) -> Node:
     """Subtracts inp2 from inp1 element-wise.
 
@@ -38,6 +40,7 @@ def subtract(inp1: Node, inp2: Node) -> Node:
     return add(inp1, negate(inp2))
 
 
+@op_scope
 def negate(inp: Node) -> Node:
     """Negates the input node (multiplies by -1).
 
