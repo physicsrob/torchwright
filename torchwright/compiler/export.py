@@ -1815,14 +1815,18 @@ def compile_to_onnx(
     # (potentially very long) streaming compile would waste the whole run.
     cache_stride_resolved = _resolve_cache_stride(cache_stride, max_seq_len)
 
+    machine, bias, rms_norm = _apply_export_profile(
+        profile, bias=bias, rms_norm=rms_norm
+    )
+    # Width first: it needs no graph at all, so a bad d fails before the
+    # embedding is even dereferenced (see
+    # test_compile_to_onnx_rejects_unsupported_width_before_compiling).
+    rms_norm_on = _resolve_norm_policy(d, rms_norm=rms_norm)
+
     from torchwright.compiler.token_model import validate_token_vocab
 
     validate_token_vocab(embedding.tokenizer.vocab)
 
-    machine, bias, rms_norm = _apply_export_profile(
-        profile, bias=bias, rms_norm=rms_norm
-    )
-    rms_norm_on = _resolve_norm_policy(d, rms_norm=rms_norm)
     n_heads = resolve_n_heads(d, d_head, n_heads)
 
     # Attached-check coverage for the debug sidecar.  Collection order

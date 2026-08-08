@@ -33,12 +33,15 @@ from torchwright.graph.misc import LiteralValue
 
 
 def _embedding(width=4):
+    # "<unk>" appended last (a/b keep their token ids) with a zeros row:
+    # the token exporters require an addressable unknown token, and the
+    # structural tests here never read vocab-size-dependent surfaces.
     table = torch.tensor(
-        [[1.0, 2.0, 3.0, 4.0], [-2.0, 1.0, 0.5, 3.0]],
+        [[1.0, 2.0, 3.0, 4.0], [-2.0, 1.0, 0.5, 3.0], [0.0, 0.0, 0.0, 0.0]],
         dtype=torch.float32,
     )
     assert width == 4
-    return Embedding(["a", "b"], width, table=table, special_tokens=[])
+    return Embedding(["a", "b", "<unk>"], width, table=table, special_tokens=[])
 
 
 def _identity(inp, name):
@@ -83,7 +86,7 @@ def test_direct_attention_handoff_preserves_order_and_clears_const_seed():
 
     assert _banks(net, embedding, output)[0] == _banks(net, embedding, output)[1]
     got = net.compute(2, {embedding.input_name: torch.tensor([0, 1])})[output]
-    assert torch.equal(got.cpu(), embedding.table)
+    assert torch.equal(got.cpu(), embedding.table[:2])
 
     ra = net.residual_assignment
     in_state = net.layers[0].attn.in_state
