@@ -13,6 +13,14 @@ IMAGE = (
     # `make test` runs `check-modal-lock` first to catch drift.
     .uv_sync(groups=["dev", "test-onnx"], extra_options="--no-install-project")
     .add_local_dir("docs", "/root/docs")
+    # add_local_python_source mounts .py files only; package-data files
+    # shipped inside the package (hatchling includes them in the wheel)
+    # must be added explicitly or Modal runs crash where installed
+    # torchwright works.
+    .add_local_file(
+        "torchwright/compiler/torchwright_truth_v1.schema.json",
+        "/root/torchwright/compiler/torchwright_truth_v1.schema.json",
+    )
     .add_local_python_source(
         "torchwright", "examples", "tests", "scripts", "modal_image"
     )

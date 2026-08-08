@@ -13,10 +13,9 @@ import math
 from typing import TYPE_CHECKING, Any
 
 from torchwright.compiler.graph_identity import (
-    canonical_ids,
+    canonical_walk,
     compiler_code_fingerprint,
     encode_cols,
-    nodes_by_canonical_id,
 )
 from torchwright.graph import Embedding
 from torchwright.graph.attn import Attn
@@ -24,6 +23,8 @@ from torchwright.graph.ffn import FFN
 from torchwright.graph.misc import InputNode, LiteralValue
 
 if TYPE_CHECKING:
+    from collections.abc import Sequence
+
     from torchwright.compiler.forward.replay_plan import NodeIndices, ReplayPlan
     from torchwright.compiler.lower import LoweredGraph
     from torchwright.compiler.transformer import HeadlessTransformer
@@ -47,7 +48,14 @@ _MATRIX_AXES = {
 _INLINE_LITERAL_LIMIT = 256
 
 
-def _sha256_json(value: object) -> str:
+def sha256_json(value: object) -> str:
+    """Hash of the canonical JSON encoding of ``value``.
+
+    This encoding (sorted keys, compact separators, raw unicode) is the
+    contract between every truth-manifest hash producer and validator —
+    both sides must call this one function or freshly built bundles fail
+    their own hash checks.
+    """
     encoded = json.dumps(
         value, sort_keys=True, separators=(",", ":"), ensure_ascii=False
     ).encode()
@@ -139,12 +147,22 @@ def _node_semantics(node: Node) -> dict[str, Any]:
 
 
 def _graph_record(
-    output: Node, prefix: str, tensor_hashes: dict[int, str]
+    output: Node,
+    prefix: str,
+    tensor_hashes: dict[int, str],
+    *,
+    stamp_hash: bool = True,
 ) -> tuple[dict[str, Any], dict[int, str]]:
-    canon = canonical_ids(output)
-    refs = {raw: f"{prefix}:{cid}" for raw, cid in canon.items()}
+    """Record a graph's nodes in canonical order.
+
+    ``stamp_hash=False`` skips the content hash for a record that will be
+    mutated before it is final (the lowered graph gains ``source_nodes``
+    in :func:`_lowering_records`, which stamps the hash afterwards).
+    """
+    walk = canonical_walk(output)
+    refs = {node.node_id: f"{prefix}:{cid}" for cid, node in enumerate(walk)}
     nodes = []
-    for cid, node in nodes_by_canonical_id(output).items():
+    for cid, node in enumerate(walk):
         value_range = node.value_type.value_range
         claimed = (
             None
@@ -184,7 +202,8 @@ def _graph_record(
             record["semantics"] = semantics
         nodes.append(record)
     graph = {"root": refs[output.node_id], "nodes": nodes}
-    graph["sha256"] = _sha256_json(graph)
+    if stamp_hash:
+        graph["sha256"] = sha256_json(graph)
     return graph, refs
 
 
@@ -228,7 +247,12 @@ def _operation_role(op_type: str) -> str:
     return "transport"
 
 
-def _column_field(value: tuple[int, ...] | None) -> list[list[int]] | None:
+def column_runs(value: Sequence[int] | None) -> list[list[int]] | None:
+    """Encode a column index list as the manifest's ``[start, length]`` runs.
+
+    The one run-list encoding every manifest field uses; ``None`` stays
+    ``None`` so optional fields serialize as JSON null.
+    """
     return None if value is None else [list(run) for run in encode_cols(list(value))]
 
 
@@ -260,7 +284,7 @@ def _lowering_records(
     lowered_refs: dict[int, str],
 ) -> list[dict[str, Any]]:
     source_mapping = []
-    for source_id, source_node in nodes_by_canonical_id(source).items():
+    for source_id, source_node in enumerate(canonical_walk(source)):
         source_ref = f"s:{source_id}"
         copied = lowered.node_map.get(source_node)
         sliced = lowered.slice_map.get(source_node)
@@ -289,7 +313,7 @@ def _lowering_records(
             inverse_sources.setdefault(entry["lowered"], []).append(entry["source"])
     for node in lowered_graph["nodes"]:
         node["source_nodes"] = sorted(inverse_sources.get(node["id"], []))
-    lowered_graph["sha256"] = _sha256_json(
+    lowered_graph["sha256"] = sha256_json(
         {key: value for key, value in lowered_graph.items() if key != "sha256"}
     )
     return source_mapping
@@ -326,6 +350,7 @@ def _plan_layers(
     d: int,
     d_head: int,
     activation: str,
+    const_one_col: int,
 ) -> tuple[list[dict[str, Any]], dict[str, dict[str, Any]]]:
     layers = []
     matrices: dict[str, dict[str, Any]] = {}
@@ -334,6 +359,14 @@ def _plan_layers(
         head_cursor = 0
         for op_index, op in enumerate(layer.attention_ops):
             head_count = op.emitted_heads(d_head)
+            if op.op_type == "compute_attn":
+                q_columns = column_runs(op.q_source_cols)
+                k_columns = column_runs(op.k_source_cols)
+            else:
+                # Every non-compute_attn attention op is a Δ=0 self-match:
+                # its Q and K both read the reserved constant-1 column
+                # (weight_writer._self_match_source), not graph values.
+                q_columns = k_columns = column_runs((const_one_col,))
             attention_ops.append(
                 {
                     "id": f"L{layer_index}.attn.{op_index}",
@@ -341,11 +374,11 @@ def _plan_layers(
                     "role": _operation_role(op.op_type),
                     "node": None if op.node is None else node_refs[op.node.node_id],
                     "heads": [head_cursor, head_count],
-                    "target_columns": _column_field(op.target_cols),
-                    "source_columns": _column_field(op.source_cols),
-                    "source_columns_b": _column_field(op.source_cols_b),
-                    "query_source_columns": _column_field(op.q_source_cols),
-                    "key_source_columns": _column_field(op.k_source_cols),
+                    "target_columns": column_runs(op.target_cols),
+                    "source_columns": column_runs(op.source_cols),
+                    "source_columns_b": column_runs(op.source_cols_b),
+                    "query_source_columns": q_columns,
+                    "key_source_columns": k_columns,
                     "reuse_input_index": op.reuse_input_index,
                 }
             )
@@ -358,10 +391,10 @@ def _plan_layers(
                 "type": op.op_type,
                 "role": _operation_role(op.op_type),
                 "node": None if op.node is None else node_refs[op.node.node_id],
-                "target_columns": _column_field(op.target_cols),
-                "source_columns": _column_field(op.source_cols),
-                "source_columns_b": _column_field(op.source_cols_b),
-                "hidden_slots": _column_field(op.mlp_slots),
+                "target_columns": column_runs(op.target_cols),
+                "source_columns": column_runs(op.source_cols),
+                "source_columns_b": column_runs(op.source_cols_b),
+                "hidden_slots": column_runs(op.mlp_slots),
                 "reuse_input_index": op.reuse_input_index,
             }
             for op_index, op in enumerate(layer.mlp_ops)
@@ -400,8 +433,52 @@ def _plan_layers(
     return layers, matrices
 
 
+def _head_slot_maps(plan: ReplayPlan, d_head: int) -> list[dict[int, int]]:
+    """Per-layer maps from the writer's untrimmed head slots to trimmed slots.
+
+    The placement recorder captures attention writes in untrimmed head
+    coordinates (the ``trim_unused_heads`` contract), while the manifest
+    declares every attention matrix at its trimmed checkpoint width.  This
+    map translates between the two; an untrimmed slot absent from its
+    layer's map is a dead head that does not exist in the checkpoint.
+    """
+    maps = []
+    for layer in plan.layers:
+        mapping: dict[int, int] = {}
+        written = trimmed = 0
+        for op in layer.attention_ops:
+            liveness = op.written_head_liveness(d_head)
+            if sum(liveness) != op.emitted_heads(d_head):
+                raise AssertionError(
+                    "written-head liveness disagrees with emitted head count"
+                )
+            for is_live in liveness:
+                if is_live:
+                    mapping[written] = trimmed
+                    trimmed += 1
+                written += 1
+        maps.append(mapping)
+    return maps
+
+
+def _translate_head_axis(
+    indices: list[int], slot_map: dict[int, int], d_head: int
+) -> list[int] | None:
+    """Map head-axis matrix indices to trimmed slots; None if the head is dead."""
+    slots = {index // d_head for index in indices}
+    live = [slot for slot in slots if slot in slot_map]
+    if not live:
+        return None
+    if len(live) != len(slots):
+        raise AssertionError("placement entry spans live and dead head slots")
+    return [slot_map[index // d_head] * d_head + index % d_head for index in indices]
+
+
 def _placement_records(
-    compiled: HeadlessTransformer, node_refs: dict[int, str]
+    compiled: HeadlessTransformer,
+    node_refs: dict[int, str],
+    head_slot_maps: list[dict[int, int]],
+    d_head: int,
 ) -> dict[str, list[dict[str, Any]]]:
     placements: dict[str, list[dict[str, Any]]] = {}
     recorder = compiled.placements
@@ -409,15 +486,30 @@ def _placement_records(
         return placements
     for entry in recorder.entries:
         matrix = f"L{entry.layer}.{entry.matrix_kind}"
+        rows, cols = entry.rows, entry.cols
+        axis0_kind, axis1_kind = _MATRIX_AXES[entry.matrix_kind]
+        if "head" in (axis0_kind, axis1_kind):
+            head_axis = rows if axis0_kind == "head" else cols
+            translated = _translate_head_axis(
+                head_axis, head_slot_maps[entry.layer], d_head
+            )
+            if translated is None:
+                # A dead head's write was trimmed out of the checkpoint;
+                # the manifest describes only weights that exist.
+                continue
+            if axis0_kind == "head":
+                rows = translated
+            else:
+                cols = translated
         key = (
             f"physical:{entry.op_type}"
             if entry.node is None
             else node_refs[entry.node.node_id]
         )
         rects = (
-            _diag_rects(matrix, entry.rows, entry.cols)
+            _diag_rects(matrix, rows, cols)
             if entry.mode == "diag"
-            else _dense_rects(matrix, entry.rows, entry.cols)
+            else _dense_rects(matrix, rows, cols)
         )
         placements.setdefault(key, []).extend(rects)
     return placements
@@ -428,40 +520,8 @@ def _state_record(
 ) -> dict[str, Any]:
     return {
         "key": key,
-        "nodes": {
-            node_refs[node_id]: [list(run) for run in encode_cols(list(cols))]
-            for node_id, cols in values
-        },
+        "nodes": {node_refs[node_id]: column_runs(cols) for node_id, cols in values},
     }
-
-
-def _residual_access_records(layers: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    records = []
-    read_fields = (
-        ("source_columns", "source"),
-        ("source_columns_b", "source_b"),
-        ("query_source_columns", "query"),
-        ("key_source_columns", "key"),
-    )
-    for layer in layers:
-        operations = [
-            *layer["attention_operations"],
-            *layer["mlp_operations"],
-        ]
-        for operation in operations:
-            reads = [
-                {"port": port, "columns": operation[field]}
-                for field, port in read_fields
-                if operation.get(field) is not None
-            ]
-            records.append(
-                {
-                    "operation": operation["id"],
-                    "reads": reads,
-                    "writes": operation["target_columns"],
-                }
-            )
-    return records
 
 
 def capture_compile_truth(
@@ -482,7 +542,11 @@ def capture_compile_truth(
         raise RuntimeError("truth capture requires a source graph")
     tensor_hashes: dict[int, str] = {}
     source_graph, _source_refs = _graph_record(source, "s", tensor_hashes)
-    lowered_graph, lowered_refs = _graph_record(lowered.output_node, "l", tensor_hashes)
+    # The lowered record is mutated (source_nodes) and hashed by
+    # _lowering_records below; hashing it here too would be discarded work.
+    lowered_graph, lowered_refs = _graph_record(
+        lowered.output_node, "l", tensor_hashes, stamp_hash=False
+    )
     node_refs, internal_nodes = _node_references(plan, lowered_refs)
     source_mapping = _lowering_records(source, lowered, lowered_graph, lowered_refs)
     layers, matrices = _plan_layers(
@@ -491,8 +555,11 @@ def capture_compile_truth(
         d=d,
         d_head=d_head,
         activation=compiled.activation,
+        const_one_col=plan.const_one_col,
     )
-    placements = _placement_records(compiled, node_refs)
+    placements = _placement_records(
+        compiled, node_refs, _head_slot_maps(plan, d_head), d_head
+    )
     states = [_state_record("input", plan.input_indices, node_refs)]
     states.extend(
         _state_record(f"L{index}.post", layer.residual_snapshot, node_refs)
@@ -538,11 +605,18 @@ def capture_compile_truth(
             "assignment": _assignment_records(plan, node_refs),
             "realizations": realizations,
             "layers": layers,
-            "residual_accesses": _residual_access_records(layers),
         },
         "residual_stream": {
             "width": d,
             "constant_one_column": plan.const_one_col,
+            "constant_one_semantics": (
+                "Holds exactly 1.0 at every position. Read as the Δ=0 "
+                "self-match query/key source by every attention operation "
+                "except compute_attn (their query/key source columns) and, "
+                "under bias=False, by MLP bias folds (their W_in/W_up rows "
+                "in physical_layout.placements). Patching it collapses "
+                "every self-match head."
+            ),
             "rms_norm_reserved_columns": (
                 [] if rms is None else list(rms.reserved_cols)
             ),
@@ -560,7 +634,10 @@ def capture_compile_truth(
         "intervention_contract": {
             "node_value_contracts": "graphs.source.nodes[*].value_contract",
             "physical_coordinates": {
-                "residual": "schedule.residual_accesses",
+                "residual": (
+                    "schedule.layers[*].attention_operations[*] and "
+                    "mlp_operations[*] target/source/query/key column runs"
+                ),
                 "attention_heads": "schedule.layers[*].attention_operations[*].heads",
                 "mlp_neurons": "schedule.layers[*].mlp_operations[*].hidden_slots",
             },

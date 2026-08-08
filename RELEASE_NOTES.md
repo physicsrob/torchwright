@@ -1,5 +1,24 @@
 # Unreleased
 
+## HF bundles ship an artifact truth manifest
+
+- `compile_hf_bundle` writes `torchwright_truth.json` into every bundle,
+  alongside its JSON Schema and a parameter-support archive: the source and
+  lowered graphs, the schedule, residual-stream layout, physical weight
+  placements (in trimmed checkpoint coordinates), and the token-I/O
+  contract, hash-bound to the bundle files.
+- The manifest carries a whole-manifest integrity hash, and staged bundles
+  are validated against it — structure, file hashes, and coordinate
+  bounds — before the destination is replaced.
+- `config.json` gains a `torchwright_truth` pointer to the manifest files.
+  Models returned by `compile_to_hf` (and bundles re-saved from them via
+  `save_hf_bundle`) carry no truth files and therefore no pointer.
+
+## Breaking: compiled vocabularies require an explicit unknown token
+
+- `compile_hf_bundle`, `save_hf_bundle`, and `compile_to_onnx` now require
+  the vocabulary to contain exactly one `<unk>` token.
+
 # 0.1.0 — 2026-07-23
 
 First public release.

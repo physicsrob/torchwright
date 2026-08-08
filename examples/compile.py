@@ -40,9 +40,12 @@ import importlib
 import inspect
 import json
 from pathlib import Path
-from typing import cast
+from typing import TYPE_CHECKING, cast
 
 from torchwright.compiler.hf import compile_hf_bundle
+
+if TYPE_CHECKING:
+    from torchwright.compiler.token_model import JSONValue
 
 _TWO_DIGIT_EXAMPLE_MIN_WIDTH = 2
 
@@ -364,7 +367,7 @@ def build_bundle(
     if not hasattr(module, "create_network_parts"):
         raise ValueError(f"examples.{name} has no create_network_parts()")
 
-    build_kwargs = {}
+    build_kwargs: dict[str, JSONValue] = {}
     if max_digits is not None:
         if (
             "max_digits"
@@ -377,6 +380,13 @@ def build_bundle(
 
     out_dir = out_dir or bundle_dirname(name, max_digits)
     output_node, embedding = module.create_network_parts(**build_kwargs)
+    truth_metadata: dict[str, JSONValue] = {
+        "source": {
+            "entrypoint": f"examples.{name}:create_network_parts",
+            "arguments": build_kwargs,
+        },
+        "task": {"example": name, "max_digits": max_digits},
+    }
     compile_hf_bundle(
         output_node,
         embedding,
@@ -388,13 +398,7 @@ def build_bundle(
         if d_hidden is not None
         else getattr(module, "D_HIDDEN", None),
         optimize=optimize,
-        truth_metadata={
-            "source": {
-                "entrypoint": f"examples.{name}:create_network_parts",
-                "arguments": build_kwargs,
-            },
-            "task": {"example": name, "max_digits": max_digits},
-        },
+        truth_metadata=truth_metadata,
     )
     write_card(name, out_dir, max_digits)
     prompts = getattr(module, "DEMO_PROMPTS", None)

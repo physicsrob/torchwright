@@ -62,7 +62,7 @@ def compiler_code_fingerprint() -> str:
     return h.hexdigest()
 
 
-def _canonical_walk(output_node: Node) -> list[Node]:
+def canonical_walk(output_node: Node) -> list[Node]:
     """Nodes in canonical (preorder-DFS) order.
 
     Preorder DFS from the output following each node's ORDERED
@@ -84,12 +84,12 @@ def _canonical_walk(output_node: Node) -> list[Node]:
 
 def canonical_ids(output_node: Node) -> dict[int, int]:
     """Map current ``node_id`` -> canonical id, independent of creation order."""
-    return {n.node_id: i for i, n in enumerate(_canonical_walk(output_node))}
+    return {n.node_id: i for i, n in enumerate(canonical_walk(output_node))}
 
 
 def nodes_by_canonical_id(output_node: Node) -> dict[int, Node]:
     """Map canonical id -> live node object (the remap direction loaders need)."""
-    return dict(enumerate(_canonical_walk(output_node)))
+    return dict(enumerate(canonical_walk(output_node)))
 
 
 def topology_entries(output_node: Node) -> list[tuple]:
@@ -98,7 +98,7 @@ def topology_entries(output_node: Node) -> list[tuple]:
     The hashable topology encoding shared by the schedule-cache
     fingerprint and the debug-sidecar fingerprint.
     """
-    ordered = _canonical_walk(output_node)
+    ordered = canonical_walk(output_node)
     canon = {n.node_id: i for i, n in enumerate(ordered)}
     topo = []
     for i, n in enumerate(ordered):
@@ -168,7 +168,7 @@ def graph_fingerprint(
     canon = canonical_ids(output_node)
     linear_support = {
         canon[n.node_id]: live_weight_row_ranges(n)
-        for n in _canonical_walk(output_node)
+        for n in canonical_walk(output_node)
         if isinstance(n, _Linear)
     }
     payload = {

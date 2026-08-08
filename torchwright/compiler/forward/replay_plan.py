@@ -6,7 +6,7 @@ from numbers import Integral
 from typing import TYPE_CHECKING, Literal, SupportsInt, cast
 
 from torchwright.compiler.forward.cpsat_scheduler import ScheduleAssignment
-from torchwright.compiler.realization import linear_attn_live_heads
+from torchwright.compiler.realization import linear_attn_chunks, linear_attn_live_heads
 from torchwright.compiler.token_model import LayerShape
 from torchwright.compiler.utils import resolve_n_heads
 from torchwright.graph import Node
@@ -141,16 +141,7 @@ class PlannedAttentionOp:
 
     def emitted_heads(self, d_head: int) -> int:
         if self.op_type == "compute_attn":
-            assert self.node is not None
-            return sum(
-                bool(
-                    cast("Attn", self.node)
-                    .output_matrix[start : start + d_head]
-                    .ne(0)
-                    .any()
-                )
-                for start in range(0, cast("Attn", self.node).d_v, d_head)
-            )
+            return sum(self.written_head_liveness(d_head))
         if self.op_type == "compute_linear":
             assert self.node is not None
             return linear_attn_live_heads(self.node, d_head)
@@ -165,6 +156,35 @@ class PlannedAttentionOp:
         if self.op_type in ("cancel", "add_into"):
             return (len(self.target_cols) + d_head - 1) // d_head
         raise AssertionError(f"unknown planned attention op {self.op_type!r}")
+
+    def written_head_liveness(self, d_head: int) -> tuple[bool, ...]:
+        """Liveness of each head this op's writer allocates, in allocation order.
+
+        One entry per head the weight writer allocates for this op
+        (untrimmed).  A ``False`` entry is a head whose emitted W_O block is
+        entirely zero — ``trim_unused_heads`` removes it from the checkpoint,
+        so it occupies an untrimmed slot but no trimmed one.  Exactly two
+        sources of dead heads exist: the one-head floor of a zero-support
+        ``compute_linear`` (``realization.linear_attn_chunks``), and
+        ``compute_attn`` d_head-chunks of ``d_v`` whose W_O slice is all
+        zero.  ``sum(written_head_liveness(d))`` equals ``emitted_heads(d)``
+        — the truth capture asserts this when mapping placement coordinates
+        from untrimmed to trimmed head slots.
+        """
+        if self.op_type == "compute_attn":
+            assert self.node is not None
+            node = cast("Attn", self.node)
+            return tuple(
+                bool(node.output_matrix[start : start + d_head].ne(0).any())
+                for start in range(0, node.d_v, d_head)
+            )
+        if self.op_type == "compute_linear":
+            assert self.node is not None
+            live = linear_attn_live_heads(self.node, d_head)
+            if live == 0:
+                return (False,) * len(linear_attn_chunks(self.node, d_head))
+            return (True,) * live
+        return (True,) * self.emitted_heads(d_head)
 
 
 @dataclass(frozen=True)

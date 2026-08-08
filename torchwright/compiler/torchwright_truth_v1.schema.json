@@ -5,6 +5,7 @@
   "type": "object",
   "required": [
     "format",
+    "integrity",
     "artifact",
     "build",
     "model",
@@ -22,6 +23,14 @@
   "properties": {
     "format": {"const": "torchwright.truth.v1"},
     "$schema": {"type": "string"},
+    "integrity": {
+      "type": "object",
+      "required": ["sha256", "scope"],
+      "properties": {
+        "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+        "scope": {"type": "string"}
+      }
+    },
     "artifact": {
       "type": "object",
       "required": ["kind", "architecture", "files"],
