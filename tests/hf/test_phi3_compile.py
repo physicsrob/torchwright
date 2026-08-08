@@ -175,7 +175,7 @@ def test_failed_save_bundle_preserves_existing_destination(tmp_path, direct):
     sentinel = destination / "existing.txt"
     sentinel.write_text("keep me")
 
-    with pytest.raises(IndexError):
+    with pytest.raises(ValueError, match=r"exactly one.*<unk>"):
         save_hf_bundle(model, ["too-short"], destination)
 
     assert {path.name for path in destination.iterdir()} == {"existing.txt"}
@@ -279,6 +279,14 @@ def test_fast_tokenizer_character_round_trip(direct):
     encoded = tok("1+2\n")["input_ids"]
     assert encoded[0] == vocab.index("<bos>")
     assert tok.decode(encoded, skip_special_tokens=True) == "1+2\n"
+    assert tok("☃", add_special_tokens=False)["input_ids"] == [vocab.index("<unk>")]
+
+
+def test_fast_tokenizer_rejects_missing_unk():
+    with pytest.raises(ValueError, match=r"exactly one.*<unk>"):
+        build_fast_tokenizer(
+            ["<bos>", "<eos>", "a"], bos_token="<bos>", eos_token="<eos>"
+        )
 
 
 def test_unsupported_swish_modes_fail_loudly():

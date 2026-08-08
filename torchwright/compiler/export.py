@@ -1815,6 +1815,10 @@ def compile_to_onnx(
     # (potentially very long) streaming compile would waste the whole run.
     cache_stride_resolved = _resolve_cache_stride(cache_stride, max_seq_len)
 
+    from torchwright.compiler.token_model import validate_token_vocab
+
+    validate_token_vocab(embedding.tokenizer.vocab)
+
     machine, bias, rms_norm = _apply_export_profile(
         profile, bias=bias, rms_norm=rms_norm
     )

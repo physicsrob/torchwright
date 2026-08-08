@@ -1,6 +1,7 @@
 import torch
 
 from torchwright.graph import Embedding
+from torchwright.ops.inout_nodes import create_onehot_embedding
 
 
 def test_embedding():
@@ -25,3 +26,25 @@ def test_embedding():
     assert torch.allclose(output4, output5)
     assert torch.allclose(output4, embedding.get_embedding("<unk>"))
     assert torch.allclose(output5, embedding.get_embedding("<unk>"))
+
+
+def test_onehot_embedding_appends_zero_unk_without_shifting_ids():
+    embedding = create_onehot_embedding(["a", "b", "<eos>"])
+
+    assert embedding.tokenizer.vocab == ["a", "b", "<eos>", "<unk>"]
+    assert embedding.d_embed == 3
+    assert embedding.table.shape == (4, 3)
+    assert torch.equal(embedding.table[:3], torch.eye(3))
+    assert torch.equal(embedding.get_embedding("<unk>"), torch.zeros(3))
+    assert torch.equal(embedding.get_embedding("not-in-vocab"), torch.zeros(3))
+
+
+def test_onehot_embedding_uses_explicit_unk_position_as_zero_row():
+    embedding = create_onehot_embedding(["a", "<unk>", "b"])
+
+    assert embedding.tokenizer.vocab == ["a", "<unk>", "b"]
+    assert embedding.d_embed == 2
+    assert torch.equal(
+        embedding.table,
+        torch.tensor([[1.0, 0.0], [0.0, 0.0], [0.0, 1.0]]),
+    )

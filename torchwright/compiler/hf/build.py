@@ -31,6 +31,7 @@ from torchwright.compiler.token_model import (
     make_layer_callback,
     resolve_rope,
     schedule_provenance,
+    validate_token_vocab,
 )
 from torchwright.compiler.utils import get_ancestor_nodes, resolve_n_heads
 from torchwright.graph import Embedding, Node
@@ -82,6 +83,7 @@ def _validate_embedding_contract(output_node: Node, embedding: Embedding) -> Non
         raise ValueError(
             "the supplied embedding is not the Embedding reachable from output_node"
         )
+    validate_token_vocab(embedding.tokenizer.vocab)
 
 
 def _remove_path(path: str) -> None:
@@ -271,8 +273,10 @@ def build_fast_tokenizer(
     from tokenizers.models import WordLevel
     from transformers import PreTrainedTokenizerFast
 
+    vocab = list(vocab)
+    validate_token_vocab(vocab)
     vocab_dict = {token: i for i, token in enumerate(vocab)}
-    unk = _DEFAULT_UNK_SPELLING if _DEFAULT_UNK_SPELLING in vocab_dict else None
+    unk = _DEFAULT_UNK_SPELLING
     tok = Tokenizer(WordLevel(vocab=vocab_dict, unk_token=_DEFAULT_UNK_SPELLING))
     tok.pre_tokenizer = pre_tokenizers.Split(Regex(r"[\s\S]"), behavior="isolated")
     tok.decoder = decoders.Fuse()
@@ -297,6 +301,7 @@ def save_hf_bundle(
     write_tokenizer: bool = True,
 ) -> PreTrainedModel:
     """Save a directly compiled model and its vocabulary as an HF bundle."""
+    validate_token_vocab(list(vocab))
     with _staged_bundle_directory(output_dir) as staging:
         _save_hf_bundle_into(
             model,

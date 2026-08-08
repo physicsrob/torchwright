@@ -39,6 +39,7 @@ from torchwright.compiler.export import (
 # hardcoded-password heuristic on *_token-named parameters).
 _DEFAULT_BOS_SPELLING = "<bos>"
 _DEFAULT_EOS_SPELLING = "<eos>"
+_DEFAULT_UNK_SPELLING = "<unk>"
 
 
 def discover_cache_stride(
@@ -136,6 +137,12 @@ class OnnxTokenModule:
             )
         self.vocab: list[str] = list(meta["vocab"])
         self._token_to_id = {t: i for i, t in enumerate(self.vocab)}
+        if self.vocab.count(_DEFAULT_UNK_SPELLING) != 1:
+            raise ValueError(
+                f"{meta_path}: token vocabulary must contain exactly one "
+                f"{_DEFAULT_UNK_SPELLING!r} token"
+            )
+        self._unk_token_id = self._token_to_id[_DEFAULT_UNK_SPELLING]
         self.metadata: dict = dict(meta.get("extra") or {})
 
         self._session = ort.InferenceSession(
@@ -179,12 +186,12 @@ class OnnxTokenModule:
         return self._d_head
 
     def token_to_id(self, token: str) -> int:
-        return self._token_to_id.get(token, 0)  # 0 = <unk>
+        return self._token_to_id.get(token, self._unk_token_id)
 
     def id_to_token(self, token_id: int) -> str:
         if 0 <= token_id < len(self.vocab):
             return self.vocab[token_id]
-        return self.vocab[0]
+        return self.vocab[self._unk_token_id]
 
     def empty_past(self) -> OnnxPast:
         """Full-S zero-filled sequence-major cache buffers, length 0.

@@ -39,6 +39,26 @@ def test_char_level_encode_decode_round_trip(vocab_file):
     assert tok.decode(ids, skip_special_tokens=True) == "12*34\n"
 
 
+def test_unknown_character_maps_to_unk(vocab_file):
+    tok = TorchwrightCustomTokenizer(
+        vocab_file=vocab_file, bos_token="<bos>", eos_token="<eos>"
+    )
+
+    assert tok("a", add_special_tokens=False)["input_ids"] == [
+        tok._token_to_id["<unk>"]
+    ]
+
+
+def test_missing_unk_is_rejected(tmp_path):
+    vocab_file = tmp_path / "vocab.json"
+    vocab_file.write_text(json.dumps(["<bos>", "<eos>", "a"]))
+
+    with pytest.raises(ValueError, match=r"exactly one.*<unk>"):
+        TorchwrightCustomTokenizer(
+            vocab_file=str(vocab_file), bos_token="<bos>", eos_token="<eos>"
+        )
+
+
 def test_add_bos_token_false_persists(tmp_path, vocab_file):
     tok = TorchwrightCustomTokenizer(
         vocab_file=vocab_file,

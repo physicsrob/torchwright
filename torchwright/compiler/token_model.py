@@ -21,6 +21,7 @@ from typing import (
 import numpy as np
 
 from torchwright.graph import Concatenate, Embedding, LiteralValue, Node
+from torchwright.graph.embedding import unk_token
 from torchwright.graph.misc import InputNode
 from torchwright.graph.rope import ROPE_BASE
 
@@ -168,6 +169,16 @@ class TokenModelSink(Protocol):
     def finalize(self, spec: TokenModelSpec, weights: TokenModelWeights) -> None: ...
 
 
+def validate_token_vocab(vocab: list[str] | tuple[str, ...]) -> None:
+    """Require a unique, addressable unknown token in a token-model vocabulary."""
+    count = vocab.count(unk_token)
+    if count != 1:
+        raise ValueError(
+            "token model vocabulary must contain exactly one "
+            f"{unk_token!r} token; found {count}"
+        )
+
+
 def make_layer_callback(header: CompileHeader, sink: TokenModelSink) -> Callable:
     """Return a ``forward_compile`` callback which transfers layer ownership."""
     begun = False
@@ -304,6 +315,7 @@ def build_token_weights(
     compiled: HeadlessTransformer, output_node: Node, embedding: Embedding, d: int
 ) -> TokenModelWeights:
     """Fold token placement, literals and RMS constants into full-width weights."""
+    validate_token_vocab(embedding.tokenizer.vocab)
     assignment = compiled.residual_assignment
     if assignment is None or not compiled.layers:
         raise ValueError("compiled model has no residual assignment or layers")

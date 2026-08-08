@@ -56,6 +56,15 @@ class TorchwrightCustomTokenizer(PreTrainedTokenizer):
         # special tokens and consults get_vocab()).
         self._tokens: list[str] = list(json.loads(Path(vocab_file).read_text()))
         self._token_to_id: dict[str, int] = {t: i for i, t in enumerate(self._tokens)}
+        # Reloaded special tokens arrive as transformers.AddedToken objects;
+        # their string spelling is the key stored in vocab.json.
+        self._unk_token_spelling = str(unk_token)
+        unk_count = self._tokens.count(self._unk_token_spelling)
+        if unk_count != 1:
+            raise ValueError(
+                "TorchwrightCustomTokenizer vocabulary must contain exactly one "
+                f"{self._unk_token_spelling!r} token; found {unk_count}"
+            )
         # transformers 5.x deliberately strips `add_bos_token` from the saved
         # tokenizer_config, so it can't round-trip under that name. Persist it
         # under our own key `prepend_bos` (set into init_kwargs below), which
@@ -94,8 +103,7 @@ class TorchwrightCustomTokenizer(PreTrainedTokenizer):
         return list(text)
 
     def _convert_token_to_id(self, token: str) -> int:
-        unk_id = self._token_to_id.get(self.unk_token, 0)
-        return self._token_to_id.get(token, unk_id)
+        return self._token_to_id.get(token, self._token_to_id[self._unk_token_spelling])
 
     def _convert_id_to_token(self, index: int) -> str:
         if 0 <= index < len(self._tokens):
