@@ -12,7 +12,7 @@ from typing import cast
 
 import torch
 
-from torchwright.graph import Concatenate, Linear, Node
+from torchwright.graph import Concatenate, Linear, Node, op_scope
 from torchwright.graph.asserts import assert_matches_value_type
 from torchwright.graph.value_type import NodeValueType, Range
 from torchwright.ops.const import min_d_hidden, scale, step_sharpness, swish_dip
@@ -37,6 +37,7 @@ _MIN_PIECEWISE_BREAKPOINTS = 2
 _MIN_RADIX_DIVISOR = 2
 
 
+@op_scope
 def compare(
     inp: Node,
     thresh: float,
@@ -126,6 +127,7 @@ def compare(
     return result
 
 
+@op_scope
 def multiply(inp1: Node, inp2: Node) -> Node:
     """Multiply two live values.
 
@@ -167,6 +169,7 @@ def multiply(inp1: Node, inp2: Node) -> Node:
     )
 
 
+@op_scope
 def abs(inp: Node) -> Node:
     """Element-wise absolute value.
 
@@ -209,6 +212,7 @@ def abs(inp: Node) -> Node:
     )
 
 
+@op_scope
 def min(inp1: Node, inp2: Node) -> Node:
     """Element-wise minimum of two nodes.
 
@@ -269,6 +273,7 @@ def min(inp1: Node, inp2: Node) -> Node:
     )
 
 
+@op_scope
 def square(inp: Node) -> Node:
     """Compute ``inp²``.
 
@@ -347,6 +352,7 @@ def _slope_change_hinges(
     return relus
 
 
+@op_scope
 def piecewise_linear(
     inp: Node,
     breakpoints: list[float],
@@ -500,6 +506,7 @@ def piecewise_linear(
     return result
 
 
+@op_scope
 def clamp(inp: Node, lo: float, hi: float) -> Node:
     """Clamp a scalar to [lo, hi] in a single FFN.
 
@@ -535,6 +542,7 @@ def clamp(inp: Node, lo: float, hi: float) -> Node:
     )
 
 
+@op_scope
 def reciprocal(
     inp: Node,
     min_value: float,
@@ -594,6 +602,7 @@ def reciprocal(
     )
 
 
+@op_scope
 def thermometer_floor_div(inp: Node, divisor: int, max_value: int) -> Node:
     """Compute floor(inp / divisor) using a piecewise-linear staircase.
 
@@ -653,6 +662,7 @@ def thermometer_floor_div(inp: Node, divisor: int, max_value: int) -> Node:
     )
 
 
+@op_scope
 def mod_const(inp: Node, divisor: int, max_value: int) -> Node:
     """Compute inp % divisor for non-negative integer inputs.
 
@@ -678,6 +688,7 @@ def mod_const(inp: Node, divisor: int, max_value: int) -> Node:
     return subtract(inp, multiply_const(q, float(divisor)))
 
 
+@op_scope
 def floor_int(
     inp: Node,
     min_value: int,
@@ -908,6 +919,7 @@ def floor_int(
     )
 
 
+@op_scope
 def ceil_int(
     inp: Node,
     min_value: int,
@@ -938,6 +950,7 @@ def ceil_int(
     return negate(floor_int(negate(inp), -max_value, -min_value, sharpness=sharpness))
 
 
+@op_scope
 def radix_floor_int(
     inp: Node,
     min_value: int,

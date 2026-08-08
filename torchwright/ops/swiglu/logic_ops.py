@@ -8,7 +8,7 @@ not their own.  ``equals_vector`` is a one-sided compare on a dot product;
 
 import torch
 
-from torchwright.graph import Concatenate, Node
+from torchwright.graph import Concatenate, Node, op_scope
 from torchwright.graph.asserts import assert_matches_value_type
 from torchwright.graph.value_type import NodeValueType, Range
 from torchwright.ops.const import embedding_step_sharpness, scale, swish_dip
@@ -46,6 +46,7 @@ def _assert_cond_pm1(cond: Node, c_tol: float = _GATE_C_TOL) -> Node:
     )
 
 
+@op_scope
 def bool_any_true(inp_list: list[Node]) -> Node:
     """Returns a node that evaluates to True if any of the input nodes are true.
 
@@ -71,6 +72,7 @@ def bool_any_true(inp_list: list[Node]) -> Node:
     return compare(sum_node, thresh=0.5, true_level=1.0, false_level=-1.0)
 
 
+@op_scope
 def bool_all_true(inp_list: list[Node]) -> Node:
     """Returns a node that evaluates to True if all of the input nodes are true.
 
@@ -97,6 +99,7 @@ def bool_all_true(inp_list: list[Node]) -> Node:
     )
 
 
+@op_scope
 def bool_not(inp: Node) -> Node:
     """Returns a node that evaluates to 1.0 if false, -1.0 if true.
 
@@ -115,6 +118,7 @@ def bool_not(inp: Node) -> Node:
     return compare(inp, thresh=0.0, true_level=-1.0, false_level=1.0)
 
 
+@op_scope
 def equals_vector(inp: Node, vector: torch.Tensor) -> Node:
     """Compare a node's value to a fixed key vector: +1 at a match, -1 otherwise.
 
@@ -175,6 +179,7 @@ def _cond_gate_output_type(inp: Node) -> NodeValueType:
     return NodeValueType(value_range=Range(min(0.0, r.lo), max(0.0, r.hi)))
 
 
+@op_scope
 def cond_gate(cond: Node, inp: Node) -> Node:
     """Output ``inp`` if ``cond`` is true, else 0.
 

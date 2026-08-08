@@ -17,7 +17,7 @@ Key components:
 
 import torch
 
-from torchwright.graph import Embedding, Linear, Node, RopeConfig
+from torchwright.graph import Embedding, Linear, Node, RopeConfig, op_scope
 from torchwright.ops.attention_ops import attend_to_offset, get_prev_value
 from torchwright.ops.inout_nodes import create_literal_value
 from torchwright.ops.linear import add_const, bool_to_01, concat, negate, sum_nodes
@@ -37,6 +37,7 @@ from torchwright.ops.relu.map_select import (
 from torchwright.ops.relu.marker_count import count_since_marker
 
 
+@op_scope
 def check_is_digit(embedding: Embedding) -> Node:
     """Check if the current embedding value is a digit (0-9).
 
@@ -73,6 +74,7 @@ class NumericSequence:
         digits: Number of digits to track in the sliding window.
     """
 
+    @op_scope
     def __init__(
         self,
         rope: RopeConfig,
@@ -106,6 +108,7 @@ class NumericSequence:
         # delimiter token (one step after the last digit).
         self.digit_values = [attend_to_offset(rope, digit) for digit in current_digits]
 
+    @op_scope
     def get_digits_at_event(self, termination_event: Node) -> list[Node]:
         """Capture the digit window at the position where termination_event fires.
 
@@ -124,6 +127,7 @@ class NumericSequence:
         ]
 
 
+@op_scope
 def output_sequence(
     rope: RopeConfig,
     trigger_condition: Node,
@@ -191,6 +195,7 @@ def output_sequence(
     )
 
 
+@op_scope
 def remove_leading_0s(
     embedding: Embedding, seq: list[Node], max_removals: int
 ) -> list[Node]:

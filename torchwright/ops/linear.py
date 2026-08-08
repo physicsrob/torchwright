@@ -54,6 +54,7 @@ def negate(inp: Node) -> Node:
     return Linear(inp, -torch.eye(d), name="negate")
 
 
+@op_scope
 def add_const(inp: Node, scalar: float) -> Node:
     """Adds a scalar value to each entry of the input node.
 
@@ -73,6 +74,7 @@ def add_const(inp: Node, scalar: float) -> Node:
     )
 
 
+@op_scope
 def multiply_const(inp: Node, scalar: float) -> Node:
     """Multiplies each entry of the input node by a scalar.
 
@@ -87,6 +89,7 @@ def multiply_const(inp: Node, scalar: float) -> Node:
     return Linear(inp, scalar * torch.eye(d), name="multiply_const")
 
 
+@op_scope
 def bool_to_01(inp: Node) -> Node:
     """Map a ±1 boolean node to 0/1.
 
@@ -103,6 +106,7 @@ def bool_to_01(inp: Node) -> Node:
     return multiply_const(add_const(inp, 1.0), 0.5)
 
 
+@op_scope
 def add_scaled_nodes(scale1: float, inp1: Node, scale2: float, inp2: Node) -> Node:
     """Computes the linear combination of two nodes using specified coefficients.
 
@@ -130,6 +134,7 @@ def add_scaled_nodes(scale1: float, inp1: Node, scale2: float, inp2: Node) -> No
 _MIN_FANOUT = 2  # a fanout chunk must combine at least 2 operands to be useful
 
 
+@op_scope
 def sum_nodes(inp_list: list[Node], *, max_fanout: int | None = None) -> Node:
     """Compute the sum of all input nodes.
 
@@ -179,6 +184,7 @@ def sum_nodes(inp_list: list[Node], *, max_fanout: int | None = None) -> Node:
     return running
 
 
+@op_scope
 def concat(inp_list: list[Node]) -> Node:
     """Concatenates all the Nodes in inp_list.
 
@@ -191,6 +197,7 @@ def concat(inp_list: list[Node]) -> Node:
     return Concatenate(inp_list)
 
 
+@op_scope
 def slice_columns(inp: Node, start: int, width: int, name: str = "slice") -> Node:
     """Take ``width`` consecutive components of ``inp`` starting at ``start``.
 

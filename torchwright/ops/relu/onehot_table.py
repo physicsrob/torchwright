@@ -32,7 +32,7 @@ the interval arithmetic through a long chain of lookups.
 
 import torch
 
-from torchwright.graph import Linear, Node
+from torchwright.graph import Linear, Node, op_scope
 from torchwright.graph.asserts import assert_matches_value_type
 from torchwright.graph.value_type import NodeValueType, Range
 from torchwright.ops.relu.linear_relu_linear import linear_relu_linear
@@ -89,6 +89,7 @@ def _validate_table(
     return n_blocks
 
 
+@op_scope
 def onehot_lookup(
     inp: Node,
     key_to_value: dict[torch.Tensor, torch.Tensor],

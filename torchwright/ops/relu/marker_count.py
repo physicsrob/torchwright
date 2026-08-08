@@ -30,7 +30,7 @@ i.e. ``gap+1`` lands within ±0.5 of the integer out to the ``max_gap`` bound.
 
 import math
 
-from torchwright.graph import Node, RopeConfig
+from torchwright.graph import Node, RopeConfig, op_scope
 from torchwright.graph.rope import rope_inv_freq
 from torchwright.ops._math import _RECIP_REL_SAFETY
 from torchwright.ops.attention_ops import attend_mean_where
@@ -42,6 +42,7 @@ from torchwright.ops.relu.arithmetic_ops import reciprocal
 _MAX_GAP_ERR_BUDGET = 0.45
 
 
+@op_scope
 def count_since_marker(
     rope: RopeConfig,
     window_validity: Node,

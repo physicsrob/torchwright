@@ -23,7 +23,7 @@ from typing import cast
 
 import torch
 
-from torchwright.graph import Attn, LiteralValue, Node, RopeConfig
+from torchwright.graph import Attn, LiteralValue, Node, RopeConfig, op_scope
 from torchwright.graph.asserts import assert_in_range
 from torchwright.ops._math import (
     _N_BPS,
@@ -36,6 +36,7 @@ from torchwright.ops.const import scale
 from torchwright.ops.swiglu.arithmetic_ops import piecewise_linear
 
 
+@op_scope
 def global_position_from_bos(
     rope: RopeConfig,
     bos_indicator: Node,

@@ -2,7 +2,7 @@ import math
 
 import torch
 
-from torchwright.graph import Concatenate, Linear, Node
+from torchwright.graph import Concatenate, Linear, Node, op_scope
 from torchwright.graph.asserts import assert_matches_value_type
 from torchwright.graph.misc import LiteralValue
 from torchwright.graph.value_type import NodeValueType, Range
@@ -76,6 +76,7 @@ def _broadcast_select_per_column_offsets(
     return per_column_offsets(union, scalar_M)
 
 
+@op_scope
 def map_to_table(
     inp: Node, key_to_value: dict[torch.Tensor, torch.Tensor], default: torch.Tensor
 ) -> Node:
@@ -332,6 +333,7 @@ def _table_lookup_column_mask(
     )
 
 
+@op_scope
 def table_lookup_2d(
     i: Node,
     j: Node,
@@ -441,6 +443,7 @@ def table_lookup_2d(
     )
 
 
+@op_scope
 def switch(conditions: list[Node], values: list[Node]) -> Node:
     """Select one of N values based on which condition is true.
 
@@ -478,6 +481,7 @@ def _select_offset(true_node: Node, false_node: Node, caller: str) -> float:
     return _max_abs_or_raise(union_vt, caller)
 
 
+@op_scope
 def select(cond: Node, true_node: Node, false_node: Node) -> Node:
     """Outputs one of two nodes based on a boolean condition.
 
@@ -571,6 +575,7 @@ def select(cond: Node, true_node: Node, false_node: Node) -> Node:
     return result
 
 
+@op_scope
 def in_range(lower: Node, upper: Node, n_slots: int) -> Node:
     """Test each integer position against a runtime interval.
 
@@ -646,6 +651,7 @@ def in_range(lower: Node, upper: Node, n_slots: int) -> Node:
     )
 
 
+@op_scope
 def dynamic_extract(
     table: Node,
     idx: Node,
@@ -749,6 +755,7 @@ def dynamic_extract(
     return Linear(masked, sum_matrix, name="dynamic_extract_sum")
 
 
+@op_scope
 def broadcast_select(
     masks: Node,
     true_value: Node,

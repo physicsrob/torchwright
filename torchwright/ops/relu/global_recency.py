@@ -53,7 +53,7 @@ from typing import cast
 
 import torch
 
-from torchwright.graph import Attn, LiteralValue, Node, RopeConfig
+from torchwright.graph import Attn, LiteralValue, Node, RopeConfig, op_scope
 from torchwright.graph.asserts import assert_in_range
 from torchwright.ops._math import _N_BPS, _bisect_m, _theta_slow, _w_of_m
 from torchwright.ops.attention_ops import attend_causal_mean
@@ -64,6 +64,7 @@ from torchwright.ops.relu.arithmetic_ops import piecewise_linear
 # ---------------------------------------------------------------------------
 
 
+@op_scope
 def global_position_from_bos(
     rope: RopeConfig,
     bos_indicator: Node,

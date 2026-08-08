@@ -1,11 +1,19 @@
 import torch
 
-from torchwright.graph import Embedding, InputNode, LiteralValue, Node, RopeConfig
+from torchwright.graph import (
+    Embedding,
+    InputNode,
+    LiteralValue,
+    Node,
+    RopeConfig,
+    op_scope,
+)
 from torchwright.graph.embedding import Unembedding, unk_token
 
 _DEFAULT_VALUE_RANGE = (-1e4, 1e4)
 
 
+@op_scope
 def create_input(
     name_or_width: str | int,
     width: int | None = None,
@@ -38,6 +46,7 @@ def create_input(
     return InputNode(width, name=name_or_width, value_range=value_range)
 
 
+@op_scope
 def create_literal_value(vector: torch.Tensor, name: str = "") -> Node:
     """Create a node with a literal value.
 
@@ -51,6 +60,7 @@ def create_literal_value(vector: torch.Tensor, name: str = "") -> Node:
     return LiteralValue(vector, name)
 
 
+@op_scope
 def create_embedding(vocab: list[str]) -> Embedding:
     """Create an embedding input.
 
@@ -63,6 +73,7 @@ def create_embedding(vocab: list[str]) -> Embedding:
     return Embedding(vocab)
 
 
+@op_scope
 def create_onehot_embedding(vocab: list[str]) -> Embedding:
     """Create a one-hot embedding with a zero-vector ``<unk>`` row.
 

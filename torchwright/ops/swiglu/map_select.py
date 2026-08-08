@@ -116,6 +116,7 @@ def select(cond: Node, true_node: Node, false_node: Node) -> Node:
     return result
 
 
+@op_scope
 def switch(conditions: list[Node], values: list[Node]) -> Node:
     """Select one of N values based on which condition is true.
 
@@ -153,6 +154,7 @@ def _is_zero_literal(node: Node) -> bool:
     return isinstance(node, LiteralValue) and bool((node.value == 0).all())
 
 
+@op_scope
 def in_range(lower: Node, upper: Node, n_slots: int) -> Node:
     """Test each integer position against a runtime interval.
 
@@ -241,6 +243,7 @@ def in_range(lower: Node, upper: Node, n_slots: int) -> Node:
     )
 
 
+@op_scope
 def broadcast_select(
     masks: Node,
     true_value: Node,
@@ -395,6 +398,7 @@ def broadcast_select(
     return result
 
 
+@op_scope
 def dynamic_extract(
     table: Node,
     idx: Node,
@@ -466,6 +470,7 @@ def dynamic_extract(
     return Linear(masked, sum_matrix, name="dynamic_extract_sum")
 
 
+@op_scope
 def map_to_table(
     inp: Node, key_to_value: dict[torch.Tensor, torch.Tensor], default: torch.Tensor
 ) -> Node:
@@ -762,6 +767,7 @@ def _column_gate_chunks(
     return chunks
 
 
+@op_scope
 def table_lookup_2d(
     i: Node,
     j: Node,

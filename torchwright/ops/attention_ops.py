@@ -58,7 +58,14 @@ from typing import cast
 
 import torch
 
-from torchwright.graph import Attn, Concatenate, LiteralValue, Node, RopeConfig
+from torchwright.graph import (
+    Attn,
+    Concatenate,
+    LiteralValue,
+    Node,
+    RopeConfig,
+    op_scope,
+)
 from torchwright.graph.asserts import (
     assert_in_range,
     assert_matches_value_type,
@@ -280,6 +287,7 @@ _MAX_RECENCY_LEAK = 1e-6
 _RECENCY_SCALE = 1.0
 
 
+@op_scope
 def attend_argmin_above_integer(
     rope: RopeConfig,
     score: Node,
@@ -405,6 +413,7 @@ def attend_argmin_above_integer(
     )
 
 
+@op_scope
 def attend_argmin_above_in_bucket(
     rope: RopeConfig,
     score: Node,
@@ -587,6 +596,7 @@ def attend_argmin_above_in_bucket(
     )
 
 
+@op_scope
 def attend_argmin_unmasked(
     rope: RopeConfig,
     score: Node,
@@ -716,6 +726,7 @@ def attend_argmin_unmasked(
     )
 
 
+@op_scope
 def attend_mean_where(
     rope: RopeConfig,
     validity: Node,
@@ -797,6 +808,7 @@ def attend_mean_where(
     return attn
 
 
+@op_scope
 def attend_causal_mean(
     rope: RopeConfig,
     value: Node,
@@ -877,6 +889,7 @@ def attend_causal_mean(
     return attn
 
 
+@op_scope
 def attend_argmax_dot(
     rope: RopeConfig,
     query_vector: Node,
@@ -967,6 +980,7 @@ def attend_argmax_dot(
     )
 
 
+@op_scope
 def attend_to_offset(rope: RopeConfig, value: Node, delta_pos: int = -1) -> Node:
     """Read ``value`` from the position ``delta_pos`` away — a rotary offset head.
 
@@ -988,6 +1002,7 @@ def attend_to_offset(rope: RopeConfig, value: Node, delta_pos: int = -1) -> Node
     )
 
 
+@op_scope
 def get_prev_value(
     rope: RopeConfig,
     value: Node,
@@ -1121,6 +1136,7 @@ def get_prev_value(
     )
 
 
+@op_scope
 def attend_most_recent_globally(
     rope: RopeConfig,
     query_vector: Node,

@@ -1,9 +1,10 @@
 import torch
 
-from torchwright.graph import Node
+from torchwright.graph import Node, op_scope
 from torchwright.graph.ffn import FFN
 
 
+@op_scope
 def linear_relu_linear(
     input_node: Node,
     input_proj: torch.Tensor,

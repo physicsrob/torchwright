@@ -1,5 +1,17 @@
 # Unreleased
 
+## Truth manifests carry semantic regions
+
+- Every public op-library constructor now stamps the nodes it creates
+  with construction-time provenance (`@op_scope`): derived op name,
+  sanitized non-node parameters, operand/result references, and the
+  enclosing-call chain.  The stamps are pure metadata — canonical ids,
+  fingerprints, and the schedule cache are unaffected.
+- The truth manifest's source graph gains a `semantic_regions` table and
+  a per-node `region` membership field, both covered by the source
+  content hash, so a consumer can read a compiled graph as the sequence
+  of op calls that built it.
+
 ## HF bundles ship an artifact truth manifest
 
 - `compile_hf_bundle` writes `torchwright_truth.json` into every bundle,

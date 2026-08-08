@@ -20,7 +20,7 @@ See Also:
 
 import torch
 
-from torchwright.graph import Embedding, Node
+from torchwright.graph import Embedding, Node, op_scope
 from torchwright.graph.asserts import assert_matches_value_type
 from torchwright.graph.value_type import NodeValueType, Range
 from torchwright.ops.const import step_sharpness
@@ -30,6 +30,7 @@ from torchwright.ops.relu.linear_relu_linear import linear_relu_linear
 from torchwright.ops.relu.map_select import map_to_table
 
 
+@op_scope
 def digit_to_scaled_scalar(
     embedding: Embedding, digit_node: Node, place_value: float
 ) -> Node:
@@ -46,6 +47,7 @@ def digit_to_scaled_scalar(
     return map_to_table(inp=digit_node, key_to_value=table, default=torch.tensor([0.0]))
 
 
+@op_scope
 def digits_to_number(embedding: Embedding, digit_nodes: list[Node]) -> Node:
     """Convert digit embeddings (MSB first) to a single scalar.
 
@@ -60,6 +62,7 @@ def digits_to_number(embedding: Embedding, digit_nodes: list[Node]) -> Node:
     return sum_nodes(scaled)
 
 
+@op_scope
 def number_to_digit_scalars(inp: Node, num_digits: int, max_value: int) -> list[Node]:
     """Extract individual digit scalars (0.0-9.0) from a scalar number, MSB first.
 
@@ -104,6 +107,7 @@ def number_to_digit_scalars(inp: Node, num_digits: int, max_value: int) -> list[
     return digits
 
 
+@op_scope
 def scalar_to_embedding(inp: Node, embedding: Embedding) -> Node:
     """Convert a scalar digit (0.0-9.0) back to its embedding vector.
 

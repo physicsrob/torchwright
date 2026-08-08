@@ -35,6 +35,7 @@ _MIN_PIECEWISE_BREAKPOINTS = 2
 # ---------------------------------------------------------------------------
 
 
+@op_scope
 def relu_add(inp1: Node, inp2: Node) -> Node:
     """Applies the ReLU function to both input nodes and then adds them together.
 
@@ -68,6 +69,7 @@ def relu_add(inp1: Node, inp2: Node) -> Node:
     )
 
 
+@op_scope
 def abs(inp: Node) -> Node:
     """Element-wise absolute value.
 
@@ -174,6 +176,7 @@ def compare(
 # ---------------------------------------------------------------------------
 
 
+@op_scope
 def min(inp1: Node, inp2: Node) -> Node:
     """Element-wise minimum of two nodes.
 
@@ -246,6 +249,7 @@ def _slope_change_relus(
     return relus
 
 
+@op_scope
 def piecewise_linear(
     inp: Node,
     breakpoints: list[float],
@@ -499,6 +503,7 @@ def _product_2d_quarter_square(
     return Add(base, relu_part)
 
 
+@op_scope
 def multiply_2d(
     inp1: Node,
     inp2: Node,
@@ -673,6 +678,7 @@ def multiply_2d(
     return result
 
 
+@op_scope
 def square(inp: Node, max_value: float, step: float = 1.0) -> Node:
     """Compute x² via piecewise-linear interpolation.
 
@@ -710,6 +716,7 @@ def square(inp: Node, max_value: float, step: float = 1.0) -> Node:
     return piecewise_linear(inp, breakpoints, lambda x: x * x, name="square")
 
 
+@op_scope
 def thermometer_floor_div(inp: Node, divisor: int, max_value: int) -> Node:
     """Compute floor(inp / divisor) using a piecewise-linear staircase.
 
@@ -780,6 +787,7 @@ def thermometer_floor_div(inp: Node, divisor: int, max_value: int) -> Node:
     )
 
 
+@op_scope
 def mod_const(inp: Node, divisor: int, max_value: int) -> Node:
     """Compute inp % divisor for non-negative integer inputs.
 
@@ -804,6 +812,7 @@ def mod_const(inp: Node, divisor: int, max_value: int) -> Node:
     return subtract(inp, multiply_const(q, float(divisor)))
 
 
+@op_scope
 def clamp(inp: Node, lo: float, hi: float) -> Node:
     """Clamp a scalar to [lo, hi] in a single MLP sublayer.
 
@@ -839,6 +848,7 @@ def clamp(inp: Node, lo: float, hi: float) -> Node:
     )
 
 
+@op_scope
 def reciprocal(
     inp: Node,
     min_value: float,
@@ -881,6 +891,7 @@ def reciprocal(
     return piecewise_linear(inp, breakpoints, lambda x: 1.0 / x, name="reciprocal")
 
 
+@op_scope
 def floor_int(
     inp: Node,
     min_value: int,
@@ -1011,6 +1022,7 @@ def floor_int(
     )
 
 
+@op_scope
 def ceil_int(
     inp: Node,
     min_value: int,
@@ -1047,6 +1059,7 @@ def ceil_int(
 # ---------------------------------------------------------------------------
 
 
+@op_scope
 def multiply_integers(
     inp1: Node,
     inp2: Node,

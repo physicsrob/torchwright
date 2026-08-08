@@ -44,7 +44,7 @@ count deviation of 0.33), so output error is ``2ε·|value_i - default|``.
 
 import torch
 
-from torchwright.graph import Linear, Node
+from torchwright.graph import Linear, Node, op_scope
 from torchwright.graph.asserts import assert_matches_value_type
 from torchwright.graph.value_type import NodeValueType, Range
 from torchwright.ops._math import _lookup_numeric_slack
@@ -95,6 +95,7 @@ def _validate_table(
     return n_blocks
 
 
+@op_scope
 def onehot_lookup(
     inp: Node,
     key_to_value: dict[torch.Tensor, torch.Tensor],

@@ -14,7 +14,7 @@ from typing import cast
 
 import torch
 
-from torchwright.graph import Embedding, Linear, Node, RopeConfig
+from torchwright.graph import Embedding, Linear, Node, RopeConfig, op_scope
 from torchwright.graph.rope import require_full_rotary, rope_inv_freq
 from torchwright.ops.attention_ops import (
     attend_argmax_dot,
@@ -47,6 +47,7 @@ from torchwright.ops.swiglu.map_select import (
 from torchwright.ops.swiglu.marker_count import count_since_marker
 
 
+@op_scope
 def check_is_digit(embedding: Embedding) -> Node:
     """Check if the current embedding value is a digit (0-9).
 
@@ -73,6 +74,7 @@ class NumericSequence:
         digits: Number of digits to track in the sliding window.
     """
 
+    @op_scope
     def __init__(
         self,
         rope: RopeConfig,
@@ -105,6 +107,7 @@ class NumericSequence:
         # delimiter token.
         self.digit_values = [attend_to_offset(rope, digit) for digit in current_digits]
 
+    @op_scope
     def get_digits_at_event(self, termination_event: Node) -> list[Node]:
         """Capture the digit window at the position where termination_event fires.
 
@@ -237,6 +240,7 @@ class IndexedRegion:
             (e.g. ``embedding.get_embedding("0")`` for implicit zero-padding).
     """
 
+    @op_scope
     def __init__(
         self,
         rope: RopeConfig,
@@ -318,6 +322,7 @@ class IndexedRegion:
         # sentinel win reads the default.
         self._value = select(in_region, embedding, create_literal_value(default))
 
+    @op_scope
     def length_at(self, event: Node) -> Node:
         """The region's length, latched where ``event`` fires.
 
@@ -330,6 +335,7 @@ class IndexedRegion:
         assert len(event) == 1, "event must be a 1-D boolean"
         return add_const(get_prev_value(self.rope, self._count, event), -1.0)
 
+    @op_scope
     def token_at(self, index: Node) -> Node:
         """The region's token at runtime ``index``, or ``default`` if out of range.
 
@@ -358,6 +364,7 @@ class IndexedRegion:
         )
 
 
+@op_scope
 def output_sequence(
     rope: RopeConfig,
     trigger_condition: Node,
@@ -403,6 +410,7 @@ def output_sequence(
     )
 
 
+@op_scope
 def remove_leading_0s(
     embedding: Embedding,
     seq: list[Node],

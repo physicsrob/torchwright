@@ -10,7 +10,7 @@ in the swiglu reciprocal (whose grid-spacing audit derives
 
 import math
 
-from torchwright.graph import Node, RopeConfig
+from torchwright.graph import Node, RopeConfig, op_scope
 from torchwright.graph.rope import rope_inv_freq
 from torchwright.ops._math import _RECIP_REL_SAFETY
 from torchwright.ops.attention_ops import attend_mean_where
@@ -23,6 +23,7 @@ _MAX_APPROX_ERR = 0.45
 accuracy the caller relies on)."""
 
 
+@op_scope
 def count_since_marker(
     rope: RopeConfig,
     window_validity: Node,

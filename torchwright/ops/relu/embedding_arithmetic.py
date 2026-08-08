@@ -16,7 +16,7 @@ All sequences are MSB-first: seq[0] is the most significant digit.
 
 import torch
 
-from torchwright.graph import Embedding, Node
+from torchwright.graph import Embedding, Node, op_scope
 from torchwright.ops.inout_nodes import create_literal_value
 from torchwright.ops.linear import concat
 from torchwright.ops.relu.map_select import map_to_table
@@ -28,6 +28,7 @@ from torchwright.ops.relu.map_select import map_to_table
 _DIGIT_BASE = 10  # decimal digits 0-9
 
 
+@op_scope
 def sum_digits(
     embedding: Embedding, num1: Node, num2: Node, carry_in: Node
 ) -> tuple[Node, Node]:
@@ -75,6 +76,7 @@ def sum_digits(
     )
 
 
+@op_scope
 def sum_digit_seqs(
     embedding: Embedding, seq1: list[Node], seq2: list[Node]
 ) -> list[Node]:
