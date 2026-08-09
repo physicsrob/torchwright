@@ -1,5 +1,7 @@
 # Unreleased
 
+# 0.2.0 — 2026-08-08
+
 ## Schematics are readable through a typed API
 
 - New torch-free package `torchwright.schematic`: `load_schematic`
