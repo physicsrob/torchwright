@@ -15,8 +15,12 @@ import sys
 import torchwright
 import torchwright.schematic
 import torchwright.schematic.format
+import torchwright.schematic.reader
 import torchwright.schematic.support
 import torchwright.schematic.validate
+
+assert callable(torchwright.load_schematic)
+assert callable(torchwright.schematic.load_schematic_bundle)
 
 heavy = [name for name in ("torch", "numpy") if name in sys.modules]
 assert not heavy, f"schematic import pulled heavy deps: {heavy}"

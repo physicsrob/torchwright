@@ -12,10 +12,18 @@ __all__ = [
     "compile_hf_bundle",
     "compile_to_onnx",
     "load_onnx",
+    "load_schematic",
+    "load_schematic_bundle",
 ]
+
+_SCHEMATIC_NAMES = frozenset({"load_schematic", "load_schematic_bundle"})
 
 
 def __getattr__(name: str) -> object:
+    if name in _SCHEMATIC_NAMES:
+        from . import schematic
+
+        return getattr(schematic, name)
     if name in __all__:
         from . import compiler
 
