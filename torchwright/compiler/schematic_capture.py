@@ -8,33 +8,31 @@ this module is JSON data: it deliberately retains no graph nodes or tensors.
 from __future__ import annotations
 
 import hashlib
-import json
 import math
 from typing import TYPE_CHECKING, Any
 
 from torchwright.compiler.graph_identity import (
     canonical_walk,
     compiler_code_fingerprint,
-    encode_cols,
 )
 from torchwright.graph import Embedding
 from torchwright.graph.attn import Attn
 from torchwright.graph.ffn import FFN
 from torchwright.graph.misc import InputNode, LiteralValue
+from torchwright.schematic.format import (
+    SCHEMATIC_FORMAT,
+    SCHEMATIC_SCHEMA_FILENAME,
+    column_runs,
+    encode_cols,
+    sha256_json,
+)
 
 if TYPE_CHECKING:
-    from collections.abc import Sequence
-
     from torchwright.compiler.forward.replay_plan import NodeIndices, ReplayPlan
     from torchwright.compiler.lower import LoweredGraph
     from torchwright.compiler.transformer import HeadlessTransformer
     from torchwright.graph import Node, OpScopeRecord
     from torchwright.graph.value_type import Range
-
-SCHEMATIC_FORMAT = "torchwright.schematic.v1"
-SCHEMATIC_FILENAME = "torchwright_schematic.json"
-SCHEMATIC_SCHEMA_FILENAME = "torchwright_schematic_v1.schema.json"
-SCHEMATIC_SUPPORT_FILENAME = "torchwright_schematic_support.npz"
 
 _MATRIX_AXES = {
     "attn.W_Q": ("residual_in", "head"),
@@ -46,20 +44,6 @@ _MATRIX_AXES = {
     "mlp.W_out": ("hidden", "residual_out"),
 }
 _INLINE_LITERAL_LIMIT = 256
-
-
-def sha256_json(value: object) -> str:
-    """Hash of the canonical JSON encoding of ``value``.
-
-    This encoding (sorted keys, compact separators, raw unicode) is the
-    contract between every schematic-manifest hash producer and validator —
-    both sides must call this one function or freshly built bundles fail
-    their own hash checks.
-    """
-    encoded = json.dumps(
-        value, sort_keys=True, separators=(",", ":"), ensure_ascii=False
-    ).encode()
-    return hashlib.sha256(encoded).hexdigest()
 
 
 def _bound(value: float) -> float | None:
@@ -302,15 +286,6 @@ def _operation_role(op_type: str) -> str:
     if op_type in {"cancel", "cancel_bypass", "clear_literal_seed"}:
         return "memory_management"
     return "transport"
-
-
-def column_runs(value: Sequence[int] | None) -> list[list[int]] | None:
-    """Encode a column index list as the manifest's ``[start, length]`` runs.
-
-    The one run-list encoding every manifest field uses; ``None`` stays
-    ``None`` so optional fields serialize as JSON null.
-    """
-    return None if value is None else [list(run) for run in encode_cols(list(value))]
 
 
 def _assignment_records(

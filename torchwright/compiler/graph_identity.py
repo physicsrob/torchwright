@@ -237,27 +237,3 @@ def debug_fingerprint(
     }
     encoded = json.dumps(payload, sort_keys=True, default=str).encode("utf-8")
     return hashlib.sha256(encoded).hexdigest()
-
-
-def encode_cols(cols: list[int]) -> list[tuple[int, int]]:
-    """Run-length encode an ORDERED column list as ``(start, length)`` runs.
-
-    Column order is meaningful (column k holds component k of the node's
-    value), so runs only merge consecutive ASCENDING indices — decoding
-    reproduces the exact original order.
-    """
-    runs: list[tuple[int, int]] = []
-    for c in cols:
-        if runs and c == runs[-1][0] + runs[-1][1]:
-            runs[-1] = (runs[-1][0], runs[-1][1] + 1)
-        else:
-            runs.append((c, 1))
-    return runs
-
-
-def decode_cols(runs: list) -> list[int]:
-    """Inverse of :func:`encode_cols` (accepts JSON-decoded lists)."""
-    cols: list[int] = []
-    for start, length in runs:
-        cols.extend(range(int(start), int(start) + int(length)))
-    return cols

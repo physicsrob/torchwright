@@ -14,9 +14,10 @@ safetensors = pytest.importorskip("safetensors")
 
 from torchwright.compiler.hf import compile_hf_bundle, compile_to_hf, save_hf_bundle
 from torchwright.compiler.hf.build import _validate_staged_bundle
-from torchwright.compiler.schematic_capture import SCHEMATIC_FORMAT, sha256_json
 from torchwright.graph import Add, Embedding, Linear
 from torchwright.ops.linear import add, subtract
+from torchwright.schematic.format import SCHEMATIC_FORMAT, sha256_json
+from torchwright.schematic.validate import SchematicValidationError
 
 
 def _compile_small_bundle(path):
@@ -193,7 +194,7 @@ def test_schematic_manifest_semantic_regions(tmp_path):
         {key: value for key, value in manifest.items() if key != "integrity"}
     )
     schematic_path.write_text(json.dumps(manifest))
-    with pytest.raises(RuntimeError, match="source graph hash mismatch"):
+    with pytest.raises(SchematicValidationError, match="source graph hash mismatch"):
         _validate_staged_bundle(tmp_path, expect_tokenizer=False, expect_schematic=True)
 
 
@@ -203,7 +204,7 @@ def test_schematic_validation_rejects_a_tampered_bound_file(tmp_path):
     original_schema = schema.read_text()
     schema.write_text(original_schema + "\n")
 
-    with pytest.raises(RuntimeError, match="size mismatch"):
+    with pytest.raises(SchematicValidationError, match="size mismatch"):
         _validate_staged_bundle(tmp_path, expect_tokenizer=False, expect_schematic=True)
 
     schema.write_text(original_schema)
@@ -214,7 +215,7 @@ def test_schematic_validation_rejects_a_tampered_bound_file(tmp_path):
     manifest = json.loads(original_schematic)
     manifest["token_io"]["unknown_token_id"] = 999
     schematic_path.write_text(json.dumps(manifest))
-    with pytest.raises(RuntimeError, match="integrity hash mismatch"):
+    with pytest.raises(SchematicValidationError, match="integrity hash mismatch"):
         _validate_staged_bundle(tmp_path, expect_tokenizer=False, expect_schematic=True)
 
     # An edit that also recomputes the integrity hash still trips the
@@ -225,7 +226,7 @@ def test_schematic_validation_rejects_a_tampered_bound_file(tmp_path):
         {key: value for key, value in manifest.items() if key != "integrity"}
     )
     schematic_path.write_text(json.dumps(manifest))
-    with pytest.raises(RuntimeError, match="source graph hash mismatch"):
+    with pytest.raises(SchematicValidationError, match="source graph hash mismatch"):
         _validate_staged_bundle(tmp_path, expect_tokenizer=False, expect_schematic=True)
 
 

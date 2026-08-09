@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import hashlib
 import json
 import math
 import os
@@ -20,14 +19,6 @@ from torchwright.compiler.forward.compile import (
     rms_norm_width_supported,
 )
 from torchwright.compiler.graph_identity import canonical_ids
-from torchwright.compiler.schematic_capture import (
-    SCHEMATIC_FILENAME,
-    SCHEMATIC_FORMAT,
-    SCHEMATIC_SCHEMA_FILENAME,
-    SCHEMATIC_SUPPORT_FILENAME,
-    column_runs,
-    sha256_json,
-)
 from torchwright.compiler.token_model import (
     CompiledLayerWeights,
     CompileHeader,
@@ -46,6 +37,22 @@ from torchwright.compiler.token_model import (
 )
 from torchwright.compiler.utils import get_ancestor_nodes, resolve_n_heads
 from torchwright.graph import Embedding, Node
+from torchwright.schematic.format import (
+    SCHEMATIC_FILENAME,
+    SCHEMATIC_FORMAT,
+    SCHEMATIC_SCHEMA_FILENAME,
+    SCHEMATIC_SCHEMA_SOURCE,
+    SCHEMATIC_SUPPORT_FILENAME,
+    column_runs,
+    sha256_file,
+    sha256_json,
+)
+from torchwright.schematic.support import validate_support_archive
+from torchwright.schematic.validate import (
+    expected_config_pointer,
+    validate_bound_files,
+    validate_manifest,
+)
 
 if TYPE_CHECKING:
     from collections.abc import Iterator, Mapping, Sequence
@@ -64,11 +71,6 @@ _DEFAULT_BOS_SPELLING = "<bos>"
 _DEFAULT_EOS_SPELLING = "<eos>"
 _DEFAULT_UNK_SPELLING = "<unk>"
 _MATRIX_NDIM = 2
-_RUN_FIELDS = 2
-#: The packaged schema: copied into every bundle and the source of the
-#: validator's required-section list, so the shipped schema cannot drift
-#: from what validation enforces.
-_SCHEMATIC_SCHEMA_SOURCE = Path(__file__).parent.parent / SCHEMATIC_SCHEMA_FILENAME
 
 
 @dataclass(frozen=True)
@@ -711,14 +713,6 @@ def _write_final_shard(
         json.dump({"metadata": {"total_size": total_size}, "weight_map": weight_map}, f)
 
 
-def _sha256_file(path: Path) -> str:
-    digest = hashlib.sha256()
-    with path.open("rb") as handle:
-        while chunk := handle.read(1 << 20):
-            digest.update(chunk)
-    return digest.hexdigest()
-
-
 def _checkpoint_parameter_map(
     profile: CompileProfile,
     spec: TokenModelSpec,
@@ -953,7 +947,7 @@ def _write_schematic_manifest(
 ) -> dict[str, dict[str, Any]]:
     """Write the manifest and return its artifact file-hash records."""
     directory = Path(output_dir)
-    shutil.copy2(_SCHEMATIC_SCHEMA_SOURCE, directory / SCHEMATIC_SCHEMA_FILENAME)
+    shutil.copy2(SCHEMATIC_SCHEMA_SOURCE, directory / SCHEMATIC_SCHEMA_FILENAME)
     sink.write_support()
 
     # The capture dict is owned by compiled.schematic_capture; the HF-specific
@@ -1093,7 +1087,7 @@ def _write_schematic_manifest(
     for path in sorted(directory.iterdir()):
         if path.is_file() and path.name != SCHEMATIC_FILENAME:
             files[path.name] = {
-                "sha256": _sha256_file(path),
+                "sha256": sha256_file(path),
                 "bytes": path.stat().st_size,
             }
     capture["artifact"] = {
@@ -1119,382 +1113,31 @@ def _write_schematic_manifest(
     return files
 
 
-def _validate_schematic_bound_files(
-    directory: Path,
-    files: dict[str, dict[str, Any]],
-    *,
-    staged_file_hashes: Mapping[str, dict[str, Any]] | None = None,
-) -> None:
-    """Check every schematic-bound artifact file against its manifest record.
-
-    ``staged_file_hashes`` is the hash map ``_write_schematic_manifest`` computed
-    moments earlier in the same process; when a file's entry is present
-    there, its digest substitutes for re-reading multi-GB shards.  External
-    validation passes nothing and always re-hashes from disk.
-    """
-    for name, record in files.items():
-        relative = Path(name)
-        if relative.is_absolute() or ".." in relative.parts or len(relative.parts) != 1:
-            raise RuntimeError(f"schematic has unsafe artifact path {name!r}")
-        path = directory / relative
-        if not path.is_file():
-            raise RuntimeError(f"schematic-bound artifact is missing: {name}")
-        if path.stat().st_size != record.get("bytes"):
-            raise RuntimeError(f"schematic-bound artifact size mismatch: {name}")
-        if staged_file_hashes is not None and name in staged_file_hashes:
-            actual = staged_file_hashes[name]["sha256"]
-        else:
-            actual = _sha256_file(path)
-        if actual != record.get("sha256"):
-            raise RuntimeError(f"schematic-bound artifact hash mismatch: {name}")
-
-
-def _validate_csr_support(
-    *,
-    name: str,
-    shape: list[int],
-    nnz: int,
-    indptr: np.ndarray,
-    indices: np.ndarray,
-) -> None:
-    invalid = (
-        len(shape) != _MATRIX_NDIM
-        or len(indptr) != shape[0] + 1
-        or indptr[0] != 0
-        or indptr[-1] != nnz
-        or bool((np.diff(indptr) < 0).any())
-        or (len(indices) and (indices.min() < 0 or indices.max() >= shape[1]))
-    )
-    if invalid:
-        raise RuntimeError(f"malformed CSR support for {name}")
-
-
-def _validate_support_tensor(
-    name: str,
-    record: dict[str, Any],
-    arrays: np.lib.npyio.NpzFile,
-    available: set[str],
-) -> None:
-    shape = record.get("shape")
-    nnz = record.get("nnz")
-    if not isinstance(shape, list) or not isinstance(nnz, int):
-        raise TypeError(f"invalid support metadata for {name}")
-    if record.get("encoding") == "flat_indices":
-        indices_key = record.get("indices")
-        if indices_key not in available or len(arrays[indices_key]) != nnz:
-            raise RuntimeError(f"invalid support indices for {name}")
-        indices = arrays[indices_key]
-        size = math.prod(shape)
-        if len(indices) and (indices.min() < 0 or indices.max() >= size):
-            raise RuntimeError(f"out-of-bounds flat support for {name}")
-        return
-    chunks = record.get("chunks")
-    if record.get("encoding") != "csr_row_chunks" or not isinstance(chunks, list):
-        raise RuntimeError(f"unknown support encoding for {name}")
-    expected_row = total_nnz = 0
-    for chunk in chunks:
-        indptr_key = chunk.get("indptr")
-        indices_key = chunk.get("indices")
-        if indptr_key not in available or indices_key not in available:
-            raise RuntimeError(f"missing support chunk for {name}")
-        if chunk.get("row_start") != expected_row:
-            raise RuntimeError(f"non-contiguous support chunks for {name}")
-        chunk_rows, chunk_nnz = chunk["row_count"], chunk["nnz"]
-        _validate_csr_support(
-            name=name,
-            shape=[chunk_rows, shape[1]],
-            nnz=chunk_nnz,
-            indptr=arrays[indptr_key],
-            indices=arrays[indices_key],
-        )
-        expected_row += chunk_rows
-        total_nnz += chunk_nnz
-    if expected_row != shape[0] or total_nnz != nnz:
-        raise RuntimeError(f"incomplete support chunks for {name}")
-
-
-def _validate_support_records(directory: Path, support: dict[str, Any]) -> None:
-    filename = support.get("file")
-    if not isinstance(filename, str) or not filename:
-        raise RuntimeError("schematic parameter_support names no file")
-    relative = Path(filename)
-    if relative.is_absolute() or ".." in relative.parts or len(relative.parts) != 1:
-        raise RuntimeError(f"schematic has unsafe support path {filename!r}")
-    support_path = directory / relative
-    if not support_path.is_file():
-        raise RuntimeError(f"schematic support file is missing: {filename}")
-    with np.load(support_path, allow_pickle=False) as arrays:
-        available = set(arrays.files)
-        for name, record in support.get("tensors", {}).items():
-            _validate_support_tensor(name, record, arrays, available)
-
-
-def _validate_runs(
-    value: object, limit: int, label: str, *, min_length: int = 1
-) -> None:
-    if not isinstance(value, list):
-        raise TypeError(f"{label} must be a list of [start, length] runs")
-    for run in value:
-        if (
-            not isinstance(run, list)
-            or len(run) != _RUN_FIELDS
-            or not all(isinstance(part, int) for part in run)
-        ):
-            raise TypeError(f"{label} has a malformed run")
-        start, length = run
-        if start < 0 or length < min_length or start + length > limit:
-            raise RuntimeError(f"{label} run {run} exceeds width {limit}")
-
-
-def _validate_graph_record(graph: dict[str, Any], prefix: str) -> dict[str, int]:
-    label = "source" if prefix == "s" else "lowered"
-    nodes = graph.get("nodes")
-    if not isinstance(nodes, list):
-        raise TypeError(f"{label} graph nodes must be a list")
-    widths: dict[str, int] = {}
-    for node in nodes:
-        if not isinstance(node, dict):
-            raise TypeError(f"{label} graph node must be an object")
-        node_id, width = node.get("id"), node.get("width")
-        if not isinstance(node_id, str) or not isinstance(width, int):
-            raise TypeError(f"{label} graph node has an invalid ID or width")
-        widths[node_id] = width
-    if len(widths) != len(nodes) or any(
-        not node.startswith(f"{prefix}:") for node in widths
-    ):
-        raise RuntimeError(f"{label} graph has duplicate or invalid node IDs")
-    if graph.get("root") not in widths:
-        raise RuntimeError(f"{label} graph root does not resolve")
-    hashed = {key: value for key, value in graph.items() if key != "sha256"}
-    if graph.get("sha256") != sha256_json(hashed):
-        raise RuntimeError(f"{label} graph hash mismatch")
-    for node in nodes:
-        if any(input_id not in widths for input_id in node.get("inputs", [])):
-            raise RuntimeError(f"{label} graph has an unresolved input reference")
-    return widths
-
-
-def _validate_semantic_regions(
-    graph: dict[str, Any], source_widths: dict[str, int]
-) -> None:
-    regions = graph.get("semantic_regions")
-    if not isinstance(regions, list):
-        raise TypeError("source graph semantic regions must be a list")
-    region_ids = {region.get("id") for region in regions}
-    if len(region_ids) != len(regions) or any(
-        not isinstance(region_id, str) or not region_id.startswith("r:")
-        for region_id in region_ids
-    ):
-        raise RuntimeError("source graph has duplicate or invalid region IDs")
-    for region in regions:
-        parent = region.get("parent")
-        if parent is not None and parent not in region_ids:
-            raise RuntimeError("semantic region parent does not resolve")
-        for field in ("operands", "results"):
-            if any(ref not in source_widths for ref in region.get(field, [])):
-                raise RuntimeError(f"semantic region has an unresolved {field} node")
-    for node in graph["nodes"]:
-        region = node.get("region")
-        if region is not None and region not in region_ids:
-            raise RuntimeError("source node names an unknown semantic region")
-
-
-def _validate_lowering_map(
-    records: object, source_widths: dict[str, int], lowered_widths: dict[str, int]
-) -> None:
-    if not isinstance(records, list) or len(records) != len(source_widths):
-        raise RuntimeError("schematic lowering map does not cover the source graph")
-    if {record.get("source") for record in records} != set(source_widths):
-        raise RuntimeError("schematic lowering map has invalid source references")
-    for record in records:
-        status = record.get("status")
-        if status == "not_materialized":
-            continue
-        lowered_id = record.get("lowered")
-        if lowered_id not in lowered_widths:
-            raise RuntimeError(
-                "schematic lowering map has an invalid lowered reference"
-            )
-        if status == "whole":
-            continue
-        sliced = record.get("slice")
-        if status != "slice" or not isinstance(sliced, dict):
-            raise RuntimeError("schematic lowering map has an invalid status")
-        offset, width = sliced.get("offset"), sliced.get("width")
-        if (
-            not isinstance(offset, int)
-            or not isinstance(width, int)
-            or offset < 0
-            or width < 1
-            or offset + width > lowered_widths[lowered_id]
-        ):
-            raise RuntimeError("schematic lowering slice exceeds its holder")
-
-
-def _validate_attention_operations(
-    layer: dict[str, Any], physical_ids: set[str], d_model: int
-) -> None:
-    for operation in layer.get("attention_operations", []):
-        if operation.get("node") not in physical_ids | {None}:
-            raise RuntimeError("attention operation has an unresolved node")
-        # A zero-length span is legitimate here: a zero-support
-        # attention-routed op emits no post-trim heads (its writer-allocated
-        # floor head is trimmed), so its span is [cursor, 0].
-        _validate_runs(
-            [operation.get("heads")],
-            layer["active_attention_heads"],
-            "attention heads",
-            min_length=0,
-        )
-        for field in (
-            "target_columns",
-            "source_columns",
-            "source_columns_b",
-            "query_source_columns",
-            "key_source_columns",
-        ):
-            if operation.get(field) is not None:
-                _validate_runs(operation[field], d_model, field)
-
-
-def _validate_mlp_operations(
-    layer: dict[str, Any], physical_ids: set[str], d_model: int
-) -> None:
-    for operation in layer.get("mlp_operations", []):
-        if operation.get("node") not in physical_ids | {None}:
-            raise RuntimeError("MLP operation has an unresolved node")
-        _validate_runs(operation.get("target_columns"), d_model, "MLP target")
-        _validate_runs(
-            operation.get("hidden_slots"),
-            layer["active_mlp_neurons"],
-            "hidden slots",
-        )
-        for field in ("source_columns", "source_columns_b"):
-            if operation.get(field) is not None:
-                _validate_runs(operation[field], d_model, field)
-
-
-def _validate_schedule_references(
-    payload: dict[str, Any], physical_ids: set[str]
-) -> None:
-    model = payload["model"]
-    d_model = model["d_model"]
-    layers = payload["schedule"].get("layers", [])
-    if len(layers) != model["n_layers"]:
-        raise RuntimeError("schematic schedule layer count disagrees with the model")
-    for index, layer in enumerate(layers):
-        if layer.get("index") != index:
-            raise RuntimeError("schematic schedule layers are not in canonical order")
-        _validate_attention_operations(layer, physical_ids, d_model)
-        _validate_mlp_operations(layer, physical_ids, d_model)
-    for state in payload["residual_stream"].get("states", []):
-        for node_id, runs in state.get("nodes", {}).items():
-            if node_id not in physical_ids:
-                raise RuntimeError("residual state has an unresolved node")
-            _validate_runs(runs, d_model, "residual columns")
-
-
-def _validate_physical_layout(payload: dict[str, Any]) -> None:
-    layout = payload["physical_layout"]
-    matrices = layout.get("matrices", {})
-    for owner, rectangles in layout.get("placements", {}).items():
-        for rectangle in rectangles:
-            matrix = rectangle.get("matrix")
-            if matrix not in matrices:
-                raise RuntimeError(f"placement {owner!r} names an unknown matrix")
-            shape = matrices[matrix]["shape"]
-            _validate_runs([rectangle.get("axis0")], shape[0], "matrix axis0")
-            _validate_runs([rectangle.get("axis1")], shape[1], "matrix axis1")
-
-    tensors = payload["parameter_support"].get("tensors", {})
-    for record in layout.get("checkpoint_parameter_map", []):
-        tensor = record.get("checkpoint_tensor")
-        if tensor not in tensors:
-            raise RuntimeError("checkpoint parameter map names an unknown tensor")
-        shape = tensors[tensor]["shape"]
-        if "checkpoint_rows" in record:
-            _validate_runs([record["checkpoint_rows"]], shape[0], "checkpoint rows")
-            _validate_runs(
-                [record["checkpoint_columns"]], shape[1], "checkpoint columns"
-            )
-        elif "checkpoint_indices" in record:
-            _validate_runs(
-                [record["checkpoint_indices"]], shape[0], "checkpoint indices"
-            )
-
-
-def _validate_schematic_internals(payload: dict[str, Any]) -> None:
-    graphs = payload["graphs"]
-    source_widths = _validate_graph_record(graphs["source"], "s")
-    _validate_semantic_regions(graphs["source"], source_widths)
-    lowered_widths = _validate_graph_record(graphs["lowered"], "l")
-    _validate_lowering_map(graphs.get("realization_map"), source_widths, lowered_widths)
-    internal = graphs.get("internal_nodes", [])
-    internal_ids = {node.get("id") for node in internal}
-    if len(internal_ids) != len(internal) or any(
-        not isinstance(node, str) or not node.startswith("i:") for node in internal_ids
-    ):
-        raise RuntimeError("schematic has invalid internal node IDs")
-    physical_ids = set(lowered_widths) | internal_ids
-    schedule = payload["schedule"]
-    for section in ("assignment", "realizations"):
-        if any(record.get("node") not in physical_ids for record in schedule[section]):
-            raise RuntimeError(f"schematic schedule {section} has an unresolved node")
-    _validate_schedule_references(payload, physical_ids)
-    _validate_physical_layout(payload)
-    d_model = payload["model"]["d_model"]
-    _validate_runs(
-        payload["token_io"]["embedding_residual_columns"],
-        d_model,
-        "embedding columns",
-    )
-    _validate_runs(
-        payload["token_io"]["output_residual_columns"], d_model, "output columns"
-    )
-
-
 def _validate_schematic_manifest(
     directory: Path,
     *,
     staged_file_hashes: Mapping[str, dict[str, Any]] | None = None,
 ) -> None:
+    """Validate the staged schematic: internals, pointer, files, support.
+
+    The manifest-internal checks live in ``torchwright.schematic.validate``
+    (shared with every reader); this wrapper adds the staging-only facts —
+    the file exists, config.json carries the exact pointer, and the bound
+    files and support archive match the bundle on disk (``staged_file_hashes``
+    lets the in-process build skip re-hashing multi-GB shards).
+    """
     schematic_path = directory / SCHEMATIC_FILENAME
     if not schematic_path.is_file():
         raise RuntimeError(f"staged HF bundle has no {SCHEMATIC_FILENAME}")
     payload = json.loads(schematic_path.read_text(encoding="utf-8"))
-    if payload.get("format") != SCHEMATIC_FORMAT:
-        raise RuntimeError("staged schematic has an unsupported format")
-    # The packaged schema's required[] list is the one section inventory;
-    # enforcing it here keeps the schema shipped in every bundle honest.
-    schema = json.loads(_SCHEMATIC_SCHEMA_SOURCE.read_text(encoding="utf-8"))
-    missing = sorted(set(schema["required"]) - set(payload))
-    if missing:
-        raise RuntimeError(f"staged schematic is missing sections: {missing}")
-    integrity = payload["integrity"]
-    expected_digest = sha256_json(
-        {key: value for key, value in payload.items() if key != "integrity"}
-    )
-    if not isinstance(integrity, dict) or integrity.get("sha256") != expected_digest:
-        raise RuntimeError("schematic integrity hash mismatch")
-
+    validate_manifest(payload)
     config = json.loads((directory / "config.json").read_text(encoding="utf-8"))
-    expected_pointer = {
-        "format": SCHEMATIC_FORMAT,
-        "file": SCHEMATIC_FILENAME,
-        "schema": SCHEMATIC_SCHEMA_FILENAME,
-        "support": SCHEMATIC_SUPPORT_FILENAME,
-    }
-    if config.get("torchwright_schematic") != expected_pointer:
+    if config.get("torchwright_schematic") != expected_config_pointer():
         raise RuntimeError("config.json schematic pointer does not match the bundle")
-
-    files = payload["artifact"].get("files")
-    if not isinstance(files, dict) or not files:
-        raise RuntimeError("schematic has no artifact file hashes")
-    _validate_schematic_bound_files(
-        directory, files, staged_file_hashes=staged_file_hashes
+    validate_bound_files(
+        directory, payload["artifact"]["files"], precomputed_hashes=staged_file_hashes
     )
-    _validate_support_records(directory, payload["parameter_support"])
-    _validate_schematic_internals(payload)
+    validate_support_archive(directory, payload["parameter_support"])
 
 
 def _emit_schematic_from_compile(

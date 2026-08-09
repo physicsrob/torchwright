@@ -58,7 +58,6 @@ from torchwright.compiler.export import (
 )
 from torchwright.compiler.graph_identity import (
     debug_fingerprint,
-    decode_cols,
     nodes_by_canonical_id,
 )
 from torchwright.compiler.residual_assignment import (
@@ -66,6 +65,7 @@ from torchwright.compiler.residual_assignment import (
     ResidualStreamState,
 )
 from torchwright.graph.embedding import Embedding
+from torchwright.schematic.format import decode_cols
 
 if TYPE_CHECKING:
     import tempfile

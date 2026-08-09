@@ -208,7 +208,7 @@ def _dense_rects(matrix_id: str, rows: list[int], cols: list[int]) -> list[dict]
     Run-length-encode each axis independently (order is irrelevant for a
     set of cells) and emit one rectangle per row-run x col-run pair.
     """
-    from torchwright.compiler.graph_identity import encode_cols
+    from torchwright.schematic.format import encode_cols
 
     rects = []
     row_runs = encode_cols(sorted(rows))
@@ -324,7 +324,7 @@ def _encode_state_entries(
     pins where it was computed.  Used as the layer/sublayer source for
     nodes the placement recorder doesn't log (literals, concatenations).
     """
-    from torchwright.compiler.graph_identity import encode_cols
+    from torchwright.schematic.format import encode_cols
 
     ra = compiled.residual_assignment
     assert ra is not None

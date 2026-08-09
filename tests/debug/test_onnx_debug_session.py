@@ -29,8 +29,6 @@ from torchwright.compiler.export import (
 )
 from torchwright.compiler.graph_identity import (
     debug_fingerprint,
-    decode_cols,
-    encode_cols,
     graph_fingerprint,
 )
 from torchwright.debug.probe import (
@@ -41,6 +39,7 @@ from torchwright.graph.asserts import assert_in_range
 from torchwright.graph.attn import Attn
 from torchwright.ops.inout_nodes import create_input
 from torchwright.ops.linear import add, multiply_const
+from torchwright.schematic.format import decode_cols, encode_cols
 
 onnxruntime = pytest.importorskip("onnxruntime")
 
