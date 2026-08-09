@@ -2,7 +2,7 @@
 
 Pattern follows ``tests/graph/test_annotate.py``: exercise the ContextVar
 machinery directly, then the capture-side translation in
-``torchwright.compiler.truth._stamp_semantic_regions``.
+``torchwright.compiler.schematic_capture._stamp_semantic_regions``.
 """
 
 import json
@@ -10,7 +10,10 @@ import json
 import pytest
 import torch
 
-from torchwright.compiler.truth import _graph_record, _stamp_semantic_regions
+from torchwright.compiler.schematic_capture import (
+    _graph_record,
+    _stamp_semantic_regions,
+)
 from torchwright.graph import Node, RopeConfig, annotate, op_scope
 from torchwright.graph.misc import InputNode
 from torchwright.graph.node import _current_op_scope, _sanitize_op_params

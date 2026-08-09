@@ -1,7 +1,7 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://github.com/physicsrob/torchwright/blob/main/torchwright/compiler/torchwright_truth_v1.schema.json",
-  "title": "torchwright compiled artifact truth manifest v1",
+  "$id": "https://github.com/physicsrob/torchwright/blob/main/torchwright/compiler/torchwright_schematic_v1.schema.json",
+  "title": "torchwright compiled artifact schematic v1",
   "type": "object",
   "required": [
     "format",
@@ -21,7 +21,7 @@
     "reference_fixtures"
   ],
   "properties": {
-    "format": {"const": "torchwright.truth.v1"},
+    "format": {"const": "torchwright.schematic.v1"},
     "$schema": {"type": "string"},
     "integrity": {
       "type": "object",

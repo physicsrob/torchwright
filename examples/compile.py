@@ -380,7 +380,7 @@ def build_bundle(
 
     out_dir = out_dir or bundle_dirname(name, max_digits)
     output_node, embedding = module.create_network_parts(**build_kwargs)
-    truth_metadata: dict[str, JSONValue] = {
+    schematic_metadata: dict[str, JSONValue] = {
         "source": {
             "entrypoint": f"examples.{name}:create_network_parts",
             "arguments": build_kwargs,
@@ -398,7 +398,7 @@ def build_bundle(
         if d_hidden is not None
         else getattr(module, "D_HIDDEN", None),
         optimize=optimize,
-        truth_metadata=truth_metadata,
+        schematic_metadata=schematic_metadata,
     )
     write_card(name, out_dir, max_digits)
     prompts = getattr(module, "DEMO_PROMPTS", None)

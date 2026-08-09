@@ -1,20 +1,24 @@
 # Unreleased
 
-## Truth manifests carry semantic regions
+## Schematics carry semantic regions
 
 - Every public op-library constructor now stamps the nodes it creates
   with construction-time provenance (`@op_scope`): derived op name,
   sanitized non-node parameters, operand/result references, and the
   enclosing-call chain.  The stamps are pure metadata — canonical ids,
   fingerprints, and the schedule cache are unaffected.
-- The truth manifest's source graph gains a `semantic_regions` table and
+- The schematic's source graph gains a `semantic_regions` table and
   a per-node `region` membership field, both covered by the source
   content hash, so a consumer can read a compiled graph as the sequence
   of op calls that built it.
 
-## HF bundles ship an artifact truth manifest
+## HF bundles ship an artifact schematic
 
-- `compile_hf_bundle` writes `torchwright_truth.json` into every bundle,
+- Naming note: this artifact was briefly published as
+  `torchwright_truth.json` (config key `torchwright_truth`, format
+  `torchwright.truth.v1`) on pre-release Hub bundles; it is now the
+  schematic everywhere — file, format string, config pointer, and API.
+- `compile_hf_bundle` writes `torchwright_schematic.json` into every bundle,
   alongside its JSON Schema and a parameter-support archive: the source and
   lowered graphs, the schedule, residual-stream layout, physical weight
   placements (in trimmed checkpoint coordinates), and the token-I/O
@@ -22,9 +26,9 @@
 - The manifest carries a whole-manifest integrity hash, and staged bundles
   are validated against it — structure, file hashes, and coordinate
   bounds — before the destination is replaced.
-- `config.json` gains a `torchwright_truth` pointer to the manifest files.
+- `config.json` gains a `torchwright_schematic` pointer to the manifest files.
   Models returned by `compile_to_hf` (and bundles re-saved from them via
-  `save_hf_bundle`) carry no truth files and therefore no pointer.
+  `save_hf_bundle`) carry no schematic files and therefore no pointer.
 
 ## Breaking: compiled vocabularies require an explicit unknown token
 

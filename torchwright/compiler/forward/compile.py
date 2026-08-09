@@ -1137,7 +1137,7 @@ def forward_compile(
     _pin_cancels: bool = True,
     _solver_params: dict[str, object] | None = None,
     _drop_decision_strategy: bool = False,
-    _capture_truth: bool = False,
+    _capture_schematic: bool = False,
 ) -> HeadlessTransformer:
     """Compile a computation graph into a HeadlessTransformer.
 
@@ -2504,15 +2504,15 @@ def forward_compile(
     if net.rms_norm_spec is not None:
         _certify_rms_norm_energy(ra, net.rms_norm_spec)
 
-    # Artifact truth must be captured here: the immutable replay plan and the
+    # Artifact schematic must be captured here: the immutable replay plan and the
     # compiler-private lowered graph are still available, and every physical
     # placement has been recorded, but none of the node-keyed surfaces have
     # yet been translated back to source nodes.  The capture is JSON-only and
     # therefore does not retain graph nodes or tensors after this call.
-    if _capture_truth:
-        from torchwright.compiler.truth import capture_compile_truth
+    if _capture_schematic:
+        from torchwright.compiler.schematic_capture import capture_compile_schematic
 
-        net.truth_capture = capture_compile_truth(
+        net.schematic_capture = capture_compile_schematic(
             lowered=lowered,
             plan=replay_plan,
             compiled=net,

@@ -18,8 +18,8 @@ IMAGE = (
     # must be added explicitly or Modal runs crash where installed
     # torchwright works.
     .add_local_file(
-        "torchwright/compiler/torchwright_truth_v1.schema.json",
-        "/root/torchwright/compiler/torchwright_truth_v1.schema.json",
+        "torchwright/compiler/torchwright_schematic_v1.schema.json",
+        "/root/torchwright/compiler/torchwright_schematic_v1.schema.json",
     )
     .add_local_python_source(
         "torchwright", "examples", "tests", "scripts", "modal_image"

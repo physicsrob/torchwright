@@ -73,7 +73,7 @@ class HeadlessTransformer:
     per_layer_head_counts: list[dict[str, int]]
     # JSON-only source/lowered/replay metadata captured for artifact emission.
     # None on ordinary headless compiles so they pay no graph-retention cost.
-    truth_capture: dict[str, Any] | None
+    schematic_capture: dict[str, Any] | None
 
     def __init__(
         self,
@@ -103,7 +103,7 @@ class HeadlessTransformer:
         self.residual_assignment = None
         self.placements = None
         self.cpsat_assignment_payload = None
-        self.truth_capture = None
+        self.schematic_capture = None
 
     @property
     def device(self) -> torch.device:

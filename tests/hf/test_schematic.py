@@ -14,7 +14,7 @@ safetensors = pytest.importorskip("safetensors")
 
 from torchwright.compiler.hf import compile_hf_bundle, compile_to_hf, save_hf_bundle
 from torchwright.compiler.hf.build import _validate_staged_bundle
-from torchwright.compiler.truth import TRUTH_FORMAT, sha256_json
+from torchwright.compiler.schematic_capture import SCHEMATIC_FORMAT, sha256_json
 from torchwright.graph import Add, Embedding, Linear
 from torchwright.ops.linear import add, subtract
 
@@ -36,7 +36,7 @@ def _compile_small_bundle(path):
         bos_token=None,
         eos_token=None,
         write_tokenizer=False,
-        truth_metadata={"task": {"name": "truth-test"}},
+        schematic_metadata={"task": {"name": "schematic-test"}},
     )
 
 
@@ -62,19 +62,19 @@ def _support_coordinates(record, arrays) -> set[tuple[int, ...]]:
     return result
 
 
-def test_truth_manifest_binds_graph_schedule_layout_and_support(tmp_path):
+def test_schematic_manifest_binds_graph_schedule_layout_and_support(tmp_path):
     _compile_small_bundle(tmp_path)
-    manifest = json.loads((tmp_path / "torchwright_truth.json").read_text())
+    manifest = json.loads((tmp_path / "torchwright_schematic.json").read_text())
     config = json.loads((tmp_path / "config.json").read_text())
 
-    assert manifest["format"] == TRUTH_FORMAT
-    assert config["torchwright_truth"] == {
-        "format": TRUTH_FORMAT,
-        "file": "torchwright_truth.json",
-        "schema": "torchwright_truth_v1.schema.json",
-        "support": "torchwright_truth_support.npz",
+    assert manifest["format"] == SCHEMATIC_FORMAT
+    assert config["torchwright_schematic"] == {
+        "format": SCHEMATIC_FORMAT,
+        "file": "torchwright_schematic.json",
+        "schema": "torchwright_schematic_v1.schema.json",
+        "support": "torchwright_schematic_support.npz",
     }
-    assert manifest["metadata"] == {"task": {"name": "truth-test"}}
+    assert manifest["metadata"] == {"task": {"name": "schematic-test"}}
 
     source = manifest["graphs"]["source"]
     lowered = manifest["graphs"]["lowered"]
@@ -137,7 +137,7 @@ def test_truth_manifest_binds_graph_schedule_layout_and_support(tmp_path):
             assert record["nnz"] == len(expected)
 
 
-def test_truth_manifest_semantic_regions(tmp_path):
+def test_schematic_manifest_semantic_regions(tmp_path):
     """Regions built through decorated ops land in the source record.
 
     ``subtract`` is the composition proof: it creates no node directly
@@ -163,7 +163,7 @@ def test_truth_manifest_semantic_regions(tmp_path):
         eos_token=None,
         write_tokenizer=False,
     )
-    manifest = json.loads((tmp_path / "torchwright_truth.json").read_text())
+    manifest = json.loads((tmp_path / "torchwright_schematic.json").read_text())
     source = manifest["graphs"]["source"]
     regions = source["semantic_regions"]
     # Canonical walk: outer Add (subtract's), inner Add, embedding, negate.
@@ -187,46 +187,46 @@ def test_truth_manifest_semantic_regions(tmp_path):
     assert memberships[by_op["Embedding"]["id"]] is None
     # The stamped source hash covers the regions table: an edit that also
     # recomputes the whole-manifest integrity hash still trips it.
-    truth_path = tmp_path / "torchwright_truth.json"
+    schematic_path = tmp_path / "torchwright_schematic.json"
     manifest["graphs"]["source"]["semantic_regions"][0]["params"] = {"x": 1}
     manifest["integrity"]["sha256"] = sha256_json(
         {key: value for key, value in manifest.items() if key != "integrity"}
     )
-    truth_path.write_text(json.dumps(manifest))
+    schematic_path.write_text(json.dumps(manifest))
     with pytest.raises(RuntimeError, match="source graph hash mismatch"):
-        _validate_staged_bundle(tmp_path, expect_tokenizer=False, expect_truth=True)
+        _validate_staged_bundle(tmp_path, expect_tokenizer=False, expect_schematic=True)
 
 
-def test_truth_validation_rejects_a_tampered_bound_file(tmp_path):
+def test_schematic_validation_rejects_a_tampered_bound_file(tmp_path):
     _compile_small_bundle(tmp_path)
-    schema = tmp_path / "torchwright_truth_v1.schema.json"
+    schema = tmp_path / "torchwright_schematic_v1.schema.json"
     original_schema = schema.read_text()
     schema.write_text(original_schema + "\n")
 
     with pytest.raises(RuntimeError, match="size mismatch"):
-        _validate_staged_bundle(tmp_path, expect_tokenizer=False, expect_truth=True)
+        _validate_staged_bundle(tmp_path, expect_tokenizer=False, expect_schematic=True)
 
     schema.write_text(original_schema)
-    truth_path = tmp_path / "torchwright_truth.json"
-    original_truth = truth_path.read_text()
+    schematic_path = tmp_path / "torchwright_schematic.json"
+    original_schematic = schematic_path.read_text()
 
     # Any in-place manifest edit trips the whole-manifest integrity hash.
-    manifest = json.loads(original_truth)
+    manifest = json.loads(original_schematic)
     manifest["token_io"]["unknown_token_id"] = 999
-    truth_path.write_text(json.dumps(manifest))
+    schematic_path.write_text(json.dumps(manifest))
     with pytest.raises(RuntimeError, match="integrity hash mismatch"):
-        _validate_staged_bundle(tmp_path, expect_tokenizer=False, expect_truth=True)
+        _validate_staged_bundle(tmp_path, expect_tokenizer=False, expect_schematic=True)
 
     # An edit that also recomputes the integrity hash still trips the
     # tampered section's own content hash.
-    manifest = json.loads(original_truth)
+    manifest = json.loads(original_schematic)
     manifest["graphs"]["source"]["nodes"][0]["name"] = "tampered"
     manifest["integrity"]["sha256"] = sha256_json(
         {key: value for key, value in manifest.items() if key != "integrity"}
     )
-    truth_path.write_text(json.dumps(manifest))
+    schematic_path.write_text(json.dumps(manifest))
     with pytest.raises(RuntimeError, match="source graph hash mismatch"):
-        _validate_staged_bundle(tmp_path, expect_tokenizer=False, expect_truth=True)
+        _validate_staged_bundle(tmp_path, expect_tokenizer=False, expect_schematic=True)
 
 
 def test_zero_support_attention_linear_builds_with_empty_head_span(tmp_path):
@@ -261,7 +261,7 @@ def test_zero_support_attention_linear_builds_with_empty_head_span(tmp_path):
         eos_token=None,
         write_tokenizer=False,
     )
-    manifest = json.loads((tmp_path / "torchwright_truth.json").read_text())
+    manifest = json.loads((tmp_path / "torchwright_schematic.json").read_text())
     linear_spans = [
         op["heads"]
         for layer in manifest["schedule"]["layers"]
@@ -277,11 +277,11 @@ def test_zero_support_attention_linear_builds_with_empty_head_span(tmp_path):
             assert rectangle["axis1"][0] + rectangle["axis1"][1] <= shape[1]
 
 
-def test_in_memory_model_carries_no_truth_pointer(tmp_path):
-    """compile_to_hf discards the truth files with its temp bundle.
+def test_in_memory_model_carries_no_schematic_pointer(tmp_path):
+    """compile_to_hf discards the schematic files with its temp bundle.
 
     The returned model and any bundle re-saved from it must not advertise
-    a truth manifest they do not carry.
+    a schematic they do not carry.
     """
     embedding = Embedding(
         ["a"],
@@ -298,7 +298,7 @@ def test_in_memory_model_carries_no_truth_pointer(tmp_path):
         bos_token=None,
         eos_token=None,
     )
-    assert not hasattr(model.config, "torchwright_truth")
+    assert not hasattr(model.config, "torchwright_schematic")
     save_hf_bundle(
         model,
         list(embedding.tokenizer.vocab),
@@ -306,5 +306,5 @@ def test_in_memory_model_carries_no_truth_pointer(tmp_path):
         write_tokenizer=False,
     )
     config = json.loads((tmp_path / "config.json").read_text())
-    assert "torchwright_truth" not in config
+    assert "torchwright_schematic" not in config
     _validate_staged_bundle(tmp_path, expect_tokenizer=False)

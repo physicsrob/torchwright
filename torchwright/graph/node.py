@@ -167,7 +167,7 @@ class OpScopeRecord:
     dedup (unlike :func:`annotate`): two identical calls produce two
     records, because each call is a distinct op instance.  ``eq=False``
     keeps identity hashing, so records can key the capture dicts the
-    truth manifest builds from them.
+    schematic builds from them.
 
     Records hold ``node_id`` integers only, never ``Node`` references:
     the clone pass's stray-reference guard
@@ -206,7 +206,7 @@ _current_op_scope: ContextVar[OpScopeRecord | None] = ContextVar(
 # Bounds for _sanitize_op_params: container elements beyond the cap (and
 # nesting beyond the depth cap) collapse to a summary string, so DOOM-scale
 # arguments (vocab lists, breakpoint grids) cannot bloat the record.  The
-# element cap follows truth._INLINE_LITERAL_LIMIT's "small enough to keep
+# element cap follows schematic_capture._INLINE_LITERAL_LIMIT's "small enough to keep
 # inline" stance.
 _PARAM_ELEMENT_CAP = 64
 _PARAM_DEPTH_CAP = 3
@@ -215,7 +215,7 @@ _PARAM_DEPTH_CAP = 3
 def _scalar_param(value: object) -> object:
     """Encode a scalar; non-finite floats become strings.
 
-    The string encoding is mandatory, not cosmetic: the truth manifest is
+    The string encoding is mandatory, not cosmetic: the schematic is
     dumped with ``allow_nan=False``, so a raw ``inf`` param would crash
     manifest emission far from the op call that captured it.
     """

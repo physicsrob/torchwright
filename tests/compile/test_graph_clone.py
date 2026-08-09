@@ -235,7 +235,7 @@ def test_clone_shares_weight_tensors_by_reference():
 def test_clone_carries_op_region_by_reference():
     """``op_region`` rides the generic copy, shared with the source.
 
-    Semantic regions are a source-level manifest concept — truth capture
+    Semantic regions are a source-level manifest concept — schematic capture
     reads only source nodes — so the shared record on the compiler-private
     clone is inert creator-provenance, not something to remap.
     """

@@ -1,6 +1,6 @@
 """Mechanistic-interpretability metadata for compiled transformer artifacts.
 
-The truth manifest is captured while the compiler still owns both sides of
+The schematic is captured while the compiler still owns both sides of
 the lowering boundary and the immutable replay plan.  Everything returned by
 this module is JSON data: it deliberately retains no graph nodes or tensors.
 """
@@ -31,10 +31,10 @@ if TYPE_CHECKING:
     from torchwright.graph import Node, OpScopeRecord
     from torchwright.graph.value_type import Range
 
-TRUTH_FORMAT = "torchwright.truth.v1"
-TRUTH_FILENAME = "torchwright_truth.json"
-TRUTH_SCHEMA_FILENAME = "torchwright_truth_v1.schema.json"
-TRUTH_SUPPORT_FILENAME = "torchwright_truth_support.npz"
+SCHEMATIC_FORMAT = "torchwright.schematic.v1"
+SCHEMATIC_FILENAME = "torchwright_schematic.json"
+SCHEMATIC_SCHEMA_FILENAME = "torchwright_schematic_v1.schema.json"
+SCHEMATIC_SUPPORT_FILENAME = "torchwright_schematic_support.npz"
 
 _MATRIX_AXES = {
     "attn.W_Q": ("residual_in", "head"),
@@ -52,7 +52,7 @@ def sha256_json(value: object) -> str:
     """Hash of the canonical JSON encoding of ``value``.
 
     This encoding (sorted keys, compact separators, raw unicode) is the
-    contract between every truth-manifest hash producer and validator —
+    contract between every schematic-manifest hash producer and validator —
     both sides must call this one function or freshly built bundles fail
     their own hash checks.
     """
@@ -441,7 +441,7 @@ def _plan_layers(
             )
             head_cursor += head_count
         if head_cursor != layer.emitted_attention_heads:
-            raise AssertionError("truth capture disagrees with replay head count")
+            raise AssertionError("schematic capture disagrees with replay head count")
         mlp_ops = [
             {
                 "id": f"L{layer_index}.mlp.{op_index}",
@@ -581,7 +581,7 @@ def _state_record(
     }
 
 
-def capture_compile_truth(
+def capture_compile_schematic(
     *,
     lowered: LoweredGraph,
     plan: ReplayPlan,
@@ -596,7 +596,7 @@ def capture_compile_truth(
     """Capture exact compiler facts before lowered nodes are re-keyed."""
     source = lowered.source_output_node
     if source is None:
-        raise RuntimeError("truth capture requires a source graph")
+        raise RuntimeError("schematic capture requires a source graph")
     tensor_hashes: dict[int, str] = {}
     # The source record is hashed only after the region stamp so the
     # source content hash covers semantic regions and per-node membership.
@@ -642,8 +642,8 @@ def capture_compile_truth(
 
     rms = compiled.rms_norm_spec
     return {
-        "format": TRUTH_FORMAT,
-        "$schema": f"./{TRUTH_SCHEMA_FILENAME}",
+        "format": SCHEMATIC_FORMAT,
+        "$schema": f"./{SCHEMATIC_SCHEMA_FILENAME}",
         "build": {
             "compiler_code_sha256": compiler_code_fingerprint(),
             "schedule_fingerprint": compiled.schedule_fingerprint,

@@ -20,6 +20,14 @@ from torchwright.compiler.forward.compile import (
     rms_norm_width_supported,
 )
 from torchwright.compiler.graph_identity import canonical_ids
+from torchwright.compiler.schematic_capture import (
+    SCHEMATIC_FILENAME,
+    SCHEMATIC_FORMAT,
+    SCHEMATIC_SCHEMA_FILENAME,
+    SCHEMATIC_SUPPORT_FILENAME,
+    column_runs,
+    sha256_json,
+)
 from torchwright.compiler.token_model import (
     CompiledLayerWeights,
     CompileHeader,
@@ -35,14 +43,6 @@ from torchwright.compiler.token_model import (
     resolve_rope,
     schedule_provenance,
     validate_token_vocab,
-)
-from torchwright.compiler.truth import (
-    TRUTH_FILENAME,
-    TRUTH_FORMAT,
-    TRUTH_SCHEMA_FILENAME,
-    TRUTH_SUPPORT_FILENAME,
-    column_runs,
-    sha256_json,
 )
 from torchwright.compiler.utils import get_ancestor_nodes, resolve_n_heads
 from torchwright.graph import Embedding, Node
@@ -68,7 +68,7 @@ _RUN_FIELDS = 2
 #: The packaged schema: copied into every bundle and the source of the
 #: validator's required-section list, so the shipped schema cannot drift
 #: from what validation enforces.
-_TRUTH_SCHEMA_SOURCE = Path(__file__).parent.parent / TRUTH_SCHEMA_FILENAME
+_SCHEMATIC_SCHEMA_SOURCE = Path(__file__).parent.parent / SCHEMATIC_SCHEMA_FILENAME
 
 
 @dataclass(frozen=True)
@@ -197,7 +197,7 @@ def _validate_staged_bundle(
     directory: str | os.PathLike,
     *,
     expect_tokenizer: bool,
-    expect_truth: bool = False,
+    expect_schematic: bool = False,
     staged_file_hashes: Mapping[str, dict[str, Any]] | None = None,
 ) -> None:
     """Validate bundle structure and tensor manifests without loading weights."""
@@ -224,8 +224,8 @@ def _validate_staged_bundle(
             TorchwrightCustomTokenizer.from_pretrained(directory)
         else:
             AutoTokenizer.from_pretrained(directory)
-    if expect_truth:
-        _validate_truth_manifest(directory, staged_file_hashes=staged_file_hashes)
+    if expect_schematic:
+        _validate_schematic_manifest(directory, staged_file_hashes=staged_file_hashes)
 
 
 def _token_id(vocab: tuple[str, ...], token: str | None, kind: str) -> int | None:
@@ -347,12 +347,12 @@ def _save_hf_bundle_into(
     write_tokenizer: bool = True,
 ) -> None:
     Path(output_dir).mkdir(parents=True, exist_ok=True)
-    # This path writes no truth files, so the config must not advertise
-    # them: a model loaded from a truth-bearing bundle carries the pointer
+    # This path writes no schematic files, so the config must not advertise
+    # them: a model loaded from a schematic-bearing bundle carries the pointer
     # as a config attribute, and save_pretrained would re-serialize it into
     # a bundle where the referenced files do not exist.
-    if hasattr(model.config, "torchwright_truth"):
-        del model.config.torchwright_truth
+    if hasattr(model.config, "torchwright_schematic"):
+        del model.config.torchwright_schematic
     model.save_pretrained(output_dir)
     _write_generation_config(
         output_dir, model.config.bos_token_id, model.config.eos_token_id
@@ -410,7 +410,7 @@ def compile_hf_bundle(
     verbose: bool = False,
     add_bos_token: bool = True,
     write_tokenizer: bool = True,
-    truth_metadata: Mapping[str, JSONValue] | None = None,
+    schematic_metadata: Mapping[str, JSONValue] | None = None,
     _solver_seed: int | None = None,
     _force_resolve: bool = False,
 ) -> HFBundleReport:
@@ -421,12 +421,12 @@ def compile_hf_bundle(
 
     ``n_heads`` defaults to ``d // d_head``. Set it explicitly to make the
     flattened attention width ``n_heads * d_head`` independent of ``d``.
-    ``truth_metadata`` is optional JSON metadata for source/task facts known by
-    the caller; it cannot replace compiler-owned truth sections.
+    ``schematic_metadata`` is optional JSON metadata for source/task facts known by
+    the caller; it cannot replace compiler-owned schematic sections.
     """
     _validate_embedding_contract(output_node, embedding)
     with _staged_bundle_directory(output_dir) as staging:
-        report, truth_files = _compile_hf_bundle_into(
+        report, schematic_files = _compile_hf_bundle_into(
             output_node,
             embedding,
             staging,
@@ -448,15 +448,15 @@ def compile_hf_bundle(
             verbose=verbose,
             add_bos_token=add_bos_token,
             write_tokenizer=write_tokenizer,
-            truth_metadata=truth_metadata,
+            schematic_metadata=schematic_metadata,
             _solver_seed=_solver_seed,
             _force_resolve=_force_resolve,
         )
         _validate_staged_bundle(
             staging,
             expect_tokenizer=write_tokenizer,
-            expect_truth=True,
-            staged_file_hashes=truth_files,
+            expect_schematic=True,
+            staged_file_hashes=schematic_files,
         )
     return replace(report, output_dir=output_dir)
 
@@ -621,7 +621,7 @@ class _DirectShardSink:
         }
         try:
             np.savez_compressed(
-                Path(self._output_dir) / TRUTH_SUPPORT_FILENAME,
+                Path(self._output_dir) / SCHEMATIC_SUPPORT_FILENAME,
                 **arrays,
             )
         finally:
@@ -937,7 +937,7 @@ def _package_version() -> str:
         return "unknown"
 
 
-def _write_truth_manifest(
+def _write_schematic_manifest(
     output_dir: str | os.PathLike,
     *,
     capture: dict[str, Any],
@@ -953,10 +953,10 @@ def _write_truth_manifest(
 ) -> dict[str, dict[str, Any]]:
     """Write the manifest and return its artifact file-hash records."""
     directory = Path(output_dir)
-    shutil.copy2(_TRUTH_SCHEMA_SOURCE, directory / TRUTH_SCHEMA_FILENAME)
+    shutil.copy2(_SCHEMATIC_SCHEMA_SOURCE, directory / SCHEMATIC_SCHEMA_FILENAME)
     sink.write_support()
 
-    # The capture dict is owned by compiled.truth_capture; the HF-specific
+    # The capture dict is owned by compiled.schematic_capture; the HF-specific
     # sections below must not leak into it, so copy every level this
     # function assigns into.
     capture = {
@@ -967,7 +967,7 @@ def _write_truth_manifest(
 
     assignment = compiled.residual_assignment
     if assignment is None:
-        raise RuntimeError("truth emission requires a residual assignment")
+        raise RuntimeError("schematic emission requires a residual assignment")
     input_state = compiled.layers[0].attn.in_state
     output_state = compiled.layers[-1].mlp.out_state
     embedding_columns = assignment.get_node_indices(input_state, embedding)
@@ -986,7 +986,7 @@ def _write_truth_manifest(
         None,
     )
     if source_embedding is None:
-        raise RuntimeError("truth capture does not contain the embedding node")
+        raise RuntimeError("schematic capture does not contain the embedding node")
     provenance = spec.schedule_provenance
     capture["build"].update(
         {
@@ -1035,7 +1035,7 @@ def _write_truth_manifest(
         capture, spec
     )
     capture["parameter_support"] = {
-        "file": TRUTH_SUPPORT_FILENAME,
+        "file": SCHEMATIC_SUPPORT_FILENAME,
         "format": "torchwright.csr_support.v1",
         "zero_test": "stored fp32 value != 0.0",
         "tensors": sink.support_tensors,
@@ -1091,7 +1091,7 @@ def _write_truth_manifest(
 
     files = {}
     for path in sorted(directory.iterdir()):
-        if path.is_file() and path.name != TRUTH_FILENAME:
+        if path.is_file() and path.name != SCHEMATIC_FILENAME:
             files[path.name] = {
                 "sha256": _sha256_file(path),
                 "bytes": path.stat().st_size,
@@ -1101,7 +1101,7 @@ def _write_truth_manifest(
         "architecture": profile.value,
         "files": files,
     }
-    capture["parameter_support"]["sha256"] = files[TRUTH_SUPPORT_FILENAME]["sha256"]
+    capture["parameter_support"]["sha256"] = files[SCHEMATIC_SUPPORT_FILENAME]["sha256"]
     # Computed last so it binds every other section: any in-place edit to
     # the manifest fails validation, not just edits to the two graph
     # records with their own content hashes.
@@ -1111,23 +1111,23 @@ def _write_truth_manifest(
             {key: value for key, value in capture.items() if key != "integrity"}
         ),
     }
-    truth_path = directory / TRUTH_FILENAME
-    truth_path.write_text(
+    schematic_path = directory / SCHEMATIC_FILENAME
+    schematic_path.write_text(
         json.dumps(capture, indent=2, sort_keys=True, allow_nan=False) + "\n",
         encoding="utf-8",
     )
     return files
 
 
-def _validate_truth_bound_files(
+def _validate_schematic_bound_files(
     directory: Path,
     files: dict[str, dict[str, Any]],
     *,
     staged_file_hashes: Mapping[str, dict[str, Any]] | None = None,
 ) -> None:
-    """Check every truth-bound artifact file against its manifest record.
+    """Check every schematic-bound artifact file against its manifest record.
 
-    ``staged_file_hashes`` is the hash map ``_write_truth_manifest`` computed
+    ``staged_file_hashes`` is the hash map ``_write_schematic_manifest`` computed
     moments earlier in the same process; when a file's entry is present
     there, its digest substitutes for re-reading multi-GB shards.  External
     validation passes nothing and always re-hashes from disk.
@@ -1135,18 +1135,18 @@ def _validate_truth_bound_files(
     for name, record in files.items():
         relative = Path(name)
         if relative.is_absolute() or ".." in relative.parts or len(relative.parts) != 1:
-            raise RuntimeError(f"truth manifest has unsafe artifact path {name!r}")
+            raise RuntimeError(f"schematic has unsafe artifact path {name!r}")
         path = directory / relative
         if not path.is_file():
-            raise RuntimeError(f"truth-bound artifact is missing: {name}")
+            raise RuntimeError(f"schematic-bound artifact is missing: {name}")
         if path.stat().st_size != record.get("bytes"):
-            raise RuntimeError(f"truth-bound artifact size mismatch: {name}")
+            raise RuntimeError(f"schematic-bound artifact size mismatch: {name}")
         if staged_file_hashes is not None and name in staged_file_hashes:
             actual = staged_file_hashes[name]["sha256"]
         else:
             actual = _sha256_file(path)
         if actual != record.get("sha256"):
-            raise RuntimeError(f"truth-bound artifact hash mismatch: {name}")
+            raise RuntimeError(f"schematic-bound artifact hash mismatch: {name}")
 
 
 def _validate_csr_support(
@@ -1216,13 +1216,13 @@ def _validate_support_tensor(
 def _validate_support_records(directory: Path, support: dict[str, Any]) -> None:
     filename = support.get("file")
     if not isinstance(filename, str) or not filename:
-        raise RuntimeError("truth manifest parameter_support names no file")
+        raise RuntimeError("schematic parameter_support names no file")
     relative = Path(filename)
     if relative.is_absolute() or ".." in relative.parts or len(relative.parts) != 1:
-        raise RuntimeError(f"truth manifest has unsafe support path {filename!r}")
+        raise RuntimeError(f"schematic has unsafe support path {filename!r}")
     support_path = directory / relative
     if not support_path.is_file():
-        raise RuntimeError(f"truth support file is missing: {filename}")
+        raise RuntimeError(f"schematic support file is missing: {filename}")
     with np.load(support_path, allow_pickle=False) as arrays:
         available = set(arrays.files)
         for name, record in support.get("tensors", {}).items():
@@ -1303,21 +1303,23 @@ def _validate_lowering_map(
     records: object, source_widths: dict[str, int], lowered_widths: dict[str, int]
 ) -> None:
     if not isinstance(records, list) or len(records) != len(source_widths):
-        raise RuntimeError("truth lowering map does not cover the source graph")
+        raise RuntimeError("schematic lowering map does not cover the source graph")
     if {record.get("source") for record in records} != set(source_widths):
-        raise RuntimeError("truth lowering map has invalid source references")
+        raise RuntimeError("schematic lowering map has invalid source references")
     for record in records:
         status = record.get("status")
         if status == "not_materialized":
             continue
         lowered_id = record.get("lowered")
         if lowered_id not in lowered_widths:
-            raise RuntimeError("truth lowering map has an invalid lowered reference")
+            raise RuntimeError(
+                "schematic lowering map has an invalid lowered reference"
+            )
         if status == "whole":
             continue
         sliced = record.get("slice")
         if status != "slice" or not isinstance(sliced, dict):
-            raise RuntimeError("truth lowering map has an invalid status")
+            raise RuntimeError("schematic lowering map has an invalid status")
         offset, width = sliced.get("offset"), sliced.get("width")
         if (
             not isinstance(offset, int)
@@ -1326,7 +1328,7 @@ def _validate_lowering_map(
             or width < 1
             or offset + width > lowered_widths[lowered_id]
         ):
-            raise RuntimeError("truth lowering slice exceeds its holder")
+            raise RuntimeError("schematic lowering slice exceeds its holder")
 
 
 def _validate_attention_operations(
@@ -1379,10 +1381,10 @@ def _validate_schedule_references(
     d_model = model["d_model"]
     layers = payload["schedule"].get("layers", [])
     if len(layers) != model["n_layers"]:
-        raise RuntimeError("truth schedule layer count disagrees with the model")
+        raise RuntimeError("schematic schedule layer count disagrees with the model")
     for index, layer in enumerate(layers):
         if layer.get("index") != index:
-            raise RuntimeError("truth schedule layers are not in canonical order")
+            raise RuntimeError("schematic schedule layers are not in canonical order")
         _validate_attention_operations(layer, physical_ids, d_model)
         _validate_mlp_operations(layer, physical_ids, d_model)
     for state in payload["residual_stream"].get("states", []):
@@ -1421,7 +1423,7 @@ def _validate_physical_layout(payload: dict[str, Any]) -> None:
             )
 
 
-def _validate_truth_internals(payload: dict[str, Any]) -> None:
+def _validate_schematic_internals(payload: dict[str, Any]) -> None:
     graphs = payload["graphs"]
     source_widths = _validate_graph_record(graphs["source"], "s")
     _validate_semantic_regions(graphs["source"], source_widths)
@@ -1432,12 +1434,12 @@ def _validate_truth_internals(payload: dict[str, Any]) -> None:
     if len(internal_ids) != len(internal) or any(
         not isinstance(node, str) or not node.startswith("i:") for node in internal_ids
     ):
-        raise RuntimeError("truth manifest has invalid internal node IDs")
+        raise RuntimeError("schematic has invalid internal node IDs")
     physical_ids = set(lowered_widths) | internal_ids
     schedule = payload["schedule"]
     for section in ("assignment", "realizations"):
         if any(record.get("node") not in physical_ids for record in schedule[section]):
-            raise RuntimeError(f"truth schedule {section} has an unresolved node")
+            raise RuntimeError(f"schematic schedule {section} has an unresolved node")
     _validate_schedule_references(payload, physical_ids)
     _validate_physical_layout(payload)
     d_model = payload["model"]["d_model"]
@@ -1451,49 +1453,51 @@ def _validate_truth_internals(payload: dict[str, Any]) -> None:
     )
 
 
-def _validate_truth_manifest(
+def _validate_schematic_manifest(
     directory: Path,
     *,
     staged_file_hashes: Mapping[str, dict[str, Any]] | None = None,
 ) -> None:
-    truth_path = directory / TRUTH_FILENAME
-    if not truth_path.is_file():
-        raise RuntimeError(f"staged HF bundle has no {TRUTH_FILENAME}")
-    payload = json.loads(truth_path.read_text(encoding="utf-8"))
-    if payload.get("format") != TRUTH_FORMAT:
-        raise RuntimeError("staged truth manifest has an unsupported format")
+    schematic_path = directory / SCHEMATIC_FILENAME
+    if not schematic_path.is_file():
+        raise RuntimeError(f"staged HF bundle has no {SCHEMATIC_FILENAME}")
+    payload = json.loads(schematic_path.read_text(encoding="utf-8"))
+    if payload.get("format") != SCHEMATIC_FORMAT:
+        raise RuntimeError("staged schematic has an unsupported format")
     # The packaged schema's required[] list is the one section inventory;
     # enforcing it here keeps the schema shipped in every bundle honest.
-    schema = json.loads(_TRUTH_SCHEMA_SOURCE.read_text(encoding="utf-8"))
+    schema = json.loads(_SCHEMATIC_SCHEMA_SOURCE.read_text(encoding="utf-8"))
     missing = sorted(set(schema["required"]) - set(payload))
     if missing:
-        raise RuntimeError(f"staged truth manifest is missing sections: {missing}")
+        raise RuntimeError(f"staged schematic is missing sections: {missing}")
     integrity = payload["integrity"]
     expected_digest = sha256_json(
         {key: value for key, value in payload.items() if key != "integrity"}
     )
     if not isinstance(integrity, dict) or integrity.get("sha256") != expected_digest:
-        raise RuntimeError("truth manifest integrity hash mismatch")
+        raise RuntimeError("schematic integrity hash mismatch")
 
     config = json.loads((directory / "config.json").read_text(encoding="utf-8"))
     expected_pointer = {
-        "format": TRUTH_FORMAT,
-        "file": TRUTH_FILENAME,
-        "schema": TRUTH_SCHEMA_FILENAME,
-        "support": TRUTH_SUPPORT_FILENAME,
+        "format": SCHEMATIC_FORMAT,
+        "file": SCHEMATIC_FILENAME,
+        "schema": SCHEMATIC_SCHEMA_FILENAME,
+        "support": SCHEMATIC_SUPPORT_FILENAME,
     }
-    if config.get("torchwright_truth") != expected_pointer:
-        raise RuntimeError("config.json truth pointer does not match the bundle")
+    if config.get("torchwright_schematic") != expected_pointer:
+        raise RuntimeError("config.json schematic pointer does not match the bundle")
 
     files = payload["artifact"].get("files")
     if not isinstance(files, dict) or not files:
-        raise RuntimeError("truth manifest has no artifact file hashes")
-    _validate_truth_bound_files(directory, files, staged_file_hashes=staged_file_hashes)
+        raise RuntimeError("schematic has no artifact file hashes")
+    _validate_schematic_bound_files(
+        directory, files, staged_file_hashes=staged_file_hashes
+    )
     _validate_support_records(directory, payload["parameter_support"])
-    _validate_truth_internals(payload)
+    _validate_schematic_internals(payload)
 
 
-def _emit_truth_from_compile(
+def _emit_schematic_from_compile(
     output_dir: str | os.PathLike,
     *,
     compiled: HeadlessTransformer,
@@ -1506,12 +1510,12 @@ def _emit_truth_from_compile(
     eos_id: int | None,
     metadata: Mapping[str, JSONValue] | None,
 ) -> dict[str, dict[str, Any]]:
-    truth_capture = compiled.truth_capture
-    if truth_capture is None:
-        raise RuntimeError("HF bundle compile did not capture artifact truth")
-    return _write_truth_manifest(
+    schematic_capture = compiled.schematic_capture
+    if schematic_capture is None:
+        raise RuntimeError("HF bundle compile did not capture artifact schematic")
+    return _write_schematic_manifest(
         output_dir,
-        capture=truth_capture,
+        capture=schematic_capture,
         profile=profile,
         spec=spec,
         sink=sink,
@@ -1547,13 +1551,13 @@ def _compile_hf_bundle_into(
     verbose: bool = False,
     add_bos_token: bool = True,
     write_tokenizer: bool = True,
-    truth_metadata: Mapping[str, JSONValue] | None = None,
+    schematic_metadata: Mapping[str, JSONValue] | None = None,
     _solver_seed: int | None = None,
     _force_resolve: bool = False,
 ) -> tuple[HFBundleReport, dict[str, dict[str, Any]]]:
     """Compile directly to a sharded safetensors HF bundle.
 
-    Returns the bundle report plus the truth manifest's artifact file-hash
+    Returns the bundle report plus the schematic's artifact file-hash
     records, so the caller's immediate re-validation can skip re-hashing
     the shards it just wrote.
 
@@ -1605,7 +1609,7 @@ def _compile_hf_bundle_into(
             machine=machine,
             _solver_seed=_solver_seed,
             _force_resolve=_force_resolve,
-            _capture_truth=True,
+            _capture_schematic=True,
             **cast(
                 "dict[str, Any]",
                 {}
@@ -1709,11 +1713,11 @@ def _compile_hf_bundle_into(
                 pad_token_id=None,
             )
             config.architectures = ["Phi3ForCausalLM"]
-        config.torchwright_truth = {
-            "format": TRUTH_FORMAT,
-            "file": TRUTH_FILENAME,
-            "schema": TRUTH_SCHEMA_FILENAME,
-            "support": TRUTH_SUPPORT_FILENAME,
+        config.torchwright_schematic = {
+            "format": SCHEMATIC_FORMAT,
+            "file": SCHEMATIC_FILENAME,
+            "schema": SCHEMATIC_SCHEMA_FILENAME,
+            "support": SCHEMATIC_SUPPORT_FILENAME,
         }
         config.save_pretrained(output_dir)
         _write_generation_config(output_dir, bos_id, eos_id)
@@ -1743,7 +1747,7 @@ def _compile_hf_bundle_into(
                 eos_token=eos_token,
                 add_bos_token=add_bos_token,
             ).save_pretrained(output_dir)
-    truth_files = _emit_truth_from_compile(
+    schematic_files = _emit_schematic_from_compile(
         output_dir,
         compiled=compiled,
         profile=profile,
@@ -1753,7 +1757,7 @@ def _compile_hf_bundle_into(
         embedding=embedding,
         bos_id=bos_id,
         eos_id=eos_id,
-        metadata=truth_metadata,
+        metadata=schematic_metadata,
     )
     provenance = spec.schedule_provenance
     assert provenance is not None
@@ -1763,7 +1767,7 @@ def _compile_hf_bundle_into(
             n_layers=spec.n_layers,
             schedule_provenance=provenance,
         ),
-        truth_files,
+        schematic_files,
     )
 
 
@@ -1839,9 +1843,9 @@ def compile_to_hf(
             from .modeling_torchwright_custom import TorchwrightCustomForCausalLM
 
             model = TorchwrightCustomForCausalLM.from_pretrained(directory)
-    # The temp bundle's truth files are gone with the directory; the
+    # The temp bundle's schematic files are gone with the directory; the
     # returned in-memory model must not claim them (a later
-    # save_pretrained would write a dangling truth pointer).
-    if hasattr(model.config, "torchwright_truth"):
-        del model.config.torchwright_truth
+    # save_pretrained would write a dangling schematic pointer).
+    if hasattr(model.config, "torchwright_schematic"):
+        del model.config.torchwright_schematic
     return model.float().eval()

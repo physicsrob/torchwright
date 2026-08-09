@@ -168,7 +168,7 @@ class PlannedAttentionOp:
         ``compute_linear`` (``realization.linear_attn_chunks``), and
         ``compute_attn`` d_head-chunks of ``d_v`` whose W_O slice is all
         zero.  ``sum(written_head_liveness(d))`` equals ``emitted_heads(d)``
-        — the truth capture asserts this when mapping placement coordinates
+        — the schematic capture asserts this when mapping placement coordinates
         from untrimmed to trimmed head slots.
         """
         if self.op_type == "compute_attn":
