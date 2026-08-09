@@ -1,5 +1,23 @@
 # Unreleased
 
+## Schematics are readable through a typed API
+
+- New torch-free package `torchwright.schematic`: `load_schematic`
+  reads and validates a manifest file alone (integrity and content
+  hashes, reference resolution — the same checks the builder runs);
+  `load_schematic_bundle` binds it to the artifact directory (config
+  pointer, file presence and sizes, support-npz structure;
+  `verify_files=True` re-hashes every bound file).  Typed views cover
+  region navigation, residual-state column ownership with reverse
+  lookup, checkpoint translation and its inverse, realization and
+  schedule queries.  All failures raise `SchematicValidationError`.
+- `docs/schematic.md` documents the format and reader (pinned against
+  the code by `tests/docs/test_schematic_doc.py`).
+- Breaking import moves (no aliases): `sha256_json`, the `SCHEMATIC_*`
+  constants, and `column_runs` live in `torchwright.schematic.format`
+  (formerly `torchwright.compiler.truth`); `encode_cols`/`decode_cols`
+  moved there from `torchwright.compiler.graph_identity`.
+
 ## Schematics carry semantic regions
 
 - Every public op-library constructor now stamps the nodes it creates
