@@ -467,7 +467,12 @@ class _DirectShardSink:
     """Streams each compiled layer directly into its final HF shard."""
 
     def __init__(
-        self, profile: CompileProfile, d_head: int, output_dir: str | os.PathLike
+        self,
+        profile: CompileProfile,
+        d_head: int,
+        output_dir: str | os.PathLike,
+        *,
+        capture_support: bool = True,
     ) -> None:
         self._profile = profile
         self._d_head = d_head
@@ -477,6 +482,7 @@ class _DirectShardSink:
         self.total_size = 0
         self.support_array_paths: dict[str, Path] = {}
         self.support_tensors: dict[str, dict[str, Any]] = {}
+        self._capture_support = capture_support
 
     def begin(self, header: CompileHeader) -> None:
         self.header = header
@@ -545,6 +551,8 @@ class _DirectShardSink:
         """Capture exact nonzero coordinates without materializing a full mask."""
         import torch
 
+        if not self._capture_support:
+            return
         max_chunk_elements = 1 << 20
         for name, value in state_dict.items():
             prefix = f"tensor_{len(self.support_tensors):06d}"

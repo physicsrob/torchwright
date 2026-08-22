@@ -29,6 +29,16 @@ from .build import (
     save_hf_bundle,
 )
 from .configuration_torchwright_custom import TorchwrightCustomConfig
+from .continuous import (
+    CONTINUOUS_BASE_FILENAME,
+    CONTINUOUS_IO_FILENAME,
+    CONTINUOUS_IO_FORMAT,
+    ContinuousHFBundleReport,
+    ContinuousIOSpec,
+    ContinuousRunner,
+    ContinuousValueSpec,
+    compile_continuous_hf_bundle,
+)
 from .modeling_torchwright_custom import (
     TorchwrightCustomForCausalLM,
     TorchwrightCustomModel,
@@ -37,7 +47,14 @@ from .modeling_torchwright_custom import (
 from .tokenization_torchwright_custom import TorchwrightCustomTokenizer
 
 __all__ = [
+    "CONTINUOUS_BASE_FILENAME",
+    "CONTINUOUS_IO_FILENAME",
+    "CONTINUOUS_IO_FORMAT",
     "CompileProfile",
+    "ContinuousHFBundleReport",
+    "ContinuousIOSpec",
+    "ContinuousRunner",
+    "ContinuousValueSpec",
     "HFArchitecture",
     "HFBundleReport",
     "ScheduleProvenance",
@@ -47,6 +64,7 @@ __all__ = [
     "TorchwrightCustomPreTrainedModel",
     "TorchwrightCustomTokenizer",
     "build_fast_tokenizer",
+    "compile_continuous_hf_bundle",
     "compile_hf_bundle",
     "compile_to_hf",
     "save_hf_bundle",
