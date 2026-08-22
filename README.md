@@ -44,11 +44,42 @@ The compiler schedules this graph into a 16-layer decoder at hidden size 512 (th
 `d=D_MODEL` argument). Every weight is computed from the source graph. Nothing
 was trained. Compiling this example takes under ten seconds on a laptop CPU.
 
+## Continuous tensor execution
+
+Graphs can also expose named tensor inputs and outputs without token IDs,
+embedding lookup, logits, or autoregressive generation:
+
+```python
+from torchwright import ContinuousRunner, compile_continuous_hf_bundle
+from torchwright.graph import Add, InputNode
+
+state = InputNode("state", 4, value_range=(-100.0, 100.0))
+update = InputNode("update", 4, value_range=(-10.0, 10.0))
+compile_continuous_hf_bundle(
+    {"state": Add(state, update)},
+    "transition_bundle",
+    n_positions=16,
+    d=256,
+    d_head=16,
+)
+
+runner = ContinuousRunner.from_pretrained("transition_bundle")
+next_state = runner(state=state_values, update=update_values)["state"]
+```
+
+The bundle records every named value's residual columns and stores the complete
+compiler-generated initial residual, including literals. Calls may be unbatched
+or batched, and `runner.run_until(...)` supports fresh-invocation recurrent
+state transitions. See [continuous Hugging Face bundles](docs/continuous_hf.md)
+for the interface format, raw-residual path, validation rules, and recurrence
+API.
+
 ## How it works
 
 A torchwright program is a computation graph: ordinary Python wiring op calls into
-a DAG of nodes, with token embeddings at the leaves and one output node at the
-root. 
+a DAG of nodes. Token graphs have an embedding at the leaves and one token
+output at the root; continuous graphs have named `InputNode` leaves and one or
+more named tensor outputs.
 
 Ops come in three groups: linear ops (`add`, `subtract`, `concat`, etc), attention
 ops (latch a value at a marker position, read a fixed offset back,
@@ -163,7 +194,8 @@ Examples that define `create_network_parts()` compile to a bundle with
   of 1024 up to 16384, or any power of two; other widths raise. See
   `docs/rms_norm_dmodel.md`.
 - The KV cache is static: sequence length is fixed at export (`max_seq_len`,
-  default 512), and overrunning it raises.
+  default 512), and overrunning it raises. Continuous calls deliberately start
+  without KV-cache history and use their bundle's fixed `n_positions`.
 
 ## Further reading
 - [Introducing torchwright](https://ood.dev/posts/torchwright-intro/) -- the story and the constructions, from ReLU
@@ -175,6 +207,8 @@ Examples that define `create_network_parts()` compile to a bundle with
 - `docs/affine_bounds.md` -- how value bounds propagate through the graph.
 - `docs/numerical_noise.md` -- measured per-op approximation error (generated
   from `docs/op_noise_data.json`).
+- `docs/continuous_hf.md` -- compiling and recurrently running named continuous
+  tensor interfaces.
 
 ## Development
 
