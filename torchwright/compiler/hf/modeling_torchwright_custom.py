@@ -49,6 +49,7 @@ _SDPA_BACKEND = [SDPBackend.MATH]
 
 # A supported key-padding mask is 2D: (batch, total_keys).
 _KEY_PADDING_MASK_NDIM = 2
+_HIDDEN_STATES_NDIM = 3
 
 
 def _require_fp32(hidden_states: torch.Tensor) -> None:
@@ -313,7 +314,13 @@ class TorchwrightCustomPreTrainedModel(PreTrainedModel):
 
 
 class TorchwrightCustomModel(TorchwrightCustomPreTrainedModel):
-    """Decoder trunk: token embedding, ``n_layers`` decoder blocks, final norm."""
+    """Decoder trunk: token embedding, ``n_layers`` decoder blocks, final norm.
+
+    ``forward_residual`` exposes the compiled residual stream after the decoder
+    blocks and before the token-oriented final normalization.  Continuous
+    Torchwright artifacts use that path because their output coordinates are
+    defined in the compiler's raw residual representation.
+    """
 
     def __init__(self, config: TorchwrightCustomConfig) -> None:
         super().__init__(config)
@@ -335,7 +342,7 @@ class TorchwrightCustomModel(TorchwrightCustomPreTrainedModel):
     def set_input_embeddings(self, value: nn.Module) -> None:
         self.embed_tokens = value
 
-    def forward(
+    def _forward_residual(
         self,
         input_ids: torch.LongTensor | None = None,
         attention_mask: torch.Tensor | None = None,
@@ -346,18 +353,30 @@ class TorchwrightCustomModel(TorchwrightCustomPreTrainedModel):
         use_cache: bool | None = None,
         cache_position: torch.LongTensor | None = None,
         **_kwargs: object,
-    ) -> BaseModelOutputWithPast:
-        if inputs_embeds is not None:
-            raise NotImplementedError("inputs_embeds is not supported; pass input_ids.")
-        if input_ids is None:
-            raise ValueError("TorchwrightCustomModel requires input_ids.")
+    ) -> tuple[torch.Tensor, Cache | None]:
+        if input_ids is not None and inputs_embeds is not None:
+            raise ValueError(
+                "Pass exactly one of input_ids or inputs_embeds, not both."
+            )
+        if input_ids is None and inputs_embeds is None:
+            raise ValueError("Pass exactly one of input_ids or inputs_embeds.")
         # `use_cache` is a generation parameter, which transformers 5.x strips
         # off the config dataclass — read it defensively, defaulting to True
         # (a bare forward must not crash on the missing attribute).
         if use_cache is None:
             use_cache = getattr(self.config, "use_cache", True)
 
-        hidden_states = self.embed_tokens(input_ids)  # (B, T, d)
+        hidden_states = (
+            self.embed_tokens(input_ids) if inputs_embeds is None else inputs_embeds
+        )
+        if (
+            hidden_states.ndim != _HIDDEN_STATES_NDIM
+            or hidden_states.shape[-1] != self.config.d
+        ):
+            raise ValueError(
+                "inputs_embeds must have shape (batch, sequence, "
+                f"{self.config.d}); got {tuple(hidden_states.shape)}."
+            )
         _B, T = hidden_states.shape[0], hidden_states.shape[1]
         device = hidden_states.device
 
@@ -378,11 +397,61 @@ class TorchwrightCustomModel(TorchwrightCustomPreTrainedModel):
         for layer in self.layers:
             hidden_states = layer(hidden_states, mask, past_key_values, cache_position)
 
+        return hidden_states, past_key_values if use_cache else None
+
+    def forward_residual(
+        self,
+        input_ids: torch.LongTensor | None = None,
+        attention_mask: torch.Tensor | None = None,
+        position_ids: torch.LongTensor | None = None,
+        past_key_values: Cache | None = None,
+        inputs_embeds: torch.FloatTensor | None = None,
+        *,
+        use_cache: bool | None = False,
+        cache_position: torch.LongTensor | None = None,
+        **kwargs: object,
+    ) -> torch.Tensor:
+        """Return the raw residual after all compiled transformer layers."""
+        hidden_states, _past = self._forward_residual(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            position_ids=position_ids,
+            past_key_values=past_key_values,
+            inputs_embeds=inputs_embeds,
+            use_cache=use_cache,
+            cache_position=cache_position,
+            **kwargs,
+        )
+        return hidden_states
+
+    def forward(
+        self,
+        input_ids: torch.LongTensor | None = None,
+        attention_mask: torch.Tensor | None = None,
+        position_ids: torch.LongTensor | None = None,
+        past_key_values: Cache | None = None,
+        inputs_embeds: torch.FloatTensor | None = None,
+        *,
+        use_cache: bool | None = None,
+        cache_position: torch.LongTensor | None = None,
+        **kwargs: object,
+    ) -> BaseModelOutputWithPast:
+        hidden_states, returned_past = self._forward_residual(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            position_ids=position_ids,
+            past_key_values=past_key_values,
+            inputs_embeds=inputs_embeds,
+            use_cache=use_cache,
+            cache_position=cache_position,
+            **kwargs,
+        )
+
         hidden_states = self.norm(hidden_states)
 
         return BaseModelOutputWithPast(
             last_hidden_state=hidden_states,
-            past_key_values=past_key_values if use_cache else None,
+            past_key_values=returned_past,
         )
 
 
@@ -415,6 +484,10 @@ class TorchwrightCustomForCausalLM(TorchwrightCustomPreTrainedModel, GenerationM
 
     def get_decoder(self) -> TorchwrightCustomModel:
         return self.model
+
+    def forward_residual(self, *args: object, **kwargs: object) -> torch.Tensor:
+        """Return the decoder's raw residual without normalization or readout."""
+        return self.model.forward_residual(*args, **kwargs)
 
     def forward(
         self,
