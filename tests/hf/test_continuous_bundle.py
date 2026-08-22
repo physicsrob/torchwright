@@ -5,6 +5,7 @@ import json
 import pytest
 import torch
 
+import torchwright
 from torchwright.compiler.hf import (
     CONTINUOUS_BASE_FILENAME,
     CONTINUOUS_IO_FILENAME,
@@ -17,6 +18,11 @@ from torchwright.graph import Add, InputNode, LiteralValue
 _D = 64
 _D_HEAD = 8
 _N_POSITIONS = 3
+
+
+def test_continuous_api_is_available_from_top_level() -> None:
+    assert torchwright.ContinuousRunner is ContinuousRunner
+    assert torchwright.compile_continuous_hf_bundle is compile_continuous_hf_bundle
 
 
 def _transition_graph():

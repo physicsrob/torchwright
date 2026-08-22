@@ -1,6 +1,7 @@
 """torchwright: a compiler from computation graphs to transformer weights.
 
-The four compile/load entry points are re-exported here, loaded lazily so
+The compile/load entry points and continuous runner are re-exported here,
+loaded lazily so
 ``import torchwright`` stays light and the base install never pulls the
 optional ``transformers`` dependency.  Op libraries are deliberately not
 re-exported: the import path (``torchwright.ops.relu`` vs
@@ -8,6 +9,8 @@ re-exported: the import path (``torchwright.ops.relu`` vs
 """
 
 __all__ = [
+    "ContinuousRunner",
+    "compile_continuous_hf_bundle",
     "compile_headless",
     "compile_hf_bundle",
     "compile_to_onnx",
