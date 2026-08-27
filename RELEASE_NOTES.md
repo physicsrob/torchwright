@@ -1,5 +1,22 @@
 # Unreleased
 
+## Continuous Hugging Face execution
+
+- `compile_continuous_hf_bundle` compiles named `InputNode` inputs and named
+  tensor outputs without requiring a token embedding. Bundles persist a
+  versioned residual-coordinate interface and the compiler-generated base
+  residual containing literals and pinned normalization constants.
+- `ContinuousRunner.from_pretrained` validates names and shapes, supports
+  unbatched and batched fp32 execution, returns named outputs from the raw final
+  compiled residual, and provides a generic fresh-invocation `run_until` loop.
+- Continuous compilation supports both ReLU and SwiGLU graphs, inferred from the
+  graph or pinned with `machine=`. The SwiGLU path preserves the range-free
+  complementary-gate product for continuous numerical algorithms.
+- The custom Hugging Face model now supports standard `inputs_embeds` calls and
+  exposes `forward_residual()` before final token normalization and language
+  modeling. Its checkpoint format supports biased ReLU and biased SwiGLU MLP
+  layers. Existing token APIs and generation remain unchanged.
+
 # 0.2.0 — 2026-08-08
 
 ## Schematics are readable through a typed API

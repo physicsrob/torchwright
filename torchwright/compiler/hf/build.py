@@ -467,7 +467,12 @@ class _DirectShardSink:
     """Streams each compiled layer directly into its final HF shard."""
 
     def __init__(
-        self, profile: CompileProfile, d_head: int, output_dir: str | os.PathLike
+        self,
+        profile: CompileProfile,
+        d_head: int,
+        output_dir: str | os.PathLike,
+        *,
+        capture_support: bool = True,
     ) -> None:
         self._profile = profile
         self._d_head = d_head
@@ -477,6 +482,7 @@ class _DirectShardSink:
         self.total_size = 0
         self.support_array_paths: dict[str, Path] = {}
         self.support_tensors: dict[str, dict[str, Any]] = {}
+        self._capture_support = capture_support
 
     def begin(self, header: CompileHeader) -> None:
         self.header = header
@@ -494,18 +500,39 @@ class _DirectShardSink:
         a = layer.attention
         p = f"model.layers.{index}"
         if self._profile is CompileProfile.CUSTOM:
-            assert isinstance(layer, ReluLayerWeights)
             sd = {
                 f"{p}.self_attn.q_proj.weight": _torch(a.wq).T.contiguous(),
                 f"{p}.self_attn.k_proj.weight": _torch(a.wk).T.contiguous(),
                 f"{p}.self_attn.v_proj.weight": _torch(a.wv).T.contiguous(),
                 f"{p}.self_attn.o_proj.weight": _torch(a.wo).T.contiguous(),
-                f"{p}.mlp.fc1.weight": _torch(layer.w1).T.contiguous(),
-                f"{p}.mlp.fc1.bias": _torch(cast("np.ndarray", layer.b1)),
-                f"{p}.mlp.fc2.weight": _torch(layer.w2).T.contiguous(),
-                f"{p}.mlp.fc2.bias": _torch(cast("np.ndarray", layer.b2)),
             }
-            kind = "relu"
+            if isinstance(layer, ReluLayerWeights):
+                sd.update(
+                    {
+                        f"{p}.mlp.fc1.weight": _torch(layer.w1).T.contiguous(),
+                        f"{p}.mlp.fc1.bias": _torch(cast("np.ndarray", layer.b1)),
+                        f"{p}.mlp.fc2.weight": _torch(layer.w2).T.contiguous(),
+                        f"{p}.mlp.fc2.bias": _torch(cast("np.ndarray", layer.b2)),
+                    }
+                )
+                kind = "relu"
+            else:
+                assert isinstance(layer, SwishLayerWeights)
+                sd.update(
+                    {
+                        f"{p}.mlp.gate_proj.weight": _torch(layer.wgate).T.contiguous(),
+                        f"{p}.mlp.gate_proj.bias": _torch(
+                            cast("np.ndarray", layer.bgate)
+                        ),
+                        f"{p}.mlp.up_proj.weight": _torch(layer.wup).T.contiguous(),
+                        f"{p}.mlp.up_proj.bias": _torch(cast("np.ndarray", layer.bup)),
+                        f"{p}.mlp.down_proj.weight": _torch(layer.wdown).T.contiguous(),
+                        f"{p}.mlp.down_proj.bias": _torch(
+                            cast("np.ndarray", layer.bdown)
+                        ),
+                    }
+                )
+                kind = "swish"
         else:
             assert isinstance(layer, SwishLayerWeights)
             rows, inter = self.max_heads * d_head, self.max_hidden
@@ -545,6 +572,8 @@ class _DirectShardSink:
         """Capture exact nonzero coordinates without materializing a full mask."""
         import torch
 
+        if not self._capture_support:
+            return
         max_chunk_elements = 1 << 20
         for name, value in state_dict.items():
             prefix = f"tensor_{len(self.support_tensors):06d}"
@@ -1307,6 +1336,7 @@ def _compile_hf_bundle_into(
                 d_rot=d_rot,
                 rms_norm=spec.rms_norm,
                 rms_norm_eps=spec.rms_norm_eps,
+                activation="relu",
                 bos_token_id=bos_id,
                 eos_token_id=eos_id,
                 # token.v6: the custom model's lm_head is storage-tied to
