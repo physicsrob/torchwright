@@ -104,6 +104,7 @@ class HeadlessTransformer:
         self.placements = None
         self.cpsat_assignment_payload = None
         self.schematic_capture = None
+        self.rms_norm_spec = None
 
     @property
     def device(self) -> torch.device:
@@ -130,6 +131,17 @@ class HeadlessTransformer:
             self.layers = [layer, *self.layers]
         return layer
 
+    def _seed_rms_norm_constants(self, res_stream: torch.Tensor) -> None:
+        """Write compiler-owned pinned normalization constants in place."""
+        if self.rms_norm_spec is None:
+            return
+        for column, value in zip(
+            self.rms_norm_spec.reserved_cols,
+            self.rms_norm_spec.const_values,
+            strict=False,
+        ):
+            res_stream[:, column] = value
+
     def get_input_res_stream(
         self,
         n_pos: int,
@@ -150,6 +162,13 @@ class HeadlessTransformer:
         assert self.residual_assignment
         in_state = self.layers[0].attn.in_state
         res_stream = torch.zeros((n_pos, self.d))
+
+        # Pinned RMSNorm columns are compiler-owned constants rather than graph
+        # nodes, so residual assignment does not enumerate them below. Seed
+        # them here to keep every headless consumer on the same initialization
+        # path. Token exporters fold these values into every embedding row;
+        # continuous export stores this tensor directly.
+        self._seed_rms_norm_constants(res_stream)
 
         for node in self.residual_assignment.get_nodes(in_state):
             indices = self.residual_assignment.get_node_indices(in_state, node)

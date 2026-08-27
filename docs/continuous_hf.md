@@ -44,14 +44,27 @@ runtime input has shape `(n_positions, InputNode.d_output)`. A batched call adds
 one leading batch dimension. All inputs in a call must either be unbatched or
 have the same batch size.
 
-The source graph must use the ReLU operation library because continuous bundles
-currently target Torchwright's custom biased-ReLU decoder. It must contain at
-least one named `InputNode`, and it cannot contain a token `Embedding`. Output
-names must be non-empty; input names must also be non-empty and unique.
+Continuous bundles support both Torchwright operation libraries. The compiler
+infers a biased-ReLU or biased-SwiGLU decoder from the graph's FFN nodes. A
+mixed-machine graph is rejected, as it is by the other compiler targets. A graph
+with no FFN nodes falls back to ReLU. Pass `machine="relu"` or
+`machine="swish"` to pin the physical machine and reject a graph built from the
+other library.
+
+Use `torchwright.ops.swiglu` for continuous algorithms that multiply two live
+values. Its `multiply(a, b)` uses the complementary gated pair
+`Swish(a)·b + Swish(-a)·(-b) = a·b`: it has no product grid or declared range
+limit. The identity is exact in real arithmetic; execution still has ordinary
+fp32 rounding. ReLU's `multiply_2d` is instead a range-bounded piecewise-linear
+approximation.
+
+The graph must contain at least one named `InputNode`, and it cannot contain a
+token `Embedding`. Output names must be non-empty; input names must also be
+non-empty and unique.
 
 The other compiler controls have their usual meanings: `max_layers`,
 `optimize`, `d_hidden`, `trim_heads`, and `n_heads`. `rms_norm=False` is the
-default for continuous bundles. Enabling it preserves the compiler's pinned
+default for both machines. Enabling it preserves the compiler's pinned
 normalization constants and uses the same supported-width rules as other
 RMSNorm compilation.
 

@@ -1,5 +1,7 @@
 """Continuous-input and raw-residual behavior of the custom HF model."""
 
+from typing import Any, Literal, cast
+
 import pytest
 import torch
 
@@ -9,7 +11,9 @@ from torchwright.compiler.hf import (
 )
 
 
-def _model() -> TorchwrightCustomForCausalLM:
+def _model(
+    *, activation: Literal["relu", "swish"] = "relu"
+) -> TorchwrightCustomForCausalLM:
     config = TorchwrightCustomConfig(
         d=8,
         d_head=4,
@@ -19,6 +23,7 @@ def _model() -> TorchwrightCustomForCausalLM:
         d_hidden_per_layer=[8],
         max_position_embeddings=4,
         rms_norm=True,
+        activation=activation,
     )
     return TorchwrightCustomForCausalLM(config).float().eval()
 
@@ -60,3 +65,28 @@ def test_inputs_embeds_validates_exclusive_source_and_shape() -> None:
         model.model(input_ids=ids, inputs_embeds=torch.zeros(1, 1, 8))
     with pytest.raises(ValueError, match="shape"):
         model.model(inputs_embeds=torch.zeros(1, 1, 7))
+
+
+def test_swiglu_model_uses_gated_mlp() -> None:
+    """The custom checkpoint model executes its configured SwiGLU equation."""
+    model = _model(activation="swish")
+    mlp = model.model.layers[0].mlp
+    assert mlp.fc1 is None
+    assert mlp.fc2 is None
+    assert mlp.gate_proj is not None
+    assert mlp.up_proj is not None
+    assert mlp.down_proj is not None
+
+    x = torch.randn(2, 3, model.config.d)
+    with torch.no_grad():
+        expected = mlp.down_proj(
+            torch.nn.functional.silu(mlp.gate_proj(x)) * mlp.up_proj(x)
+        )
+        actual = mlp(x)
+
+    torch.testing.assert_close(actual, expected)
+
+
+def test_custom_config_rejects_unknown_activation() -> None:
+    with pytest.raises(ValueError, match="activation"):
+        _model(activation=cast("Any", "gelu"))

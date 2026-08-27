@@ -70,9 +70,11 @@ next_state = runner(state=state_values, update=update_values)["state"]
 The bundle records every named value's residual columns and stores the complete
 compiler-generated initial residual, including literals. Calls may be unbatched
 or batched, and `runner.run_until(...)` supports fresh-invocation recurrent
-state transitions. See [continuous Hugging Face bundles](docs/continuous_hf.md)
-for the interface format, raw-residual path, validation rules, and recurrence
-API.
+state transitions. Both ReLU and SwiGLU graphs are supported; the compiler
+infers the machine, and SwiGLU supplies the range-free gated product needed by
+multiplication-heavy numerical graphs. See [continuous Hugging Face
+bundles](docs/continuous_hf.md) for the interface format, raw-residual path,
+validation rules, and recurrence API.
 
 ## How it works
 

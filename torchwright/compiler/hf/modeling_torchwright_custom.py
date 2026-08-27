@@ -8,7 +8,7 @@ The forward path:
     h = embed_tokens(input_ids)                    # (B, T, d)
     for each layer:
         h = h + attn(norm(h))                      # causal, scale=1.0, RoPE, no bias
-        h = h + mlp(norm(h))                       # fc2(relu(fc1(h))), biased
+        h = h + mlp(norm(h))                       # biased ReLU or SwiGLU
     logits = lm_head(norm(h))                      # tied to embed_tokens, no bias
 
 ``norm`` is a Llama-style RMSNorm when ``config.rms_norm`` is set and
@@ -215,16 +215,34 @@ class TorchwrightCustomAttention(nn.Module):
 
 
 class TorchwrightCustomMLP(nn.Module):
-    """``fc2(relu(fc1(x)))`` — both linears biased."""
+    """Biased ReLU or SwiGLU MLP selected by ``config.activation``."""
 
     def __init__(self, config: TorchwrightCustomConfig, layer_idx: int) -> None:
         super().__init__()
         d_hidden = config.d_hidden_per_layer[layer_idx]
-        self.fc1 = nn.Linear(config.d, d_hidden, bias=True)
-        self.fc2 = nn.Linear(d_hidden, config.d, bias=True)
+        self.activation = config.activation
+        if self.activation == "relu":
+            self.fc1: nn.Module | None = nn.Linear(config.d, d_hidden, bias=True)
+            self.fc2: nn.Module | None = nn.Linear(d_hidden, config.d, bias=True)
+            self.gate_proj: nn.Module | None = None
+            self.up_proj: nn.Module | None = None
+            self.down_proj: nn.Module | None = None
+        else:
+            self.fc1 = None
+            self.fc2 = None
+            self.gate_proj = nn.Linear(config.d, d_hidden, bias=True)
+            self.up_proj = nn.Linear(config.d, d_hidden, bias=True)
+            self.down_proj = nn.Linear(d_hidden, config.d, bias=True)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.fc2(functional.relu(self.fc1(x)))
+        if self.activation == "relu":
+            assert self.fc1 is not None
+            assert self.fc2 is not None
+            return self.fc2(functional.relu(self.fc1(x)))
+        assert self.gate_proj is not None
+        assert self.up_proj is not None
+        assert self.down_proj is not None
+        return self.down_proj(functional.silu(self.gate_proj(x)) * self.up_proj(x))
 
 
 class TorchwrightCustomRMSNorm(nn.Module):

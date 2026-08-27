@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import Any, cast
+from typing import Any, Literal, cast
 
 from transformers import PretrainedConfig
 
@@ -14,10 +14,12 @@ class TorchwrightCustomConfig(PretrainedConfig):
     ``(vocab_size, d)`` token embedding feeds ``n_layers`` attention+MLP
     blocks, and the same ``(vocab_size, d)`` table is tied to ``lm_head`` for
     readout. Attention is causal with ``scale=1.0`` and rotary position
-    embeddings; the MLP is ``fc2(relu(fc1(x)))``. Head count and MLP hidden
-    width may vary per layer. When ``rms_norm`` is set, each sublayer input
-    and the final hidden state pass through a Llama-style RMSNorm. Weights
-    and activations are fp32; the modeling code enforces this.
+    embeddings. The MLP is either biased ReLU
+    ``fc2(relu(fc1(x)))`` or biased SwiGLU
+    ``down(swish(gate(x)) * up(x))``. Head count and MLP hidden width may vary
+    per layer. When ``rms_norm`` is set, each sublayer input and the final hidden
+    state pass through a Llama-style RMSNorm. Weights and activations are fp32;
+    the modeling code enforces this.
 
     Args:
         d: Residual stream width (also the embedding/unembedding width).
@@ -37,6 +39,7 @@ class TorchwrightCustomConfig(PretrainedConfig):
         rms_norm: Whether the model applies RMSNorm — pre-norm on each
             sublayer input plus a final norm.
         rms_norm_eps: RMSNorm epsilon.
+        activation: Physical MLP machine, ``"relu"`` or ``"swish"``.
     """
 
     model_type = "torchwright_custom"
@@ -55,6 +58,7 @@ class TorchwrightCustomConfig(PretrainedConfig):
         *,
         rms_norm: bool = False,
         rms_norm_eps: float = 1e-5,
+        activation: Literal["relu", "swish"] = "relu",
         **kwargs: object,
     ) -> None:
         self.d = int(d)
@@ -75,6 +79,12 @@ class TorchwrightCustomConfig(PretrainedConfig):
             )
         self.rms_norm = bool(rms_norm)
         self.rms_norm_eps = float(rms_norm_eps)
+        if activation not in ("relu", "swish"):
+            raise ValueError(
+                "TorchwrightCustomConfig.activation must be 'relu' or 'swish'; "
+                f"got {activation!r}."
+            )
+        self.activation = activation
         # Canonical aliases consulted by generic transformers utilities (cache
         # sizing, repr, sharding). Recomputed from our own fields; drop any
         # stale values round-tripped in from a serialized config.

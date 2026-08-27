@@ -13,7 +13,7 @@ import json
 import os
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, cast
+from typing import TYPE_CHECKING, Any, Literal, cast
 
 import torch
 from safetensors.torch import load_file, save_file
@@ -218,8 +218,8 @@ def _write_continuous_final_shard(
         state_dict["model.norm.weight"] = gain
         for index in range(n_layers):
             prefix = f"model.layers.{index}"
-            state_dict[f"{prefix}.input_layernorm.weight"] = gain
-            state_dict[f"{prefix}.post_attention_layernorm.weight"] = gain
+            state_dict[f"{prefix}.input_layernorm.weight"] = gain.clone()
+            state_dict[f"{prefix}.post_attention_layernorm.weight"] = gain.clone()
     filename = f"model-{shard_count:05d}-of-{shard_count:05d}.safetensors"
     save_file(state_dict, str(Path(output_dir) / filename))
     weight_map = dict(sink.weight_map)
@@ -269,6 +269,7 @@ def compile_continuous_hf_bundle(
     rms_norm: bool = False,
     rms_norm_eps: float = 1e-5,
     rms_norm_const_exp: int | None = None,
+    machine: Literal["relu", "swish"] | None = None,
     verbose: bool = False,
     _solver_seed: int | None = None,
     _force_resolve: bool = False,
@@ -277,14 +278,17 @@ def compile_continuous_hf_bundle(
 
     ``n_positions`` fixes the sequence dimension stored in the bundle. Runtime
     values may be unbatched ``(n_positions, width)`` tensors or consistently
-    batched ``(batch, n_positions, width)`` tensors. The continuous profile
-    uses the custom biased-ReLU decoder and never requires a token embedding in
-    the source graph.
+    batched ``(batch, n_positions, width)`` tensors. ``machine`` may pin the
+    custom biased-ReLU or biased-SwiGLU decoder and must then match the graph's
+    op library. By default the compiler infers it from the graph (with ReLU as
+    the no-FFN fallback). The source graph never requires a token embedding.
     """
     if n_positions <= 0:
         raise ValueError("n_positions must be positive")
     if rms_norm and not rms_norm_width_supported(d):
         raise ValueError(f"rms_norm is on but d={d} is unsupported")
+    if machine not in (None, "relu", "swish"):
+        raise ValueError(f"machine must be 'relu', 'swish', or None; got {machine!r}")
     outputs = _validate_outputs(outputs)
     inputs = _named_inputs(outputs)
     output_node = (
@@ -323,7 +327,7 @@ def compile_continuous_hf_bundle(
                 d_hidden=d_hidden,
                 rms_norm=rms_norm,
                 rms_norm_eps=rms_norm_eps,
-                machine="relu",
+                machine=machine,
                 _solver_seed=_solver_seed,
                 _force_resolve=_force_resolve,
                 **cast(
@@ -385,6 +389,7 @@ def compile_continuous_hf_bundle(
                 d_rot=d_rot,
                 rms_norm=rms_spec is not None,
                 rms_norm_eps=rms_spec.eps if rms_spec is not None else rms_norm_eps,
+                activation=cast("Literal['relu', 'swish']", compiled.activation),
                 bos_token_id=None,
                 eos_token_id=None,
             )
